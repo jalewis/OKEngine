@@ -1,0 +1,82 @@
+diff --git a/tools/file_operations.py b/tools/file_operations.py
+index 9815673ee..8a23e4d29 100644
+--- a/tools/file_operations.py
++++ b/tools/file_operations.py
+@@ -73,6 +73,48 @@ def _strip_terminal_fence_leaks(text: str) -> str:
+     return "".join(cleaned_lines)
+ 
+ 
++# ── Read-echo corruption guard ───────
++# A weak model sometimes echoes the gateway's line-numbered Read display back
++# into a write — "     12|content" (cat -n) or a "|---"/"|key:" pipe-prefixed
++# frontmatter (the display's column separator). That silently corrupts files
++# (a real corruption mode this guards against). Reject such writes so the model
++# rewrites clean content (the repair_broken_frontmatter cron is the safety net).
++_READ_ECHO_CATN_RE = re.compile(r"^\s*\d+\|")
++_READ_ECHO_PIPE_FM_RE = re.compile(r"^﻿?\|+(?:---|[A-Za-z_][\w-]*:)")
++
++
++def _detect_read_echo_corruption(content: str) -> Optional[str]:
++    """Return a rejection reason if ``content`` looks like Read-tool output
++    echoed back into a write (line-number or pipe-separator prefixes), else
++    None. Table-safe: a markdown body table (``| col |``) matches neither
++    pattern (cat-n needs ``<digits>|``; the pipe check needs ``|---`` or
++    ``|key:`` with no space, which a ``| col |`` row never has)."""
++    if not content:
++        return None
++    lines = content.split("\n")
++    catn = sum(1 for ln in lines[:80] if _READ_ECHO_CATN_RE.match(ln))
++    if catn >= 2:
++        return (f"content has {catn} lines prefixed with line numbers like '12|' — "
++                "that is Read-tool output echoed back into the write. Re-write the "
++                "file's ACTUAL content without the 'NN|' line-number prefixes.")
++    if lines and _READ_ECHO_PIPE_FM_RE.match(lines[0]):
++        return ("content opens with a pipe-prefixed frontmatter fence/key ('|---' or "
++                "'|type:') — the Read display's '|' column separator was echoed into "
++                "the write. Re-write clean frontmatter with no leading '|'.")
++    return None
++
++
++def _schema_reject(path: str, content: str) -> Optional[str]:
++    """OKF/domain schema gate (reads the vault's schema.yaml via tools.schema_validator).
++    Lazy-imported and fail-open: a validator/schema problem must never block a write —
++    only an actual conformance violation returns a reason."""
++    try:
++        from tools.schema_validator import schema_reject_reason
++        return schema_reject_reason(path, content)
++    except Exception:
++        return None
++
++
+ def _detect_line_ending(sample: str) -> Optional[str]:
+     """Return the dominant line ending in ``sample`` or None if undetermined.
+ 
+@@ -1239,6 +1281,16 @@ class ShellFileOperations(FileOperations):
+         if _is_write_denied(path):
+             return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
+ 
++        # Block Read-echo corruption (line-number / pipe-separator prefixes).
++        _echo = _detect_read_echo_corruption(content)
++        if _echo:
++            return WriteResult(error=f"Write rejected: {_echo}")
++
++        # Block schema-non-conformant writes (OKF base + domain schema.yaml).
++        _sr = _schema_reject(path, content)
++        if _sr:
++            return WriteResult(error=f"Write rejected (schema): {_sr}")
++
+         # Capture pre-write content.  Two consumers want it:
+         #
+         #   1. The lint-delta layer (for in-process linters like ast.parse
+@@ -1385,6 +1437,11 @@ class ShellFileOperations(FileOperations):
+         if _is_write_denied(path):
+             return PatchResult(error=f"Write denied: '{path}' is a protected system/credential file.")
+ 
++        # Block Read-echo corruption in the replacement text.
++        _echo = _detect_read_echo_corruption(new_string)
++        if _echo:
++            return PatchResult(error=f"Patch rejected: {_echo}")
++
+         # Read current content
+         read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
+         read_result = self._exec(read_cmd)

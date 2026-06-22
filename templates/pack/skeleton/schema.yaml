@@ -1,0 +1,121 @@
+# OKF domain contract for: {{PACK}} — {{TITLE}}.
+# The engine reads this (never hardcodes layout). STARTER taxonomy — refine the
+# types/fields for your domain. See pack-template/BUILDING-A-PACK.md §3.
+version: 1
+apply_under: [wiki/]
+exclude:
+  - wiki/operational/
+
+okf:
+  required: [type]            # OKF v0.1 base: every page needs a type
+  should:   [id]              # every page SHOULD carry a stable `id` (engine base-schema floor; advisory)
+# NOTE: `strict_types` is ENGINE-OWNED (set in the engine's base-schema, default
+# false = unknown types allowed if they satisfy okf.required). It is NOT pack-
+# settable — under composition a pack can't loosen/tighten the global taxonomy —
+# so don't declare it here (framework validate WARNs if you do).
+common_optional: [id, title, description, tags, created, updated, related, sources, tlp, confidence,
+                  aliases, maintained_by, discovered_by]
+
+# How each namespace buckets on disk (read by okf_migrate / reshelve / reshard).
+partitioning:
+  reshard_over: 500
+  namespaces:
+    entities:    {strategy: by-letter, reshard_by: second-letter}
+    sources:     {strategy: by-date, date_field: published, reshard_by: day}
+    concepts:    {strategy: by-letter, reshard_by: second-letter}
+    predictions: {strategy: flat}
+    findings:    {strategy: flat}                                   # human-authored (see permissions)
+    briefings:   {strategy: flat}                                   # daily brief — one dated page/day
+
+# The agent's load-first working set (build_hot_set -> wiki/HOT.md).
+hot_set:
+  days: 30
+  cap: 300
+  sections:
+    - {kind: open, namespace: predictions, status_field: status, open_values: [open, active], secondary_field: resolves_by, title: "Open predictions"}
+    - {kind: recent, namespace: sources, date_field: published, layout: by-date, title: "Recent sources"}
+    - {kind: recent, namespace: entities, date_field: updated, show_type: true, title: "Recently-updated entities"}
+
+# Write-permission matrix (conformance G2) — enforced by the MCP write path.
+# default delete:false => tombstone, never hard-rm; a namespace may set
+# create/update:false to mark it human-authored.
+permissions:
+  default: {create: true, update: true, delete: false}
+  namespaces:
+    # Human-only gate: analysts author findings (via git); the agent may READ but
+    # not create/update them. Drop this block if your domain has no such gate.
+    findings: {create: false, update: false}
+
+# Review trust model (conformance G3) — FLAG, not gate. Asserting a categorical
+# verdict lands the write but flags it (needs_review). Numeric / low-med-high never flag.
+review:
+  confidence_field: confidence
+  confidence_review_values: [confirmed, false-positive, refuted]
+  review_on_change_fields: []
+
+# Hot/warm/cold tiers (conformance G4) — DERIVED at query time, never stored.
+tier:
+  hot_days: 30
+  warm_days: 365
+  namespaces:
+    sources:     {date_field: published, from_path: true}
+    entities:    {date_field: updated}
+    concepts:    {date_field: updated}
+    predictions: {date_field: resolves_by, status_field: status, open_values: [open, active], open_floor: hot}
+    briefings:   {date_field: published}
+
+# Page types + required (identity/load-bearing) fields. Keep `required` minimal so the
+# write-gate never rejects a legitimately-shaped page; everything else is optional.
+types:
+  # --- cross-cutting spine (most packs keep these) ---
+  source:        {required: [type, published]}   # published = the partition/tier key. publisher / source_kind / scoring fields are DOMAIN choices — add them here only if your domain truly requires them (see CLAUDE.md).
+  concept:       {required: [type]}                         # a cross-cutting pattern / segment / cluster
+  prediction:    {required: [type, status, confidence, subject, resolves_by]}
+  finding:       {required: [type, status]}                 # human-authored (permissions.findings)
+  dashboard:     {required: [type, title]}                  # generated view / index / brief
+
+  # --- DOMAIN ENTITIES — REPLACE THESE with your domain's types. ---
+  # Each entity lives under wiki/entities/ and declares its identity field.
+  # Example (from okpack-sec): an actor, a thing, an identifier.
+  #
+  # Identity (composable okpacks): a type MAY declare how its `id` is minted and
+  # who owns it. The engine converges authority-id pages across packs into one
+  # canonical page; field-scoped ownership keeps two packs from clobbering each
+  # other. All four keys are OPTIONAL — omit them and the engine mints a slug id.
+  #   id_authority: <scope>   external-authority scope; pages get `<scope>:<value of id_field>`
+  #   id_field:     <field>   the frontmatter field carrying the authority's native id
+  #   owner:        {{PACK}}      pack that owns this type (only the owner mutates owned fields)
+  #   field_owners: {field: pack}   per-field override (a field another pack is allowed to own)
+  #
+  # actor:       {required: [type], owner: {{PACK}}}        # a named agent worth tracking (minted slug id)
+  # artifact:    {required: [type, identifier], id_authority: artifact, id_field: identifier, owner: {{PACK}}}
+  # standard:    {required: [type, ref_id], id_authority: std, id_field: ref_id, owner: {{PACK}}}
+
+# --- engine cron inputs (all OPTIONAL; the engine ships no domain taxonomy) ---
+# The maintenance drains/audits/classifiers read these here instead of hardcoding
+# any domain vocabulary. Leave them empty for generic behaviour; fill them to
+# teach the engine your taxonomy. Type references must name a key in `types:`.
+
+# Canonicalize legacy / alias type names onto a `types:` key. schema-type-drain
+# and normalize-entity-schema propose the rename.  e.g. {org: entity, vuln: cve}
+type_aliases: {}
+
+# Types whose pages are operational/derived — exempt from type-conformance drift
+# in wiki-health-audit.  e.g. [dashboard]
+operational_types: []
+
+# Types that warrant a deeper quality bar; page-quality-audit demotes thin pages
+# of these types.  e.g. [actor]
+depth_critical_types: []
+
+# Hints for schema-classify-drain: a canonical type -> tags that imply it.
+# e.g. {concept: [theme, pattern], actor: [group, org]}
+classify_hints: {}
+
+# Catch-all types the classifier should disambiguate (re-typed alongside bare
+# `entity` pages).  e.g. [entity]
+classify_catchall: []
+
+# Curated frontmatter fields the write path must never silently drop
+# (detect-field-loss guards these).  e.g. [aliases, canonical_url]
+protected_fields: []

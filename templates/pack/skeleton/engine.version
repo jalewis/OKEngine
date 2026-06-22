@@ -1,0 +1,3 @@
+engine: okengine
+version: {{ENGINE_VERSION}}
+hermes_pin: {{HERMES_PIN}}

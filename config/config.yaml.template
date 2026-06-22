@@ -1,0 +1,68 @@
+# OKEngine deployment overrides for ~/.hermes/config.yaml.
+#
+# Copy this file to a pack's .hermes-data/config.yaml, then fill the model,
+# provider, token, and local endpoint placeholders for that deployment.
+# The generated pack's docker-compose mounts ./.hermes-data at /opt/data and the
+# pack root at /opt/vault inside the gateway container.
+
+model:
+  # Default for interactive sessions. Cron jobs may override this per job in the
+  # generated cron-plus jobs file. gpt-oss-120b via OpenRouter — set
+  # OPENROUTER_API_KEY in the pack .env (the provider reads it from the env).
+  default: openai/gpt-oss-120b
+  provider: openrouter
+
+# Fallback chain used when the primary provider errors or is unreachable.
+# Keep at least one entry you have credentials or a reachable local endpoint for.
+fallback_providers:
+- provider: openrouter
+  model: openai/gpt-oss-120b:free       # same model, free tier (rate-limited)
+- provider: deepseek
+  model: deepseek-v4-pro                # needs DEEPSEEK_API_KEY
+- provider: custom
+  model: qwen3.5:27b                    # local Ollama / OpenAI-compatible endpoint
+  base_url: http://YOUR_OLLAMA_HOST:11434/v1
+
+compression:
+  enabled: true
+  threshold: 0.7
+  target_ratio: 0.3
+  protect_last_n: 20
+
+terminal:
+  # Required: the agent must run commands inside the gateway container so tools
+  # can see the pack mounted at /opt/vault.
+  backend: local
+  cwd: /opt/vault
+
+plugins:
+  # cron-plus is the scheduler the engine's whole cron fleet runs on — required
+  # for the self-maintaining vault. `deploy.sh` (scripts/install-cron-plus.sh)
+  # clones it into .hermes-data/plugins/cron-plus at the manifest-pinned commit
+  # before the gateway starts. Add other installed plugins here as needed.
+  enabled: [cron-plus]
+
+mcp_servers:
+  # Read-only OKEngine MCP query surface served by the okengine-mcp container.
+  # The token MUST match the read server's: it falls back to the built-in
+  # "okengine-local" when OKENGINE_MCP_TOKEN is unset, so that is the working
+  # local default here. If you set OKENGINE_MCP_TOKEN in .env, ensure-runtime.sh
+  # rewrites this header to match at deploy time (okengine#32).
+  okengine:
+    url: http://localhost:8730/mcp
+    headers:
+      Authorization: "Bearer okengine-local"
+
+  # Enforced local write path. This stdio server runs inside the gateway image
+  # and validates writes against the pack's nearest schema.yaml.
+  okengine-write:
+    command: /opt/hermes/.venv/bin/python
+    args:
+    - /opt/hermes/okengine-mcp/write_server.py
+
+# Cron jobs opt into MCP explicitly. This keeps maintenance drains and pure
+# script jobs from opening MCP connections unless a job requests them.
+platform_toolsets:
+  cron:
+    - hermes-cron
+    - no_mcp

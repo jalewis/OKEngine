@@ -1,0 +1,5 @@
+# Pinned for reproducible builds (see docs/supply-chain.md to bump).
+# Verify `mcp` against okengine-mcp/server.py + write_server.py when changing it.
+mcp==1.28.0
+PyYAML==6.0.2
+uvicorn==0.34.0

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- {{PACK}} SUGGESTED feed sources — public {{DOMAIN}} RSS+Atom feeds.
+     DISABLED BY DEFAULT: a suggestion list, not active config. REPLACE these
+     EXAMPLE entries with your real sources, then copy the ones you want into
+     feeds/feeds.opml to opt in — see README §"Enabling data sources". Shipping
+     sources active would point every deployment at the same origins at once
+     (a thundering herd); opt in deliberately and jitter your schedule.
+     Consumed by the engine's generic feed_fetch.py -> raw/ -> the ingest cron
+     compiles into wiki/. Grouped by source TYPE; per-source quality scores
+     (reliability/credibility/tlp) are assigned at ingest time (see CLAUDE.md).
+     Once your feeds are real, adopt the "All N probed live <date>" header so
+     `validate.py` enforces the count; re-probe with `python3 validate.py` (probe flag). -->
+<opml version="2.0">
+  <head><title>{{PACK}} feeds</title></head>
+  <body>
+    <outline text="Authoritative / first-party">
+      <outline text="EXAMPLE — replace" type="rss" xmlUrl="https://example.com/authoritative/feed.xml"/>
+    </outline>
+    <outline text="Research / analysis">
+      <outline text="EXAMPLE — replace" type="rss" xmlUrl="https://example.com/research/feed.xml"/>
+    </outline>
+    <outline text="News / practitioner">
+    </outline>
+  </body>
+</opml>

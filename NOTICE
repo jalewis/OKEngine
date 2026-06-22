@@ -1,0 +1,40 @@
+OKEngine — Open Knowledge Engine
+Copyright the OKEngine authors.
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+-------------------------------------------------------------------------------
+Third-party code redistributed in this repository
+-------------------------------------------------------------------------------
+
+patches/
+    The files under patches/ are unified diffs against Hermes-Agent
+    (https://github.com/NousResearch/hermes-agent), and therefore contain
+    excerpts of Hermes-Agent source. Hermes-Agent is licensed under the MIT
+    License, Copyright (c) NousResearch. Those excerpts remain under the MIT
+    License; OKEngine's own patch logic is Apache-2.0. The MIT permission and
+    copyright notice are preserved here as required by that license.
+
+-------------------------------------------------------------------------------
+Pinned dependencies (NOT vendored — cloned separately by the operator)
+-------------------------------------------------------------------------------
+
+OKEngine consumes, but does not redistribute, the following at the versions
+pinned in engine-manifest.yaml:
+
+  * Hermes-Agent — https://github.com/NousResearch/hermes-agent (MIT)
+        the agent runtime, cloned at a fixed tag; OKEngine layers an overlay
+        plus the carried patches/ above. We do not fork it.
+  * cron-plus (hermes-cron-plus) — https://github.com/jalewis/hermes-cron-plus
+        the subprocess-per-job scheduler plugin, installed separately.
+
+-------------------------------------------------------------------------------
+Generated content
+-------------------------------------------------------------------------------
+
+This repository ships NO domain knowledge and NO compiled vault content. A
+deployment ingests the feeds the operator configures and compiles them into a
+vault; that generated content is a derivative work of the ingested sources and
+is the deploying operator's responsibility (respect each source's license and
+any sensitivity marking). Domain packs live in the separate, public pack
+catalog: https://github.com/jalewis/okpacks-library

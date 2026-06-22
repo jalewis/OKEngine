@@ -1,0 +1,24 @@
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 40e19a0e4..e0de39071 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -1910,6 +1910,19 @@ def _run_single_child(
+         except Exception:
+             logger.debug("Failed to close child agent after delegation")
+ 
++        # Mark the child's session row as ended in state.db. Without this,
++        # delegate sub-agents leak rows with ended_at IS NULL forever — the
++        # agent's normal lifecycle has no end-of-conversation end_session()
++        # hook (run_agent.py only ends a session on compression-split). See
++        # See the delegate-tool session-end fix.
++        try:
++            db = getattr(child, "_session_db", None)
++            sid = getattr(child, "session_id", None)
++            if db and sid:
++                db.end_session(sid, "delegate_complete")
++        except Exception:
++            logger.debug("Failed to end child session row after delegation")
++
+ 
+ def _recover_tasks_from_json_string(
+     tasks: Any,

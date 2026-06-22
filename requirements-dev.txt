@@ -1,0 +1,35 @@
+# Dev / test dependencies for working ON OKEngine. See CONTRIBUTING.md.
+#
+# Enough to run the OFFLINE test suite. Two test groups self-skip
+# (pytest.importorskip) when their deps are absent, so the extra blocks below
+# UNLOCK them rather than being strictly required:
+#   - reader tests (tests/test_reader_browse.py) import okengine-reader/app.py
+#   - extractor tests (tests/test_extract_docs.py) exercise the doc backends
+# MCP-server tests still self-skip without `mcp` — add okengine-mcp/requirements.txt.
+#
+# Versions are bounded (>=,<next-major) for reproducibility (okengine#58): a lower
+# floor for features + an upper cap so a surprise upstream major can't break CI/local
+# out from under us. Bump caps deliberately.
+
+# core
+pytest>=8,<10
+pyyaml>=6,<7
+ruff>=0.6,<0.13
+
+# static analysis + supply-chain checks (make audit / coverage / typecheck — okengine#54/#56/#57)
+pip-audit>=2.7,<3
+bandit>=1.7,<2
+pytest-cov>=5,<7
+mypy>=1.11,<2
+
+# reader tests — app.py's top-level imports (NOT weasyprint; it's lazy, PDF-only)
+fastapi>=0.115,<1
+nh3>=0.3,<0.4
+markdown>=3.7,<4
+
+# document-extractor tests — the python backends (overlaps requirements-extract.txt
+# minus the optional trafilatura; system tools poppler-utils/antiword aren't pip)
+python-docx>=1.1,<2
+python-pptx>=0.6.23,<2
+openpyxl>=3.1,<4
+striprtf>=0.0.26,<0.1

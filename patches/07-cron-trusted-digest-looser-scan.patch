@@ -1,0 +1,51 @@
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -1102,6 +1102,12 @@
+     """
+     prompt = str(job.get("prompt") or "")
+     skills = job.get("skills")
++    # A successful prerun-script digest is trusted, engine-generated content that
++    # often DESCRIBES attack commands (security intel). Like install-vetted skill
++    # docs, scan it with the looser ruleset so a `cat ~/.aws/credentials`-style
++    # example in the digest doesn't trip a command-shape pattern and permanently
++    # block the job (real injection DIRECTIVES are still blocked).
++    trusted_context = False
+ 
+     # Run data-collection script if configured, inject output as context.
+     script_path = job.get("script")
+@@ -1119,6 +1125,7 @@
+                     f"```\n{script_output}\n```\n\n"
+                     f"{prompt}"
+                 )
++                trusted_context = True
+             else:
+                 # Script produced no output — nothing to report, skip AI call.
+                 return None
+@@ -1201,7 +1208,7 @@
+ 
+     skill_names = [str(name).strip() for name in skills if str(name).strip()]
+     if not skill_names:
+-        return _scan_assembled_cron_prompt(prompt, job, has_skills=False)
++        return _scan_assembled_cron_prompt(prompt, job, has_skills=False, trusted_context=trusted_context)
+ 
+     from tools.skills_tool import skill_view
+     from tools.skill_usage import bump_use
+@@ -1278,7 +1285,7 @@
+     return _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
+ 
+ 
+-def _scan_assembled_cron_prompt(assembled: str, job: dict, *, has_skills: bool = False) -> str:
++def _scan_assembled_cron_prompt(assembled: str, job: dict, *, has_skills: bool = False, trusted_context: bool = False) -> str:
+     """Scan the fully-assembled cron prompt for injection patterns. Raises
+     ``CronPromptInjectionBlocked`` when a match fires so ``run_job`` can
+     surface a clear refusal to the operator.
+@@ -1305,7 +1312,7 @@
+     """
+     from tools.cronjob_tools import _scan_cron_prompt, _scan_cron_skill_assembled
+ 
+-    if has_skills:
++    if has_skills or trusted_context:
+         # Skill content is install-time vetted by skills_guard.py. Invisible
+         # unicode is sanitized (not blocked) so a stray zero-width space in a
+         # skill code example can't permanently kill the job; the cleaned

@@ -1,0 +1,33 @@
+# OKEngine base schema — the engine-owned universal layer merged UNDER every
+# pack's schema.yaml (see scripts/cron/schema_lib.merged_schema). Packs declare
+# only their domain types on top; the universal fields and the global toggles
+# (okf.required / okf.should, strict_types) live here and are NOT pack-settable
+# under composition. Engine-owned — do not edit per deployment.
+version: 1
+
+okf:
+  required: [type]        # the one universal MUST, on every page
+  should:   [id]          # WARN tier — `id` flips to required after the id backfill (P1)
+
+strict_types: false       # engine-owned; packs cannot loosen/tighten under composition
+
+# Universal fields every page MAY carry. Informational only — undeclared extras
+# always pass through (the format is open/extensible); this list documents the
+# interoperability surface. `id` is the immutable, type-independent identity
+# (RFC composable-okpacks §5a): an authority id (<authority>:<localid>) when the
+# owning type declares id_authority, else a slug minted once at creation.
+common_optional:
+  - id
+  - title
+  - description
+  - status
+  - created
+  - updated
+  - version
+  - created_by
+  - last_modified_by
+  - confidence
+  - tags
+  - aliases          # alternate/legacy ids — the id resolver consults these
+  - maintained_by    # provenance: packs that maintain the page (composition)
+  - discovered_by    # provenance: where the knowledge was first attributed

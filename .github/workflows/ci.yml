@@ -1,0 +1,116 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: lint (syntax + real-bug)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - name: ruff (E9,F63,F7,F82 — no style enforcement)
+        run: ruff check --select E9,F63,F7,F82 scripts tools okengine-mcp okengine-reader tests
+
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -r requirements-dev.txt
+      # The MCP server tests self-skip without `mcp`; install it for full coverage.
+      - run: pip install -r okengine-mcp/requirements.txt || echo "mcp deps unavailable — those tests will skip"
+      - name: pytest
+        run: python -m pytest
+
+  scaffold:
+    name: scaffold validates clean
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      - name: framework init -> framework validate (no FAILs)
+        run: |
+          python scripts/framework_init.py /tmp/pack --domain "CI Scaffold"
+          python scripts/framework_validate.py /tmp/pack --quiet
+      - name: generated pack's own validator
+        run: cd /tmp/pack && python validate.py
+      - name: docker compose config (smoke — validates compose without building)
+        run: docker compose -f /tmp/pack/docker-compose.yml config -q
+
+  # NOTE: these run on GitHub Actions only. The repo is GitLab-hosted; GitLab CI is
+  # NOT enabled, so no .gitlab-ci.yml is shipped. All checks also run locally via the
+  # matching `make` targets, so they work regardless of CI platform (okengine#54-#58).
+
+  audit:
+    name: supply-chain + security scan (okengine#54)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "pip-audit>=2.7,<3" "bandit>=1.7,<2"
+      # reader + mcp are SEPARATE images/venvs — scan each requirements file on its own (installing
+      # them together is an artificial cross-env conflict). All three gate.
+      - name: pip-audit dev tools (gating)
+        run: pip-audit -r requirements-dev.txt
+      - name: pip-audit mcp runtime (gating)
+        run: pip-audit -r okengine-mcp/requirements.txt
+      - name: pip-audit reader runtime (gating)
+        run: pip-audit -r okengine-reader/requirements.txt
+      - name: bandit (python security lint, high-severity — informational baseline)
+        run: bandit -q -ll -r scripts tools okengine-mcp okengine-reader -x tests
+        continue-on-error: true
+
+  typecheck:
+    name: limited type check (okengine#57)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt && (pip install -r okengine-mcp/requirements.txt || true)
+      - name: mypy (core tools + MCP — baseline, not yet gating)
+        run: python -m mypy
+        continue-on-error: true
+
+  coverage:
+    name: test coverage report (okengine#56)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt && (pip install -r okengine-mcp/requirements.txt || true)
+      - name: pytest --cov (report only; no threshold gate yet)
+        run: python -m pytest --cov --cov-report=term-missing
+
+  docker-build:
+    name: build service images (okengine#55)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build okengine-reader image
+        run: docker build -t okengine-reader:ci okengine-reader
+      - name: build okengine-mcp image
+        # context = repo root (the Dockerfile COPYs okengine-mcp/* AND scripts/cron/*)
+        run: docker build -t okengine-mcp:ci -f okengine-mcp/Dockerfile .

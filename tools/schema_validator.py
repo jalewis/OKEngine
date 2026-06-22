@@ -1,0 +1,368 @@
+"""OKF + domain schema validator.
+
+Single source of truth for "is this file conformant?", read from a `schema.yaml`
+discovered by walking up from the target file (like `.editorconfig`). Used by:
+
+  - the write-time guard (`tools/file_operations.write_file` / `patch_replace`) —
+    rejects non-conformant content before it ever lands, and
+  - a pre-commit gate / drift-lint via the CLI: `python -m tools.schema_validator <files...>`.
+
+Conformance = OKF v0.1 base (`type` required) + the per-type required fields
+declared in `schema.yaml`.
+
+TWO PROFILES (see the conformance spec, docs/okf/okengine-conformance-spec.md):
+
+  - `schema_reject_reason()` — RUNTIME / fail-OPEN. Used by the write path + the
+    file-tool write-guard. A missing/broken schema or a validator error PASSES, so
+    an infra hiccup never bricks the agent's writes; only a real conformance
+    violation rejects. No schema.yaml in the file's ancestry → off for that tree
+    (this is what keeps the engine domain-agnostic — drop a schema.yaml in a vault
+    root to turn enforcement on).
+  - `conformance_reject_reason()` — STRICT / fail-CLOSED. For CI, release gates,
+    and public conformance tests (CLI: `--strict`). A missing/unparsable schema or
+    a validator error is itself a FAILURE, so a release can't pass on a check that
+    was silently disabled. Genuinely out-of-scope files still pass.
+"""
+from __future__ import annotations
+
+import fnmatch
+import os
+import re
+import time
+from pathlib import Path
+from typing import Optional
+
+try:
+    import yaml
+except Exception:  # pragma: no cover - yaml always present in the runtime venv
+    yaml = None
+
+_FM_RE = re.compile(r"\A---[ \t]*\n(.*?\n)---[ \t]*(?:\n|\Z)", re.S)
+_SCHEMA_NAMES = ("schema.yaml", ".okf-schema.yaml")
+
+# OKF v0.1 reserves these filenames as special/structural files exempt from the
+# `type:` requirement (index = collection landing page, log = changelog,
+# AGENTS = agent instructions). A schema.yaml may override via `reserved_files`.
+_OKF_RESERVED_DEFAULT = ("index.md", "log.md", "agents.md")
+
+# dir -> (cached_at_monotonic, schema path|None). Entries EXPIRE (okengine#49): a negative
+# result cached forever would leave a long-running validator/write-server fail-open for a tree
+# whose schema.yaml is added/moved later (until restart); a positive is also re-resolved if its
+# file later vanished. TTL bounds staleness; the parsed content is cached separately by mtime.
+_dir_to_schema: dict[str, tuple[float, Optional[str]]] = {}
+_FIND_TTL = float(os.environ.get("OKENGINE_SCHEMA_FIND_TTL", "10") or 0)
+_schema_cache: dict[str, tuple[float, dict]] = {}  # schema path -> (mtime, parsed)
+
+# The engine-owned base schema (config/base-schema.yaml) is merged UNDER every
+# pack schema: it supplies the universal `okf.required` floor (`type`) and the
+# `okf.should` WARN tier (`id`). Resolved repo-relative; OKENGINE_BASE_SCHEMA
+# overrides for deployed layouts. Absent → {} → behaviour identical to pre-base
+# (fail-safe: a missing base never changes conformance verdicts).
+_DEFAULT_BASE = Path(__file__).resolve().parents[1] / "config" / "base-schema.yaml"
+_base_cache: dict[str, dict] = {}
+
+
+def _base_schema() -> dict:
+    if yaml is None:
+        return {}
+    p = str(os.environ.get("OKENGINE_BASE_SCHEMA") or _DEFAULT_BASE)
+    if p not in _base_cache:
+        try:
+            data = yaml.safe_load(Path(p).read_text(encoding="utf-8"))
+            _base_cache[p] = data if isinstance(data, dict) else {}
+        except Exception:
+            _base_cache[p] = {}
+    return _base_cache[p]
+
+
+def _find_schema(start: str) -> Optional[Path]:
+    """Walk up from `start` to the first schema.yaml. Cached per directory."""
+    p = Path(start)
+    d = p if p.is_dir() else p.parent
+    try:
+        d = d.resolve()
+    except OSError:
+        return None
+    key = str(d)
+    cached = _dir_to_schema.get(key)
+    if cached is not None:
+        ts, sp = cached
+        fresh = _FIND_TTL <= 0 or (time.monotonic() - ts) < _FIND_TTL
+        # a stale negative must be re-walked (a schema may have appeared); a stale-or-removed
+        # positive too (file vanished) — otherwise we'd return a dead path or stay fail-open.
+        if fresh and (sp is None or Path(sp).is_file()):
+            return Path(sp) if sp else None
+    cur = d
+    found: Optional[Path] = None
+    while True:
+        for name in _SCHEMA_NAMES:
+            cand = cur / name
+            if cand.is_file():
+                found = cand
+                break
+        if found or cur.parent == cur:
+            break
+        cur = cur.parent
+    _dir_to_schema[key] = (time.monotonic(), str(found) if found else None)
+    return found
+
+
+def _load_schema(sp: Path) -> Optional[dict]:
+    if yaml is None:
+        return None
+    try:
+        mtime = sp.stat().st_mtime
+    except OSError:
+        return None
+    hit = _schema_cache.get(str(sp))
+    if hit and hit[0] == mtime:
+        return hit[1]
+    try:
+        data = yaml.safe_load(sp.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    _schema_cache[str(sp)] = (mtime, data)
+    return data
+
+
+def _excluded(rel_posix: str, schema: dict) -> bool:
+    base = rel_posix.rsplit("/", 1)[-1]
+    for pat in schema.get("exclude") or []:
+        pat = str(pat)
+        if pat.endswith("/"):
+            if rel_posix.startswith(pat) or rel_posix == pat[:-1]:
+                return True
+        elif fnmatch.fnmatch(rel_posix, pat) or fnmatch.fnmatch(base, pat):
+            return True
+    return False
+
+
+def _present(fm: dict, key: str) -> bool:
+    """A required field is satisfied if present, non-null, and (for scalars)
+    non-empty. Empty lists pass the gate — drift-lint flags those — so a stub
+    being filled in isn't rejected outright."""
+    if key not in fm:
+        return False
+    v = fm[key]
+    if v is None:
+        return False
+    if isinstance(v, str) and not v.strip():
+        return False
+    return True
+
+
+def _evaluate(abs_path: str, content: str) -> tuple[str, Optional[str]]:
+    """Core conformance evaluation. Returns (kind, reason):
+
+      ok     — conformant.
+      skip   — OUT OF SCOPE for this schema (not .md, outside apply_under/root,
+               excluded, or a reserved file). Passes in BOTH profiles.
+      fail   — a real CONFORMANCE VIOLATION (reason set). Rejects in both profiles.
+      error  — the governing schema or the validator is UNAVAILABLE/broken (reason
+               set): no schema in ancestry, unparsable schema, PyYAML missing, or
+               an internal validator exception. The runtime gate treats this as
+               fail-OPEN (pass — never brick a write); the strict/conformance gate
+               treats it as fail-CLOSED (reject — a release can't pass on a
+               silently-disabled check).
+
+    Never raises."""
+    try:
+        sp = _find_schema(abs_path)
+        if sp is None:
+            return ("error", "no governing schema.yaml found in the file's ancestry")
+        schema = _load_schema(sp)
+        if not schema:
+            return ("error", f"governing schema is unparsable or empty: {sp}")
+        root = sp.parent
+        try:
+            rel = Path(abs_path).resolve().relative_to(root)
+        except (ValueError, OSError):
+            return ("skip", None)                       # not under the schema root
+        rel_posix = rel.as_posix()
+        apply_under = schema.get("apply_under") or []
+        if apply_under and not any(rel_posix.startswith(a) for a in apply_under):
+            return ("skip", None)
+        if not rel_posix.endswith(".md"):
+            return ("skip", None)
+        if _excluded(rel_posix, schema):
+            return ("skip", None)
+        # OKF reserved filenames (index.md / log.md / AGENTS.md) are exempt.
+        reserved = schema.get("reserved_files")
+        reserved = tuple(str(r).lower() for r in reserved) if reserved else _OKF_RESERVED_DEFAULT
+        if rel_posix.rsplit("/", 1)[-1].lower() in reserved:
+            return ("skip", None)
+
+        m = _FM_RE.match(content)
+        if not m:
+            return ("fail", "missing YAML frontmatter (OKF requires at least a `type:` field)")
+        if yaml is None:
+            return ("error", "PyYAML unavailable — cannot validate frontmatter")
+        try:
+            fm = yaml.safe_load(m.group(1))
+        except Exception as e:
+            return ("fail", f"frontmatter is not valid YAML: {str(e)[:120]}")
+        if not isinstance(fm, dict):
+            return ("fail", "frontmatter is not a YAML mapping")
+
+        # okf.required = the engine-base floor UNION the pack's (never loosens;
+        # `type` is always present). The base guarantees `type` even if a pack
+        # omits an `okf:` block.
+        base_okf = (_base_schema().get("okf") or {})
+        pack_okf = (schema.get("okf") or {})
+        okf_req = sorted(set(base_okf.get("required") or ["type"]) |
+                         set(pack_okf.get("required") or ["type"]))
+        missing = [k for k in okf_req if not _present(fm, k)]
+        if missing:
+            return ("fail", f"missing required field(s): {', '.join(missing)}")
+
+        t = str(fm.get("type") or "").strip()
+        types = schema.get("types") or {}
+        if t not in types:
+            # strict_types is ENGINE-OWNED (base), not pack-settable — a pack
+            # cannot loosen/tighten the global type taxonomy under composition.
+            if _base_schema().get("strict_types"):
+                return ("fail", f"unknown type '{t}' — not in schema.yaml taxonomy")
+            return ("ok", None)
+        req = types[t].get("required") or ["type"]
+        miss = [k for k in req if not _present(fm, k)]
+        if miss:
+            return ("fail", f"type '{t}' is missing required field(s): {', '.join(miss)}")
+        return ("ok", None)
+    except Exception as e:
+        return ("error", f"validator error: {str(e)[:120]}")
+
+
+def schema_reject_reason(abs_path: str, content: str) -> Optional[str]:
+    """RUNTIME (fail-OPEN) gate — used by the write path. Returns a rejection
+    reason only for an actual conformance violation; a missing/broken schema or a
+    validator error passes (None) so a write is never bricked by infra. Out of
+    scope and conformant both return None. Never raises."""
+    kind, reason = _evaluate(abs_path, content)
+    return reason if kind == "fail" else None
+
+
+def conformance_reject_reason(abs_path: str, content: str) -> Optional[str]:
+    """STRICT (fail-CLOSED) conformance gate — for CI / release / public
+    conformance tests. Returns a reason for a conformance violation OR an
+    unavailable/broken schema/validator, so a release can't pass on a check that
+    was silently disabled. OUT-OF-SCOPE files (not .md, outside apply_under/root,
+    reserved) still pass (None) — strict ≠ "everything must be a page". Never raises."""
+    kind, reason = _evaluate(abs_path, content)
+    return reason if kind in ("fail", "error") else None
+
+
+def missing_should(abs_path: str, content: str) -> list[str]:
+    """The WARN tier: engine-base `okf.should` fields absent from a page's
+    frontmatter. Advisory only — NEVER rejects (kept out of `schema_reject_reason`
+    so it can't block a write). Returns [] when there's no parseable frontmatter
+    or no base `should` list. Used by drift-lint to flag e.g. a missing `id`
+    before it's promoted to required."""
+    try:
+        should = (_base_schema().get("okf") or {}).get("should") or []
+        if not should or yaml is None:
+            return []
+        m = _FM_RE.match(content)
+        if not m:
+            return []
+        fm = yaml.safe_load(m.group(1))
+        if not isinstance(fm, dict):
+            return []
+        return [k for k in should if not _present(fm, k)]
+    except Exception:
+        return []
+
+
+def governing_policy(abs_path: str) -> dict:
+    """Return the write-governance policy from the schema.yaml governing
+    `abs_path` (walk-up, same discovery + cache as the conformance gate):
+
+        {"permissions": {...}, "review": {...}}
+
+    Empty dict for either block if unset / no schema / error. This is the
+    pack-owned policy the *MCP write path* (okengine-mcp/write_server.py) reads —
+    `permissions` are HARD structural rights (per-namespace create/update +
+    delete:false→tombstone); `review` is SOFT (flag high-stakes assertions for
+    human review, never block). Never raises (fail-open: the write path treats an
+    empty policy as "no extra restrictions").
+    """
+    try:
+        sp = _find_schema(abs_path)
+        if sp is None:
+            return {}
+        schema = _load_schema(sp) or {}
+        out = {}
+        if isinstance(schema.get("permissions"), dict):
+            out["permissions"] = schema["permissions"]
+        if isinstance(schema.get("review"), dict):
+            out["review"] = schema["review"]
+        return out
+    except Exception:
+        return {}
+
+
+def drift_policy(abs_path: str) -> dict:
+    """Pack-declared field-drift normalization for the schema governing `abs_path`:
+
+        {"field_aliases": {alias_key: canonical_key},
+         "value_aliases": {field: {from_value: canonical_value}},
+         "allowed":       {type: [field, ...]}}
+
+    The MCP write path applies this so agent writes converge on the schema's vocabulary
+    (e.g. `country`->`suspected_origin`, `CN`->`China`) instead of drifting (okengine#46).
+    `allowed` (optional, per type) lets the write path FLAG unknown fields for review (G3,
+    never block). Empty blocks when unset / no schema. Never raises (fail-open)."""
+    try:
+        sp = _find_schema(abs_path)
+        if sp is None:
+            return {}
+        schema = _load_schema(sp) or {}
+        out: dict = {}
+        for key in ("field_aliases", "value_aliases", "allowed"):
+            if isinstance(schema.get(key), dict):
+                out[key] = schema[key]
+        return out
+    except Exception:
+        return {}
+
+
+def main(argv: list[str]) -> int:
+    """CLI for the pre-commit gate / drift-lint: validate each path; exit 1 if
+    any is non-conformant.
+
+      --strict   use the fail-CLOSED conformance profile (a missing/broken
+                 governing schema or validator error is a FAILURE, not a pass).
+                 This is the CI / release / public-conformance gate; without it
+                 the CLI uses the runtime fail-OPEN profile.
+      --quiet    print only violations (suppress the should-warn advisories)."""
+    strict = "--strict" in argv
+    quiet = "--quiet" in argv
+    args = [a for a in argv if not a.startswith("-")]
+    check = conformance_reject_reason if strict else schema_reject_reason
+    bad = 0
+    for path in args:
+        try:
+            content = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            print(f"  ! {path}: cannot read ({e})")
+            bad += 1
+            continue
+        rpath = str(Path(path).resolve())
+        reason = check(rpath, content)
+        if reason:
+            print(f"  ✗ {path}: {reason}")
+            bad += 1
+        elif not quiet:
+            sh = missing_should(rpath, content)
+            if sh:   # WARN tier — advisory, does not fail the gate
+                print(f"  · {path}: should-warn — missing {', '.join(sh)}")
+    if bad:
+        print(f"\n{bad} file(s) fail {'strict conformance' if strict else 'schema conformance'}.")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main(sys.argv[1:]))

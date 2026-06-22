@@ -1,0 +1,27 @@
+name: validate pack
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install pyyaml
+
+      - name: Validate pack (parse + cross-consistency)
+        run: python3 validate.py
+
+      - name: Validate docker-compose
+        # `config` resolves + type-checks the compose file without building; it does
+        # not require the engine checkout that the build contexts point at.
+        run: docker compose config -q

@@ -1,0 +1,52 @@
+# Root project metadata + tool config for OKEngine.
+#
+# OKEngine is NOT a pip-installable library (it is an engine layered on a pinned
+# Hermes-Agent + deployed packs), so there is intentionally no [build-system].
+# This file exists for project metadata and to configure pytest + ruff.
+
+[project]
+name = "okengine"
+version = "0.2.0"
+description = "OKEngine (Open Knowledge Engine) — a domain-agnostic engine for swappable-topic LLM wikis: it turns a pinned agent into a wiki maintainer driven by declarative packs (OKF is a portability floor)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100          # match the existing engine style; not enforced in CI
+
+[tool.ruff.lint]
+# The CI lint gate is the "real bug" subset only — syntax errors (E9) and
+# pyflakes correctness (undefined names, broken f-strings, bad comparisons).
+# Style is deliberately NOT enforced, so the gate stays green and meaningful.
+select = ["E9", "F63", "F7", "F82"]
+
+# Limited static type-check (okengine#57): a CONTRACT baseline over the core
+# tools + MCP write path, not full typing. ignore_missing_imports keeps third-party
+# stubs out of scope; run via `make typecheck`. Widen `files` as modules get typed.
+[tool.mypy]
+files = [
+    "tools/schema_validator.py",
+    "okengine-mcp/write_server.py",
+    "scripts/cron/canonical_assemble.py",
+]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+no_implicit_optional = true
+
+# Coverage (okengine#56): `make coverage` -> term report. No gate threshold yet — the
+# first goal is visibility into which cron/service paths are untested.
+[tool.coverage.run]
+branch = true
+source = ["scripts", "tools", "okengine-mcp", "okengine-reader"]
+omit = ["*/tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

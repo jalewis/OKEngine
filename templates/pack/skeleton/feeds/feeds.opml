@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- {{PACK}} ACTIVE feed sources — EMPTY BY DEFAULT (safe: nothing is fetched).
+     This pack ships no enabled sources so a fresh clone never floods upstreams.
+     To enable: copy entries from feeds.opml.example here (review each first), then
+     enable + schedule the feed-fetch cron. See README §"Enabling data sources".
+     Keep your schedule jittered (random minute, never :00, interval >= ~2h). -->
+<opml version="2.0">
+  <head><title>{{PACK}} feeds (none enabled)</title></head>
+  <body>
+  </body>
+</opml>

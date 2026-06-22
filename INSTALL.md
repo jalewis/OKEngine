@@ -1,0 +1,143 @@
+# Installing OKEngine on Hermes
+
+OKEngine = **a pinned Hermes** + **6 carried patches** + an **overlay** (new
+files) + **plugins** + **config**, then **one domain pack**. This is the procedure
+to take a stock Hermes install and bring it up to OKEngine — i.e. the exact
+stock→OKEngine delta.
+
+**Pinned dependency:** Hermes **v0.16.0** = upstream git tag **`v2026.6.5`**
+(`github.com/NousResearch/hermes-agent`). The engine is cut against this version;
+a different Hermes version may require rebasing the patches.
+
+Prereqs: Docker, git, a host user. Export the deploy uid once per shell
+(standardized on 10000 — never `$(id -u)`):
+```bash
+export HERMES_UID=10000 HERMES_GID=10000
+```
+
+## Fast path — build the gateway image (automates §1–§3)
+
+The gateway container image (`hermes-agent`) = pinned Hermes + the patches +
+the engine overlay, baked to `/opt/hermes` (where `config.yaml` points the
+`okengine-write` MCP server). OKEngine is an *overlay*, not a Hermes fork, so it
+has no root Dockerfile — one script assembles the tree and builds the image:
+
+```bash
+bash scripts/build-engine-image.sh          # clone Hermes@pin -> patch -> overlay -> docker build hermes-agent
+#   HERMES_SRC=/path/to/hermes  bash scripts/build-engine-image.sh   # reuse a checkout
+#   SKIP_BUILD=1                bash scripts/build-engine-image.sh   # assemble tree only (inspect/CI)
+#   TAG_LATEST=0                bash scripts/build-engine-image.sh   # build the version tag only — DON'T move a :latest other stacks share
+```
+
+> **Overlay code changes only go live after an image rebuild.** The overlay files
+> (`tools/schema_validator.py`, `okengine-mcp/`, `config/`, `plugins/`) are BAKED into
+> `hermes-agent` at build time — the gateway runs them from `/opt/hermes`, not from a mount.
+> Editing the engine repo (or `docker cp`-ing a hotfix into a running gateway) does NOT persist:
+> a `docker compose up` recreate restores the image's copy. Rebuild the image to make a change
+> durable. If `hermes-agent:latest` is shared by other stacks on the host, build with
+> `TAG_LATEST=0` (version tag only) or, for a single-file hotfix without re-cloning Hermes, build
+> a thin derived image and point only your pack at it:
+> ```dockerfile
+> FROM hermes-agent:okengine-vX.Y.Z
+> COPY tools/schema_validator.py /opt/hermes/tools/schema_validator.py
+> COPY okengine-mcp/write_server.py /opt/hermes/okengine-mcp/write_server.py
+> ```
+> then set that tag as the gateway `image:` in the pack's `docker-compose.yml` and recreate only
+> the gateway. (This is how okengine#46/#48's write-path guards were baked in ahead of a full rebuild.)
+
+That single command is §1–§3 below + the `docker build`. The `okengine-reader` and
+`okengine-mcp` images are separate slim images built by the pack's `docker compose`
+(they're standalone — they don't need the gateway image). §1–§3 document what the
+script does, if you prefer to do it by hand.
+
+## 1. Pin Hermes
+```bash
+git clone https://github.com/NousResearch/hermes-agent.git hermes
+cd hermes && git checkout v2026.6.5          # == Hermes v0.16.0
+```
+
+## 2. Apply the carried patches (6 core-file patches)
+```bash
+<OKEngine>/patches/apply.sh "$PWD"           # idempotent; fails loudly on drift
+```
+What each patch is and why: `patches/README.md`. (The schema write-guard is the
+only OKF-specific one; the rest are generic hardening/pricing.)
+
+## 3. Install the overlay (the engine's new files — no patching)
+Copy the overlay paths from the OKEngine repo onto the Hermes tree. The
+**authoritative list is `engine-manifest.yaml`** (`okf_contract`, `cron_machinery`,
+`ops_tooling`, `framework_cli`, `mcp_query_surface`, `reader`, plus `docs/`,
+`config/`, `tools/schema_validator.py`). High level:
+- `tools/schema_validator.py` — the OKF conformance contract (validator + the hook patch 01 calls).
+- `okengine-mcp/` — read-only query server (`server.py`) **+** the enforced write server (`write_server.py` → `okengine-write`, G1).
+- `okengine-reader/` — the human web reader.
+- `scripts/` — OKF cron wake-gates, `framework.py`/`framework_validate.py`, `cron_pack_split.py`, `tier_lib.py`/`tier_refresh.py`, `kb_*`, `deploy-*`.
+- `config/` — `cron-tiers.yaml`, `engine-crons.json`, `config.yaml.template`.
+- `docs/okf/` — the pattern guides.
+
+## 4. Install the plugins
+- **cron-plus** — the **required** subprocess-per-job cron scheduler the engine's
+  cron fleet runs on. It is a *separate Hermes plugin*, cloned by you (not vendored
+  here) and **pinned** in `engine-manifest.yaml` (`dependencies.cron-plus`). Without
+  it the deployed `config/cron-plus-jobs.json` (the engine + pack cron fleet) has
+  nothing to schedule it. Clone it at the pin and enable it:
+  ```bash
+  git clone https://github.com/jalewis/hermes-cron-plus ~/.hermes/plugins/cron-plus
+  git -C ~/.hermes/plugins/cron-plus checkout eacd1729859ff378be63cb13e25319abf9539eff
+  # then add `cron-plus` under plugins.enabled in ~/.hermes/config.yaml
+  ```
+- **model-provider plugins** ship in the overlay (`plugins/model-providers/custom` — the local-Ollama `reasoning_effort:none` lever; `openrouter`).
+
+## 5. Configure
+```bash
+cp config/config.yaml.template ~/.hermes/config.yaml   # (or the pack's .hermes-data/config.yaml)
+```
+Fill the load-bearing keys (template documents all):
+- `model.default` — your primary (e.g. `deepseek-v4-pro`).
+- `terminal.backend: local` — **required**, or the agent can't see the vault mount.
+- `mcp_servers.okengine` (read, HTTP :8730) **and** `mcp_servers.okengine-write`
+  (the enforced G1 write path, stdio, no token).
+- `fallback_providers` — the failover chain.
+- `~/.hermes/.env` — `TELEGRAM_BOT_TOKEN`, model keys, `OKENGINE_MCP_TOKEN` (mode 600).
+
+## 6. Add a domain pack (the "task")
+The engine carries no domain knowledge — a pack supplies `schema.yaml` + persona
+`CLAUDE.md` + feeds + crons + `wiki/`. The pack/vault is a directory **separate
+from** (sibling to) this engine checkout. Two paths:
+
+**Use an existing catalog pack** (operator happy path — `docs/install-selected-pack.md`):
+```bash
+python scripts/framework.py list                         # browse the catalog
+python scripts/framework.py pull <pack> ../my-brain      # fetch into a SIBLING vault dir
+```
+**Author a new pack from scratch:**
+```bash
+python scripts/framework.py init ../my-brain --domain "..."   # then fill it in
+python scripts/framework.py validate ../my-brain              # pre-deploy check (FAIL = deploy-breaking)
+```
+Pack spec + quickstart: `docs/deploy-a-new-domain.md`. Don't `pull`/`init` into
+this engine checkout — keep `okengine/` (code) and `my-brain/` (vault) side by side.
+
+## 7. Deploy
+Run from the **pack** dir (the pack's `docker-compose.yml` wires all three
+services; `ENGINE_DIR` points at this engine checkout):
+```bash
+export HERMES_UID=10000 HERMES_GID=10000
+bash $ENGINE_DIR/scripts/build-engine-image.sh   # builds the gateway image (hermes-agent) — once per engine version
+ENGINE_DIR=$ENGINE_DIR docker compose up -d       # builds okengine-reader + okengine-mcp, runs gateway + both
+CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-scripts.sh   # engine + pack scripts/data -> /opt/data
+CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-plus-jobs.sh # cron defs -> live (self-heals next_run_at)
+```
+The `gateway` service consumes the prebuilt `hermes-agent` image (step above);
+`compose` builds only the standalone `okengine-reader`/`okengine-mcp` images.
+
+## 8. Smoke (the gauntlet)
+A no_agent cron succeeds; an LLM agent cron succeeds (API + tools + prompt-cache);
+a delivery lands; `curl :8730/mcp` → 401 without token (read MCP up); the
+`okengine-write` stdio server registers its tools; `schema-drift-lint` is green.
+Then feeds → ingest → first compiled pages.
+
+## Upgrading Hermes
+Bump the pin: `git checkout <new-tag>` in the Hermes checkout, re-run
+`patches/apply.sh` (rebase any patch that fails — `patches/README.md`), rebuild,
+smoke-gauntlet, cut over. The overlay + plugins + pack are unaffected.

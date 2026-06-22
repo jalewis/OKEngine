@@ -1,0 +1,86 @@
+# Cron tier classification — engine vs domain split for the deployable framework.
+#
+# Draws the framework boundary over the cron-plus fleet. Three tiers:
+#
+#   engine          Domain-agnostic KB machinery. Ships UNCHANGED with the engine
+#                   and runs on any OKF vault: conformance, repair, index/health,
+#                   re-shelve/re-shard, source hygiene. Zero domain knowledge.
+#
+#   engine-template Generic mechanism (the wake-gate / selector SCRIPT) ships with
+#                   the engine, but the agent PROMPT (and any classifier seed) is
+#                   domain-specific and comes from the domain pack. The ingest
+#                   selectors and the enrich/backfill drains live here: reusable
+#                   plumbing, domain-filled.
+#
+#   domain          Domain content production: ingest feeds, the delivered
+#                   digests/briefs, event modeling, calibration/backtests, and any
+#                   domain-specific analytics. Part of the domain pack, not the
+#                   engine. (The generic prediction lifecycle — candidate-watch /
+#                   grade / regrade over a `prediction` type — is engine-template.)
+#
+# This is the M3 input: the engine repo ships `engine` + `engine-template` scripts;
+# the domain pack supplies every `domain` job plus the prompts for `engine-template`.
+# Borderline calls are noted inline — override freely.
+version: 1
+
+engine:
+  # --- structure / placement (fully config-driven, read from schema.yaml) ---
+  - reshelve
+  - reshard-oversized
+  - build-index-tree
+  - index-rebuild-daily
+  - build-hot-set
+  - tier-refresh
+  - corpus-indexer
+  - canonical-assemble           # generic: fuse per-source observations -> canonical entity (okengine#38)
+  # --- health / dashboards / stats ---
+  - kb-health-refresh
+  - refresh-kb-dashboards
+  - project-stats-refresh
+  - page-quality-audit
+  - wiki-health-audit
+  - contradictions-refresh       # generic: walks vault for contradiction H2s
+  # --- conformance / lint / repair ---
+  - lint-watcher
+  - schema-drift-lint
+  - schema-type-drain
+  - normalize-entity-schema
+  - repair-broken-frontmatter
+  - repair-yaml-apply
+  - repair-yaml-propose
+  - sanitize-frontmatter-updated
+  - detect-field-loss
+  - broken-wikilinks-drain
+  - source-backlink-drain
+  - orphans-drain
+  - publisher-canonical-drain    # generic source-publisher canonicalization
+  # --- cost safety ---
+  - budget-guard                 # no_agent spend cap: pauses agent crons over budget (okengine#35)
+
+engine-template:
+  # --- ingest pipeline (selector generic, prompt domain) ---
+  - raw-backfill
+  - entity-backfill
+  - concept-backfill
+  # --- source hygiene (quality / staleness: generic frame, domain judgment) ---
+  - source-quality-backfill
+  - source-staleness-refresh
+  # --- classification drains (mechanism generic, classifier seed domain) ---
+  - schema-classify-drain
+  - page-quality-enrich
+  # --- curated-field enrichment (apply-curated-frontmatter to a type) ---
+  - curated-fields-guard
+  # --- forecasting (generic selectors over a `prediction` type; prompt domain) ---
+  - prediction-candidate-watch
+  - prediction-grade
+  - prediction-regrade
+
+domain:
+  # The engine ships ZERO domain jobs — each domain pack declares its own here
+  # (and supplies their full defs in <pack>/crons/domain-crons.json). This list
+  # is consulted only when SPLITTING a live deployment's jobs.json back into
+  # sources; the forward regen path reads the pack's domain-crons.json directly.
+  # Examples a pack supplies: ingest feeds, delivered digests/briefs,
+  # domain-specific forecasting (calibration, backtest, event ledger/scoring), and
+  # any domain analytics. (The generic prediction lifecycle is engine-template.)
+  []

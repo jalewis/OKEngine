@@ -1,0 +1,109 @@
+# OKEngine — engine manifest.
+#
+# OKEngine (Open Knowledge Engine) is an engine for swappable-topic LLM wikis — the catalyst is Karpathy's
+# LLM-maintained-wiki pattern. It's the reusable layer that turns a pinned Hermes-Agent into an
+# agent that builds and maintains a topic wiki: the enforced MCP write path,
+# conformance/validation, index/health/tiering, repair drains, the cron machinery, and the
+# framework CLI. Security is the first concrete domain profile. Pages are portable via OKF
+# (Open Knowledge Format) — a small interoperability floor, not the origin or center.
+#
+# A live deployment = OKEngine @ a pinned Hermes  +  ONE domain pack.
+# The engine is domain-agnostic; all domain knowledge lives in the pack
+# (schema.yaml + persona + feeds + crons + content). See INSTALL.md and
+# docs/deploy-a-new-domain.md.
+version: 1
+engine_release: v0.2.0   # publish-readiness release (scrub + composable-okpacks fixes + conformance/supply-chain hardening)
+
+runtime:
+  # Hermes is a PINNED DEPENDENCY, not vendored into this repo. You clone Hermes
+  # at the pinned tag, apply patches/, then overlay the engine_layer below.
+  description: pinned Hermes-Agent (cloned separately, patched + overlaid — see INSTALL.md)
+  upstream: https://github.com/NousResearch/hermes-agent.git
+  pinned_version: v0.16.0          # upstream git tag v2026.6.5
+  pinned_tag: v2026.6.5
+  pinned_sha: 3c231eb3979ab9c57d5cd6d02f1d577a3b718b43   # commit the tag resolves to; build-engine-image.sh verifies the clone matches
+  carried_patches: patches/        # 6 core-file patches + apply.sh (idempotent) + README
+
+dependencies:
+  # External plugins the engine REQUIRES at runtime — cloned separately by the
+  # operator, NOT vendored into this repo. Pinned by commit (see INSTALL.md §4).
+  cron-plus:
+    role: subprocess-per-job cron scheduler — the engine's whole cron fleet
+          (the deployed config/cron-plus-jobs.json) runs on it; without it nothing
+          schedules.
+    upstream: https://github.com/jalewis/hermes-cron-plus.git
+    pinned_sha: eacd1729859ff378be63cb13e25319abf9539eff   # untagged; pin by commit
+    install_to: ~/.hermes/plugins/cron-plus
+
+engine_layer:
+  okf_contract:
+    - tools/schema_validator.py          # OKF conformance contract (validator + write-guard hook)
+    - config/base-schema.yaml            # engine-owned universal layer merged under every pack schema
+  cron_machinery:
+    - config/cron-tiers.yaml             # engine/engine-template/domain classification
+    - config/engine-crons.json           # the engine half of the cron fleet (source)
+    - scripts/cron_pack_split.py         # split/merge/regen/dump generator
+    - scripts/cron/                      # engine + engine-template scripts + shared libs (schema_lib, okf_migrate, kb_*, tier_*)
+  ops_tooling:
+    - scripts/deploy.sh                  # one-command pack bring-up: validate -> seed -> build -> compose up -> crons -> verify
+    - scripts/post_deploy_verify.sh      # live end-to-end post-deploy checks (reader/MCP/write-path/cron-plus/qmd)
+    - scripts/publish-snapshot.sh        # gated no-history public GitHub snapshot builder (never pushes)
+    - scripts/ensure-runtime.sh          # seed a pack's .hermes-data/config.yaml (host-owned) before compose-up
+    - scripts/deploy-cron-scripts.sh
+    - scripts/install-cron-plus.sh       # clone the pinned external cron-plus plugin into the pack runtime
+    - scripts/deploy-cron-plus-jobs.sh
+    - scripts/dump-cron-plus-jobs.sh
+    - scripts/regen-cron-plus-jobs.sh
+    - scripts/cron-plus.sh
+    - scripts/cron-plus-logs.sh
+    - scripts/extract-pdfs.sh            # stage-1 PDF->text companions (host-side, generic)
+    - scripts/extract-html.py            # stage-1 HTML->article-text companions (generic; trafilatura/readability/stdlib)
+    - scripts/extract-docs.py            # stage-1 DOCX/PPTX->text companions (optional python-docx/pptx; graceful skip)
+    - scripts/extract-raw.sh             # stage-1 wrapper: runs every shipped extractor over raw/ under one flock
+    - requirements-extract.txt           # host-side optional extractor deps (docx/pptx/xlsx/rtf/html)
+    - scripts/install-extract-cron.sh    # idempotent host-crontab installer for extract-raw.sh (cron-as-code)
+  framework_cli:
+    - scripts/framework.py                # branded CLI: `init` (scaffold) + `validate` (pre-deploy pack check)
+    - scripts/framework_init.py           # pack scaffolder (delegated to by `framework init`)
+    - scripts/framework_validate.py       # pre-deploy pack-spec validator
+    - scripts/engine_meta.py              # single source of truth for engine/Hermes pins (init stamps, validate enforces)
+  corpus_helpers:
+    - scripts/backfill_source_fields.py
+    - scripts/backfill_typeless_type.py
+    - scripts/normalize_publishers.py
+  reader:
+    - okengine-reader/                      # generic OKF vault reader (markdown + backlinks + PDF)
+  mcp_query_surface:
+    - okengine-mcp/                         # MCP servers: read-only query (server.py) + enforced write path (write_server.py / okengine-write, G1)
+  config_reference:
+    - config/config.yaml.template
+  plugins:
+    - plugins/model-providers/custom     # local OpenAI-compatible endpoint (reasoning_effort:none lever)
+    - plugins/model-providers/openrouter # OpenRouter fallback provider
+  docs:
+    - INSTALL.md                         # stock-Hermes -> OKEngine procedure
+    - docs/deploy-a-new-domain.md        # pack spec + quickstart
+    - docs/install-selected-pack.md      # operator happy path: list -> pull -> deploy a catalog pack
+    - docs/engine-domain-boundary.md
+    - docs/sharded-scan-discipline.md    # rglob-vs-glob convention for sharded namespaces
+    - docs/ingest-extraction.md          # stage-1 extraction pipeline + host-cron vs cron-plus rationale
+    - docs/kb-tooling.md
+    - docs/okf-alignment.md
+    - docs/okf/                          # the OKF pattern guides (1-4) + deployment-topology
+  tests:
+    # The whole offline suite (run with `make test` / `make check`). Listed as the directory —
+    # like scripts/cron/ above — so it can't drift out of date as tests are added. Covers the
+    # cron machinery, write/converge path, schema validator, MCP auth + index maintainer, reader,
+    # framework CLI, extractors, canonical assembler, and the post-deploy verifier.
+    - tests/
+
+generated_artifacts:
+  # produced by the deploy/regen pipeline (cron_pack_split merge of engine-crons +
+  # the pack); NOT hand-edited and NOT shipped in this repo.
+  - config/cron-plus-jobs.json
+
+pack:
+  description: the per-deployment domain (schema, content, crons, prompts, scripts, data, feeds, persona)
+  spec: docs/deploy-a-new-domain.md
+  scaffold: python scripts/framework.py init <path> --domain "..."
+  location_env: CRON_PACK_DIR        # points the cron generator at the pack

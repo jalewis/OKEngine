@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>OKEngine · vault reader</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">⬢ OKEngine · <span>vault reader</span></div>
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-view="browse">Browse</button>
+    <button class="tab" data-view="chat" id="tab-chat" hidden>Chat</button>
+  </nav>
+  <div class="gsearch-wrap">
+    <input id="gsearch" class="gsearch" type="search" autocomplete="off" placeholder="search all pages…  ( / )">
+    <div id="gresults" class="gresults" hidden></div>
+  </div>
+  <div class="clock" id="clock"></div>
+  <button id="about-btn" class="about-btn" title="About this reader">About</button>
+</header>
+
+<div id="about-overlay" class="about-overlay" hidden>
+  <div class="about-card">
+    <button id="about-close" class="about-close" title="close (Esc)">✕</button>
+    <h2>⬢ OKEngine Reader</h2>
+    <p class="about-meta" id="about-meta"></p>
+    <p>A read-only web browser for an <strong>OKEngine</strong> vault — markdown + YAML
+       knowledge, cross-linked, with backlinks and embeds. It renders content only;
+       it never writes to the vault.</p>
+    <p class="about-credit">Maintained by <strong>Jason Lewis</strong></p>
+    <ul class="about-links">
+      <li><a href="https://www.linkedin.com/in/jasonalewis/" target="_blank" rel="noopener">Jason Lewis on LinkedIn ↗</a></li>
+      <li id="about-repo-li" hidden><a id="about-repo" href="#" target="_blank" rel="noopener">OKEngine source ↗</a></li>
+      <li><a href="https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f" target="_blank" rel="noopener">Karpathy — the LLM-wiki pattern ↗</a></li>
+      <li><a href="https://github.com/GoogleCloudPlatform/knowledge-catalog" target="_blank" rel="noopener">Open Knowledge Format (OKF) ↗</a></li>
+      <li><a href="https://github.com/iwe-org/iwe" target="_blank" rel="noopener">IWE — markdown knowledge graph ↗</a></li>
+    </ul>
+    <p class="about-shortcuts"><strong>Shortcuts</strong> — <kbd>/</kbd> search · <kbd>↑</kbd><kbd>↓</kbd> results · <kbd>Enter</kbd> open · <kbd>Esc</kbd> close</p>
+    <p class="about-license">OKEngine is <a href="https://www.apache.org/licenses/LICENSE-2.0" target="_blank" rel="noopener">Apache-2.0</a> · vault content belongs to its sources / the operator.</p>
+  </div>
+</div>
+
+<main>
+  <section id="view-browse" class="view active">
+    <aside id="dir-rail"><div class="rail-title" id="analysis-title" hidden></div><div id="analysis"></div><div class="rail-title rail-sep" id="groups-title" hidden>BY KIND</div><div id="groups"></div><div class="rail-title rail-sep" id="ns-title">NAMESPACES</div><div id="dirs"></div></aside>
+    <div id="list-pane" class="pane"><div class="empty">Loading…</div></div>
+  </section>
+
+  <section id="view-chat" class="view">
+    <div class="chat-wrap">
+      <div id="chat-log" class="chat-log">
+        <div class="chat-hint">Ask the agent. It answers from the <strong>vault it maintains</strong> — reading whole pages and following <code>[[links]]</code> as memory, not retrieving chunks. Answers cite their source pages; click to open them.</div>
+      </div>
+      <form id="chat-form" class="chat-form">
+        <textarea id="chat-input" rows="1" autocomplete="off" placeholder="Ask the agent…  (Enter to send · Shift+Enter for newline)"></textarea>
+        <button type="submit" id="chat-send">Send</button>
+      </form>
+    </div>
+  </section>
+</main>
+
+<div id="page-overlay" class="overlay" hidden>
+  <div class="ov-bar">
+    <button id="ov-back" title="back">←</button>
+    <span id="ov-title"></span>
+    <span id="ov-path"></span>
+    <span id="ov-dl" class="ov-dl"></span>
+    <button id="ov-close" title="close (Esc)">✕</button>
+  </div>
+  <div id="ov-content" class="md ov-content"></div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

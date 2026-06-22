@@ -1,0 +1,15 @@
+# secrets + runtime — NEVER commit (a pack may be public)
+.env
+.hermes-data/
+config.yaml
+raw/            # feed_fetch output: scraped third-party article bodies, not source-of-truth
+
+# tooling caches
+.serena/
+
+# python / editor / scratch
+__pycache__/
+*.pyc
+*.bak
+*.bak.*
+.DS_Store
