@@ -52,16 +52,22 @@ def _build_vault(root: Path):
     return root
 
 
-def test_excluded_dirs_parsed_from_schema(tmp_path):
+def test_excluded_dirs_surfaces_dashboards_hides_operational(tmp_path):
+    """okengine#117: schema `exclude:` scopes CONFORMANCE, not reader visibility. The reader
+    SURFACES dashboards/ (synthesized digests meant to be read) and hides only operator-internal
+    excludes like operational/."""
     m = _load(_build_vault(tmp_path))
-    assert m._excluded_dirs() == frozenset({"operational", "dashboards"})
+    assert m._excluded_dirs() == frozenset({"operational"})   # dashboards surfaced, operational hidden
 
 
-def test_browse_rail_hides_excluded_dirs(tmp_path):
+def test_browse_rail_surfaces_dashboards_hides_operational(tmp_path):
     m = _load(_build_vault(tmp_path))
-    rail = {d["dir"] for d in m.api_tree()["dirs"]}
+    tree = m.api_tree()["dirs"]
+    rail = {d["dir"] for d in tree}
     assert "sources" in rail
-    assert "operational" not in rail and "dashboards" not in rail
+    assert "operational" not in rail            # operator-internal -> hidden
+    assert "dashboards" in rail                 # synthesized digests -> surfaced (the brief/HOT payoff)
+    assert {d["dir"]: d["derived"] for d in tree}.get("dashboards") is True   # flagged generated
 
 
 def test_browse_rail_marks_derived_namespaces(tmp_path):

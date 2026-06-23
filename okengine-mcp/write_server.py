@@ -28,6 +28,7 @@ Env: WIKI_PATH (/opt/vault), OKENGINE_MCP_WRITE_DATE (override today()).
 from __future__ import annotations
 
 import datetime
+import difflib
 import os
 import re
 import sys
@@ -291,6 +292,32 @@ def _policy_reject(p: Path, fm: dict, op: str, prev: dict | None = None) -> Opti
     return None
 
 
+def _namespace_reject(p: Path) -> Optional[str]:
+    """A knowledge page must land in a schema-DECLARED namespace. The write tools take a
+    literal agent-supplied path and `_namespace()` is just its top dir, so an agent can drift a
+    `type: source` page into a stray `source/` (singular) instead of the schema's `sources/`
+    — a fork the dashboards/index/assembler never see (okengine#115, same class as the cwd
+    split-brain #110). Reject an undeclared namespace, offering the closest declared one as a
+    hint. No-op when the pack declares no namespaces (nothing to enforce against); excluded
+    engine-internal dirs (operational/, dashboards/) are allowed."""
+    ns = _namespace(p)
+    if not ns:
+        return None
+    try:
+        schema = _governing(ns)
+        declared = schema_lib.knowledge_namespaces(schema)
+        allowed = declared | schema_lib.excluded_dirs(schema)
+    except Exception:                       # pragma: no cover - schema load is best-effort
+        return None
+    if not declared or ns in allowed:
+        return None
+    hint = difflib.get_close_matches(ns, sorted(declared), n=1)
+    suggest = f" — did you mean '{hint[0]}/'?" if hint else ""
+    return (f"namespace '{ns}/' is not declared in schema.yaml (declared knowledge "
+            f"namespaces: {sorted(declared)}){suggest} — a page written here forks into a "
+            f"stray tree the dashboards/index never see (okengine#115)")
+
+
 def _review_flags(p: Path, fm: dict, prev: dict | None = None) -> list[str]:
     """Return review reasons (flag, do NOT block). prev=None => create. A value
     that is unchanged from `prev` never re-flags (so backfills/no-ops don't churn
@@ -435,6 +462,10 @@ def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> st
     fm = _coerce_fm(frontmatter_yaml)
     if fm is None:
         return "rejected: frontmatter_yaml is not a valid YAML mapping"
+    # Enforce the page lands in a schema-declared namespace (no stray-namespace fork, #115).
+    nsr = _namespace_reject(p)
+    if nsr:
+        return f"rejected: {nsr}"
     # Identity-based dedup BEFORE writing: route a cosmetic duplicate to the
     # existing canonical (authority) or flag+refuse a slug collision, instead of
     # minting a second canonical (okengine#98/#99/#100). Stamps fm["id"].

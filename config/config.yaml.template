@@ -30,10 +30,14 @@ compression:
   protect_last_n: 20
 
 terminal:
-  # Required: the agent must run commands inside the gateway container so tools
-  # can see the pack mounted at /opt/vault.
+  # Required: the agent runs commands inside the gateway container so tools can see
+  # the pack mounted at /opt/vault. cwd is the PAGE TREE (`/opt/vault/wiki`), NOT the
+  # vault root — page writes go through the MCP write path (rooted at <vault>/wiki), so
+  # a cwd at the vault root would make a stray relative `file_write` (e.g. `source/x`)
+  # land at `/opt/vault/source` and fork from the canonical tree → split-brain vault
+  # (okengine#110). Pinning cwd to the page tree keeps any relative write in the one tree.
   backend: local
-  cwd: /opt/vault
+  cwd: /opt/vault/wiki
 
 plugins:
   # cron-plus is the scheduler the engine's whole cron fleet runs on — required

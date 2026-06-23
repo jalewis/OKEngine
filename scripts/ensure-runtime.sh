@@ -59,11 +59,31 @@ fi
 # rewrite the header to match or every read MCP call 401s (okengine#32). Runs even
 # when CFG already existed, so a token added after the first deploy is picked up.
 if [ -f "$CFG" ]; then
-    MTOK="okengine-local"
+    MTOK=""
     if [ -f "$PACK/.env" ]; then
         _t="$(grep -E '^[[:space:]]*OKENGINE_MCP_TOKEN[[:space:]]*=' "$PACK/.env" | tail -1 | cut -d= -f2-)"
         _t="$(printf '%s' "$_t" | sed -E 's/^[[:space:]"'\'']+//; s/[[:space:]"'\'']+$//')"
         [ -n "$_t" ] && MTOK="$_t"
+    fi
+    # The read server REFUSES to serve the built-in "okengine-local" default on its
+    # (container) 0.0.0.0 bind — it's public/well-known — so a fresh deploy with no real
+    # token leaves the mcp crash-looping. Generate a secret and persist it to .env so the
+    # mcp boots out of the box; the header rewrite below matches it (okengine#105).
+    if [ -z "$MTOK" ] || [ "$MTOK" = "okengine-local" ]; then
+        MTOK="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+        ENVF="$PACK/.env"
+        if [ -f "$ENVF" ] && grep -qE '^[[:space:]]*OKENGINE_MCP_TOKEN[[:space:]]*=' "$ENVF"; then
+            MTOK="$MTOK" ENVF="$ENVF" python3 - <<'PY'
+import os, re, pathlib
+f = pathlib.Path(os.environ["ENVF"])
+f.write_text(re.sub(r'(?m)^[ \t]*OKENGINE_MCP_TOKEN[ \t]*=.*$',
+                    "OKENGINE_MCP_TOKEN=" + os.environ["MTOK"], f.read_text(encoding="utf-8")),
+             encoding="utf-8")
+PY
+        else
+            printf 'OKENGINE_MCP_TOKEN=%s\n' "$MTOK" >> "$ENVF"
+        fi
+        echo "  generated a secret OKENGINE_MCP_TOKEN in .env (the read MCP refuses the built-in default on its bind)"
     fi
     # Python rewrite (no sed-escaping pitfalls with token punctuation); touches
     # only the okengine read-server Authorization header. Handles both the quoted

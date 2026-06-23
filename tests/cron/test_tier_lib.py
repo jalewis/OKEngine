@@ -43,6 +43,16 @@ def test_entities_tier_from_updated():
     assert t("entities/vendor/acme", {}) == "cold"        # no recency signal -> cold
 
 
+def test_entities_tier_falls_back_to_envelope_date():
+    """okengine#116: entities carry the OKF envelope `last_updated` (the agent never sets a
+    domain `updated`), so `date_field: updated` must fall back to last_updated/created — else
+    a freshly-written entity tiers cold and vanishes from the hot set / dashboard."""
+    assert t("entities/vendor/acme", {"last_updated": "2026-06-10"}) == "hot"
+    assert t("entities/vendor/acme", {"created": "2026-06-12"}) == "hot"
+    # an explicit configured field still wins when present (no regression for packs that set it)
+    assert t("entities/vendor/acme", {"updated": "2024-01-01", "last_updated": "2026-06-10"}) == "cold"
+
+
 def test_predictions_open_floor_hot_regardless_of_date():
     # open prediction with a far-future resolves_by is still hot (working set)
     assert t("predictions/p1", {"status": "open", "resolves_by": "2030-01-01"}) == "hot"

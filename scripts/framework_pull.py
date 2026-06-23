@@ -271,12 +271,27 @@ def _engine_check(dest: Path) -> None:
         if line.strip().startswith("version:"):
             pinned = line.split(":", 1)[1].strip()
             break
+    if not pinned:
+        return
     cur = engine_version()
-    if pinned and pinned.lstrip("engine-") != cur.lstrip("engine-"):
-        print(f"  ⚠ engine.version {pinned}  ≠  engine {cur} — review "
+    sat = _engine_meta_mod().satisfies_pin(pinned, cur)   # patch-tolerant (okengine#104)
+    if sat is False:
+        print(f"  ⚠ engine.version {pinned}  ≠  engine {cur} (different release series) — review "
               f"docs/deploy-a-new-domain.md §3 (engine upgrade) before deploy")
-    elif pinned:
+    elif pinned.lstrip("engine-") == cur.lstrip("engine-"):
         print(f"  ✓ engine.version {pinned}  ==  engine {cur}")
+    else:
+        print(f"  ✓ engine.version {pinned}  ~  engine {cur} (same release series — compatible)")
+
+
+def _engine_meta_mod():
+    """Load the sibling engine_meta module by path (no package assumptions)."""
+    import importlib.util
+    p = Path(__file__).resolve().parent / "engine_meta.py"
+    spec = importlib.util.spec_from_file_location("engine_meta", p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
 
 
 def _validate(dest: Path) -> int:

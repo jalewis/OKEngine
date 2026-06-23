@@ -86,7 +86,9 @@ fi
 
 # 4. MCP write server (stdio, in the gateway) --------------------------------
 echo "[4] MCP write server"
-CFG=/opt/vault/.hermes-data/config.yaml
+# The runtime config is the pack's .hermes-data mounted at /opt/data, NOT under /opt/vault
+# (the vault tree) — checking the wrong path produced false write-path/cron-plus FAILs (okengine#106).
+CFG=/opt/data/config.yaml
 if dcx "$GW" sh -c "grep -q 'okengine-write' $CFG" ; then ok "okengine-write registered in config.yaml"
 else bad "okengine-write not in $CFG" "re-run deploy; the enforced write path must be wired into mcp_servers"; fi
 if dcx "$GW" test -f /opt/hermes/okengine-mcp/write_server.py; then ok "write_server.py present in the gateway image"

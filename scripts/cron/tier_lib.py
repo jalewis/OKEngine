@@ -127,7 +127,15 @@ def tier_of(rel_path: str, fm: Optional[dict], cfg: dict, today: date) -> Option
     if nscfg.get("from_path"):
         d = _date_from_path(parts)
     else:
-        d = _parse_date(fm.get(nscfg.get("date_field", "updated")))
+        # configured date_field, falling back to the OKF envelope last_updated/created when
+        # absent — entities/concepts carry only the envelope date, so a `date_field: updated`
+        # would otherwise tier every page cold though it's freshly written (okengine#116).
+        d = None
+        for _k in (nscfg.get("date_field", "updated"), "last_updated", "created"):
+            if _k:
+                d = _parse_date(fm.get(_k))
+                if d:
+                    break
     if d is None:
         return "cold"
     age = (today - d).days

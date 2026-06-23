@@ -575,3 +575,58 @@ def test_update_clears_body_on_empty_keeps_on_none(vault):
     txt = p.read_text()
     assert "original body text" not in txt
     assert txt.split("---", 2)[2].strip() == ""              # body emptied
+
+
+_NS_SCHEMA = """\
+okf:
+  required: [type]
+types:
+  source: {required: [type, source_kind, published]}
+  entity: {required: [type, name]}
+strict_types: false
+partitioning:
+  namespaces:
+    sources:  {strategy: by-date, date_field: published}
+    entities: {strategy: by-letter}
+exclude:
+  - wiki/operational/
+permissions:
+  default: {create: true, update: true, delete: false}
+"""
+
+
+@pytest.fixture
+def ns_vault(tmp_path, monkeypatch):
+    (tmp_path / "wiki").mkdir()
+    (tmp_path / "schema.yaml").write_text(_NS_SCHEMA, encoding="utf-8")
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-06-15")
+    sys.modules.pop("write_server", None)
+    return _load(), tmp_path
+
+
+def test_create_rejects_stray_namespace(ns_vault):
+    """okengine#115: a type:source page must land in the schema's `sources/`; a stray
+    `source/` (singular) is refused with a hint, so content can't fork into a tree the
+    dashboards/index never see (the duplicate-namespace bug found dogfooding)."""
+    m, root = ns_vault
+    res = m._create("source/some-paper",
+                    "type: source\nsource_kind: paper\npublished: 2026-06-01", "# Some Paper")
+    assert res.startswith("rejected"), res
+    assert "not declared" in res and "sources" in res    # names the issue + the right namespace
+    assert not (root / "wiki" / "source").exists()        # nothing written to the stray namespace
+
+
+def test_create_allows_declared_namespace(ns_vault):
+    """The canonical `sources/` namespace is accepted — the guard only blocks strays."""
+    m, root = ns_vault
+    res = m._create("sources/2026-06-01-some-paper",
+                    "type: source\nsource_kind: paper\npublished: 2026-06-01", "# Some Paper")
+    assert res.startswith("created"), res
+
+
+def test_create_allows_excluded_namespace(ns_vault):
+    """Engine-internal excluded dirs (operational/) are not knowledge strays — not blocked."""
+    m, root = ns_vault
+    res = m._create("operational/health", "type: dashboard\ntitle: Health", "# Health")
+    assert "not declared" not in res, res

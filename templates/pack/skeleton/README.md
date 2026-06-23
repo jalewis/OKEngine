@@ -89,16 +89,16 @@ bash $ENGINE_DIR/scripts/deploy.sh              # validate -> seed runtime -> bu
 be skipped (a fresh `git clone` has no `.hermes-data/`). Flags: `--rebuild`,
 `--skip-build`, `--skip-validate`, `--no-crons`, `--fix-perms`.
 
-> The gateway runs as `HERMES_UID` (default `10000`), so the pack tree must be
-> writable by that uid. If you cloned the pack as your own user, either run
-> `deploy.sh --fix-perms` (quick, local) or `sudo chown -R 10000:10000 .` first —
-> otherwise deploy stops before compose with a permission message (rather than the
-> gateway coming up unhealthy).
+> The gateway runs as `HERMES_UID`, which **defaults to your own uid** (`$(id -u)`), so a
+> pack you cloned as yourself is writable out of the box — no `chown`. Pin a **fixed** uid
+> (and `sudo chown -R <uid> .`) only for a vault you'll move between hosts or operate as
+> several users; otherwise deploy stops before compose with a permission message.
 
 The equivalent manual steps:
 
 ```sh
-export HERMES_UID=10000 HERMES_GID=10000        # must match the engine's hermes user (owns the mounted vault)
+# HERMES_UID/HERMES_GID default to your uid (you own the clone) — nothing to export.
+# Only for a portable/shared vault: export a fixed uid AND `sudo chown -R <uid> .` first.
 bash $ENGINE_DIR/scripts/build-engine-image.sh  # builds the gateway image (hermes-agent)
 bash $ENGINE_DIR/scripts/ensure-runtime.sh      # seed .hermes-data/config.yaml (fresh clone has none) — MUST run before compose
 ENGINE_DIR=$ENGINE_DIR docker compose up -d      # builds reader+mcp, runs all three

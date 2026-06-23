@@ -48,9 +48,24 @@ if [ ! -f "$SRC" ]; then
     exit 1
 fi
 
-# Target the running pack gateway container (compose service == gateway).
-CONTAINER="$(docker ps --filter 'label=com.docker.compose.service=gateway' \
-                       --filter 'status=running' --format '{{.Names}}' | head -1)"
+# Expand any @jitter:* sentinels into concrete schedules for the DEPLOY copy. Engine crons
+# ship sentinels for per-install jitter (pack crons were expanded at `framework pull`); cron-plus
+# can't parse a raw sentinel, so an unexpanded one errors every tick and never runs (okengine#107).
+# Expand a temp copy, NOT $SRC, so the generated cron-plus-jobs.json stays round-trippable.
+DEPLOY_JOBS="$(mktemp)"
+trap 'rm -f "$DEPLOY_JOBS"' EXIT
+PYTHONPATH="$REPO_ROOT/scripts" python3 - "$SRC" "$DEPLOY_JOBS" <<'PY'
+import sys, json, cron_jitter
+src, out = sys.argv[1], sys.argv[2]
+d = json.load(open(src, encoding="utf-8"))
+n = cron_jitter.expand_jobs(d.get("jobs", []))
+json.dump(d, open(out, "w", encoding="utf-8"), indent=2)
+print(f"  expanded {n} @jitter sentinel(s) for deploy")
+PY
+
+# Target THIS pack's gateway via its compose project — NOT the first gateway on the host,
+# which is the wrong pack on a multi-pack host (okengine#108).
+CONTAINER="$(docker compose -f "$PACK_DIR/docker-compose.yml" ps -q gateway 2>/dev/null | head -1)"
 if [ -z "$CONTAINER" ]; then
     echo "ERROR: no running gateway container found (is the stack up?)." >&2
     exit 1
@@ -62,7 +77,7 @@ TS="$(date +%Y%m%d-%H%M%S)"
 docker exec -u "$HERMES_UID" "$CONTAINER" mkdir -p /opt/data/cron-plus
 docker exec -u "$HERMES_UID" "$CONTAINER" sh -c \
     "[ -f '$DEST_IN' ] && cp -p '$DEST_IN' '$DEST_IN.bak.$TS' && echo '  snapshot: $DEST_IN.bak.$TS' || true"
-docker exec -i -u "$HERMES_UID" "$CONTAINER" sh -c "cat > '$DEST_IN' && chmod 600 '$DEST_IN'" < "$SRC"
+docker exec -i -u "$HERMES_UID" "$CONTAINER" sh -c "cat > '$DEST_IN' && chmod 600 '$DEST_IN'" < "$DEPLOY_JOBS"
 echo "  deployed: $CONTAINER:$DEST_IN"
 
 JOB_COUNT=$(python3 -c "import json; print(len(json.load(open('$SRC'))['jobs']))")

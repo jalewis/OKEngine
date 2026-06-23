@@ -35,9 +35,13 @@ async function loadTree() {
     else { atitle.hidden = true; abox.innerHTML = ""; }
     _railRows(box, rest);
     const all = [...featured, ...rest];
-    const initial = new URLSearchParams(location.search).get("dir") || (all[0] && all[0].dir);
+    const dirParam = new URLSearchParams(location.search).get("dir");
+    const initial = dirParam || (all[0] && all[0].dir);
     const node = [...$$(".dir", abox), ...$$(".dir", box)].find(r => $(".d-name", r).textContent === initial);
-    if (initial) selectDir(initial, node);
+    // Default landing = the curated HOT set (the vault's "why it's useful" view); fall back to
+    // the first namespace when no HOT.md exists yet. An explicit ?dir= still wins.
+    if (dirParam) selectDir(dirParam, node);
+    else if (!(await renderHome($("#list-pane")))) { if (initial) selectDir(initial, node); }
   } catch (e) { box.innerHTML = `<div class="empty" style="padding:14px">failed (${e.message})</div>`; }
 }
 function renderPages(pane, heading, pages) {
@@ -52,6 +56,20 @@ function renderPages(pane, heading, pages) {
     `<table class="ledger"><thead><tr><th>title</th><th>type</th><th class="num">updated</th></tr></thead><tbody>${rows}</tbody></table>`;
   $$("table.ledger tbody tr", pane).forEach(tr => tr.onclick = e => { if (e.target.closest("a.wl")) return; openPage(tr.dataset.page); });
 }
+async function renderHome(pane) {
+  // The curated hot set (HOT.md) as the landing — recent sources, open predictions, recently
+  // updated entities — so a fresh install opens on its value, not an empty rail. Wikilinks in
+  // the rendered HTML work via the global a.wl handler. Returns false when no HOT.md exists yet.
+  try {
+    const d = await j("/api/page?path=HOT");
+    $$(".dir.sel").forEach(n => n.classList.remove("sel"));
+    CURRENT_DIR = null;
+    pane.innerHTML = `<div class="list-head"><h1>${esc(d.title || "Hot Set")}</h1><span class="meta">curated · recent</span></div>` +
+                     `<div class="md">${d.html}</div>`;
+    return true;
+  } catch (e) { return false; }
+}
+
 async function selectDir(dir, node) {
   CURRENT_DIR = dir;
   $$(".dir.sel").forEach(n => n.classList.remove("sel"));
@@ -254,6 +272,9 @@ function showView(name) {
   if (name === "chat") $("#chat-input").focus();
 }
 $$(".tab").forEach(t => t.onclick = () => showView(t.dataset.view));
+// Brand = Home: back to the curated hot set.
+const _brandHome = $("#brand-home");
+if (_brandHome) _brandHome.onclick = () => { showView("browse"); renderHome($("#list-pane")); };
 
 // ── agent chat ───────────────────────────────────────────────────────────────
 // Relays to THE Hermes agent (/api/chat → its OpenAI-compatible API). The agent answers

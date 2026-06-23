@@ -12,7 +12,7 @@
 # (schema.yaml + persona + feeds + crons + content). See INSTALL.md and
 # docs/deploy-a-new-domain.md.
 version: 1
-engine_release: v0.3.2   # cron jitter never picks minute 0 — no herd-prone :00 schedule that fails validation (#103)
+engine_release: v0.3.3   # split-brain vault fix (cwd + type→namespace) · kickstart · reader dashboards/HOT — see CHANGELOG.md
 
 runtime:
   # Hermes is a PINNED DEPENDENCY, not vendored into this repo. You clone Hermes

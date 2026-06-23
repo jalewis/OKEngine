@@ -60,6 +60,21 @@ def test_missing_persona_is_a_fail(tmp_path):
     assert v.main([str(pack), "--quiet"]) == 1
 
 
+def test_vault_mount_wiki_path_doubling_is_a_fail(tmp_path):
+    """okengine#110: WIKI_PATH ending in 'wiki' (e.g. /opt/wiki) doubles to /opt/wiki/wiki and
+    forks the vault into a split-brain — validate must FAIL it; the skeleton (/opt/vault) passes."""
+    pack = tmp_path / "pack"
+    _scaffold_with_compose(pack)
+    v = _load("framework_validate", VAL)
+    r = v.validate(pack)
+    assert not any(s == "FAIL" and "WIKI_PATH" in c for s, c, d in r.rows), "skeleton (/opt/vault) should pass the guard"
+    compose = pack / "docker-compose.yml"
+    compose.write_text(compose.read_text().replace("/opt/vault", "/opt/wiki"))   # the okpack-ai-research misconfig
+    r2 = v.validate(pack)
+    assert any(s == "FAIL" and "WIKI_PATH" in c for s, c, d in r2.rows), "WIKI_PATH=/opt/wiki must FAIL"
+    assert v.main([str(pack), "--quiet"]) == 1
+
+
 def test_runtime_config_context_aware(tmp_path):
     """Missing .hermes-data/config.yaml is context-aware: a definition repo
     (.hermes-data gitignored) WARNs (it's seeded at deploy); a dir that doesn't

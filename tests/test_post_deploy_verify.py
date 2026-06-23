@@ -63,3 +63,12 @@ def test_deploy_wires_in_the_verifier():
     body = DEPLOY.read_text()
     assert "post_deploy_verify.sh" in body, "deploy.sh no longer runs the verifier"
     assert "[6/6]" in body, "deploy.sh step labels not updated for the verify step"
+
+
+def test_checks_config_at_runtime_mount_not_vault():
+    """okengine#106: the runtime config is the pack's .hermes-data mounted at /opt/data;
+    checking /opt/vault/.hermes-data/config.yaml (absent in the gateway) produced false
+    write-path + cron-plus FAILs."""
+    body = VERIFY.read_text()
+    assert "CFG=/opt/data/config.yaml" in body, "verifier should read the runtime config at /opt/data"
+    assert "/opt/vault/.hermes-data/config.yaml" not in body, "stale vault config path still present"

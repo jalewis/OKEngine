@@ -264,10 +264,17 @@ _GROUPS_CACHE: tuple[float, list[tuple[str, frozenset[str]]]] = (float("-inf"), 
 _RAILTOP_CACHE: tuple[float, tuple[str, tuple[str, ...]]] = (float("-inf"), ("", ()))
 
 
+# `dashboards/` holds synthesized digests (the brief, HOT, kb-health, …) that are MEANT to be
+# read — the payoff of the vault. schema.yaml `exclude:` scopes CONFORMANCE (don't validate
+# generated pages), NOT reader visibility — so the reader SURFACES dashboards/ (flagged
+# `derived` in the rail) and only hides operator-internal excludes like operational/ (okengine#117).
+_SURFACED_DERIVED = frozenset({"dashboards"})
+
+
 def _excluded_dirs() -> frozenset[str]:
-    """Top-level wiki/ dir names the pack's schema.yaml marks `exclude:` — operator
-    / generated content (e.g. wiki/operational/, wiki/dashboards/) the reader hides
-    from the browse rail, page lists, and search. Cached briefly (vault is :ro)."""
+    """Top-level wiki/ dir names the reader hides from the browse rail, page lists, and search:
+    the pack's schema.yaml `exclude:` set MINUS the surfaced synthesized namespaces
+    (`dashboards/`, see _SURFACED_DERIVED — generated but meant to be read). Cached (vault :ro)."""
     global _EXCLUDE_CACHE
     now = time.monotonic()
     if now - _EXCLUDE_CACHE[0] < _DIR_TTL:
@@ -286,7 +293,7 @@ def _excluded_dirs() -> frozenset[str]:
                     out.add(seg)
         except Exception:
             pass
-    _EXCLUDE_CACHE = (now, frozenset(out))
+    _EXCLUDE_CACHE = (now, frozenset(out) - _SURFACED_DERIVED)
     return _EXCLUDE_CACHE[1]
 
 

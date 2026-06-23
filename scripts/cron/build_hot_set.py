@@ -90,6 +90,20 @@ def _d(v) -> date | None:
         return None
 
 
+def _resolve_date(fm: dict, df: str) -> date | None:
+    """The configured `date_field`, falling back to the OKF envelope `last_updated` then
+    `created` when it's absent/unparseable. Entities & concepts usually carry only the
+    envelope `last_updated` (the agent never sets a domain `updated`), so a schema
+    `date_field: updated` would otherwise silently drop EVERY page from the hot set —
+    the dashboard reads 0 though the namespace is full (okengine#116)."""
+    for key in (df, "last_updated", "created"):
+        if key:
+            d = _d(fm.get(key))
+            if d:
+                return d
+    return None
+
+
 def _path_upper_date(rel: str) -> date | None:
     """Latest date a date-sharded PATH could represent (`…/YYYY/MM[/DD]/…`), so an
     old shard can be skipped WITHOUT reading frontmatter. Directory components only
@@ -132,7 +146,7 @@ def _select_recent(sec: dict, cutoff: date) -> list[tuple[date, Path, dict]]:
         if up is not None and up < cutoff:
             continue   # date-sharded into a shard wholly before the cutoff — skip cheap
         fm = _fm(p)
-        dv = _d(fm.get(df))
+        dv = _resolve_date(fm, df)
         if dv and dv >= cutoff:
             rows.append((dv, p, fm))
     rows.sort(key=lambda x: x[0], reverse=True)

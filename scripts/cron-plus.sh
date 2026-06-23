@@ -20,13 +20,22 @@ set -euo pipefail
 # would mismatch and hit permission-denied on jobs.json / the .tick.lock.
 HERMES_UID="${HERMES_UID:-10000}"
 
-# Target the running pack gateway container by compose-service label, so this
-# works regardless of which pack dir the stack was brought up from (#19) — the
-# deployed compose lives in the pack, not the engine repo.
-CONTAINER="$(docker ps --filter 'label=com.docker.compose.service=gateway' \
-                       --filter 'status=running' --format '{{.Names}}' | head -1)"
+# Target the pack's gateway. With CRON_PACK_DIR set, scope to THAT pack's compose project
+# (the right gateway on a multi-pack host, okengine#108). Without it, fall back to the gateway
+# label — but REFUSE if more than one matches, rather than silently picking the wrong pack.
+if [ -n "${CRON_PACK_DIR:-}" ]; then
+    CONTAINER="$(docker compose -f "$CRON_PACK_DIR/docker-compose.yml" ps -q gateway 2>/dev/null | head -1)"
+else
+    mapfile -t _GWS < <(docker ps --filter 'label=com.docker.compose.service=gateway' \
+                                  --filter 'status=running' --format '{{.Names}}')
+    if [ "${#_GWS[@]}" -gt 1 ]; then
+        echo "ERROR: ${#_GWS[@]} gateways running (${_GWS[*]}); set CRON_PACK_DIR=<pack> to pick one." >&2
+        exit 1
+    fi
+    CONTAINER="${_GWS[0]:-}"
+fi
 if [ -z "$CONTAINER" ]; then
-    echo "ERROR: no running gateway container found (is the stack up?)." >&2
+    echo "ERROR: no running gateway container found (is the stack up? set CRON_PACK_DIR=<pack>)." >&2
     exit 1
 fi
 

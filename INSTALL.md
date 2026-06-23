@@ -9,10 +9,12 @@ stock→OKEngine delta.
 (`github.com/NousResearch/hermes-agent`). The engine is cut against this version;
 a different Hermes version may require rebasing the patches.
 
-Prereqs: Docker, git, a host user. Export the deploy uid once per shell
-(standardized on 10000 — never `$(id -u)`):
+Prereqs: Docker, git, a host user. `HERMES_UID`/`HERMES_GID` **default to your own uid**
+(`$(id -u)`), so a pack you cloned as yourself just works — nothing to export. Pin a
+**fixed** uid (and `chown` the tree to it) only for a vault you'll move between hosts or
+operate as several users:
 ```bash
-export HERMES_UID=10000 HERMES_GID=10000
+export HERMES_UID=10000 HERMES_GID=10000 && sudo chown -R 10000:10000 <pack>   # portable/shared only
 ```
 
 ## Fast path — build the gateway image (automates §1–§3)
@@ -122,7 +124,7 @@ this engine checkout — keep `okengine/` (code) and `my-brain/` (vault) side by
 Run from the **pack** dir (the pack's `docker-compose.yml` wires all three
 services; `ENGINE_DIR` points at this engine checkout):
 ```bash
-export HERMES_UID=10000 HERMES_GID=10000
+# HERMES_UID/HERMES_GID default to your uid (you own the clone) — export a fixed uid only for a portable/shared vault.
 bash $ENGINE_DIR/scripts/build-engine-image.sh   # builds the gateway image (hermes-agent) — once per engine version
 ENGINE_DIR=$ENGINE_DIR docker compose up -d       # builds okengine-reader + okengine-mcp, runs gateway + both
 CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-scripts.sh   # engine + pack scripts/data -> /opt/data

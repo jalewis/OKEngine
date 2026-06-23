@@ -37,9 +37,9 @@ if [ ! -d "$SRC_DIR" ]; then
     exit 1
 fi
 
-# Locate the running gateway container (compose service == gateway).
-CONTAINER="$(docker ps --filter 'label=com.docker.compose.service=gateway' \
-                       --filter 'status=running' --format '{{.Names}}' | head -1)"
+# Locate THIS pack's gateway via its compose project — NOT the first gateway on the host,
+# which is the wrong pack on a multi-pack host (okengine#108).
+CONTAINER="$(docker compose -f "$PACK_DIR/docker-compose.yml" ps -q gateway 2>/dev/null | head -1)"
 if [ -z "$CONTAINER" ]; then
     echo "ERROR: no running gateway container found (is the stack up?)." >&2
     exit 1
@@ -51,13 +51,15 @@ echo "  gateway container: $CONTAINER"
 docker exec -u "$HERMES_UID" "$CONTAINER" mkdir -p /opt/data/scripts /opt/data/config
 
 # --- engine/pack version pin check (warn-only; slice 4a) ---
-# The pack pins an engine release in $PACK_DIR/engine.version; warn if it doesn't
-# match this engine checkout's latest v* release tag. Non-fatal by design.
+# The pack pins an engine release in $PACK_DIR/engine.version; warn only if it's a
+# DIFFERENT major.minor series than this engine checkout. A patch-newer engine (e.g.
+# v0.3.2 vs a v0.3.0 pin) is compatible and must not warn (okengine#104). Non-fatal.
 if [ -f "$PACK_DIR/engine.version" ]; then
     PINNED="$(sed -n 's/^version:[[:space:]]*//p' "$PACK_DIR/engine.version" | head -1)"
     ENGINE_TAG="$(git -C "$REPO_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo '')"
-    if [ -n "$PINNED" ] && [ -n "$ENGINE_TAG" ] && [ "$PINNED" != "$ENGINE_TAG" ]; then
-        echo "  ⚠ engine/pack version mismatch: pack pins '$PINNED', engine is '$ENGINE_TAG'" >&2
+    _series() { echo "${1#v}" | cut -d. -f1-2; }   # vX.Y.Z -> X.Y
+    if [ -n "$PINNED" ] && [ -n "$ENGINE_TAG" ] && [ "$(_series "$PINNED")" != "$(_series "$ENGINE_TAG")" ]; then
+        echo "  ⚠ engine/pack series mismatch: pack pins '$PINNED', engine is '$ENGINE_TAG'" >&2
     elif [ -n "$ENGINE_TAG" ]; then
         echo "  engine: $ENGINE_TAG (pack pin: ${PINNED:-none})"
     fi

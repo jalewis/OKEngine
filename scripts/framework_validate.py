@@ -232,12 +232,15 @@ def check_engine_version(pack: Path, r: Report) -> None:
     if not target:
         r.ok("engine.version", ver)
         return
-    if ver != target:
-        r.fail("engine.version",
-               f"pins {ver} but this engine is {target} — re-validate against {target} "
-               f"and bump engine.version (or check out the matching engine)")
-    else:
+    if ver == target:
         r.ok("engine.version", f"{ver} (matches this engine)")
+    elif meta.satisfies_pin(ver, target):
+        # same release series — a patch-newer engine is compatible with the pin (okengine#104).
+        r.ok("engine.version", f"{ver} pin · engine {target} — compatible (same release series)")
+    else:
+        r.fail("engine.version",
+               f"pins {ver} but this engine is {target} — incompatible release series; "
+               f"re-validate against {target} and bump engine.version (or check out a matching engine)")
     if htag and hpin and hpin != htag:
         r.warn("engine.version hermes_pin",
                f"pins {hpin} but this engine targets Hermes {htag}")
@@ -445,6 +448,43 @@ def check_gateway_env(pack: Path, r: Report) -> None:
            "required: false}]` to the gateway service in docker-compose.yml")
 
 
+def check_vault_mount(pack: Path, r: Report) -> None:
+    """WIKI_PATH must be a vault root whose last segment is NOT `wiki`. The engine derives the
+    page tree as `WIKI_PATH/wiki` (write_server.py, build_hot_set.py, …), so `WIKI_PATH=/opt/wiki`
+    doubles to `/opt/wiki/wiki` and a stray relative write forks the vault → split-brain
+    (okengine#110). The convention is `/opt/vault`; the skeleton + okpack-sec use it."""
+    compose = pack / "docker-compose.yml"
+    if not compose.is_file() or yaml is None:
+        return
+    try:
+        data = yaml.safe_load(compose.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return
+    paths = set()
+    for svc in (data.get("services") or {}).values():
+        if not isinstance(svc, dict):
+            continue
+        env = svc.get("environment") or []
+        pairs = env.items() if isinstance(env, dict) else (
+            tuple(e.split("=", 1)) for e in env if isinstance(e, str) and "=" in e)
+        for k, v in pairs:
+            if str(k).strip() == "WIKI_PATH":
+                paths.add(str(v).strip().rstrip("/"))
+    if not paths:
+        r.ok("vault mount (WIKI_PATH)", "unset — defaults to /opt/vault")
+        return
+    bad = sorted(p for p in paths if p.rsplit("/", 1)[-1] == "wiki")
+    if bad:
+        r.fail("vault mount (WIKI_PATH)",
+               f"WIKI_PATH={bad[0]} ends in 'wiki' — the engine appends /wiki, so the page tree "
+               f"doubles to {bad[0]}/wiki and relative writes fork the vault into a split-brain "
+               f"(okengine#110). Mount the vault at /opt/vault and set WIKI_PATH=/opt/vault.")
+    elif len(paths) > 1:
+        r.warn("vault mount (WIKI_PATH)", f"services disagree on WIKI_PATH: {sorted(paths)}")
+    else:
+        r.ok("vault mount (WIKI_PATH)", next(iter(paths)))
+
+
 def check_surface_auth(pack: Path, r: Report) -> None:
     """Local-first guardrail (issues #20/#29): bound to localhost, the generic
     default MCP token is fine and the reader may stay open — a fresh scaffold
@@ -643,6 +683,7 @@ def validate(pack: Path, probe: bool = False) -> Report:
     check_crons(pack, r)
     check_env(pack, r)
     check_gateway_env(pack, r)
+    check_vault_mount(pack, r)
     check_surface_auth(pack, r)
     check_runtime_config(pack, r)
     check_docs(pack, r)

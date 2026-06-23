@@ -21,11 +21,14 @@
 #   --no-crons       bring up containers only; don't deploy crons
 #   --fix-perms      make the pack tree writable by HERMES_UID (local convenience;
 #                    otherwise a non-writable tree fails before compose with remediation)
+#   --kickstart      after deploy, populate the vault NOW (ingest -> compile -> dashboards
+#                    -> brief) instead of waiting for the schedule. Opt-in: the compile +
+#                    brief stages spend on the model. See scripts/kickstart.sh.
 set -euo pipefail
 
 ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PACK="$PWD"
-REBUILD=0; SKIP_BUILD=0; SKIP_VALIDATE=0; NO_CRONS=0; FIX_PERMS=0
+REBUILD=0; SKIP_BUILD=0; SKIP_VALIDATE=0; NO_CRONS=0; FIX_PERMS=0; KICKSTART=0
 for a in "$@"; do
     case "$a" in
         --rebuild)       REBUILD=1 ;;
@@ -33,6 +36,7 @@ for a in "$@"; do
         --skip-validate) SKIP_VALIDATE=1 ;;
         --no-crons)      NO_CRONS=1 ;;
         --fix-perms)     FIX_PERMS=1 ;;
+        --kickstart)     KICKSTART=1 ;;
         -*)              echo "unknown flag: $a" >&2; exit 2 ;;
         *)               PACK="$a" ;;
     esac
@@ -121,3 +125,13 @@ else
     echo "    re-verify any time:  ( cd $PACK && bash $ENGINE_DIR/scripts/post_deploy_verify.sh )"
 fi
 echo "    LLM cron output + delivery appear once a model key (and a delivery channel, if used) are set in .env."
+
+# --kickstart: populate the vault now instead of waiting for the schedule (opt-in; the compile
+# + brief stages spend on the model). Needs the crons deployed, so it's skipped with --no-crons.
+if [ "$KICKSTART" = 1 ]; then
+    if [ "$NO_CRONS" = 1 ]; then
+        echo "==> --kickstart skipped: no crons were deployed (--no-crons)." >&2
+    else
+        CRON_PACK_DIR="$PACK" HERMES_UID="$HERMES_UID" bash "$ENGINE_DIR/scripts/kickstart.sh" "$PACK"
+    fi
+fi

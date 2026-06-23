@@ -90,8 +90,8 @@ From the pack directory:
 
 ```bash
 export ENGINE_DIR="$(cd ../okengine && pwd)"
-export HERMES_UID=10000
-export HERMES_GID=10000
+# HERMES_UID/HERMES_GID default to your uid (you own the clone) — nothing to export.
+# Only for a portable/shared vault: export a fixed uid AND `sudo chown -R <uid> .`.
 
 bash "$ENGINE_DIR/scripts/deploy.sh"
 ```

@@ -29,7 +29,25 @@ def test_deploy_jobs_targets_pack_runtime_not_host_hermes():  # #18
     t = (S / "deploy-cron-plus-jobs.sh").read_text()
     assert "/opt/data/cron-plus/jobs.json" in t
     assert ".hermes/cron-plus/jobs.json" not in t        # no host ~/.hermes target
-    assert "com.docker.compose.service=gateway" in t     # finds the pack container
+    assert "ps -q gateway" in t                          # finds the pack container (compose-scoped, #108)
+
+
+def test_deploy_jobs_expands_jitter_sentinels():  # #107
+    """Engine crons ship @jitter:* sentinels; the deploy must expand them to concrete schedules
+    (cron-plus can't parse a raw sentinel — it errors every tick) before streaming to the container."""
+    t = (S / "deploy-cron-plus-jobs.sh").read_text()
+    assert "cron_jitter" in t and "expand_jobs" in t, "deploy no longer expands @jitter sentinels"
+    assert 'DEPLOY_JOBS' in t and '< "$DEPLOY_JOBS"' in t, "deploy must stream the expanded copy, not raw $SRC"
+
+
+def test_deploy_scripts_scope_gateway_to_pack_project():  # #108
+    """On a multi-pack host the deploy must target THIS pack's gateway (its compose project),
+    not the first 'gateway'-labeled container globally."""
+    for name in ("deploy-cron-plus-jobs.sh", "deploy-cron-scripts.sh"):
+        t = (S / name).read_text()
+        assert 'docker compose -f "$PACK_DIR/docker-compose.yml" ps -q gateway' in t, f"{name} not project-scoped"
+    c = (S / "cron-plus.sh").read_text()   # scope via CRON_PACK_DIR; refuse ambiguity vs pick head -1
+    assert "CRON_PACK_DIR" in c and "set CRON_PACK_DIR" in c, "cron-plus.sh lacks the disambiguation guard"
 
 
 def test_cron_plus_helper_uses_pack_container():  # #19

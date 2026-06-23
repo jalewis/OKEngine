@@ -38,7 +38,11 @@ def test_seeds_missing_runtime(tmp_path):
     assert (tmp_path / ".hermes-data" / "qmd").is_dir()
     assert (tmp_path / ".hermes-data" / "logs").is_dir()
     assert (tmp_path / ".hermes-data" / ".gitkeep").is_file()
-    assert cfg.read_text() == TEMPLATE.read_text()
+    # seeded verbatim from the template, except ensure-runtime rewrites the MCP Bearer to a
+    # generated secret token (okengine#105) — compare modulo that one line.
+    import re
+    _norm = lambda s: re.sub(r"Bearer \S+", "Bearer X", s)
+    assert _norm(cfg.read_text()) == _norm(TEMPLATE.read_text())
 
 
 def test_idempotent_does_not_clobber(tmp_path):
@@ -78,6 +82,23 @@ def test_fix_perms_makes_tree_writable(tmp_path):
     assert mode[-1] in ("6", "7")   # other has write
 
 
+def test_generates_secret_token_on_fresh_deploy(tmp_path):
+    """okengine#105: a fresh pack (no .env) must get a GENERATED secret OKENGINE_MCP_TOKEN,
+    not the built-in 'okengine-local' (which the read MCP refuses on its 0.0.0.0 bind →
+    crash-loop), and the seeded config's Bearer must be rewritten to match."""
+    import re
+    r = _run([str(tmp_path)])
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    env = (tmp_path / ".env").read_text()
+    m = re.search(r"(?m)^OKENGINE_MCP_TOKEN=(\S+)", env)
+    assert m, f"no OKENGINE_MCP_TOKEN written to .env:\n{env}"
+    tok = m.group(1)
+    assert tok != "okengine-local" and len(tok) >= 24, f"not a generated secret: {tok!r}"
+    cfg = (tmp_path / ".hermes-data" / "config.yaml").read_text()
+    assert f"Bearer {tok}" in cfg, "config Bearer not synced to the generated token"
+    assert "Bearer okengine-local" not in cfg, "default token still present in config"
+
+
 def test_seeded_config_passes_validator(tmp_path):
     """The seeded config.yaml satisfies the validator's runtime-config key checks
     (so a clone -> ensure-runtime -> validate flow is clean on that check)."""
@@ -105,14 +126,8 @@ def test_mcp_token_synced_from_env(tmp_path):
     assert "<OKENGINE_MCP_TOKEN" not in cfg, "template placeholder must be gone"
 
 
-def test_mcp_token_defaults_to_local(tmp_path):
-    """No token in .env → header is the built-in local default the read server
-    accepts, never the unsubstituted placeholder (okengine#32)."""
-    r = _run([str(tmp_path)])
-    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
-    cfg = (tmp_path / ".hermes-data" / "config.yaml").read_text()
-    assert 'Authorization: "Bearer okengine-local"' in cfg
-    assert "<OKENGINE_MCP_TOKEN" not in cfg
+# (okengine#105) No-token-in-.env no longer leaves the built-in "okengine-local" default —
+# ensure-runtime generates a secret; covered by test_generates_secret_token_on_fresh_deploy.
 
 
 def test_mcp_token_synced_unquoted_header(tmp_path):

@@ -360,23 +360,20 @@ bash $ENGINE_DIR/scripts/deploy.sh                 # validate -> seed -> build (
 skipped (a fresh `git clone` of a library pack has no `.hermes-data/`). Flags:
 `--rebuild`, `--skip-build`, `--skip-validate`, `--no-crons`, `--fix-perms`.
 
-The gateway runs as `HERMES_UID` (default `10000`), so the pack tree must be
-writable by that uid. Cloned the pack as your own user? Either:
-- run the whole stack as yourself — `export HERMES_UID=$(id -u) HERMES_GID=$(id -g)`
-  before `deploy.sh` (simplest: `deploy.sh` writes the tree as you, the gateway
-  remaps internally), or
-- `deploy.sh --fix-perms` (quick local; makes the tree world-writable).
+The gateway runs as `HERMES_UID`, which **defaults to your own uid** (`$(id -u)`), so a
+pack you cloned as yourself is writable out of the box — `deploy.sh` writes the tree as
+you and the gateway remaps internally. No `chown`, nothing to export. (`deploy.sh
+--fix-perms` is a fallback that makes the tree world-writable for a non-matching uid.)
 
-Avoid `sudo chown -R 10000:10000 .` *unless you also run `deploy.sh` as uid 10000*
-— chowning the tree to 10000 while you run `deploy.sh` as your own user breaks the
-deploy, which must write the tree (okengine#33). Otherwise deploy stops before
-compose with a permission message instead of the gateway coming up unhealthy.
-
-The fixed-uid (10000) model — preferred on shared hosts / for upgrade stability —
-is equivalent to:
+The **fixed-uid** model — for a vault you'll move between hosts or operate as several
+users — pins a uid and chowns the tree to it, so ownership doesn't depend on who
+deployed. Don't `sudo chown -R 10000:10000 .` while running `deploy.sh` as your own user,
+though — that breaks the deploy, which must write the tree (okengine#33). The fixed-uid
+model is:
 
 ```bash
-export HERMES_UID=10000 HERMES_GID=10000           # fixed uid; never $(id -u)
+export HERMES_UID=10000 HERMES_GID=10000           # a fixed uid (portable/shared vault)
+sudo chown -R 10000:10000 .                        # the tree must be owned by it
 bash $ENGINE_DIR/scripts/build-engine-image.sh     # build the gateway image once
 bash $ENGINE_DIR/scripts/ensure-runtime.sh         # seed .hermes-data/config.yaml — MUST precede compose
 ENGINE_DIR=$ENGINE_DIR docker compose up -d        # gateway + reader + mcp
