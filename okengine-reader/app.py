@@ -965,6 +965,29 @@ def _skip_backlink_src(key: str) -> bool:
     return bool(ns) and ns in _excluded_dirs()
 
 
+def _backlink_title(src: str) -> str:
+    """Human label for a backlink source: its frontmatter `title`/`name`, else the
+    a true `# H1`, else the de-slugged basename. Deliberately NOT IWE's title (the
+    page's *first heading of any level*) — that makes every source page show its
+    `## Summary` heading and every entity show its raw path, useless in a "what
+    links here" list. Frontmatter `name` is the curated page name (e.g. 'Andariel',
+    'FireEye Operation Saffron Rose 2013'); the H1 fallback recovers the real title
+    of a page that has one but no `name` (e.g. a freshly-ingested source whose
+    article headline is its `# H1`). `_H1_RE` matches `# ` only, so a section
+    heading like `## Summary` is never picked up."""
+    try:
+        fm, body = split_fm(_read_head(WIKI / f"{src}.md"))
+        t = str(fm.get("title") or fm.get("name") or "").strip()
+        if t:
+            return t
+        h1 = _H1_RE.search(body)
+        if h1:
+            return h1.group(0).lstrip("# ").strip()
+    except OSError:
+        pass
+    return src.split("/")[-1].replace("-", " ").strip() or src
+
+
 def _build_backlinks() -> dict:
     cmd = [IWE_BIN, "find", "-f", "json", "-l", "0"]
     try:
@@ -986,7 +1009,7 @@ def _build_backlinks() -> dict:
         src = d.get("key")
         if not src or _skip_backlink_src(src):
             continue
-        title = d.get("title") or src.split("/")[-1]
+        title = _backlink_title(src)
         for ref in d.get("references") or []:
             tgt = ref.get("key")
             if not tgt or tgt == src:

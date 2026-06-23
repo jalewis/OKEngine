@@ -112,6 +112,25 @@ def test_tombstoned_id_refused(tmp_path):
     assert "tombstoned" in out and out.startswith("refused")
 
 
+def test_create_authority_variant_converges_not_duplicates(tmp_path):
+    """okengine#99/#100 via the id-aware create path: a create_entity for an
+    AUTHORITY-bound entity that already exists at another path (different filename
+    / `<type>--` mint prefix / wrong namespace) resolves to the same authority id
+    and CONVERGES into the canonical instead of forking a second canonical."""
+    m = _load(tmp_path)
+    a = m._create("attack-pattern/t1059.md",
+                  "type: attack-pattern\ntechnique_id: T1059\ntactic: execution")
+    assert a.startswith("created"), a
+    assert _read_id(m, "attack-pattern/t1059.md")["id"] == "mitre:t1059"
+    # same technique, different namespace + `<type>--` minted filename -> mitre:t1059
+    b = m._create("entities/a/attack-pattern--t1059.md",
+                  "type: attack-pattern\ntechnique_id: T1059\ndetection: sigma")
+    assert b.startswith("converged into attack-pattern/t1059.md"), b
+    assert not (tmp_path / "wiki" / "entities" / "a" / "attack-pattern--t1059.md").exists()
+    fm = _read_id(m, "attack-pattern/t1059.md")
+    assert fm["tactic"] == "execution" and fm["detection"] == "sigma"   # merged, one canonical
+
+
 # --- #21: converge must not bypass write-governance on existing pages ---
 
 _PERM_SCHEMA = (

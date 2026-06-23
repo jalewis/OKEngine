@@ -36,7 +36,7 @@ def test_base_floors_required_type_when_pack_omits_okf(tmp_path):
     m = _load()
     w = _vault(tmp_path, "types:\n  entity: {required: [type]}\n")  # NO okf: block
     pg = w / "entities" / "a.md"
-    pg.write_text("---\ntype: entity\n---\nx\n")
+    pg.write_text("---\ntype: entity\nid: 'entity:a'\n---\nx\n")
     assert m.schema_reject_reason(str(pg.resolve()), pg.read_text()) is None
     # a page with no `type` is rejected by the base floor even though the pack
     # declared no okf block
@@ -45,15 +45,19 @@ def test_base_floors_required_type_when_pack_omits_okf(tmp_path):
     assert r and "type" in r
 
 
-def test_should_warns_on_missing_id_but_never_rejects(tmp_path):
+def test_id_required_after_promotion_should_tier_empty(tmp_path):
+    """`id` was promoted WARN->MUST after the P1 id backfill stamped every page: a
+    page missing `id` now HARD-rejects (it was a should/WARN flag), and the engine
+    `okf.should` WARN tier is empty."""
     m = _load()
     w = _vault(tmp_path, "types:\n  entity: {required: [type]}\n")
     pg = w / "entities" / "a.md"
-    pg.write_text("---\ntype: entity\n---\nx\n")          # conformant, no id
-    assert m.schema_reject_reason(str(pg.resolve()), pg.read_text()) is None  # not rejected
-    assert m.missing_should(str(pg.resolve()), pg.read_text()) == ["id"]       # but flagged
-    pg.write_text("---\ntype: entity\nid: 'entity:a'\n---\nx\n")
-    assert m.missing_should(str(pg.resolve()), pg.read_text()) == []
+    pg.write_text("---\ntype: entity\n---\nx\n")          # no id -> now a hard reject
+    r = m.schema_reject_reason(str(pg.resolve()), pg.read_text())
+    assert r and "id" in r
+    assert m.missing_should(str(pg.resolve()), pg.read_text()) == []   # should tier now empty
+    pg.write_text("---\ntype: entity\nid: 'entity:a'\n---\nx\n")        # with id -> conformant
+    assert m.schema_reject_reason(str(pg.resolve()), pg.read_text()) is None
 
 
 def test_strict_types_is_engine_owned_pack_value_ignored(tmp_path):
@@ -62,7 +66,7 @@ def test_strict_types_is_engine_owned_pack_value_ignored(tmp_path):
     m = _load()  # real base ships strict_types: false
     w = _vault(tmp_path, "strict_types: true\ntypes:\n  entity: {required: [type]}\n")
     pg = w / "entities" / "a.md"
-    pg.write_text("---\ntype: wildcat\n---\nx\n")            # unknown type
+    pg.write_text("---\ntype: wildcat\nid: 'x:wildcat'\n---\nx\n")   # unknown type (+id so strict_types is isolated)
     assert m.schema_reject_reason(str(pg.resolve()), pg.read_text()) is None
 
 
@@ -159,7 +163,7 @@ def test_strict_passes_conformant_page(tmp_path):
     m = _load()
     w = _vault(tmp_path, "types:\n  entity: {required: [type]}\n")
     pg = w / "entities" / "a.md"
-    pg.write_text("---\ntype: entity\n---\nx\n")
+    pg.write_text("---\ntype: entity\nid: 'entity:a'\n---\nx\n")
     p, c = str(pg.resolve()), pg.read_text()
     assert m.schema_reject_reason(p, c) is None
     assert m.conformance_reject_reason(p, c) is None

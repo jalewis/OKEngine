@@ -36,8 +36,8 @@ def _vault(tmp_path: Path, schema_yaml: str | None) -> Path:
 def test_base_schema_ships_globals():
     m = _load()
     base = m.base_schema()
-    assert base.get("okf", {}).get("required") == ["type"]
-    assert base.get("okf", {}).get("should") == ["id"]
+    assert base.get("okf", {}).get("required") == ["type", "id"]   # id promoted WARN->MUST
+    assert base.get("okf", {}).get("should") == []
     assert base.get("strict_types") is False
     assert "id" in base.get("common_optional", [])
 
@@ -46,8 +46,8 @@ def test_merge_packless_falls_back_to_base(tmp_path):
     m = _load()
     root = _vault(tmp_path, None)  # no pack schema
     merged = m.merged_schema(root)
-    assert merged["okf"]["required"] == ["type"]
-    assert merged["okf"]["should"] == ["id"]
+    assert merged["okf"]["required"] == ["id", "type"]   # union, sorted; id now required
+    assert merged["okf"].get("should", []) == []   # empty WARN tier may be omitted from merge
     assert merged["strict_types"] is False
     assert "id" in merged["common_optional"]
 
@@ -64,9 +64,9 @@ def test_merge_layers_pack_on_base(tmp_path):
     # pack keys pass through
     assert set(merged["types"]) == {"entity"}
     assert merged["partitioning"]["namespaces"]["entities"]["strategy"] == "flat"
-    # base owns the globals; required is the union (type always present)
-    assert merged["okf"]["required"] == ["type"]
-    assert merged["okf"]["should"] == ["id"]
+    # base owns the globals; required is the union (type + id always present)
+    assert merged["okf"]["required"] == ["id", "type"]
+    assert merged["okf"].get("should", []) == []   # empty WARN tier may be omitted from merge
     # common_optional unions base + pack
     assert "id" in merged["common_optional"] and "vendor_field" in merged["common_optional"]
 
@@ -110,8 +110,8 @@ def test_required_unions_and_strict_types_engine_owned(tmp_path):
         "types:\n  entity: {required: [type]}\n"
     ))
     merged = m.merged_schema(root)
-    # required is the union (sorted; stricter-only); base guarantees `type`
-    assert merged["okf"]["required"] == ["name", "type"]
+    # required is the union (sorted; stricter-only); base guarantees `type` + `id`
+    assert merged["okf"]["required"] == ["id", "name", "type"]
     # strict_types is ENGINE-OWNED: the pack's `true` is IGNORED, base default wins
     assert merged["strict_types"] is False
     # a pack that omits strict_types likewise inherits the engine-base default

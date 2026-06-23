@@ -54,9 +54,8 @@ jobs:
       - name: docker compose config (smoke — validates compose without building)
         run: docker compose -f /tmp/pack/docker-compose.yml config -q
 
-  # NOTE: these run on GitHub Actions only. The repo is GitLab-hosted; GitLab CI is
-  # NOT enabled, so no .gitlab-ci.yml is shipped. All checks also run locally via the
-  # matching `make` targets, so they work regardless of CI platform (okengine#54-#58).
+  # NOTE: CI runs on GitHub Actions. All checks also run locally via the matching
+  # `make` targets, so they work regardless of CI platform (okengine#54-#58).
 
   audit:
     name: supply-chain + security scan (okengine#54)

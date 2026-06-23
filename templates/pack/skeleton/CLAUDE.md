@@ -48,17 +48,26 @@ Rule of thumb: **SEARCH before CREATE; RETRIEVE before EDIT.** Update the existi
 Process each raw item in the digest IN ORDER. Read `schema.yaml` for the exact required
 fields per type.
 
-1. **Source page first (dedupe + provenance).** Create `wiki/sources/<YYYY>/<MM>/<slug>.md`
-   (`type: source`). Set **`raw:`** to the exact raw path — this is the dedupe key. Set
-   `publisher`, `published`, `url`, and your `source_kind`.
+1. **Source page first (dedupe + provenance).** Create the source page at the
+   **wiki-relative** path `sources/<YYYY>/<MM>/<slug>` (`type: source`). The MCP write tools
+   take paths relative to `wiki/` — **never** absolute or `/opt/vault/wiki/`-prefixed (an
+   absolute path misfiles the page into a duplicate shadow location). Use **exactly two date
+   segments** `<YYYY>/<MM>` — do NOT add a `<DD>` day directory; it splits the namespace and
+   breaks the index/dedup scans that assume `sources/YYYY/MM/`. Set **`raw:`** to the exact
+   raw path — this is the dedupe key. Set `publisher`, `published`, `url`, and your `source_kind`.
 2. **Score every source.**
    > TODO: define your source-quality rubric. okpack-sec uses Admiralty
    > `reliability` (A–F, the channel) + `credibility` (1–6, the claim) + `tlp` +
    > `bias_flags`. Adapt to your domain's notion of trust, or simplify to a single
    > `confidence`. Add the scoring fields to `source.required` in schema.yaml if you
    > want the gate to enforce them.
-3. **Extract entities** (under `wiki/entities/`, bucketed by type). Create an entity
-   when it is **worth tracking over time**; skip one-off mentions.
+3. **Extract entities** — every entity page lands at the wiki-relative path
+   **`entities/<first-letter-of-slug>/<slug>`** (the engine shards by the slug's FIRST
+   letter, e.g. `entities/a/acme`, `entities/n/northwind`). The `type` is a **frontmatter
+   field, never a path segment**: do NOT write `entities/<type>/…`, a top-level `<type>/…`,
+   or a bare `<slug>` at the wiki root — all of those create duplicate/orphaned canonicals
+   (the write path auto-corrects them, but pass the right path so the write isn't flagged).
+   Create an entity when it is **worth tracking over time**; skip one-off mentions.
    > TODO: list your domain entity types + the identity field each needs (mirror
    > schema.yaml `types`).
 4. **Cross-link.** Link related entities with `[[wikilinks]]` — to pages that exist or

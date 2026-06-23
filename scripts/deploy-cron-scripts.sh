@@ -20,6 +20,11 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC_DIR="$REPO_ROOT/scripts/cron"
+# Exec into the container as the SAME uid the gateway runs as (compose
+# `user: ${HERMES_UID:-10000}`), not the image's `hermes` name (10000): a pack
+# that overrides HERMES_UID owns /opt/data with that uid, so `-u hermes` would
+# mismatch and the tar extraction / mkdir hit permission-denied.
+HERMES_UID="${HERMES_UID:-10000}"
 # Two-repo split (slice 3): domain cron scripts + domain data live in the pack.
 # The deploy assembles /opt/data/{scripts,config}/ from BOTH the engine repo and
 # the pack — co-location means imports resolve regardless of source repo.
@@ -43,7 +48,7 @@ echo "  gateway container: $CONTAINER"
 
 # A freshly-seeded pack runtime has no /opt/data/scripts (or /config) yet — create
 # them before any tar extract, else the first deploy fails "Cannot open" (#17).
-docker exec -u hermes "$CONTAINER" mkdir -p /opt/data/scripts /opt/data/config
+docker exec -u "$HERMES_UID" "$CONTAINER" mkdir -p /opt/data/scripts /opt/data/config
 
 # --- engine/pack version pin check (warn-only; slice 4a) ---
 # The pack pins an engine release in $PACK_DIR/engine.version; warn if it doesn't
@@ -64,14 +69,14 @@ if [ "$ecount" -eq 0 ]; then
     echo "  (no engine scripts found in $SRC_DIR)"
 else
     ( cd "$SRC_DIR" && tar -cf - ./*.py ) \
-        | docker exec -i -u hermes "$CONTAINER" tar -xf - -C /opt/data/scripts/
+        | docker exec -i -u "$HERMES_UID" "$CONTAINER" tar -xf - -C /opt/data/scripts/
     echo "  $ecount engine cron script(s) deployed to $CONTAINER:/opt/data/scripts/"
 fi
 if [ -d "$PACK_SCRIPTS" ]; then
     pcount="$(cd "$PACK_SCRIPTS" && ls -1 ./*.py 2>/dev/null | wc -l)"
     if [ "$pcount" -gt 0 ]; then
         ( cd "$PACK_SCRIPTS" && tar -cf - ./*.py ) \
-            | docker exec -i -u hermes "$CONTAINER" tar -xf - -C /opt/data/scripts/
+            | docker exec -i -u "$HERMES_UID" "$CONTAINER" tar -xf - -C /opt/data/scripts/
         echo "  $pcount pack (domain) cron script(s) deployed from $PACK_SCRIPTS"
     fi
 else
@@ -92,9 +97,9 @@ if [ -d "$PACK_DATA" ]; then
         [ -f "$PACK_DATA/$cfg" ] && cfgs+=("$cfg")
     done
     if [ "${#cfgs[@]}" -gt 0 ]; then
-        docker exec -u hermes "$CONTAINER" mkdir -p /opt/data/config
+        docker exec -u "$HERMES_UID" "$CONTAINER" mkdir -p /opt/data/config
         ( cd "$PACK_DATA" && tar -cf - "${cfgs[@]}" ) \
-            | docker exec -i -u hermes "$CONTAINER" tar -xf - -C /opt/data/config/
+            | docker exec -i -u "$HERMES_UID" "$CONTAINER" tar -xf - -C /opt/data/config/
         echo "  ${#cfgs[@]} pack data file(s) deployed to $CONTAINER:/opt/data/config/"
     fi
 else
@@ -107,9 +112,9 @@ PACK_FEEDS="$PACK_DIR/feeds"
 if [ -d "$PACK_FEEDS" ]; then
     ocount="$(cd "$PACK_FEEDS" && ls -1 ./*.opml 2>/dev/null | wc -l)"
     if [ "$ocount" -gt 0 ]; then
-        docker exec -u hermes "$CONTAINER" mkdir -p /opt/data/config
+        docker exec -u "$HERMES_UID" "$CONTAINER" mkdir -p /opt/data/config
         ( cd "$PACK_FEEDS" && tar -cf - ./*.opml ) \
-            | docker exec -i -u hermes "$CONTAINER" tar -xf - -C /opt/data/config/
+            | docker exec -i -u "$HERMES_UID" "$CONTAINER" tar -xf - -C /opt/data/config/
         echo "  $ocount pack feed list(s) deployed to $CONTAINER:/opt/data/config/"
     fi
 fi

@@ -93,3 +93,34 @@ def test_pdf_export_pins_pydyf_to_match_weasyprint():
     req = (REPO / "okengine-reader" / "requirements.txt").read_text()
     if "weasyprint" in req:
         assert "pydyf" in req, "weasyprint is pinned but pydyf is not — transitive drift will break PDF export"
+
+
+def test_backlink_title_uses_frontmatter_name_not_first_heading(tmp_path, monkeypatch):
+    """okengine: a backlink label must be the page's curated name, NOT IWE's title
+    (its first heading). Source pages all open with '## Summary' and entity pages
+    have no clean H1, so the heading-title made every backlink read 'Summary' or a
+    raw slug path — useless in a 'what links here' list."""
+    wiki = tmp_path / "wiki"
+    (wiki / "entities" / "a").mkdir(parents=True)
+    (wiki / "sources").mkdir()
+    (wiki / "entities" / "a" / "andariel.md").write_text(
+        "---\ntype: intrusion-set\nname: Andariel\n---\n## Summary\nstuff\n")
+    (wiki / "sources" / "s1.md").write_text(
+        "---\ntype: source\nname: FireEye Operation Saffron Rose 2013\n---\n## Summary\nx\n")
+    (wiki / "entities" / "a" / "raw-name.md").write_text(
+        "---\ntype: intrusion-set\n---\n## Summary\nx\n")   # no title/name
+    m = _load(tmp_path, monkeypatch)
+
+    # no title/name but a TRUE '# H1' (e.g. a freshly-ingested source) -> the H1,
+    # even when a '## Summary' SECTION heading precedes it.
+    (wiki / "sources" / "s2.md").write_text(
+        "---\ntype: source\n---\n## Summary\nblah\n\n# Crypto Clipper uses Tor for propagation\nbody\n")
+    m = _load(tmp_path, monkeypatch)
+
+    assert m._backlink_title("entities/a/andariel") == "Andariel"
+    assert m._backlink_title("sources/s1") == "FireEye Operation Saffron Rose 2013"
+    assert m._backlink_title("sources/s2") == "Crypto Clipper uses Tor for propagation"
+    # no title/name AND no true H1 (only '## Summary') -> de-slugged basename, never 'Summary'
+    assert m._backlink_title("entities/a/raw-name") == "raw name"
+    # missing file -> graceful de-slugged basename, no exception
+    assert m._backlink_title("entities/a/ghost-page") == "ghost page"

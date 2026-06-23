@@ -6,8 +6,9 @@
 version: 1
 
 okf:
-  required: [type]        # the one universal MUST, on every page
-  should:   [id]          # WARN tier — `id` flips to required after the id backfill (P1)
+  required: [type, id]    # universal MUSTs on every page — `id` promoted from WARN to MUST
+                          # after the P1 id backfill stamped every page (RFC composable-okpacks §5a)
+  should:   []            # WARN tier — empty now that `id` is required
 
 strict_types: false       # engine-owned; packs cannot loosen/tighten under composition
 

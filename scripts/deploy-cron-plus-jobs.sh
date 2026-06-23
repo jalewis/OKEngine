@@ -22,6 +22,11 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$REPO_ROOT/config/cron-plus-jobs.json"
 PACK_DIR="${CRON_PACK_DIR:-/path/to/pack}"
+# Write into the container as the SAME uid the gateway runs as (compose
+# `user: ${HERMES_UID:-10000}`), not the image's `hermes` name (10000): a pack
+# that overrides HERMES_UID owns /opt/data with that uid, and `-u hermes` would
+# mismatch -> permission-denied writing jobs.json (#18 follow-up).
+HERMES_UID="${HERMES_UID:-10000}"
 # cron-plus runs INSIDE the gateway and reads /opt/data/cron-plus/jobs.json (the
 # mounted pack .hermes-data) — NOT host ~/.hermes. Deploy into the container as
 # the `hermes` user so ownership is correct (#18).
@@ -54,10 +59,10 @@ TS="$(date +%Y%m%d-%H%M%S)"
 
 # Create the runtime dir, snapshot any existing jobs.json, then stream the new one
 # in as `hermes` (so the cron-plus subprocess, also hermes, can read it).
-docker exec -u hermes "$CONTAINER" mkdir -p /opt/data/cron-plus
-docker exec -u hermes "$CONTAINER" sh -c \
+docker exec -u "$HERMES_UID" "$CONTAINER" mkdir -p /opt/data/cron-plus
+docker exec -u "$HERMES_UID" "$CONTAINER" sh -c \
     "[ -f '$DEST_IN' ] && cp -p '$DEST_IN' '$DEST_IN.bak.$TS' && echo '  snapshot: $DEST_IN.bak.$TS' || true"
-docker exec -i -u hermes "$CONTAINER" sh -c "cat > '$DEST_IN' && chmod 600 '$DEST_IN'" < "$SRC"
+docker exec -i -u "$HERMES_UID" "$CONTAINER" sh -c "cat > '$DEST_IN' && chmod 600 '$DEST_IN'" < "$SRC"
 echo "  deployed: $CONTAINER:$DEST_IN"
 
 JOB_COUNT=$(python3 -c "import json; print(len(json.load(open('$SRC'))['jobs']))")

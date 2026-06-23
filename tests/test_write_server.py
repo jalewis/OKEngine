@@ -467,6 +467,75 @@ def test_leading_wiki_prefix_not_doubled(vault):
     assert m._safe("entities/vendor/acme") == m._safe("wiki/entities/vendor/acme")
 
 
+def test_over_qualified_vault_path_not_shadowed(vault):
+    """Over-qualified-path variant of okengine#31/#34: an agent that follows the persona's 'prefer the absolute form'
+    guidance (correct for file_read) may pass a write tool the FULL vault path —
+    `<vault>/wiki/sources/...` or the vault-relative `<...>/wiki/sources/...`.
+    Those stay *inside* wiki/, so the escape guard misses them and the write lands
+    in a shadow `wiki/<vault>/wiki/...` tree — a duplicate canonical. _safe must
+    collapse the over-qualified prefix to the wiki-relative tail."""
+    m, root = vault
+    rel = "sources/2026/06/09/unit42-cloud-logging"
+    body = "type: source\nsource_kind: vendor-research\npublisher: Unit 42\npublished: 2026-06-09"
+    # 1) absolute vault/wiki form (the exact shape seen in production)
+    abs_form = str(root / "wiki" / rel)
+    res = m._create(abs_form, body, "x")
+    assert res.startswith("created"), res
+    good = root / "wiki" / "sources" / "2026" / "06" / "09" / "unit42-cloud-logging.md"
+    assert good.is_file(), "page must land at the canonical wiki/sources/... path"
+    # no shadow tree anywhere under wiki/ (e.g. wiki/.../wiki/sources/...)
+    shadows = [p for p in (root / "wiki").rglob("unit42-cloud-logging.md")
+               if p != good]
+    assert not shadows, f"over-qualified path created a shadow page: {shadows}"
+    # 2) absolute & vault-relative over-qualified forms normalize to the canonical path
+    assert m._safe(abs_form) == m._safe(rel)
+    assert m._safe(abs_form.lstrip("/")) == m._safe(rel)
+
+
+def test_create_slug_variant_does_not_duplicate(vault):
+    """okengine#98/#99/#100: create_entity keys on IDENTITY, not the filename. The
+    same entity written a second time under a cosmetically different path/slug (here
+    `Akira` vs `akira`, different shard dir) derives the same minted slug id and is
+    refused as a slug collision + flagged — so exactly ONE canonical exists instead
+    of a stale duplicate the assembler never reconciles."""
+    m, root = vault
+    r1 = m._create("entities/a/akira", "type: entity\nname: Akira", "first")
+    assert r1.startswith("created"), r1
+    # same identity (name), cosmetically different filename + shard dir
+    r2 = m._create("entities/vendor/Akira", "type: entity\nname: akira", "second")
+    assert r2.startswith("refused:") and "slug id" in r2 and "akira" in r2, r2
+    # only the first canonical exists; the duplicate path was never written
+    assert (root / "wiki" / "entities" / "a" / "akira.md").is_file()
+    assert not (root / "wiki" / "entities" / "vendor" / "Akira.md").exists()
+    assert "slug id collision" in (root / "wiki" / "_review-queue.md").read_text()
+    # the stamped id is the content-derived identity, independent of the path
+    assert _fm(root / "wiki" / "entities" / "a" / "akira.md")["id"] == "entities:akira"
+
+
+def test_create_stamps_name_from_h1_when_absent(vault):
+    """Source ingest (agent -> okengine-write) often puts the article title in the
+    body's `# H1` but sets no `name`/`title`, leaving the page nameless. The write
+    path derives `name` from the true H1 when both are absent — never overriding a
+    curated name, and never picking up a `## Summary` section heading."""
+    m, root = vault
+    body = "## Summary\nblah\n\n# Crypto Clipper uses Tor for propagation\nbody\n"
+    res = m._create("sources/2026/06/crypto-clipper", "type: source\npublisher: MS\n"
+                    "source_kind: vendor-research\npublished: 2026-06-17", body)
+    assert res.startswith("created"), res
+    p = root / "wiki" / "sources" / "2026" / "06" / "crypto-clipper.md"
+    assert _fm(p)["name"] == "Crypto Clipper uses Tor for propagation"   # from the # H1, not ## Summary
+
+    # a curated name is never overridden
+    m._create("entities/a/acme", "type: entity\nname: Acme Corp", "# Something Else\nx")
+    assert _fm(root / "wiki" / "entities" / "a" / "acme.md")["name"] == "Acme Corp"
+
+    # no name and no true H1 -> left nameless (no spurious stamp; source has no
+    # required `name`, so it still creates)
+    m._create("sources/2026/06/nohdr", "type: source\npublisher: MS\n"
+              "source_kind: vendor-research\npublished: 2026-06-17", "## Summary only\nno h1 here\n")
+    assert "name" not in _fm(root / "wiki" / "sources" / "2026" / "06" / "nohdr.md")
+
+
 def test_blank_wiki_path_falls_back_to_default(monkeypatch):
     """A set-but-blank WIKI_PATH must fall back to the /opt/vault default, not
     resolve to a *relative* wiki/ under CWD (okengine#34)."""

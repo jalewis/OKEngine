@@ -59,6 +59,9 @@ except Exception:       # pragma: no cover
 VAULT = Path(os.environ.get("WIKI_PATH") or "/opt/vault")
 WIKI = VAULT / "wiki"
 _FM = re.compile(r"\A---[ \t]*\n(.*?\n)---(.*)\Z", re.S)
+# A TRUE H1 (`# title`). `[ \t]+` after the single `#` means `## Summary` and deeper
+# section headings never match — only a page-title H1 is captured (group 1).
+_H1 = re.compile(r"^#[ \t]+(.+?)[ \t]*$", re.M)
 
 
 def _today() -> str:
@@ -99,10 +102,34 @@ def _safe(path: str) -> Optional[Path]:
     ingest prompt) that prefixes a redundant leading `wiki/` must NOT stack into
     `wiki/wiki/...` — strip it. The escape guard can't catch that because the
     doubled path is still *inside* wiki/, so it would silently misfile every page
-    and break raw-drain dedup (okengine#31). Entity paths are also normalized to the
-    one-level shard layout to prevent duplicate canonicals (okengine#48)."""
+    and break raw-drain dedup (okengine#31). The same applies to an OVER-QUALIFIED
+    path: an agent that follows the persona's "prefer the absolute form" guidance
+    for file_read may pass the full `/opt/vault/wiki/sources/x` (or the vault-relative
+    `opt/vault/wiki/...`) to a write tool — that would land in a shadow
+    `wiki/opt/vault/wiki/...` tree (still inside wiki/, so the escape guard misses
+    it), creating duplicate canonicals. Collapse any leading absolute/relative
+    vault-or-wiki prefix to the wiki-relative tail first (the over-qualified-path
+    variant of okengine#31/#34). Entity paths are also normalized to the one-level
+    shard layout to prevent duplicate canonicals (okengine#48)."""
     wiki = _wiki()
-    rel = path.lstrip("/")
+    try:
+        wiki_abs = wiki.resolve()
+    except OSError:
+        wiki_abs = wiki
+    rel = path.strip()
+    # Strip the longest matching over-qualified prefix: the absolute wiki path,
+    # the absolute vault path, or either without the leading slash. Longest-first
+    # so `/opt/vault/wiki` wins over `/opt/vault`; the redundant-`wiki/` loop below
+    # then mops up any residual (e.g. a stripped vault prefix leaving `wiki/...`).
+    _prefixes = []
+    for _b in (wiki_abs, wiki_abs.parent):
+        _s = str(_b)
+        _prefixes += [_s, _s.lstrip("/")]
+    for _cand in sorted({p for p in _prefixes if p}, key=len, reverse=True):
+        if rel == _cand or rel.startswith(_cand + "/"):
+            rel = rel[len(_cand):]
+            break
+    rel = rel.lstrip("/")
     while rel == "wiki" or rel.startswith("wiki/"):
         rel = rel[len("wiki"):].lstrip("/")
     rel = _normalize_entity_shard(rel)
@@ -348,6 +375,54 @@ def _queue_review(p: Path, flags: list[str]) -> str:
 
 # --- plain logic helpers (tested directly) -------------------------------
 
+def _dedup_on_create(path: str, p: Path, fm: dict, body: str) -> Optional[str]:
+    """Identity-based dedup for create_entity (okengine#98/#99/#100).
+
+    The duplicate-canonical class is caused by `create_entity` keying on the
+    on-disk PATH: every cosmetic variant of the same entity (different shard dir,
+    wrong namespace, `Akira` vs `akira`, `vulnerability--cve-x` vs `cve-x`) is a
+    new path, so it created a SECOND canonical the assembler never reconciles.
+    The fix is to key on IDENTITY, not the filename: derive the page's stable id
+    from its CONTENT (authority field, else minted slug) — exactly as converge
+    does — and refuse to mint a second canonical for an id that already lives
+    elsewhere. The path band-aids in !40/!41 fight this at the wrong layer; here
+    the path is irrelevant to identity, which is the design intent (§5a of
+    docs/design/composable-okpacks.md).
+
+    Returns a result string when this handled the write (converged into the
+    existing canonical, or flagged+refused a slug collision); None to let the
+    normal create proceed. Mutates `fm` to stamp the derived `id` so the new page
+    is resolvable forever after. No-op (returns None) when the converge/id libs
+    are unavailable or no id can be derived."""
+    if not _CONVERGE_OK:
+        return None
+    namespace = _namespace(p)
+    try:
+        schema = _governing(namespace)
+        pid, kind = _page_id_and_kind(fm, schema, namespace, p.stem)
+    except Exception:               # pragma: no cover - id derivation is best-effort
+        return None
+    if not pid:
+        return None
+    fm["id"] = pid                  # stamp the content-derived id onto the new page
+    existing_rel = _registry().resolve(pid)
+    if not existing_rel:
+        return None                 # genuinely new identity -> create normally
+    existing_path = _wiki() / existing_rel
+    if not existing_path.exists() or existing_path.resolve() == p.resolve():
+        return None                 # stale index entry or the same page -> create normally
+    # An existing canonical already owns this id at a different path.
+    if kind == "authority":
+        # Same real-world entity (authority ids are globally unique to the type)
+        # -> converge into the canonical instead of duplicating it.
+        return _converge(path, fm, body)
+    # Minted-slug collision: two pages, possibly different entities, that slugged
+    # the same. Never auto-merge a slug id -> flag for human review and refuse.
+    _flag(path, f"slug id collision on create: {pid} already used by {existing_rel}")
+    return (f"refused: slug id {pid} already used by {existing_rel} — "
+            "flagged for review (slug ids never auto-merge)")
+
+
 def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> str:
     p = _safe(path)
     if p is None:
@@ -360,6 +435,12 @@ def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> st
     fm = _coerce_fm(frontmatter_yaml)
     if fm is None:
         return "rejected: frontmatter_yaml is not a valid YAML mapping"
+    # Identity-based dedup BEFORE writing: route a cosmetic duplicate to the
+    # existing canonical (authority) or flag+refuse a slug collision, instead of
+    # minting a second canonical (okengine#98/#99/#100). Stamps fm["id"].
+    dedup = _dedup_on_create(path, p, fm, body)
+    if dedup is not None:
+        return dedup
     fm, drift = _normalize_drift(fm, p)            # converge on schema vocab (okengine#46)
     # Server stamps version/last_updated if absent, and an IMMUTABLE `created` on first write
     # (the OKF-envelope creation date = when the page was ingested; unlike last_updated it never
@@ -370,6 +451,16 @@ def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> st
         fm["created"] = _today()
     if "last_updated" not in fm:
         fm["last_updated"] = _today()
+    # Ensure every page carries a human `name`. The ingest agent (esp. source ingest:
+    # select_raw_batch -> agent -> okengine-write) puts the article title in the body's
+    # `# H1` but doesn't always set a `name`/`title` field, leaving the page nameless in
+    # the reader/backlinks/search. Derive `name` from the first true H1 when absent —
+    # only when BOTH name and title are missing, so a curated name is never overridden,
+    # and after id derivation, so the minted slug stays filename-based.
+    if not str(fm.get("name") or fm.get("title") or "").strip():
+        _h1 = _H1.search(body or "")
+        if _h1:
+            fm["name"] = _h1.group(1).strip()
     pol = _policy_reject(p, fm, "create")
     if pol:
         return f"rejected: {pol}"
@@ -382,6 +473,13 @@ def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> st
         return f"rejected: {reason}"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
+    # Write-synchronous id claim: the new page is now resolvable by id, so a later
+    # cosmetic-variant write dedupes against it instead of forking a canonical.
+    if _CONVERGE_OK and isinstance(fm.get("id"), str):
+        try:
+            _registry().by_id[fm["id"]] = _rel(p)
+        except Exception:           # pragma: no cover - registry is best-effort
+            pass
     ver = fm.get("version", 1)
     _append_log(f"- {_today()} mcp-write create {_rel(p)} v{ver}")
     note = _queue_review(p, flags)

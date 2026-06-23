@@ -574,5 +574,19 @@
     "script": "/opt/data/scripts/canonical_assemble.py",
     "deliver": "local",
     "no_agent": true
+  },
+  {
+    "id": "55bf76bfeb48",
+    "name": "ensure-readable",
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "*/15 * * * *"
+    },
+    "workdir": "/opt/vault",
+    "prompt": "(unused \u2014 ensure_readable.py restores the g+r/o+r bit on any wiki/**.md a writer left owner-only, e.g. the file-tool-written daily brief, so the read-only reader can serve it.)",
+    "script": "ensure_readable.py",
+    "deliver": "local",
+    "no_agent": true
   }
 ]

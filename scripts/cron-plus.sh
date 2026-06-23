@@ -14,6 +14,12 @@
 
 set -euo pipefail
 
+# Run as the SAME uid the gateway runs as (compose `user: ${HERMES_UID:-10000}`),
+# NOT the image's `hermes` name (10000): a deployment that overrides HERMES_UID
+# (e.g. to the host operator's uid) owns /opt/data with that uid, so `-u hermes`
+# would mismatch and hit permission-denied on jobs.json / the .tick.lock.
+HERMES_UID="${HERMES_UID:-10000}"
+
 # Target the running pack gateway container by compose-service label, so this
 # works regardless of which pack dir the stack was brought up from (#19) — the
 # deployed compose lives in the pack, not the engine repo.
@@ -24,5 +30,5 @@ if [ -z "$CONTAINER" ]; then
     exit 1
 fi
 
-exec docker exec -i -u hermes "$CONTAINER" \
+exec docker exec -i -u "$HERMES_UID" "$CONTAINER" \
     /opt/hermes/.venv/bin/python /opt/data/plugins/cron-plus/cli.py "$@"
