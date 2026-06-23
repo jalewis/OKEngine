@@ -55,6 +55,27 @@ def test_image_provenance_and_staleness_wired():
     assert 'org.okengine.git_sha' in dp and "STALE" in dp
 
 
+def test_default_image_tag_tracks_release_not_a_literal():
+    """okengine#101: the default OKENGINE_TAG must derive from the manifest's engine_release,
+    never a hardcoded vX.Y.Z literal (which goes stale and mis-tags images on every bump)."""
+    import re
+    bi = (REPO / "scripts" / "build-engine-image.sh").read_text()
+    assert 'OKENGINE_TAG:-okengine-$RELEASE' in bi, "default tag should be okengine-$RELEASE"
+    # no hardcoded okengine-vX.Y.Z literal as a tag default anywhere in the script
+    assert not re.search(r'OKENGINE_TAG:-okengine-v[0-9]', bi), "default tag still hardcodes a version literal"
+
+
+def test_default_uid_is_invoking_user_not_fixed_10000():
+    """okengine#102: deploy defaults HERMES_UID/GID to the invoking user's uid, so a
+    clone-as-yourself pack tree is writable out of the box instead of aborting the #33
+    writability guard. A fixed uid stays available as an explicit override."""
+    dp = SCRIPT.read_text()
+    assert "HERMES_UID:-$(id -u)" in dp and "HERMES_GID:-$(id -g)" in dp
+    assert "HERMES_UID:-10000" not in dp, "deploy.sh must not default HERMES_UID to a fixed 10000"
+    er = (REPO / "scripts" / "ensure-runtime.sh").read_text()
+    assert "HERMES_UID:-$(id -u)" in er, "ensure-runtime.sh should default to the invoking uid too"
+
+
 def test_skip_validate_proceeds_past_gate(tmp_path):
     """--skip-validate bypasses the gate; the run then proceeds to seeding (step 2)
     even for an otherwise-incomplete dir (it'll fail later at docker, not here)."""

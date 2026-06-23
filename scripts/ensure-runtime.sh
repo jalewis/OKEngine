@@ -7,9 +7,10 @@
 # for a catalog pack) skips that, and the gateway bind-mounts
 # `./.hermes-data:/opt/data`. If the dir is missing at compose-up Docker
 # auto-creates it as ROOT; and even when present, the gateway runs as
-# HERMES_UID:HERMES_GID (default 10000) — if the pack tree is owned by the host
-# user and not writable by that uid, the gateway can't `mkdir /opt/data/logs`
-# and stays unhealthy while showing as Up (issue #16).
+# HERMES_UID:HERMES_GID (default: the invoking user's uid, so a clone-as-yourself
+# tree is writable out of the box) — if you instead PIN a uid the tree isn't
+# writable by, the gateway can't `mkdir /opt/data/logs` and stays unhealthy while
+# showing as Up (issue #16, okengine#102).
 #
 # So this: (1) seeds .hermes-data (config.yaml from the engine template + qmd/ +
 # logs/), idempotently (an existing config is left untouched); (2) ensures the
@@ -19,7 +20,7 @@
 # Usage:
 #   bash $ENGINE_DIR/scripts/ensure-runtime.sh [pack-dir] [--fix-perms]
 #   CRON_PACK_DIR=/path/to/pack bash .../ensure-runtime.sh
-# Env: HERMES_UID/HERMES_GID (default 10000), FIX_PERMS=1 (same as --fix-perms).
+# Env: HERMES_UID/HERMES_GID (default: your uid/gid), FIX_PERMS=1 (same as --fix-perms).
 set -euo pipefail
 
 ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -35,7 +36,7 @@ PACK="$(cd "${PACK_ARG:-${CRON_PACK_DIR:-$PWD}}" && pwd)"
 TMPL="$ENGINE_DIR/config/config.yaml.template"
 RT="$PACK/.hermes-data"
 CFG="$RT/config.yaml"
-HUID="${HERMES_UID:-10000}"; HGID="${HERMES_GID:-10000}"
+HUID="${HERMES_UID:-$(id -u)}"; HGID="${HERMES_GID:-$(id -g)}"
 
 mkdir -p "$RT/qmd" "$RT/logs"
 [ -f "$RT/.gitkeep" ] || : > "$RT/.gitkeep"

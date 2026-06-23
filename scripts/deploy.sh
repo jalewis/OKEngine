@@ -44,7 +44,11 @@ if [ ! -f "$PACK/docker-compose.yml" ]; then
     exit 1
 fi
 
-export HERMES_UID="${HERMES_UID:-10000}" HERMES_GID="${HERMES_GID:-10000}"
+# Default to the invoking user's uid/gid so a clone-as-yourself pack tree is writable out of
+# the box (okengine#102): you own the vault, and the gateway remaps to it. Pin a FIXED uid
+# (+ chown the tree to it) instead for a vault you'll move between hosts or share across
+# operators — see docs/deploy-a-new-domain.md §2.
+export HERMES_UID="${HERMES_UID:-$(id -u)}" HERMES_GID="${HERMES_GID:-$(id -g)}"
 PYTHON="${PYTHON:-python3}"
 
 echo "==> OKEngine deploy: $PACK"

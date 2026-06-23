@@ -15,6 +15,9 @@ Commands:
       Browse the pack catalog (delegates to framework_list).
   framework validate <pack> [--probe-feeds] [--quiet]
       Pre-deploy sanity check on a pack (delegates to framework_validate).
+  framework budget (--status | --resume)
+      Inspect/control the spend-cap guard. --resume is the manual recovery path
+      after a budget trip (re-enables paused crons + clears state); see okengine#35.
 
 Each subcommand's own --help lists its flags. Exit code is the subcommand's.
 """
@@ -39,6 +42,7 @@ _COMMANDS = {
     "pull": ("framework_pull", "framework_pull.py"),
     "list": ("framework_list", "framework_list.py"),
     "validate": ("framework_validate", "framework_validate.py"),
+    "budget": ("framework_budget", "framework_budget.py"),
 }
 
 

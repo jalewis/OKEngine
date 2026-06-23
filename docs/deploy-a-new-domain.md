@@ -53,13 +53,17 @@ how a `wiki/<subdomain>/` tree becomes a second domain inside the same vault.
 
 ## 2. Quickstart — stand up a new domain
 
-Prereqs: Docker, a host user, the engine repo. Export the deploy uid **once per
-shell** — use a **fixed** uid (10000 is the recommended default), never
-`$(id -u)`. A hardcoded build-host uid bakes that host's identity into the image
-and breaks vault file ownership when the image runs anywhere else:
+Prereqs: Docker, a host user, the engine repo. **`HERMES_UID`/`HERMES_GID` default to
+your own uid/gid** — you clone the pack as yourself, so you own the vault tree and the
+gateway remaps to it; the deploy just works, no `chown` (okengine#102). Export a uid
+only for the **portable/shared** model: a vault you'll move between hosts or operate as
+several users wants a **fixed** uid so ownership doesn't depend on who deployed — pin it
+and `chown` the tree to match:
 
 ```bash
-export HERMES_UID=10000 HERMES_GID=10000
+# self-hosted, single operator (the common case): export NOTHING — the deploy uses your uid.
+# portable / shared vault instead — pin a fixed uid and chown the tree to it:
+export HERMES_UID=10000 HERMES_GID=10000 && sudo chown -R 10000:10000 <pack>
 ```
 
 1. **Get the engine** at a pinned release:
@@ -126,7 +130,8 @@ export HERMES_UID=10000 HERMES_GID=10000
    Equivalent manual steps (steps 4–5):
    ```bash
    cd ../my-brain
-   export HERMES_UID=10000 HERMES_GID=10000   # fixed uid; never $(id -u)
+   # HERMES_UID/HERMES_GID default to your uid (you own the clone) — nothing to export.
+   # Only for a portable/shared vault: export a fixed uid AND `sudo chown -R <uid> <pack>`.
    bash <engine-checkout>/scripts/build-engine-image.sh    # -> hermes-agent:latest (once)
    bash <engine-checkout>/scripts/ensure-runtime.sh        # seed .hermes-data/config.yaml (a fresh git clone has none) — MUST precede compose
    ENGINE_DIR=<engine-checkout> docker compose up -d        # builds reader+mcp, runs all three
@@ -143,8 +148,9 @@ export HERMES_UID=10000 HERMES_GID=10000
 The pack pins `engine.version`. To upgrade: `git fetch upstream`, merge the new
 release on a branch, build, smoke-gauntlet, cut over (keep the old image tagged
 for rollback), bump the pack's `engine.version`. The pack is never rewritten by
-an engine upgrade. Watch the **HERMES_UID** cutover gotcha — keep the same fixed
-uid across the upgrade so vault file ownership doesn't shift.
+an engine upgrade. Watch the **HERMES_UID** cutover gotcha — keep the same uid across
+the upgrade (the default is your uid; if you pinned a fixed one, keep pinning it) so
+vault file ownership doesn't shift.
 
 ## 4. Reference pack
 

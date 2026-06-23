@@ -9,9 +9,9 @@
 # MCP server: /opt/hermes/okengine-mcp/write_server.py).
 #
 # Usage:
-#   bash scripts/build-engine-image.sh              # clone Hermes, build hermes-agent:okengine-v0.2.0 + :latest
+#   bash scripts/build-engine-image.sh              # clone Hermes, build hermes-agent:okengine-<engine_release> + :latest
 #   HERMES_SRC=/path/to/hermes bash scripts/build-engine-image.sh   # reuse a checkout (must be at the pin)
-#   OKENGINE_IMAGE=myrepo/okengine OKENGINE_TAG=v0.2.0 bash scripts/build-engine-image.sh
+#   OKENGINE_IMAGE=myrepo/okengine OKENGINE_TAG=custom bash scripts/build-engine-image.sh
 #   SKIP_BUILD=1 bash scripts/build-engine-image.sh # assemble the tree only (no docker build) — for inspection/CI
 set -euo pipefail
 
@@ -23,7 +23,9 @@ RELEASE="${RELEASE:-unknown}"
 ENG_SHA="$(git -C "$ENGINE_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 HERMES_REPO="${HERMES_REPO:-https://github.com/NousResearch/hermes-agent.git}"
 IMAGE="${OKENGINE_IMAGE:-hermes-agent}"
-TAG="${OKENGINE_TAG:-okengine-v0.2.0}"
+# Default tag tracks the engine release from the manifest (okengine#101) — never a hardcoded
+# literal, so a default build stamps the image with the version of the source it was built from.
+TAG="${OKENGINE_TAG:-okengine-$RELEASE}"
 
 echo "==> OKEngine gateway image build"
 echo "    engine : $ENGINE_DIR"

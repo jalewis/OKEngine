@@ -17,7 +17,8 @@ Env (all optional; with no budget set this exits 0 as a no-op):
   OKENGINE_BUDGET_WINDOW      day|week|month (default day) — rolling window
   OKENGINE_BUDGET_RESUME      auto|manual (default auto) — auto re-enables when
                                   usage ages back under budget; manual stays paused
-                                  until `framework budget --resume` (clears state)
+                                  until `framework budget --resume` (re-enables the
+                                  paused crons + clears state)
   OKENGINE_STATE_DB           path (default $HERMES_HOME/state.db or /opt/data/state.db)
   OKENGINE_CRON_PLUS_JOBS     path (default /opt/data/cron-plus/jobs.json)
   OKENGINE_CRON_PLUS_CLI      path (default /opt/data/plugins/cron-plus/cli.py)
@@ -159,6 +160,25 @@ def _cronplus(action: str, job_id: str) -> bool:
         return False
 
 
+def resume(reason: str = "manual") -> int:
+    """Re-enable the cost-bearing crons a budget trip paused, and clear the pause state.
+
+    Returns the number of crons re-enabled (0 if not currently paused). This is the
+    manual recovery path behind `framework budget --resume` (the supported way back when
+    OKENGINE_BUDGET_RESUME=manual); auto mode calls it from main() once window usage ages
+    back under budget. Idempotent: a no-op when there is no active trip."""
+    state = _load_state()
+    if not state.get("paused"):
+        print("budget-guard: not paused — nothing to resume.")
+        return 0
+    ids = state.get("paused_ids") or []
+    done = sum(1 for jid in ids if _cronplus("resume", jid))
+    _save_state({"paused": False, "resumed_at": time.time(),
+                 "note": f"{reason}-resume", "resumed_count": done})
+    print(f"budget-guard: ✅ resumed {done} cron(s) ({reason}).", file=sys.stderr)
+    return done
+
+
 def main(argv: list[str] | None = None) -> int:
     tok_budget = int(os.environ.get("OKENGINE_BUDGET_TOKENS") or 0)
     usd_budget = float(os.environ.get("OKENGINE_BUDGET_USD") or 0)
@@ -198,12 +218,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{', '.join(done)}. Free maintenance crons keep running. "
               f"Resume policy: {resume_policy}.", file=sys.stderr)
     elif action == "resume":
-        ids = state.get("paused_ids") or []
-        done = sum(1 for jid in ids if _cronplus("resume", jid))
-        _save_state({"paused": False, "resumed_at": now,
-                     "note": "auto-resumed: window usage back under budget"})
-        print(f"budget-guard: ✅ resumed {done} cron(s) — usage back under budget "
-              f"({usage_str}).", file=sys.stderr)
+        resume("auto")
     return 0
 
 

@@ -1,7 +1,9 @@
 # docker-compose for {{PACK}} — {{TITLE}} (engine okengine {{ENGINE_VERSION}}).
 # The pack dir IS the vault (schema.yaml + CLAUDE.md + wiki/ + crons/feeds/data).
 # Set ENGINE_DIR to your engine checkout, then:
-#   export HERMES_UID=10000 HERMES_GID=10000        # must match the engine's hermes user
+#   # HERMES_UID/HERMES_GID default to your uid via deploy.sh (you own the vault). Export a
+#   # fixed uid + chown the tree only for a portable/shared vault. The :-10000 below is just a
+#   # bare-compose fallback when neither deploy.sh nor an exported HERMES_UID is in play.
 #   bash $ENGINE_DIR/scripts/build-engine-image.sh  # builds the gateway image (hermes-agent)
 #   ENGINE_DIR=$ENGINE_DIR docker compose up -d      # builds reader+mcp, runs all three
 #   CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-scripts.sh

@@ -57,9 +57,9 @@ def engine_version() -> str:
         out = subprocess.run(["git", "-C", str(ENGINE_ROOT), "describe", "--tags",
                               "--match", "v*", "--abbrev=0"],
                              capture_output=True, text=True, timeout=10)
-        return (out.stdout or "").strip() or "v0.3.0"
+        return (out.stdout or "").strip() or "v0.3.1"
     except Exception:
-        return "v0.3.0"
+        return "v0.3.1"
 
 
 def hermes_pin() -> str:

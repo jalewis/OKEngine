@@ -117,3 +117,54 @@ def test_main_pauses_over_budget(tmp_path, monkeypatch):
     assert paused == [("pause", "a")]                       # only the agent job paused
     state = json.loads((tmp_path / "budget-guard-state.json").read_text())
     assert state["paused"] is True and state["paused_ids"] == ["a"]
+
+
+def _seed_paused(tmp_path, ids):
+    (tmp_path / "budget-guard-state.json").write_text(json.dumps(
+        {"paused": True, "paused_ids": ids, "paused_names": ids,
+         "tripped_at": 1.0, "reason": "over budget (test)"}))
+
+
+def test_resume_reenables_and_clears_state(tmp_path, monkeypatch):
+    """okengine#97: resume() re-enables the paused crons and clears the pause state."""
+    m = _load()
+    _seed_paused(tmp_path, ["a", "c"])
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(m, "time", type("T", (), {"time": staticmethod(lambda: 2_000_000.0)}))
+    calls = []
+    monkeypatch.setattr(m, "_cronplus", lambda action, jid: calls.append((action, jid)) or True)
+    assert m.resume("manual") == 2
+    assert calls == [("resume", "a"), ("resume", "c")]
+    state = json.loads((tmp_path / "budget-guard-state.json").read_text())
+    assert state["paused"] is False and state["note"] == "manual-resume"
+
+
+def test_resume_noop_when_not_paused(tmp_path, monkeypatch):
+    m = _load()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))  # no state file -> not paused
+    calls = []
+    monkeypatch.setattr(m, "_cronplus", lambda action, jid: calls.append((action, jid)) or True)
+    assert m.resume("manual") == 0
+    assert calls == []
+
+
+def test_manual_mode_pauses_and_resume_is_the_recovery(tmp_path, monkeypatch):
+    """End-to-end #97: in manual mode the guard pauses and NEVER auto-resumes (a second
+    run stays paused); resume() is the only supported way back."""
+    m = _load()
+    db = tmp_path / "state.db"
+    _make_db(db, [(1_000_000.0 - 10, 2_000_000, 0)])
+    jobs = tmp_path / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [{"id": "a", "name": "raw-backfill"}]}))
+    for k, v in {"HERMES_HOME": str(tmp_path), "OKENGINE_STATE_DB": str(db),
+                 "OKENGINE_CRON_PLUS_JOBS": str(jobs), "OKENGINE_BUDGET_TOKENS": "1000000",
+                 "OKENGINE_BUDGET_RESUME": "manual"}.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(m, "time", type("T", (), {"time": staticmethod(lambda: 1_000_000.0)}))
+    calls = []
+    monkeypatch.setattr(m, "_cronplus", lambda action, jid: calls.append((action, jid)) or True)
+    assert m.main([]) == 0 and ("pause", "a") in calls          # trips
+    calls.clear()
+    assert m.main([]) == 0 and calls == []                      # manual: stays paused, no auto-resume
+    assert m.resume("manual") == 1 and calls == [("resume", "a")]   # operator recovery
+    assert json.loads((tmp_path / "budget-guard-state.json").read_text())["paused"] is False
