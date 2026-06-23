@@ -66,7 +66,9 @@ def expand_jobs(jobs: list, rng: random.Random | None = None) -> int:
         sched = job.get("schedule") or {}
         expr = sched.get("expr")
         if is_sentinel(expr):
-            concrete = expand_one(expr, rng.randint(0, 59))
+            # Jitter to minutes 1-59, never 0: a :00 minute is the herd-prone case the
+            # jitter exists to avoid, and the schedule validator rejects it (okengine#103).
+            concrete = expand_one(expr, rng.randint(1, 59))
             sched["expr"] = concrete
             job["schedule"] = sched
             n += 1

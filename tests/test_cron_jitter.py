@@ -50,6 +50,19 @@ def test_expand_jobs_assigns_random_minute_per_job():
         assert not m.is_sentinel(j["schedule"]["expr"])         # fully expanded
 
 
+def test_expand_jobs_never_picks_minute_zero():
+    """okengine#103: the jittered minute must never be 0 — a :00 schedule is the herd-prone
+    case the jitter exists to avoid, and the validator rejects it. Sweep many seeds."""
+    m = _load()
+    for seed in range(300):
+        jobs = [{"name": "x", "schedule": {"kind": "cron", "expr": "@jitter:daily"}},
+                {"name": "y", "schedule": {"kind": "cron", "expr": "@jitter:hourly"}}]
+        m.expand_jobs(jobs, random.Random(seed))
+        for j in jobs:
+            minute = int(j["schedule"]["expr"].split()[0])
+            assert 1 <= minute <= 59, f"seed {seed} -> herd-prone/invalid minute in {j['schedule']['expr']!r}"
+
+
 def test_expand_file_roundtrip(tmp_path):
     m = _load()
     p = tmp_path / "domain-crons.json"
