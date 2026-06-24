@@ -153,6 +153,51 @@ def _present(fm: dict, key: str) -> bool:
     return True
 
 
+def _field_values(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    return [str(value)]
+
+
+def _enum_rule(schema: dict, typ: str, field: str):
+    rules = schema.get("field_enums") or {}
+    rule = rules.get(field)
+    if not isinstance(rule, dict):
+        return None
+    by_type = rule.get("by_type")
+    if isinstance(by_type, dict):
+        type_rule = by_type.get(typ)
+        if isinstance(type_rule, str):
+            return {"enum": type_rule, "extensible": rule.get("extensible")}
+        if isinstance(type_rule, dict):
+            merged = dict(rule)
+            merged.update(type_rule)
+            return merged
+    return rule if rule.get("enum") else None
+
+
+def _enum_reject_reason(schema: dict, typ: str, fm: dict) -> Optional[str]:
+    enums = schema.get("enums") or {}
+    if not isinstance(enums, dict):
+        return None
+    for field in schema.get("field_enums") or {}:
+        if field not in fm or fm[field] is None:
+            continue
+        rule = _enum_rule(schema, typ, field)
+        if not rule or rule.get("extensible") is True:
+            continue
+        enum_name = rule.get("enum")
+        allowed = enums.get(enum_name)
+        if not isinstance(allowed, list):
+            continue
+        allowed_values = {str(v) for v in allowed}
+        bad = [v for v in _field_values(fm[field]) if v not in allowed_values]
+        if bad:
+            allowed_fmt = ", ".join(sorted(allowed_values))
+            return f"{field}={bad[0]!r} not in enum '{enum_name}' ({allowed_fmt})"
+    return None
+
+
 def _evaluate(abs_path: str, content: str) -> tuple[str, Optional[str]]:
     """Core conformance evaluation. Returns (kind, reason):
 
@@ -229,6 +274,9 @@ def _evaluate(abs_path: str, content: str) -> tuple[str, Optional[str]]:
         miss = [k for k in req if not _present(fm, k)]
         if miss:
             return ("fail", f"type '{t}' is missing required field(s): {', '.join(miss)}")
+        enum_reason = _enum_reject_reason(schema, t, fm)
+        if enum_reason:
+            return ("fail", enum_reason)
         return ("ok", None)
     except Exception as e:
         return ("error", f"validator error: {str(e)[:120]}")

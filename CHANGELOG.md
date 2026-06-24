@@ -3,6 +3,21 @@
 Notable changes to the OKEngine layer. Versions track `engine_release` in
 `engine-manifest.yaml` (and `pyproject.toml`). Issue refs are `okengine#NN`.
 
+## Unreleased
+
+### Added
+- **Field-enum enforcement in the conformance contract.** `schema_validator` rejects a page whose
+  `field_enums` value isn't in the schema's `enums` (honoring `by_type` overrides + `extensible`).
+  `feed_fetch` no longer stamps a non-enum `source_kind: feed` on raw items — it writes
+  `source_channel: feed` (raw provenance), and the wake-gated ingest agent assigns the real
+  enum-valid `source_kind` from the pack schema.
+
+### Fixed
+- **Backlinks skip generated dashboards.** Surfacing `dashboards/` for browsing (#117) accidentally
+  let its auto-generated digests appear as "what links here" edges; `_skip_backlink_src` now skips
+  the surfaced-derived dirs as backlink SOURCES too (browse-visibility ≠ backlink-skip). The reader
+  suite skips locally without `fastapi`, so this only failed in CI.
+
 ## v0.3.4
 
 ### Changed

@@ -152,3 +152,19 @@ def test_empty_opml_is_clean_noop(monkeypatch, tmp_path):
     rc2 = m.main(["--opml", str(tmp_path / "missing.opml"),
                   "--out-dir", str(tmp_path / "out"), "--source-tag", "test"])
     assert rc2 == 0
+
+
+def test_raw_feed_landing_uses_channel_not_final_source_kind(monkeypatch, tmp_path):
+    """Raw feed landing files should not carry a domain final-classification value.
+    The ingest step assigns source_kind from the pack schema."""
+    m = _load(monkeypatch)
+    out = tmp_path / "raw"
+    p = m.write_item(out, "Example Feed", {
+        "title": "Example Item",
+        "link": "https://example.test/item",
+        "summary": "Short summary",
+        "published": "2026-06-23T12:00:00+00:00",
+    }, "test")
+    text = p.read_text(encoding="utf-8")
+    assert "source_channel: feed" in text
+    assert "source_kind: feed" not in text

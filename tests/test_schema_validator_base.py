@@ -167,3 +167,22 @@ def test_strict_passes_conformant_page(tmp_path):
     p, c = str(pg.resolve()), pg.read_text()
     assert m.schema_reject_reason(p, c) is None
     assert m.conformance_reject_reason(p, c) is None
+
+
+def test_field_enum_rejects_closed_values(tmp_path):
+    m = _load()
+    w = _vault(tmp_path, """\
+types:
+  source: {required: [type, source_kind]}
+enums:
+  source_kind: [news, blog]
+field_enums:
+  source_kind: {enum: source_kind}
+""")
+    (w / "sources").mkdir()
+    pg = w / "sources" / "item.md"
+    pg.write_text("---\ntype: source\nsource_kind: feed\nid: 'source:item'\n---\nx\n")
+    r = m.schema_reject_reason(str(pg.resolve()), pg.read_text())
+    assert r and "source_kind='feed'" in r
+    pg.write_text("---\ntype: source\nsource_kind: news\nid: 'source:item'\n---\nx\n")
+    assert m.schema_reject_reason(str(pg.resolve()), pg.read_text()) is None

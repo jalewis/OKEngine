@@ -967,14 +967,19 @@ def _skip_backlink_src(key: str) -> bool:
     not contribute "what links here" edges. IWE indexes the whole vault and doesn't apply
     our filters, so we re-apply the same exclusions the rail uses: `_skip()` (INDEX*/
     `_*`/backups), an `exclude:`-ed namespace (e.g. operational/), and the root artifacts
-    HOT.md/log.md. Keeps briefings/dashboards — those are real references."""
+    HOT.md/log.md, plus generated dashboards/ (surfaced for READING in #117 but its digests
+    aren't real edges). Real references (sources, entities, briefings) are kept."""
     name = key.split("/")[-1]
     if not name.endswith(".md"):
         name += ".md"
     if _skip(name) or name in _RESERVED_BL_NAMES:
         return True
     ns = key.split("/")[0] if "/" in key else ""
-    return bool(ns) and ns in _excluded_dirs()
+    # Browse-visibility and backlink-skip differ: dashboards/ is SURFACED for READING
+    # (okengine#117) but its auto-generated digests aren't meaningful "what links here" edges,
+    # so skip the surfaced-derived dirs as backlink SOURCES too. Real namespaces (sources,
+    # entities, briefings, …) are kept.
+    return bool(ns) and ns in (_excluded_dirs() | _SURFACED_DERIVED)
 
 
 def _backlink_title(src: str) -> str:

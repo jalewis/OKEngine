@@ -220,7 +220,7 @@ def write_item(out_dir: Path, feed: str, it: dict, tag: str) -> Path | None:
     fm = [
         "---",
         "type: source",
-        "source_kind: feed",
+        "source_channel: feed",
         f"source_feed: {json.dumps(feed)}",
         f"title: {json.dumps(it.get('title') or '(untitled)')}",
         f"url: {json.dumps(it.get('link') or '')}",
