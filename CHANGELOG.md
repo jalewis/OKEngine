@@ -3,6 +3,22 @@
 Notable changes to the OKEngine layer. Versions track `engine_release` in
 `engine-manifest.yaml` (and `pyproject.toml`). Issue refs are `okengine#NN`.
 
+## v0.3.4
+
+### Changed
+- **Hermes pin bumped v0.16.0 → v0.17.0** (upstream tag `v2026.6.5` → `v2026.6.19`, ~1476
+  commits — almost all in code the engine doesn't ship: desktop app, web, i18n). The 6 core
+  carried patches apply unchanged; **dropped 2**: patch 07 (cron trusted-digest looser scan) —
+  v0.17.0 implements it natively (`_scan_assembled_cron_prompt`'s `has_injected_data` tier) —
+  and patch 08 (dockerfile recursive-chmod avoidance) — declined, to stay on upstream's new
+  immutable-install permissions model (the ZFS build cost is negligible here: 4m58s with the
+  recursive chmod present). cron-plus is unchanged (`run_job`/`_deliver_result` signatures match).
+  The new cron-script env-sanitization is no-impact (no engine cron script reads a stripped var).
+- **Reader About reports the live runtime** — ensure-runtime stamps the actual deployed engine/Hermes
+  (`.hermes-data/engine-runtime.yaml`); the About prefers it over the pack's declared engine.version
+  pins, which can be stale/wrong vs the running engine (the deploy even warns on mismatch). (#119)
+  Full record: [`docs/hermes-upgrades/v2026.6.19-v0.17.0.md`](docs/hermes-upgrades/v2026.6.19-v0.17.0.md).
+
 ## v0.3.3
 
 Closes the recurring **split-brain vault** class, adds the cold-start **kickstart**, and makes

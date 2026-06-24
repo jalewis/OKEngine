@@ -5,10 +5,10 @@ set of patches against core Hermes files. These are **carried** — re-applied o
 each Hermes version bump — **not** submitted upstream. They are kept deliberately
 small and almost entirely additive so re-applying is cheap and low-conflict.
 
-**Pinned Hermes:** `v2026.6.5` (Hermes **v0.16.0**), commit `3c231eb3979ab9c57d5cd6d02f1d577a3b718b43`
+**Pinned Hermes:** `v2026.6.19` (Hermes **v0.17.0**), commit `2bd1977d8fad185c9b4be47884f7e87f1add0ce3`
 (recorded in `engine-manifest.yaml`; `build-engine-image.sh` verifies the clone matches).
 **Apply:** `patches/apply.sh /path/to/hermes-checkout` (idempotent; verified to
-apply clean to a stock `v2026.6.5` tree).
+apply clean to a stock `v2026.6.19` tree).
 
 Everything else the engine adds is **overlay** (new files — see
 `engine-manifest.yaml`) or **plugins** (Hermes' plugin system) — neither needs a
@@ -22,7 +22,6 @@ patch.
 | 04 | `04-usage-pricing-models.patch` | `agent/usage_pricing.py` | Pricing entries upstream lacks (deepseek-v4-flash/pro, Claude 4.x) so `insights` cost tracking isn't `unknown`. |
 | 05 | `05-delegate-tool-session-end.patch` | `tools/delegate_tool.py` | End delegate sub-agent rows in `state.db` (without it, sub-agent sessions leak `ended_at IS NULL` rows forever). |
 | 06 | `06-approval-vercel-sandbox.patch` | `tools/approval.py` | Add `vercel_sandbox` to the recognized sandbox env-type allowlist. |
-| 07 | `07-cron-trusted-digest-looser-scan.patch` | `cron/scheduler.py` | Scan a cron job's **trusted prerun-script digest** with the **looser** ruleset Hermes already uses for install-vetted skill docs (drops command-shape patterns, still blocks real injection directives). An OKF vault compiles security intel that *describes* attacker commands (e.g. `cat ~/.aws/credentials`), which tripped the strict `read_secrets` pattern and permanently blocked ingest/curation crons (~40% of runs). The digest is engine-generated from vault content, not user/skill input. |
 
 If a patch fails to apply after a Hermes bump, `git apply --3way` it against the
 new version, resolve, and regenerate the `.patch` (`git diff <new-pin> -- <file>`).

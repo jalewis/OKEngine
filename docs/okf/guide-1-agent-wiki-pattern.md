@@ -216,7 +216,7 @@ The implementation splits cleanly into two layers:
 
 | Layer | What it is | Domain-specific? |
 |---|---|---|
-| **Engine** | The runtime (a pinned Hermes-Agent, v0.16.0, consumed as a dependency — not forked), the `cron-plus` scheduler, LLM-wiki governance/maintenance machinery, OKF-compatible validation, retrieval + graph tooling, and deploy tooling | No — fully domain-agnostic |
+| **Engine** | The runtime (a pinned Hermes-Agent, v0.17.0, consumed as a dependency — not forked), the `cron-plus` scheduler, LLM-wiki governance/maintenance machinery, OKF-compatible validation, retrieval + graph tooling, and deploy tooling | No — fully domain-agnostic |
 | **Domain pack** | Per deployment: `schema.yaml`, the content `wiki/`, the persona `CLAUDE.md`, feeds, data, cron job definitions + prompts, and `.env` | Yes — this *is* the domain |
 
 The boundary is explicit and versioned:
@@ -232,7 +232,7 @@ This is the mechanism that makes the pattern *deployable* rather than a one-off:
 
 | Pattern concept (this briefing) | Reference implementation |
 |---|---|
-| Autonomous agent loop | pinned Hermes-Agent (v0.16.0, consumed as a dependency) running observe→reason→act with tool use |
+| Autonomous agent loop | pinned Hermes-Agent (v0.17.0, consumed as a dependency) running observe→reason→act with tool use |
 | Runs continuously, not on demand | `cron-plus` scheduler — ~98 scheduled jobs maintain the wiki |
 | Three Karpathy layers | immutable `raw/` → agent-maintained `wiki/` → `schema.yaml` + persona `CLAUDE.md` |
 | The schema/contract (Layer 3) | `schema.yaml` — read by the engine, never hardcoded |

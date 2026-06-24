@@ -16,7 +16,7 @@ usage: new-pack.sh <pack-name> [title] [options]
 options:
   --offset N         host-port offset (reader=9200+N, mcp=8730+N)   [default 0]
   --engine TAG       engine pin                                     [default v0.2.0]
-  --hermes-pin TAG   Hermes runtime pin (engine.version)            [default v2026.6.5]
+  --hermes-pin TAG   Hermes runtime pin (engine.version)            [default v2026.6.19]
   --brief-hour H     UTC hour (0-23) for the daily brief            [default 13]
   --owner NAME       GitHub owner for the README CI badge           [default REPLACE_OWNER]
   --license NAME     LICENSE to ship: apache-2.0 | none             [default apache-2.0]
@@ -26,7 +26,7 @@ EOF
   exit 2
 }
 
-PACK="" TITLE="" OFFSET=0 ENGINE="v0.2.0" HERMES_PIN="v2026.6.5" BRIEF_HOUR=13 OWNER="REPLACE_OWNER" LICENSE="apache-2.0" BLURB="" OUT=""
+PACK="" TITLE="" OFFSET=0 ENGINE="v0.2.0" HERMES_PIN="v2026.6.19" BRIEF_HOUR=13 OWNER="REPLACE_OWNER" LICENSE="apache-2.0" BLURB="" OUT=""
 POSITIONAL=()
 while [ $# -gt 0 ]; do
   case "$1" in

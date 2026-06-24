@@ -17,7 +17,7 @@ set -euo pipefail
 
 ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PIN="$(awk -F': *' '/pinned_tag:/{print $2; exit}' "$ENGINE_DIR/engine-manifest.yaml" | tr -d ' ')"
-PIN="${PIN:-v2026.6.5}"
+PIN="${PIN:-v2026.6.19}"
 RELEASE="$(awk -F': *' '/^engine_release:/{print $2; exit}' "$ENGINE_DIR/engine-manifest.yaml" | awk '{print $1}')"
 RELEASE="${RELEASE:-unknown}"
 ENG_SHA="$(git -C "$ENGINE_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"

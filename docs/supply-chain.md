@@ -13,7 +13,7 @@ documents what is pinned, where, and how to bump each dependency safely.
 | **node-gyp** (npm) | `okengine-mcp/Dockerfile` | `node-gyp@11` | npm version pin |
 | **MCP Python deps** | `okengine-mcp/requirements.txt` | `==` pins (`mcp`, `PyYAML`, `uvicorn`) | exact versions |
 | **Reader Python deps** | `okengine-reader/requirements.txt` | `==` pins | exact versions |
-| **Hermes-Agent** runtime | `engine-manifest.yaml` → `runtime.pinned_sha` | tag `v2026.6.5` → commit `3c231eb…8b43` | `build-engine-image.sh` verifies the clone matches |
+| **Hermes-Agent** runtime | `engine-manifest.yaml` → `runtime.pinned_sha` | tag `v2026.6.19` → commit `2bd1977…0ce3` | `build-engine-image.sh` verifies the clone matches |
 | **cron-plus** plugin (required runtime scheduler) | `engine-manifest.yaml` → `dependencies.cron-plus`, `INSTALL.md` §4 | commit `eacd1729…39eff` (untagged) | operator clones + `git checkout` the pin |
 
 apt packages are intentionally **not** version-pinned individually: the base-image

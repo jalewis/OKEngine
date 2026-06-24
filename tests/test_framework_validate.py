@@ -279,7 +279,7 @@ def test_engine_version_required_and_matches_engine(tmp_path):
     ev.write_text("engine: okengine\nversion: latest\n")
     assert any(s == "FAIL" and "engine.version" in c for s, c, d in v.validate(pack).rows)
     # a valid-but-wrong version (drift) -> FAIL with a "this engine is" message
-    ev.write_text("engine: okengine\nversion: v0.0.1\nhermes_pin: v2026.6.5\n")
+    ev.write_text("engine: okengine\nversion: v0.0.1\nhermes_pin: v2026.6.19\n")
     r = v.validate(pack)
     assert any(s == "FAIL" and "engine.version" in c and "this engine is" in d for s, c, d in r.rows)
 

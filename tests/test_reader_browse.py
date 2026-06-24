@@ -171,12 +171,12 @@ def test_about_api_reports_vault_and_versions(tmp_path, monkeypatch):
     monkeypatch.delenv("OKENGINE_PROJECT_URL", raising=False)
     (tmp_path / "pack.yaml").write_text(
         "name: okpack-demo\nversion: 1.2.0\ntrust: public\nproject_url: https://example.org/okengine\n")
-    (tmp_path / "engine.version").write_text("engine: okengine\nversion: v0.2.0\nhermes_pin: v2026.6.5\n")
+    (tmp_path / "engine.version").write_text("engine: okengine\nversion: v0.2.0\nhermes_pin: v2026.6.19\n")
     (tmp_path / "wiki").mkdir()
     m = _load(tmp_path)
     a = m._about_info()
     assert a["vault"] == "okpack-demo" and a["vault_version"] == "1.2.0"
-    assert a["engine_version"] == "v0.2.0" and a["hermes_pin"] == "v2026.6.5"
+    assert a["engine_version"] == "v0.2.0" and a["hermes_pin"] == "v2026.6.19"
     assert a["project_url"] == "https://example.org/okengine"   # pack.yaml fallback
     monkeypatch.setenv("OKENGINE_PROJECT_URL", "https://env.example/repo")
     assert m._about_info()["project_url"] == "https://env.example/repo"   # env wins
@@ -272,3 +272,22 @@ def test_rate_limit_bounded_by_default_off_public(tmp_path, monkeypatch):
     (tmp_path / "wiki").mkdir()
     m = _load(tmp_path)
     assert m._RATE.per_min == 300 and m._RATE.per_min > 0
+
+
+def test_about_prefers_runtime_marker_over_declared_pin(tmp_path):
+    """okengine#119: the About reports the ACTUAL deployed engine/Hermes (the ensure-runtime
+    marker), not the pack's declared engine.version pins — which can be stale/wrong (a pack
+    pinned to an older engine still deploys on a newer one, and its hermes_pin then lies)."""
+    v = tmp_path
+    (v / "wiki").mkdir()
+    (v / "pack.yaml").write_text("name: testpack\nversion: 0.2.1\n")
+    (v / "engine.version").write_text("engine: okengine\nversion: v0.3.3\nhermes_pin: v2026.6.5\n")
+    m = _load(v)
+    a = m._about_info()
+    assert a["engine_version"] == "v0.3.3" and a["hermes_pin"] == "v2026.6.5"   # no marker -> declared pin
+    (v / ".hermes-data").mkdir(exist_ok=True)
+    (v / ".hermes-data" / "engine-runtime.yaml").write_text(
+        "engine_release: v0.3.4\nhermes_pin: v2026.6.19\nhermes_sha: 2bd1977\nengine_sha: e8862c2\n")
+    a2 = m._about_info()
+    assert a2["engine_version"] == "v0.3.4" and a2["hermes_pin"] == "v2026.6.19"   # marker wins
+    assert a2["vault_version"] == "0.2.1"                                          # pack version unchanged

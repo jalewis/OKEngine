@@ -36,7 +36,7 @@ RAG embeds document chunks and retrieves semantically similar fragments at query
 
 The vault therefore uses **lexical + hybrid search over the markdown itself** (see §7), not a vector store as the primary retrieval path.
 
-> **Reference implementation.** The engine is a pinned Hermes-Agent (v0.16.0, consumed as a dependency — not forked) + the `cron-plus` scheduler + LLM-wiki governance/maintenance machinery with an OKF-compatible validation floor, driving a fleet of autonomous cron jobs. The three-layer stack is literal: `raw/` (immutable, gitignored, durable storage) → `wiki/` (agent-maintained) → `schema.yaml` + the vault's persona `CLAUDE.md`. No RAG; search is qmd-hybrid + IWE + ripgrep (§7).
+> **Reference implementation.** The engine is a pinned Hermes-Agent (v0.17.0, consumed as a dependency — not forked) + the `cron-plus` scheduler + LLM-wiki governance/maintenance machinery with an OKF-compatible validation floor, driving a fleet of autonomous cron jobs. The three-layer stack is literal: `raw/` (immutable, gitignored, durable storage) → `wiki/` (agent-maintained) → `schema.yaml` + the vault's persona `CLAUDE.md`. No RAG; search is qmd-hybrid + IWE + ripgrep (§7).
 
 ---
 

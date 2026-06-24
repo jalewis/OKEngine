@@ -64,9 +64,9 @@ def engine_version() -> str:
 
 def hermes_pin() -> str:
     try:
-        return _engine_meta().hermes_pin() or "v2026.6.5"
+        return _engine_meta().hermes_pin() or "v2026.6.19"
     except Exception:
-        return "v2026.6.5"
+        return "v2026.6.19"
 
 
 def _tokens(dest: Path, domain: str, offset: int) -> dict[str, str]:

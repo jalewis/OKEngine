@@ -11,7 +11,7 @@ template is **not** expected to parse until rendered).
 | `{{TITLE}}` | Human title of the vault. | `security knowledge vault` | you choose |
 | `{{BLURB}}` | One-line description (README intro + GitHub "About"). | `Agent-curated security knowledge vault…` | you choose |
 | `{{ENGINE_VERSION}}` | Engine tag this pack is pinned to. | `v0.2.0` | the engine release |
-| `{{HERMES_PIN}}` | Hermes runtime pin written to `engine.version`. | `v2026.6.5` | `--hermes-pin` (engine default) |
+| `{{HERMES_PIN}}` | Hermes runtime pin written to `engine.version`. | `v2026.6.19` | `--hermes-pin` (engine default) |
 | `{{PORT_OFFSET}}` | Host-port offset so packs don't collide on one host. | `200` | you choose (unique per host) |
 | `{{READER_PORT}}` | reader host port = `9200 + offset`. | `9400` | computed |
 | `{{MCP_PORT}}` | mcp host port = `8730 + offset`. | `8930` | computed |

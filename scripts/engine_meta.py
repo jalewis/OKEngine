@@ -39,7 +39,7 @@ def engine_release() -> str | None:
 
 
 def hermes_pin() -> str | None:
-    """The pinned Hermes tag this engine targets (e.g. 'v2026.6.5'), or None."""
+    """The pinned Hermes tag this engine targets (e.g. 'v2026.6.19'), or None."""
     rt = _load().get("runtime")
     if not isinstance(rt, dict):
         return None

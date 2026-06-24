@@ -5,7 +5,7 @@ files) + **plugins** + **config**, then **one domain pack**. This is the procedu
 to take a stock Hermes install and bring it up to OKEngine — i.e. the exact
 stock→OKEngine delta.
 
-**Pinned dependency:** Hermes **v0.16.0** = upstream git tag **`v2026.6.5`**
+**Pinned dependency:** Hermes **v0.17.0** = upstream git tag **`v2026.6.19`**
 (`github.com/NousResearch/hermes-agent`). The engine is cut against this version;
 a different Hermes version may require rebasing the patches.
 
@@ -55,7 +55,7 @@ script does, if you prefer to do it by hand.
 ## 1. Pin Hermes
 ```bash
 git clone https://github.com/NousResearch/hermes-agent.git hermes
-cd hermes && git checkout v2026.6.5          # == Hermes v0.16.0
+cd hermes && git checkout v2026.6.19          # == Hermes v0.17.0
 ```
 
 ## 2. Apply the carried patches (6 core-file patches)

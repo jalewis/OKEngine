@@ -8,7 +8,7 @@
 # Idempotent: already-applied patches are skipped. Exits non-zero on drift.
 set -euo pipefail
 
-PIN="v2026.6.5"   # Hermes v0.16.0 — the version these patches are cut against
+PIN="v2026.6.19"   # Hermes v0.17.0 — the version these patches are cut against
 HERMES="${1:-${HERMES_DIR:-$PWD}}"
 PATCHDIR="$(cd "$(dirname "$0")" && pwd)"
 

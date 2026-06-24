@@ -462,8 +462,13 @@ def _about_info() -> dict:
     info["vault"] = str(pk.get("name") or "")
     info["vault_version"] = str(pk.get("version") or "")
     ev = _yaml(VAULT / "engine.version")
-    info["engine_version"] = str(ev.get("version") or "")
-    info["hermes_pin"] = str(ev.get("hermes_pin") or "")
+    # Prefer the deploy-stamped runtime marker (the ACTUAL engine/Hermes running, written by
+    # ensure-runtime) over the pack's DECLARED engine.version pins, which can be stale/wrong vs
+    # the deployed engine — a pack pinned to an older engine still deploys on a newer one, and
+    # its hermes_pin then reports the wrong runtime (okengine#119). Fall back to the declared pin.
+    rt = _yaml(VAULT / ".hermes-data" / "engine-runtime.yaml")
+    info["engine_version"] = str(rt.get("engine_release") or ev.get("version") or "")
+    info["hermes_pin"] = str(rt.get("hermes_pin") or ev.get("hermes_pin") or "")
     # The project/repo link for the About panel is deployment config — the engine ships no
     # hardcoded URL (stays publishable / no private host). Env wins; pack.yaml is fallback.
     info["project_url"] = os.environ.get("OKENGINE_PROJECT_URL") or str(pk.get("project_url") or "")

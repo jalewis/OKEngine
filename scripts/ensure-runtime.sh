@@ -52,6 +52,25 @@ else
     exit 1
 fi
 
+# --- runtime version marker: stamp the ACTUAL engine/Hermes being deployed ---
+# The reader's About reads this so it reports what's RUNNING, not the pack's DECLARED
+# engine.version pins (which can be stale/wrong vs the deployed engine — a public pack pinned
+# to an older engine still deploys on a newer one, and its hermes_pin then lies). okengine#119.
+MANIFEST="$ENGINE_DIR/engine-manifest.yaml"
+if [ -f "$MANIFEST" ]; then
+    _rel="$(awk -F': *' '/^engine_release:/{print $2; exit}' "$MANIFEST" | awk '{print $1}')"
+    _htag="$(awk -F': *' '/pinned_tag:/{print $2; exit}' "$MANIFEST" | awk '{print $1}')"
+    _hsha="$(awk -F': *' '/pinned_sha:/{print $2; exit}' "$MANIFEST" | awk '{print $1}')"
+    _esha="$(git -C "$ENGINE_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    {
+        printf 'engine_release: %s\n' "${_rel:-unknown}"
+        printf 'hermes_pin: %s\n'     "${_htag:-unknown}"
+        printf 'hermes_sha: %s\n'     "${_hsha:-unknown}"
+        printf 'engine_sha: %s\n'     "$_esha"
+    } > "$RT/engine-runtime.yaml"
+    echo "stamped: $RT/engine-runtime.yaml  (engine ${_rel:-?} · Hermes ${_htag:-?})"
+fi
+
 # --- MCP auth: keep the gateway's read-MCP client header in sync with the token ---
 # The read server requires `Bearer <OKENGINE_MCP_TOKEN>`, falling back to the
 # built-in "okengine-local" when that env var is unset. The seeded config.yaml
