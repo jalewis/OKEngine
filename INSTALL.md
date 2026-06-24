@@ -17,6 +17,29 @@ operate as several users:
 export HERMES_UID=10000 HERMES_GID=10000 && sudo chown -R 10000:10000 <pack>   # portable/shared only
 ```
 
+## Run it with Docker (start here)
+
+Most users never touch §1–§8 below — **`deploy.sh` runs the whole stock→engine delta** (clone
+Hermes → apply `patches/` → overlay → `docker build`) on first run, then brings the stack up:
+
+```bash
+git clone <engine-repo> okengine                              # 1. the engine (overlay + build source)
+python okengine/scripts/framework.py list                     #    browse the pack catalog
+python okengine/scripts/framework.py pull <pack> my-brain     # 2. a domain pack -> SIBLING vault dir
+cd my-brain && bash ../okengine/scripts/deploy.sh             # 3. build image (once) + up gateway/reader/mcp + crons + verify
+```
+
+Then add a model key to `my-brain/.env` to enable the LLM crons (the stack comes up without one).
+
+> **Where is `docker-compose.yml`?** Not in this engine repo — the engine is an *overlay*, not a
+> deployable stack. The compose file (wiring **gateway + `okengine-reader` + `okengine-mcp`**) ships
+> with the **pack**: `framework pull`/`init` lands it at `<pack>/docker-compose.yml`, and `deploy.sh`
+> runs `docker compose up` from the pack dir. Engine (`okengine/`) and vault (`my-brain/`) are
+> separate sibling directories. Full deploy guide: [`docs/deploy-a-new-domain.md`](docs/deploy-a-new-domain.md).
+
+**§1–§8 below are the by-hand internals** that `build-engine-image.sh` + `deploy.sh` automate —
+read them to build manually, debug a build, or rebase patches on a Hermes bump.
+
 ## Fast path — build the gateway image (automates §1–§3)
 
 The gateway container image (`hermes-agent`) = pinned Hermes + the patches +
@@ -121,17 +144,23 @@ Pack spec + quickstart: `docs/deploy-a-new-domain.md`. Don't `pull`/`init` into
 this engine checkout — keep `okengine/` (code) and `my-brain/` (vault) side by side.
 
 ## 7. Deploy
-Run from the **pack** dir (the pack's `docker-compose.yml` wires all three
-services; `ENGINE_DIR` points at this engine checkout):
+Run from the **pack** dir (its `docker-compose.yml` wires all three services; `ENGINE_DIR` points
+at this engine checkout). **One command** — `deploy.sh` does validate → seed runtime → install
+cron-plus → build the image (if missing) → `docker compose up` → deploy crons → verify:
 ```bash
 # HERMES_UID/HERMES_GID default to your uid (you own the clone) — export a fixed uid only for a portable/shared vault.
-bash $ENGINE_DIR/scripts/build-engine-image.sh   # builds the gateway image (hermes-agent) — once per engine version
-ENGINE_DIR=$ENGINE_DIR docker compose up -d       # builds okengine-reader + okengine-mcp, runs gateway + both
+cd <pack> && bash $ENGINE_DIR/scripts/deploy.sh
+```
+Or step by step (exactly what `deploy.sh` runs in order):
+```bash
+bash $ENGINE_DIR/scripts/ensure-runtime.sh "$(pwd)"                    # seed .hermes-data/config.yaml + cron-plus + MCP token
+bash $ENGINE_DIR/scripts/build-engine-image.sh                        # build hermes-agent — once per engine version
+ENGINE_DIR=$ENGINE_DIR docker compose up -d                           # builds okengine-reader + okengine-mcp, runs gateway + both
 CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-scripts.sh   # engine + pack scripts/data -> /opt/data
 CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-plus-jobs.sh # cron defs -> live (self-heals next_run_at)
 ```
-The `gateway` service consumes the prebuilt `hermes-agent` image (step above);
-`compose` builds only the standalone `okengine-reader`/`okengine-mcp` images.
+The `gateway` service consumes the prebuilt `hermes-agent` image; `compose` builds only the
+standalone `okengine-reader`/`okengine-mcp` images.
 
 ## 8. Smoke (the gauntlet)
 A no_agent cron succeeds; an LLM agent cron succeeds (API + tools + prompt-cache);

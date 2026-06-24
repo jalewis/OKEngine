@@ -104,10 +104,16 @@ One active pack per instance is the supported deployment model today.
 
 ## Quickstart
 
-1. **Install the engine onto pinned Hermes**
+1. **Clone the engine**
 
-   Follow [`INSTALL.md`](INSTALL.md): clone Hermes at the pinned tag, apply
-   `patches/`, overlay OKEngine, and configure runtime dependencies.
+   ```bash
+   git clone <engine-repo> okengine
+   ```
+
+   No manual Hermes/patch/overlay work needed — `deploy.sh` (step 3) builds the `hermes-agent`
+   Docker image (pinned Hermes + `patches/` + overlay) on first run. The deployable
+   `docker-compose.yml` ships with the **pack** (step 2), not the engine. See
+   [`INSTALL.md`](INSTALL.md) for the build internals / by-hand path.
 
 2. **Get a domain pack**
 

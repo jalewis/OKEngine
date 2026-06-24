@@ -3,7 +3,7 @@
 Notable changes to the OKEngine layer. Versions track `engine_release` in
 `engine-manifest.yaml` (and `pyproject.toml`). Issue refs are `okengine#NN`.
 
-## Unreleased
+## v0.3.5
 
 ### Added
 - **Field-enum enforcement in the conformance contract.** `schema_validator` rejects a page whose
@@ -17,6 +17,12 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
   let its auto-generated digests appear as "what links here" edges; `_skip_backlink_src` now skips
   the surfaced-derived dirs as backlink SOURCES too (browse-visibility ≠ backlink-skip). The reader
   suite skips locally without `fastapi`, so this only failed in CI.
+
+### Docs
+- **One-command Docker path surfaced.** INSTALL.md now opens with a 3-command quickstart
+  (`clone engine → framework pull → deploy.sh`) and states `docker-compose.yml` ships with the
+  pack, not the engine; §7 leads with `deploy.sh`; README stops routing users through the manual
+  patch/overlay delta.
 
 ## v0.3.4
 

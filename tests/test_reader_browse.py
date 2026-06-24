@@ -287,7 +287,7 @@ def test_about_prefers_runtime_marker_over_declared_pin(tmp_path):
     assert a["engine_version"] == "v0.3.3" and a["hermes_pin"] == "v2026.6.5"   # no marker -> declared pin
     (v / ".hermes-data").mkdir(exist_ok=True)
     (v / ".hermes-data" / "engine-runtime.yaml").write_text(
-        "engine_release: v0.3.4\nhermes_pin: v2026.6.19\nhermes_sha: 2bd1977\nengine_sha: e8862c2\n")
+        "engine_release: v0.3.5\nhermes_pin: v2026.6.19\nhermes_sha: 2bd1977\nengine_sha: e8862c2\n")
     a2 = m._about_info()
-    assert a2["engine_version"] == "v0.3.4" and a2["hermes_pin"] == "v2026.6.19"   # marker wins
+    assert a2["engine_version"] == "v0.3.5" and a2["hermes_pin"] == "v2026.6.19"   # marker wins
     assert a2["vault_version"] == "0.2.1"                                          # pack version unchanged

@@ -12,7 +12,7 @@
 # (schema.yaml + persona + feeds + crons + content). See INSTALL.md and
 # docs/deploy-a-new-domain.md.
 version: 1
-engine_release: v0.3.4   # Hermes pin v0.16.0->v0.17.0 (tag v2026.6.19) · see CHANGELOG.md
+engine_release: v0.3.5   # enum enforcement · reader About live runtime · Docker quickstart docs — see CHANGELOG.md
 
 runtime:
   # Hermes is a PINNED DEPENDENCY, not vendored into this repo. You clone Hermes
