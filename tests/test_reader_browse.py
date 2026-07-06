@@ -113,8 +113,13 @@ def test_skip_backlink_src_excludes_generated_and_operational(tmp_path):
     # pages under an exclude:-ed namespace
     assert m._skip_backlink_src("operational/op-note")
     assert m._skip_backlink_src("dashboards/hot")
-    # real references are KEPT (incl. briefings — a brief citing a source is a real edge)
-    for k in ("sources/2026/06/real-source", "entities/a/autojack", "briefings/2026-06-19"):
+    # sources/ is DROPPED by default since the #179 backlink rework (raw-ingest pages link
+    # everything they mention; their edges drown the graph) — pack-configurable via
+    # schema.yaml `backlink_drop:`. The old "sources are KEPT" assertion rotted unnoticed
+    # because this file self-skips wherever flask isn't installed.
+    assert m._skip_backlink_src("sources/2026/06/real-source")
+    # real references are KEPT (a brief citing an entity is a real edge)
+    for k in ("entities/a/autojack", "briefings/2026-06-19"):
         assert not m._skip_backlink_src(k), k
 
 
@@ -187,11 +192,16 @@ def test_about_api_reports_vault_and_versions(tmp_path, monkeypatch):
 
 
 def test_about_api_tolerates_missing_files(tmp_path):
-    """A definition checkout without pack.yaml/engine.version -> empty strings, no crash."""
+    """A definition checkout without pack.yaml/engine.version -> empty strings, no crash.
+    Pins the FULL empty-state shape incl. the v0.9.1 About-panel fields (description/
+    mission/installed_domains/sub_domains/extensions) — the old 5-key assertion rotted
+    unnoticed because this file self-skips wherever flask isn't installed."""
     (tmp_path / "wiki").mkdir()
     m = _load(tmp_path)
     assert m._about_info() == {"vault": "", "vault_version": "", "engine_version": "",
-                              "hermes_pin": "", "project_url": ""}
+                              "hermes_pin": "", "project_url": "",
+                              "description": "", "mission": "",
+                              "installed_domains": [], "sub_domains": [], "extensions": []}
 
 
 def test_display_groups_browse_by_kind(tmp_path):

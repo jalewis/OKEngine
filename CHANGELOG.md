@@ -40,6 +40,20 @@ the paired security MR, 9 deferred to okengine#184.
   exists (a state-cleanup regression would ship green); the content-pegs wake-gate test time-bombed
   once "today" drifted past its lookback window. Both made deterministic.
 
+Fixes surfaced by the public mirror's CI (the first snapshot since v0.3.5 ran the reader/extension
+tests on a full dependency set — locally they self-skip without flask):
+- **panel-svg charts destroyed by the markdown pipeline**: the `nl2br` extension injects `<br/>`
+  between SVG shape lines, and `<br>` is an HTML5 foreign-content *breakout* tag — a spec-following
+  sanitizer (nh3 ≥ 0.3.6) closes the `<svg>` there and silently drops every shape. panel-svg blocks
+  now bypass *markdown* (stash/re-insert) while still passing through the full `nh3` allowlist.
+- **critic wake-gate dead on Python < 3.13**: `Path.glob("briefings/**")` matched directories only
+  before 3.13, so a pack's `critic_flagship` glob selected 0 pages and the gate never woke on
+  3.11/3.12 runtimes (deployed gateways run 3.13 — production unaffected). Trailing `**` patterns
+  are normalized to `**/*`.
+- Two reader tests updated for behavior that changed deliberately (About-panel empty-state fields;
+  `sources/` dropped from the backlink graph by default since #179) — the stale assertions rotted
+  unnoticed behind the flask self-skip.
+
 Two further fixes surfaced by the paired library's pre-publish **deploy-matrix** (validate × compose ×
 co-install over every public pack):
 - **install-domain persona idempotency**: `append_persona` only recognized a prior install when the

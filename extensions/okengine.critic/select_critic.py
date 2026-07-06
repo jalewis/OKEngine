@@ -100,6 +100,11 @@ def main() -> int:
         print("critic: no critic_flagship declared (or no vault) — nothing to critique")
         print(json.dumps({"wakeAgent": False}))
         return 0
+    if pattern.endswith("**"):
+        # Path.glob('**') matched DIRECTORIES ONLY before Python 3.13, so a pack pattern
+        # like 'briefings/**' silently selected 0 pages on 3.11/3.12 runtimes and the gate
+        # never woke. '**/*' matches files on every supported version.
+        pattern += "/*"
 
     targets = sorted(p for p in WIKI.glob(pattern) if p.is_file() and p.suffix == ".md"
                      and not any(part.startswith((".", "_")) for part in p.parts)

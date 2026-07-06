@@ -291,12 +291,30 @@ _ALLOWED_ATTRS = {
 }
 
 
+# okengine.viz panel-svg blocks must bypass MARKDOWN (not the sanitizer): the nl2br
+# extension injects <br/> between the shape lines, and <br> is an HTML5 foreign-content
+# BREAKOUT tag — a spec-following sanitizer parser (nh3/ammonia >= 0.3.6) closes the
+# <svg> at the first <br> and every shape after it is silently dropped. The blocks are
+# stashed before markdown and re-inserted BEFORE nh3.clean, so the svg still gets the
+# full _ALLOWED_TAGS/_ALLOWED_ATTRS pass (script tags / event handlers stripped as ever).
+_PANEL_SVG_RE = re.compile(r"<!--\s*panel-svg\b.*?<!--\s*/panel-svg\s*-->", re.DOTALL)
+
+
 def render_md(body: str) -> str:
     body = _resolve_embeds(body)
     body = re.sub(r"```dataview(js)?\n.*?\n```",
                   "_[Dataview view — open in Obsidian to compute]_", body, flags=re.DOTALL)
+    stash: list[str] = []
+
+    def _stash(m: re.Match) -> str:
+        stash.append(m.group(0))
+        return f"OKENGINEPANELSVG{len(stash) - 1}MARKER"
+
+    body = _PANEL_SVG_RE.sub(_stash, body)
     body = _linkify(body)
     html = md.markdown(body, extensions=["tables", "fenced_code", "sane_lists", "nl2br"])
+    for i, blk in enumerate(stash):
+        html = html.replace(f"OKENGINEPANELSVG{i}MARKER", blk)
     return nh3.clean(html, tags=_ALLOWED_TAGS, attributes=_ALLOWED_ATTRS)
 
 
