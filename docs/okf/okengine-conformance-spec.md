@@ -52,8 +52,11 @@ open/extensible — unknown data passes through). Fields a pack marks in
 2.4 The universal interoperability fields a page **MAY** carry are: `id`, `title`,
 `description`, `status`, `created`, `updated`, `version`, `created_by`,
 `last_modified_by`, `confidence`, `tags`, `aliases`, `maintained_by`,
-`discovered_by`. These are defined once in the engine base schema; packs add
-domain fields on top.
+`discovered_by`, plus the cross-cutting **optional** fields `tlp`, `sensitivity`,
+`source_kind`, `publisher`, `reliability`, `credibility`, `severity` (okengine#90 —
+validated by the base's extensible enums: `tlp` ships the FIRST.org standard set; a
+pack extends the rest with domain values). These are defined once in the engine base
+schema; packs add domain fields on top.
 
 ## 3. Schema discovery & the base floor
 
@@ -62,12 +65,19 @@ domain fields on top.
 vault root's. A sub-tree **MAY** carry its own `schema.yaml` (a nested sub-domain).
 
 3.2 The engine merges an **engine-owned base schema UNDER** every pack schema. The
-base owns the global toggles; a pack **MUST NOT** override them (it declares only
-its domain `types`, `partitioning`, `tier`, `permissions`, and extra keys):
+base owns the global toggles **and the universal OKF core**; a pack **MUST NOT**
+override the toggles, and declares only its **domain** `types`/namespaces (+ any
+domain `partitioning`/`tier`/`permissions` and extra keys):
 - `okf.required` — the merged requirement is the **union** of base and pack; `type`
   is always present and the floor never loosens.
 - `okf.should` — base-owned advisory tier (currently `[id]`).
 - `strict_types` — **engine-owned**; a pack-level value is ignored.
+- the **OKF core** (okengine#90) — engine-owned DEFAULTS merged under the pack: the
+  core `types` (`source`/`concept`/`prediction`/`finding`/`dashboard`/`briefing`/
+  `trend`), the core `partitioning.namespaces` + `tier`, and the cross-cutting
+  optional fields/enums (§2.4). A pack **inherits** them and adds domain types on top;
+  it **MUST NOT** *own* a core id, and **MUST NOT** *tighten* a core type (add required
+  fields) — both are composition conflicts (`framework compose-preview` flags them).
 
 3.3 If the base schema is absent/unreadable, validation **MUST** fail safe (fall
 back to the pack's own `okf`, never crash a write).

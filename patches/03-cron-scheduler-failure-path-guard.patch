@@ -1,0 +1,75 @@
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index a9732d1a1..1bfc222dc 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -167,6 +167,29 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
+     return result
+ 
+ 
++# Toolsets stripped from a cron agent that only runs to REPORT a failed
++# data-collection script. Such a run exists solely to summarize an error that
++# is already in its prompt — it has no business mutating the vault. Names map
++# to CONFIGURABLE_TOOLSETS keys: terminal/process exec, file write+patch, and
++# arbitrary code execution. (Incident 2026-06-14: a script-failure agent ran
++# `rm` and deleted dashboards while "reporting" the error.)
++_FAILURE_PATH_BLOCKED_TOOLSETS = ("terminal", "file", "code_execution")
++
++
++def _apply_failure_path_toolset_guard(disabled: list[str], script_failed: bool) -> list[str]:
++    """When the agent only woke to report a script failure, append the mutating
++    toolsets to the always-wins denylist so the report run cannot delete, write,
++    patch, or shell out. No-op (returns the list unchanged) on every normal run,
++    including legitimate ``wakeAgent: true`` runs that need full tools."""
++    if not script_failed:
++        return disabled
++    out = list(disabled)
++    for name in _FAILURE_PATH_BLOCKED_TOOLSETS:
++        if name not in out:
++            out.append(name)
++    return out
++
++
+ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
+     """Resolve the toolset list for a cron job.
+ 
+@@ -1975,7 +1998,9 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
+         else:
+             prompt = (
+                 "## Script Error\n"
+-                "The data-collection script failed. Report this to the user.\n\n"
++                "The data-collection script failed. Report this error to the user "
++                "as your final response. Do NOT attempt to investigate, fix, "
++                "modify, or delete any files — only report the error text below.\n\n"
+                 f"```\n{script_output}\n```\n\n"
+                 f"{prompt}"
+             )
+@@ -2402,6 +2427,18 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+             )
+             return True, silent_doc, SILENT_MARKER, None
+ 
++    # The agent is about to run despite a failed data-collection script (the
++    # wakeAgent=false short-circuit above already returned for clean gates). Such
++    # a run only reports the error — strip its mutating toolsets below so it can't
++    # touch the vault (see _apply_failure_path_toolset_guard).
++    _script_failed = bool(script_path) and prerun_script is not None and not prerun_script[0]
++    if _script_failed:
++        logger.warning(
++            "Job '%s' (ID: %s): data-collection script failed — running report-only "
++            "agent with mutating toolsets (%s) disabled",
++            job_name, job_id, ", ".join(_FAILURE_PATH_BLOCKED_TOOLSETS),
++        )
++
+     try:
+         prompt = _build_job_prompt(job, prerun_script=prerun_script)
+     except CronPromptInjectionBlocked as block_exc:
+@@ -2817,7 +2854,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+             provider_sort=pr.get("sort"),
+             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
+             enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
+-            disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
++            disabled_toolsets=_apply_failure_path_toolset_guard(
++                _resolve_cron_disabled_toolsets(_cfg), _script_failed
++            ),
+             quiet_mode=True,
+             # Cron jobs should always inherit the user's SOUL.md identity from
+             # HERMES_HOME. When a workdir is configured, also inject project

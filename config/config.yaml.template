@@ -6,22 +6,34 @@
 # pack root at /opt/vault inside the gateway container.
 
 model:
-  # Default for interactive sessions. Cron jobs may override this per job in the
-  # generated cron-plus jobs file. gpt-oss-120b via OpenRouter — set
-  # OPENROUTER_API_KEY in the pack .env (the provider reads it from the env).
-  default: openai/gpt-oss-120b
+  # Default for interactive sessions AND every cron lane that doesn't override it. Lanes CAN
+  # override per job (extensions via `model:` in the manifest; engine/pack crons in the job
+  # def) — point a cheap lane (glossary) at a free model and a reasoning lane (predictions
+  # grading) at a strong one. Which model for which task: docs/model-selection.md.
+  # Ships free-first: a capable free NVIDIA Nemotron (120B/12B-active MoE, 1M context).
+  # All models here are OpenRouter — set OPENROUTER_API_KEY in the pack .env. A `:free` tier
+  # is rate-limited, so the fallback chain below catches a rate-limit/error.
+  default: nvidia/nemotron-3-super-120b-a12b:free
   provider: openrouter
 
-# Fallback chain used when the primary provider errors or is unreachable.
-# Keep at least one entry you have credentials or a reachable local endpoint for.
+# Fallback chain, in order, when the primary errors / is rate-limited / unreachable.
+# Free OpenRouter tiers first, then a known PAID escape (deepseek) — used only when every
+# free tier above is rate-limited. No openrouter/auto: it auto-routes to an unpredictable
+# (possibly paid) model; a single explicit paid fallback is the controllable choice.
 fallback_providers:
 - provider: openrouter
-  model: openai/gpt-oss-120b:free       # same model, free tier (rate-limited)
+  model: openai/gpt-oss-120b:free        # capable free workhorse (free tier)
+- provider: openrouter
+  model: nvidia/nemotron-3-nano-30b-a3b:free   # smaller/faster nemotron (free tier)
+- provider: openrouter
+  model: openrouter/free                 # Free Models Router — routes to ANY available free
+                                         #   model (the free counterpart of openrouter/auto)
 - provider: deepseek
-  model: deepseek-v4-pro                # needs DEEPSEEK_API_KEY
-- provider: custom
-  model: qwen3.5:27b                    # local Ollama / OpenAI-compatible endpoint
-  base_url: http://YOUR_OLLAMA_HOST:11434/v1
+  model: deepseek-v4-pro                 # PAID escape hatch — needs DEEPSEEK_API_KEY. Remove
+                                         #   this entry for a strictly-free deployment (then a
+                                         #   run fails if every free tier above is rate-limited).
+# A local model (no rate limits) is the better paid-free workhorse if you have the hardware:
+#   - {provider: custom, model: qwen3.5:27b, base_url: http://YOUR_OLLAMA_HOST:11434/v1}
 
 compression:
   enabled: true
@@ -53,7 +65,10 @@ mcp_servers:
   # local default here. If you set OKENGINE_MCP_TOKEN in .env, ensure-runtime.sh
   # rewrites this header to match at deploy time (okengine#32).
   okengine:
-    url: http://localhost:8730/mcp
+    # Service name on the per-pack bridge — the gateway and okengine-mcp share the compose
+    # default network, so this needs no host port and no port_offset (okengine#138). (A pre-#138
+    # deployment used http://localhost:8730/mcp; ensure-runtime.sh rewrites that to this.)
+    url: http://okengine-mcp:8730/mcp
     headers:
       Authorization: "Bearer okengine-local"
 
@@ -70,3 +85,10 @@ platform_toolsets:
   cron:
     - hermes-cron
     - no_mcp
+
+# Agent-wide toolset hygiene. OKEngine agents curate the vault through the enforced MCP write
+# path; they never run arbitrary code. `execute_code` is already runtime-blocked for cron jobs,
+# but it still rides in via hermes-cron's includes, so agents waste turns reaching for a tool
+# that is then refused. Disable it globally (defense-in-depth + no wasted turns).
+agent:
+  disabled_toolsets: [code_execution]

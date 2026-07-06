@@ -47,6 +47,10 @@ def test_covers_every_required_surface():
         "qmd index": "qmd status",
         "reader auth": "OKENGINE_READER_PASSWORD",
         "MCP token": "OKENGINE_MCP_TOKEN",
+        "api_server exposure (#120)": "api_server is LAN-exposed",
+        # NB: the iwe-dep check (#168) was intentionally removed by #179 — backlinks-refresh now
+        # builds the graph with an in-process link-scanner and needs no gateway iwe binary, so the
+        # verifier no longer probes for it. (Stale required-surface entry dropped.)
     }
     missing = [name for name, token in required.items() if token not in body]
     assert not missing, f"verifier no longer checks: {missing}"

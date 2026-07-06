@@ -52,15 +52,49 @@ fi
 # ship sentinels for per-install jitter (pack crons were expanded at `framework pull`); cron-plus
 # can't parse a raw sentinel, so an unexpanded one errors every tick and never runs (okengine#107).
 # Expand a temp copy, NOT $SRC, so the generated cron-plus-jobs.json stays round-trippable.
+# Also resolve any `@<profile>` model references against the pack's model-profiles.yaml
+# (okengine#151) — same deploy-only transform as @jitter (on the temp copy, never $SRC), so a
+# lane can switch ollama host / ctx. Fail-loud on an undefined profile (a broken fleet must not
+# deploy).
 DEPLOY_JOBS="$(mktemp)"
 trap 'rm -f "$DEPLOY_JOBS"' EXIT
-PYTHONPATH="$REPO_ROOT/scripts" python3 - "$SRC" "$DEPLOY_JOBS" <<'PY'
-import sys, json, cron_jitter
-src, out = sys.argv[1], sys.argv[2]
+# Morning-brief hour: the deployment's single "when do my daily briefs run" knob
+# (OKENGINE_BRIEF_HOUR in .env, gateway-local TZ). Brief lanes ship `@morning[:MM]`
+# sentinels; they expand to this hour at deploy so every deployment picks its own
+# morning without forking any schedule (okengine#177). Default 7.
+BRIEF_HOUR="$(grep -oE '^OKENGINE_BRIEF_HOUR=[0-9]+' "$PACK_DIR/.env" 2>/dev/null | cut -d= -f2 || true)"
+BRIEF_HOUR="${BRIEF_HOUR:-7}"
+PYTHONPATH="$REPO_ROOT/scripts" python3 - "$SRC" "$DEPLOY_JOBS" "$PACK_DIR" "$BRIEF_HOUR" <<'PY'
+import sys, json, cron_jitter, model_profiles
+src, out, pack_dir, brief_hour = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 d = json.load(open(src, encoding="utf-8"))
-n = cron_jitter.expand_jobs(d.get("jobs", []))
+jobs = d.get("jobs", [])
+bn = cron_jitter.expand_brief_jobs(jobs, brief_hour)
+n = cron_jitter.expand_jobs(jobs)
+try:
+    profiles = model_profiles.load_profiles(pack_dir)
+except (ValueError, OSError) as e:
+    print(f"ERROR: model-profiles.yaml: {e}", file=sys.stderr); sys.exit(1)
+perr = model_profiles.validate_profiles(profiles)
+if perr:
+    print("ERROR: model-profiles.yaml:\n  " + "\n  ".join(perr), file=sys.stderr); sys.exit(1)
+# Per-lane model overrides for non-extension lanes (engine/engine-template/domain), applied
+# BEFORE @-profile expansion so an `@profile` value here resolves like any other ref.
+try:
+    lane_models = model_profiles.load_lane_models(pack_dir)
+except (ValueError, OSError) as e:
+    print(f"ERROR: cron-models.json: {e}", file=sys.stderr); sys.exit(1)
+ln, lerr = model_profiles.apply_lane_models(jobs, lane_models)
+if lerr:
+    print("ERROR: cron-models.json (not deploying):\n  " + "\n  ".join(lerr), file=sys.stderr)
+    sys.exit(1)
+pn, jerr = model_profiles.expand_jobs(jobs, profiles)
+if jerr:
+    print("ERROR: model-profile references (not deploying):\n  " + "\n  ".join(jerr), file=sys.stderr)
+    sys.exit(1)
 json.dump(d, open(out, "w", encoding="utf-8"), indent=2)
-print(f"  expanded {n} @jitter sentinel(s) for deploy")
+print(f"  expanded {bn} @morning brief(s) @{brief_hour:02d}:MM + {n} @jitter sentinel(s) "
+      f"+ {ln} lane override(s) + {pn} model-profile ref(s) for deploy")
 PY
 
 # Target THIS pack's gateway via its compose project — NOT the first gateway on the host,
@@ -72,6 +106,17 @@ if [ -z "$CONTAINER" ]; then
 fi
 TS="$(date +%Y%m%d-%H%M%S)"
 
+# PREFLIGHT: the cron-plus plugin must exist in the gateway, or these jobs deploy into a silently
+# DEAD scheduler (jobs.json lands fine, nothing ever fires — a live deployment shipped exactly this
+# way). ensure-runtime.sh installs it (pinned) before compose; fail loud here as the backstop.
+if ! docker exec "$CONTAINER" sh -c "test -f /opt/data/plugins/cron-plus/runner.py" 2>/dev/null; then
+    echo "ERROR: cron-plus plugin missing in the gateway (/opt/data/plugins/cron-plus/runner.py)." >&2
+    echo "       These jobs would deploy into a DEAD scheduler — nothing would ever fire." >&2
+    echo "       Fix: bash \$ENGINE_DIR/scripts/ensure-runtime.sh (installs the pinned plugin)," >&2
+    echo "       then docker compose restart gateway, then re-run this script." >&2
+    exit 1
+fi
+
 # Create the runtime dir, snapshot any existing jobs.json, then stream the new one
 # in as `hermes` (so the cron-plus subprocess, also hermes, can read it).
 docker exec -u "$HERMES_UID" "$CONTAINER" mkdir -p /opt/data/cron-plus
@@ -82,6 +127,29 @@ echo "  deployed: $CONTAINER:$DEST_IN"
 
 JOB_COUNT=$(python3 -c "import json; print(len(json.load(open('$SRC'))['jobs']))")
 echo "  jobs: $JOB_COUNT"
+
+# --- guard (okengine#162): every deployed lane's `script` must be STAGED. A lane pointing at an
+#     unstaged script fails SILENTLY — cron-plus runs the agent with no wake-gate and writes nothing
+#     (how an enabled extension whose scripts were never deploy-cron-scripts'd goes dark). Fail-loud
+#     so a half-deployed stack cannot ship green. ---
+MISSING_SCRIPTS="$(docker exec -i -u "$HERMES_UID" "$CONTAINER" python3 - "$DEST_IN" <<'PY'
+import json, os, sys
+for j in json.load(open(sys.argv[1]))["jobs"]:
+    s = (j.get("script") or "").strip()
+    if not s:
+        continue
+    p = s if s.startswith("/") else "/opt/data/scripts/" + s
+    if not os.path.isfile(p):
+        print((j.get("name") or "?") + " -> " + p)
+PY
+)"
+if [ -n "$MISSING_SCRIPTS" ]; then
+    echo "ERROR: deployed lane(s) reference scripts that are NOT staged in the gateway:" >&2
+    echo "$MISSING_SCRIPTS" | sed 's/^/  MISSING  /' >&2
+    echo "  fix: CRON_PACK_DIR='$PACK_DIR' bash '$REPO_ROOT/scripts/deploy-cron-scripts.sh'" >&2
+    exit 1
+fi
+echo "  all $JOB_COUNT lane scripts staged"
 
 echo ""
 echo "Done. cron-plus self-heals null next_run_at on the next tick (~60s)."

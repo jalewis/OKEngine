@@ -48,15 +48,37 @@ if [ ! -f "$PACK/docker-compose.yml" ]; then
     exit 1
 fi
 
-# Default to the invoking user's uid/gid so a clone-as-yourself pack tree is writable out of
-# the box (okengine#102): you own the vault, and the gateway remaps to it. Pin a FIXED uid
-# (+ chown the tree to it) instead for a vault you'll move between hosts or share across
-# operators — see docs/deploy-a-new-domain.md §2.
-export HERMES_UID="${HERMES_UID:-$(id -u)}" HERMES_GID="${HERMES_GID:-$(id -g)}"
+# Resolve uid:gid. Precedence: an explicit shell export > a value already pinned in the pack's
+# .env (an operator's deliberate choice / a prior deploy) > the invoking user's uid. Preferring
+# the .env pin over $(id -u) means re-running deploy.sh as a different user can't silently retag
+# the tree. Default to the invoking user's uid so a clone-as-yourself pack tree is writable out
+# of the box (okengine#102): you own the vault, and the gateway remaps to it. Pin a FIXED uid
+# (+ chown the tree to it) for a vault you'll move between hosts or share across operators —
+# see docs/deploy-a-new-domain.md §2.
+_env_uid=""; _env_gid=""
+if [ -f "$PACK/.env" ]; then
+    _env_uid="$(grep -oE '^HERMES_UID=[0-9]+' "$PACK/.env" | cut -d= -f2 | head -1)"
+    _env_gid="$(grep -oE '^HERMES_GID=[0-9]+' "$PACK/.env" | cut -d= -f2 | head -1)"
+fi
+export HERMES_UID="${HERMES_UID:-${_env_uid:-$(id -u)}}" HERMES_GID="${HERMES_GID:-${_env_gid:-$(id -g)}}"
 PYTHON="${PYTHON:-python3}"
 
 echo "==> OKEngine deploy: $PACK"
 echo "    engine $ENGINE_DIR · uid:gid $HERMES_UID:$HERMES_GID"
+
+# PERSIST the resolved uid:gid to .env if not already pinned, so EVERY later op uses the same uid
+# the runtime tree is owned by — a plain `docker compose up`, a `--force-recreate` (config reads
+# need one), or a standalone `deploy-cron-*.sh`. Without this the uid is set only for THIS process;
+# a later bare compose call falls back to the image default (10000), desyncs ownership from the
+# mounted tree, and the cron-plus ticker dies on a `.tick.lock` PermissionError — nothing schedules
+# (the exact trap that forced a full rebuild of a review instance). Idempotent; never overrides an
+# existing pin. CREATE .env if the operator hasn't yet: ensure-runtime.sh (step 2) appends its own
+# keys with `>>` and would otherwise mint a .env with NO uid pin on a clean deploy — pin FIRST here.
+[ -f "$PACK/.env" ] || : > "$PACK/.env"
+if ! grep -qE '^HERMES_UID=' "$PACK/.env"; then
+    printf '\n# uid:gid the gateway remaps to; pinned by deploy.sh so bare docker-compose ops match\n# the runtime tree owner (else compose defaults to 10000 and the scheduler dies on a perm error).\nHERMES_UID=%s\nHERMES_GID=%s\n' "$HERMES_UID" "$HERMES_GID" >> "$PACK/.env"
+    echo "    pinned HERMES_UID:GID=$HERMES_UID:$HERMES_GID -> .env (matches the runtime tree owner)"
+fi
 
 # 1. validate — don't deploy a broken pack.
 if [ "$SKIP_VALIDATE" = 0 ]; then
@@ -66,6 +88,16 @@ if [ "$SKIP_VALIDATE" = 0 ]; then
         exit 1
     fi
 fi
+
+# 1b. Recompose the schema artifact. The enforced write path prefers <pack>/.okengine/
+#     composed-schema.yaml when present, but ONLY `framework extensions enable/disable` ever
+#     regenerated it — so a plain schema.yaml edit was silently ignored on the write path until the
+#     next extension toggle (okengine#178). write_composed_schema regenerates it from the CURRENT
+#     schema.yaml + enabled extensions, or REMOVES a stale artifact when no schema-extensions remain
+#     (a no-op when a pack has neither). Non-fatal.
+"$PYTHON" -c "import sys, pathlib; sys.path.insert(0, '$ENGINE_DIR/scripts'); import extension_compose as c; errs = c.write_composed_schema(pathlib.Path('$PACK')); [print('    WARN: recompose:', e) for e in (errs or [])]" \
+    && echo "    schema artifact recomposed from current schema.yaml + extensions" \
+    || echo "    WARN: composed-schema recompose failed (non-fatal)" >&2
 
 # 2. seed the runtime dir + ensure it's writable by HERMES_UID BEFORE compose binds it,
 #    and install the cron-plus scheduler plugin into the runtime (the seeded config
@@ -99,9 +131,14 @@ else
     fi
 fi
 
-# 4. bring up the containers (from the pack dir, where docker-compose.yml lives).
-echo "==> [4/6] docker compose up -d"
-( cd "$PACK" && ENGINE_DIR="$ENGINE_DIR" docker compose up -d )
+# 4. bring up the containers (from the pack dir, where docker-compose.yml lives). Use --build so
+#    the SIBLING images (okengine-reader/-mcp/-cockpit — the only services with a compose `build:`)
+#    are rebuilt when their COPY'd source changed. Plain `up -d` builds an image only when ABSENT,
+#    so after the first deploy those three froze and shipped stale baked code silently — the gateway
+#    (built separately by build-engine-image.sh, step 3) has no `build:` here, so --build never
+#    touches it (okengine#178). --build uses the layer cache, so an unchanged image is a fast no-op.
+echo "==> [4/6] docker compose up -d --build"
+( cd "$PACK" && ENGINE_DIR="$ENGINE_DIR" docker compose up -d --build )
 
 # 5. deploy cron scripts + jobs.
 if [ "$NO_CRONS" = 0 ]; then

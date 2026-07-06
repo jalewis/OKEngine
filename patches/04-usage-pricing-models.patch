@@ -1,8 +1,8 @@
 diff --git a/agent/usage_pricing.py b/agent/usage_pricing.py
-index 8d6b85cd0..68d043a7a 100644
+index 32338caff..21caec0f3 100644
 --- a/agent/usage_pricing.py
 +++ b/agent/usage_pricing.py
-@@ -533,6 +533,18 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
+@@ -561,6 +561,18 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
          source="official_docs_snapshot",
          pricing_version="minimax-pricing-2026-04",
      ),

@@ -28,7 +28,7 @@ pack-template/
 
 ```sh
 # from wherever the template lives:
-./new-pack.sh okpack-fin "finance threat & fraud vault" --offset 400 --engine v0.2.0
+./new-pack.sh okpack-fin "finance threat & fraud vault" --offset 400   # --engine defaults to this engine's release
 #            ^pack name   ^human title                   ^host port offset ^engine pin
 ```
 

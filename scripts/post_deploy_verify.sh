@@ -46,7 +46,14 @@ for svc in "$GW" "$MCP" "$READER"; do
 done
 
 # helper: host port + bind for a service's container port
-hostport() { docker compose port "$1" "$2" 2>/dev/null | tail -1; }   # ip:port or empty
+hostport() {   # ip:port, or EMPTY when unpublished
+    # docker compose v2 prints ":0" (not empty) for an unpublished port — treating
+    # that as a binding made check [3] curl port 0 and FAIL "returned 000" on every
+    # stack whose MCP is deliberately bridge-internal (the skeleton default).
+    local o; o=$(docker compose port "$1" "$2" 2>/dev/null | tail -1)
+    case "$o" in ""|*:0) return 0 ;; esac
+    printf '%s\n' "$o"
+}
 
 # 2. reader ------------------------------------------------------------------
 echo "[2] reader"
@@ -84,6 +91,31 @@ else
     else bad "MCP /mcp returned $code" "docker compose logs $MCP"; fi
 fi
 
+# 3b. gateway api_server exposure (okengine#120) ----------------------------
+# The host-net gateway's OpenAI-compatible api_server (the reader Chat relay target)
+# binds per API_SERVER_HOST. If it's listening on a NON-loopback interface it's
+# LAN-reachable — unnecessary attack surface even when authenticated. Defense-in-depth
+# guard, paralleling the MCP guard above (the equivalent posture #120 asks for).
+echo "[3b] gateway api_server exposure"
+if ! command -v ss >/dev/null 2>&1; then
+    wn "ss unavailable — can't probe api_server (:8642) exposure" "install iproute2 to enable the okengine#120 check"
+else
+    API_BIND=$(ss -ltn 2>/dev/null | awk '{print $4}' | grep -E ':8642$' | head -1)
+    if [ -z "$API_BIND" ]; then ok "api_server not listening on :8642 (Chat/api_server feature off) — no exposure"
+    else
+        acode=$(curl -s -o /dev/null -w "%{http_code}" -m8 "http://127.0.0.1:8642/v1/models")
+        case "$API_BIND" in
+            127.0.0.1:*|"[::1]:"*) ok "api_server bound to $API_BIND (loopback-only) — not LAN-exposed" ;;
+            *)
+                if [ "$acode" = "401" ] || [ "$acode" = "403" ]; then
+                    wn "api_server is LAN-exposed on $API_BIND (authenticated)" "defense-in-depth: set API_SERVER_HOST=127.0.0.1, or move the gateway to a bridge (okengine#120/#138); keep a strong API_SERVER_KEY"
+                else
+                    bad "api_server LAN-exposed on $API_BIND and returned $acode without a key" "set a strong API_SERVER_KEY and bind API_SERVER_HOST=127.0.0.1 (okengine#120)"
+                fi ;;
+        esac
+    fi
+fi
+
 # 4. MCP write server (stdio, in the gateway) --------------------------------
 echo "[4] MCP write server"
 # The runtime config is the pack's .hermes-data mounted at /opt/data, NOT under /opt/vault
@@ -103,6 +135,21 @@ if [ -n "$njobs" ] && [ "$njobs" -gt 0 ] 2>/dev/null; then ok "cron-plus has $nj
 else bad "cron-plus jobs.json empty/absent" "CRON_PACK_DIR=<pack> bash ../okengine/scripts/deploy-cron-plus-jobs.sh"; fi
 if dcx "$GW" test -f /opt/data/cron-plus/.tick.lock; then ok "cron-plus is ticking (.tick.lock present)"
 else wn "no .tick.lock — scheduler may not have ticked yet" "give it a minute, then re-check; else docker compose logs $GW"; fi
+# 5c. runtime-dir ownership — the ticker + every lane run AS $HERMES_UID and must OWN /opt/data to
+# write .tick.lock/jobs.json. A tree owned by a DIFFERENT uid (brought up with the compose default
+# 10000 while the mounted .hermes-data is the operator's uid) kills the scheduler on a
+# PermissionError. The .tick.lock check above passes on a CONSISTENT deploy but not on a later uid
+# desync (a bare recreate without HERMES_UID) — catch that here, at the deploy-time gate that runs
+# regardless of scheduler health (deployment-validate can't: a dead ticker never runs its lane).
+want_uid="$(dcx "$GW" sh -c 'echo ${HERMES_UID:-10000}' 2>/dev/null | tr -d '[:space:]')"
+got_uid="$(dcx "$GW" stat -c '%u' /opt/data/cron-plus 2>/dev/null | tr -d '[:space:]')"
+if [ -n "$want_uid" ] && [ -n "$got_uid" ] && [ "$got_uid" != "$want_uid" ]; then
+    bad "runtime /opt/data/cron-plus owned by uid $got_uid but the gateway runs as $want_uid" \
+        "the scheduler dies on .tick.lock; pin HERMES_UID=$got_uid in .env + recreate, or chown .hermes-data to $want_uid"
+else ok "runtime dir owned by the gateway uid (${got_uid:-?})"; fi
+
+# 5b. NB: backlinks-refresh no longer needs an iwe binary (okengine#179 — it builds the graph
+# with an in-process link-scanner), so there is no gateway iwe dependency to verify here anymore.
 
 # 6. search index (qmd) ------------------------------------------------------
 # qmd stores its index under XDG dirs inside the mcp container (engine-standard layout);

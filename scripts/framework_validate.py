@@ -74,7 +74,12 @@ class Report:
 
 
 def _load_yaml(p: Path):
-    return yaml.safe_load(p.read_text(encoding="utf-8"))
+    """Parse a YAML file; return None on a parse error so a broken pack file fails/skips gracefully
+    instead of crashing the whole validator (callers report the FAIL or `or {}` past it)."""
+    try:
+        return yaml.safe_load(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 def check_schema(pack: Path, r: Report) -> None:
@@ -85,10 +90,9 @@ def check_schema(pack: Path, r: Report) -> None:
     if yaml is None:
         r.warn("schema.yaml", "PyYAML unavailable; skipped parse")
         return
-    try:
-        sch = _load_yaml(sp)
-    except Exception as e:
-        r.fail("schema.yaml parses", f"YAML error: {str(e)[:140]}")
+    sch = _load_yaml(sp)
+    if sch is None:
+        r.fail("schema.yaml parses", "empty or unparseable YAML")
         return
     if not isinstance(sch, dict):
         r.fail("schema.yaml shape", "top level is not a mapping")
@@ -101,8 +105,13 @@ def check_schema(pack: Path, r: Report) -> None:
     else:
         r.ok("schema.okf.required", f"{req}")
     types = sch.get("types")
-    if not isinstance(types, dict) or not types:
-        r.fail("schema.types", "must be a non-empty mapping of page types")
+    if types in (None, {}):
+        # A pack may declare ZERO types and inherit the whole engine-owned core (okengine#90):
+        # the merged schema still carries source/concept/prediction/… — so this is valid, just a
+        # minimal pack (the scaffold's starting state). Domain types get added on top.
+        r.ok("schema.types", "none declared — inherits the engine core (okengine#90)")
+    elif not isinstance(types, dict):
+        r.fail("schema.types", "must be a mapping of page types")
     else:
         bad = [t for t, d in types.items()
                if not isinstance(d, dict) or "type" not in (d.get("required") or ["type"])]
@@ -138,9 +147,16 @@ def _check_engine_inputs(sch: dict, type_names: set, r: Report) -> None:
             shadow = sorted({str(k) for k in aliases} & type_names)
             if unknown:
                 r.warn("schema.type_aliases", f"alias target(s) not in `types:` {unknown}")
-            elif shadow:
-                r.warn("schema.type_aliases", f"alias key(s) are themselves declared types: {shadow}")
-            else:
+            if shadow:
+                # FAIL, not WARN — same severity as coinstall_preflight and the
+                # deployment-validate lane. An alias key that IS a declared type makes
+                # the normalization drains silently retype canonical pages; a pack-side
+                # WARN here let exactly that reach a live deployment (the digest-alias
+                # class caught on the v0.9.0 readiness sweep).
+                r.fail("schema.type_aliases", f"alias key(s) SHADOW declared types "
+                                              f"(drains would silently retype pages — retire the "
+                                              f"alias or the type): {shadow}")
+            if not unknown and not shadow:
                 r.info("schema.type_aliases", f"{len(aliases)} alias(es)")
     hints = sch.get("classify_hints")
     if hints is not None:
@@ -166,6 +182,127 @@ def _check_engine_inputs(sch: dict, type_names: set, r: Report) -> None:
                 f"schema.{key}", f"entr(ies) not in `types:` {unknown}" if unknown else f"{len(val)} entr(ies)")
         else:
             r.info(f"schema.{key}", f"{len(val)} entr(ies)")
+
+
+def check_compose_drift(pack: Path, r: Report) -> None:
+    """#169 class 2: pack composes are hand-copied skeleton snapshots and drift (one live
+    pack shipped its reader with ZERO auth env). Checks fail-safe env plumbing and that
+    pack.yaml's port_offset agrees with the bound ports."""
+    cf = pack / "docker-compose.yml"
+    if not cf.is_file():
+        return
+    try:
+        comp = yaml.safe_load(cf.read_text()) or {}
+    except Exception as e:
+        r.fail("compose drift", f"docker-compose.yml unparseable ({e})")
+        return
+    services = comp.get("services") or {}
+    for svc in ("okengine-reader", "okengine-cockpit"):
+        s = services.get(svc)
+        if not s:
+            continue
+        env = " ".join(map(str, s.get("environment") or []))
+        for var in ("OKENGINE_TRUST", "OKENGINE_BIND", "OKENGINE_READER_PASSWORD"):
+            if var not in env:
+                r.fail("compose drift", f"{svc} missing {var} plumbing — the auth/trust "
+                                        "fail-safe is skeleton-standard (okengine#90 P4a)")
+    meta = _load_yaml(pack / "pack.yaml") or {}
+    if meta.get("port_offset"):
+        import re as _re
+        # Scan only ACTUAL bindings: drop full-line comments first, so a commented-out example
+        # (e.g. a doc line showing the un-offset mcp port `# ports: [...:8730:8730]`) is not
+        # mistaken for a live binding and does not trip the drift check.
+        raw = "\n".join(ln for ln in cf.read_text().splitlines() if not ln.lstrip().startswith("#"))
+        base_hits = sorted({p for p in _re.findall(r":(\d{4,5}):\d+", raw)
+                            if p in ("9200", "9201", "8730")})
+        if base_hits:
+            r.fail("compose drift", f"pack.yaml declares port_offset {meta['port_offset']} but "
+                                    f"compose binds un-offset base port(s) {base_hits}")
+
+
+def check_prompt_residue(pack: Path, r: Report) -> None:
+    """#169 class 4 (structural form): prompts referencing `type:` tokens or [[ns/ link
+    prefixes the pack's schema doesn't declare — sibling-domain residue from cloned cron
+    trees. Prose-noun residue still needs a human read."""
+    import re as _re
+    sch = _load_yaml(pack / "schema.yaml") or {}
+    types = set(sch.get("types") or {}) | {"source", "concept", "prediction", "finding",
+        "dashboard", "briefing", "trend", "entity", "gap", "term", "lacuna", "battle-card",
+        "daily-brief", "weekly-review", "marketing-pulse",
+        # first-party extension-owned types (fragments compose them in when enabled)
+        "messaging-brief", "value-prop-snapshot", "forecast-review", "portfolio-watch"}
+    nss = set((sch.get("partitioning") or {}).get("namespaces") or {}) | {"entities",
+        "sources", "concepts", "predictions", "findings", "briefings", "trends", "dashboards",
+        "operational", "raw", "gaps", "glossary", "lacuna", "marketing", "reports", "dailies",
+        "doctrine", "config"}
+    blob = ""
+    for f in ("crons/domain-crons.json", "crons/engine-template-prompts.json"):
+        p = pack / f
+        if p.is_file():
+            blob += p.read_text(encoding="utf-8", errors="replace")
+    for s in sorted({m for m in _re.findall(r"type:\s*([a-z][a-z0-9-]{2,})", blob) if m not in types})[:6]:
+        r.warn("prompt residue", f"prompts reference `type: {s}` — not in this pack's schema (sibling residue?)")
+    for s in sorted({m for m in _re.findall(r"\[\[([a-z][a-z0-9-]{2,})/", blob) if m not in nss})[:6]:
+        r.warn("prompt residue", f"prompts link [[{s}/ — namespace not declared here")
+
+
+def check_validator_vintage(pack: Path, r: Report) -> None:
+    """#169 class 3: three vintages of vendored validate.py gave three verdicts on one
+    contract. The skeleton's copy carries VALIDATE_VERSION; missing/older stamp = refresh."""
+    vp = pack / "validate.py"
+    if not vp.is_file():
+        return
+    import re as _re
+    m = _re.search(r'VALIDATE_VERSION\s*=\s*"([^"]+)"', vp.read_text(encoding="utf-8", errors="replace"))
+    skel = Path(__file__).resolve().parent.parent / "templates/pack/skeleton/validate.py"
+    sm = _re.search(r'VALIDATE_VERSION\s*=\s*"([^"]+)"', skel.read_text()) if skel.is_file() else None
+    if not m:
+        r.warn("validator vintage", "vendored validate.py has no VALIDATE_VERSION stamp — "
+                                    "pre-consolidation vintage; refresh from the skeleton")
+    elif sm and m.group(1) != sm.group(1):
+        r.warn("validator vintage", f"validate.py {m.group(1)} vs skeleton {sm.group(1)} — refresh")
+
+
+def check_subdomain_form(pack: Path, r: Report) -> None:
+    """Single-source rule for the co-install form (authoring-a-pack §8): every type a
+    subdomain/ schema or host-schema-additions file declares must exist in the pack's
+    MAIN schema with the same required fields — the co-install form is DERIVED from the
+    standalone schema, and drift between the two forms is a shipped bug."""
+    sub = pack / "subdomain"
+    if not sub.is_dir():
+        r.info("subdomain form", "none shipped (standalone-only pack; see authoring-a-pack §8)")
+        return
+    main = _load_yaml(pack / "schema.yaml") or {}
+    mtypes = main.get("types") or {}
+    for f in sorted(sub.glob("*.yaml")):  # glob-ok: pack subdomain/ dir is flat, not a sharded vault namespace
+        d = _load_yaml(f)
+        if d is None:
+            r.fail("subdomain form", f"{f.name}: unparseable")
+            continue
+        stypes = d.get("types") or {}
+        for tname, tdef in stypes.items():
+            if tname not in mtypes:
+                r.fail("subdomain form", f"{f.name}: type '{tname}' not in the main schema — "
+                                          "the co-install form must be derived, not divergent")
+            else:
+                mreq = set((mtypes[tname] or {}).get("required") or [])
+                sreq = set((tdef or {}).get("required") or [])
+                if mreq != sreq:
+                    r.fail("subdomain form", f"{f.name}: type '{tname}' required-fields drift "
+                                              f"(main {sorted(mreq)} vs form {sorted(sreq)})")
+        if stypes:
+            r.ok("subdomain form", f"{f.name}: {len(stypes)} type(s), all ⊆ main schema")
+        # a subdomain schema (the walk-up contract that LANDS) that declares types but
+        # no partitioning leaves the installer with no dirs to create and the subtree's
+        # namespace guard a NO-OP — found live on the first automated subtree install
+        if (f.name == "schema.yaml" and stypes
+                and not ((d.get("partitioning") or {}).get("namespaces"))):
+            r.warn("subdomain form", f"{f.name}: declares types but no "
+                                     "partitioning.namespaces — the installer creates no "
+                                     "dirs and the subtree namespace guard won't enforce")
+    if (not (sub / "INSTALL-ALONGSIDE.md").is_file() and not list(sub.glob("INSTALL*.md"))  # glob-ok: flat pack dir
+            and not (sub / "README.md").is_file()):
+        r.warn("subdomain form", "subdomain/ ships no INSTALL doc — the probes ARE the contract")
 
 
 def check_persona(pack: Path, r: Report) -> None:
@@ -299,6 +436,73 @@ def _cron_expr(d: dict) -> str:
     if isinstance(sched, str):
         return sched.strip()
     return str(d.get("expr") or "").strip()
+
+
+def _model_profiles_mod():
+    """Load the sibling model_profiles module by path (no package assumptions)."""
+    import importlib.util
+    p = Path(__file__).resolve().parent / "model_profiles.py"
+    spec = importlib.util.spec_from_file_location("model_profiles", p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def check_model_profiles(pack: Path, r: Report) -> None:
+    """Validate the optional model-profiles registry (okengine#151) and that every `@<profile>`
+    reference the operator wrote (pack domain crons + extension-models.json) resolves — fail
+    BEFORE deploy, where an undefined reference would otherwise abort the fold."""
+    mp = _model_profiles_mod()
+    f = pack / ".okengine" / "model-profiles.yaml"
+    try:
+        profiles = mp.load_profiles(pack)
+    except Exception as e:                       # malformed YAML / wrong shape
+        r.fail(".okengine/model-profiles.yaml", str(e)[:140])
+        return
+    if not f.is_file():
+        # No registry is fine — but an `@`-ref with no registry can never resolve, so flag it.
+        refs = _collect_model_refs(pack, mp)
+        if refs:
+            r.fail("model profiles", f"{sorted(refs)} referenced but .okengine/model-profiles.yaml "
+                                     "is absent — define the profiles or use literal model names")
+        else:
+            r.info("model profiles", "none declared (lanes use literal models / the config default)")
+        return
+    shape_errs = mp.validate_profiles(profiles)
+    if shape_errs:
+        for e in shape_errs:
+            r.fail("model profiles", e)
+        return
+    refs = _collect_model_refs(pack, mp)
+    missing = sorted(n for n in refs if n not in profiles)
+    if missing:
+        r.fail("model profiles", f"undefined profile reference(s): {missing} "
+                                 f"(defined: {sorted(profiles)})")
+    else:
+        r.ok("model profiles", f"{len(profiles)} profile(s); {len(refs)} reference(s) resolve")
+
+
+def _collect_model_refs(pack: Path, mp) -> set[str]:
+    """Profile names referenced (`@name`) across the pack's operator-facing model hooks: domain
+    cron defs and the extension-models override map."""
+    refs: set[str] = set()
+    dc = pack / "crons" / "domain-crons.json"
+    if dc.is_file():
+        try:
+            for d in json.loads(dc.read_text(encoding="utf-8")) or []:
+                if isinstance(d, dict) and mp.is_ref(d.get("model")):
+                    refs.add(mp.ref_name(d["model"]))
+        except (ValueError, OSError):
+            pass                                  # shape errors reported by check_crons
+    em = pack / ".okengine" / "extension-models.json"
+    if em.is_file():
+        try:
+            for v in (json.loads(em.read_text(encoding="utf-8")) or {}).values():
+                if mp.is_ref(v):
+                    refs.add(mp.ref_name(v))
+        except (ValueError, OSError):
+            pass
+    return refs
 
 
 def check_crons(pack: Path, r: Report) -> None:
@@ -496,6 +700,7 @@ def check_surface_auth(pack: Path, r: Report) -> None:
     text = compose.read_text(encoding="utf-8", errors="replace")
     env = _read_dotenv(pack)
     has_reader = "okengine-reader" in text and "ports:" in text
+    has_cockpit = "okengine-cockpit" in text and "ports:" in text
     has_mcp = "okengine-mcp" in text and "ports:" in text
     if not _is_exposed(text, env):
         r.info("network exposure", "host ports bind loopback (local-first default)")
@@ -507,10 +712,25 @@ def check_surface_auth(pack: Path, r: Report) -> None:
                "built-in default 'okengine-local' — set a real secret")
     elif has_mcp:
         r.ok("MCP auth", "exposed with a custom token")
-    if has_reader and not (env.get("OKENGINE_READER_PASSWORD") or "").strip():
-        r.fail("reader auth", "exposed beyond localhost but .env has no OKENGINE_READER_PASSWORD")
-    elif has_reader:
-        r.ok("reader auth", "exposed with a password set")
+    # reader/cockpit auth is TRUST-AWARE (okengine#90 P4a): a PUBLIC reference deployment is
+    # intentionally open, but a PRIVATE vault exposed without a password is a hard FAIL (both UIs
+    # also fail-closes at runtime). They SHARE OKENGINE_READER_PASSWORD — the cockpit is a superset
+    # of the reader and must not be laxer. Trust comes from pack.yaml.
+    _trust = "private"
+    if (pack / "pack.yaml").is_file():
+        _trust = str((_load_yaml(pack / "pack.yaml") or {}).get("trust") or "private").strip().lower()
+    _has_pw = bool((env.get("OKENGINE_READER_PASSWORD") or "").strip())
+    for _label, _present in (("reader auth", has_reader), ("cockpit auth", has_cockpit)):
+        if not _present:
+            continue
+        if not _has_pw:
+            if _trust == "public":
+                r.warn(_label, "exposed with no password — intended for a PUBLIC pack (anyone can read)")
+            else:
+                r.fail(_label, "PRIVATE pack exposed beyond localhost with no OKENGINE_READER_PASSWORD "
+                       "— set a password, bind to loopback, or declare `trust: public` (#90 P4a)")
+        else:
+            r.ok(_label, "exposed with a password set")
 
 
 def _runtime_gitignored(pack: Path) -> bool:
@@ -643,15 +863,126 @@ def check_pack_meta(pack: Path, r: Report) -> None:
         return
     if meta["trust"] not in ("public", "private"):
         r.fail("pack.yaml trust", f"'{meta['trust']}' — must be public or private")
-    if not (meta["owns_types"] or meta["owns_namespaces"]):
-        r.warn("pack.yaml owns", "declares no owned types/namespaces")
-    else:
-        r.ok("pack.yaml", f"{meta['name']} v{meta['version']} "
-             f"({meta['trust']}; owns {len(meta['owns_types'])} type(s), "
-             f"{len(meta['owns_namespaces'])} namespace(s))")
+    if not (meta["owns_types"] or meta["owns_namespaces"]) and meta.get("kind") != "bundle":
+        # Valid but minimal: a pack may own nothing and inherit the engine core (okengine#90);
+        # it just contributes no domain ids yet. Nudge, don't fail. (A bundle owns nothing BY
+        # DESIGN — okengine#181 — so it's exempt; check_bundle validates its recipe instead.)
+        r.warn("pack.yaml owns", "declares no owned types/namespaces (inherits the engine core)")
+    r.ok("pack.yaml", f"{meta['name']} v{meta['version']} "
+         f"({meta['trust']}; owns {len(meta['owns_types'])} type(s), "
+         f"{len(meta['owns_namespaces'])} namespace(s))")
     if meta.get("port_offset"):
         r.info("pack.yaml port_offset", f"{meta['port_offset']} (reader {9200 + meta['port_offset']}, "
                f"mcp {8730 + meta['port_offset']} — applied by framework pull)")
+    # description/mission feed the reader/cockpit ABOUT panel, the catalog blurb and
+    # `framework list` — one declaration, three surfaces (multi-surface rule). Read
+    # raw: load_pack_meta normalizes composition keys only.
+    raw = _load_yaml(pack / "pack.yaml") or {}
+    if not str(raw.get("description") or "").strip():
+        r.warn("pack.yaml description", "missing — the About panel and catalog have "
+                                        "nothing to say about this deployment's purpose")
+    elif "TODO" in str(raw.get("mission") or ""):
+        r.warn("pack.yaml mission", "still the scaffold TODO — write the reader-facing paragraph")
+
+
+def _is_bundle(pack: Path) -> bool:
+    """True iff the pack declares `kind: bundle` (owns nothing; composes other packs)."""
+    if not (pack / "pack.yaml").is_file():
+        return False
+    try:
+        meta = _pack_meta_mod().load_pack_meta(pack)
+    except Exception:
+        return False
+    return bool(meta and meta.get("kind") == "bundle")
+
+
+def check_bundle(pack: Path, r: Report) -> None:
+    """Validate a `kind: bundle` pack's recipe (okengine#181): owns-nothing, a `host` base
+    pack, a non-empty `compose` list (host not in it, no self/dupes), and every recipe member
+    declared in `requires`. A bundle ships no schema/persona/crons/feeds/wiki, so the
+    domain-content checks are skipped for it (see validate())."""
+    try:
+        meta = _pack_meta_mod().load_pack_meta(pack)
+    except Exception as e:
+        r.fail("bundle recipe", f"could not load pack.yaml: {str(e)[:120]}")
+        return
+    errs = _pack_meta_mod().validate_bundle_recipe(meta or {})
+    if errs:
+        for e in errs:
+            r.fail("bundle recipe", e)
+    else:
+        r.ok("bundle recipe",
+             f"host {meta['bundle_host']} + composes {len(meta['bundle_compose'])} pack(s): "
+             f"{', '.join(meta['bundle_compose'])}")
+
+
+def _discovery_mod():
+    import importlib.util
+    p = Path(__file__).resolve().parent / "extension_discovery.py"
+    spec = importlib.util.spec_from_file_location("extension_discovery", p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def _schema_ext_owners(pack: Path) -> set[str]:
+    """Extension ids hard-referenced as owners in the pack's schema.yaml ``owners:`` map
+    (grammar: engine | pack:<name> | ext:<id>) — implicit pack->extension deps (#142 D)."""
+    sp = pack / "schema.yaml"
+    if not sp.is_file():
+        return set()
+    data = _load_yaml(sp) or {}
+    owners = data.get("owners") if isinstance(data, dict) else None
+    out: set[str] = set()
+    for grp in ("types", "fields"):
+        for owner in ((owners or {}).get(grp) or {}).values():
+            if isinstance(owner, str) and owner.startswith("ext:"):
+                out.add(owner[len("ext:"):])
+    return out
+
+
+def check_extension_requirements(pack: Path, r: Report) -> None:
+    """okengine#142 (A+D): a pack can require an extension (`requires: [ext:<id>@>=ver]`),
+    and a pack schema can annotate an `ext:<id>` owner. Both must resolve to an ENABLED
+    extension (explicit or core-default-on) at the version floor — fail-loud BEFORE deploy
+    rather than degrade silently at runtime when the operator didn't enable it."""
+    pm = _pack_meta_mod()
+    meta = None
+    if (pack / "pack.yaml").is_file():
+        try:
+            meta = pm.load_pack_meta(pack)
+        except Exception:
+            return                              # pack.yaml errors already reported above
+    ext_reqs = pm.extension_requires(meta) if meta else []
+    schema_owners = _schema_ext_owners(pack)
+    if not ext_reqs and not schema_owners:
+        return                                  # no declared pack->extension coupling
+
+    disc = _discovery_mod()
+    resolved, errs = disc.resolve_for_pack(pack)
+    for e in errs:
+        r.warn("extension resolve", e)
+    versions = {eid: str(rec.get("manifest", {}).get("version", "0"))
+                for eid, rec in resolved.items()}
+
+    for ext_id, spec in ext_reqs:
+        if ext_id not in resolved:
+            r.fail(f"requires ext:{ext_id}",
+                   f"required by the pack but not enabled — "
+                   f"`framework extensions enable <pack> {ext_id}` (or mark it core)")
+        elif spec and not pm.satisfies(versions[ext_id], spec):
+            r.fail(f"requires ext:{ext_id}@{spec}",
+                   f"enabled at {versions[ext_id]} — version floor not met")
+        else:
+            r.ok(f"requires ext:{ext_id}", f"enabled ({versions[ext_id]})")
+
+    for ext_id in sorted(schema_owners - {e for e, _ in ext_reqs}):
+        if ext_id not in resolved:
+            r.fail(f"schema owner ext:{ext_id}",
+                   "a type/field is owned by this extension but it isn't enabled — "
+                   "enable it or drop the owner annotation")
+        else:
+            r.ok(f"schema owner ext:{ext_id}", "enabled")
 
 
 def check_tokens(pack: Path, r: Report) -> None:
@@ -675,12 +1006,24 @@ def check_tokens(pack: Path, r: Report) -> None:
 def validate(pack: Path, probe: bool = False) -> Report:
     r = Report()
     check_tokens(pack, r)
+    if _is_bundle(pack):
+        # A bundle (okengine#181) owns nothing and ships no schema/persona/crons/feeds/wiki —
+        # it composes other packs. Validate identity + recipe + engine pin + docs/env only; the
+        # domain-content checks below don't apply and would spuriously FAIL on absent files.
+        check_pack_meta(pack, r)
+        check_bundle(pack, r)
+        check_engine_version(pack, r)
+        check_docs(pack, r)
+        check_env(pack, r)
+        return r
     check_schema(pack, r)
     check_persona(pack, r)
     check_engine_version(pack, r)
     check_pack_meta(pack, r)
+    check_extension_requirements(pack, r)
     check_feeds(pack, r, probe)
     check_crons(pack, r)
+    check_model_profiles(pack, r)
     check_env(pack, r)
     check_gateway_env(pack, r)
     check_vault_mount(pack, r)
@@ -688,6 +1031,10 @@ def validate(pack: Path, probe: bool = False) -> Report:
     check_runtime_config(pack, r)
     check_docs(pack, r)
     check_wiki(pack, r)
+    check_subdomain_form(pack, r)
+    check_compose_drift(pack, r)
+    check_prompt_residue(pack, r)
+    check_validator_vintage(pack, r)
     return r
 
 

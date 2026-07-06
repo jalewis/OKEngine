@@ -1,0 +1,14 @@
+# okengine.completeness schema fragment — the §5 "Own" case.
+# Folded into the composed schema only when the extension is enabled; owner =
+# ext:okengine.completeness. A pack that enables it must not already own a `gap`
+# type or `gaps` namespace (the composer fails loud on collision).
+owns:
+  namespaces: [gaps]
+  types:
+    gap:
+      # a detected completeness gap: which rule fired, on what subject, and the exact
+      # unmet expectation. status lifecycle: open -> resolved (auto, expectation now met)
+      #                                          -> dismissed (operator, with reason — never reopened)
+      required: [type, rule, subject, severity, status]
+      optional: [expectation, resolution_hint, first_seen, last_seen, resolved_on,
+                 dismiss_reason, sources]

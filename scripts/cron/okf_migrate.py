@@ -6,10 +6,19 @@ as a SINGLE O(n) pass over the corpus, because per-file `iwe rename` rebuilds th
 graph each call (~13s on 40k = infeasible at scale). `iwe stats` is the validator
 (run before/after: reference count must be unchanged), not the mover.
 
-Phase 1 target: entities/ (flat) -> entities/{type}/[{letter}/]{slug}, where the
-dominant types (e.g. type-a/type-b, each >500) are letter-sharded to
-keep buckets under the OKF 500-entry rule. Only canonical-typed entities move;
-ambiguous/typeless ones stay at entities/ root for classify-drain.
+Target layout is CONFIG-DRIVEN: the governing schema.yaml's `partitioning` block
+(inherited from base-schema — entities: by-letter `entities/{L}/{slug}`, sources:
+by-date). The mover normalizes BOTH flat pages and pages nested in a
+NON-CANONICAL layout (okengine#165: a vault imported through the old by-type
+Phase-1 target carries `entities/{type}/[{L}/]{slug}` trees — those re-nest to
+the canonical key). Only canonical-typed pages move; ambiguous/typeless ones
+stay put for the classify drains. Oversized letter buckets are reshard_oversized's
+job afterwards, not this mover's.
+
+Collision guard (okengine#165): a page whose canonical destination ALREADY holds a
+different file does NOT move — it is reported as a duplicate-slug collision for
+the dedup pass (true-dup merge or slug disambiguation) and the migration stays
+safe to run in any order relative to dedup.
 
 Link forms handled: [[entities/slug]], [[entities/slug|alias]],
 [[entities/slug#heading]], [[entities/slug#heading|alias]] — the key segment is
@@ -102,18 +111,23 @@ def _new_key(namespace: str, slug: str, fm: dict, pcfg: dict, canonical: set) ->
 
 
 def build_map(root: Path, namespace: str, only_types: set[str] | None = None,
-              only_year: str | None = None) -> dict[str, str]:
-    """old-key -> new-key for flat files directly under the namespace dir, driven by
-    the governing schema.yaml's `partitioning` config (domain-agnostic).
-    only_types / only_year: staged-pilot filters (migration-time)."""
+              only_year: str | None = None) -> tuple[dict[str, str], list[tuple[str, str]]]:
+    """(old-key -> new-key, collisions) for EVERY page under the namespace whose current
+    key differs from its canonical key per the governing schema.yaml `partitioning`
+    config (domain-agnostic). Covers flat pages AND pages nested in a non-canonical
+    layout (okengine#165). Collisions — a destination already occupied by a different
+    file, or two sources mapping to one destination — are excluded from the map and
+    returned for the dedup pass. only_types / only_year: staged-pilot filters."""
     schema = _governing_schema(root, namespace)
     pcfg = _partition_cfg(schema, namespace)
     canonical = set((schema.get("types") or {}).keys())
     base = root / "wiki" / namespace
     m: dict[str, str] = {}
-    for p in sorted(base.glob("*.md")):           # glob-ok: migrates only flat top-level keys (already-nested = done)
+    collisions: list[tuple[str, str]] = []
+    for p in sorted(base.rglob("*.md")):
         slug = p.stem
-        if slug.startswith("_") or slug in ("index", "INDEX", "log", "README"):
+        if slug.startswith("_") or slug in ("index", "INDEX", "log", "README") \
+                or slug.startswith("INDEX-p"):
             continue
         try:
             fmm = _FM_RE.match(p.read_text(encoding="utf-8", errors="replace"))
@@ -129,13 +143,25 @@ def build_map(root: Path, namespace: str, only_types: set[str] | None = None,
             continue
         if only_types is not None and str(fm.get("type") or "").strip() not in only_types:
             continue
+        cur = p.relative_to(root / "wiki").as_posix()[:-3]
         new = _new_key(namespace, slug, fm, pcfg, canonical)
         if new and only_year and new.startswith(f"{namespace}/") \
                 and not new.startswith(f"{namespace}/{only_year}/"):
             new = None
-        if new and new != f"{namespace}/{slug}":
-            m[f"{namespace}/{slug}"] = new
-    return m
+        if not new or new == cur:
+            continue
+        # collision guard: the canonical seat is already taken by a DIFFERENT file
+        if (root / "wiki" / (new + ".md")).is_file():
+            collisions.append((cur, new))
+            continue
+        if new in set(m.values()):                # two sources -> one destination
+            other = next(k for k, v in m.items() if v == new)
+            del m[other]
+            collisions.append((other, new))
+            collisions.append((cur, new))
+            continue
+        m[cur] = new
+    return m, collisions
 
 
 def make_rewriter(move_map: dict[str, str], namespace: str):
@@ -163,11 +189,18 @@ def main(argv: list[str]) -> int:
     only = set(t.strip() for t in args.types.split(",") if t.strip()) or None
     only_year = args.year.strip() or None
 
-    move_map = build_map(root, ns, only, only_year)
-    print(f"{'APPLY' if args.apply else 'DRY-RUN'} namespace={ns}: {len(move_map)} files to move")
+    move_map, collisions = build_map(root, ns, only, only_year)
+    print(f"{'APPLY' if args.apply else 'DRY-RUN'} namespace={ns}: {len(move_map)} files to move"
+          f", {len(collisions)} duplicate-slug collision(s) held back")
     # sample
     for k in list(move_map)[:6]:
         print(f"   {k}  ->  {move_map[k]}")
+    if collisions:
+        print(f"  ! collisions (dedup first — true-dup merge or slug disambiguation, okengine#165):")
+        for cur, new in collisions[:40]:
+            print(f"      {cur}  ~X~>  {new}")
+        if len(collisions) > 40:
+            print(f"      ... and {len(collisions) - 40} more")
 
     # --- link rewrite across the whole wiki ---
     pat, repl = make_rewriter(move_map, ns)

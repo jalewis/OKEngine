@@ -143,7 +143,7 @@ def detect() -> tuple[list[dict], str | None]:
 def write_report(losses: list[dict], baseline: str | None, today: str) -> None:
     OP_DIR.mkdir(parents=True, exist_ok=True)
     L = ["---", "type: dashboard", "title: Curated field-loss review",
-         f"updated: {today}", "generator: scripts/cron/detect_field_loss.py",
+         f"updated: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}", "generator: scripts/cron/detect_field_loss.py",
          "---", "", "# Curated field-loss review", "",
          f"_Window: last {WINDOW_DAYS}d (baseline `{(baseline or 'n/a')[:8]}`) → HEAD. "
          "Detection only — restore via `config/curated-entity-fields.json` overlay "

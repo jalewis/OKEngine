@@ -1,0 +1,55 @@
+# okengine.competitive-analytics — generic competitive / market-structure analytics (okengine#146).
+#
+# Two-tier model: the quadrant / battle-card / acquirer-signal MATH is generic (the public adoption
+# layer); the EDGE — watchlists, competitor seeds, segment + axis definitions — stays as
+# pack/operator config (WATCHLIST_PATH). The extension ships ZERO seeds. Runs unchanged on any pack
+# that supplies a watchlist (acceptance: okpack-fintech).
+#
+# Outputs are written as the pack-owned `dashboard` type under dashboards/competitive/ — so no schema
+# fragment is required (every pack already declares `dashboard`).
+id: okengine.competitive-analytics
+kind: operation
+version: 0.2.0
+name: Competitive analytics
+description: >-
+  Generic competitive / market-structure analytics over a vault's entity graph — competitor
+  quadrants, sector battle-cards, and acquirer/movement signals. The math is generic; the
+  watchlist + segment/axis seeds are pack config (WATCHLIST_PATH), never shipped.
+trust: in-gateway
+# tier: analyze — these run AFTER the ingest/compile lanes (the entity graph must be current).
+# Sequenced by schedule for now; okengine#129 (cross-extension ordering) would formalize the
+# dependency on the compile tier rather than rely on cron timing.
+tier: analyze
+requires:
+  engine: ">=0.5.0"
+capabilities:
+  read: ["wiki/**"]
+  write: ["dashboards/**"]            # writes the pack-owned `dashboard` type under dashboards/competitive/
+  network: false
+config:
+  watchlist_path:
+    type: string
+    default: "config/competitive-watchlist.yaml"
+    description: >-
+      Pack/operator watchlist (segments → competitor entity slugs + the two quadrant axes). The
+      extension ships none; an absent file simply yields no segments. Override via the
+      WATCHLIST_PATH env. See README for the format.
+operations:
+  competitor-quadrants:
+    schedule: {kind: cron, expr: "0 5 * * 1"}        # weekly (Mon) — gated, cheap
+    entrypoint: select_competitor_quadrants.py
+    prompt_file: prompts/quadrants.md
+    toolsets: [hermes-cron, okengine-write, okengine]
+  sector-battle-cards:
+    schedule: {kind: cron, expr: "0 5 * * 2"}        # weekly (Tue)
+    entrypoint: select_sector_battle_cards.py
+    prompt_file: prompts/battle-cards.md
+    toolsets: [hermes-cron, okengine-write, okengine]
+  acquirer-signals:
+    schedule: {kind: cron, expr: "0 5 * * 4"}        # weekly (Thu) — movement/acquisition signals
+    entrypoint: select_acquirer_signals.py
+    prompt_file: prompts/acquirer-signals.md
+    toolsets: [hermes-cron, okengine-write, okengine]
+  discover-competitors:
+    schedule: {kind: cron, expr: "0 5 * * 3"}        # weekly (Wed) — deterministic graph analysis
+    entrypoint: discover_competitors.py              # no prompt_file => no_agent: deterministic, writes a review dashboard, no LLM/fabrication

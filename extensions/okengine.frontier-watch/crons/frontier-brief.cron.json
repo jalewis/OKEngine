@@ -1,0 +1,6 @@
+{
+  "schedule": {"kind": "cron", "expr": "30 7 * * 1"},
+  "prompt_file": "prompts/frontier-brief.md",
+  "toolsets": ["hermes-cron", "okengine-write", "okengine"],
+  "tier": "deliver"
+}

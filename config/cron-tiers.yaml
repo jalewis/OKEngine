@@ -28,10 +28,13 @@ engine:
   - reshelve
   - reshard-oversized
   - build-index-tree
+  - backlinks-refresh            # no_agent precompute of wiki/.backlinks.json for the UIs (okengine#168)
   - index-rebuild-daily
   - build-hot-set
   - tier-refresh
+  - usage-rollup
   - corpus-indexer
+  - ensure-readable              # generic: keep vault files world-readable for the reader
   - canonical-assemble           # generic: fuse per-source observations -> canonical entity (okengine#38)
   # --- health / dashboards / stats ---
   - kb-health-refresh
@@ -39,10 +42,19 @@ engine:
   - project-stats-refresh
   - page-quality-audit
   - wiki-health-audit
-  - contradictions-refresh       # generic: walks vault for contradiction H2s
+  - source-portfolio-refresh     # no_agent corpus-composition dashboard (complements source-staleness)
+  # contradictions-refresh migrated to the okengine.contradictions extension (okengine#131 §11)
   # --- conformance / lint / repair ---
   - lint-watcher
   - schema-drift-lint
+  - conformance-audit
+  - deployment-validate
+  - fleet-health
+  - grounding-audit
+  - review-queue
+  - operator-dashboard
+  - health-export
+  - relink-prose-sources
   - schema-type-drain
   - normalize-entity-schema
   - repair-broken-frontmatter
@@ -51,6 +63,7 @@ engine:
   - sanitize-frontmatter-updated
   - detect-field-loss
   - broken-wikilinks-drain
+  - normalize-bare-name-links    # deterministic: bare-name wikilink -> canonical entity path
   - source-backlink-drain
   - orphans-drain
   - publisher-canonical-drain    # generic source-publisher canonicalization
@@ -62,6 +75,7 @@ engine-template:
   - raw-backfill
   - entity-backfill
   - concept-backfill
+  - daily-brief
   # --- source hygiene (quality / staleness: generic frame, domain judgment) ---
   - source-quality-backfill
   - source-staleness-refresh
@@ -70,10 +84,10 @@ engine-template:
   - page-quality-enrich
   # --- curated-field enrichment (apply-curated-frontmatter to a type) ---
   - curated-fields-guard
-  # --- forecasting (generic selectors over a `prediction` type; prompt domain) ---
-  - prediction-candidate-watch
-  - prediction-grade
-  - prediction-regrade
+  # --- analysis synthesis (delta selector generic, trend voice domain — okengine#37) ---
+  - trends-refresh
+  # NOTE: forecasting (prediction-candidate-watch/grade/regrade) was migrated out of the
+  # engine fleet into the first-party `okengine.predictions` extension (extensions/).
 
 domain:
   # The engine ships ZERO domain jobs — each domain pack declares its own here

@@ -35,6 +35,46 @@ def test_hidden_pages_are_not_renderable(tmp_path, monkeypatch):
     assert ei.value.status_code == 403
 
 
+def test_provenance_fields_render_in_secondary(tmp_path, monkeypatch):
+    # okengine#90 P3: composition provenance (maintained_by/discovered_by) renders in the collapsed
+    # record-keeping panel, labeled — not mixed into the primary domain-intel rows.
+    m = _load(tmp_path, monkeypatch)
+    panel = m._meta_panel_items({
+        "type": "source", "origin": "lab",                        # domain intel -> primary
+        "maintained_by": ["okpack-sec", "okpack-ai-research"],    # provenance -> secondary
+        "discovered_by": "okpack-sec",
+    })
+    sec_labels = {i["label"] for i in panel["secondary"]}
+    pri_labels = {i["label"] for i in panel["primary"]}
+    assert "Maintained by" in sec_labels and "Discovered by" in sec_labels
+    assert "Origin" in pri_labels                                 # domain intel stays primary
+    mb = next(i for i in panel["secondary"] if i["label"] == "Maintained by")
+    assert "okpack-sec" in str(mb["values"]) and "okpack-ai-research" in str(mb["values"])
+
+
+def test_private_vault_exposed_without_password_refuses(tmp_path, monkeypatch):
+    # okengine#90 P4a: a PRIVATE vault bound to a non-loopback host with no reader password must
+    # FAIL-CLOSED (refuse to start) rather than serve a private vault to the network.
+    (tmp_path / "wiki").mkdir()
+    monkeypatch.setenv("OKENGINE_TRUST", "private")
+    monkeypatch.setenv("OKENGINE_BIND", "0.0.0.0")
+    monkeypatch.delenv("OKENGINE_READER_PASSWORD", raising=False)
+    with pytest.raises(SystemExit):
+        _load(tmp_path, monkeypatch)
+
+
+def test_trust_enforcement_allows_loopback_public_and_passworded(tmp_path, monkeypatch):
+    # The refusal is narrow: only PRIVATE + exposed + no-password. These three must all start fine.
+    (tmp_path / "wiki").mkdir()
+    monkeypatch.delenv("OKENGINE_READER_PASSWORD", raising=False)
+    monkeypatch.setenv("OKENGINE_TRUST", "private"); monkeypatch.setenv("OKENGINE_BIND", "127.0.0.1")
+    assert _load(tmp_path, monkeypatch)                                   # private + loopback: ok
+    monkeypatch.setenv("OKENGINE_TRUST", "public"); monkeypatch.setenv("OKENGINE_BIND", "0.0.0.0")
+    assert _load(tmp_path, monkeypatch)                                   # public + exposed: ok
+    monkeypatch.setenv("OKENGINE_TRUST", "private"); monkeypatch.setenv("OKENGINE_READER_PASSWORD", "s3cret")
+    assert _load(tmp_path, monkeypatch)                                   # private + exposed + password: ok
+
+
 def test_bare_basename_prefers_canonical_then_refuses_true_ambiguity(tmp_path, monkeypatch):
     wiki = tmp_path / "wiki"
     (wiki / "entities").mkdir(parents=True)
@@ -124,3 +164,78 @@ def test_backlink_title_uses_frontmatter_name_not_first_heading(tmp_path, monkey
     assert m._backlink_title("entities/a/raw-name") == "raw name"
     # missing file -> graceful de-slugged basename, no exception
     assert m._backlink_title("entities/a/ghost-page") == "ghost page"
+
+
+def test_inline_panel_svg_survives_sanitizer(tmp_path, monkeypatch):
+    """okengine.viz embeds charts as inline SVG in page bodies (the origin-system pattern);
+    the nh3 allowlist must pass the static shape/text tags through — while still
+    stripping script/event-handler vectors from the same markup."""
+    (tmp_path / "wiki").mkdir()
+    m = _load(tmp_path, monkeypatch)
+    body = ('<!-- panel-svg v=abc123 -->\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 520" width="100%">\n'
+            '<rect x="0" y="0" width="820" height="520" fill="#fafafa"/>\n'
+            '<line x1="50" y1="46" x2="50" y2="464" stroke="#374151"/>\n'
+            '<circle cx="200" cy="300" r="5" fill="#1d4ed8"/>\n'
+            '<text x="209" y="304" font-size="11" fill="#111827">Node</text>\n'
+            '<script>alert(1)</script>\n'
+            '<circle cx="1" cy="1" r="1" onload="alert(2)"/>\n'
+            '</svg>\n<!-- /panel-svg -->\n')
+    html = m.render_md(body)
+    assert "<svg" in html and "<circle" in html and "Node" in html
+    assert "<script" not in html and "onload" not in html and "alert(1)" not in html
+
+
+def test_about_reports_purpose_and_composition(tmp_path, monkeypatch):
+    """About = deployment purpose + composition, ALL derived from live state files
+    (pack.yaml declaration, the installer's CLAUDE.md markers, walk-up subtrees,
+    extensions enable-state) — never scraped from the agent persona prose."""
+    (tmp_path / "wiki" / "doctrine").mkdir(parents=True)
+    (tmp_path / "wiki" / "doctrine" / "schema.yaml").write_text("types: {}\n")
+    (tmp_path / "wiki" / "plain").mkdir()          # dir WITHOUT schema -> not a sub-domain
+    (tmp_path / "pack.yaml").write_text(
+        "name: okpack-x\nversion: 0.2.0\ndescription: Vendor risk watch\n"
+        "mission: Track the suppliers we depend on.\n")
+    (tmp_path / "CLAUDE.md").write_text(
+        "# persona\n\n## Installed domain: doctrine (okpack-doctrine sub-domain)\n\nrules\n"
+        "\n## Installed domain: security KB (okpack-sec co-install)\n\nrules\n")
+    (tmp_path / ".okengine").mkdir()
+    (tmp_path / ".okengine" / "extensions.yaml").write_text(
+        "enabled:\n  okengine.events: {}\n  okengine.completeness: {}\n")
+    m = _load(tmp_path, monkeypatch)
+    a = m._about_info()
+    assert a["description"] == "Vendor risk watch"
+    assert a["mission"] == "Track the suppliers we depend on."
+    assert a["installed_domains"] == ["doctrine (okpack-doctrine sub-domain)",
+                                      "security KB (okpack-sec co-install)"]
+    assert a["sub_domains"] == ["doctrine"]
+    assert [e["id"] for e in a["extensions"]] == ["okengine.completeness", "okengine.events"]
+
+
+def test_about_empty_state_is_calm(tmp_path, monkeypatch):
+    (tmp_path / "wiki").mkdir()
+    m = _load(tmp_path, monkeypatch)
+    a = m._about_info()
+    assert a["description"] == "" and a["installed_domains"] == [] \
+        and a["sub_domains"] == [] and a["extensions"] == []  # list of dicts when populated
+
+
+def test_about_extensions_prefer_effective_artifact(tmp_path, monkeypatch):
+    """Core (default-on) extensions never appear in the opt-in enabled-state file —
+    About must read the GENERATED effective artifact when present (found live:
+    a fleet running 3 extensions showed 1)."""
+    (tmp_path / "wiki").mkdir()
+    (tmp_path / ".okengine").mkdir()
+    (tmp_path / ".okengine" / "extensions.yaml").write_text(
+        "enabled:\n  okengine.competitive-analytics: {}\n")
+    (tmp_path / ".okengine" / "extensions-effective.yaml").write_text(
+        "effective:\n"
+        "  - {id: okengine.competitive-analytics, name: Competitive analytics, description: quadrants}\n"
+        "  - okengine.contradictions\n"          # legacy plain-id entry still accepted
+        "  - {id: okengine.timeline, name: Timeline, description: dated dashboard}\n")
+    m = _load(tmp_path, monkeypatch)
+    got = m._about_info()["extensions"]
+    assert [e["id"] for e in got] == [
+        "okengine.competitive-analytics", "okengine.contradictions", "okengine.timeline"]
+    assert got[0]["description"] == "quadrants"
+    assert got[1]["description"] == ""            # legacy entry -> empty description

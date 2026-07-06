@@ -16,7 +16,6 @@ Env:
   PORT                      listen port (default 9200)
   OKENGINE_READER_PASSWORD  if set, require HTTP Basic auth (see _BasicAuth)
   OKENGINE_READER_USER      Basic-auth username (default "okengine")
-  IWE_BIN                   path to the IWE binary (default "iwe")
 """
 from __future__ import annotations
 
@@ -81,6 +80,18 @@ _READER_PASSWORD = os.environ.get("OKENGINE_READER_PASSWORD", "")
 if _READER_PASSWORD:
     app.add_middleware(_BasicAuth, user=os.environ.get("OKENGINE_READER_USER", "okengine"),
                        password=_READER_PASSWORD)
+
+# Trust enforcement (okengine#90 P4a): a PRIVATE vault must never be served unauthenticated when
+# publicly exposed. `OKENGINE_TRUST` is the deployment's pack trust (derived from pack.yaml `trust`);
+# `OKENGINE_BIND` is the intended host exposure. Default trust=private (the engine's pack default) →
+# fail-safe: refuse to start rather than expose a private vault to the network without a password.
+_TRUST = os.environ.get("OKENGINE_TRUST", "private").strip().lower()
+_BIND_HOST = os.environ.get("OKENGINE_BIND", "127.0.0.1").strip()
+if _TRUST == "private" and _BIND_HOST not in ("", "127.0.0.1", "localhost", "::1") and not _READER_PASSWORD:
+    raise SystemExit(
+        f"okengine-reader REFUSED to start: PRIVATE vault exposed on {_BIND_HOST!r} with no "
+        f"OKENGINE_READER_PASSWORD. Set a reader password, bind to loopback "
+        f"(OKENGINE_BIND=127.0.0.1), or declare the pack `trust: public`. (okengine#90 P4a)")
 
 
 # ── public-deployment hardening (expensive endpoints) ───────────────────────
@@ -160,14 +171,45 @@ def split_fm(text: str) -> tuple[dict, str]:
     return (fm if isinstance(fm, dict) else {}), m.group(2)
 
 
+_LINK_TITLE_CACHE: dict = {}
+
+
+def _link_title(target: str) -> str | None:
+    """The target page's human title (frontmatter `title`/`name`) for friendlier wikilink text —
+    so a citation reads 'EvilTokens: a phishing attack…' instead of the raw slug
+    `eviltokens-a-phishing-attack…`. Resolves a flat-form target to its sharded page (basename).
+    Returns None when there's no real title (caller falls back to the slug). Cached for the
+    process lifetime (titles are stable; the reader restarts on deploy)."""
+    target = (target or "").strip()
+    if not target or "://" in target:
+        return None
+    if target in _LINK_TITLE_CACHE:
+        return _LINK_TITLE_CACHE[target]
+    title = None
+    key = target[:-3] if target.endswith(".md") else target
+    try:
+        cand = (WIKI / (key + ".md")).resolve()
+        hit = cand if (cand.is_file() and _within(WIKI, cand)) else None
+        if hit is None and WIKI.is_dir():
+            hits = [p for p in WIKI.rglob(Path(key).name + ".md") if not _skip(p.name)]
+            hit = hits[0] if len(hits) == 1 else None
+        if hit is not None:
+            fm, _ = split_fm(_read_head(hit))
+            title = (str(fm.get("title") or fm.get("name") or "").strip()) or None
+    except OSError:
+        pass
+    _LINK_TITLE_CACHE[target] = title
+    return title
+
+
 def _wl_display(m) -> str:
-    """Display text for a wikilink: alias, else target's last segment, else heading."""
+    """Display text for a wikilink: alias, else the target page's title, else its last segment."""
     alias = (m.group(3) or "").strip()
     if alias:
         return alias
     target = (m.group(1) or "").strip()
     if target:
-        return target.split("/")[-1]
+        return _link_title(target) or target.split("/")[-1]
     return (m.group(2) or "").strip()
 
 
@@ -228,7 +270,12 @@ _ALLOWED_TAGS = {
     "h1", "h2", "h3", "h4", "h5", "h6", "p", "br", "hr", "em", "strong", "b", "i",
     "code", "pre", "blockquote", "ul", "ol", "li", "a", "img", "span", "del",
     "table", "thead", "tbody", "tr", "th", "td",
+    # inline charts (okengine.viz panel-svg blocks): static SVG shapes/text ONLY —
+    # no script/foreignObject/animate/use/href, so nothing here can execute or fetch.
+    "svg", "rect", "line", "circle", "text",
 }
+_SVG_PRESENTATION = {"fill", "stroke", "stroke-width", "stroke-dasharray",
+                     "font-size", "font-weight", "font-style", "text-anchor", "opacity"}
 _ALLOWED_ATTRS = {
     "a": {"href", "title", "class", "data-page", "target"},
     "img": {"src", "alt", "title"},
@@ -236,6 +283,11 @@ _ALLOWED_ATTRS = {
     "th": {"align"},
     "code": {"class"},
     "span": {"class"},
+    "svg": {"xmlns", "viewBox", "width", "style"},
+    "rect": {"x", "y", "width", "height"} | _SVG_PRESENTATION,
+    "line": {"x1", "y1", "x2", "y2"} | _SVG_PRESENTATION,
+    "circle": {"cx", "cy", "r"} | _SVG_PRESENTATION,
+    "text": {"x", "y", "transform"} | _SVG_PRESENTATION,
 }
 
 
@@ -297,6 +349,38 @@ def _excluded_dirs() -> frozenset[str]:
     return _EXCLUDE_CACHE[1]
 
 
+_BL_DROP_CACHE: tuple = (0.0, None)
+
+
+def _backlink_drop_dirs() -> frozenset[str]:
+    """Namespaces dropped from the backlink graph in BOTH directions — schema.yaml
+    `backlink_drop:` when present (pack knob; `[]` re-includes sources), else the default
+    {'sources'}. MIRRORS backlink_lib._BACKLINK_DROPPED / excluded_top_dirs (keep in sync).
+    Cached (vault :ro)."""
+    global _BL_DROP_CACHE
+    now = time.monotonic()
+    if _BL_DROP_CACHE[1] is not None and now - _BL_DROP_CACHE[0] < _DIR_TTL:
+        return _BL_DROP_CACHE[1]
+    drop = {"sources"}
+    sp = VAULT / "schema.yaml"
+    if sp.is_file():
+        try:
+            sch = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}
+            if "backlink_drop" in sch:
+                drop = set()
+                for e in (sch.get("backlink_drop") or []):
+                    seg = str(e).strip().strip("/")
+                    if seg.startswith("wiki/"):
+                        seg = seg[len("wiki/"):]
+                    seg = seg.strip("/").split("/")[0]
+                    if seg:
+                        drop.add(seg)
+        except Exception:
+            pass
+    _BL_DROP_CACHE = (now, frozenset(drop))
+    return _BL_DROP_CACHE[1]
+
+
 def _display_groups() -> list[tuple[str, frozenset[str]]]:
     """Optional `display_groups:` from the pack's schema.yaml — a label -> [types]
     map that lets the reader browse pages BY KIND across namespaces (e.g. a pack
@@ -341,6 +425,10 @@ def _rail_top_section() -> tuple[str, tuple[str, ...]]:
                 ns = tuple(str(x).strip() for x in (d.get("namespaces") or []) if str(x).strip())
         except Exception:
             pass
+    # Engine default (okengine briefings-by-default): briefings/ is the first-class brief
+    # namespace, so pin a "Briefs" rail section when the pack declares no rail_top_section.
+    if not label and (WIKI / "briefings").is_dir():
+        label, ns = "Briefs", ("briefings",)
     _RAILTOP_CACHE = (now, (label, ns))
     return _RAILTOP_CACHE[1]
 
@@ -388,7 +476,20 @@ def _page_meta(p: Path) -> dict:
         h1 = _H1_RE.search(body)
         title = h1.group(0).lstrip("# ").strip() if h1 else Path(rel).name
     return {"path": rel, "title": title, "type": str(fm.get("type") or "").strip(),
-            "updated": str(fm.get("updated") or fm.get("created") or "")[:10]}
+            "updated": _disp_ts(fm.get("last_updated") or fm.get("updated") or fm.get("created"))}
+
+
+def _disp_ts(v) -> str:
+    """Display an OKF envelope date/timestamp: an ISO-8601 timestamp renders date + time
+    (`2026-06-28 14:30:00`, T->space, trailing Z dropped); a bare date stays as-is. Empty -> ''.
+    Prefers `last_updated` (the engine's actual update field) over `updated`/`created`."""
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    m = re.match(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})", s)
+    if m:
+        return f"{m.group(1)} {m.group(2)}"
+    return s[:10] if re.match(r"\d{4}-\d{2}-\d{2}", s) else s
 
 
 def _scan_dir(sub: str, force: bool = False) -> list[dict]:
@@ -461,6 +562,49 @@ def _about_info() -> dict:
     pk = _yaml(VAULT / "pack.yaml")
     info["vault"] = str(pk.get("name") or "")
     info["vault_version"] = str(pk.get("version") or "")
+    # Deployment PURPOSE + composition (okengine#177-class ask: "what is this wiki,
+    # what's installed?"). All DERIVED from state files that install-domain /
+    # extensions-enable already maintain — nothing here is hand-written for About:
+    #   description/mission  pack.yaml (declared; validate WARNs when absent)
+    #   installed_domains    the '## Installed domain:' markers in the deployment
+    #                        CLAUDE.md (the installer's provenance convention)
+    #   sub_domains          walk-up subtrees (wiki/*/schema.yaml)
+    #   extensions           enabled ids (.okengine/extensions.yaml)
+    info["description"] = str(pk.get("description") or "")
+    info["mission"] = str(pk.get("mission") or "")
+    try:
+        cm = (VAULT / "CLAUDE.md").read_text(encoding="utf-8") \
+            if (VAULT / "CLAUDE.md").is_file() else ""
+        info["installed_domains"] = [ln[len("## Installed domain:"):].strip()
+                                     for ln in cm.splitlines()
+                                     if ln.startswith("## Installed domain:")]
+    except OSError:
+        info["installed_domains"] = []
+    try:
+        info["sub_domains"] = sorted(d.name for d in WIKI.iterdir()
+                                     if d.is_dir() and (d / "schema.yaml").is_file())
+    except OSError:
+        info["sub_domains"] = []
+    # Prefer the GENERATED effective set (opt-ins + core default-ons, written by
+    # the deploy's stage-plan) — the enabled-state file lists opt-ins only, which
+    # under-reported core extensions (a fleet running 3 showed 1 in About).
+    eff = _yaml(VAULT / ".okengine" / "extensions-effective.yaml")
+    if isinstance(eff.get("effective"), list) and eff["effective"]:
+        # entries are {id,name,description} (or legacy plain ids) — normalize to dicts
+        exts = []
+        for x in eff["effective"]:
+            if isinstance(x, dict):
+                exts.append({"id": str(x.get("id") or ""),
+                             "name": str(x.get("name") or x.get("id") or ""),
+                             "description": str(x.get("description") or "")})
+            else:
+                exts.append({"id": str(x), "name": str(x), "description": ""})
+        info["extensions"] = sorted(exts, key=lambda e: e["id"])
+    else:
+        ext = _yaml(VAULT / ".okengine" / "extensions.yaml")
+        ids = sorted((ext.get("enabled") or {}).keys()) \
+            if isinstance(ext.get("enabled"), dict) else []
+        info["extensions"] = [{"id": i, "name": i, "description": ""} for i in ids]
     ev = _yaml(VAULT / "engine.version")
     # Prefer the deploy-stamped runtime marker (the ACTUAL engine/Hermes running, written by
     # ensure-runtime) over the pack's DECLARED engine.version pins, which can be stale/wrong vs
@@ -637,7 +781,25 @@ def api_pages(dir: str = Query(default=""), group: str = Query(default="")):
         raise HTTPException(404, "unknown group")
     if "/" in dir or ".." in dir or dir.startswith((".", "/")):
         raise HTTPException(400, "bad dir")
-    return {"dir": dir, "pages": _scan_dir(dir)}
+    return {"dir": dir, "about": _ns_about(dir), "pages": _scan_dir(dir)}
+
+
+def _ns_about(dir: str) -> str:
+    """Rendered HTML of an optional ``wiki/<dir>/_about.md`` — a namespace description card
+    shown above the ledger (what this namespace/extension is, why it's here, what its pages
+    contain). Lets a less-known extension like okengine.lacuna explain itself in the UI with
+    zero per-extension reader code. Empty when absent. ``_about.md`` is ``_``-prefixed so
+    _skip() already keeps it out of the ledger/render."""
+    if not dir:
+        return ""
+    p = (WIKI / dir / "_about.md").resolve()
+    if not (p.is_file() and _within(WIKI, p)):
+        return ""
+    try:
+        _, body = split_fm(p.read_text(encoding="utf-8", errors="ignore"))
+        return render_md(body)
+    except OSError:
+        return ""
 
 
 # ── render any page ─────────────────────────────────────────────────────────
@@ -676,9 +838,13 @@ def _resolve_page(path: str) -> Path:
 _META_PANEL_SKIP = {"title", "name", "type", "version", "raw"}
 # Record-keeping / provenance fields — real but low-signal for a reader. SURFACED knowledge
 # (aliases, origin, refs, …) stays visible; these get tucked into a collapsed disclosure so
-# they don't bury the intel. Domain-agnostic (OKF envelope + assembler provenance).
+# they don't bury the intel. Domain-agnostic (OKF envelope + assembler provenance). Includes
+# COMPOSITION provenance — `maintained_by` (which pack(s) have written the page) + `discovered_by`
+# (first attributor), stamped by the write path from OKENGINE_PACK (okengine#90 P3) — rendered with
+# clean "Maintained by" / "Discovered by" labels; most useful in a composed multi-pack vault.
 _META_SECONDARY = {"tlp", "created", "updated", "last_updated", "last_seen", "first_seen",
-                   "assembled_from", "tier", "tlp_caveat"}
+                   "assembled_from", "tier", "tlp_caveat",
+                   "maintained_by", "discovered_by", "created_by", "last_modified_by"}
 # `conflicts` + `needs_review` get a dedicated provenance view (api_page), not a raw row.
 
 
@@ -776,9 +942,37 @@ def _url_label(url: str) -> str:
     return host or url
 
 
+def _ref_target(s: str) -> str | None:
+    """If `s` is a wiki-relative path (`<namespace>/.../<slug>`) that resolves to a vault page,
+    return its canonical wiki-relative key (no `.md`) for an internal link; else None. This
+    linkifies the plain-path reference values (see_also / field_mapped / prediction_candidate /
+    …) the normalized write path now stores — so the fact-sheet's refs are clickable, not text.
+    Path-shaped only (must contain '/'), and the basename fallback resolves a flat-form ref to a
+    sharded page (e.g. entities/foo -> entities/f/foo)."""
+    if not isinstance(s, str):
+        return None
+    key = s.strip()
+    if "/" not in key or "://" in key or " " in key:
+        return None
+    key = key[:-3] if key.endswith(".md") else key
+    if not WIKI.is_dir():
+        return None
+    try:
+        cand = (WIKI / (key + ".md")).resolve()
+        if cand.is_file() and _within(WIKI, cand):
+            return key
+        hits = [p for p in WIKI.rglob(Path(key).name + ".md") if not _skip(p.name)]
+        if len(hits) == 1:
+            return str(hits[0].resolve().relative_to(WIKI.resolve()))[:-3]
+    except OSError:
+        pass
+    return None
+
+
 def _meta_values(v) -> list[dict]:
     """One frontmatter value -> display chips. http(s) scalars and list items carrying a
-    url/href (e.g. refs/rels) become links (friendly host label); dicts compact to k=v."""
+    url/href (e.g. refs/rels) become external links; a value that resolves to a vault page
+    becomes an internal page link (`page`); dicts compact to k=v."""
     out: list[dict] = []
     for el in (v if isinstance(v, list) else [v]):
         if isinstance(el, dict):
@@ -788,8 +982,11 @@ def _meta_values(v) -> list[dict]:
             out.append({"text": str(txt), "url": str(url)} if url else {"text": str(txt)})
         else:
             s = str(el)
-            out.append({"text": _url_label(s), "url": s} if s.startswith(("http://", "https://"))
-                       else {"text": s})
+            if s.startswith(("http://", "https://")):
+                out.append({"text": _url_label(s), "url": s})
+            else:
+                tgt = _ref_target(s)
+                out.append({"text": s, "page": tgt} if tgt else {"text": s})
     return out
 
 
@@ -810,6 +1007,42 @@ def _meta_panel_items(fm: dict) -> dict:
     return {"primary": primary, "secondary": secondary}
 
 
+# ── reader UI extension panels (okengine#160) ────────────────────────────────
+_RPANELS_CACHE: list = [0.0, None]
+
+
+def _reader_panels() -> dict:
+    """Type-bound panel bindings staged by the deploy (okengine#160): VAULT/.okengine/
+    reader-panels.json = {page_type: {kind, fields, ...}}. Cached briefly (refreshes on deploy)."""
+    now = time.time()
+    if _RPANELS_CACHE[1] is None or now - _RPANELS_CACHE[0] > 60:
+        try:
+            _RPANELS_CACHE[1] = json.loads((VAULT / ".okengine" / "reader-panels.json").read_text())
+        except Exception:
+            _RPANELS_CACHE[1] = {}
+        _RPANELS_CACHE[0] = now
+    return _RPANELS_CACHE[1] or {}
+
+
+def _panel_for(fm: dict, body: str = "") -> dict | None:
+    """The panel to render for a page. A GENERATED page self-declares `panel:` (e.g. viz's two-axis
+    map, nodes included). Otherwise a type-bound `fields` panel is built from the staged bindings by
+    pulling the declared frontmatter field values. Returns a render-ready dict or None."""
+    p = fm.get("panel")
+    if isinstance(p, dict) and p.get("kind"):
+        # a body carrying the server-rendered chart (viz panel-svg block) supersedes the
+        # client two-axis renderer — suppress to avoid a double chart. `fields` panels
+        # have no embedded form and always render client-side.
+        if p.get("kind") == "two-axis" and "<!-- panel-svg" in (body or ""):
+            return None
+        return p                                          # self-declared (carries its own data)
+    b = _reader_panels().get(str(fm.get("type") or ""))
+    if isinstance(b, dict) and b.get("kind") == "fields":
+        items = [{"label": f, "value": fm.get(f)} for f in (b.get("fields") or []) if fm.get(f) is not None]
+        return {"kind": "fields", "title": b.get("title") or "Details", "items": items} if items else None
+    return None
+
+
 @app.get("/api/page")
 def api_page(path: str = Query(...)):
     """Render any wiki page for click-through navigation."""
@@ -820,9 +1053,28 @@ def api_page(path: str = Query(...)):
     slug = cp.stem.lower()
     return {"path": path, "title": str(title), "type": str(fm.get("type") or ""),
             "rel": str(cp.relative_to(WIKI.resolve()))[:-3], "html": render_md(body),
-            "meta": m["primary"], "meta_aux": m["secondary"],
+            "meta": m["primary"], "meta_aux": m["secondary"], "panel": _panel_for(fm, body),
+            "provenance": _provenance(fm, body),
             "conflicts": _shape_conflicts(fm), "needs_review": bool(fm.get("needs_review")),
             "observations": _observations_by_canonical().get(slug, [])}
+
+
+def _provenance(fm: dict, body: str) -> dict:
+    """Trust signals surfaced as a per-page strip (okengine#70): how grounded the page is (cited
+    source PAGES vs total), the Tier-2 grounding-check tally (supported / unsupported claims), and
+    whether a human has signed off. All from data the trust lanes already write."""
+    srcs = fm.get("sources")
+    srcs = srcs if isinstance(srcs, list) else ([srcs] if srcs else [])
+    page_srcs = sum(1 for s in srcs if "/" in str(s) or str(s).lower().endswith(".md"))
+    grounding = None
+    g = re.search(r"##\s+Grounding check(.*?)(?:\n##\s|\Z)", body, re.S | re.I)
+    if g:
+        seg = g.group(1)
+        grounding = {"supported": len(re.findall(r"\*\*\s*supported", seg, re.I)),
+                     "unsupported": len(re.findall(r"\*\*\s*(?:unsupported|not[- ]found|contradict)", seg, re.I))}
+    return {"sources": len(srcs), "source_pages": page_srcs,
+            "reviewed_by": fm.get("reviewed_by"), "reviewed_on": fm.get("reviewed_on"),
+            "needs_review": bool(fm.get("needs_review")), "grounding": grounding}
 
 
 # ── downloads (md / docx / pdf via pandoc) ─────────────────────────────────
@@ -946,29 +1198,37 @@ def api_search(request: Request, q: str = Query(...), limit: int = 40):
     return {"q": q, "total": len(rows), "results": rows[:max(1, min(limit, 100))]}
 
 
-# ── IWE backlinks (knowledge-graph: "what links here") ─────────────────────
-# IWE parses the vault's [[wikilinks]] into a reference graph. The CLI rebuilds
-# the whole graph per call, so we run ONE no-query pass, invert forward-references
-# into a {target: [referrers]} map, and cache it with a TTL. Per-page lookups are
-# then instant dict hits. Read-only (no .iwe writes), so it works on the :ro mount.
-IWE_BIN = os.environ.get("IWE_BIN", "iwe")
+# ── backlinks (knowledge-graph: "what links here") ─────────────────────────
+# The cron-precomputed wiki/.backlinks.json (below) is served directly. The live FALLBACK builds
+# the graph by scanning [[wikilinks]] over the vault directly (okengine#179) — it no longer shells
+# iwe. Invert forward-refs into a {target: [referrers]} map, cache with a TTL. Read-only mount.
 _BACKLINKS: dict = {"map": None, "ts": 0.0}
-_BACKLINKS_TTL = 3600  # seconds — the graph build is heavy; backlinks change slowly.
+_BACKLINKS_TTL = limits.intenv("OKENGINE_BACKLINKS_TTL", 86400, lo=60)  # 24h default — the fallback
+# scan is cheap, but backlinks change over days, so a day-stale "what links here" is fine.
 _BL_LOCK = threading.Lock()
+
+# Cron-precomputed graph (okengine#168): the `backlinks-refresh` engine cron
+# writes the inverted+filtered+titled map to wiki/.backlinks.json once per
+# deployment per day (scripts/cron/backlink_lib.py is the canonical filter
+# logic). When that artifact is present and fresh we serve it directly and
+# never run iwe in this container; the live build below survives ONLY as the
+# fallback for a missing/stale artifact (deployment without the cron, or a
+# stopped cron). Ceiling default 48h = two missed daily runs.
+_BL_ARTIFACT_MAX_AGE = limits.intenv("OKENGINE_BACKLINKS_MAX_AGE", 172800, lo=3600)
+_BL_ARTIFACT: dict = {"map": None, "mtime": None}
 
 # Generated root artifacts _skip() doesn't catch (they live at the vault root, not as
 # INDEX*/underscore files): the agent's HOT set and the write log. Excluded as backlink
 # SOURCES so their markdown links don't pollute "what links here".
 _RESERVED_BL_NAMES = frozenset({"HOT.md", "log.md"})
-
-
 def _skip_backlink_src(key: str) -> bool:
     """True if a backlink *source* document is generated/operational machinery that must
     not contribute "what links here" edges. IWE indexes the whole vault and doesn't apply
     our filters, so we re-apply the same exclusions the rail uses: `_skip()` (INDEX*/
     `_*`/backups), an `exclude:`-ed namespace (e.g. operational/), and the root artifacts
     HOT.md/log.md, plus generated dashboards/ (surfaced for READING in #117 but its digests
-    aren't real edges). Real references (sources, entities, briefings) are kept."""
+    aren't real edges) and the raw-ingest sources/ tree (_BACKLINK_DROPPED_NS). entities,
+    concepts, briefings, … are kept."""
     name = key.split("/")[-1]
     if not name.endswith(".md"):
         name += ".md"
@@ -977,9 +1237,9 @@ def _skip_backlink_src(key: str) -> bool:
     ns = key.split("/")[0] if "/" in key else ""
     # Browse-visibility and backlink-skip differ: dashboards/ is SURFACED for READING
     # (okengine#117) but its auto-generated digests aren't meaningful "what links here" edges,
-    # so skip the surfaced-derived dirs as backlink SOURCES too. Real namespaces (sources,
-    # entities, briefings, …) are kept.
-    return bool(ns) and ns in (_excluded_dirs() | _SURFACED_DERIVED)
+    # so skip the surfaced-derived dirs as backlink SOURCES too. The backlink-drop set (sources/
+    # by default; pack-configurable via schema.yaml `backlink_drop:`) is dropped both ways.
+    return bool(ns) and ns in (_excluded_dirs() | _SURFACED_DERIVED | _backlink_drop_dirs())
 
 
 def _backlink_title(src: str) -> str:
@@ -1005,22 +1265,84 @@ def _backlink_title(src: str) -> str:
     return src.split("/")[-1].replace("-", " ").strip() or src
 
 
+# okengine#179: build the graph by scanning markdown links directly instead of shelling the
+# heavy `iwe find -f json -l 0` full-graph dump (~4GB RSS / ~550s on a 52k-file vault). This
+# MIRRORS scripts/cron/backlink_lib.scan_forward_refs (the cron builds the served artifact;
+# this is only the missing/stale fallback) — keep the two in sync. Semantics: [[key]]/[[key|
+# label]] and [text](path.md) are edges (label may wrap lines); frontmatter/code-span/external
+# links are not; targets resolve by basename to the real key (exact wins; collision -> alpha-
+# first; dangling kept).
+_BL_FM = re.compile(r"\A---\s*\n.*?\n---\s*(?:\n|\Z)", re.DOTALL)
+_BL_WIKI = re.compile(r"\[\[([^\]]+?)\]\]", re.DOTALL)
+_BL_MD = re.compile(r"\[[^\]\n]*\]\(([^)\s]+?)\)")
+_BL_FENCE = re.compile(r"^([ \t]*)(```+|~~~+)[^\n]*\n.*?^\1\2[^\n]*$", re.DOTALL | re.MULTILINE)
+_BL_INLINE = re.compile(r"(`+)[^\n]*?\1")
+
+
+def _bl_strip(text: str) -> str:
+    m = _BL_FM.match(text)
+    if m:
+        text = text[m.end():]
+    return _BL_INLINE.sub(" ", _BL_FENCE.sub("\n", text))
+
+
+def _bl_wikikey(inner: str):
+    k = inner.split("|", 1)[0].split("\n", 1)[0].split("#", 1)[0].strip()
+    if not k or k.startswith(("http://", "https://", "mailto:")):
+        return None
+    return k[:-3] if k.endswith(".md") else k
+
+
+def _bl_mdkey(url: str, doc_dir: str):
+    u = url.split("#", 1)[0].strip()
+    if not u or u.startswith(("http://", "https://", "mailto:", "#")) or not u.endswith(".md"):
+        return None
+    rel = os.path.normpath(os.path.join(doc_dir, u))
+    return None if rel.startswith("..") else rel[:-3]
+
+
+def _scan_forward_refs() -> list:
+    """Forward-reference scan over WIKI (iwe-parity). Mirrors backlink_lib.scan_forward_refs."""
+    paths = list(WIKI.rglob("*.md"))
+    keys = [p.relative_to(WIKI).as_posix()[:-3] for p in paths]
+    keyset = set(keys)
+    by_base: dict[str, list] = {}
+    for k in keys:
+        by_base.setdefault(k.rsplit("/", 1)[-1], []).append(k)
+    for lst in by_base.values():
+        lst.sort()
+
+    def resolve(raw: str) -> str:
+        if raw in keyset:
+            return raw
+        cands = by_base.get(raw.rsplit("/", 1)[-1])
+        return cands[0] if cands else raw
+
+    docs = []
+    for p, key in zip(paths, keys):
+        if _skip_backlink_src(key):
+            continue
+        try:
+            body = _bl_strip(p.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        doc_dir = key.rsplit("/", 1)[0] if "/" in key else ""
+        refs, seen = [], set()
+        for rx, kf in ((_BL_WIKI, lambda m: _bl_wikikey(m.group(1))),
+                       (_BL_MD, lambda m: _bl_mdkey(m.group(1), doc_dir))):
+            for m in rx.finditer(body):
+                k = kf(m)
+                if k:
+                    k = resolve(k)
+                    if k != key and k not in seen:
+                        seen.add(k)
+                        refs.append({"key": k})
+        docs.append({"key": key, "references": refs})
+    return docs
+
+
 def _build_backlinks() -> dict:
-    cmd = [IWE_BIN, "find", "-f", "json", "-l", "0"]
-    try:
-        # The full-graph JSON dump over a large vault can take minutes on a couple
-        # of cores; generous ceiling so it isn't truncated. Runs in the startup
-        # prewarm thread, so this latency is off the request path.
-        proc = subprocess.run(cmd, cwd=str(WIKI), capture_output=True,
-                              text=True, timeout=420)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return {}
-    if proc.returncode != 0:
-        return {}
-    try:
-        docs = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return {}
+    docs = _scan_forward_refs()
     bl: dict[str, list] = {}
     for d in docs:
         src = d.get("key")
@@ -1029,7 +1351,9 @@ def _build_backlinks() -> dict:
         title = _backlink_title(src)
         for ref in d.get("references") or []:
             tgt = ref.get("key")
-            if not tgt or tgt == src:
+            # drop excluded namespaces (sources/, dashboards/, …) as TARGETS too, mirroring
+            # backlink_lib.invert — so a raw-ingest page never accumulates a backlink list.
+            if not tgt or tgt == src or _skip_backlink_src(tgt):
                 continue
             bl.setdefault(tgt, []).append({"key": src, "title": title})
     for tgt, lst in bl.items():
@@ -1042,6 +1366,33 @@ def _build_backlinks() -> dict:
         uniq.sort(key=lambda r: r["title"].lower())
         bl[tgt] = uniq
     return bl
+
+
+def _artifact_backlinks() -> dict | None:
+    """The cron-precomputed backlink map (wiki/.backlinks.json), or None when
+    absent/stale/corrupt — callers then fall back to the live iwe build.
+    Freshness is judged by file mtime (the cron's atomic rename stamps it at
+    build time); the parsed map is cached and only re-read when the mtime
+    changes, so the steady-state cost per request is one stat()."""
+    p = WIKI / ".backlinks.json"
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    if time.time() - st.st_mtime > _BL_ARTIFACT_MAX_AGE:
+        return None
+    if _BL_ARTIFACT["mtime"] == st.st_mtime and _BL_ARTIFACT["map"] is not None:
+        return _BL_ARTIFACT["map"]
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    m = data.get("backlinks")
+    if not isinstance(m, dict):
+        return None
+    _BL_ARTIFACT["map"] = m
+    _BL_ARTIFACT["mtime"] = st.st_mtime
+    return m
 
 
 def _refresh_backlinks_async() -> None:
@@ -1059,6 +1410,9 @@ def _refresh_backlinks_async() -> None:
 
 
 def _load_backlinks(blocking: bool = True) -> dict:
+    m = _artifact_backlinks()
+    if m is not None:                     # precomputed artifact wins — no iwe here
+        return m
     now = time.monotonic()
     if _BACKLINKS["map"] is not None and now - _BACKLINKS["ts"] <= _BACKLINKS_TTL:
         return _BACKLINKS["map"]
@@ -1104,7 +1458,7 @@ def index():
     # UI from heuristic cache after a reader update. The ?v=<hash> only changes when the
     # asset changes, so unchanged assets still cache; changed ones are fetched immediately.
     try:
-        h = hashlib.sha1()
+        h = hashlib.sha1(usedforsecurity=False)   # cache-bust asset digest, not a security hash
         for asset in ("style.css", "app.js"):
             p = STATIC / asset
             if p.is_file():

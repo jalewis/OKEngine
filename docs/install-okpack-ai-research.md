@@ -49,7 +49,7 @@ python scripts/framework.py pull jalewis/okpacks-library:packs/okpack-ai-researc
 ```
 
 The catalog pack declares `port_offset: 100`, so the reader runs on
-`http://localhost:9300` and the MCP service on `http://localhost:8830`.
+`http://localhost:9300`. The MCP runs internally on the per-pack bridge — no host port — since okengine#138 (the gateway reaches it by service name).
 
 ## Configure
 

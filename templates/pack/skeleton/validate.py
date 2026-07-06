@@ -24,11 +24,12 @@ Dependency: PyYAML (schema.yaml). Everything else is stdlib.
 import argparse
 import json
 import re
-import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import yaml
+
+VALIDATE_VERSION = "2026.07.3"  # vintage stamp — framework validate flags drift vs the skeleton
 
 ROOT = Path(__file__).resolve().parent
 
@@ -166,7 +167,15 @@ def check_crons_jittered() -> None:
         expr = ((item.get("schedule") or {}).get("expr") or "").strip()
         name = item.get("name")
         if expr.startswith("@jitter:"):
-            continue  # expanded to a random minute at install
+            # Only the SUPPORTED bases expand (engine cron_jitter._SENTINEL_RE — keep this set in
+            # sync; tests/cron/test_cron_jitter guards the agreement). An unsupported base like
+            # @jitter:3h would sail through here yet never expand -> cron-plus errors every tick
+            # and the lane silently never fires (okengine#178). Reject it at this earliest gate.
+            base = expr[len("@jitter:"):]
+            if base not in {"hourly", "2h", "4h", "6h", "12h", "daily", "weekly"}:
+                fail(f"domain cron '{name}' uses an unsupported @jitter base '{expr}' — "
+                     "supported: hourly, 2h, 4h, 6h, 12h, daily, weekly")
+            continue  # a supported sentinel is expanded to a random minute at install
         minute = expr.split()[0] if expr else ""
         if minute in ("", "0", "*", "*/1"):
             fail(f"domain cron '{name}' is enabled with a herd-prone schedule "
@@ -184,10 +193,19 @@ def cron_prompt_strings() -> list[str]:
     return out
 
 
+# Engine base-schema (L1) types + namespaces — merged UNDER every pack at deploy by
+# schema_lib._merge_base_pack. The standalone validator must validate the MERGED schema, so it
+# accepts these in membership checks (a cron writing `type: dashboard`, a `status.by_type` binding to
+# `prediction`) without spurious FAILs (okengine#163). Mirror config/base-schema.yaml. They are NOT
+# added to the spec-render or the pack.yaml `owns` check — a pack neither lists nor owns base types.
+BASE_TYPES = {"source", "concept", "prediction", "finding", "dashboard", "briefing", "trend"}
+BASE_NAMESPACES = {"entities", "sources", "concepts", "predictions", "findings", "briefings", "trends"}
+
+
 def known_namespaces(schema: dict) -> set[str]:
     part = (schema.get("partitioning") or {}).get("namespaces") or {}
     excluded = {Path(p.rstrip("/")).name for p in (schema.get("exclude") or [])}
-    return set(part) | excluded
+    return set(part) | excluded | BASE_NAMESPACES
 
 
 def check_namespace_consistency(schema: dict) -> None:
@@ -205,7 +223,7 @@ def check_namespace_consistency(schema: dict) -> None:
 
 def check_type_consistency(schema: dict) -> None:
     """Every literal `type: X` a cron tells the agent to write must be a schema type."""
-    types = set(schema.get("types") or {})
+    types = set(schema.get("types") or {}) | set(schema.get("type_aliases") or {}) | BASE_TYPES
     for prompt in cron_prompt_strings():
         for t in re.findall(r"type:\s+([a-z][a-z-]+)", prompt):
             if t not in types:
@@ -304,6 +322,211 @@ def probe_feeds(urls: list[str]) -> None:
             warn(f"feed probe: unreachable — {u} ({e})")
 
 
+FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.S)
+
+
+def _frontmatter(path: Path) -> dict:
+    m = FRONTMATTER_RE.match(path.read_text(encoding="utf-8", errors="replace"))
+    if not m:
+        return {}
+    try:
+        d = yaml.safe_load(m.group(1))
+    except Exception:  # noqa: BLE001
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _iter_wiki_pages(schema: dict):
+    """Every authored knowledge page shipped with the pack (skips excluded namespaces +
+    engine-managed root files). No-op when the pack ships an empty wiki skeleton."""
+    excluded = {Path(p.rstrip("/")).name for p in (schema.get("exclude") or [])}
+    base = ROOT / "wiki"
+    if not base.is_dir():
+        return
+    for p in base.rglob("*.md"):
+        rel = p.relative_to(base)
+        if rel.parts and rel.parts[0] in excluded:
+            continue
+        if len(rel.parts) == 1 and p.stem in ROOT_WIKI_FILES:
+            continue
+        if p.name.startswith(("_", "INDEX")):
+            continue
+        yield p
+
+
+def _dotted(fm: dict, key: str):
+    cur = fm
+    for part in key.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return None
+    return cur
+
+
+def check_type_aliases(schema: dict) -> None:
+    """Every type alias must normalize to a real canonical type, and must not shadow one
+    (a shadow silently retypes pages in the normalization drains)."""
+    types = set(schema.get("types") or {}) | BASE_TYPES
+    for alias, canonical in (schema.get("type_aliases") or {}).items():
+        if canonical not in types:
+            fail(f"type_aliases['{alias}'] -> '{canonical}' is not a canonical schema type")
+        if alias in types:
+            warn(f"type_aliases['{alias}'] shadows a canonical type of the same name")
+
+
+def check_enums_wellformed(schema: dict) -> None:
+    """field_enums / list_field_enums entries must target declared enums and real types."""
+    enums = schema.get("enums") or {}
+    types = set(schema.get("types") or {}) | BASE_TYPES
+    for field, spec in (schema.get("field_enums") or {}).items():
+        if not isinstance(spec, dict):
+            fail(f"field_enums['{field}'] must be a mapping")
+            continue
+        targets = [spec["enum"]] if "enum" in spec else []
+        for ty, en in (spec.get("by_type") or {}).items():
+            targets.append(en)
+            if ty not in types:
+                fail(f"field_enums['{field}'].by_type references unknown type '{ty}'")
+        if not targets:
+            fail(f"field_enums['{field}'] has neither `enum:` nor `by_type:`")
+        for en in targets:
+            if en not in enums:
+                fail(f"field_enums['{field}'] -> enum '{en}' is not declared in enums:")
+    for field, subspec in (schema.get("list_field_enums") or {}).items():
+        if not isinstance(subspec, dict):
+            fail(f"list_field_enums['{field}'] must be a mapping")
+            continue
+        for sub, spec in subspec.items():
+            en = spec.get("enum") if isinstance(spec, dict) else spec
+            if en not in enums:
+                fail(f"list_field_enums['{field}'].{sub} -> enum '{en}' is not declared in enums:")
+
+
+def check_page_enum_values(schema: dict) -> None:
+    """Shipped pages' frontmatter values against declared enums. Wrong value FAILS
+    (extensible binding -> WARN); absence is fine."""
+    enums = schema.get("enums") or {}
+    field_enums = schema.get("field_enums") or {}
+    aliases = schema.get("type_aliases") or {}
+    if not field_enums:
+        return
+    for page in _iter_wiki_pages(schema):
+        fm = _frontmatter(page)
+        if not fm:
+            continue
+        ptype = aliases.get(fm.get("type"), fm.get("type"))
+        rel = page.relative_to(ROOT)
+        for field, spec in field_enums.items():
+            val = _dotted(fm, field)
+            if val is None:
+                continue
+            enum_name = (spec.get("by_type") or {}).get(ptype) if "by_type" in spec else spec.get("enum")
+            if not enum_name:
+                continue
+            allowed = {str(x) for x in enums.get(enum_name, [])}
+            extensible = bool(spec.get("extensible"))
+            for v in (val if isinstance(val, list) else [val]):
+                if str(v) not in allowed:
+                    msg = f"{rel}: {field}={v!r} not in enum '{enum_name}'"
+                    warn(msg) if extensible else fail(msg)
+
+
+def check_page_required_fields(schema: dict) -> None:
+    """Missing required field on a shipped page warns (flag-not-gate)."""
+    types = schema.get("types") or {}
+    aliases = schema.get("type_aliases") or {}
+    for page in _iter_wiki_pages(schema):
+        fm = _frontmatter(page)
+        if not fm:
+            continue
+        ptype = aliases.get(fm.get("type"), fm.get("type"))
+        spec = types.get(ptype)
+        if not isinstance(spec, dict):
+            continue
+        for field in spec.get("required", []):
+            if field != "type" and _dotted(fm, field) is None:
+                warn(f"{page.relative_to(ROOT)}: missing required '{field}' for type '{ptype}'")
+
+
+def check_page_rels_predicates(schema: dict) -> None:
+    """rels predicates outside the declared vocabulary warn (flag-not-gate)."""
+    rv = schema.get("rels_vocabulary") or {}
+    vocab = set().union(*(set(rv.get(g) or []) for g in ("canonical", "reverse", "okf_native"))) if rv else set()
+    if not vocab:
+        return
+    for page in _iter_wiki_pages(schema):
+        rels = _frontmatter(page).get("rels")
+        if not isinstance(rels, dict):
+            continue
+        for pred in rels:
+            if pred not in vocab:
+                warn(f"{page.relative_to(ROOT)}: rels predicate '{pred}' not in the declared vocabulary")
+
+
+def check_page_list_enum_values(schema: dict) -> None:
+    """Enum values inside list-of-object fields (e.g. refs[].std)."""
+    enums = schema.get("enums") or {}
+    lfe = schema.get("list_field_enums") or {}
+    if not lfe:
+        return
+    for page in _iter_wiki_pages(schema):
+        fm = _frontmatter(page)
+        for field, subspec in lfe.items():
+            items = fm.get(field)
+            if not isinstance(items, list):
+                continue
+            for i, item in enumerate(items):
+                if not isinstance(item, dict):
+                    continue
+                for sub, spec in subspec.items():
+                    val = item.get(sub)
+                    if val is None:
+                        continue
+                    enum_name = spec.get("enum") if isinstance(spec, dict) else spec
+                    allowed = {str(x) for x in enums.get(enum_name, [])}
+                    extensible = isinstance(spec, dict) and bool(spec.get("extensible"))
+                    if str(val) not in allowed:
+                        msg = f"{page.relative_to(ROOT)}: {field}[{i}].{sub}={val!r} not in enum '{enum_name}'"
+                        warn(msg) if extensible else fail(msg)
+
+
+def check_page_refs_shape(schema: dict) -> None:
+    """Each refs[] entry needs `std` and at least one of id/url."""
+    for page in _iter_wiki_pages(schema):
+        refs = _frontmatter(page).get("refs")
+        if not isinstance(refs, list):
+            continue
+        rel = page.relative_to(ROOT)
+        for i, r in enumerate(refs):
+            if not isinstance(r, dict):
+                fail(f"{rel}: refs[{i}] is not a mapping")
+                continue
+            if not r.get("std"):
+                fail(f"{rel}: refs[{i}] missing 'std'")
+            if not (r.get("id") or r.get("url")):
+                fail(f"{rel}: refs[{i}] needs at least one of id/url")
+
+
+def run_pack_extras(schema: dict, fix: bool) -> None:
+    """Pack-specific checks live in validate_extra.py NEXT TO this file (the hook that
+    lets a pack extend validation without forking the shared validator — okengine#169
+    class 3). Contract: `run(ctx)` with ctx = dict(fail, warn, schema, ROOT,
+    iter_pages, frontmatter, fix)."""
+    xp = ROOT / "validate_extra.py"
+    if not xp.is_file():
+        return
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("validate_extra", xp)
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+        mod.run({"fail": fail, "warn": warn, "schema": schema, "ROOT": ROOT,
+                 "iter_pages": _iter_wiki_pages, "frontmatter": _frontmatter, "fix": fix})
+    except Exception as e:  # noqa: BLE001
+        fail(f"validate_extra.py crashed: {e}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--probe", action="store_true", help="HTTP-probe every feed (network)")
@@ -322,6 +545,14 @@ def main() -> int:
         check_schema_consistency(schema)
         check_namespace_dirs_exist(schema)
         check_pack_meta(schema)
+        check_type_aliases(schema)
+        check_enums_wellformed(schema)
+        check_page_enum_values(schema)
+        check_page_required_fields(schema)
+        check_page_rels_predicates(schema)
+        check_page_list_enum_values(schema)
+        check_page_refs_shape(schema)
+        run_pack_extras(schema, args.fix)
     check_crons_jittered()
     if args.probe:
         probe_feeds(suggested)

@@ -1,0 +1,18 @@
+# okengine.frontier-watch schema fragment — the §5 "Own" case (okengine#133).
+# Folded into the composed schema only when enabled; owner = ext:okengine.frontier-watch.
+# A pack that enables frontier-watch must NOT already own a `whitespace-thesis` type or a
+# `frontier` namespace (own = new ids only; the composer fails loud on a collision).
+#
+# A whitespace-thesis is an ANALYSIS artifact (not canonical knowledge): a capability the market
+# wants but few supply. Low-trust — `needs_review` (universal OKF scaffolding, not declared here)
+# + a measured demand/supply signal that drives how warm it reads.
+owns:
+  namespaces: [frontier]
+  types:
+    whitespace-thesis:
+      # the load-bearing parts: WHICH capability, the evidence it's WANTED, the (thin) supply
+      # state, and the whitespace claim itself. A page missing these isn't a thesis.
+      required: [type, capability, demand_signal, supply_state, thesis]
+      # the measured signal (demand/supply counts), the supply-side players, grounding links,
+      # and the soft lacuna edge (set when the thesis was handed to lacuna for force-naming).
+      optional: [confidence, frontier_density, players, see_also, sources, lacuna_candidate]

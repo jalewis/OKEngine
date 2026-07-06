@@ -197,7 +197,7 @@ def main() -> int:
     lines.append("")
     out.write_text("\n".join(lines), encoding="utf-8")
     try:
-        os.chmod(out, 0o646)
+        os.chmod(out, 0o644)   # report file: owner-writable, world-readable (0o646 was world-WRITABLE)
     except OSError:
         pass
 

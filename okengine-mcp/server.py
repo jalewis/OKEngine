@@ -21,10 +21,18 @@ Tools:
 Transport: stdio by default; set OKENGINE_MCP_TRANSPORT=streamable-http for networked
 consumers. Read-only — no tool mutates the vault.
 
+Per-extension scoped tokens (okengine#132): the admin token (OKENGINE_MCP_TOKEN) keeps
+FULL read (gateway crons + reader Chat relay are unaffected). A token minted for an
+extension is limited to its declared read scopes on the explicit-path tools
+(get_page / retrieve_context) and filtered in list_pages. search / find_references /
+graph_stats are full-vault for any authenticated caller in v1 — read-scope filtering of
+those text/graph surfaces is a documented deferral (lower-risk discovery surfaces).
+
 Env: WIKI_PATH (/opt/vault), OKENGINE_MCP_SCRIPTS (/opt/data/scripts).
 """
 from __future__ import annotations
 
+import contextvars
 import hmac
 import os
 import re
@@ -36,6 +44,10 @@ from pathlib import Path
 
 import yaml
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import scope as _scope  # noqa: E402  per-extension token resolution (okengine#132)
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
@@ -48,7 +60,14 @@ _QMD_ENV = {
 }
 _FM = re.compile(r"\A---[ \t]*\n(.*?\n)---(.*)\Z", re.S)
 
-mcp = FastMCP("okengine")
+# Disable the MCP SDK's DNS-rebinding host allowlist (okengine#138): on a bridge the gateway
+# reaches this by SERVICE NAME (Host: okengine-mcp:8730), which FastMCP's loopback-default
+# allowlist rejects with 421 "Invalid Host header" — silently killing the read MCP. This server
+# is internal-only (the per-pack bridge / a loopback host port) and authenticated by
+# OKENGINE_MCP_TOKEN, not browser-facing, so DNS-rebinding protection is moot; the token is the
+# guard. (Without this, every bridge deployment loses the okengine read tools.)
+mcp = FastMCP("okengine",
+              transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
 
 
 def _run(args: list[str], extra_env: dict | None = None, timeout: int = 90) -> str:
@@ -115,6 +134,8 @@ def get_page(path: str) -> str:
     p = _safe(path)
     if p is None:
         return "(refused: path outside the vault)"
+    if not _authorize_read(path):
+        return "(refused: outside this caller's read scope)"
     if not p.is_file():
         return f"(not found: {path})"
     return p.read_text(encoding="utf-8", errors="replace")[:16000]
@@ -134,6 +155,8 @@ def retrieve_context(path: str) -> str:
     Richer than get_page (which is the raw file) — use it to load a page together
     with its neighbourhood when you need the surrounding graph, not just the text.
     `path` is a vault page id/path, e.g. 'entities/a/example' or 'concepts/topic'."""
+    if not _authorize_read(str(path)):
+        return "(refused: outside this caller's read scope)"
     return _run([str(SCRIPTS / "kb_graph.py"), "retrieve", "-k", str(path)])[:16000]
 
 
@@ -182,11 +205,13 @@ def list_pages(namespace: str, type: str = "", status: str = "", limit: int = 40
             st = str(fm.get("status") or "").lower()
             if want_status and st != want_status:
                 continue
+            rel = p.relative_to(WIKI).as_posix()[:-3]
+            if not _authorize_read(rel):        # drop out-of-scope rows (okengine#132)
+                continue
             date = str(fm.get("updated") or fm.get("resolves_by")
                        or fm.get("made_on") or fm.get("created") or "")
             rows.append((date, str(fm.get("title") or fm.get("name") or p.stem),
-                         str(fm.get("type") or ""), st,
-                         p.relative_to(WIKI).as_posix()[:-3]))
+                         str(fm.get("type") or ""), st, rel))
     rows.sort(reverse=True)
     if not rows:
         flt = "".join((f" type={type!r}" if want_type else "",
@@ -243,25 +268,55 @@ def _resolve_http_auth(env, host: str):
     return token, warning
 
 
-class _BearerAuth:
-    """Minimal ASGI middleware: require `Authorization: Bearer <token>` on HTTP
-    when OKENGINE_MCP_TOKEN is set. No token set => open (e.g. trusted local net)."""
+# Per-request caller identity, set by the auth middleware and read by the tools.
+# None (stdio, or unauthenticated mode, or no middleware) = trusted local = FULL read,
+# which is the pre-#132 behavior — back-compat by construction.
+_caller_var: contextvars.ContextVar = contextvars.ContextVar("okengine_mcp_caller", default=None)
 
-    def __init__(self, app, token: str):
-        self.app, self.token = app, token
+
+def _caller() -> dict:
+    c = _caller_var.get()
+    return c if c is not None else {"kind": "admin", "read_scopes": None}
+
+
+def _authorize_read(rel_path: str) -> bool:
+    """May the current caller read this wiki-relative path? Admin = always; an
+    extension = only within its declared read scopes (okengine#132)."""
+    c = _caller()
+    if c.get("kind") == "admin":
+        return True
+    return _scope.path_in_scopes(rel_path, c.get("read_scopes") or [])
+
+
+class _ScopedAuth:
+    """ASGI middleware: resolve `Bearer <token>` -> caller identity, 401 if unknown.
+
+    The configured admin token (OKENGINE_MCP_TOKEN) keeps FULL read — the gateway's
+    cron jobs and the reader Chat relay use it, so their behavior is unchanged. A token
+    minted for an extension (in the vault token store) resolves to its read scopes."""
+
+    def __init__(self, app, admin_token: str):
+        self.app, self.admin_token = app, admin_token
 
     async def __call__(self, scope, receive, send):
-        if scope.get("type") == "http" and self.token:
+        if scope.get("type") == "http":
             headers = dict(scope.get("headers") or [])
             provided = headers.get(b"authorization", b"").decode()
-            expected = f"Bearer {self.token}"
-            # constant-time compare — `!=` on str short-circuits on the first
-            # differing byte and leaks the token prefix/length via timing.
-            if not hmac.compare_digest(provided, expected):
+            token = provided[7:] if provided.startswith("Bearer ") else ""
+            caller = None
+            if self.admin_token and hmac.compare_digest(token, self.admin_token):
+                caller = {"kind": "admin", "read_scopes": None}
+            else:
+                rec = _scope.resolve(token)
+                if rec is not None:
+                    caller = {"kind": "extension", "ext_id": rec.get("ext_id"),
+                              "read_scopes": rec.get("read_scopes") or []}
+            if caller is None:
                 await send({"type": "http.response.start", "status": 401,
                             "headers": [(b"content-type", b"text/plain")]})
                 await send({"type": "http.response.body", "body": b"unauthorized"})
                 return
+            _caller_var.set(caller)
         await self.app(scope, receive, send)
 
 
@@ -301,6 +356,23 @@ def _refresh_index() -> None:
 
 _INDEX_POLL_SECONDS = float(os.environ.get("OKENGINE_MCP_INDEX_POLL_SECONDS", "30") or 0)
 
+# Debounce for change-triggered reindexing. On a large vault an incremental
+# `qmd update` can take minutes; during a write burst (backfill lanes) an
+# update-per-write keeps the container churning and starves tool calls into
+# the client's timeout. Change-triggered updates therefore wait out a cooldown:
+# at least MIN_UPDATE_SECONDS, and at least DUTY x the previous update's own
+# duration (so reindexing never exceeds ~1/(1+DUTY) of the maintainer's time,
+# no matter how slow qmd is on this vault). Writes landing during the cooldown
+# are NOT lost — the mtime poll still sees them and one update covers them all.
+_INDEX_MIN_UPDATE_SECONDS = float(os.environ.get("OKENGINE_MCP_INDEX_MIN_UPDATE_SECONDS", "60") or 0)
+_INDEX_UPDATE_DUTY = 3.0
+
+
+def _index_update_cooldown(duration: float) -> float:
+    """Seconds to wait after an index update (which took `duration` s) before
+    the next change-triggered one may run."""
+    return max(_INDEX_MIN_UPDATE_SECONDS, _INDEX_UPDATE_DUTY * duration)
+
 
 def _vault_max_mtime() -> float:
     """Newest .md mtime under the wiki — a cheap change-detector for prompt reindex (okengine#80).
@@ -321,27 +393,41 @@ def _vault_max_mtime() -> float:
     return newest
 
 
+def _index_maintainer_step(state: dict) -> None:
+    """One poll iteration of the index maintainer (extracted so the debounce is
+    testable without the thread). `state` keys: last_full, last_seen,
+    cooldown_until — all floats on the time.monotonic() clock."""
+    now = time.monotonic()
+    due_full = _INDEX_REFRESH_HOURS > 0 and (now - state["last_full"]) >= _INDEX_REFRESH_HOURS * 3600
+    if state["last_full"] == 0.0 or due_full:
+        _refresh_index()                          # registers collection + full incremental
+        done = time.monotonic()
+        state["last_full"] = now
+        state["last_seen"] = _vault_max_mtime()
+        state["cooldown_until"] = done + _index_update_cooldown(done - now)
+        return
+    cur = _vault_max_mtime()
+    # a page changed since the last index AND the cooldown has passed; skipped
+    # changes stay pending (last_seen unchanged) and coalesce into one update
+    if cur > state["last_seen"] and now >= state["cooldown_until"]:
+        rc, _ = _qmd(["update"])
+        done = time.monotonic()
+        print(f"okengine-mcp: qmd index update on vault change rc={rc} ({done - now:.1f}s)",
+              file=sys.stderr, flush=True)
+        state["last_seen"] = cur
+        state["cooldown_until"] = done + _index_update_cooldown(done - now)
+
+
 def _index_maintainer() -> None:
     """Keep the qmd index fresh. A full refresh on start + every REFRESH_HOURS catches deletes /
     orphaned hashes; BETWEEN those, poll the vault every POLL_SECONDS and run an incremental
-    `qmd update` as soon as any page changes — so an agent's just-written page is searchable
-    within seconds, closing the write -> recall loop (okengine#80) instead of waiting up to 6h."""
-    last_full = 0.0
-    last_seen = -1.0
+    `qmd update` when pages change — debounced by _index_update_cooldown so a write burst
+    can't starve the container (an idle vault's first write still indexes on the next poll,
+    keeping the write -> recall loop of okengine#80)."""
+    state = {"last_full": 0.0, "last_seen": -1.0, "cooldown_until": 0.0}
     while True:
         try:
-            now = time.monotonic()
-            due_full = _INDEX_REFRESH_HOURS > 0 and (now - last_full) >= _INDEX_REFRESH_HOURS * 3600
-            if last_full == 0.0 or due_full:
-                _refresh_index()                      # registers collection + full incremental
-                last_full, last_seen = now, _vault_max_mtime()
-            else:
-                cur = _vault_max_mtime()
-                if cur > last_seen:                   # a page was written/updated since last index
-                    rc, _ = _qmd(["update"])
-                    print(f"okengine-mcp: qmd index update on vault change rc={rc}",
-                          file=sys.stderr, flush=True)
-                    last_seen = cur
+            _index_maintainer_step(state)
         except Exception as e:                        # never let an error kill the thread
             print(f"okengine-mcp: index maintainer error: {e}", file=sys.stderr, flush=True)
         time.sleep(_INDEX_POLL_SECONDS if _INDEX_POLL_SECONDS > 0 else _INDEX_REFRESH_HOURS * 3600)
@@ -364,7 +450,7 @@ if __name__ == "__main__":
         if warning:
             print(f"WARNING: okengine-mcp {warning}", file=sys.stderr, flush=True)
         if token is not None:
-            app = _BearerAuth(app, token)
+            app = _ScopedAuth(app, token)
         # Self-maintain the search index (qmd is only in this container; cron-plus can't).
         if _INDEX_REFRESH_HOURS > 0:
             threading.Thread(target=_index_maintainer, name="qmd-index-maintainer",

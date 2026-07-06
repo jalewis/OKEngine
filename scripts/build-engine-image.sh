@@ -41,6 +41,11 @@ if [ -n "${HERMES_SRC:-}" ]; then
 else
   WORK="$(mktemp -d)/hermes"
   CLEAN_WORK=1
+  # Clean the temp clone on ANY exit — success, error, OR signal (okengine#139). The
+  # old inline rm's only fired on the happy path + one error path, leaking ~160M per
+  # failed/interrupted build. Guarded by CLEAN_WORK so a reused HERMES_SRC checkout is
+  # never deleted (that branch never sets this trap anyway).
+  trap '[ "${CLEAN_WORK:-0}" = 1 ] && rm -rf "$(dirname "$WORK")"' EXIT
   echo "==> cloning Hermes @ $PIN"
   git clone --depth 1 --branch "$PIN" "$HERMES_REPO" "$WORK"
 fi
@@ -54,8 +59,7 @@ if [ -n "$PINNED_SHA" ]; then
   if [ "$GOT" != "$PINNED_SHA" ]; then
     echo "ERROR: Hermes source is at ${GOT:-unknown}, expected pinned commit $PINNED_SHA" >&2
     echo "       (tag $PIN must resolve to $PINNED_SHA — refusing to build a mismatched base)" >&2
-    [ "$CLEAN_WORK" = 1 ] && rm -rf "$(dirname "$WORK")"
-    exit 1
+    exit 1                                  # the EXIT trap removes the temp clone
   fi
   echo "==> verified Hermes @ $PINNED_SHA"
 else
@@ -101,5 +105,5 @@ LABELS=(
 echo "==> docker build $IMAGE:$TAG ${LATEST_ARGS[*]:-}  (release=$RELEASE sha=$ENG_SHA hermes=$PIN)"
 docker build "${LABELS[@]}" -t "$IMAGE:$TAG" "${LATEST_ARGS[@]}" "$WORK"
 
-[ "$CLEAN_WORK" = 1 ] && rm -rf "$(dirname "$WORK")"
+# temp clone is removed by the EXIT trap (okengine#139)
 echo "==> done: $IMAGE:$TAG${LATEST_ARGS:+ (and :latest)}. Pack docker-compose 'gateway' runs it."

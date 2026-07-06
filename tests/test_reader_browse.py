@@ -291,3 +291,104 @@ def test_about_prefers_runtime_marker_over_declared_pin(tmp_path):
     a2 = m._about_info()
     assert a2["engine_version"] == "v0.3.5" and a2["hermes_pin"] == "v2026.6.19"   # marker wins
     assert a2["vault_version"] == "0.2.1"                                          # pack version unchanged
+
+
+# --- fact-sheet reference linkify (plain-path refs -> internal page links, #145 follow-up) ---
+
+def test_factsheet_ref_values_linkify_to_pages(tmp_path):
+    """Plain-path reference values (see_also/field_mapped from the normalized write path) resolve
+    to internal page links — including a flat-form ref to a SHARDED page; a non-existent ref and
+    free text stay plain."""
+    w = tmp_path / "wiki"
+    _mk(w / "concepts" / "s" / "supply-chain.md", "concept")     # sharded concept page
+    _mk(w / "entities" / "s" / "scc-t1195.md", "entity")
+    (tmp_path / "schema.yaml").write_text("okf: {required: [type]}\n")
+    app = _load(tmp_path)
+    vals = app._meta_values([
+        "concepts/supply-chain",        # flat-form ref -> sharded page (basename fallback)
+        "entities/s/scc-t1195",         # direct sharded path
+        "concepts/does-not-exist",      # no page -> plain text
+        "just text, not a path",        # not a ref
+    ])
+    by = {v["text"]: v for v in vals}
+    assert by["concepts/supply-chain"].get("page") == "concepts/s/supply-chain"
+    assert by["entities/s/scc-t1195"].get("page") == "entities/s/scc-t1195"
+    assert "page" not in by["concepts/does-not-exist"]
+    assert "page" not in by["just text, not a path"]
+
+
+def test_ref_target_ignores_urls_and_non_paths(tmp_path):
+    app = _load(tmp_path)
+    assert app._ref_target("https://example.com/x") is None
+    assert app._ref_target("no-slash-bareword") is None
+    assert app._ref_target("") is None
+
+
+# --- wikilink display uses target title, not raw slug (lacuna-review readability fix) ---
+
+def test_wikilink_display_uses_target_title(tmp_path):
+    w = tmp_path / "wiki"
+    (w / "sources" / "2026" / "06").mkdir(parents=True)
+    (w / "sources" / "2026" / "06" / "eviltokens-x.md").write_text(
+        "---\ntype: source\ntitle: EvilTokens OAuth Campaign\n---\nbody\n")
+    (w / "entities" / "e").mkdir(parents=True)
+    (w / "entities" / "e" / "no-title.md").write_text("---\ntype: entity\n---\nbody\n")
+    (tmp_path / "schema.yaml").write_text("okf: {required: [type]}\n")
+    app = _load(tmp_path)
+    assert app._link_title("sources/2026/06/eviltokens-x") == "EvilTokens OAuth Campaign"
+    assert app._link_title("entities/no-title") is None        # no real title -> caller uses slug
+    assert app._link_title("does/not/exist") is None
+    assert app._link_title("https://example.com") is None
+
+
+# --- updated timestamp display (UI shows date + time, prefers last_updated) ---
+
+def test_disp_ts_renders_timestamp_and_date(tmp_path):
+    app = _load(tmp_path)
+    assert app._disp_ts("2026-06-28T14:30:00Z") == "2026-06-28 14:30:00"   # ISO timestamp -> date+time
+    assert app._disp_ts("2026-06-28 14:30:00") == "2026-06-28 14:30:00"
+    assert app._disp_ts("2026-06-23") == "2026-06-23"                       # bare date stays
+    assert app._disp_ts(None) == ""
+
+
+def test_page_meta_updated_prefers_last_updated_timestamp(tmp_path):
+    w = tmp_path / "wiki"
+    (w / "briefings").mkdir(parents=True)
+    (w / "briefings" / "b.md").write_text(
+        "---\ntype: report\nlast_updated: 2026-06-28T14:30:00Z\ncreated: 2026-06-20\n---\n# B\n")
+    (tmp_path / "schema.yaml").write_text("okf: {required: [type]}\n")
+    app = _load(tmp_path)
+    meta = app._page_meta(w / "briefings" / "b.md")
+    assert meta["updated"] == "2026-06-28 14:30:00"      # last_updated, with time, not the created date
+
+
+# --- reader extension panels (okengine#160 P2): self-declared + type-bound resolution ---
+
+def test_panel_for_self_declared_and_type_bound(tmp_path):
+    app = _load(tmp_path)
+    # a generated page self-declares its panel (viz two-axis) -> passes through
+    assert app._panel_for({"panel": {"kind": "two-axis", "nodes": []}})["kind"] == "two-axis"
+    # type-bound fields: built from frontmatter values via the staged bindings
+    (tmp_path / ".okengine").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".okengine" / "reader-panels.json").write_text(
+        '{"prediction": {"kind": "fields", "title": "Forecast", "fields": ["confidence", "status"]}}')
+    app._RPANELS_CACHE[1] = None      # bust the cache
+    p = app._panel_for({"type": "prediction", "confidence": "high", "status": "open"})
+    assert p["kind"] == "fields" and {i["label"] for i in p["items"]} == {"confidence", "status"}
+    app._RPANELS_CACHE[1] = None
+    assert app._panel_for({"type": "entity"}) is None          # no binding for this type
+
+
+# --- provenance/trust strip (okengine#70) ---
+
+def test_provenance_signals(tmp_path):
+    app = _load(tmp_path)
+    fm = {"sources": ["sources/2026/06/x", "Prose citation"], "reviewed_by": "Jane",
+          "reviewed_on": "2026-06-28"}
+    body = "# E\n## Grounding check\n- **supported** — a\n- **supported** — b\n- **unsupported** — c\n"
+    p = app._provenance(fm, body)
+    assert p["sources"] == 2 and p["source_pages"] == 1          # 1 page-ref, 1 prose
+    assert p["grounding"] == {"supported": 2, "unsupported": 1}
+    assert p["reviewed_by"] == "Jane" and not p["needs_review"]
+    p2 = app._provenance({"needs_review": True}, "# no grounding section\n")
+    assert p2["needs_review"] and p2["grounding"] is None and p2["sources"] == 0

@@ -36,24 +36,37 @@ SIDECAR = OPDIR / ".tier-counts.json"
 _TIERS = ("hot", "warm", "cold")
 
 
+def _namespace_bases(ns: str) -> list:
+    """Every dir holding `ns` pages: the root wiki/<ns>, PLUS wiki/<subdomain>/<ns> for each
+    walk-up sub-domain (a dir under wiki/ carrying its own schema.yaml). Without the sub-domain
+    bases a co-installed (multipack) vault under-counts every namespace, so the operator sees a
+    vault smaller than it is (okengine#178)."""
+    bases = [WIKI / ns]
+    if WIKI.is_dir():
+        for sub in sorted(WIKI.iterdir()):
+            if sub.is_dir() and (sub / "schema.yaml").is_file():
+                bases.append(sub / ns)
+    return bases
+
+
 def _count_namespace(ns: str, nscfg: dict, cfg: dict, today) -> dict:
-    base = WIKI / ns
     counts = {t: 0 for t in _TIERS}
     untiered = 0
-    if not base.is_dir():
-        return counts
     from_path = nscfg.get("from_path") and not nscfg.get("status_field")
-    for p in base.rglob("*.md"):
-        n = p.name
-        if n == "INDEX.md" or n.startswith("INDEX-p") or n.startswith("_"):
+    for base in _namespace_bases(ns):
+        if not base.is_dir():
             continue
-        rel = p.relative_to(WIKI).as_posix()
-        fm = {} if from_path else tier_lib.fm_of(p)
-        t = tier_lib.tier_of(rel, fm, cfg, today)
-        if t in counts:
-            counts[t] += 1
-        else:
-            untiered += 1
+        for p in base.rglob("*.md"):
+            n = p.name
+            if n == "INDEX.md" or n.startswith("INDEX-p") or n.startswith("_"):
+                continue
+            rel = p.relative_to(WIKI).as_posix()
+            fm = {} if from_path else tier_lib.fm_of(p)
+            t = tier_lib.tier_of(rel, fm, cfg, today)
+            if t in counts:
+                counts[t] += 1
+            else:
+                untiered += 1
     if untiered:
         counts["_untiered"] = untiered
     return counts

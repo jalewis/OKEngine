@@ -32,3 +32,84 @@ common_optional:
   - aliases          # alternate/legacy ids — the id resolver consults these
   - maintained_by    # provenance: packs that maintain the page (composition)
   - discovered_by    # provenance: where the knowledge was first attributed
+  # Cross-cutting OPTIONAL fields (okengine#90 P2) — universally useful, validated by the base
+  # enums below, extended by packs. Optional everywhere → composition-safe (never rejects another
+  # pack's page). A pack that wants one PRESENT enforces it in its ingest workflow, not the gate.
+  - tlp              # data-sharing/handling marker (FIRST.org Traffic Light Protocol — cross-domain)
+  - sensitivity      # generic confidentiality marker (alt to tlp)
+  - source_kind      # what kind of source (paper / post / release / …)
+  - publisher        # source publisher / outlet
+  - reliability      # source-channel reliability (the grading SCHEME is a pack enum)
+  - credibility      # claim credibility (scheme is a pack enum)
+  - severity         # finding / issue severity
+
+# Base value vocabularies for the cross-cutting fields. Marked `extensible` so a pack ADDS its
+# domain values (the extensible-enum grammar) rather than re-declaring the enum. TLP ships its full
+# standard set (not extensible — it IS the standard).
+enums:
+  tlp:        [CLEAR, GREEN, AMBER, "AMBER+STRICT", RED]
+  source_kind: [paper, post, release, news, report]
+  severity:    [info, low, medium, high, critical]
+
+field_enums:
+  tlp:         {enum: tlp}
+  source_kind: {enum: source_kind, extensible: true}
+  severity:    {enum: severity, extensible: true}
+
+# ── Core OKF structure (engine-owned) — okengine#90 P2 ──────────────────────
+# The universal knowledge-graph spine. ENGINE-owned so it is NOT re-declared per pack, which lets
+# multiple packs compose into ONE shared graph (entities/sources/concepts/…) without ownership
+# collisions. A pack OWNS only its DOMAIN types (its entity types: model/lab, vulnerability/…);
+# it does NOT re-declare these. To add domain fields to a core type, a pack uses the `extends`
+# grammar (all core types are `extensible: true`) — see docs/core-types-and-extensions.md.
+#
+# Merge semantics: these are DEFAULTS — a pack that still declares one of these types/namespaces
+# overrides the core copy (so existing single-pack deploys are unchanged); a pack that omits it
+# inherits the core copy.
+types:
+  source:     {required: [type, published], extensible: true}                # a paper / post / feed item
+  concept:    {required: [type], extensible: true}                           # a cross-cutting pattern / theme
+  prediction: {required: [type, status, confidence, subject, resolves_by], extensible: true}
+  finding:    {required: [type, status], extensible: true}                   # human-authored
+  dashboard:  {required: [type, title], extensible: true}                    # generated view / index
+  briefing:   {required: [type, title, published], extensible: true}         # daily/weekly synthesized brief
+  trend:      {required: [type, title, period, direction], extensible: true} # dated, directional shift
+
+partitioning:
+  reshard_over: 500
+  namespaces:
+    entities:    {strategy: by-letter, reshard_by: second-letter}
+    sources:     {strategy: by-date, date_field: published, reshard_by: day}
+    concepts:    {strategy: by-letter, reshard_by: second-letter}
+    predictions: {strategy: flat}
+    findings:    {strategy: flat}
+    briefings:   {strategy: flat}
+    trends:      {strategy: flat}
+
+tier:
+  hot_days: 30
+  warm_days: 365
+  namespaces:
+    sources:     {date_field: published, from_path: true}
+    entities:    {date_field: updated}
+    concepts:    {date_field: updated}
+    predictions: {date_field: resolves_by, status_field: status, open_values: [open, active], open_floor: hot}
+    findings:    {date_field: updated}
+    briefings:   {date_field: published}
+    trends:      {date_field: updated}
+
+# Conformance rules — mechanically-checkable CONTENT rules BEYOND field presence/type (those are
+# `types`/`okf`). The conformance audit (scripts/cron/conformance_audit.py) checks EXISTING pages
+# against these and writes wiki/dashboards/conformance.md; the write-guard will enforce them going
+# forward (okengine#158 P2). One source of truth, so a rule can't be enforced-but-unaudited.
+# A pack EXTENDS `rules` with its own (composed, additive). Rule kinds:
+#   ref_fields  — entries of the named frontmatter LIST fields must be page-paths (contain '/' or
+#                 end .md), not prose; a prose entry links nothing (no backlink / graph edge).
+# severity: fix (retroactively remediable) | forward-only (can't fabricate the past, informational).
+conformance:
+  rules:
+    - id: source-refs-are-pages
+      kind: ref_fields
+      fields: [sources]
+      severity: fix
+      remediation: "relink-prose-sources (deterministic, unique slug match) + entity-backfill (LLM) for the rest; ambiguous prose left flagged"

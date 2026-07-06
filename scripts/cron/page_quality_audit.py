@@ -71,6 +71,7 @@ DEFICIENT = {"empty", "stub", "thin"}
 #     default empty ⇒ no depth demotion.
 _SCHEMA = schema_lib.governing_schema(VAULT)
 ENRICHABLE_TYPES = schema_lib.canonical_types(_SCHEMA)
+_REFPOL = schema_lib.reference_policy(_SCHEMA)  # reference-catalog imports → excluded from deficient
 _dc = _SCHEMA.get("depth_critical_types")
 DEPTH_CRITICAL = {str(x) for x in _dc} if isinstance(_dc, (list, tuple, set)) else set()
 
@@ -93,7 +94,7 @@ def read_fm_body(path: Path) -> tuple[dict, str]:
     if not m:
         return {}, txt
     try:
-        fm = yaml.safe_load(m.group(1))
+        fm = schema_lib.fast_load(m.group(1))
     except yaml.YAMLError:
         fm = None
     return (fm if isinstance(fm, dict) else {}), txt[m.end():]
@@ -183,6 +184,11 @@ def classify(sub: str, fm: dict, body: str, today: date) -> dict:
         ptype == "media"
         or ("publisher" in tags and bool(ENRICHABLE_TYPES) and ptype not in ENRICHABLE_TYPES))
 
+    # Reference-catalog imports (pack-declared: CVE / ATT&CK / encyclopedia records) are
+    # deterministic reference data, not enrichable prose — a thin CVE record is correct as-is,
+    # not a stub to deepen. Classed `reference` and excluded from the deficient queue.
+    is_reference = schema_lib.is_reference_page(fm, _REFPOL)
+
     # Highest qualifying tier wins (checked strongest-first so the conditions
     # are monotonic). Each tier: word-count OR (structure AND sourcing).
     if empty:
@@ -191,6 +197,8 @@ def classify(sub: str, fm: dict, body: str, today: date) -> dict:
         tier = "redirect"
     elif is_publisher:
         tier = "publisher"
+    elif is_reference:
+        tier = "reference"
     elif words < 50:
         tier = "stub"
     elif sections == 0 and nsrc == 0:
@@ -238,9 +246,9 @@ def main() -> int:
         return 100 * by_tier[s][t] / tot[s] if tot[s] else 0.0
 
     # ── dashboard ───────────────────────────────────────────────────
-    TIERS = ["empty", "stub", "thin", "ok", "strong", "encyclopedic", "redirect", "publisher"]
+    TIERS = ["empty", "stub", "thin", "ok", "strong", "encyclopedic", "redirect", "publisher", "reference"]
     L = ["---", "type: dashboard", "title: Page content quality",
-         f"updated: {today.isoformat()}", "generator: scripts/cron/page_quality_audit.py",
+         f"updated: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}", "generator: scripts/cron/page_quality_audit.py",
          "---", "", "# Page content quality", "",
          "_Per-page content-depth audit of entity + concept pages. "
          "Tiers from body word count / `##` sections / `sources:` count, "
@@ -253,7 +261,7 @@ def main() -> int:
         L.append(f"| {t} | {by_tier['entities'][t]} | {pct('entities', t):.0f}% "
                  f"| {by_tier['concepts'][t]} | {pct('concepts', t):.0f}% |")
     L.append("")
-    L.append(f"**Deficient (empty/stub/thin, excl. redirects):** {n_def} · "
+    L.append(f"**Deficient (empty/stub/thin; excl. redirect/publisher/reference):** {n_def} · "
              f"**empty (0-byte/no body):** {n_empty}")
     L.append("")
     L.append(f"## Enrich queue — top {QUEUE_SIZE} by inbound links")

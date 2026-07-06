@@ -46,9 +46,11 @@ if [ -z "$CONTAINER" ]; then
 fi
 echo "  gateway container: $CONTAINER"
 
-# A freshly-seeded pack runtime has no /opt/data/scripts (or /config) yet — create
-# them before any tar extract, else the first deploy fails "Cannot open" (#17).
-docker exec -u "$HERMES_UID" "$CONTAINER" mkdir -p /opt/data/scripts /opt/data/config
+# A freshly-seeded pack runtime has no /opt/data/{scripts,config,metrics} yet — create them AS THE
+# CRON UID before any write. Else the first deploy fails "Cannot open" (#17), and — if the metrics
+# dir/db is first created by a root-context run — usage-rollup later fails with "attempt to write a
+# readonly database" because the 1003 cron can't write a root-owned usage.db.
+docker exec -u "$HERMES_UID" "$CONTAINER" mkdir -p /opt/data/scripts /opt/data/config /opt/data/metrics
 
 # --- engine/pack version pin check (warn-only; slice 4a) ---
 # The pack pins an engine release in $PACK_DIR/engine.version; warn only if it's a
@@ -66,7 +68,7 @@ if [ -f "$PACK_DIR/engine.version" ]; then
 fi
 
 # --- cron scripts: engine scripts/cron/*.py + pack crons/scripts/*.py -> /opt/data/scripts/ ---
-ecount="$(cd "$SRC_DIR" && ls -1 ./*.py 2>/dev/null | wc -l)"
+ecount="$(find "$SRC_DIR" -maxdepth 1 -name '*.py' | wc -l)"   # find: rc 0 on no match — a bare ls glob here dies silently under set -euo pipefail (4th instance of this class)
 if [ "$ecount" -eq 0 ]; then
     echo "  (no engine scripts found in $SRC_DIR)"
 else
@@ -74,8 +76,18 @@ else
         | docker exec -i -u "$HERMES_UID" "$CONTAINER" tar -xf - -C /opt/data/scripts/
     echo "  $ecount engine cron script(s) deployed to $CONTAINER:/opt/data/scripts/"
 fi
+
+# --- engine base-schema -> /opt/data/config/ (okengine#90) ---
+# The core (types/namespaces/optionals) lives in config/base-schema.yaml; the staged schema_lib
+# resolves it at ../config relative to /opt/data/scripts (== /opt/data/config). Without it, cron
+# lanes would see only the pack's domain types and miss the engine-owned core.
+if [ -f "$REPO_ROOT/config/base-schema.yaml" ]; then
+    ( cd "$REPO_ROOT/config" && tar -cf - base-schema.yaml ) \
+        | docker exec -i -u "$HERMES_UID" "$CONTAINER" tar -xf - -C /opt/data/config/
+    echo "  engine base-schema deployed to $CONTAINER:/opt/data/config/"
+fi
 if [ -d "$PACK_SCRIPTS" ]; then
-    pcount="$(cd "$PACK_SCRIPTS" && ls -1 ./*.py 2>/dev/null | wc -l)"
+    pcount="$(find "$PACK_SCRIPTS" -maxdepth 1 -name '*.py' | wc -l)"
     if [ "$pcount" -gt 0 ]; then
         ( cd "$PACK_SCRIPTS" && tar -cf - ./*.py ) \
             | docker exec -i -u "$HERMES_UID" "$CONTAINER" tar -xf - -C /opt/data/scripts/
@@ -84,6 +96,41 @@ if [ -d "$PACK_SCRIPTS" ]; then
 else
     echo "  (pack scripts not found at $PACK_SCRIPTS — engine-only deploy)"
 fi
+
+# --- enabled extension scripts -> /opt/data/scripts/<id>/ (okengine#128) ---
+# Each enabled in-gateway operation extension stages its *.py into a NAMESPACED
+# subdir; the synthesized cron job's `script:` is /opt/data/scripts/<id>/<file>
+# (extension_compose.SCRIPTS_ROOT). The plan comes from the composer, so a broken
+# enabled set (dup id, missing dep) fails the deploy BEFORE staging — fail-loud.
+if ! EXT_PLAN="$(python3 "$REPO_ROOT/scripts/framework.py" extensions stage-plan "$PACK_DIR")"; then
+    echo "ERROR: extension staging plan failed (see errors above)." >&2
+    exit 1
+fi
+if [ -n "$EXT_PLAN" ]; then
+    estaged=0
+    while IFS=$'\t' read -r ext_id ext_dir; do
+        [ -z "$ext_id" ] && continue
+        pyn="$(find "$ext_dir" -maxdepth 1 -name '*.py' | wc -l)"
+        if [ "$pyn" -eq 0 ]; then
+            echo "  ⚠ extension '$ext_id' has no *.py to stage in $ext_dir" >&2
+            continue
+        fi
+        docker exec -u "$HERMES_UID" "$CONTAINER" mkdir -p "/opt/data/scripts/$ext_id"
+        ( cd "$ext_dir" && tar -cf - ./*.py ) \
+            | docker exec -i -u "$HERMES_UID" "$CONTAINER" tar -xf - -C "/opt/data/scripts/$ext_id/"
+        estaged=$((estaged + 1))
+        echo "  extension '$ext_id': $pyn script(s) -> /opt/data/scripts/$ext_id/"
+    done <<< "$EXT_PLAN"
+    echo "  $estaged enabled extension(s) staged"
+else
+    echo "  (no enabled extensions to stage)"
+fi
+
+# --- reader extension panels (okengine#160) -> <pack>/.okengine/reader-panels.json ---
+# Type-bound panel bindings for the reader (it reads them from the vault it mounts). Host-side
+# (a vault file, not a /opt/data script). Self-declared panels (e.g. viz's map) don't need this.
+python3 "$REPO_ROOT/scripts/framework.py" extensions stage-panels "$PACK_DIR" || \
+    echo "  (reader-panels staging skipped)"
 
 # --- domain data -> /opt/data/config/ ---
 # Domain data tables consumed at runtime (cron-plus mounts only /opt/data/, so
@@ -112,7 +159,7 @@ fi
 # Read by the generic feed_fetch.py at runtime (feeds = pure config).
 PACK_FEEDS="$PACK_DIR/feeds"
 if [ -d "$PACK_FEEDS" ]; then
-    ocount="$(cd "$PACK_FEEDS" && ls -1 ./*.opml 2>/dev/null | wc -l)"
+    ocount="$(find "$PACK_FEEDS" -maxdepth 1 -name '*.opml' | wc -l)"
     if [ "$ocount" -gt 0 ]; then
         docker exec -u "$HERMES_UID" "$CONTAINER" mkdir -p /opt/data/config
         ( cd "$PACK_FEEDS" && tar -cf - ./*.opml ) \

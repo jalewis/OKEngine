@@ -36,7 +36,12 @@ vault repo). Layout:
 Plus `wiki/` (the content the engine compiles + maintains) alongside.
 
 **`schema.yaml`** is the heart — three blocks the engine reads (never hardcodes):
-- `types:` — the domain's page types + required fields (OKF requires only `type`).
+- `types:` — the domain's page types + required fields. The universal OKF core
+  (`source`/`concept`/`prediction`/`finding`/`dashboard`/`briefing`/`trend` + the core
+  namespaces) is **engine-owned** (`config/base-schema.yaml`) and merged *under* the
+  pack, so a pack declares **only its domain types** and uses `extends:` to add optional
+  fields to a core type — never re-declares or tightens one (okengine#90 P2; see
+  [`core-types-and-extensions.md`](core-types-and-extensions.md)).
 - `partitioning:` — how each namespace buckets on disk (`by-type` / `by-letter` /
   `by-date` / `flat`, + `reshard_over`/`reshard_by`). Read by `okf_migrate` /
   `reshelve` / `reshard`.
@@ -91,11 +96,15 @@ export HERMES_UID=10000 HERMES_GID=10000 && sudo chown -R 10000:10000 <pack>
    - **`config.yaml`** (the runtime config — REQUIRED): `framework init` copies
      the engine's `config/config.yaml.template` to `<pack>/.hermes-data/config.yaml`;
      fill it before deploy.
-     Load-bearing keys: `model.default` (your primary, e.g. deepseek-v4-pro) +
+     Load-bearing keys: `model.default` (your primary model — make it your **economical
+     workhorse**; it carries every cron lane that doesn't override it) +
      `terminal.backend: local` (without it the agent can't see the vault mount);
      `mcp_servers.okengine` (read) **and**
      `mcp_servers.okengine-write` (the enforced G1 write path — stdio, no token);
-     and `fallback_providers`. The template documents every key.
+     and `fallback_providers`. The template documents every key. **Which model for which
+     lane** — and how to point a cheap lane (glossary) or a reasoning lane (predictions
+     grading) at a different model via the per-lane `model:` override — is in
+     [`docs/model-selection.md`](model-selection.md).
    (Or start from the reference pack — okpack-sec, a separate repo — instead of `init`.)
    Then **validate before you go further** (catches a bad schema/cron JSON/script
    syntax/unfilled persona/committed `.env` up front):
@@ -133,7 +142,7 @@ export HERMES_UID=10000 HERMES_GID=10000 && sudo chown -R 10000:10000 <pack>
    # HERMES_UID/HERMES_GID default to your uid (you own the clone) — nothing to export.
    # Only for a portable/shared vault: export a fixed uid AND `sudo chown -R <uid> <pack>`.
    bash <engine-checkout>/scripts/build-engine-image.sh    # -> hermes-agent:latest (once)
-   bash <engine-checkout>/scripts/ensure-runtime.sh        # seed .hermes-data/config.yaml (a fresh git clone has none) — MUST precede compose
+   bash <engine-checkout>/scripts/ensure-runtime.sh        # seed .hermes-data/config.yaml + install the PINNED cron-plus scheduler plugin (REQUIRED — without it nothing schedules) — MUST precede compose
    ENGINE_DIR=<engine-checkout> docker compose up -d        # builds reader+mcp, runs all three
    CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-scripts.sh       # engine + pack scripts -> /opt/data/scripts; pack data/feeds -> /opt/data/config
    CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-plus-jobs.sh     # regenerated jobs.json -> live (self-heals next_run_at in ~60s)
@@ -151,6 +160,69 @@ for rollback), bump the pack's `engine.version`. The pack is never rewritten by
 an engine upgrade. Watch the **HERMES_UID** cutover gotcha — keep the same uid across
 the upgrade (the default is your uid; if you pinned a fixed one, keep pinning it) so
 vault file ownership doesn't shift.
+
+**After every cutover, in order** (each step verified by the next):
+
+1. `bash scripts/ensure-runtime.sh <deployment>` — besides the runtime seeds, this
+   **re-stamps `/opt/data/engine-runtime.yaml`** with the release/Hermes actually
+   deployed. A stale stamp makes the weekly pin-drift check compare against the OLD
+   engine (found live on the v0.9.0 sweep: a deployment still stamped two releases back).
+2. `deploy-cron-scripts.sh` + `deploy-cron-plus-jobs.sh` (with `HERMES_UID` exported —
+   the scripts default to 10000 and fail with `mkdir /opt/data: Permission denied`
+   otherwise).
+3. Recreate the gateway, then **sweep `/opt/data/cron-plus/pids/`** for dead-pid
+   orphans (a recreate strands in-flight lanes' pidfiles; a stranded pidfile blocks
+   that lane's every future run as "still active").
+4. If the fleet includes `backlinks-refresh` (okengine#168): the gateway image ships
+   no iwe — stage the binary at `/opt/data/iwe/bin/iwe` (the reader image carries the
+   pinned build). The weekly validation lane FAILs when the job is enabled without it.
+5. Run the validation lane once by hand and require **PASS**:
+   `scripts/vault-exec.sh <deployment> sh -c 'cd /opt/vault && python3 /opt/data/scripts/deployment_validate.py'`
+
+## 3a. Updating a deployed pack (pack updates, not engine upgrades)
+
+The flip side of §3: the **pack definition** changed upstream (library or private repo)
+and a live deployment should pick it up. The engine stays put; only pack files move.
+The mechanism is `framework pull --update` — it never touches runtime or content
+(`.env`, `.hermes-data/`, `raw/`, `wiki/`, the active `feeds.opml`), adds new upstream
+files, and writes each changed definition file as `<file>.upstream` next to yours.
+
+**In order** (each step verified by the next):
+
+1. **Pull from the source that actually has the change.** The catalog resolves to the
+   *published* snapshot — if the publish lags the working repo, point at a checkout
+   directly (a local path is a first-class source):
+
+   ```bash
+   OKENGINE_LIBRARY=/path/to/okpacks-library \
+     python3 scripts/framework.py pull okpacks-library:<pack> <deployment-dir> --update
+   # private/monorepo packs: framework.py pull /path/to/repo:packs/<pack> <deployment-dir> --update
+   ```
+
+2. **Reconcile every `.upstream` file — never bulk-adopt.** Diff each one. Rules of thumb:
+   - **Keep the deployment's copy** for anything carrying deployment state:
+     `pack.yaml` (a deliberate `trust:` flip), the active `feeds/feeds.opml`,
+     `crons/domain-crons.json` (install-time jittered minutes + locally added jobs),
+     a port-offset `docker-compose.yml`.
+   - **Co-installed vaults: `schema.yaml` and `CLAUDE.md` are merge targets, not files
+     to replace.** `install-domain` writes the co-installed taxonomy into the host's
+     schema and appends `## Installed domain:` persona sections — adopting the upstream
+     copy wholesale **wipes the composition** (and can re-shadow a co-installed type
+     via `type_aliases`). Merge the upstream delta by hand, or skip it if the change
+     doesn't apply.
+   - **Adopt upstream** for everything else (validators, conformance suites, docs, CI).
+   - Delete each `.upstream` as you settle it; finish with none left.
+3. **Validate the pack offline:** `python3 validate.py` in the deployment dir
+   (plus its conformance suite, if it ships one).
+4. **Redeploy crons only if cron files changed** (`domain-crons.json`,
+   `engine-template-prompts.json`, `crons/scripts/`): `deploy-cron-scripts.sh` +
+   `deploy-cron-plus-jobs.sh` with `HERMES_UID` exported (§3 step 2). Definition-only
+   changes (schema, persona, docs) need **no redeploy and no restart** — the vault is
+   bind-mounted and read at use time. Restart only if `docker-compose.yml`/`.env` changed.
+5. **Verify live:** `bash <engine>/scripts/post_deploy_verify.sh` from the deployment
+   dir — require 0 FAIL.
+6. **Run the validation lane once by hand** and require **PASS** (§3 step 5):
+   `scripts/vault-exec.sh <deployment> sh -c 'cd /opt/vault && python3 /opt/data/scripts/deployment_validate.py'`
 
 ## 4. Reference pack
 

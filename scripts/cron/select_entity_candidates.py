@@ -168,4 +168,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # DeepSeek off-peak deferral (CRON_DEFER_UTC_HOURS): during the configured peak UTC window
+    # emit nothing — cron-plus wakes the agent only on non-empty stdout (scheduler.py), so this
+    # bulk drain silently defers to the next off-peak fire (no model call at 2x price).
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from offpeak import offpeak_defer
+    if offpeak_defer():
+        sys.exit(0)
     sys.exit(main())

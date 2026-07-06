@@ -110,13 +110,15 @@ spec is §1.
 
 ### Services & ports
 
-Host ports are offset by **+{{PORT_OFFSET}}** to avoid colliding with other packs on this host.
+All three services share a per-pack bridge (the compose default network); only the reader
+publishes a host port, offset by **+{{PORT_OFFSET}}** to avoid colliding with other packs
+(okengine#138).
 
 | Service | Container | Host port → internal | Role |
 |---------|-----------|----------------------|------|
-| `gateway` | `{{PACK}}-gateway` | `network_mode: host` | Hermes agent runtime + delivery |
+| `gateway` | `{{PACK}}-gateway` | none (bridge; reaches `okengine-mcp` by service name) | Hermes agent runtime + delivery |
 | `okengine-reader` | `{{PACK}}-reader` | `{{READER_PORT}} → 9200` | search/read index over the vault (`:ro`) |
-| `okengine-mcp` | `{{PACK}}-mcp` | `{{MCP_PORT}} → 8730` | enforced MCP write/query surface (`WIKI_PATH=/opt/vault`) |
+| `okengine-mcp` | `{{PACK}}-mcp` | none by default (`{{MCP_PORT}} → 8730` only if exposed to external agents) | enforced MCP write/query surface (`WIKI_PATH=/opt/vault`) |
 
 ## Validate
 

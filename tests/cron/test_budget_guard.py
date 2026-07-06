@@ -168,3 +168,72 @@ def test_manual_mode_pauses_and_resume_is_the_recovery(tmp_path, monkeypatch):
     assert m.main([]) == 0 and calls == []                      # manual: stays paused, no auto-resume
     assert m.resume("manual") == 1 and calls == [("resume", "a")]   # operator recovery
     assert json.loads((tmp_path / "budget-guard-state.json").read_text())["paused"] is False
+
+
+def test_cost_bearing_ids_skips_already_disabled():  # invariant-audit #19
+    """An already-disabled job (operator maintenance pause) must NOT be captured for pausing —
+    else auto-resume flips it back to enabled, silently reverting the operator's deliberate pause."""
+    m = _load()
+    jobs = [
+        {"id": "a", "name": "raw-backfill", "enabled": False},              # operator-disabled -> skip
+        {"id": "b", "name": "brief", "enabled": True},
+        {"id": "c", "name": "drain"},                                        # enabled defaults True
+        {"id": "d", "name": "cleanup", "no_agent": True, "enabled": True},   # free -> skip
+    ]
+    names = [n for _, n in m.cost_bearing_ids(jobs)]
+    assert "raw-backfill" not in names                                       # not re-enabled on resume
+    assert "brief" in names and "drain" in names
+    assert "cleanup" not in names
+
+
+def test_usd_budget_without_price_warns_inert(tmp_path, monkeypatch, capsys):  # invariant-audit #18
+    """A USD cap needs OKENGINE_BUDGET_PRICE_PER_MTOK to convert tokens->USD. Without it the USD
+    term is always False and the cap SILENTLY never trips (fail-open). The guard must WARN so the
+    operator knows they aren't actually capped."""
+    m = _load()
+    db = tmp_path / "state.db"
+    _make_db(db, [])
+    monkeypatch.setenv("OKENGINE_STATE_DB", str(db))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_BUDGET_USD", "10")
+    monkeypatch.delenv("OKENGINE_BUDGET_PRICE_PER_MTOK", raising=False)
+    monkeypatch.delenv("OKENGINE_BUDGET_TOKENS", raising=False)
+    assert m.main([]) == 0
+    assert "USD cap is INERT" in capsys.readouterr().err
+
+
+def test_trip_does_not_claim_paused_when_pause_fails(tmp_path, monkeypatch):
+    """okengine invariant-audit #3: if cron-plus pause fails for all cost-bearing crons, the guard
+    must NOT persist paused=True — that makes decide() no-op forever while crons keep spending past
+    the cap (fail-open). paused stays False so the next tick re-attempts."""
+    m = _load()
+    db = tmp_path / "state.db"; _make_db(db, [(1_000_000.0 - 10, 2_000_000, 0)])
+    jobs = tmp_path / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [{"id": "a", "name": "raw-backfill"}]}))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_STATE_DB", str(db))
+    monkeypatch.setenv("OKENGINE_CRON_PLUS_JOBS", str(jobs))
+    monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "1000000")
+    monkeypatch.setattr(m, "time", type("T", (), {"time": staticmethod(lambda: 1_000_000.0)}))
+    monkeypatch.setattr(m, "_cronplus", lambda action, jid: False)   # every pause FAILS
+    assert m.main([]) == 0
+    state = json.loads((tmp_path / "budget-guard-state.json").read_text())
+    assert state["paused"] is False                 # NOT tripped-on-paper — retry next tick
+    assert state["paused_ids"] == []
+    # decide() therefore re-attempts the pause rather than no-op'ing
+    assert m.decide(over_budget=True, currently_paused=False, resume_policy="manual") == "pause"
+
+
+def test_resume_keeps_paused_when_some_resume_fails(tmp_path, monkeypatch):
+    """okengine invariant-audit #14: a partial resume (cron-plus fails for some ids) must NOT clear
+    paused — that strands those crons disabled while reporting 'not paused'. Keep paused with only
+    the still-disabled ids so the next tick re-resumes them."""
+    m = _load()
+    _seed_paused(tmp_path, ["a", "c"])
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(m, "time", type("T", (), {"time": staticmethod(lambda: 2_000_000.0)}))
+    monkeypatch.setattr(m, "_cronplus", lambda action, jid: jid == "a")   # "c" resume FAILS
+    assert m.resume("auto") == 1                     # one resumed
+    state = json.loads((tmp_path / "budget-guard-state.json").read_text())
+    assert state["paused"] is True                   # still paused (not falsely cleared)
+    assert state["paused_ids"] == ["c"]              # only the still-disabled one retained

@@ -1,0 +1,67 @@
+diff --git a/tools/file_tools.py b/tools/file_tools.py
+index 7bf51aa90..9b862319a 100644
+--- a/tools/file_tools.py
++++ b/tools/file_tools.py
+@@ -3,6 +3,7 @@
+ 
+ import errno
+ import json
++import re
+ import logging
+ import os
+ import threading
+@@ -876,6 +877,38 @@ def _is_internal_file_tool_content(content: str) -> bool:
+         or _looks_like_read_file_line_numbered_content(content)
+     )
+ 
++def _doubled_path_segment(path_str: str) -> str | None:
++    """Return the doubled segment if the resolved write path contains the
++    same directory name back-to-back (e.g. `/vault/wiki/wiki/index.md`).
++
++    This is the agent-CWD-confusion footgun: the model thinks CWD is X
++    and writes `wiki/foo.md`, but the actual CWD is `X/wiki`, so the
++    file lands at `X/wiki/wiki/foo.md`. Once a rogue `wiki/wiki/` exists,
++    every dataview / find_vault_root walker that checks for a `wiki/`
++    subdir matches the rogue first, silently breaking downstream pipelines.
++
++    Caught after `wiki/wiki/index.md` (and rogue `./concepts/`, `./sources/`
++    at vault root) was created by cron agents — the
++    competitive-landscape PDF rendered with empty dashboard tables
++    because find_vault_root walked into `wiki/wiki/` and load_entities
++    found nothing.
++
++    Returns the doubled segment string for the error message, or None if
++    no doubling detected. Skips standard non-directory parts ('/', '.', '..').
++    """
++    try:
++        parts = Path(path_str).resolve().parts
++    except (OSError, ValueError):
++        return None
++    skip = {"/", ".", ".."}
++    for i in range(len(parts) - 1):
++        a = parts[i]
++        if a in skip or a.startswith("."):
++            continue
++        if a == parts[i + 1]:
++            return f"{a}/{a}"
++    return None
++
+ 
+ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
+     """Get or create ShellFileOperations for a terminal environment.
+@@ -1503,6 +1536,15 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
+             "Strip read_file line-number prefixes or reconstruct the intended "
+             "file contents before writing."
+         )
++    doubled = _doubled_path_segment(path)
++    if doubled:
++        return tool_error(
++            f"Refusing to write to a path with a doubled directory segment: `{doubled}`. "
++            "This usually means CWD confusion — you constructed the path relative to a "
++            "parent of your actual working directory, so a prefix got duplicated. "
++            f"Verify your CWD (probably with `pwd`) and re-run the write with a "
++            f"corrected path. Path attempted: {path}"
++        )
+     try:
+         # Resolve once for the registry lock + stale check.  Failures here
+         # fall back to the legacy path — write proceeds, per-task staleness

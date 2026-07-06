@@ -78,7 +78,7 @@ def parse_fm(text):
     if not m:
         return None, None
     try:
-        fm = yaml.safe_load(m.group(1))
+        fm = schema_lib.fast_load(m.group(1))
         return (fm if isinstance(fm, dict) else None), m
     except yaml.YAMLError:
         return None, m
@@ -135,8 +135,10 @@ def scan_queues():
     pages = all_wiki_pages()
     schema = schema_lib.governing_schema(VAULT)
     declared_types = schema_lib.canonical_types(schema)  # empty ⇒ accept any type
+    refpol = schema_lib.reference_policy(schema)  # reference-catalog pages → out of content-debt counts
     knowledge_ns = knowledge_namespaces()
     fm_parse_errors = 0
+    reference_pages = 0
     yaml_invalid = 0
     schema_drift = 0
     sources_missing_quality = 0
@@ -145,7 +147,9 @@ def scan_queues():
 
     # All wikilinks → set of resolved/unresolved targets
     all_targets = set()
+    synth_targets = set()  # targets referenced from at least one NON-reference page
     inbound_count = {}  # slug → count
+    reference_stems = set()  # stems of reference-catalog pages (excluded from orphans)
 
     # Build slug index for resolution
     valid_slugs = set()
@@ -186,7 +190,7 @@ def scan_queues():
 
         # FM regex passed — try YAML
         try:
-            yaml.safe_load(m.group(1))
+            schema_lib.fast_load(m.group(1))
         except yaml.YAMLError:
             yaml_invalid += 1
             continue
@@ -201,6 +205,14 @@ def scan_queues():
         if declared_types and t and t not in declared_types and t not in OPERATIONAL_TYPES:
             schema_drift += 1
 
+        # Reference-catalog pages (pack-declared: CVE / ATT&CK / encyclopedia imports) are
+        # link-target scaffolding, not synthesized content — tracked, but kept out of the orphan
+        # count: a catalog entry with no inbound links yet is waiting to be cited, not a defect.
+        is_ref = schema_lib.is_reference_page(fm, refpol)
+        if is_ref:
+            reference_pages += 1
+            reference_stems.add(p.stem)
+
         # Sources: must carry quality scores (reliability + credibility) and
         # contribute to the publisher-canonicalization tally. These are generic
         # OKF source-page conventions; a pack without a `source` type simply
@@ -212,10 +224,14 @@ def scan_queues():
             if pub and isinstance(pub, str):
                 publisher_counts[pub] = publisher_counts.get(pub, 0) + 1
 
-        # All pages: count outbound wikilinks and inbound references
+        # All pages: count outbound wikilinks and inbound references. Targets a NON-reference
+        # page links to are "synthesized" — a broken one of those is real debt; a target only
+        # ever linked from reference-catalog pages is catalog scaffolding noise.
         for wm in _WIKILINK_RE.finditer(txt):
             tgt = wm.group(1).strip()
             all_targets.add(tgt)
+            if not is_ref:
+                synth_targets.add(tgt)
             slug = tgt.split("/")[-1]
             inbound_count[slug] = inbound_count.get(slug, 0) + 1
 
@@ -227,14 +243,22 @@ def scan_queues():
             if not any(s in index_links for s in slug_paths):
                 pages_missing_index += 1
 
-    # Broken wikilinks: targets not in valid_slugs
-    broken_wikilinks = sum(1 for t in all_targets if t not in valid_slugs and t.split("/")[-1] not in valid_slugs)
+    # Broken wikilinks: unresolved targets. A target referenced ONLY by reference-catalog pages
+    # (e.g. an ATT&CK record cross-linking a technique that wasn't imported) is catalog
+    # scaffolding noise, not synthesized-content debt — counted separately, out of the headline.
+    def _unresolved(t):
+        return t not in valid_slugs and t.split("/")[-1] not in valid_slugs
+    broken_all = {t for t in all_targets if _unresolved(t)}
+    broken_wikilinks = sum(1 for t in broken_all if t in synth_targets)
+    reference_broken = len(broken_all) - broken_wikilinks
 
     # Orphans: knowledge-namespace pages with 0 inbound references
     orphans = 0
     for p in pages:
         rel = p.relative_to(VAULT / "wiki")
         if rel.parts and rel.parts[0] in knowledge_ns:
+            if p.stem in reference_stems:
+                continue                    # reference-catalog data isn't an orphan to fix
             if inbound_count.get(p.stem, 0) == 0:
                 orphans += 1
 
@@ -252,6 +276,8 @@ def scan_queues():
         "schema-drift": schema_drift,
         "sources-missing-quality-scores": sources_missing_quality,
         "pages-missing-from-index": pages_missing_index,
+        "reference-pages": reference_pages,
+        "reference-broken-wikilinks": reference_broken,
     }
 
 

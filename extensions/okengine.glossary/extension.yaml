@@ -1,0 +1,37 @@
+# okengine.glossary — a domain glossary as a first-party extension.
+#
+# Exercises areas the other first-party extensions don't: it OWNS a schema type
+# (bring-your-own-schema, okengine#133 "Own" path) and writes pages of that type into its own
+# namespace via the scoped okengine-write path (okengine#132), and carries a `config:` block.
+# Mirrors the concept-backfill pattern: pages seed a term by linking [[glossary/<slug>]]; once
+# a slug accrues enough references, the agent synthesizes its definition page. Opt-in (it
+# spends model budget) — unlike core okengine.contradictions.
+id: okengine.glossary
+kind: operation
+version: 0.1.0
+name: Glossary
+description: >-
+  Maintains a glossary of domain terms. A page seeds a term by linking [[glossary/<slug>]];
+  once enough pages reference the same slug, this synthesizes its definition page (type: term)
+  — the lexical companion to concepts (which group entities by theme).
+trust: in-gateway
+requires:
+  engine: ">=0.5.0"          # core/schema-owning extension grammar
+  schema_refs: [entity, concept]   # types a term links to (must exist in the composed schema)
+capabilities:
+  read: [wiki/**]
+  write: [glossary/**]       # writes into its OWN namespace, owned by the fragment below
+schema:
+  - schema/glossary.schema.yaml    # OWNS the `term` type + `glossary` namespace (#133)
+operation:
+  schedule: {kind: cron, expr: "37 5 * * *"}
+  entrypoint: select_undefined_terms.py   # wake-gate: finds under-referenced undefined terms
+  prompt_file: prompts/glossary.md
+  toolsets: [hermes-cron, okengine-write, okengine]
+  tier: concepts             # run alongside concept synthesis (#129 kickstart hint)
+  # Defining a term is lightweight, so this lane is fine on the deployment's default model
+  # (which should be your economical workhorse) — no override needed. A shipped first-party
+  # extension does NOT pin a model: that's a deployment choice. The `model:` key is available
+  # if a lane genuinely needs a different tier; pick by task profile — see docs/model-selection.md.
+config:
+  min_references: {type: integer, default: 3}   # define a term once N pages link [[glossary/<slug>]]

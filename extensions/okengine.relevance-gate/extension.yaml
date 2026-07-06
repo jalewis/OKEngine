@@ -1,0 +1,44 @@
+# okengine.relevance-gate — consumer-side ingest scope filtering (okengine#167).
+#
+# The principle (from the design issue): relevance is a CONSUMER decision — filtering at the
+# producer bakes one consumer's taste into a shared source. So the mechanism lives here, generic,
+# and the BOUNDARY is pack/operator config: `pack_config.scope` in the pack's schema.yaml
+# (statement / in_scope / out_of_scope / on_uncertain: keep). No scope declared -> both lanes
+# no-op loudly; this extension never invents a boundary.
+#
+# Two deterministic (no_agent) lanes, both flag-not-delete (`off_scope: true` + scope_reason —
+# the reversible marker; nothing is removed, the dashboards make the boundary a tunable dial):
+#   scope-prescore  — term matching from the scope lists: flags CLEAR out-of-scope (out-terms hit,
+#                     zero in-terms), leaves the ambiguous middle; writes dashboards/scope-audit.md.
+#   scope-classify  — the ambiguous middle through the vendored llm_lib (reasoning-off default;
+#                     cheap qwen-class model): model labels, THIS SCRIPT holds the pen
+#                     (propose/dispose); uncertain -> KEPT for operator review; needs
+#                     OKENGINE_LLM_BASE_URL + OKENGINE_LLM_MODEL in the deployment .env, else
+#                     no-ops loudly. Writes dashboards/scope-classify.md.
+#
+# No schema fragment: off_scope/scope_reason are additive OPTIONAL fields (the validator checks
+# required-lists + enums only), established by the manual F2 scope pass this mechanizes.
+id: okengine.relevance-gate
+kind: operation
+version: 0.1.0
+name: Relevance gate
+description: >-
+  Consumer-side ingest scope filtering: flag (never delete) off-thesis source pages against the
+  pack's operator-owned scope config, with a deterministic term pass, a cheap-model pass for the
+  ambiguous middle, and audit dashboards that make the boundary a visible, tunable dial.
+trust: in-gateway
+requires:
+  engine: ">=0.8.0"
+capabilities:
+  read: ["wiki/**"]
+  write: ["sources/**", "dashboards/**"]   # frontmatter flags + the audit views
+config:
+  SCOPE_LOOKBACK_DAYS: "7"     # 0 = whole corpus (backlog pass)
+  SCOPE_CLASSIFY_BATCH: "12"   # fits the ~120s no_agent script timeout at ~6s/model call
+operations:
+  scope-prescore:
+    schedule: {kind: cron, expr: "10 5 * * *"}   # after the overnight ingest, before the briefs
+    entrypoint: scope_prescore.py
+  scope-classify:
+    schedule: {kind: cron, expr: "25 5 * * *"}   # the middle, right after prescore
+    entrypoint: scope_classify.py

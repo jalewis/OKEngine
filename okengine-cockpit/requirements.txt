@@ -1,0 +1,5 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+markdown==3.7
+PyYAML==6.0.2
+weasyprint==62.3

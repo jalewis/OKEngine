@@ -35,7 +35,16 @@ if [ -d "$DEST/.git" ]; then
         echo "  already at the pinned commit ($DEST) — skipping"
     else
         git -C "$DEST" fetch --quiet --depth 1 origin "$SHA" 2>/dev/null || git -C "$DEST" fetch --quiet origin
-        git -C "$DEST" checkout --quiet "$SHA"
+        # The plugin dir is an engine-MANAGED clone — the pin is authoritative, not a place for
+        # local edits. A plain `checkout` ABORTS on any local modification, which blocks the WHOLE
+        # deploy (this bit a live redeploy: an old-pin jobs.py carried a hand-ported TZ-aware patch,
+        # so `checkout` refused and deploy.sh died at step 2). FORCE the tree to the pin instead,
+        # but SURFACE any discarded change so a real hand-edit isn't lost silently (okengine#178).
+        if [ -n "$(git -C "$DEST" status --porcelain 2>/dev/null)" ]; then
+            echo "  ⚠ discarding LOCAL modification(s) in the managed cron-plus clone (the pin is authoritative):" >&2
+            git -C "$DEST" status --porcelain 2>/dev/null | sed 's/^/        /' >&2
+        fi
+        git -C "$DEST" checkout --quiet --force "$SHA"
         echo "  updated to the pinned commit"
     fi
 else

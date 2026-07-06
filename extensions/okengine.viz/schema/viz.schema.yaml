@@ -1,0 +1,14 @@
+# okengine.viz schema fragment — the §5 "Extend" case (okengine#172).
+# Adds the two Wardley axis fields + the enrichment provenance marker as OPTIONAL
+# fields on the core `concept` type (marked extensible by base-schema). First
+# fragment to exercise the extends-on-core-type path; owner = ext:okengine.viz.
+# Values: evolution ∈ genesis|custom|product|commodity (enforced by the enrich
+# lane, which is the only writer); value_chain ∈ [0,1] (higher = foundational);
+# viz_enriched = ISO date stamped by the lane — fields present WITHOUT the marker
+# are human/pack-set and the lane never touches them.
+extends:
+  concept:
+    fields:
+      evolution: {}
+      value_chain: {}
+      viz_enriched: {}

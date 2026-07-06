@@ -1,0 +1,37 @@
+id: okengine.contradictions
+kind: operation
+version: 0.1.0
+name: Contradictions
+description: >
+  Walks the vault for "## Contradictions" sections, classifies each as
+  ACTIVE / EMPTY / RESOLVED, and renders wiki/dashboards/contradictions.md —
+  surfacing where the wiki currently disagrees with itself. Deterministic;
+  domain-agnostic. The first-party reference extension (okengine#131 §11 first slice),
+  migrated out of the engine cron fleet into an opt-in operation.
+
+requires:
+  engine: ">=0.4.0"        # core flag (#142) lands in v0.4.0
+
+# core (okengine#142): default-ON / opt-out. A contradictions dashboard is cheap
+# (deterministic no_agent, one dashboard page) and useful on any OKF vault, so it's part
+# of the house baseline — active unless explicitly disabled (`framework extensions disable
+# <pack> okengine.contradictions`). Predictions stays opt-in (it spends model budget).
+core: true
+
+# in-gateway, trusted first-party: a deterministic cron script. It reads the vault
+# and writes its dashboard directly — the established pattern for engine dashboard
+# generators (the okengine-write path is the agent/third-party write contract,
+# enforced once scoped MCP lands, okengine#132).
+trust: in-gateway
+
+capabilities:
+  read: [wiki/**]
+  write: [dashboards/**]
+  network: false
+  secrets: []
+  delivery: false
+
+operation:
+  schedule: {kind: cron, expr: "0 4 * * *"}   # daily 04:00 (was the contradictions-refresh engine cron)
+  entrypoint: {script: select_contradictions.py}
+  timeout: 600

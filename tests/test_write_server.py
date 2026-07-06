@@ -32,6 +32,7 @@ permissions:
   namespaces:
     findings:
       create: false
+      update: false
 review:
   confidence_field: confidence
   confidence_review_values: [confirmed, false-positive, refuted]
@@ -162,6 +163,25 @@ def test_entity_shard_normalized_to_one_level(vault):
     assert not (root / "wiki" / "entities" / "a" / "p" / "apt-test.md").exists()
 
 
+def test_entity_shard_preserves_resharded_two_level(vault):
+    """okengine invariant-audit: once a hot first-letter leaf is resharded to two levels
+    (entities/<l>/<2nd>/<slug>.md), the enforced write path must NOT collapse the resharded canonical
+    back to one level — that refuses/duplicates writes on a mature vault. Shard letters recomputed
+    from the slug either way, so an arbitrary/old path still resolves to the real canonical."""
+    m, root = vault
+    resh = root / "wiki" / "entities" / "c" / "v"
+    resh.mkdir(parents=True)
+    (resh / "cve-2021-44228.md").write_text("---\ntype: entity\nname: x\n---\nbody\n")
+    # the resharded canonical is preserved (NOT collapsed to the nonexistent one-level path)
+    assert m._normalize_entity_shard("entities/c/v/cve-2021-44228.md") == "entities/c/v/cve-2021-44228.md"
+    # an agent passing the OLD one-level path is redirected UP to the resharded canonical
+    assert m._normalize_entity_shard("entities/c/cve-2021-44228.md") == "entities/c/v/cve-2021-44228.md"
+    # an arbitrary wrong second-shard is corrected to the real resharded location
+    assert m._normalize_entity_shard("entities/c/z/cve-2021-44228.md") == "entities/c/v/cve-2021-44228.md"
+    # a DIFFERENT slug in the same resharded leaf lands two-level (leaf has been resharded)
+    assert m._normalize_entity_shard("entities/c/cobalt-strike.md") == "entities/c/o/cobalt-strike.md"
+
+
 def test_malformed_create_rejected(vault):
     m, root = vault
     # type: source but missing publisher/published required fields.
@@ -279,6 +299,20 @@ def test_flag_for_review(vault):
 
 
 # --- G2 structural permissions + G3 review FLAGS (not gates) --------------
+
+def test_tombstone_respects_update_denied_namespace(vault):
+    """G2 via tombstone (okengine#166): a tombstone IS an update — a namespace the
+    agent may not update (e.g. a human-authored or federated read-only lookup tree)
+    must reject it through the same permission matrix as every other mutation.
+    This path bypassed _policy_reject before the fix."""
+    m, root = vault
+    p = root / "wiki" / "findings" / "seeded.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("---\ntype: entity\nname: Seeded\nversion: 1\n---\nbody\n")
+    res = m._tombstone("findings/seeded", "should not land")
+    assert res.startswith("rejected:") and "not agent-writable" in res, res
+    assert "tombstoned" not in p.read_text(), "file must be untouched"
+
 
 def test_create_denied_namespace_refused(vault):
     """G2: a namespace with create:false is a STRUCTURAL boundary (human-authored)
@@ -630,3 +664,75 @@ def test_create_allows_excluded_namespace(ns_vault):
     m, root = ns_vault
     res = m._create("operational/health", "type: dashboard\ntitle: Health", "# Health")
     assert "not declared" not in res, res
+
+
+# --- frontmatter reference normalization (wikilink -> plain path) -----------------
+# Agents write [[wikilinks]]; in YAML `[[x]]` is a nested flow sequence, so a bare wikilink in a
+# frontmatter value mangles. _coerce_fm canonicalizes refs to plain paths at the enforced-write
+# chokepoint, fixing every extension at once. (okengine#145 follow-up)
+
+def test_normalize_refs_strips_bare_wikilink_string():
+    m = _load()
+    fm = m._normalize_refs({"field_mapped": "[[concepts/x]]", "title": "Plain Title"})
+    assert fm["field_mapped"] == "concepts/x"
+    assert fm["title"] == "Plain Title"            # non-wikilink string untouched
+
+
+def test_normalize_refs_flattens_yaml_mangled_nested_lists():
+    m = _load()
+    fm = m._normalize_refs({
+        "field_mapped": [["concepts/supply-chain-compromise"]],   # bare [[x]] -> [["x"]]
+        "see_also": [[["concepts/x"]], [["entities/s/y"]]],       # list of bare [[..]] items
+    })
+    assert fm["field_mapped"] == ["concepts/supply-chain-compromise"]
+    assert fm["see_also"] == ["concepts/x", "entities/s/y"]
+
+
+def test_normalize_refs_strips_wikilinks_in_flat_list():
+    m = _load()
+    fm = m._normalize_refs({"see_also": ["[[concepts/a]]", "[[entities/b]]"]})
+    assert fm["see_also"] == ["concepts/a", "entities/b"]
+
+
+def test_normalize_refs_leaves_plain_values_untouched():
+    m = _load()
+    fm = m._normalize_refs({"aliases": ["foo", "bar"], "sources": [], "name": "Acme"})
+    assert fm["aliases"] == ["foo", "bar"]
+    assert fm["sources"] == []
+    assert fm["name"] == "Acme"
+
+
+def test_coerce_fm_normalizes_bare_wikilinks_from_yaml_string():
+    m = _load()
+    # the REAL path: agent writes bare [[..]] in the YAML string -> safe_load mangles to nested
+    # lists -> _coerce_fm must return canonical plain paths.
+    yaml_text = ("type: lacuna\nfield_mapped: [[concepts/x]]\n"
+                 "see_also:\n- [[concepts/a]]\n- [[entities/s/b]]\n")
+    fm = m._coerce_fm(yaml_text)
+    assert fm["field_mapped"] == ["concepts/x"]
+    assert fm["see_also"] == ["concepts/a", "entities/s/b"]
+
+
+# --- ISO-8601 timestamps for last_updated/created (OKF envelope; UI tracks WHEN, not just day) ---
+
+def test_now_helper_timestamp_and_overrides(monkeypatch):
+    m = _load()
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_NOW", "2026-06-28T14:30:00Z")
+    assert m._now() == "2026-06-28T14:30:00Z"
+    monkeypatch.delenv("OKENGINE_MCP_WRITE_NOW", raising=False)
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-06-28")     # date override still honored
+    assert m._now() == "2026-06-28"
+    monkeypatch.delenv("OKENGINE_MCP_WRITE_DATE", raising=False)
+    real = m._now()                                                  # real UTC timestamp
+    assert real.endswith("Z") and "T" in real and len(real) == 20
+
+
+def test_create_stamps_iso_timestamp(vault, monkeypatch):
+    m, root = vault
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_NOW", "2026-06-28T14:30:00Z")
+    res = m._create("entities/q/qilin", "type: entity\nname: Qilin", "body")
+    assert res.startswith("created"), res
+    import yaml
+    fm = yaml.safe_load((root / "wiki" / "entities" / "q" / "qilin.md").read_text().split("---")[1])
+    assert fm["last_updated"] == "2026-06-28T14:30:00Z"   # a timestamp, not just a date
+    assert fm["created"] == "2026-06-28T14:30:00Z"

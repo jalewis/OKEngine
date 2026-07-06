@@ -38,6 +38,13 @@ MAX_ENTRIES = 500
 _FM_RE = re.compile(r"\A---[ \t]*\n(.*?\n)---", re.S)
 _STRUCT = {"INDEX.md", "index.md", "log.md", "BUNDLE.md", "HEALTH.md", "AGENTS.md"}
 
+
+def _listable(name: str) -> bool:
+    """A page worth listing in an INDEX — not structural/scaffolding. Excludes _STRUCT
+    (INDEX/log/BUNDLE/HEALTH/AGENTS) and any `_`-prefixed file (the _about namespace
+    description card, _review-queue, etc.) — those exist but are not navigable pages."""
+    return name not in _STRUCT and not name.startswith("_")
+
 _SCHEMA = schema_lib.governing_schema(VAULT)
 # Non-knowledge top-level dirs to skip. The pack declares its derived/operational
 # dirs via schema.yaml `exclude:`; the engine adds only generic, never-knowledge
@@ -76,6 +83,28 @@ def _title(p: Path, fm: dict) -> str:
     return str(t) if t else p.stem
 
 
+def _date(fm: dict) -> str:
+    """A human-meaningful date for the index row (YYYY-MM-DD). Prefers the curation date, then the
+    write-path auto-stamp, then the source date — so pages whose slug carries no date (e.g. lacuna,
+    entities, concepts) still show WHEN, keyed off the fields the write path always stamps."""
+    for k in ("updated", "last_updated", "published", "created"):
+        v = fm.get(k)
+        if v:
+            return str(v)[:10]
+    return ""
+
+
+def _created(fm: dict) -> str:
+    """The row's birth date (YYYY-MM-DD): the write-path `created` stamp, else the source's
+    published date. Separate from _date() so an INDEX shows both when-it-appeared and
+    when-it-last-moved — new pages are what operators scan an INDEX for."""
+    for k in ("created", "published"):
+        v = fm.get(k)
+        if v:
+            return str(v)[:10]
+    return ""
+
+
 def _count_md(d: Path) -> int:
     return sum(1 for _ in d.rglob("*.md"))
 
@@ -83,32 +112,44 @@ def _count_md(d: Path) -> int:
 def gen_index(d: Path, now: str) -> None:
     """Write INDEX.md for directory d (immediate children), then recurse."""
     subdirs = sorted(x for x in d.iterdir() if x.is_dir() and not x.name.startswith("."))
-    files = sorted(x for x in d.glob("*.md") if x.name not in _STRUCT)  # glob-ok: per-directory INDEX; gen_index recurses into subdirs
+    files = sorted(x for x in d.glob("*.md") if _listable(x.name))  # glob-ok: per-directory INDEX; gen_index recurses into subdirs
+    # One fm read per file, then NEWEST-CREATED FIRST (empty created sorts last; ties stay
+    # alphabetical via the stable sort above) — an INDEX's first job is surfacing new pages.
+    entries = [(f, _fm(f)) for f in files]
+    entries.sort(key=lambda e: _created(e[1]) or "0000-00-00", reverse=True)
     rel = d.relative_to(WIKI).as_posix() or "."
+    prefix = "" if rel == "." else rel + "/"
     lines = ["---", "type: dashboard", f'title: "Index: {rel}"', "---", "",
              f"# Index: {rel}", "", f"_generated {now} · {len(subdirs)} subdir(s), "
              f"{len(files)} page(s) here_", ""]
+    _about_f = d / "_about.md"
+    if _about_f.is_file():
+        _at = _about_f.read_text(encoding="utf-8", errors="replace")
+        _m = _FM_RE.match(_at)
+        _body = (_at[_m.end():] if _m else _at).strip()
+        if _body:
+            lines += [_body, "", "---", ""]   # fold the namespace description card in
     if subdirs:
         lines += ["## Subdirectories", "", "| Dir | Pages | Index |", "|---|---:|---|"]
         for sd in subdirs:
-            lines.append(f"| `{sd.name}/` | {_count_md(sd)} | [open]({sd.name}/INDEX.md) |")
+            lines.append(f"| `{sd.name}/` | {_count_md(sd)} | [[{prefix}{sd.name}/INDEX|open]] |")
         lines.append("")
     def _rows(chunk):
-        out = ["| Page | Type | Title |", "|---|---|---|"]
-        for f in chunk:
-            fm = _fm(f)
+        out = ["| Page | Type | Created | Updated | Title |", "|---|---|---|---|---|"]
+        for f, fm in chunk:
             t = _title(f, fm).replace("|", "\\|")[:90]
-            out.append(f"| [{f.stem}]({f.name}) | {str(fm.get('type') or '')} | {t} |")
+            out.append(f"| [[{prefix}{f.stem}|{f.stem}]] | {str(fm.get('type') or '')} | "
+                       f"{_created(fm)} | {_date(fm)} | {t} |")
         return out
 
     if files and len(files) <= MAX_ENTRIES:
-        lines += ["## Pages", ""] + _rows(files) + [""]
+        lines += ["## Pages", ""] + _rows(entries) + [""]
         (d / "INDEX.md").write_text("\n".join(lines), encoding="utf-8")
     elif files:
-        # Paginate: INDEX.md holds page 1 + a page nav; INDEX-pNN.md hold the rest.
-        pages = [files[i:i + MAX_ENTRIES] for i in range(0, len(files), MAX_ENTRIES)]
+        # Paginate: INDEX.md holds page 1 (the newest) + a page nav; INDEX-pNN.md hold the rest.
+        pages = [entries[i:i + MAX_ENTRIES] for i in range(0, len(entries), MAX_ENTRIES)]
         nav = "Pages: " + " ".join(
-            ("**1**" if i == 0 else f"[{i+1}](INDEX-p{i+1:02d}.md)") for i in range(len(pages)))
+            ("**1**" if i == 0 else f"[[{prefix}INDEX-p{i+1:02d}|{i+1}]]") for i in range(len(pages)))
         lines += [f"> {len(files)} pages — paginated at {MAX_ENTRIES}/page.", "", nav, "",
                   "## Pages (1)", ""] + _rows(pages[0]) + [""]
         (d / "INDEX.md").write_text("\n".join(lines), encoding="utf-8")

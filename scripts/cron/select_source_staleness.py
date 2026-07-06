@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Daily refresh of wiki/dashboards/source-staleness.md — closes GitLab #11.
+"""Daily refresh of wiki/dashboards/source-staleness.md — closes okengine#11.
 
 Walks every source page in `wiki/sources/`, computes an effective_score
 that decays the frozen source rating by source_kind-specific half-life
@@ -271,7 +271,7 @@ def render_dashboard(scores: dict[str, SourceScore], anchors: list[Anchor], toda
     L.append("type: dashboard")
     L.append("title: Source staleness — effective-score decay")
     L.append(f"created: {today.isoformat()}")
-    L.append(f"updated: {today.isoformat()}")
+    L.append(f"updated: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
     L.append("---")
     L.append("")
     L.append("# Source staleness — effective-score decay")

@@ -3,13 +3,21 @@
 # set (disjoint ownership, requires present, single trust level).
 name: {{PACK}}
 version: 0.1.0
+# One-liner + a reader-facing paragraph: these feed the reader/cockpit ABOUT panel,
+# the catalog blurb, and `framework list` — one declaration, three surfaces
+# (validate WARNs when description is missing). NOT scraped from CLAUDE.md: that
+# file is the AGENT's operating instructions, phrased for the agent.
+description: "{{TITLE}}"
+mission: >-
+  TODO: one reader-facing paragraph — what this deployment tracks, from what kinds
+  of sources, to answer what questions for whom.
 trust: private            # public | private — compose only within one trust level
 owns:
   # The types + namespaces THIS pack defines and owns (others may read/link them,
   # but only the owner mutates owned fields). Add your DOMAIN entity types here as
   # you add them to schema.yaml `types:`.
-  types: [source, concept, prediction, finding, dashboard]
-  namespaces: [sources, concepts, predictions, findings, briefings, entities]
+  types: []
+  namespaces: []
 requires: []              # packs this one depends on, e.g. [okpack-base@>=0.1.0]
 port_offset: {{PORT_OFFSET}}   # default host-port offset: reader 9200+N, mcp 8730+N.
                           # `framework pull` applies it unless you pass --port-offset.

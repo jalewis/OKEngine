@@ -36,7 +36,10 @@ typecheck:  ## limited static type check — core tools + MCP (okengine#57)
 
 docker-smoke:  ## build the reader + mcp images (no run) — catches Dockerfile/dep breakage (okengine#55)
 	docker build -t okengine-reader:smoke okengine-reader
-	docker build -t okengine-mcp:smoke okengine-mcp
+	# mcp Dockerfile COPYs the shared scripts/cron/kb_* wrappers → build context is the repo ROOT
+	# (matches `docker compose build okengine-mcp`, which sets context: .). Building with the
+	# okengine-mcp/ subdir as context fails: those COPYs resolve outside it.
+	docker build -f okengine-mcp/Dockerfile -t okengine-mcp:smoke .
 
 publish-snapshot:  ## stage a gated, no-history public GitHub snapshot (never pushes; okengine#94)
 	bash scripts/publish-snapshot.sh

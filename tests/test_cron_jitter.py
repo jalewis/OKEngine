@@ -80,3 +80,33 @@ def test_expand_file_roundtrip(tmp_path):
 def test_expand_file_missing_is_noop(tmp_path):
     m = _load()
     assert m.expand_file(tmp_path / "nope.json") == 0
+
+
+def test_unsupported_jitter_base_fails_loud():  # invariant-audit #14
+    """An unsupported @jitter base never expands; shipping the raw sentinel makes cron-plus error
+    every tick and the lane silently never fires. Fail loud at the deploy/pull gate instead."""
+    import pytest
+    m = _load()
+    for bad in ("@jitter:3h", "@jitter:8h", "@jitter:30m"):
+        with pytest.raises(ValueError, match="unsupported @jitter base"):
+            m.expand_jobs([{"schedule": {"expr": bad}}])
+
+
+def test_supported_jitter_bases_still_expand():
+    m = _load()
+    for base in ("hourly", "2h", "4h", "6h", "12h", "daily", "weekly"):
+        j = [{"schedule": {"expr": f"@jitter:{base}"}}]
+        assert m.expand_jobs(j, random.Random(1)) == 1
+        assert "@jitter" not in j[0]["schedule"]["expr"]
+
+
+def test_validator_jitter_bases_match_expander():  # anti-drift guard
+    """The skeleton validator (templates/pack/skeleton/validate.py) rejects unsupported @jitter
+    bases inline; that set MUST equal the engine expander's supported bases (cron_jitter's
+    _SENTINEL_RE), or an author-facing FAIL and the deploy-time expander disagree on what's valid."""
+    import re
+    m = _load()
+    expander = set(re.search(r"\(([^)]+)\)", m._SENTINEL_RE.pattern).group(1).split("|"))
+    vtext = (REPO / "templates" / "pack" / "skeleton" / "validate.py").read_text()
+    for base in expander:
+        assert f'"{base}"' in vtext, f"validate.py no longer accepts the expander base '{base}'"

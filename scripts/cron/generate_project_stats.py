@@ -556,8 +556,7 @@ def main() -> int:
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     if OUT.exists():
-        ts = NOW.strftime("%Y%m%d-%H%M%S")
-        bak = OUT.with_suffix(f".bak.{ts}.md")
+        bak = OUT.parent / (OUT.name + ".bak")   # single overwritten sidecar, not indexed (#165 sweep)
         shutil.copy2(OUT, bak)
     OUT.write_text(body)
     print(f"wrote {OUT} ({len(body)} bytes)", file=sys.stderr)

@@ -10,7 +10,7 @@
     "workdir": "/opt/vault",
     "script": "select_broken_wikilinks_drain.py",
     "deliver": "local",
-    "prompt": "HARD CONSTRAINT \u2014 LOCAL-ONLY, DO NOT USE WEB TOOLS.\n\nThis job is local-only: the raw file's content is your sole evidence. Do\nNOT call web_search / web_extract / web_crawl or any tool that issues an\noutbound HTTP request. Web-search tools draw on a shared, capped paid\nbudget that a high-frequency drain exhausts quickly, and source-quality\nscoring derives from the publisher channel + the raw text itself (external\nURL checks don't change it). If a raw file is genuinely incomplete,\ndocument that under \"## Status\" on the source page and move on \u2014 don't\nreach for the web. Allowed: file_read, file_write, file_list (and the rest\nof the local-only tool surface).\n\nThe select_broken_wikilinks_drain.py wake-gate above has surfaced\nbroken `[[wikilinks]]` in `wiki/**/*.md` whose targets don't resolve to\nexisting files, sorted by inbound source count. You're applying the\ncuration decisions: create entity stubs where there's clearly an entity\nbehind the link, rewrite citing pages where the link is a typo / variant\n/ bare-publisher form, and defer genuinely speculative targets for human\nreview. Operational/report pages (lint-*, log*, triage-*, operational/)\nwere already filtered from the inbound counts \u2014 every shown source is a\nreal body reference.\n\n## Per-target classification (5 actions)\n\nFor EACH target in the wake-gate batch, in order:\n\n### 1. MISSING ENTITY \u2014 write the page, not a bare stub\n\nThe target is `[[entities/<slug>]]` (or a bare basename that's clearly an\nentity name) and no existing page resolves. Read 2-3 of the inbound source\npages \u2014 the surrounding context tells you the type AND gives you the\nmaterial to write the page.\n\nPer the vault creation standard (CLAUDE.md \u2192 \"Entity & concept pages \u2014\nminimum on creation\"): a created entity page should carry a 1-3 sentence\nlead saying what it is, plus **>=1 `##` section of real analysis** when\nthe inbound sources support it. Do NOT mint a name-only stub if the sources\nlet you write a paragraph.\n\nAction: Create `wiki/entities/<slug>.md` (use `file_write`). Frontmatter:\n\n```yaml\n---\ntype: <one of your pack's entity types from schema.yaml>\ntags: [<2-4 short tags from context>]\ncreated: <YYYY-MM-DD today>\nupdated: <YYYY-MM-DD today>\nsources:\n  - \"[[sources/<inbound-1>]]\"\n  - \"[[sources/<inbound-2>]]\"\n---\n\n# <Display Name>\n\n<1-3 sentence lead: what this entity is, from the inbound context.>\n\n## <Section grounded in the sources \u2014 e.g. Activity / Positioning / Why it matters>\n\n<2-5 sentences of real analysis pulled from the citing sources.>\n```\n\n**Fallback \u2014 bare stub ONLY when the inbound sources genuinely lack usable\nmaterial** about the target (you are creating the page solely so the link\nresolves). Then add `link_stub: true` to frontmatter and a body line\n`Stub \u2014 backfilled by broken-wikilinks-drain from N inbound references;\ndeepen via page-quality-enrich.` so the auditor classes it correctly and\nthe enrich loop picks it up. Do NOT use this fallback when a paragraph is\nwritable.\n\nThe `sources:` list should include the inbound source pages from the\nwake-gate output (paths shown without the .md suffix). YAML must use\nmulti-line list form (NOT bracketed JSON-style); unquoted wikilinks in\nbrackets break `yaml.safe_load`.\n\n### 2. CASE-MISMATCH / BARE-PUBLISHER (rewrite-link)\n\nTarget like `[[Acme Corp]]` where `entities/acme-corp.md` exists, or\n`[[entities/Acme-Corp]]` (case drift). Action: rewrite each citing source\npage to use the canonical path `[[entities/acme-corp]]`. Use `patch` or\n`file_write` per source \u2014 touch ONLY the broken wikilink, never other\ncontent.\n\nDo NOT create a stub.\n\n### 3. TYPO / VARIANT (rewrite-link)\n\nTarget like `[[entities/acme-globex]]` where the canonical entity is\n`[[entities/acme]]`, or `[[entities/example-vendor]]` where the canonical\nis `[[entities/example-vendor-ai]]`. Verify the canonical exists by\nlisting/reading `wiki/entities/`. Action: rewrite each citing source page\nto use the correct path. If the variant is plausibly a different concept\n(e.g. composite co-attribution like `acme-globex` could legitimately\nmean the post-merger entity vs `acme` standalone), DEFER under \u00a75\nrather than guessing.\n\n### 4. ARCHIVED / DELETED TARGET (rewrite-link)\n\nTarget like `[[sources/<dated-slug>]]` where the source page no longer\nexists (rotated to `_archived/` or removed). Action: check\n`wiki/sources/_archived/` for the file. If found, rewrite to the\n`_archived/` path. If not found, replace the wikilink with plain text\n(remove the `[[ ]]` brackets) \u2014 the reference is still meaningful as a\ntitle even without a target.\n\n### 5. DEFER FOR HUMAN REVIEW\n\nTarget doesn't fit any of the above:\n- Genuinely speculative (no clear stub candidate, no obvious typo)\n- Composite forms where the resolution is ambiguous\n- Targets where you can't determine the entity type from context\n\nSurface in your final response under \"## Items deferred for human review\".\nDo NOT create a placeholder stub for these.\n\n## Constraints\n\n- DO NOT touch any vault page outside the affected entity stub files and\n  the citing source pages identified by the wake-gate.\n- DO NOT modify operational pages (lint-*, log*, triage-*, dashboards/,\n  operational/) even if they cite the broken target.\n- For source-page rewrites, NEVER touch fields other than the exact\n  wikilink string being fixed.\n- Verify your edits parse: after writing each entity stub, `file_read`\n  it back and confirm the YAML is valid (frontmatter delimiters present,\n  `sources:` is a multi-line list).\n- Append a `wiki/log.md` entry: `## [YYYY-MM-DD HH:MM UTC]\n  broken-wikilinks-drain | created N stubs, rewrote M citations, deferred K`.\n- Process targets IN ORDER. If you run out of budget partway through,\n  stop cleanly and surface the remaining batch items in the deferred\n  section \u2014 do NOT skip ahead.\n\n## After processing\n\nRespond with a structured summary:\n\n```\n## Created entity stubs (N)\n- `entities/<slug>` (type=<X>, <count> inbound sources)\n...\n\n## Rewrote citations (M targets, P source pages touched)\n- `<broken-target>` \u2192 `<canonical-target>` \u2014 Q citations rewritten across R source pages\n...\n\n## Replaced with plain text (K)\n- `<broken-target>` (<count> sources) \u2014 target not recoverable, brackets stripped\n...\n\n## Items deferred for human review (J)\n- `<target>` (<count> sources): <one-line reason>\n```\n\nNo Telegram delivery; this stays local.\n\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nWRITE VIA THE MCP WRITE PATH (G1/G1.1) \u2014 NOT file_write/patch\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nApply curation with the enforced MCP tools (file_read still reads):\n- MISSING ENTITY \u2192 `mcp_okengine_write_create_entity`, path \"entities/<slug>\",\n  frontmatter type: <one of your pack's types> + the type's required fields\n  (incl sources), body: the lead + >=1 analysis section. Required fields are\n  enforced; create refuses dupes.\n- TYPO / VARIANT / bare-publisher link in a CITING page \u2192 `mcp_okengine_write_patch_entity`,\n  path: the citing page, old_string: \"[[<broken target>]]\", new_string: \"[[<correct>]]\".\n  old_string must be UNIQUE in that page (include surrounding text if the link\n  recurs). It preserves the rest of the page and rejects dropping any frontmatter field.\nDo NOT use file_write/patch for wiki pages.",
+    "prompt": "HARD CONSTRAINT — LOCAL-ONLY, DO NOT USE WEB TOOLS.\n\nThis job is local-only: the raw file's content is your sole evidence. Do\nNOT call web_search / web_extract / web_crawl or any tool that issues an\noutbound HTTP request. Web-search tools draw on a shared, capped paid\nbudget that a high-frequency drain exhausts quickly, and source-quality\nscoring derives from the publisher channel + the raw text itself (external\nURL checks don't change it). If a raw file is genuinely incomplete,\ndocument that under \"## Status\" on the source page and move on — don't\nreach for the web. Allowed: file_read, file_write, file_list (and the rest\nof the local-only tool surface).\n\nThe select_broken_wikilinks_drain.py wake-gate above has surfaced\nbroken `[[wikilinks]]` in `wiki/**/*.md` whose targets don't resolve to\nexisting files, sorted by inbound source count. You're applying the\ncuration decisions: create entity stubs where there's clearly an entity\nbehind the link, rewrite citing pages where the link is a typo / variant\n/ bare-publisher form, and defer genuinely speculative targets for human\nreview. Operational/report pages (lint-*, log*, triage-*, operational/)\nwere already filtered from the inbound counts — every shown source is a\nreal body reference.\n\n## Per-target classification (5 actions)\n\nFor EACH target in the wake-gate batch, in order:\n\n### 1. MISSING ENTITY — write the page, not a bare stub\n\nThe target is `[[entities/<slug>]]` (or a bare basename that's clearly an\nentity name) and no existing page resolves. Read 2-3 of the inbound source\npages — the surrounding context tells you the type AND gives you the\nmaterial to write the page.\n\nPer the vault creation standard (CLAUDE.md → \"Entity & concept pages —\nminimum on creation\"): a created entity page should carry a 1-3 sentence\nlead saying what it is, plus **>=1 `##` section of real analysis** when\nthe inbound sources support it. Do NOT mint a name-only stub if the sources\nlet you write a paragraph.\n\nAction: Create `wiki/entities/<slug>.md` (use `file_write`). Frontmatter:\n\n```yaml\n---\ntype: <one of your pack's entity types from schema.yaml>\ntags: [<2-4 short tags from context>]\ncreated: <YYYY-MM-DD today>\nupdated: <YYYY-MM-DD today>\nsources:\n  - \"[[sources/<inbound-1>]]\"\n  - \"[[sources/<inbound-2>]]\"\n---\n\n# <Display Name>\n\n<1-3 sentence lead: what this entity is, from the inbound context.>\n\n## <Section grounded in the sources — e.g. Activity / Positioning / Why it matters>\n\n<2-5 sentences of real analysis pulled from the citing sources.>\n```\n\n**Fallback — bare stub ONLY when the inbound sources genuinely lack usable\nmaterial** about the target (you are creating the page solely so the link\nresolves). Then add `link_stub: true` to frontmatter and a body line\n`Stub — backfilled by broken-wikilinks-drain from N inbound references;\ndeepen via page-quality-enrich.` so the auditor classes it correctly and\nthe enrich loop picks it up. Do NOT use this fallback when a paragraph is\nwritable.\n\nThe `sources:` list should include the inbound source pages from the\nwake-gate output (paths shown without the .md suffix). YAML must use\nmulti-line list form (NOT bracketed JSON-style); unquoted wikilinks in\nbrackets break `yaml.safe_load`.\n\n### 2. CASE-MISMATCH / BARE-PUBLISHER (rewrite-link)\n\nTarget like `[[Acme Corp]]` where `entities/acme-corp.md` exists, or\n`[[entities/Acme-Corp]]` (case drift). Action: rewrite each citing source\npage to use the canonical path `[[entities/acme-corp]]`. Use `patch` or\n`file_write` per source — touch ONLY the broken wikilink, never other\ncontent.\n\nDo NOT create a stub.\n\n### 3. TYPO / VARIANT (rewrite-link)\n\nTarget like `[[entities/acme-globex]]` where the canonical entity is\n`[[entities/acme]]`, or `[[entities/example-vendor]]` where the canonical\nis `[[entities/example-vendor-ai]]`. Verify the canonical exists by\nlisting/reading `wiki/entities/`. Action: rewrite each citing source page\nto use the correct path. If the variant is plausibly a different concept\n(e.g. composite co-attribution like `acme-globex` could legitimately\nmean the post-merger entity vs `acme` standalone), DEFER under §5\nrather than guessing.\n\n### 4. ARCHIVED / DELETED TARGET (rewrite-link)\n\nTarget like `[[sources/<dated-slug>]]` where the source page no longer\nexists (rotated to `_archived/` or removed). Action: check\n`wiki/sources/_archived/` for the file. If found, rewrite to the\n`_archived/` path. If not found, replace the wikilink with plain text\n(remove the `[[ ]]` brackets) — the reference is still meaningful as a\ntitle even without a target.\n\n### 5. DEFER FOR HUMAN REVIEW\n\nTarget doesn't fit any of the above:\n- Genuinely speculative (no clear stub candidate, no obvious typo)\n- Composite forms where the resolution is ambiguous\n- Targets where you can't determine the entity type from context\n\nSurface in your final response under \"## Items deferred for human review\".\nDo NOT create a placeholder stub for these.\n\n## Constraints\n\n- DO NOT touch any vault page outside the affected entity stub files and\n  the citing source pages identified by the wake-gate.\n- DO NOT modify operational pages (lint-*, log*, triage-*, dashboards/,\n  operational/) even if they cite the broken target.\n- For source-page rewrites, NEVER touch fields other than the exact\n  wikilink string being fixed.\n- Verify your edits parse: after writing each entity stub, `file_read`\n  it back and confirm the YAML is valid (frontmatter delimiters present,\n  `sources:` is a multi-line list).\n- End your response with a one-line summary: `broken-wikilinks-drain | created N stubs, rewrote M citations, deferred K`. Do NOT write wiki/log.md yourself; the MCP write path logs each change automatically.\n- Process targets IN ORDER. If you run out of budget partway through,\n  stop cleanly and surface the remaining batch items in the deferred\n  section — do NOT skip ahead.\n\n## After processing\n\nRespond with a structured summary:\n\n```\n## Created entity stubs (N)\n- `entities/<slug>` (type=<X>, <count> inbound sources)\n...\n\n## Rewrote citations (M targets, P source pages touched)\n- `<broken-target>` → `<canonical-target>` — Q citations rewritten across R source pages\n...\n\n## Replaced with plain text (K)\n- `<broken-target>` (<count> sources) — target not recoverable, brackets stripped\n...\n\n## Items deferred for human review (J)\n- `<target>` (<count> sources): <one-line reason>\n```\n\nNo Telegram delivery; this stays local.\n\n─────────────────────────────────────────────────────────────────\nWRITE VIA THE MCP WRITE PATH (G1/G1.1) — NOT file_write/patch\n─────────────────────────────────────────────────────────────────\nApply curation with the enforced MCP tools (file_read still reads):\n- MISSING ENTITY → `mcp_okengine_write_create_entity`, path \"entities/<slug>\",\n  frontmatter type: <one of your pack's types> + the type's required fields\n  (incl sources), body: the lead + >=1 analysis section. Required fields are\n  enforced; create refuses dupes.\n- TYPO / VARIANT / bare-publisher link in a CITING page → `mcp_okengine_write_patch_entity`,\n  path: the citing page, old_string: \"[[<broken target>]]\", new_string: \"[[<correct>]]\".\n  old_string must be UNIQUE in that page (include surrounding text if the link\n  recurs). It preserves the rest of the page and rejects dropping any frontmatter field.\nDo NOT use file_write/patch for wiki pages.",
     "enabled_toolsets": [
       "hermes-cron",
       "okengine-write",
@@ -23,11 +23,25 @@
     "enabled": true,
     "schedule": {
       "kind": "cron",
-      "expr": "30 1 * * *"
+      "expr": "30 3 * * *"
     },
     "workdir": "/opt/vault",
     "prompt": "Generate the derived hot-set working index (recent sources + open predictions + recent entities); pure script, wakeAgent=false.",
     "script": "/opt/data/scripts/build_hot_set.py",
+    "deliver": "local",
+    "no_agent": true
+  },
+  {
+    "id": "007c0b16b658",
+    "name": "backlinks-refresh",
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "20 3 * * *"
+    },
+    "workdir": "/opt/vault",
+    "prompt": "Precompute the IWE backlink graph into wiki/.backlinks.json so the reader/cockpit serve a static artifact instead of running iwe; pure script, wakeAgent=false.",
+    "script": "/opt/data/scripts/backlinks_refresh.py",
     "deliver": "local",
     "no_agent": true
   },
@@ -37,7 +51,7 @@
     "enabled": true,
     "schedule": {
       "kind": "cron",
-      "expr": "0 1 * * *"
+      "expr": "0 3 * * *"
     },
     "workdir": "/opt/vault",
     "prompt": "Generate the OKF hierarchical INDEX.md tree + BUNDLE/HEALTH/AGENTS; pure script, wakeAgent=false.",
@@ -61,20 +75,6 @@
       "okengine"
     ],
     "workdir": "/opt/vault"
-  },
-  {
-    "id": "df7bb3c1f06e",
-    "name": "contradictions-refresh",
-    "enabled": true,
-    "schedule": {
-      "kind": "cron",
-      "expr": "0 4 * * *"
-    },
-    "workdir": "/opt/vault",
-    "script": "select_contradictions.py",
-    "deliver": "local",
-    "prompt": "(unused \u2014 select_contradictions.py wake-gate always returns wakeAgent=false. Walks the vault for any H2 whose words include 'Contradiction', classifies each section as ACTIVE / EMPTY / RESOLVED, and rewrites wiki/dashboards/contradictions.md as a side effect. Companion to prediction-backtest and trend-acceleration.)",
-    "no_agent": true
   },
   {
     "id": "24a01d27cd23",
@@ -111,7 +111,7 @@
       "expr": "40 22 * * *"
     },
     "workdir": "/opt/vault",
-    "prompt": "(unused \u2014 detect_field_loss.py returns wakeAgent=false. Deterministic git-diff backstop: flags the pack's curated/protected frontmatter fields (schema.yaml protected_fields) + entity source-drops lost between vault git revisions in the last day. Detection only \u2014 writes a review report; restore via the curated-entity-fields overlay. Complements the write-guard (prevention) and feeds kb-health.)",
+    "prompt": "(unused — detect_field_loss.py returns wakeAgent=false. Deterministic git-diff backstop: flags the pack's curated/protected frontmatter fields (schema.yaml protected_fields) + entity source-drops lost between vault git revisions in the last day. Detection only — writes a review report; restore via the curated-entity-fields overlay. Complements the write-guard (prevention) and feeds kb-health.)",
     "script": "detect_field_loss.py",
     "deliver": "local",
     "no_agent": true
@@ -144,7 +144,7 @@
     "workdir": "/opt/vault",
     "script": "rebuild_index.py",
     "deliver": "local",
-    "prompt": "(unused \u2014 rebuild_index.py wake-gate always returns wakeAgent=false. The script writes wiki/index.md as a side effect during the wake-gate run; no agent invocation needed.)"
+    "prompt": "(unused — rebuild_index.py wake-gate always returns wakeAgent=false. The script writes wiki/index.md as a side effect during the wake-gate run; no agent invocation needed.)"
   },
   {
     "id": "7e5d6d05181f",
@@ -155,7 +155,7 @@
       "expr": "50 22 * * *"
     },
     "workdir": "/opt/vault",
-    "prompt": "(unused \u2014 kb_health.py wake-gate returns wakeAgent=false. Script aggregates lint_watcher + prediction-intake-audit snapshots and direct prediction metrics into wiki/dashboards/kb-health.md with red/green thresholds and a drain-vs-accumulation trend; appends wiki/operational/kb-health-snapshots.md.)",
+    "prompt": "(unused — kb_health.py wake-gate returns wakeAgent=false. Script aggregates lint_watcher + prediction-intake-audit snapshots and direct prediction metrics into wiki/dashboards/kb-health.md with red/green thresholds and a drain-vs-accumulation trend; appends wiki/operational/kb-health-snapshots.md.)",
     "script": "kb_health.py",
     "deliver": "local",
     "no_agent": true
@@ -171,7 +171,7 @@
     "workdir": "/opt/vault",
     "script": "lint_watcher.py",
     "deliver": "local",
-    "prompt": "(unused \u2014 lint_watcher.py wake-gate always returns wakeAgent=false. The script writes its reports as side effects during the wake-gate run; no agent invocation needed.)\n\n**Output contract**: your final response IS the message delivered to the user. Output the deliverable content directly. Do not narrate your process (\"now I have...\", \"let me compose...\", \"the digest is the primary deliverable\"), do not announce what you are about to produce, and do not include lead-ins or post-script summaries. The structure described above is the entire response \u2014 nothing before or after.\n"
+    "prompt": "(unused — lint_watcher.py wake-gate always returns wakeAgent=false. The script writes its reports as side effects during the wake-gate run; no agent invocation needed.)\n\n**Output contract**: your final response IS the message delivered to the user. Output the deliverable content directly. Do not narrate your process (\"now I have...\", \"let me compose...\", \"the digest is the primary deliverable\"), do not announce what you are about to produce, and do not include lead-ins or post-script summaries. The structure described above is the entire response — nothing before or after.\n"
   },
   {
     "id": "1c3a0b216250",
@@ -188,6 +188,20 @@
     "no_agent": true
   },
   {
+    "id": "85732a174661",
+    "name": "normalize-bare-name-links",
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "5 */2 * * *"
+    },
+    "workdir": "/opt/vault",
+    "script": "normalize_bare_name_links.py",
+    "prompt": "[SILENT]",
+    "deliver": "local",
+    "no_agent": true
+  },
+  {
     "id": "f14c4ea69ade",
     "name": "orphans-drain",
     "enabled": true,
@@ -198,7 +212,7 @@
     "workdir": "/opt/vault",
     "script": "select_orphans_drain.py",
     "deliver": "local",
-    "prompt": "HARD CONSTRAINT \u2014 LOCAL-ONLY, DO NOT USE WEB TOOLS.\n\nThis job is local-only: the raw file's content is your sole evidence. Do\nNOT call web_search / web_extract / web_crawl or any tool that issues an\noutbound HTTP request. Web-search tools draw on a shared, capped paid\nbudget that a high-frequency drain exhausts quickly, and source-quality\nscoring derives from the publisher channel + the raw text itself (external\nURL checks don't change it). If a raw file is genuinely incomplete,\ndocument that under \"## Status\" on the source page and move on \u2014 don't\nreach for the web. Allowed: file_read, file_write, file_list (and the rest\nof the local-only tool surface).\n\nThe select_orphans_drain.py wake-gate above has surfaced\nentity/concept/prediction pages with **zero inbound `[[wikilinks]]`** from\nany other page with valid frontmatter. For each orphan it surfaces the\ntop-3 candidate referencers ranked by shared sources / shared tags. Your\njob: for each batch orphan, decide whether each candidate is genuinely\ntopically related, then EITHER patch the candidate's `related:` array to\nadd the orphan (rescuing it from the queue), OR if no candidate qualifies,\nappend a `## Triage note` to the orphan with the strongest 2 candidates\nand the reason none worked.\n\nThe drain reads from the same lint_watcher counting model, so adding the\norphan to a candidate's `related:` array (which is in the candidate's\nfrontmatter) IS the cure \u2014 lint-watcher will count the new wikilink as a\nreal inbound reference and remove the orphan from the queue.\n\n## Per-orphan workflow\n\nFor EACH orphan in the wake-gate batch, in order:\n\n### Step 1 \u2014 Read the orphan\n\n`file_read` the orphan page. Confirm what it claims to be, what sources\nit cites, what concepts/entities it relates to. Pay attention to:\n- The body's natural prose: what other entity/concept names does it\n  mention? (Even if not wikilinked.)\n- For predictions: the `subject:` field names the entity/concept the\n  prediction is about \u2014 that entity is almost always the right\n  referencer.\n- For entities: what category / cluster does this fit into? The corresponding concept page is usually the\n  right referencer.\n\n### Step 2 \u2014 Evaluate each candidate\n\nFor each of the top-3 candidates surfaced by the wake-gate, in order:\n\na. `file_read` the candidate page (only the parts you need: frontmatter\n   + first 30-60 lines of body usually enough).\n\nb. Decide: does the candidate genuinely relate to the orphan?\n   - **YES** if the candidate's body discusses the same entity/concept as the orphan, OR if there's a natural place a reader of\n     the candidate would want to discover the orphan.\n   - **NO** if the only signal is shared tags coincidentally (e.g.,\n     both tagged with one broad topic tag); that's not specific enough.\n\nc. If YES: patch the candidate's frontmatter `related:` array. Use\n   `patch` with `mode: smart` to add the new wikilink. If the candidate\n   has NO `related:` field yet, add one as a multi-line YAML list:\n\n   ```yaml\n   related:\n     - \"[[<orphan-rel-path-without-md>]]\"\n   ```\n\n   If `related:` already exists, prepend or append the new wikilink\n   while preserving existing entries. NEVER use bracketed JSON form\n   (`related: [\"[[foo]]\"]`) \u2014 the unquoted-wikilink-inside-brackets\n   pattern breaks `yaml.safe_load`. Always use multi-line list form\n   with quoted wikilinks.\n\nd. If NO: try the next candidate. If all 3 fail, the orphan goes to\n   triage (Step 3).\n\n### Step 3 \u2014 Triage notes (when no candidate qualifies)\n\nIf no candidate genuinely relates, append a `## Triage note` section to\nthe orphan body (NOT frontmatter):\n\n```markdown\n\n## Triage note\n\nFlagged <YYYY-MM-DD> by `orphans-drain` \u2014 no inbound references after\nshared-source / shared-tag scoring against the vault. Top scoring\ncandidates considered:\n- `<candidate-1>` \u2014 score X.XX (<reason none of its content discussed\n  the orphan>)\n- `<candidate-2>` \u2014 score Y.YY (<reason>)\n\nPossible follow-ups: archive (stale / superseded), backfill via\nentity-backfill (add fresh source citations that would create natural\nreferencer overlap), or human review.\n```\n\nAppend the section; do NOT modify frontmatter or other body content.\nThe triage note is a signal for the next human-driven cleanup pass.\n\n## Constraints\n\n- Touch ONLY the candidate pages whose `related:` arrays you patch, and\n  the orphan pages you append triage notes to.\n- For `related:` array edits: NEVER touch any other frontmatter field\n  on the candidate (sources, tags, type, created, etc.). Targeted edit\n  only.\n- For triage-note appends: NEVER modify the orphan's frontmatter or\n  existing body \u2014 only append the new section at the end.\n- Verify your YAML edits parse: after each `related:` write, `file_read`\n  the candidate's frontmatter and confirm it round-trips cleanly.\n- Append a `wiki/log.md` entry after the run:\n  `## [YYYY-MM-DD HH:MM UTC] orphans-drain | rescued N orphans (M `related:` patches), triaged K`\n\n## After processing\n\nRespond with a structured summary:\n\n```\n## Rescued via `related:` patch (N)\n- `<orphan-rel>` \u2190 `<candidate-rel>` \u2014 <one-line why this candidate fit>\n...\n\n## Triaged (K)\n- `<orphan-rel>` \u2014 top candidate `<best>` (score X.XX) didn't qualify because <reason>\n...\n```\n\nNo Telegram delivery; this stays local.\n\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nWRITE VIA THE MCP WRITE PATH (G1/G1.1) \u2014 NOT file_write/patch\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n- RESCUE (preferred): add the orphan to a qualifying candidate's `related:` via\n  `mcp_okengine_write_update_entity`, path: the candidate,\n  frontmatter_yaml: \"related: [<COMPLETE list including the new \\\"[[<orphan>]]\\\">]\".\n  \u26a0 `related:` is a LIST \u2014 read the candidate first and send the FULL updated list\n  (a list key REPLACES, it does not append).\n- NO candidate qualifies \u2192 `mcp_okengine_write_append_to_section`, path: the\n  orphan, heading: \"Triage note\", text: the 2 strongest candidates + why none worked.\nfile_read to read; do NOT use file_write/patch for wiki pages.",
+    "prompt": "HARD CONSTRAINT — LOCAL-ONLY, DO NOT USE WEB TOOLS.\n\nThis job is local-only: the raw file's content is your sole evidence. Do\nNOT call web_search / web_extract / web_crawl or any tool that issues an\noutbound HTTP request. Web-search tools draw on a shared, capped paid\nbudget that a high-frequency drain exhausts quickly, and source-quality\nscoring derives from the publisher channel + the raw text itself (external\nURL checks don't change it). If a raw file is genuinely incomplete,\ndocument that under \"## Status\" on the source page and move on — don't\nreach for the web. Allowed: file_read, file_write, file_list (and the rest\nof the local-only tool surface).\n\nThe select_orphans_drain.py wake-gate above has surfaced\nentity/concept/prediction pages with **zero inbound `[[wikilinks]]`** from\nany other page with valid frontmatter. For each orphan it surfaces the\ntop-3 candidate referencers ranked by shared sources / shared tags. Your\njob: for each batch orphan, decide whether each candidate is genuinely\ntopically related, then EITHER patch the candidate's `related:` array to\nadd the orphan (rescuing it from the queue), OR if no candidate qualifies,\nappend a `## Triage note` to the orphan with the strongest 2 candidates\nand the reason none worked.\n\nThe drain reads from the same lint_watcher counting model, so adding the\norphan to a candidate's `related:` array (which is in the candidate's\nfrontmatter) IS the cure — lint-watcher will count the new wikilink as a\nreal inbound reference and remove the orphan from the queue.\n\n## Per-orphan workflow\n\nFor EACH orphan in the wake-gate batch, in order:\n\n### Step 1 — Read the orphan\n\n`file_read` the orphan page. Confirm what it claims to be, what sources\nit cites, what concepts/entities it relates to. Pay attention to:\n- The body's natural prose: what other entity/concept names does it\n  mention? (Even if not wikilinked.)\n- For predictions: the `subject:` field names the entity/concept the\n  prediction is about — that entity is almost always the right\n  referencer.\n- For entities: what category / cluster does this fit into? The corresponding concept page is usually the\n  right referencer.\n\n### Step 2 — Evaluate each candidate\n\nFor each of the top-3 candidates surfaced by the wake-gate, in order:\n\na. `file_read` the candidate page (only the parts you need: frontmatter\n   + first 30-60 lines of body usually enough).\n\nb. Decide: does the candidate genuinely relate to the orphan?\n   - **YES** if the candidate's body discusses the same entity/concept as the orphan, OR if there's a natural place a reader of\n     the candidate would want to discover the orphan.\n   - **NO** if the only signal is shared tags coincidentally (e.g.,\n     both tagged with one broad topic tag); that's not specific enough.\n\nc. If YES: patch the candidate's frontmatter `related:` array. Use\n   `patch` with `mode: smart` to add the new wikilink. If the candidate\n   has NO `related:` field yet, add one as a multi-line YAML list:\n\n   ```yaml\n   related:\n     - \"[[<orphan-rel-path-without-md>]]\"\n   ```\n\n   If `related:` already exists, prepend or append the new wikilink\n   while preserving existing entries. NEVER use bracketed JSON form\n   (`related: [\"[[foo]]\"]`) — the unquoted-wikilink-inside-brackets\n   pattern breaks `yaml.safe_load`. Always use multi-line list form\n   with quoted wikilinks.\n\nd. If NO: try the next candidate. If all 3 fail, the orphan goes to\n   triage (Step 3).\n\n### Step 3 — Triage notes (when no candidate qualifies)\n\nIf no candidate genuinely relates, append a `## Triage note` section to\nthe orphan body (NOT frontmatter):\n\n```markdown\n\n## Triage note\n\nFlagged <YYYY-MM-DD> by `orphans-drain` — no inbound references after\nshared-source / shared-tag scoring against the vault. Top scoring\ncandidates considered:\n- `<candidate-1>` — score X.XX (<reason none of its content discussed\n  the orphan>)\n- `<candidate-2>` — score Y.YY (<reason>)\n\nPossible follow-ups: archive (stale / superseded), backfill via\nentity-backfill (add fresh source citations that would create natural\nreferencer overlap), or human review.\n```\n\nAppend the section; do NOT modify frontmatter or other body content.\nThe triage note is a signal for the next human-driven cleanup pass.\n\n## Constraints\n\n- Touch ONLY the candidate pages whose `related:` arrays you patch, and\n  the orphan pages you append triage notes to.\n- For `related:` array edits: NEVER touch any other frontmatter field\n  on the candidate (sources, tags, type, created, etc.). Targeted edit\n  only.\n- For triage-note appends: NEVER modify the orphan's frontmatter or\n  existing body — only append the new section at the end.\n- Verify your YAML edits parse: after each `related:` write, `file_read`\n  the candidate's frontmatter and confirm it round-trips cleanly.\n- End your response with a one-line summary: `orphans-drain | rescued N orphans (M related: patches), triaged K`. Do NOT write wiki/log.md yourself; the MCP write path logs each change automatically.\n\n## After processing\n\nRespond with a structured summary:\n\n```\n## Rescued via `related:` patch (N)\n- `<orphan-rel>` ← `<candidate-rel>` — <one-line why this candidate fit>\n...\n\n## Triaged (K)\n- `<orphan-rel>` — top candidate `<best>` (score X.XX) didn't qualify because <reason>\n...\n```\n\nNo Telegram delivery; this stays local.\n\n─────────────────────────────────────────────────────────────────\nWRITE VIA THE MCP WRITE PATH (G1/G1.1) — NOT file_write/patch\n─────────────────────────────────────────────────────────────────\n- RESCUE (preferred): add the orphan to a qualifying candidate's `related:` via\n  `mcp_okengine_write_update_entity`, path: the candidate,\n  frontmatter_yaml: \"related: [<COMPLETE list including the new \\\"[[<orphan>]]\\\">]\".\n  ⚠ `related:` is a LIST — read the candidate first and send the FULL updated list\n  (a list key REPLACES, it does not append).\n- NO candidate qualifies → `mcp_okengine_write_append_to_section`, path: the\n  orphan, heading: \"Triage note\", text: the 2 strongest candidates + why none worked.\nfile_read to read; do NOT use file_write/patch for wiki pages.",
     "enabled_toolsets": [
       "hermes-cron",
       "okengine-write",
@@ -214,7 +228,7 @@
       "expr": "25 22 * * *"
     },
     "workdir": "/opt/vault",
-    "prompt": "(unused \u2014 page_quality_audit.py returns wakeAgent=false. Deterministic per-page content-quality scorer over wiki/entities + wiki/concepts: tiers each page (stub/thin/ok/strong/encyclopedic) by body words / ## sections / sources count, type-aware, excluding deliberate redirects/aliases. Writes wiki/dashboards/page-quality.md with the tier distribution + an enrich queue ranked by inbound links, a machine-readable page-quality-queue.json, and a daily snapshot read by kb-health.)",
+    "prompt": "(unused — page_quality_audit.py returns wakeAgent=false. Deterministic per-page content-quality scorer over wiki/entities + wiki/concepts: tiers each page (stub/thin/ok/strong/encyclopedic) by body words / ## sections / sources count, type-aware, excluding deliberate redirects/aliases. Writes wiki/dashboards/page-quality.md with the tier distribution + an enrich queue ranked by inbound links, a machine-readable page-quality-queue.json, and a daily snapshot read by kb-health.)",
     "script": "page_quality_audit.py",
     "deliver": "local",
     "no_agent": true
@@ -245,7 +259,7 @@
       "expr": "15 22 * * *"
     },
     "workdir": "/opt/vault",
-    "prompt": "(unused \u2014 generate_project_stats.py wake-gate returns wakeAgent=false. Script writes wiki/dashboards/project-stats.md as a side effect; no agent invocation.)",
+    "prompt": "(unused — generate_project_stats.py wake-gate returns wakeAgent=false. Script writes wiki/dashboards/project-stats.md as a side effect; no agent invocation.)",
     "script": "generate_project_stats.py",
     "deliver": "local",
     "no_agent": true
@@ -261,7 +275,7 @@
     "workdir": "/opt/vault",
     "script": "select_publisher_canonical_drain.py",
     "deliver": "local",
-    "prompt": "HARD CONSTRAINT \u2014 LOCAL-ONLY, DO NOT USE WEB TOOLS.\n\nThis job is local-only: the raw file's content is your sole evidence. Do\nNOT call web_search / web_extract / web_crawl or any tool that issues an\noutbound HTTP request. Web-search tools draw on a shared, capped paid\nbudget that a high-frequency drain exhausts quickly, and source-quality\nscoring derives from the publisher channel + the raw text itself (external\nURL checks don't change it). If a raw file is genuinely incomplete,\ndocument that under \"## Status\" on the source page and move on \u2014 don't\nreach for the web. Allowed: file_read, file_write, file_list (and the rest\nof the local-only tool surface).\n\nThe select_publisher_canonical_drain.py wake-gate above has surfaced\npublisher-name drift in `wiki/sources/*.md`. You're applying the curation\ndecisions: add legitimate new publishers to the canonical list, fold drift\nvariants into existing canonicals, and surface data-quality flags for human\nreview (do NOT auto-resolve those).\n\n## Your job\n\nFor each item in the wake-gate output:\n\n### NEW canonical candidates (most common path)\n\nFor each, verify it's a real publisher (not a one-off blog title or a\nborderline data-quality flag like \"Various ...\"). For each verified one:\n\n1. **Append to vault `CLAUDE.md` canonical list.** Read\n   `/opt/vault/CLAUDE.md`, find the `**Canonical names**` line\n   under \u00a7\"Publisher names \u2014 avoid drift\", and insert the new name in\n   alphabetical order within the inline-code block. Use `file_write` to\n   rewrite the whole file (or `patch` for a targeted edit).\n2. **Append to `config/publishers.canonical.json`** at\n   `/opt/vault/config/publishers.canonical.json`. Add a key for\n   the new publisher with an empty array value (no known variants yet).\n   Preserve existing keys; preserve the `_doc` key.\n\n### DRIFT variants\n\nFor each drift candidate where you're confident the mapping is correct\n(e.g. `Acme Sec Corp` \u2192 `Acme` is unambiguous; a `Foo / Bar` composite is\ndebatable when both names refer to the same parent and the composite may\nbe intentional co-attribution):\n\n1. **Add the variant to the existing canonical's array** in\n   `config/publishers.canonical.json`.\n2. **Rewrite affected source pages**: `grep -l '^publisher: <variant>'\n   /opt/vault/wiki/sources/*.md` to find each, then `patch`\n   each to change the `publisher:` field to the canonical form. Each\n   rewrite is a single-line targeted edit; do NOT touch other frontmatter.\n3. If the mapping is **debatable** (e.g. composite forms like `Foo\n   / Bar`), surface in your final response under \"## Items deferred\n   for human review\" \u2014 don't auto-merge composite forms; they often\n   describe genuine co-attribution.\n\n### DATA-QUALITY FLAGS\n\nNEVER auto-add. List each in your final response under \"## Data-quality\nflags surfaced\". For each, suggest: investigate the affected source pages\nand fill in the actual publisher (often recoverable from the source's\n`url:` frontmatter \u2014 the domain is usually the publisher).\n\n## Constraints\n\n- DO NOT touch any other vault page besides `CLAUDE.md`, the affected\n  source pages, and `/opt/vault/config/publishers.canonical.json`.\n- DO NOT change the `_doc` key in the json.\n- Verify your edits parse: after writing, `file_read` the file and confirm\n  it still looks well-formed.\n- For source-page rewrites, NEVER touch fields other than `publisher:`.\n- Append a `wiki/log.md` entry: `## [YYYY-MM-DD HH:MM UTC]\n  publisher-canonical-drain | added N canonical, folded M variants, deferred K`.\n\n## After processing\n\nRespond with a structured summary:\n\n```\n## Added to canonical list (N)\n- `<name>` (<count> sources)\n...\n\n## Folded as drift variants (M)\n- `<variant>` (<count> sources) \u2192 `<canonical>` \u2014 N source pages rewritten\n\n## Items deferred for human review (K)\n- `<item>` (<count> sources): <one-line reason>\n\n## Data-quality flags surfaced\n- `<flag>` (<count> sources): <suggested investigation>\n```\n\nNo Telegram delivery; this stays local."
+    "prompt": "HARD CONSTRAINT — LOCAL-ONLY, DO NOT USE WEB TOOLS.\n\nThis job is local-only: the raw file's content is your sole evidence. Do\nNOT call web_search / web_extract / web_crawl or any tool that issues an\noutbound HTTP request. Web-search tools draw on a shared, capped paid\nbudget that a high-frequency drain exhausts quickly, and source-quality\nscoring derives from the publisher channel + the raw text itself (external\nURL checks don't change it). If a raw file is genuinely incomplete,\ndocument that under \"## Status\" on the source page and move on — don't\nreach for the web. Allowed: file_read, file_write, file_list (and the rest\nof the local-only tool surface).\n\nThe select_publisher_canonical_drain.py wake-gate above has surfaced\npublisher-name drift in `wiki/sources/*.md`. You're applying the curation\ndecisions: add legitimate new publishers to the canonical list, fold drift\nvariants into existing canonicals, and surface data-quality flags for human\nreview (do NOT auto-resolve those).\n\n## Your job\n\nFor each item in the wake-gate output:\n\n### NEW canonical candidates (most common path)\n\nFor each, verify it's a real publisher (not a one-off blog title or a\nborderline data-quality flag like \"Various ...\"). For each verified one:\n\n1. **Append to vault `CLAUDE.md` canonical list.** Read\n   `/opt/vault/CLAUDE.md`, find the `**Canonical names**` line\n   under §\"Publisher names — avoid drift\", and insert the new name in\n   alphabetical order within the inline-code block. Use `file_write` to\n   rewrite the whole file (or `patch` for a targeted edit).\n2. **Append to `config/publishers.canonical.json`** at\n   `/opt/vault/config/publishers.canonical.json`. Add a key for\n   the new publisher with an empty array value (no known variants yet).\n   Preserve existing keys; preserve the `_doc` key.\n\n### DRIFT variants\n\nFor each drift candidate where you're confident the mapping is correct\n(e.g. `Acme Sec Corp` → `Acme` is unambiguous; a `Foo / Bar` composite is\ndebatable when both names refer to the same parent and the composite may\nbe intentional co-attribution):\n\n1. **Add the variant to the existing canonical's array** in\n   `config/publishers.canonical.json`.\n2. **Rewrite affected source pages**: `grep -l '^publisher: <variant>'\n   /opt/vault/wiki/sources/*.md` to find each, then `patch`\n   each to change the `publisher:` field to the canonical form. Each\n   rewrite is a single-line targeted edit; do NOT touch other frontmatter.\n3. If the mapping is **debatable** (e.g. composite forms like `Foo\n   / Bar`), surface in your final response under \"## Items deferred\n   for human review\" — don't auto-merge composite forms; they often\n   describe genuine co-attribution.\n\n### DATA-QUALITY FLAGS\n\nNEVER auto-add. List each in your final response under \"## Data-quality\nflags surfaced\". For each, suggest: investigate the affected source pages\nand fill in the actual publisher (often recoverable from the source's\n`url:` frontmatter — the domain is usually the publisher).\n\n## Constraints\n\n- DO NOT touch any other vault page besides `CLAUDE.md`, the affected\n  source pages, and `/opt/vault/config/publishers.canonical.json`.\n- DO NOT change the `_doc` key in the json.\n- Verify your edits parse: after writing, `file_read` the file and confirm\n  it still looks well-formed.\n- For source-page rewrites, NEVER touch fields other than `publisher:`.\n- End your response with a one-line summary: `publisher-canonical-drain | added N canonical, folded M variants, deferred K`. Do NOT write wiki/log.md yourself; the MCP write path logs each change automatically.\n\n## After processing\n\nRespond with a structured summary:\n\n```\n## Added to canonical list (N)\n- `<name>` (<count> sources)\n...\n\n## Folded as drift variants (M)\n- `<variant>` (<count> sources) → `<canonical>` — N source pages rewritten\n\n## Items deferred for human review (K)\n- `<item>` (<count> sources): <one-line reason>\n\n## Data-quality flags surfaced\n- `<flag>` (<count> sources): <suggested investigation>\n```\n\nNo Telegram delivery; this stays local."
   },
   {
     "id": "da91e3a7b8ca",
@@ -269,7 +283,7 @@
     "script": "select_raw_batch.py",
     "schedule": {
       "kind": "cron",
-      "expr": "*/5 * * * *"
+      "expr": "*/15 * * * *"
     },
     "enabled": true,
     "deliver": "local",
@@ -331,7 +345,7 @@
     },
     "workdir": "/opt/vault",
     "script": "select_broken_yaml.py",
-    "prompt": "The select_broken_yaml.py wake-gate above listed vault pages whose YAML\nfrontmatter does not parse, with each page's current (broken) frontmatter\nand the parser error.\n\nYou are PHASE 1 of a propose/dispose pipeline. **You do NOT edit any files.**\nYou read each broken page, work out the corrected frontmatter, and write a\nsingle JSON proposal. A deterministic applier (phase 2) replaces ONLY the\nfrontmatter \u2014 it preserves the body byte-for-byte and writes only if your\nproposal parses and keeps `type:`. So focus entirely on producing correct,\nparseable YAML that preserves the original intent.\n\n## For each page in the batch\n\n1. `file_read` `$WIKI_PATH/<path>` to see the full page (frontmatter + body)\n   if you need context beyond the digest.\n2. Fix the YAML SYNTAX while preserving every field's intended value:\n   - quote scalars containing colons: `reliability_basis: \"D/3: vendor...\"`\n   - quote or block-list wikilinks: `entities:\\n  - \"[[entities/x]]\"`\n   - close unclosed brackets; remove stray trailing `\"`/`]`\n   - convert mixed inline+block lists to one consistent form\n   - never invent values \u2014 if a field is garbled beyond recovery, keep the\n     recoverable part and drop only the unrecoverable fragment (note it)\n   - keep `type:` (required) and all other real fields\n3. Do NOT include the `---` delimiters in your proposed frontmatter \u2014 just\n   the YAML body between them.\n\n## Structureless files (marked [structureless] \u2014 NO closing `---`)\n\nSome batch items have lost their closing `---` entirely, so body content\n(headings, **bold** metadata, prose) has bled into the YAML block. For\nthese you MUST provide TWO things in the proposal object:\n  - \"frontmatter\": the corrected YAML (fix the internal syntax error too \u2014\n    e.g. a mis-indented `  - ` source line, an unclosed list)\n  - \"body_starts_with\": the VERBATIM first line of the real body (the first\n    line that belongs AFTER the closing `---`, copied exactly \u2014 e.g.\n    \"# Example Entity\" or \"**URL:** https://...\")\n\nThe applier locates that exact line in the original file, inserts the\nclosing `---` before it, and preserves everything from there to EOF\nverbatim. If body_starts_with does not match a real line, the file is left\nuntouched \u2014 so copy it exactly (no paraphrasing, exact whitespace).\n\n## Deliverable \u2014 write ONE JSON file\n\n`file_write` exactly once to:\n  `$WIKI_PATH/wiki/.yaml-repair-proposals.json`\n\nA JSON array, one object per page:\n```json\n[\n  {\n    \"path\": \"wiki/concepts/example-topic.md\",\n    \"frontmatter\": \"type: concept\\ntags: [example, topic]\\ncreated: 2026-01-01\\nupdated: 2026-01-02\",\n    \"notes\": \"optional: what was garbled / dropped\"\n  }\n]\n```\n\nRules:\n- `frontmatter` is the corrected YAML as a single string (use \\n for newlines),\n  NO `---` delimiters, valid JSON string escaping.\n- Verify each proposed frontmatter would parse as a YAML mapping with a\n  `type:` key before including it.\n- Do NOT file_write/patch any entity/source/concept page. The ONLY file you\n  write is the proposals JSON.\n- Do NOT touch wiki/log.md, wiki/index.md, or dashboards.\n\n## Final response\n\nA short table: | path | fix | dropped? |. Phase 2 (apply_yaml_repair.py)\nruns next. No Telegram delivery; stays local.",
+    "prompt": "The select_broken_yaml.py wake-gate above listed vault pages whose YAML\nfrontmatter does not parse, with each page's current (broken) frontmatter\nand the parser error.\n\nYou are PHASE 1 of a propose/dispose pipeline. **You do NOT edit any files.**\nYou read each broken page, work out the corrected frontmatter, and write a\nsingle JSON proposal. A deterministic applier (phase 2) replaces ONLY the\nfrontmatter — it preserves the body byte-for-byte and writes only if your\nproposal parses and keeps `type:`. So focus entirely on producing correct,\nparseable YAML that preserves the original intent.\n\n## For each page in the batch\n\n1. `file_read` `$WIKI_PATH/<path>` to see the full page (frontmatter + body)\n   if you need context beyond the digest.\n2. Fix the YAML SYNTAX while preserving every field's intended value:\n   - quote scalars containing colons: `reliability_basis: \"D/3: vendor...\"`\n   - quote or block-list wikilinks: `entities:\\n  - \"[[entities/x]]\"`\n   - close unclosed brackets; remove stray trailing `\"`/`]`\n   - convert mixed inline+block lists to one consistent form\n   - never invent values — if a field is garbled beyond recovery, keep the\n     recoverable part and drop only the unrecoverable fragment (note it)\n   - keep `type:` (required) and all other real fields\n3. Do NOT include the `---` delimiters in your proposed frontmatter — just\n   the YAML body between them.\n\n## Structureless files (marked [structureless] — NO closing `---`)\n\nSome batch items have lost their closing `---` entirely, so body content\n(headings, **bold** metadata, prose) has bled into the YAML block. For\nthese you MUST provide TWO things in the proposal object:\n  - \"frontmatter\": the corrected YAML (fix the internal syntax error too —\n    e.g. a mis-indented `  - ` source line, an unclosed list)\n  - \"body_starts_with\": the VERBATIM first line of the real body (the first\n    line that belongs AFTER the closing `---`, copied exactly — e.g.\n    \"# Example Entity\" or \"**URL:** https://...\")\n\nThe applier locates that exact line in the original file, inserts the\nclosing `---` before it, and preserves everything from there to EOF\nverbatim. If body_starts_with does not match a real line, the file is left\nuntouched — so copy it exactly (no paraphrasing, exact whitespace).\n\n## Deliverable — write ONE JSON file\n\n`file_write` exactly once to:\n  `$WIKI_PATH/wiki/.yaml-repair-proposals.json`\n\nA JSON array, one object per page:\n```json\n[\n  {\n    \"path\": \"wiki/concepts/example-topic.md\",\n    \"frontmatter\": \"type: concept\\ntags: [example, topic]\\ncreated: 2026-01-01\\nupdated: 2026-01-02\",\n    \"notes\": \"optional: what was garbled / dropped\"\n  }\n]\n```\n\nRules:\n- `frontmatter` is the corrected YAML as a single string (use \\n for newlines),\n  NO `---` delimiters, valid JSON string escaping.\n- Verify each proposed frontmatter would parse as a YAML mapping with a\n  `type:` key before including it.\n- Do NOT file_write/patch any entity/source/concept page. The ONLY file you\n  write is the proposals JSON.\n- Do NOT touch wiki/log.md, wiki/index.md, or dashboards.\n\n## Final response\n\nA short table: | path | fix | dropped? |. Phase 2 (apply_yaml_repair.py)\nruns next. No Telegram delivery; stays local.",
     "deliver": "local"
   },
   {
@@ -416,7 +430,7 @@
       "expr": "25 */6 * * *"
     },
     "workdir": "/opt/vault",
-    "prompt": "(unused \u2014 schema_type_drain.py returns wakeAgent=false. Deterministic backstop: remaps the safe/unambiguous non-canonical entity types to canonical (the pack's declared type_aliases (schema.yaml)), draining the part of schema-drift that needs no judgment.)",
+    "prompt": "(unused — schema_type_drain.py returns wakeAgent=false. Deterministic backstop: remaps the safe/unambiguous non-canonical entity types to canonical (the pack's declared type_aliases (schema.yaml)), draining the part of schema-drift that needs no judgment.)",
     "script": "schema_type_drain.py",
     "deliver": "local",
     "no_agent": true
@@ -458,10 +472,22 @@
     "enabled": true,
     "schedule": {
       "kind": "cron",
-      "expr": "30 2 * * *"
+      "expr": "30 4 * * *"
     },
     "workdir": "/opt/vault",
     "script": "select_source_staleness.py",
+    "deliver": "local"
+  },
+  {
+    "id": "855c0ca14699",
+    "name": "source-portfolio-refresh",
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "45 4 * * *"
+    },
+    "workdir": "/opt/vault",
+    "script": "source_portfolio_watch.py",
     "deliver": "local"
   },
   {
@@ -470,7 +496,7 @@
     "enabled": true,
     "schedule": {
       "kind": "cron",
-      "expr": "45 1 * * *"
+      "expr": "45 3 * * *"
     },
     "workdir": "/opt/vault",
     "prompt": "Refresh the derived hot/warm/cold tier distribution dashboard (pure script, wakeAgent=false).",
@@ -481,7 +507,7 @@
   {
     "id": "8d5dbb7a036c",
     "name": "wiki-health-audit",
-    "prompt": "Read $WIKI_PATH/CLAUDE.md and follow the Lint workflow exactly.\n\n**File rotation matters here**: per the vault's File rotation policy, lint output is one file per run, not one file per day. If a `wiki/lint-YYYY-MM-DD.md` (or any `wiki/lint-YYYY-MM-DD-v*.md`) already exists with today's date, write yours as the next version (`-v2`, `-v3`, etc. \u2014 increment from the highest existing). Do NOT overwrite prior runs; they're history for trend comparison.\n\nOutput covers: contradictions across pages not yet flagged, stale claims newer sources have superseded, orphan pages (no inbound links), concepts mentioned 3+ times without their own page, missing cross-references where obvious, open predictions whose resolves_by has passed without grading (flip to expired-ungraded and propose postmortem), suggested next questions and underrepresented source types/publishers for those questions.\n\n**Publisher drift check**: under \u00a7\"Publisher names \u2014 avoid drift\" in vault CLAUDE.md, the canonical publisher list is authoritative. Run `grep -h '^publisher:' /opt/vault/wiki/sources/*.md | sort | uniq -c | sort -rn`, then list any value with \u22652 sources that (a) is not in the canonical list AND (b) is not a composite \" / \"-joined or \"(...)\"-annotated co-attribution AND (c) appears to be a plausible drift variant of an existing canonical name. For each, propose either: (i) which canonical name absorbs it, or (ii) it's a genuinely new publisher that should be added to the canonical list. This goes in a `## Publisher drift` section near the top of the lint report. If zero drift candidates: write `## Publisher drift\\n\\nNone.` and move on.\n\n**Schema drift check**: run `python3 /opt/data/scripts/wiki_schema_audit.py` and paste its full markdown output (under the `## Schema drift audit` heading it produces) into the lint report immediately after the Publisher drift section. The script reports three things: (1) `type:` distribution across the wiki, (2) schema emergence \u2014 unsanctioned `type:` values split into canonization candidates (\u22655 pages \u2014 vault is signaling a missing schema slot) vs. one-off drift (<5 pages \u2014 typos or experiments), and (3) structural conformance gaps \u2014 pages with a canonical type missing required fields (e.g. `type: trend` without `trend_status`). After pasting the report, add a `### Recommendations` subsection. For each canonization candidate, propose one of: canonize (add to vault CLAUDE.md type list with required fields), rename to an existing canonical type, or migrate pages off. For one-off drift, propose individual page fixes. For structural conformance gaps, identify whether the migration should be drained by a follow-up cron job (if mechanizable) or a human sweep (if it requires editorial judgment). **Do NOT modify any pages from this audit job** \u2014 this section produces a queue, not an action; the human or a dedicated migration job drains it.\n\nAlways include a top-of-file summary line: total broken wikilinks (with top 10 missing concepts by inbound-count), pages missing from index, frontmatter parse errors, and a delta vs the prior version if one exists.\n\nAppend log: `## [YYYY-MM-DD HH:MM UTC] lint | <one-line summary>` followed by `Full report: [[lint-YYYY-MM-DD-vN]]` (the version you just wrote).\n\nUpdate `wiki/index.md` to point at the latest lint version under the appropriate section.",
+    "prompt": "Read $WIKI_PATH/CLAUDE.md and follow the Lint workflow exactly.\n\n**File rotation matters here**: per the vault's File rotation policy, lint output is one file per run, not one file per day. If a `wiki/lint-YYYY-MM-DD.md` (or any `wiki/lint-YYYY-MM-DD-v*.md`) already exists with today's date, write yours as the next version (`-v2`, `-v3`, etc. — increment from the highest existing). Do NOT overwrite prior runs; they're history for trend comparison.\n\nOutput covers: contradictions across pages not yet flagged, stale claims newer sources have superseded, orphan pages (no inbound links), concepts mentioned 3+ times without their own page, missing cross-references where obvious, open predictions whose resolves_by has passed without grading (flip to expired-ungraded and propose postmortem), suggested next questions and underrepresented source types/publishers for those questions.\n\n**Publisher drift check**: under §\"Publisher names — avoid drift\" in vault CLAUDE.md, the canonical publisher list is authoritative. Run `grep -h '^publisher:' /opt/vault/wiki/sources/*.md | sort | uniq -c | sort -rn`, then list any value with ≥2 sources that (a) is not in the canonical list AND (b) is not a composite \" / \"-joined or \"(...)\"-annotated co-attribution AND (c) appears to be a plausible drift variant of an existing canonical name. For each, propose either: (i) which canonical name absorbs it, or (ii) it's a genuinely new publisher that should be added to the canonical list. This goes in a `## Publisher drift` section near the top of the lint report. If zero drift candidates: write `## Publisher drift\\n\\nNone.` and move on.\n\n**Schema drift check**: run `python3 /opt/data/scripts/wiki_schema_audit.py` and paste its full markdown output (under the `## Schema drift audit` heading it produces) into the lint report immediately after the Publisher drift section. The script reports three things: (1) `type:` distribution across the wiki, (2) schema emergence — unsanctioned `type:` values split into canonization candidates (≥5 pages — vault is signaling a missing schema slot) vs. one-off drift (<5 pages — typos or experiments), and (3) structural conformance gaps — pages with a canonical type missing required fields (e.g. `type: trend` without `trend_status`). After pasting the report, add a `### Recommendations` subsection. For each canonization candidate, propose one of: canonize (add to vault CLAUDE.md type list with required fields), rename to an existing canonical type, or migrate pages off. For one-off drift, propose individual page fixes. For structural conformance gaps, identify whether the migration should be drained by a follow-up cron job (if mechanizable) or a human sweep (if it requires editorial judgment). **Do NOT modify any pages from this audit job** — this section produces a queue, not an action; the human or a dedicated migration job drains it.\n\nAlways include a top-of-file summary line: total broken wikilinks (with top 10 missing concepts by inbound-count), pages missing from index, frontmatter parse errors, and a delta vs the prior version if one exists.\n\nAppend log: `## [YYYY-MM-DD HH:MM UTC] lint | <one-line summary>` followed by `Full report: [[lint-YYYY-MM-DD-vN]]` (the version you just wrote).\n\nUpdate `wiki/index.md` to point at the latest lint version under the appropriate section.",
     "skills": [
       "llm-wiki"
     ],
@@ -511,57 +537,6 @@
     "no_agent": true
   },
   {
-    "id": "4c580157eb56",
-    "name": "prediction-candidate-watch",
-    "script": "select_prediction_candidates.py",
-    "schedule": {
-      "kind": "cron",
-      "expr": "17 6 * * *"
-    },
-    "enabled": true,
-    "deliver": "local",
-    "enabled_toolsets": [
-      "hermes-cron",
-      "okengine-write",
-      "okengine"
-    ],
-    "workdir": "/opt/vault"
-  },
-  {
-    "id": "4dc386ce95f0",
-    "name": "prediction-grade",
-    "script": "select_predictions_for_grading.py",
-    "schedule": {
-      "kind": "cron",
-      "expr": "23 6 * * *"
-    },
-    "enabled": true,
-    "deliver": "local",
-    "enabled_toolsets": [
-      "hermes-cron",
-      "okengine-write",
-      "okengine"
-    ],
-    "workdir": "/opt/vault"
-  },
-  {
-    "id": "d3ddbf191e51",
-    "name": "prediction-regrade",
-    "script": "select_regrade_batch.py",
-    "schedule": {
-      "kind": "cron",
-      "expr": "29 */6 * * *"
-    },
-    "enabled": true,
-    "deliver": "local",
-    "enabled_toolsets": [
-      "hermes-cron",
-      "okengine-write",
-      "okengine"
-    ],
-    "workdir": "/opt/vault"
-  },
-  {
     "id": "a55e3b1ec0de",
     "name": "canonical-assemble",
     "enabled": true,
@@ -584,9 +559,168 @@
       "expr": "*/15 * * * *"
     },
     "workdir": "/opt/vault",
-    "prompt": "(unused \u2014 ensure_readable.py restores the g+r/o+r bit on any wiki/**.md a writer left owner-only, e.g. the file-tool-written daily brief, so the read-only reader can serve it.)",
+    "prompt": "(unused — ensure_readable.py restores the g+r/o+r bit on any wiki/**.md a writer left owner-only, e.g. the file-tool-written daily brief, so the read-only reader can serve it.)",
     "script": "ensure_readable.py",
     "deliver": "local",
     "no_agent": true
+  },
+  {
+    "id": "2c1945551dba",
+    "name": "usage-rollup",
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "12 * * * *"
+    },
+    "workdir": "/opt/vault",
+    "prompt": "Roll up per-model usage from cron run logs into the SQLite usage ledger (okengine#144); pure script, wakeAgent=false.",
+    "script": "/opt/data/scripts/usage_rollup.py",
+    "deliver": "local",
+    "no_agent": true
+  },
+  {
+    "id": "7e3d2a1b9c4f",
+    "name": "trends-refresh",
+    "script": "select_trend_deltas.py",
+    "schedule": {
+      "kind": "cron",
+      "expr": "40 4 * * 1"
+    },
+    "enabled": true,
+    "deliver": "local",
+    "enabled_toolsets": [
+      "hermes-cron",
+      "okengine-write",
+      "okengine"
+    ],
+    "workdir": "/opt/vault"
+  },
+  {
+    "id": "cf0a0d175800",
+    "name": "conformance-audit",
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "35 22 * * *"
+    },
+    "workdir": "/opt/vault",
+    "prompt": "Report-only content-conformance monitor (okengine#158); script writes the dashboard and emits wakeAgent=false.",
+    "script": "/opt/data/scripts/conformance_audit.py",
+    "deliver": "local",
+    "no_agent": true
+  },
+  {
+    "id": "0e11ab0c0d20",
+    "name": "relink-prose-sources",
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "20 */6 * * *"
+    },
+    "workdir": "/opt/vault",
+    "prompt": "Deterministic remediation (okengine#158): relink confidently-matchable prose sources to source-page refs; script-only, wakeAgent=false.",
+    "script": "/opt/data/scripts/relink_prose_sources.py",
+    "deliver": "local",
+    "no_agent": true
+  },
+  {
+    "id": "f1ee70ea1402",
+    "name": "fleet-health",
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "15 */6 * * *"
+    },
+    "workdir": "/opt/vault",
+    "prompt": "Report-only fleet-health monitor (okengine#161): flags stale/errored/off-model lanes; writes the dashboard, wakeAgent=false.",
+    "script": "/opt/data/scripts/fleet_health.py",
+    "deliver": "local",
+    "no_agent": true
+  },
+  {
+    "id": "9c0a0d175840",
+    "name": "grounding-audit",
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "40 22 * * *"
+    },
+    "workdir": "/opt/vault",
+    "prompt": "Report-only source-grounding audit (trust floor): flags ungrounded/dangling entities; writes the dashboard, wakeAgent=false.",
+    "script": "/opt/data/scripts/grounding_audit.py",
+    "deliver": "local",
+    "no_agent": true
+  },
+  {
+    "id": "4ev1e0a0d10",
+    "name": "review-queue",
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "5 23 * * *"
+    },
+    "workdir": "/opt/vault",
+    "prompt": "Report-only human-review queue (okengine#69): grounding-flagged + needs_review + unvetted high-stakes pages; writes the dashboard, wakeAgent=false.",
+    "script": "/opt/data/scripts/review_queue.py",
+    "deliver": "local",
+    "no_agent": true
+  },
+  {
+    "id": "09e8a70de500",
+    "name": "operator-dashboard",
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "30 */3 * * *"
+    },
+    "workdir": "/opt/vault",
+    "prompt": "Report-only operator home (okengine#60): rolls up engine + vault health dashboards; wakeAgent=false.",
+    "script": "/opt/data/scripts/operator_dashboard.py",
+    "deliver": "local",
+    "no_agent": true
+  },
+  {
+    "id": "4ea170e0900d",
+    "name": "health-export",
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "45 */3 * * *"
+    },
+    "workdir": "/opt/vault",
+    "prompt": "Report-only observability export (okengine#64): Prometheus metrics + transition alerts; wakeAgent=false.",
+    "script": "/opt/data/scripts/health_export.py",
+    "deliver": "local",
+    "no_agent": true
+  },
+  {
+    "id": "70c0b69cc497",
+    "name": "deployment-validate",
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "10 12 * * 1"
+    },
+    "workdir": "/opt/vault",
+    "script": "deployment_validate.py",
+    "no_agent": true,
+    "deliver": "local"
+  },
+  {
+    "id": "b554841c2a05",
+    "name": "daily-brief",
+    "script": "select_daily_brief.py",
+    "schedule": {
+      "kind": "cron",
+      "expr": "@morning:30"
+    },
+    "enabled": true,
+    "deliver": "local",
+    "enabled_toolsets": [
+      "hermes-cron",
+      "okengine-write",
+      "okengine"
+    ],
+    "workdir": "/opt/vault"
   }
 ]

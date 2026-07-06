@@ -205,7 +205,7 @@ def render(today: date, q_rows, pages) -> str:
     L.append("---")
     L.append("type: dashboard")
     L.append("title: KB Health")
-    L.append(f"updated: {today.isoformat()}")
+    L.append(f"updated: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
     L.append("generator: scripts/cron/kb_health.py")
     L.append("---")
     L.append("")
@@ -216,6 +216,13 @@ def render(today: date, q_rows, pages) -> str:
     L.append("")
     src_date = latest[0].isoformat() if latest else "n/a"
     L.append(f"Snapshot source date: **{src_date}** · total vault pages: **{pages:,}**")
+    ref_pages = lkv.get("reference-pages")
+    if ref_pages:
+        L.append("")
+        L.append(f"Reference-catalog pages: **{ref_pages:,}** — deterministic imports "
+                 "(CVE / ATT&CK / encyclopedia); link-target scaffolding, **excluded from the "
+                 "orphan and page-quality debt metrics** (a catalog entry with no inbound links "
+                 "yet is waiting to be cited, not a defect).")
     L.append("")
 
     # ── Top-line ────────────────────────────────────────────────────

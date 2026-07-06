@@ -56,6 +56,45 @@ def expand_one(expr: str, minute: int, *, hour: int = _DEFAULT_HOUR,
     }[base]
 
 
+_MORNING_RE = re.compile(r"^@morning(?::(\d{1,2}))?$")
+# The deployment-wide morning hour for reader-facing daily briefs (gateway-local TZ).
+# One knob (OKENGINE_BRIEF_HOUR in .env) so ALL brief lanes cluster in the operator's
+# morning instead of each lane hardcoding an hour — the recurring "briefs run at the
+# wrong time" pain (okengine#177). Default 7 = 07:00 local.
+DEFAULT_BRIEF_HOUR = 7
+
+
+def is_morning_sentinel(expr: str) -> bool:
+    return isinstance(expr, str) and bool(_MORNING_RE.match(expr.strip()))
+
+
+def expand_morning_one(expr: str, brief_hour: int) -> str | None:
+    """`@morning` / `@morning:MM` -> `MM <brief_hour> * * *` (daily). MM defaults 0.
+    The minute lets several morning briefs stagger so a slow local model isn't
+    contended (e.g. positioning :00, messaging :15, brief :30, threat :45).
+    Returns None if `expr` is not a morning sentinel."""
+    m = _MORNING_RE.match((expr or "").strip())
+    if not m:
+        return None
+    minute = int(m.group(1) or 0) % 60
+    return f"{minute} {brief_hour % 24} * * *"
+
+
+def expand_brief_jobs(jobs: list, brief_hour: int) -> int:
+    """Expand every `@morning[:MM]` schedule to the deployment's brief hour, in place.
+    Returns the count expanded. Call at DEPLOY time (like expand_jobs for @jitter),
+    so the same source ships to every deployment and each picks its own morning."""
+    n = 0
+    for job in jobs:
+        sched = job.get("schedule") or {}
+        concrete = expand_morning_one(sched.get("expr"), brief_hour)
+        if concrete is not None:
+            sched["expr"] = concrete
+            job["schedule"] = sched
+            n += 1
+    return n
+
+
 def expand_jobs(jobs: list, rng: random.Random | None = None) -> int:
     """Expand every jitter-sentinel schedule in a list of cron job dicts, in
     place. Returns the number of jobs expanded. Each job gets its own random
@@ -72,6 +111,14 @@ def expand_jobs(jobs: list, rng: random.Random | None = None) -> int:
             sched["expr"] = concrete
             job["schedule"] = sched
             n += 1
+        elif isinstance(expr, str) and expr.strip().startswith("@jitter:"):
+            # Looks like a jitter sentinel but the base isn't one of the SUPPORTED set, so
+            # expand_one() returned None and the raw sentinel would ship to cron-plus — which
+            # can't parse it (errors every tick, the lane silently never fires, okengine#107).
+            # Fail loud at the deploy/pull gate instead of shipping a dead lane (okengine#178).
+            raise ValueError(
+                f"unsupported @jitter base in schedule {expr!r} — supported bases: "
+                "hourly, 2h, 4h, 6h, 12h, daily, weekly")
     return n
 
 

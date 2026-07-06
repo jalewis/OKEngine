@@ -14,11 +14,12 @@
 
 set -euo pipefail
 
-# Run as the SAME uid the gateway runs as (compose `user: ${HERMES_UID:-10000}`),
-# NOT the image's `hermes` name (10000): a deployment that overrides HERMES_UID
-# (e.g. to the host operator's uid) owns /opt/data with that uid, so `-u hermes`
-# would mismatch and hit permission-denied on jobs.json / the .tick.lock.
-HERMES_UID="${HERMES_UID:-10000}"
+# Run as the SAME uid the gateway runs as. A deployment that overrides HERMES_UID
+# (e.g. to the host operator's uid) owns /opt/data 700 with that uid, so a `-u 10000`
+# exec can't even traverse /opt/data and fails "can't open file … cli.py" (okengine#136).
+# An explicit HERMES_UID wins; otherwise AUTO-DETECT it from the running gateway (the
+# owner of /opt/data) once we've found the container — never assume the 10000 default.
+HERMES_UID="${HERMES_UID:-}"
 
 # Target the pack's gateway. With CRON_PACK_DIR set, scope to THAT pack's compose project
 # (the right gateway on a multi-pack host, okengine#108). Without it, fall back to the gateway
@@ -37,6 +38,13 @@ fi
 if [ -z "$CONTAINER" ]; then
     echo "ERROR: no running gateway container found (is the stack up? set CRON_PACK_DIR=<pack>)." >&2
     exit 1
+fi
+
+# Auto-detect the gateway's uid from the owner of /opt/data (the uid that owns it and
+# can traverse it), unless the operator set HERMES_UID explicitly (okengine#136).
+if [ -z "$HERMES_UID" ]; then
+    HERMES_UID="$(docker exec "$CONTAINER" stat -c %u /opt/data 2>/dev/null || true)"
+    HERMES_UID="${HERMES_UID:-10000}"
 fi
 
 exec docker exec -i -u "$HERMES_UID" "$CONTAINER" \

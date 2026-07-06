@@ -68,3 +68,55 @@ def test_main_writes_hot_with_recent_sources(tmp_path):
     hot = (vault / "wiki" / "HOT.md").read_text()
     assert "want-better-data" in hot
     assert "Recent sources: **1**" in hot
+
+
+# --- forecast-movement signals: status-filtered recent + due-soon open (predictions in HOT.md) ---
+
+def _pred(p: Path, status, resolves_by=None, last_updated=None) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fm = f"---\ntype: prediction\nstatus: {status}\nsubject: x\nconfidence: medium\n"
+    if resolves_by:
+        fm += f"resolves_by: {resolves_by}\n"
+    if last_updated:
+        fm += f"last_updated: {last_updated}\n"
+    p.write_text(fm + "---\n# pred\n")
+
+
+def test_select_recent_status_filter(tmp_path):
+    """recent + status_values = recently *resolved* (recent-by-graded-date AND status in set)."""
+    vault = tmp_path
+    pr = vault / "wiki" / "predictions"
+    t = TODAY.isoformat()
+    _pred(pr / "graded-recent.md", "confirmed", last_updated=f"{t}T10:00:00Z")
+    _pred(pr / "open-recent.md", "open", last_updated=f"{t}T10:00:00Z")   # recent but NOT resolved
+    _pred(pr / "graded-old.md", "refuted", last_updated="2019-01-01")     # resolved but old
+    m = _load(vault)
+    rows = m._select_recent(
+        {"namespace": "predictions", "date_field": "last_updated", "status_field": "status",
+         "status_values": ["confirmed", "refuted", "partial", "expired-ungraded"]},
+        TODAY - timedelta(days=3))
+    assert {p.stem for _, p, _ in rows} == {"graded-recent"}
+
+
+def test_select_open_due_within_includes_overdue_sorted(tmp_path):
+    vault = tmp_path
+    pr = vault / "wiki" / "predictions"
+    _pred(pr / "due-soon.md", "open", resolves_by=(TODAY + timedelta(days=3)).isoformat())
+    _pred(pr / "overdue.md", "open", resolves_by=(TODAY - timedelta(days=2)).isoformat())
+    _pred(pr / "due-far.md", "open", resolves_by=(TODAY + timedelta(days=90)).isoformat())
+    _pred(pr / "resolved.md", "confirmed", resolves_by=(TODAY + timedelta(days=3)).isoformat())
+    m = _load(vault)
+    rows = m._select_open(
+        {"namespace": "predictions", "status_field": "status", "open_values": ["open", "active"],
+         "secondary_field": "resolves_by", "due_within_days": 7})
+    assert [p.stem for p, _ in rows] == ["overdue", "due-soon"]   # within horizon, soonest-first
+
+
+def test_select_open_without_due_filter_unchanged(tmp_path):
+    vault = tmp_path
+    pr = vault / "wiki" / "predictions"
+    _pred(pr / "a.md", "open", resolves_by=(TODAY + timedelta(days=200)).isoformat())
+    m = _load(vault)
+    rows = m._select_open({"namespace": "predictions", "status_field": "status",
+                           "open_values": ["open"]})
+    assert {p.stem for p, _ in rows} == {"a"}   # no due_within_days -> all open (backward-compatible)

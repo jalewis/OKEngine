@@ -1,0 +1,7 @@
+{
+  "schedule": {"kind": "cron", "expr": "50 6 * * *"},
+  "entrypoint": "select_critic.py",
+  "prompt_file": "prompts/flagship.md",
+  "toolsets": ["hermes-cron", "okengine-write", "okengine"],
+  "tier": "deliver"
+}

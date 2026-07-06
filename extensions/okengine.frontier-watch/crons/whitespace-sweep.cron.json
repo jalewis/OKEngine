@@ -1,0 +1,7 @@
+{
+  "schedule": {"kind": "cron", "expr": "0 7 * * 1"},
+  "entrypoint": "select_whitespace.py",
+  "prompt_file": "prompts/whitespace-sweep.md",
+  "toolsets": ["hermes-cron", "okengine-write", "okengine"],
+  "tier": "analyze"
+}

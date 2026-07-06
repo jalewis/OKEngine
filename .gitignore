@@ -20,10 +20,17 @@ build/
 config/cron-plus-jobs.json
 
 # Editor / tooling
+.claude/
 .serena/
 .vscode/
 .idea/
 *.swp
+
+# Local-only engineering notes (reference private origin systems / absolute paths —
+# kept out of the engine repo per the no-domain-knowledge / no-deployment-paths rule)
+docs/origin-system-review.md
+# private scrub-check regexes for the pre-commit leak grep (see CLAUDE.md)
+.scrub-patterns
 
 # Scratch / backups
 *.bak
@@ -31,3 +38,9 @@ config/cron-plus-jobs.json
 scratch/
 tmp/
 *.log
+
+# invariant-audit run artifacts (findings reference internal/domain detail; the script+README are tracked, outputs are not)
+scripts/audit/last-run-*.md
+
+# local audit triage working file (references finding content)
+.audit-triage.md

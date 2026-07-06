@@ -1,5 +1,13 @@
 # Composable okpacks — v1 implementation plan
 
+> **Status (okengine#90, 2026-06):** the schema slices are **implemented** — P1 (stamped-once `id`),
+> P2 (engine-owned core: `schema_lib._merge_base_pack` merges the core types/namespaces/tiering +
+> cross-cutting optionals under every pack; packs own only their domain), and the P3 N-way fold
+> (`schema_lib.compose_schema` with the `owners` map + fail-loud own/extend, surfaced by
+> `framework compose-preview`). Write provenance (`maintained_by`/`discovered_by` from
+> `OKENGINE_PACK`) is P3.1. The phase tables below are the original plan; see
+> [`core-types-and-extensions.md`](../core-types-and-extensions.md) for the current pack-author contract.
+
 Implements the decisions in [`composable-okpacks.md`](composable-okpacks.md).
 **v1 = additive / disjoint / fail-loud**, with identity + dedup-on-write and a
 real base pack as the proving ground. Conflict resolution beyond owner-wins,

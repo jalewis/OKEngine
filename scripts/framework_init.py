@@ -87,6 +87,7 @@ def _tokens(dest: Path, domain: str, offset: int) -> dict[str, str]:
         "PORT_OFFSET": str(offset),
         "READER_PORT": str(9200 + offset),
         "MCP_PORT": str(8730 + offset),
+        "COCKPIT_PORT": str(9201 + offset),
         "ENV_PREFIX": re.sub(r"[^A-Z0-9]", "_", pack.upper()),
         "PACK_UNDERSCORE": pack.replace("-", "_"),
         "BRIEF_HOUR": "13",
@@ -227,7 +228,7 @@ def main(argv: list[str]) -> int:
     print(f"✓ scaffolded domain pack '{tokens['TITLE']}' at {dest}  (engine {ver}"
           f"{'' if args.no_compose else ', + docker-compose.yml'})")
     if not args.no_compose and args.port_offset:
-        print(f"  ports: reader {tokens['READER_PORT']}, mcp {tokens['MCP_PORT']}")
+        print(f"  ports: reader {tokens['READER_PORT']}, cockpit {tokens['COCKPIT_PORT']}, mcp {tokens['MCP_PORT']}")
     print("  next: edit schema.yaml / CLAUDE.md / feeds/, fill .hermes-data/config.yaml,")
     print("        cp .env.example .env, run `python3 validate.py`,")
     print("        then follow docs/deploy-a-new-domain.md §2 to deploy.")

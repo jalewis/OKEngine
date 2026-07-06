@@ -1,0 +1,40 @@
+id: okengine.embeddings
+kind: operation
+version: 0.1.0
+name: Embeddings
+description: >-
+  The canonical first-party SIDECAR exemplar. Computes content-similarity over entity pages to
+  surface SEMANTIC near-duplicate candidates — complementing okengine.dedupe's name/alias
+  detection. Runs as a digest-pinned container, OS-HARDENED (cap_drop ALL, no-new-privileges,
+  read-only rootfs, pid/mem/cpu caps — okengine#124), reaching the read/write MCP by SERVICE NAME
+  with scoped tokens (#132), on the per-pack bridge (#138). Ships as a buildable reference
+  template: build image/ and pin the digest before enabling (see README).
+
+trust: sidecar
+requires:
+  engine: ">=0.5.0"
+
+capabilities:
+  read: [wiki/entities/**]
+  write: [dashboards/**]
+  network: false          # reaches the MCP by service name on the bridge; no external internet
+  secrets: []
+  delivery: false
+
+config:
+  threshold:
+    type: number
+    default: 0.85
+    description: Cosine-similarity threshold above which two entities are flagged near-duplicate.
+
+operation:
+  schedule: {kind: cron, expr: "50 5 * * *"}
+  entrypoint:
+    image:
+      registry: registry.example.com/okengine/embeddings   # build from image/, then repin (README)
+      tag: "0.1.0"                                          # informational
+      # PLACEHOLDER digest — REPLACE with your built image's sha256 before enabling. A sidecar
+      # without a real pinned digest will not pull (content-addressed supply-chain hygiene).
+      digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      command: ["python", "/app/run.py"]
+  timeout: 1800

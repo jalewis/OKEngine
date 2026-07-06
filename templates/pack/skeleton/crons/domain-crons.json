@@ -13,22 +13,5 @@
     "script": "/opt/data/scripts/{{PACK_UNDERSCORE}}_feed_fetch.py",
     "deliver": "local",
     "no_agent": true
-  },
-  {
-    "id": "{{CRON_ID_2}}",
-    "name": "{{PACK}}-daily-brief",
-    "enabled": true,
-    "_note": "Enabled by default. Writes a daily brief from whatever is in the vault — trivial while the vault is empty, substantive once ingest runs. `@jitter:daily` -> a random minute at hour 13 UTC (~9am US-Eastern); retune the hour for your timezone. Set deliver:telegram + a bot token to push it.",
-    "schedule": {
-      "kind": "cron",
-      "expr": "@jitter:daily"
-    },
-    "workdir": "/opt/vault",
-    "enabled_toolsets": [
-      "hermes-cron",
-      "okengine"
-    ],
-    "prompt": "Daily {{DOMAIN}} brief. Your FIRST response MUST be a tool call: file_read on wiki/HOT.md (the derived load-first set: recent sources, recently-updated entities, open predictions). Then write today's brief to wiki/briefings/<YYYY-MM-DD>.md (frontmatter: type: dashboard, title, published: <YYYY-MM-DD> — published drives tier recency) summarizing the 3-5 most significant developments, each 2-3 sentences with [[wikilinks]] to the entities + their source. Expert-grade and terse; skip 101 explanation. If the vault is essentially empty, say so in one line instead of padding. LOCAL-ONLY: do not use web tools.",
-    "deliver": "local"
   }
 ]

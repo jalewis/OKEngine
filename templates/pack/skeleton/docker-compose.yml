@@ -8,7 +8,9 @@
 #   ENGINE_DIR=$ENGINE_DIR docker compose up -d      # builds reader+mcp, runs all three
 #   CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-scripts.sh
 #   CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-plus-jobs.sh
-# Host ports are offset by {{PORT_OFFSET}} to avoid colliding with other packs on this host.
+# Only the reader publishes a host port (offset by {{PORT_OFFSET}} to avoid collisions with other
+# packs); the gateway is on the per-pack bridge (no host port) and reaches okengine-mcp by service
+# name, and okengine-mcp needs no host port for the engine itself (okengine#138).
 services:
   gateway:
     # gateway image = pinned Hermes + patches + engine overlay; build it ONCE
@@ -16,7 +18,9 @@ services:
     image: hermes-agent
     container_name: {{PACK}}-gateway
     restart: unless-stopped
-    network_mode: host
+    # On the compose default bridge (a per-pack network), NOT host-net (okengine#138). The gateway
+    # reaches okengine-mcp by SERVICE NAME (config.yaml: http://okengine-mcp:8730/mcp); outbound
+    # traffic (Telegram long-poll, model API) works over the bridge; it binds no inbound host port.
     # NO `user:` here — the gateway is an s6-overlay image that must start as
     # root and remap internally via HERMES_UID/HERMES_GID (passed below). Pinning
     # `user:` to a non-10000 uid makes s6 abort on startup (okpacks-library#12).
@@ -33,13 +37,49 @@ services:
     environment:
       - HERMES_UID=${HERMES_UID:-10000}
       - HERMES_GID=${HERMES_GID:-10000}
+      # Deployment timezone — sets the container clock (logs/timestamps) AND the TZ cron-plus
+      # interprets schedule exprs in (hermes-cron-plus reads CRON_TZ, else TZ). Engine default UTC
+      # (zero-config, public-reference); set TZ=America/New_York (your locale) in .env so a schedule
+      # like `30 13 * * *` means 13:30 LOCAL, DST-aware — next_run_at is still stored in UTC.
+      - TZ=${TZ:-UTC}
       # Explicit vault path: the gateway's enforced write_server resolves the
       # vault here. The engine treats a blank WIKI_PATH as /opt/vault too, but the
       # base image ships it blank, so set it outright (okengine#34).
       - WIKI_PATH=/opt/vault
+      # Pack identity — the enforced write path stamps composition provenance
+      # (maintained_by / discovered_by) with this on every write, so a composed
+      # multi-pack vault records which pack maintains each page (okengine#90 P3).
+      - OKENGINE_PACK={{PACK}}
+      # Hermes v0.17.0 bakes ENV HERMES_WRITE_SAFE_ROOT=/opt/data and DENIES every agent
+      # file-tool write outside it as a "protected system/credential file" — which silently
+      # blocks the agent from writing the vault at /opt/vault (okengine#140). Widen the safe
+      # root to /opt so BOTH /opt/data and /opt/vault are writable; /etc, /root, host paths
+      # stay blocked, and the /opt/data credential denylist runs first and is unaffected.
+      # Override here, NOT the Dockerfile — every build-engine-image re-bakes =/opt/data.
+      # Any custom compose that mounts its vault outside /opt/data must replicate this.
+      - HERMES_WRITE_SAFE_ROOT=/opt
+      # Free-tier survival: the engine ships a free model default (config.yaml.template), and
+      # a :free tier is rate-limited — so cap how many agent cron lanes run at once. Without
+      # this, a burst of coincident lanes stampedes the free tier into 429s. Trade: lanes run
+      # more serially (slower) but COMPLETE instead of dying. Raise/remove it for a paid
+      # primary + high throughput. See docs/model-selection.md § running on free models.
+      - HERMES_CRON_MAX_PARALLEL=${HERMES_CRON_MAX_PARALLEL:-2}
+      # ── Agent Chat (OPT-IN, off by default) ──────────────────────────────────────────────
+      # Turn on the okengine-reader Chat tab — it relays to this OpenAI-compatible api_server
+      # (:8642). To enable: (1) uncomment the four vars below + set API_SERVER_KEY in .env;
+      # (2) uncomment the reader's OKENGINE_AGENT_* env; (3) add the platform_toolsets.api_server
+      # lockdown to config.yaml (read + enforced-write + web, NO shell/code). On this bridge the
+      # api_server is PRIVATE: API_SERVER_HOST=0.0.0.0 binds only the gateway container's bridge
+      # interface (no host port is published for the gateway), and the reader reaches it by service
+      # name (gateway:8642). It is exposed ONLY if you expose the reader — then set
+      # OKENGINE_READER_PASSWORD. See docs/agent-chat.md.
+      # - API_SERVER_ENABLED=true
+      # - API_SERVER_KEY=${API_SERVER_KEY:-}
+      # - API_SERVER_HOST=0.0.0.0
+      # - API_SERVER_MODEL_NAME=OKEngine Agent
     command: ["gateway", "run"]
-    # network_mode: host serves Telegram/agent traffic directly; no mapped HTTP
-    # port to probe, so no healthcheck (limits + backoff still apply).
+    # Outbound only (Telegram long-poll + model API) + reaches okengine-mcp by service name; no
+    # inbound host port, so no healthcheck (limits + backoff still apply).
     deploy:
       restart_policy: {condition: on-failure, delay: 10s, max_attempts: 5, window: 120s}
       resources: {limits: {cpus: "2.0", memory: 2048M}}
@@ -54,7 +94,18 @@ services:
     ports: ["${OKENGINE_BIND:-127.0.0.1}:{{READER_PORT}}:9200"]
     environment:
       - OKENGINE_READER_PASSWORD=${OKENGINE_READER_PASSWORD:-}
+      # Trust enforcement (okengine#90 P4a): a PRIVATE vault REFUSES to serve unauthenticated when
+      # exposed (OKENGINE_BIND != loopback) with no password. OKENGINE_TRUST is the pack's trust —
+      # ensure-runtime.sh derives it from pack.yaml; default `private` is fail-safe.
+      - OKENGINE_TRUST=${OKENGINE_TRUST:-private}
+      - OKENGINE_BIND=${OKENGINE_BIND:-127.0.0.1}
       - OKENGINE_PROJECT_URL=${OKENGINE_PROJECT_URL:-}   # About-panel repo link (optional)
+      - TZ=${TZ:-UTC}                                    # match the gateway clock (page timestamps)
+      # Agent Chat (opt-in — see the gateway api_server block + docs/agent-chat.md). Both required;
+      # the gateway is reached by SERVICE NAME on the bridge (private + stable, no host.docker.internal):
+      # - OKENGINE_AGENT_API=http://gateway:8642/v1
+      # - OKENGINE_AGENT_KEY=${API_SERVER_KEY:-}
+      # - OKENGINE_AGENT_MODEL=OKEngine Agent
     volumes: ["./:/vault:ro"]
     # TCP-connect probe via python3 (present in the python:3.13-slim reader/mcp images).
     healthcheck:
@@ -74,16 +125,23 @@ services:
     container_name: {{PACK}}-mcp
     user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
     restart: unless-stopped
-    # Local-first: host port binds loopback by default. To expose on the LAN,
-    # set OKENGINE_BIND=0.0.0.0 in .env AND a real OKENGINE_MCP_TOKEN.
-    ports: ["${OKENGINE_BIND:-127.0.0.1}:{{MCP_PORT}}:8730"]
+    # On the bridge the gateway reaches this by service name (okengine-mcp:8730) — NO host port is
+    # needed for the engine itself (okengine#138). Publish one ONLY to expose the read query
+    # surface to EXTERNAL agents/tools; then set OKENGINE_BIND=0.0.0.0 + a real OKENGINE_MCP_TOKEN.
+    # ports: ["${OKENGINE_BIND:-127.0.0.1}:{{MCP_PORT}}:8730"]
     environment:
       - WIKI_PATH=/opt/vault
       - OKENGINE_MCP_TRANSPORT=streamable-http
       - PORT=8730
+      - TZ=${TZ:-UTC}
       # Default token ships configured so a fresh deploy authenticates out of the
       # box; safe because the host port is loopback-only above. CHANGE before exposing.
       - OKENGINE_MCP_TOKEN=${OKENGINE_MCP_TOKEN:-okengine-local}
+      # Index-maintainer tuning (docs/kb-tooling.md): mtime-poll cadence and the
+      # debounce floor for change-triggered reindexing. Defaults mirror server.py's
+      # (an EMPTY value would disable, not default — keep the fallbacks).
+      - OKENGINE_MCP_INDEX_POLL_SECONDS=${OKENGINE_MCP_INDEX_POLL_SECONDS:-30}
+      - OKENGINE_MCP_INDEX_MIN_UPDATE_SECONDS=${OKENGINE_MCP_INDEX_MIN_UPDATE_SECONDS:-60}
     volumes:
       - ./:/opt/vault:ro
       - ./.hermes-data/qmd:/opt/data/qmd
@@ -97,3 +155,42 @@ services:
     deploy:
       restart_policy: {condition: on-failure, delay: 10s, max_attempts: 5, window: 120s}
       resources: {limits: {cpus: "2.0", memory: 2560M}}
+  okengine-cockpit:
+    build: ${ENGINE_DIR:-../engine}/okengine-cockpit
+    image: okengine-cockpit
+    container_name: {{PACK}}-cockpit
+    user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
+    restart: unless-stopped
+    # The function-oriented cockpit UI (briefings/predictions/dashboards/competitors + Browse + Chat).
+    # A superset of okengine-reader — ship one or both. Local-first: host port binds loopback by
+    # default. To expose on the LAN, set OKENGINE_BIND=0.0.0.0 in .env (and set OKENGINE_READER_PASSWORD
+    # — the cockpit enforces the SAME auth/trust fail-safe as the reader, so a private vault refuses to
+    # start exposed without one).
+    ports: ["${OKENGINE_BIND:-127.0.0.1}:{{COCKPIT_PORT}}:9200"]
+    environment:
+      - VAULT_DIR=/vault
+      # Auth/trust: SHARED credential with the reader — one password protects both UIs. The cockpit is
+      # a superset of the reader (adds the agent-Chat relay), so it must not be laxer. OKENGINE_TRUST +
+      # OKENGINE_BIND drive the private-vault fail-safe (okengine#90 P4a); ensure-runtime.sh derives
+      # OKENGINE_TRUST from pack.yaml, default `private`.
+      - OKENGINE_READER_PASSWORD=${OKENGINE_READER_PASSWORD:-}
+      - OKENGINE_TRUST=${OKENGINE_TRUST:-private}
+      - OKENGINE_BIND=${OKENGINE_BIND:-127.0.0.1}
+      - TZ=${TZ:-UTC}
+      # Agent Chat (OPT-IN) — relays to the gateway api_server (:8642) by SERVICE NAME on the
+      # per-pack bridge; the Chat tab appears only when these are set. Requires the gateway
+      # api_server on (API_SERVER_ENABLED=true + key in .env, api_server toolset lockdown in
+      # config.yaml). See docs/agent-chat.md.
+      # - OKENGINE_AGENT_API=http://gateway:8642/v1
+      # - OKENGINE_AGENT_KEY=${API_SERVER_KEY:-}
+      # - OKENGINE_AGENT_MODEL=OKEngine Agent
+    volumes: ["./:/vault:ro"]
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(s.connect_ex(('127.0.0.1',9200)))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      restart_policy: {condition: on-failure, delay: 10s, max_attempts: 5, window: 120s}
+      resources: {limits: {cpus: "2.0", memory: 2048M}}

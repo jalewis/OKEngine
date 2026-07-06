@@ -1,0 +1,34 @@
+# okengine.critic — subjective QC critique over a vault's flagship deliverable(s).
+#
+# The judgment-based quality lane the engine's MECHANICAL QC (page-quality-audit, repair, lint)
+# deliberately doesn't cover. Per #148: engine ships mechanical machinery; subjective-judgment
+# lanes (dedupe, predictions, contradictions) are extensions — a deliverable-critic belongs with
+# them. Generic: "critique the headline deliverable and flag weak claims/coverage" is sector-
+# agnostic; the TARGET is pack config (schema.yaml `critic_flagship`: a path/glob), so it ships no
+# hardcoded target and runs on any pack that names a flagship.
+#
+# Cost lever (preserve it): the wake-gate is CONDITIONAL — select_critic.py wakes the agent ONLY
+# when it finds hard structural flags (stale / thin / under-cited), otherwise it stays silent and
+# spends nothing. Output is a derived critic report + needs_review flags — NOT a new page type
+# (#148 convention). Built on the #63 cron drop-in model.
+id: okengine.critic
+kind: operation
+version: 0.1.0
+name: Critic
+description: >-
+  Subjective LLM critique over a pack's flagship deliverable: a conditional wake-gate flags weak
+  claims / thin coverage / staleness only when hard signals appear, then the agent critiques and
+  writes a critic report. Target is pack config; runs on any domain.
+trust: in-gateway
+requires:
+  engine: ">=0.6.0"               # #63 cron drop-in collector
+capabilities:
+  read: [wiki/**]
+  write: [dashboards/**]          # the derived critic report (L1 dashboard); review flags are universal
+config:
+  # PACK INPUT (schema.yaml): critic_flagship — a path or glob naming the flagship deliverable(s),
+  # e.g. "briefings/**" or "dashboards/strategy.md". No flagship declared -> the lane no-ops.
+  # The hard-flag thresholds (the cost lever) are tunable via env on the gate:
+  stale_days:  {type: integer, default: 14}    # CRITIC_STALE_DAYS
+  min_words:   {type: integer, default: 200}   # CRITIC_MIN_WORDS
+  min_sources: {type: integer, default: 3}     # CRITIC_MIN_SOURCES

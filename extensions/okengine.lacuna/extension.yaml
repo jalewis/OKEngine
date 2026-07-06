@@ -1,0 +1,49 @@
+# okengine.lacuna — structural-gap discovery (lacuna prompting) as a first-party extension.
+#
+# The most DIFFERENTIATED capability in the parity map: everything else is table-stakes KB
+# machinery; this generates new COORDINATES (whitespace / research direction / positioning),
+# not verdicts. Instead of asking a model for "a novel idea" (which regresses to the mean), it
+# runs a 6-step procedure that forces output to a structural EDGE of the field — and grounds
+# that edge in the vault's REAL concept/entity graph, not the model's averaged recall. See
+# docs/design/extension-system.md and the README for the method + the three engine constraints.
+#
+# It OWNS its `lacuna` type + namespace (bring-your-own-schema, okengine#133) — pages are an
+# analysis artifact, NOT canonical knowledge, so they land low-trust (`needs_review`, with a
+# confidence/density signal). When okengine.predictions is ALSO enabled, testable fills are
+# emitted as prediction candidates into predictions/** (a SOFT convention — no hard `requires`).
+# Opt-in (it spends model budget) — unlike core okengine.contradictions.
+id: okengine.lacuna
+kind: operation
+version: 0.1.0
+name: Lacuna
+description: >-
+  Structural-gap discovery: maps a field from the real concept graph, names the force keeping
+  a cell empty, and proposes a fill with a density-measured confidence. Writes its own low-trust
+  `lacuna` pages; emits testable fills as prediction candidates when okengine.predictions is on.
+trust: in-gateway
+requires:
+  engine: ">=0.5.0"               # core/schema-owning extension grammar (#133) + agent ops
+  schema_refs: [concept, entity]  # the graph it maps the field from (must exist in the composed schema)
+capabilities:
+  read: [wiki/**]
+  write:
+    - lacuna/**                   # its OWN namespace, owned by the fragment below (#132/#133)
+    - predictions/**              # SOFT edge: emit prediction candidates when predictions is enabled
+schema:
+  - schema/lacuna.schema.yaml     # OWNS the `lacuna` type + namespace (#133) — wires the fragment
+                                  #   into the composer; without this the file is orphaned (never composed)
+operation:
+  schedule: {kind: cron, expr: "0 6 * * *"}   # daily (06:00) — drift-gated, cheap, one field per run
+  entrypoint: select_lacuna_field.py          # wake-gate: densest concept cluster not analyzed lately
+  prompt_file: prompts/lacuna.md
+  toolsets: [hermes-cron, okengine-write, okengine]
+  tier: analyze                   # okengine#129 hint: run AFTER ingest/compile so the graph is fresh
+config:
+  # A field worth analyzing must be dense enough that the geometry is well-sampled — a thin patch
+  # makes step 6 extrapolation, not inference. Floor on the cluster's reference count.
+  min_density: {type: integer, default: 8}
+  # Don't re-analyze the same field for this many days (rotation across the concept graph).
+  reanalyze_days: {type: integer, default: 90}
+  # How many of the densest unanalyzed clusters to surface to the agent per run (it produces at
+  # most one lacuna per field, deferring when no real force can be named — coverage is not a goal).
+  batch_size: {type: integer, default: 3}

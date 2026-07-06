@@ -16,7 +16,7 @@ usage: new-pack.sh <pack-name> [title] [options]
 options:
   --offset N         host-port offset (reader=9200+N, mcp=8730+N)   [default 0]
   --engine TAG       engine pin                                     [default v0.2.0]
-  --hermes-pin TAG   Hermes runtime pin (engine.version)            [default v2026.6.19]
+  --hermes-pin TAG   Hermes runtime pin (engine.version)            [default v2026.7.1]
   --brief-hour H     UTC hour (0-23) for the daily brief            [default 13]
   --owner NAME       GitHub owner for the README CI badge           [default REPLACE_OWNER]
   --license NAME     LICENSE to ship: apache-2.0 | none             [default apache-2.0]
@@ -26,7 +26,7 @@ EOF
   exit 2
 }
 
-PACK="" TITLE="" OFFSET=0 ENGINE="v0.2.0" HERMES_PIN="v2026.6.19" BRIEF_HOUR=13 OWNER="REPLACE_OWNER" LICENSE="apache-2.0" BLURB="" OUT=""
+PACK="" TITLE="" OFFSET=0 ENGINE="" HERMES_PIN="v2026.7.1" BRIEF_HOUR=13 OWNER="REPLACE_OWNER" LICENSE="apache-2.0" BLURB="" OUT=""
 POSITIONAL=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -47,6 +47,13 @@ done
 PACK="${POSITIONAL[0]}"
 TITLE="${POSITIONAL[1]:-}"
 
+# Default engine.version to the release THIS scaffold ships with (engine-manifest.yaml), not a
+# hardcoded pin that silently drifts as the engine bumps (okengine invariant-audit). --engine wins.
+if [ -z "$ENGINE" ]; then
+  ENGINE="$( (cd "$(dirname "$0")/../.." 2>/dev/null && grep -E '^engine_release:' engine-manifest.yaml 2>/dev/null | awk '{print $2}') )"
+  ENGINE="${ENGINE:-v0.2.0}"
+fi
+
 [ -d "$SKELETON" ] || { echo "error: skeleton/ not found next to this script" >&2; exit 1; }
 case "$PACK" in okpack-*) ;; *) echo "warn: convention is okpack-<domain> (got '$PACK')" >&2 ;; esac
 case "$OFFSET" in *[!0-9]*) echo "error: --offset must be an integer" >&2; exit 2 ;; esac
@@ -58,6 +65,7 @@ ENV_PREFIX=$(printf '%s' "$PACK" | tr 'a-z-' 'A-Z_')
 PACK_UNDERSCORE=$(printf '%s' "$PACK" | tr '-' '_')
 READER_PORT=$((9200 + OFFSET))
 MCP_PORT=$((8730 + OFFSET))
+COCKPIT_PORT=$((9201 + OFFSET))   # skeleton compose uses {{COCKPIT_PORT}} (added v0.8.0); must match framework_init.py
 LICENSE_YEAR=$(date +%Y)
 case "$LICENSE" in apache-2.0|none) ;; *) echo "error: --license must be 'apache-2.0' or 'none'" >&2; exit 2 ;; esac
 mint_id() { openssl rand -hex 6 2>/dev/null || python3 -c "import secrets;print(secrets.token_hex(6))"; }
@@ -87,7 +95,7 @@ done < <(find "$OUT" -depth -name '*{{PACK_UNDERSCORE}}*')
 
 # substitute tokens in every text file
 export PACK DOMAIN TITLE BLURB ENGINE HERMES_PIN BRIEF_HOUR OWNER LICENSE_YEAR ENV_PREFIX PACK_UNDERSCORE \
-       READER_PORT MCP_PORT CRON_ID_1 CRON_ID_2 OFFSET
+       READER_PORT MCP_PORT COCKPIT_PORT CRON_ID_1 CRON_ID_2 OFFSET
 python3 - "$OUT" <<'PY'
 import os, sys
 root = sys.argv[1]
@@ -96,6 +104,7 @@ repl = {
     "{{PACK}}": e["PACK"], "{{DOMAIN}}": e["DOMAIN"], "{{TITLE}}": e["TITLE"],
     "{{BLURB}}": e["BLURB"], "{{ENGINE_VERSION}}": e["ENGINE"], "{{HERMES_PIN}}": e["HERMES_PIN"],
     "{{PORT_OFFSET}}": e["OFFSET"], "{{READER_PORT}}": e["READER_PORT"], "{{MCP_PORT}}": e["MCP_PORT"],
+    "{{COCKPIT_PORT}}": e["COCKPIT_PORT"],
     "{{ENV_PREFIX}}": e["ENV_PREFIX"], "{{PACK_UNDERSCORE}}": e["PACK_UNDERSCORE"],
     "{{BRIEF_HOUR}}": e["BRIEF_HOUR"], "{{OWNER}}": e["OWNER"], "{{LICENSE_YEAR}}": e["LICENSE_YEAR"],
     "{{CRON_ID_1}}": e["CRON_ID_1"], "{{CRON_ID_2}}": e["CRON_ID_2"],

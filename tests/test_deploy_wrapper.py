@@ -45,6 +45,26 @@ def test_validate_gate_aborts_before_docker(tmp_path):
     assert "[4/" not in r.stdout        # never reached the docker compose up step
 
 
+def test_deploy_recomposes_schema_artifact():  # invariant-audit #12
+    """deploy.sh must recompose <pack>/.okengine/composed-schema.yaml, else a schema.yaml edit is
+    silently ignored on the enforced write path (which prefers the frozen artifact) until the next
+    `framework extensions enable/disable`."""
+    dp = SCRIPT.read_text()
+    assert "write_composed_schema" in dp, \
+        "deploy.sh no longer recomposes the schema artifact — schema.yaml edits won't reach the write path"
+
+
+def test_deploy_rebuilds_sibling_images():  # invariant-audit #8/#23
+    """deploy.sh step 4 must `up -d --build`. Plain `up -d` builds an image only when ABSENT, so
+    the reader/mcp/cockpit images (the only services with a compose build:) freeze after the first
+    deploy and ship stale baked code — a fix to app.py/server.py/tier_lib.py would look deployed
+    (the gateway visibly rebuilds) but not actually run. --build rebuilds the changed siblings; the
+    gateway has no compose build: so it's untouched (built separately in step 3)."""
+    dp = SCRIPT.read_text()
+    assert "docker compose up -d --build" in dp, \
+        "deploy.sh step 4 must use --build, or the sibling images run stale baked code after deploy 1"
+
+
 def test_image_provenance_and_staleness_wired():
     """build-engine-image stamps version/sha/hermes labels; deploy.sh compares the
     image's git_sha label to the current checkout to detect a stale image (#14)."""
@@ -70,8 +90,12 @@ def test_default_uid_is_invoking_user_not_fixed_10000():
     clone-as-yourself pack tree is writable out of the box instead of aborting the #33
     writability guard. A fixed uid stays available as an explicit override."""
     dp = SCRIPT.read_text()
-    assert "HERMES_UID:-$(id -u)" in dp and "HERMES_GID:-$(id -g)" in dp
+    # #7 (invariant-audit): the resolution now prefers an existing .env pin, then the invoking
+    # uid — `${HERMES_UID:-${_env_uid:-$(id -u)}}` — so the ULTIMATE fallback is still $(id -u),
+    # never a fixed uid. Assert the invoking-uid fallback survives and no fixed default crept in.
+    assert "$(id -u)" in dp and "$(id -g)" in dp
     assert "HERMES_UID:-10000" not in dp, "deploy.sh must not default HERMES_UID to a fixed 10000"
+    assert ":-1003" not in dp, "deploy.sh must not hardcode an operator-specific uid"
     er = (REPO / "scripts" / "ensure-runtime.sh").read_text()
     assert "HERMES_UID:-$(id -u)" in er, "ensure-runtime.sh should default to the invoking uid too"
 

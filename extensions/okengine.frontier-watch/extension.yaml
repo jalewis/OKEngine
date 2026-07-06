@@ -1,0 +1,47 @@
+# okengine.frontier-watch — capability-frontier + demand/supply whitespace discovery.
+#
+# The applied market-strategy sibling of okengine.lacuna (#145): lacuna is the generic
+# structural-gap PRIMITIVE (map -> hidden axis -> name the FORCE -> sort -> confidence);
+# frontier-watch is the applied LANE that tracks a tech market's capability frontier and
+# surfaces demand/supply whitespace — capabilities the market clearly wants (talked about by
+# many SOURCES) but few players actually SUPPLY (few ENTITIES). Generic method; the frontier
+# feed list + segment vocab are pack config, not extension code, so it runs on any market.
+#
+# SOFT edge to lacuna (no hard `requires`, exactly like lacuna<->predictions): when a whitespace
+# thesis can be sharpened into a NAMED FORCE keeping the cell empty, it's a candidate for
+# lacuna's rigorous treatment — the prompt hands it off when okengine.lacuna is enabled, and the
+# thesis stands alone when it isn't. Opt-in (spends model budget).
+#
+# Built on the #63 cron drop-in model: the ops live in crons/*.cron.json, not an `operations:`
+# block — adding a lane is dropping a file.
+id: okengine.frontier-watch
+kind: operation
+version: 0.1.0
+name: Frontier Watch
+description: >-
+  Capability-frontier + demand/supply whitespace discovery: surfaces capabilities the market
+  wants (discussed across sources) but few players supply, writes low-trust whitespace theses,
+  and briefs on the open frontier. Soft-hands a thesis to okengine.lacuna for force-naming when
+  that extension is enabled.
+trust: in-gateway
+requires:
+  engine: ">=0.6.0"               # #63 cron drop-in collector + schema-owning extension grammar
+  schema_refs: [concept, entity, source]   # the graph it measures demand (sources) vs supply (entities) over
+capabilities:
+  read: [wiki/**]
+  write:
+    - frontier/**                 # its OWN namespace, owned by the fragment below
+    - lacuna/**                   # SOFT edge: hand a sharpened thesis to lacuna when it's enabled
+schema:
+  - schema/frontier.schema.yaml   # OWNS the `whitespace-thesis` type + `frontier` namespace
+config:
+  # A capability is only worth a thesis when the market clearly WANTS it — floor on demand
+  # (distinct source pages referencing the capability).
+  min_demand: {type: integer, default: 5}
+  # ...and supply is thin — ceiling on supply (distinct entity pages that provide it). 0 = pure
+  # whitespace (wanted, nobody builds it); a small ceiling catches under-served capabilities too.
+  max_supply: {type: integer, default: 2}
+  # Don't re-thesis the same capability for this many days (rotation across the frontier).
+  reanalyze_days: {type: integer, default: 60}
+  # How many of the highest-demand whitespace candidates to surface per run.
+  batch_size: {type: integer, default: 5}

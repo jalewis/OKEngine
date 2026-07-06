@@ -17,7 +17,8 @@ SELF_GID = str(os.getgid())
 
 
 def _run(args, **env):
-    e = dict(os.environ, HERMES_UID=SELF_UID, HERMES_GID=SELF_GID)
+    e = dict(os.environ, HERMES_UID=SELF_UID, HERMES_GID=SELF_GID,
+             OKENGINE_CRON_PLUS_SKIP="1")   # hermetic: no plugin clone in tests
     e.update(env)
     return subprocess.run(["bash", str(SCRIPT), *args], capture_output=True,
                           text=True, timeout=30, env=e)
@@ -61,7 +62,7 @@ def test_idempotent_does_not_clobber(tmp_path):
 def test_fails_when_not_writable_by_gateway_uid(tmp_path):
     """If the pack tree isn't writable by HERMES_UID, fail BEFORE compose with an
     actionable message (issue #16) — not a silent broken start."""
-    e = dict(os.environ, HERMES_UID="99999", HERMES_GID="99999")
+    e = dict(os.environ, HERMES_UID="99999", HERMES_GID="99999", OKENGINE_CRON_PLUS_SKIP="1")
     r = subprocess.run(["bash", str(SCRIPT), str(tmp_path)],
                        capture_output=True, text=True, timeout=30, env=e)
     assert r.returncode == 1
@@ -72,7 +73,7 @@ def test_fails_when_not_writable_by_gateway_uid(tmp_path):
 def test_fix_perms_makes_tree_writable(tmp_path):
     """--fix-perms makes the tree world-writable so a non-matching gateway uid can
     write it (the documented local-deploy remedy)."""
-    e = dict(os.environ, HERMES_UID="99999", HERMES_GID="99999")
+    e = dict(os.environ, HERMES_UID="99999", HERMES_GID="99999", OKENGINE_CRON_PLUS_SKIP="1")
     r = subprocess.run(["bash", str(SCRIPT), str(tmp_path), "--fix-perms"],
                        capture_output=True, text=True, timeout=30, env=e)
     assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
@@ -148,3 +149,39 @@ def test_mcp_token_synced_unquoted_header(tmp_path):
     cfg = (rt / "config.yaml").read_text()
     assert "Authorization: Bearer abc123" in cfg, cfg
     assert "<OKENGINE_MCP_TOKEN" not in cfg
+
+
+def test_mcp_url_uses_service_name_not_host_port(tmp_path):
+    """okengine#138 (supersedes #137): the gateway shares the compose bridge with okengine-mcp and
+    reaches the read-MCP by SERVICE NAME on the container port (okengine-mcp:8730) — no host port,
+    no port_offset, no cross-pack collision. So an offset pack's MCP url is the service name, NOT a
+    rewritten localhost host-port."""
+    (tmp_path / "pack.yaml").write_text("name: demo\nport_offset: 100\n")
+    r = _run([str(tmp_path)])
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    cfg = (tmp_path / ".hermes-data" / "config.yaml").read_text()
+    assert "http://okengine-mcp:8730/mcp" in cfg      # service name on the bridge
+    assert "localhost:8830" not in cfg                # not the superseded #137 offset host-port form
+    # (the template's explanatory comment legitimately mentions localhost:8730 — don't over-assert)
+
+
+def test_no_offset_keeps_default_mcp_url(tmp_path):
+    """No port_offset -> the template default :8730 is kept (back-compat)."""
+    (tmp_path / "pack.yaml").write_text("name: demo\n")
+    r = _run([str(tmp_path)])
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    cfg = (tmp_path / ".hermes-data" / "config.yaml").read_text()
+    assert "http://localhost:8730/mcp" in cfg
+
+
+def test_iwe_only_in_mcp():
+    """okengine#179: backlinks are built by an in-process link-scanner, so iwe is used ONLY by
+    the MCP's graph tools (kb_graph). It must stay sha-pinned in the MCP image, and must NOT be
+    fetched anywhere it's no longer needed (reader/cockpit images, ensure-runtime staging)."""
+    import re
+    mcp = (REPO / "okengine-mcp" / "Dockerfile").read_text()
+    assert re.search(r'ARG IWE_VERSION=[0-9.]+', mcp) and re.search(r'ARG IWE_SHA256=[0-9a-f]{64}', mcp), \
+        "MCP must keep iwe pinned + sha-verified — it's the sole remaining iwe user"
+    for f in ("okengine-reader/Dockerfile", "okengine-cockpit/Dockerfile", "scripts/ensure-runtime.sh"):
+        assert "iwe-org/iwe/releases" not in (REPO / f).read_text(), \
+            f"{f} still downloads iwe, but it no longer needs it (backlinks are in-process, #179)"

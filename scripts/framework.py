@@ -15,9 +15,30 @@ Commands:
       Browse the pack catalog (delegates to framework_list).
   framework validate <pack> [--probe-feeds] [--quiet]
       Pre-deploy sanity check on a pack (delegates to framework_validate).
+  framework install-domain <deployment> <pack> [--under wiki/<slug>] [--shape ...] [--apply]
+      Install a pack ALONGSIDE the host in a live deployment (okengine#173): both
+      co-install shapes (walk-up subtree / taxonomy-augmenting), collision-preflighted,
+      key-based merges (idempotent), dry-run by default.
+  framework upgrade <pack> [--apply]
+      Reconcile the pack's engine.version pin to the running engine — dry-run by
+      default; --apply bumps the pin, runs registered migrations, records state
+      (okengine#66).
+  framework backup (create|verify|restore|list|prune) …
+      Disaster-recovery snapshots of a vault + runtime: create a verifiable .tar.gz,
+      verify its integrity, restore into a target, list/prune (okengine#65).
+  framework compose-preview <pack-dir> <pack-dir> [...] [--json]
+      Multi-pack composition SAFETY GATE (read-only): merge >= 2 packs' schemas + crons
+      and report blocking conflicts (schema ownership, cron name clashes, ID-authority
+      overlap, trust mismatch) + the secrets union before any deploy (okengine#90 P1).
   framework budget (--status | --resume)
       Inspect/control the spend-cap guard. --resume is the manual recovery path
       after a budget trip (re-enables paused crons + clears state); see okengine#35.
+  framework extensions (list | inspect | validate | enable | disable
+                        | stage-plan | sidecar-generate | purge) <pack> [...]
+      Discover/inspect/validate a pack's extensions across the engine/pack/operator
+      tiers, enable/disable them, and emit deploy artifacts (delegates to
+      framework_extensions; okengine#134, #113, #128, #135). enable/disable manage
+      vault-level state + scoped MCP tokens; redeploy regenerates the fleet.
 
 Each subcommand's own --help lists its flags. Exit code is the subcommand's.
 """
@@ -42,7 +63,14 @@ _COMMANDS = {
     "pull": ("framework_pull", "framework_pull.py"),
     "list": ("framework_list", "framework_list.py"),
     "validate": ("framework_validate", "framework_validate.py"),
+    "import": ("framework_import", "framework_import.py"),
+    "install-domain": ("framework_install_domain", "framework_install_domain.py"),
+    "review": ("framework_review", "framework_review.py"),
+    "upgrade": ("framework_upgrade", "framework_upgrade.py"),
+    "backup": ("framework_backup", "framework_backup.py"),
+    "compose-preview": ("framework_compose_preview", "framework_compose_preview.py"),
     "budget": ("framework_budget", "framework_budget.py"),
+    "extensions": ("framework_extensions", "framework_extensions.py"),
 }
 
 

@@ -237,8 +237,10 @@ def main() -> int:
         return 0
 
     if INDEX.exists():
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        bak = INDEX.with_suffix(f".bak.{ts}.md")
+        # ONE overwritten sidecar, NOT .md-suffixed: dated .bak.<ts>.md copies
+        # accumulated unboundedly AND were indexed/searched as pages (they end
+        # in .md) — the vault grew three 500KB "index" pages in three days.
+        bak = INDEX.parent / (INDEX.name + ".bak")
         shutil.copy2(INDEX, bak)
         print(f"snapshot → {bak.name}", file=sys.stderr)
 

@@ -29,11 +29,14 @@ VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
 
 # An `updated:` line whose value is two or more space-separated ISO dates.
+# An ISO value: a date OR a `T`-separated ISO-8601 timestamp (the write path stamps the latter,
+# okengine#... — so the multi-value separator stays an unambiguous space, the value has no space).
+_TS = r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}Z?)?"
 _MULTIDATE_RE = re.compile(
-    r"^(updated:[ \t]*)(\d{4}-\d{2}-\d{2}(?:[ \t]+\d{4}-\d{2}-\d{2})+)[ \t]*(#.*)?$",
+    rf"^(updated:[ \t]*)({_TS}(?:[ \t]+{_TS})+)[ \t]*(#.*)?$",
     re.MULTILINE,
 )
-_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_ISO_DATE = re.compile(_TS)
 
 # Path fragments that mark a non-live / frozen artifact we must not rewrite.
 _SKIP_SUBSTRINGS = (

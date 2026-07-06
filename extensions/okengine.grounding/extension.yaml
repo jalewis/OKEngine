@@ -1,0 +1,26 @@
+# okengine.grounding — Tier-2 semantic grounding (the trust backbone's LLM layer).
+# Tier-1 (grounding_audit, engine) checks a claim cites a source that EXISTS; this reads each
+# grounded entity + its cited sources and flags claims the sources don't SUPPORT. Opt-in (model
+# budget) -> extension. Domain-agnostic; no schema fragment (annotates existing entity/concept pages).
+id: okengine.grounding
+kind: operation
+version: 0.1.0
+name: Semantic grounding
+description: >-
+  Read each grounded entity/concept + its cited sources and flag claims the sources do not support
+  (append a `## Grounding check`, set grounding_checked). Tier-2 above the deterministic
+  grounding_audit. Generic; no domain knowledge.
+trust: in-gateway
+core: false
+requires:
+  engine: ">=0.6.0"
+capabilities:
+  read: ["wiki/**"]
+  write: ["entities/**", "concepts/**"]      # annotates pages in place (## Grounding check + field)
+  network: false
+operations:
+  grounding-check:
+    schedule: {kind: cron, expr: "50 4 * * *"}     # daily; wake-gated to fresh grounded entities
+    entrypoint: select_grounding_check.py
+    prompt_file: prompts/grounding-check.md
+    toolsets: [hermes-cron, okengine-write, okengine]

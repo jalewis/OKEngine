@@ -7,14 +7,14 @@ documents what is pinned, where, and how to bump each dependency safely.
 
 | Dependency | Where | Pin | Integrity |
 |---|---|---|---|
-| **Base image** (`python:3.13-slim-trixie`) | `okengine-mcp/Dockerfile`, `okengine-reader/Dockerfile` | digest `sha256:c33f0bc4…105e4f` | digest pin (also pins the apt snapshot) |
-| **IWE** binary | both Dockerfiles | `IWE_VERSION=0.3.2` | `IWE_SHA256` verified with `sha256sum -c` |
+| **Base image** (`python:3.13-slim-trixie`) | `okengine-mcp/Dockerfile`, `okengine-reader/Dockerfile`, `okengine-cockpit/Dockerfile` | digest `sha256:c33f0bc4…105e4f` | digest pin (also pins the apt snapshot) |
+| **IWE** binary | all three image Dockerfiles (mcp, reader, cockpit) | `IWE_VERSION=0.3.2` | `IWE_SHA256` verified with `sha256sum -c` |
 | **qmd** (npm) | `okengine-mcp/Dockerfile` | `@tobilu/qmd@2.5.3` | npm version pin |
 | **node-gyp** (npm) | `okengine-mcp/Dockerfile` | `node-gyp@11` | npm version pin |
 | **MCP Python deps** | `okengine-mcp/requirements.txt` | `==` pins (`mcp`, `PyYAML`, `uvicorn`) | exact versions |
 | **Reader Python deps** | `okengine-reader/requirements.txt` | `==` pins | exact versions |
-| **Hermes-Agent** runtime | `engine-manifest.yaml` → `runtime.pinned_sha` | tag `v2026.6.19` → commit `2bd1977…0ce3` | `build-engine-image.sh` verifies the clone matches |
-| **cron-plus** plugin (required runtime scheduler) | `engine-manifest.yaml` → `dependencies.cron-plus`, `INSTALL.md` §4 | commit `eacd1729…39eff` (untagged) | operator clones + `git checkout` the pin |
+| **Hermes-Agent** runtime | `engine-manifest.yaml` → `runtime.pinned_sha` | tag `v2026.7.1` → commit `7c1a029…213b` | `build-engine-image.sh` verifies the clone matches |
+| **cron-plus** plugin (required runtime scheduler) | `engine-manifest.yaml` → `dependencies.cron-plus`, `INSTALL.md` §4 | commit `6b230dc8…ca83c` (untagged) | operator clones + `git checkout` the pin |
 
 apt packages are intentionally **not** version-pinned individually: the base-image
 digest pins the Debian snapshot they come from, so they're reproducible without the

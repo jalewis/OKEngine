@@ -12,17 +12,17 @@
 # (schema.yaml + persona + feeds + crons + content). See INSTALL.md and
 # docs/deploy-a-new-domain.md.
 version: 1
-engine_release: v0.3.5   # enum enforcement · reader About live runtime · Docker quickstart docs — see CHANGELOG.md
+engine_release: v0.10.1   # post-cut hardening from the v0.10.0 invariant audit (secret leaks, write-path, budget-guard, DST, test fixes); see CHANGELOG.md
 
 runtime:
   # Hermes is a PINNED DEPENDENCY, not vendored into this repo. You clone Hermes
   # at the pinned tag, apply patches/, then overlay the engine_layer below.
   description: pinned Hermes-Agent (cloned separately, patched + overlaid — see INSTALL.md)
   upstream: https://github.com/NousResearch/hermes-agent.git
-  pinned_version: v0.17.0          # upstream git tag v2026.6.19
-  pinned_tag: v2026.6.19
-  pinned_sha: 2bd1977d8fad185c9b4be47884f7e87f1add0ce3   # commit the tag resolves to; build-engine-image.sh verifies the clone matches
-  carried_patches: patches/        # 6 core-file patches + apply.sh (idempotent) + README
+  pinned_version: v0.18.0          # upstream git tag v2026.7.1
+  pinned_tag: v2026.7.1
+  pinned_sha: 7c1a029553d87c43ecff8a3821336bc95872213b   # commit the tag resolves to; build-engine-image.sh verifies the clone matches
+  carried_patches: patches/        # 7 core-file patches + apply.sh (idempotent) + README
 
 dependencies:
   # External plugins the engine REQUIRES at runtime — cloned separately by the
@@ -32,13 +32,14 @@ dependencies:
           (the deployed config/cron-plus-jobs.json) runs on it; without it nothing
           schedules.
     upstream: https://github.com/jalewis/hermes-cron-plus.git
-    pinned_sha: eacd1729859ff378be63cb13e25319abf9539eff   # untagged; pin by commit
+    pinned_sha: 6b230dc89171b0e21e89b7856e7a1a57628ca83c   # untagged; pin by commit (TZ-aware scheduling — CRON_TZ/TZ, DST-safe)
     install_to: ~/.hermes/plugins/cron-plus
 
 engine_layer:
   okf_contract:
-    - tools/schema_validator.py          # OKF conformance contract (validator + write-guard hook)
+    - tools/schema_validator.py          # OKF conformance contract (validator + write-guard hook; prefers .okengine/composed-schema.yaml, okengine#133)
     - config/base-schema.yaml            # engine-owned universal layer merged under every pack schema
+    # schema_lib.compose_schema (scripts/cron/) is the N-way fold (okengine#90 P3 / #133)
   cron_machinery:
     - config/cron-tiers.yaml             # engine/engine-template/domain classification
     - config/engine-crons.json           # the engine half of the cron fleet (source)
@@ -67,12 +68,20 @@ engine_layer:
     - scripts/framework_init.py           # pack scaffolder (delegated to by `framework init`)
     - scripts/framework_validate.py       # pre-deploy pack-spec validator
     - scripts/engine_meta.py              # single source of truth for engine/Hermes pins (init stamps, validate enforces)
+  extension_system:
+    - extensions/                         # tier-1 engine-shipped extension discovery root (present≠enabled; okengine#134)
+    - scripts/extension_manifest.py       # extension.yaml parse + §6 validation (okengine#134)
+    - scripts/extension_discovery.py      # three-tier discovery scanner + no-shadow/duplicate-id guard + enabled-state (okengine#134, #113)
+    - scripts/extension_compose.py        # enabled-extension cron synthesis + namespacing + conflict-check (okengine#113)
+    - scripts/extension_tokens.py         # host-side per-extension MCP token mint/revoke (okengine#132)
+    - scripts/framework_extensions.py     # `framework extensions {list,inspect,validate,enable,disable,stage-plan}` (okengine#134, #113, #128)
   corpus_helpers:
     - scripts/backfill_source_fields.py
     - scripts/backfill_typeless_type.py
     - scripts/normalize_publishers.py
   reader:
     - okengine-reader/                      # generic OKF vault reader (markdown + backlinks + PDF)
+    - okengine-cockpit/                     # function-oriented "intelligence cockpit" reader (stream rail + briefings/predictions/dashboards tabs + OPTIONAL pack-config-driven watchlist/competitors); reads schema.yaml `cockpit:` block, no hermes import
   mcp_query_surface:
     - okengine-mcp/                         # MCP servers: read-only query (server.py) + enforced write path (write_server.py / okengine-write, G1)
   config_reference:

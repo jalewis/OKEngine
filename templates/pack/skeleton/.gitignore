@@ -4,6 +4,18 @@
 config.yaml
 raw/            # feed_fetch output: scraped third-party article bodies, not source-of-truth
 
+# GENERATED + SECRET .okengine/ artifacts (the extension/deploy machinery writes these). The
+# committed enable-state (.okengine/extensions.yaml) + per-lane model config
+# (.okengine/model-profiles.yaml, .okengine/cron-models.json) ARE tracked — everything below is
+# regenerated at deploy or holds injected MCP tokens, so committing it leaks secrets + a stale
+# composed-schema that silently governs the enforced write path (okengine invariant-audit).
+.okengine/composed-schema.yaml
+.okengine/extensions-effective.yaml
+.okengine/reader-panels.json
+.okengine/extension-tokens.json
+.okengine/extension-secrets.json
+.okengine/generated/
+
 # tooling caches
 .serena/
 

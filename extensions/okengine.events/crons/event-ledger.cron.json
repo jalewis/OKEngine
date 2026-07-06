@@ -1,0 +1,4 @@
+{
+  "schedule": {"kind": "cron", "expr": "40 5 * * *"},
+  "entrypoint": "build_event_ledger.py"
+}

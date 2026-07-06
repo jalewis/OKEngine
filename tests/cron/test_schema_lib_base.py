@@ -61,9 +61,10 @@ def test_merge_layers_pack_on_base(tmp_path):
         "common_optional: [vendor_field]\n"
     ))
     merged = m.merged_schema(root)
-    # pack keys pass through
-    assert set(merged["types"]) == {"entity"}
-    assert merged["partitioning"]["namespaces"]["entities"]["strategy"] == "flat"
+    # pack keys pass through + the pack INHERITS the engine-owned core (okengine#90)
+    assert "entity" in merged["types"]                                    # pack's domain type
+    assert {"source", "concept", "prediction"} <= set(merged["types"])    # core inherited from base
+    assert merged["partitioning"]["namespaces"]["entities"]["strategy"] == "flat"   # pack overrides core default
     # base owns the globals; required is the union (type + id always present)
     assert merged["okf"]["required"] == ["id", "type"]
     assert merged["okf"].get("should", []) == []   # empty WARN tier may be omitted from merge
@@ -117,3 +118,33 @@ def test_required_unions_and_strict_types_engine_owned(tmp_path):
     # a pack that omits strict_types likewise inherits the engine-base default
     root2 = _vault(tmp_path / "p2", "types:\n  entity: {required: [type]}\n")
     assert m.merged_schema(root2)["strict_types"] is False
+
+
+# --- reference-catalog classification (KB-health: reference imports != content debt) ---
+
+def test_reference_policy_reads_top_level_keys():
+    m = _load()
+    rp = m.reference_policy({"reference_types": ["vulnerability"], "reference_fields": ["mitre_id"]})
+    assert rp["types"] == {"vulnerability"} and rp["fields"] == {"mitre_id"}
+
+
+def test_reference_policy_defaults_empty_when_unset():
+    m = _load()
+    rp = m.reference_policy({})
+    assert rp == {"types": set(), "fields": set()}
+
+
+def test_is_reference_page_by_type_and_by_field():
+    m = _load()
+    rp = m.reference_policy({"reference_types": ["vulnerability"], "reference_fields": ["mitre_id"]})
+    assert m.is_reference_page({"type": "vulnerability"}, rp) is True              # CVE catalog (by type)
+    assert m.is_reference_page({"type": "intrusion-set", "mitre_id": "G1036"}, rp) is True  # ATT&CK (by field)
+    # the discriminating case: SAME type, but source-cited synthesized content is NOT reference
+    assert m.is_reference_page({"type": "intrusion-set", "sources": ["sources/x"]}, rp) is False
+    assert m.is_reference_page({"type": "lacuna"}, rp) is False
+
+
+def test_is_reference_page_noop_without_policy():
+    m = _load()
+    rp = m.reference_policy({})                      # pack didn't opt in
+    assert m.is_reference_page({"type": "vulnerability", "mitre_id": "x"}, rp) is False

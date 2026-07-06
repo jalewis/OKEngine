@@ -1,0 +1,12 @@
+# okengine.glossary schema fragment — the §5 "Own" case (okengine#133).
+# Folded into the composed schema only when the extension is enabled; owner = ext:okengine.glossary.
+# A pack that enables glossary must NOT already own a `term` type or `glossary` namespace
+# (own = new ids only; the composer fails loud on a collision).
+owns:
+  namespaces: [glossary]
+  types:
+    term:
+      # a glossary entry: the term, its definition, and what it relates to.
+      required: [type, term, definition]
+      # optional, additive: aliases/acronyms, links to the entities/concepts it appears in.
+      optional: [aliases, see_also, sources]

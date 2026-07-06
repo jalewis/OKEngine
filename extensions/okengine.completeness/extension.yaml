@@ -1,0 +1,69 @@
+# okengine.completeness — relationship/workflow-level completeness gaps as a first-party
+# extension. The engine's conformance audit answers "does this page satisfy its SCHEMA?";
+# this answers the next question up: "does the corpus satisfy its declared EXPECTATIONS?"
+# — object X exists but the relationship/companion/field/freshness the pack expects around
+# it does not. Pure boundary split (the relevance-gate pattern): the ENGINE ships the rule
+# grammar + evaluation lane + queue/disposition/precision machinery; the PACK ships the
+# rules (config/completeness-rules.yaml — domain knowledge stays pack-side).
+#
+# Deterministic no_agent: detection costs zero model budget and every gap is explainable
+# by construction (rule id + subject + the exact unmet expectation). Distinct from
+# okengine.lacuna (generative STRUCTURAL gaps, low-trust, model-priced): this is the
+# high-volume, high-trust COMPLETENESS tier. The object type is `gap`, never "lacuna",
+# so the two queues cannot be confused in schemas, dashboards, or prompts.
+id: okengine.completeness
+kind: operation
+version: 0.1.0
+name: Completeness gaps
+description: >-
+  Evaluates pack-declared completeness rules over the corpus (expected fields, links,
+  companion pages, freshness) and maintains an explainable gap queue: gap pages in the
+  owned gaps/ namespace, auto-resolve when expectations become satisfied, dismissals
+  respected, and a queue dashboard with per-rule precision so noisy rules surface.
+trust: in-gateway
+core: false                  # opt-in: zero model cost, but queue volume is an operator decision
+requires:
+  engine: ">=0.5.0"          # schema-owning extension grammar
+capabilities:
+  read: [wiki/**]
+  # gaps/ + the dashboard are the audit lane's; wiki/** is the DRAIN's: a fix targets the
+  # rule's SUBJECT, and subjects live wherever the pack's rules point (predictions/,
+  # trends/, entities/, ...). Every drain write still passes the full MCP validation.
+  write: [gaps/**, dashboards/**, wiki/**]
+  network: false
+schema:
+  - schema/completeness.schema.yaml   # OWNS the `gap` type + `gaps` namespace
+operations:
+  completeness-audit:
+    schedule: {kind: cron, expr: "55 5 * * *"}   # after ingest/backfills, before the briefs
+    entrypoint: completeness_audit.py            # no_agent: deterministic rule evaluation
+  gap-drain:
+    # The resolution half — a queue that only accumulates is a work generator, not a
+    # product. Gaps whose rules the pack marks `fix: agent|agent-draft` drain in bounded
+    # batches through the MCP write path; the next audit auto-resolves them. Rules default
+    # to `fix: human` (queue-only): the pack DECLARES what an agent may touch.
+    schedule: {kind: cron, expr: "25 6 * * *"}   # after the 05:55 audit refreshes the queue
+    entrypoint: select_gap_fixes.py              # wake-gate: silent when nothing is fixable
+    prompt_file: prompts/gap_drain.md
+    toolsets: [hermes-cron, okengine-write, okengine]
+    tier: analyze
+config:
+  rules_file:
+    type: string
+    default: "config/completeness-rules.yaml"
+    description: >-
+      Vault-relative path to the pack's rule set. Absent -> the lane no-ops LOUDLY (the
+      relevance-gate convention: never guess a boundary). Override via COMPLETENESS_RULES.
+  gap_drain_batch:
+    type: string
+    default: "5"
+    description: >-
+      Open agent-fixable gaps drained per gap-drain run (oldest first; the backlog drains
+      across days). Override via GAP_DRAIN_BATCH.
+  max_gaps_per_rule:
+    type: string
+    default: "200"
+    description: >-
+      Cap on OPEN gaps a single rule may hold; beyond it the rule is marked saturated on
+      the dashboard instead of flooding the queue (silent truncation is logged, never
+      hidden). Override via COMPLETENESS_MAX_PER_RULE.

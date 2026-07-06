@@ -5,6 +5,11 @@ running deployment: scaffold → fill the schema → write the persona → wire 
 add crons → validate → deploy → iterate. It ties together the pieces documented
 elsewhere:
 
+- [`entity-partitioning.md`](entity-partitioning.md) — the on-disk layout + write/reference
+  contract (read before writing any lane that creates entities),
+  [`common-issues.md`](common-issues.md) — recurring gotchas that cost real time, and
+  [`pack-building-challenges.md`](pack-building-challenges.md) — why packs rot (clone-and-diverge,
+  non-propagation, compose drift) + the 60-second pre-ship audit
 - [`deploy-a-new-domain.md`](deploy-a-new-domain.md) — §1 is the pack **spec**
   (layout + the `schema.yaml` blocks); §2 is the **deploy** quickstart this guide
   hands off to.
@@ -55,7 +60,7 @@ python $ENGINE_DIR/scripts/framework.py init ../my-brain --domain "My Brain"
 #   --interactive     prompt for inputs (also the default with no dest + a TTY)
 #   --feeds f.opml    seed feeds/ from an existing OPML
 #   --delivery local  no Telegram (default: telegram)
-#   --port-offset 100 if another pack already runs on this host (reader 9300, mcp 8830)
+#   --port-offset 100 if another pack's reader port collides on this host (reader 9300)
 #   --no-compose      skip the generated docker-compose.yml
 ```
 
@@ -83,7 +88,7 @@ my-brain/
 │   ├── index.md                      # a seed dashboard page
 │   └── {sources,entities,concepts,predictions,findings,briefings,operational}/
 ├── .hermes-data/                     # runtime state (gitignored; `framework init` seeds config.yaml)
-└── docker-compose.yml                # gateway + reader + mcp, ports offset as requested
+└── docker-compose.yml                # gateway+reader+mcp on a per-pack bridge; reader port offset as requested
 ```
 
 > A pack may be **public**, so the scaffold writes `.gitignore` *first* and never
@@ -98,17 +103,28 @@ The scaffold ships a sane generic contract; edit it to your domain. The blocks:
 
 - **`okf.required: [type]`** — the OKF v0.1 base. Every page needs a `type`; this
   stays.
-- **`types:`** — your domain's page types and their required fields. This is the
-  main thing you change. Each type's `required` list should include `type`.
+- **`types:`** — your **domain** page types and their required fields. The universal
+  OKF core — `source`/`concept`/`prediction`/`finding`/`dashboard`/`briefing`/`trend`
+  + the core namespaces — is **engine-owned** (`config/base-schema.yaml`, merged *under*
+  your schema) and **inherited, not declared**; re-declaring a core type breaks
+  composition. So declare only what your domain adds (each type's `required` should
+  include `type`):
   ```yaml
   types:
-    source:     {required: [type, source_kind, publisher, published]}
-    entity:     {required: [type]}
-    concept:    {required: [type]}
-    prediction: {required: [type, status, confidence, subject, resolves_by]}
-    dashboard:  {required: [type, title]}
+    model:    {required: [type]}                 # domain entity types (live under core entities/)
+    lab:      {required: [type]}
+    # source / concept / prediction / dashboard / briefing / trend are INHERITED — do NOT re-declare.
   ```
-  Rename/add freely — `release`, `paper`, `org`, whatever your domain needs.
+  Rename/add freely — `release`, `paper`, `org`, whatever your domain needs. To add a
+  field to a **core** type, don't re-declare it — `extends:` it (additive + **OPTIONAL
+  only**; a pack may never own or *tighten* a core type, which `framework
+  compose-preview` flags):
+  ```yaml
+  extends:
+    source: {fields: {source_kind: {optional: true}}}   # + a field_enums entry for its values
+  ```
+  Full model, rules, and the cross-cutting optional fields the core ships (`tlp`,
+  `source_kind`, `severity`, …): [`core-types-and-extensions.md`](core-types-and-extensions.md).
 - **Identity (`id`)** — every page carries a stable, immutable `id` of the form
   `<scope>:<key>` (conformance §5). By default the engine **mints a slug** from the
   page's title/name. For a type backed by an external authority, declare it on the
@@ -142,10 +158,26 @@ The scaffold ships a sane generic contract; edit it to your domain. The blocks:
   `type_aliases` (legacy/alias type → a `types:` key, used by the
   schema-type/normalize drains), `operational_types` (types exempt from
   conformance drift), `depth_critical_types` (types page-quality holds to a
-  deeper bar), `classify_hints` (`type → [tags]`) and `classify_catchall` (types
-  the schema-classify drain disambiguates), and `protected_fields` (curated
+  deeper bar), `reference_types` / `reference_fields` (recognise REFERENCE-CATALOG
+  imports — a CVE feed, the MITRE ATT&CK catalog, a threat-group encyclopedia — by
+  page `type` or by a marker field's mere presence e.g. `mitre_id`; such pages are
+  link-target scaffolding, so KB-health excludes them from the orphan and
+  page-quality debt metrics rather than flagging a catalog entry with no inbound
+  links as a defect), `classify_hints` (`type → [tags]`) and `classify_catchall`
+  (types the schema-classify drain disambiguates), and `protected_fields` (curated
   fields the write path must never silently drop). The scaffold seeds them empty
   with worked examples in comments.
+- **Scope & guards** — what the contract applies to and protects:
+  `apply_under` (the dir roots this schema governs — a page outside them is
+  out-of-scope and skipped, not failed), `exclude` (non-knowledge / derived dirs
+  to skip, e.g. `wiki/<ns>/`), and `reserved_files` (paths the MCP write path
+  refuses — overrides the engine default set like `CLAUDE.md`/log).
+- **Field-value validation** — constrain values without a code change:
+  `common_optional` (optional fields allowed on *every* type, merged with the
+  engine base), `enums` (named, reusable value sets: `enum-name → [values]`), and
+  `field_enums` (`<field> → [values]` or a named `enums` ref — the write path flags
+  a value outside the set). `field_enums` also accepts `extensible: true` to warn
+  rather than flag on a new value.
 
 A sub-tree can drop its **own** `schema.yaml`; the validator walks up to the
 nearest one — that's how `wiki/<subdomain>/` becomes a second domain in one vault.
@@ -163,17 +195,58 @@ name: my-pack
 version: 0.1.0
 trust: public            # public | private — packs compose only within one trust level
 owns:
-  types: [source, concept, prediction, dashboard, <your domain types>]
-  namespaces: [sources, concepts, predictions, entities]
-requires: []             # other packs this one depends on, e.g. [okpack-base@>=0.1.0]
-port_offset: 0           # default host-port offset: reader 9200+N, mcp 8730+N
+  types: [<your domain types>]          # DOMAIN types only — the OKF core is engine-owned & inherited
+  namespaces: [<your domain namespaces>]  # DOMAIN namespaces only — entities/sources/concepts/… are core
+requires: []             # deps: packs (e.g. okpack-base@>=0.1.0) AND extensions
+                         # (e.g. ext:okengine.predictions@>=0.1.0) — see below
+port_offset: 0           # host-port offset for the READER (9200+N); the MCP is internal (per-pack bridge, no host port — okengine#138)
 ```
 
+**Depending on an extension (okengine#142).** A pack may genuinely rely on an extension
+(predictions, a scorer, …) to be coherent — that's a supported, first-class pattern, not a
+smell. Declare it in `requires:` with an `ext:` prefix and an optional version floor:
+
+```yaml
+requires: [okpack-base@>=0.1.0, ext:okengine.predictions@>=0.1.0]
+```
+
+`framework validate` then **FAILS before deploy** if a required extension isn't enabled
+(explicitly, or default-on via `core: true`) at the version floor — instead of the pack
+degrading silently at runtime. The same fires if your `schema.yaml` annotates an
+`ext:<id>` owner. Only require an extension the pack truly can't function without; an
+extension that merely *enriches* the pack should stay operator-optional.
+
 `port_offset` makes a host-port offset a **durable property of the pack**: set it
-(e.g. `100` → reader 9300, mcp 8830) when the pack is meant to run alongside
+(e.g. `100` → reader 9300) when the pack is meant to run alongside
 another stack, and `framework pull` applies it automatically — every fresh pull
 and the deployed compose get the offset without anyone remembering `--port-offset`
 (which still overrides it). `framework init --port-offset N` records N here for you.
+
+**`kind: bundle` — a pack that composes other packs (okengine#181).** A normal pack
+(`kind: pack`, the default) owns types and ships a `schema.yaml` + content. A **bundle**
+owns *nothing* and ships no schema — it declares a **recipe** of packs to compose, so a
+family of focused packs can be installed as one:
+
+```yaml
+name: okpack-sec
+kind: bundle              # "pack" (default) | "bundle"
+trust: public
+owns: {types: [], namespaces: []}   # a bundle MUST own nothing
+bundle:
+  host: okpack-threat-actors        # the base vault
+  compose: [okpack-vuln, okpack-threat-landscape]   # install-domain'd onto the host, in order
+requires: [okpack-threat-actors, okpack-vuln, okpack-threat-landscape]  # every recipe member
+port_offset: 200          # applied to the COMPOSED host (wins over the host pack's own default)
+```
+
+`framework pull <bundle>` resolves the recipe automatically: it fetches `host` as the base
+vault, then runs `framework install-domain <host> <pack> --apply` for each `compose` entry
+(each guest must ship `subdomain/host-schema-additions.yaml` — the taxonomy shape). The
+result is one composed vault, exactly as if you had assembled it by hand. `framework
+validate` skips the schema/persona/crons/feeds checks for a bundle and instead validates the
+**recipe** (owns-nothing, a `host`, a non-empty `compose` that excludes the host, every
+member in `requires`, and **no nesting** — a bundle can't compose another bundle). Recipe
+members are resolved via the catalog, or as siblings of the bundle in the same monorepo.
 
 **The composition model: one engine → one vault → one *or many* packs.** When you
 drop several packs into a packs directory, the engine composes them into a single
@@ -182,13 +255,15 @@ same **type** or **namespace**, and all must share one **trust** level. Declare
 `owner: <pack>` on each type you own (above) so the converge-on-write path can keep
 fields straight.
 
-> **The catch most authors hit:** two *full* domain packs usually both define the
-> spine (`source`/`concept`/`prediction` + `sources`/`concepts`/`predictions`),
-> which is an ownership conflict — so they **can't** share a vault; they run as
-> separate instances. To genuinely compose, factor the shared spine into a base
-> pack that each domain pack `requires:`, and have each domain pack own *only* its
-> own types/namespaces. If you just want a standalone pack, own the spine and ship
-> it as its own instance — that's the common case.
+> **The shared spine is the engine-owned core (okengine#90 P2).** You used to have to
+> factor the spine (`source`/`concept`/`prediction` + `sources`/`concepts`/`predictions`)
+> into a base pack that each domain pack `requires:`, because two full packs both
+> *owning* the spine collided. That's no longer needed: the core is now **engine-owned**
+> (`config/base-schema.yaml`) and inherited by every pack, so two packs compose into one
+> vault **without** a base pack — they share the same `source` type and `entities/`
+> namespace by inheriting them. Each pack just owns **disjoint DOMAIN types/namespaces**;
+> `framework compose-preview` verifies that and flags any pack that re-declares (owns) or
+> tightens a core type. See [`core-types-and-extensions.md`](core-types-and-extensions.md).
 
 Check a composition with `python $ENGINE_DIR/scripts/cron_pack_split.py compose
 --packs <dir>` (it discovers every pack with a `pack.yaml` and fails loudly on an
@@ -288,6 +363,15 @@ Leave both files at their scaffold defaults (`[]` and `{}`) for a minimal pack �
 the engine-tier maintenance fleet still runs.
 
 ---
+
+### Brief scheduling policy
+
+A reader-facing brief's **delivery time is part of the product**: fix daily briefs to a
+morning slot after your ingest lanes finish (the fleet convention: ingest 05:00–06:30,
+briefs 07:30 deployment-local). `@jitter:*` is for MAINTENANCE lanes (spreading load),
+never for briefs — jitter shipped two real deployments with 1pm "daily" briefs before
+this was written down. Weekly synthesis/digest lanes may deliberately choose end-of-week
+evening slots; that is a genre decision, not jitter.
 
 ## 6. Validate (before every deploy)
 
@@ -392,7 +476,95 @@ LLM agent cron succeeds, a delivery lands, the MCP answers
 
 ---
 
-## 8. Iterate
+## 8. Deployment modes — write mode-neutral packs
+
+A pack has two co-equal deployment modes, chosen **per deployment by the operator** —
+neither is a phase of the other:
+
+- **Standalone** (`framework init`): its own vault + stack + fleet. The right mode for a
+  distinct task or audience, a public deployment, and ALWAYS for a different trust
+  boundary (instance-per-trust-boundary is non-negotiable — `docs/okf/deployment-topology.md`).
+- **Co-installed** (walk-up domain, topology model A): the pack's domain lives alongside
+  another pack's in one vault — shared entity world, shared instance machinery. The right
+  mode when domains compound (same trust boundary, related signal, shared cadence).
+
+Your job as an author is not to pick a mode — it is to **not accidentally forbid one**.
+Three hygiene rules do that:
+
+1. **Annotate your entity types as host-reusable.** When co-installed, the HOST owns the
+   shared entity world (vendor, threat-actor, cve, …); your pages wikilink it rather than
+   redeclaring it. Keep your *knowledge/product* types (the ones only your pack mints)
+   clearly separable from entity-world types in `schema.yaml` — the co-install form drops
+   or `reuse`s the latter.
+2. **Namespace your shared-surface writes.** Raw streams (`raw/<pack-stream>/`, never bare
+   `raw/market/`-style names another pack will also pick), dashboards
+   (`dashboards/<pack-or-domain>-*.md` or a subdirectory), and generated operational pages.
+   Two packs writing the same path silently interleave.
+3. **Id-key your config files.** Rules, watchlists, and rosters merge across packs only if
+   entries carry stable ids (the completeness-rules pattern). A config that is one opaque
+   blob per file cannot co-install.
+
+### The two co-install shapes
+
+- **Domain-subtree pack** — the pack's content is its own knowledge domain: a subtree
+  with its own `schema.yaml` (owned types only), persona section, and id-keyed config
+  merges. **Naming standard: the subtree is the pack's domain slug** (okpack-doctrine →
+  `wiki/doctrine/`) — one word across the pack name, the domain dir, validators, and
+  reports; ad-hoc install names proved confusing in the first real install. Reference:
+  `okpack-example/subdomain/` (public teaching copy of BOTH forms) — first real
+  subtree install: a knowledge-state pack.
+- **Taxonomy-augmenting pack** — the pack's value is entity-world coverage + lanes (feeds,
+  curation, enrichment) over shared namespaces: the install *adds missing types to the
+  host schema* (id-keyed additions file), merges feeds/lanes, and appends persona. Its
+  pages live in the host's namespaces, not a subtree. Reference: `okpack-sec/subdomain/`.
+
+Ship the co-install form under `subdomain/` (schema variant or host-schema additions +
+`INSTALL-*.md` with verification probes + `PERSONA.md`, the marked `## Installed domain:`
+section the installer appends to the deployment `CLAUDE.md`). **Single-source rule:** the
+co-install form must be derivable from (and checked against) the main schema — subdomain
+types ⊆ standalone types; drift between the two forms is a bug.
+
+The install itself is automated (okengine#173):
+
+```
+framework install-domain <deployment> <pack> [--under wiki/<slug>] [--shape ...] [--apply]
+```
+
+It detects the shape from `subdomain/`, runs `coinstall_preflight` on what actually LANDS
+(refusing on FAIL), and performs only key-based merges — type name, namespace, rule id,
+job name, lane-script name, feed xmlUrl, persona marker — so a re-run (or a resumed
+partial install) applies only what's missing. Rules learned from the manual installs and
+the first real automated one, encoded:
+
+- **host wins on types** (identical shape = skip; different required = preflight FAIL);
+- **engine-template prompts NEVER auto-merge** — shared lanes (daily-brief, trends,
+  prediction-*) are per-vault decisions the host already made, and a promptless stub is
+  a deliberate OFF (merging a prompt would silently activate the lane). A pack lane
+  worth keeping distinct ships as a PREFIXED domain job;
+- **domain cron jobs must be pack-prefixed**, and their `crons/scripts/*.py` are copied
+  into the host's staging source (a merged job whose script never stages fails at
+  deploy);
+- **owned namespaces land with their partitioning + permission + tier entries** (else
+  the undeclared-namespace guard refuses every page, and e.g. a human-authored
+  register's write-deny would silently not exist);
+- **subtree completeness rules merge ONLY for types not also in the host root** (rules
+  are instance-global);
+- **all edits to commented deployment files are surgical text inserts with parse-back
+  asserts** — never a parse+dump round-trip, which strips the operator's comments.
+
+Dry-run prints the plan; `--apply` writes; the write-path probes in the INSTALL docs
+remain the post-deploy test.
+
+**Before a pack ships**, the deploy matrix is the gauntlet
+(`scripts/deploy_matrix.py`): offline tier — validate × conformance ×
+compose-preview over every combo × every co-install form applied into a fresh
+scratch host (assertions, idempotent re-apply, teardown) — runs automatically
+inside the library's publish gate; the `--live <pack>` tier (real docker stack:
+pull → deploy.sh → post_deploy_verify → teardown on success) is the manual step
+for any pack you touched. Its first runs caught shipped gaps that per-pack
+validation missed.
+
+## 9. Iterate
 
 The vault compounds: feeds → `raw/` → ingest → compiled
 sources/entities/concepts/predictions → digests, with the engine's maintenance

@@ -86,13 +86,20 @@ def tokens_in_window(db_path: str | os.PathLike, window_s: int, now: float) -> i
 
 
 def cost_bearing_ids(jobs: list, self_name: str = SELF_NAME) -> list[tuple[str, str]]:
-    """(id, name) for every cost-bearing job — i.e. an AGENT job (not no_agent),
-    excluding the guard itself. These are the jobs paused when over budget; the
-    free no_agent maintenance scripts keep running."""
+    """(id, name) for every cost-bearing job to PAUSE when over budget — i.e. an ENABLED agent
+    job (not no_agent), excluding the guard itself. The free no_agent maintenance scripts keep
+    running.
+
+    Skips a job that is ALREADY disabled: cron-plus pause is `enabled:False`, so capturing an
+    operator-disabled job here would let auto-resume flip it back to enabled — silently reverting a
+    deliberate maintenance pause (okengine#178). The guard must only pause (and later resume) what
+    was actually running when it tripped."""
     out = []
     for j in jobs or []:
         if j.get("no_agent"):
             continue
+        if not j.get("enabled", True):
+            continue                       # already disabled (operator maintenance) — don't touch
         if j.get("name") == self_name:
             continue
         jid = j.get("id")
@@ -172,11 +179,23 @@ def resume(reason: str = "manual") -> int:
         print("budget-guard: not paused — nothing to resume.")
         return 0
     ids = state.get("paused_ids") or []
-    done = sum(1 for jid in ids if _cronplus("resume", jid))
-    _save_state({"paused": False, "resumed_at": time.time(),
-                 "note": f"{reason}-resume", "resumed_count": done})
-    print(f"budget-guard: ✅ resumed {done} cron(s) ({reason}).", file=sys.stderr)
-    return done
+    resumed = [jid for jid in ids if _cronplus("resume", jid)]
+    still = [jid for jid in ids if jid not in resumed]
+    if not still:
+        # every paused cron came back — safe to clear the tripped state
+        _save_state({"paused": False, "resumed_at": time.time(),
+                     "note": f"{reason}-resume", "resumed_count": len(resumed)})
+        print(f"budget-guard: ✅ resumed {len(resumed)} cron(s) ({reason}).", file=sys.stderr)
+    else:
+        # some resume calls FAILED (cron-plus down / jobs.json lock / uid-desynced write). Do NOT
+        # clear paused — that would strand those crons disabled while reporting "not paused". Keep
+        # `paused` with only the STILL-disabled ids so the next tick re-attempts them (okengine
+        # invariant-audit #14).
+        _save_state({"paused": True, "paused_ids": still, "resumed_at": time.time(),
+                     "note": f"{reason}-resume PARTIAL", "resumed_count": len(resumed)})
+        print(f"budget-guard: ⚠ resume PARTIAL ({reason}) — {len(resumed)}/{len(ids)} resumed, "
+              f"{len(still)} still disabled; retrying next tick.", file=sys.stderr)
+    return len(resumed)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -189,6 +208,13 @@ def main(argv: list[str] | None = None) -> int:
     if not tok_budget and not usd_budget:
         print("budget-guard: no budget set (OKENGINE_BUDGET_TOKENS/_USD) — disabled, no-op")
         return 0
+    # A USD cap needs a token->USD price. Without OKENGINE_BUDGET_PRICE_PER_MTOK the `usd_budget
+    # and price` term below is always False, so the USD cap silently NEVER trips (fail-open — the
+    # operator thinks they're capped and aren't). Surface it loudly (okengine#178).
+    if usd_budget and not price:
+        print("budget-guard: WARN OKENGINE_BUDGET_USD is set but OKENGINE_BUDGET_PRICE_PER_MTOK "
+              "is unset — the USD cap is INERT (no token->USD conversion) and will NEVER trip. "
+              "Set the price, or cap with OKENGINE_BUDGET_TOKENS instead.", file=sys.stderr)
 
     now = time.time()
     win_s = window_seconds(win_name)
@@ -209,14 +235,26 @@ def main(argv: list[str] | None = None) -> int:
 
     if action == "pause":
         ids = cost_bearing_ids(_load_jobs())
-        done = [name for jid, name in ids if _cronplus("pause", jid)]
-        state = {"paused": True, "paused_ids": [jid for jid, _ in ids],
-                 "paused_names": done, "tripped_at": now, "window": win_name,
+        # pause each cost-bearing cron; track which ACTUALLY paused. `paused` is True only when the
+        # cap is genuinely enforced (every cost-bearing cron paused, or there were none). If some/all
+        # pauses failed (cron-plus down, jobs.json unreadable/corrupt -> ids==[], lock race), leaving
+        # paused=True would make decide() no-op forever while crons keep spending past the cap — a
+        # fail-OPEN circuit breaker. Keeping paused=False lets the next tick RE-attempt (idempotent)
+        # until the cap actually holds (okengine invariant-audit #3).
+        paused = [(jid, name) for jid, name in ids if _cronplus("pause", jid)]
+        fully = len(paused) == len(ids)
+        state = {"paused": fully, "paused_ids": [jid for jid, _ in paused],
+                 "paused_names": [name for _, name in paused], "tripped_at": now, "window": win_name,
                  "usage_tokens": tokens, "reason": f"over budget ({usage_str} >= {budget_str})"}
         _save_state(state)
-        print(f"budget-guard: ⛔ BUDGET TRIPPED — paused {len(done)} cost-bearing cron(s): "
-              f"{', '.join(done)}. Free maintenance crons keep running. "
-              f"Resume policy: {resume_policy}.", file=sys.stderr)
+        if fully:
+            print(f"budget-guard: ⛔ BUDGET TRIPPED — paused {len(paused)} cost-bearing cron(s): "
+                  f"{', '.join(n for _, n in paused)}. Free maintenance crons keep running. "
+                  f"Resume policy: {resume_policy}.", file=sys.stderr)
+        else:
+            print(f"budget-guard: ⚠ OVER BUDGET but pause INCOMPLETE — {len(paused)}/{len(ids)} "
+                  f"cost-bearing cron(s) paused (cron-plus/jobs.json failure?). Cap NOT yet enforced; "
+                  f"retrying next tick.", file=sys.stderr)
     elif action == "resume":
         resume("auto")
     return 0

@@ -1,0 +1,31 @@
+# okengine.events — domain event ledger + scoring (deterministic, no_agent, zero LLM tokens).
+#
+# Models discrete, dated DOMAIN events as an append-only ledger and scores them. Optional — not
+# every vault models events, so it's an extension, not engine machinery (#148: engine ships
+# mechanical machinery; optional lanes are extensions). The ledger/scoring MECHANISM is
+# sector-agnostic ("a dated thing happened, here's its weight"); the event TYPES and any scoring
+# weights are PACK config (schema.yaml `event_types` / `event_date_field` / `event_score_weights`),
+# so it runs unchanged on any pack. A pack that declares no event_types gets a clean no-op.
+#
+# Derived view, NOT a new page type (#148 convention): it reads the pack's event-typed pages and
+# writes an L1 `dashboard` ledger — no schema fragment. Built on the #63 cron drop-in model.
+id: okengine.events
+kind: operation
+version: 0.1.0
+name: Events
+description: >-
+  Compiles the pack's dated event-typed pages into a scored, append-only event ledger dashboard.
+  Deterministic (no LLM); event types + weights are pack config, so it runs on any domain.
+trust: in-gateway
+requires:
+  engine: ">=0.6.0"               # #63 cron drop-in collector
+capabilities:
+  read: [wiki/**]
+  write: [dashboards/**]          # derived L1 dashboard (no owned namespace/type)
+config:
+  # PACK INPUTS (read from schema.yaml, not extension code — the domain coupling lives in the pack):
+  #   event_types:         [<type>, ...]   page types that are events (e.g. deal, incident)
+  #   event_date_field:    <field>          frontmatter field with the event date (default: date)
+  #   event_score_weights: {<type>: <n>}    per-type weight (default 1)
+  # A pack declaring no event_types -> the lane no-ops (generic).
+  max_events: {type: integer, default: 500}

@@ -1,0 +1,35 @@
+id: okengine.dedupe
+kind: operation
+version: 0.1.0
+name: Dedupe
+description: >-
+  Surfaces likely DUPLICATE entities — distinct pages whose normalized name collides, or whose
+  name matches another page's `aliases:` — and proposes merges: tombstone the loser with
+  `superseded_by` and absorb its aliases/sources into the canonical. Deterministic detection
+  (a wake-gate selector) + an agent merge lane. Domain-agnostic KB hygiene; the engine does
+  STRUCTURAL canonicalization, this catches "same entity, different name". Opt-in (proposes
+  mutations + spends model). A first-party reference for an agent op that mutates via the guard.
+
+trust: in-gateway
+requires:
+  engine: ">=0.5.0"
+
+capabilities:
+  read: [wiki/**]
+  write: [entities/**]
+  network: false
+  secrets: []
+  delivery: false
+
+operation:
+  schedule: {kind: cron, expr: "40 5 * * *"}   # daily 05:40
+  entrypoint: select_dup_candidates.py          # wake-gate: name/alias-collision groups
+  prompt_file: prompts/dedupe.md
+  toolsets: [hermes-cron, okengine-write, okengine]
+  timeout: 1200
+
+config:
+  max_groups:
+    type: integer
+    default: 25
+    description: Cap how many candidate groups are surfaced (and merged) per run.

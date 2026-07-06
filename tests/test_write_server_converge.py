@@ -22,6 +22,10 @@ SCHEMA = (
     "    owner: atk\n"
     "    field_owners: {detection: hunt}\n"
     "  vendor: {required: [type]}\n"
+    # base-schema injects the core namespaces (entities/sources/…); this test also writes to a
+    # type-named namespace, so declare it or the #115 namespace-discipline gate rejects the write.
+    "partitioning:\n"
+    "  namespaces: {attack-pattern: {strategy: flat}}\n"
 )
 
 

@@ -9,7 +9,9 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("yaml")
-CRON = Path(__file__).resolve().parents[2] / "scripts" / "cron"
+# The prediction selectors moved into the okengine.predictions extension (extensions/).
+CRON = Path(__file__).resolve().parents[2] / "extensions" / "okengine.predictions"
+pytestmark = pytest.mark.skipif(not CRON.is_dir(), reason="okengine.predictions extension absent")
 
 
 def _load(name):

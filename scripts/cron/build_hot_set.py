@@ -135,6 +135,10 @@ def _select_recent(sec: dict, cutoff: date) -> list[tuple[date, Path, dict]]:
     `<publisher>/<yr>/<mo>/<day>/` nesting feed packs use (#24)."""
     ns = sec["namespace"]
     df = sec.get("date_field", "published")
+    # Optional status filter (e.g. recently *resolved* predictions = recent-by-graded-date
+    # AND status in confirmed/refuted/partial). Absent -> all recent pages (unchanged).
+    sf = sec.get("status_field")
+    svals = {str(v).lower() for v in (sec.get("status_values") or [])}
     base = WIKI / ns
     if not base.is_dir():
         return []
@@ -148,6 +152,8 @@ def _select_recent(sec: dict, cutoff: date) -> list[tuple[date, Path, dict]]:
         fm = _fm(p)
         dv = _resolve_date(fm, df)
         if dv and dv >= cutoff:
+            if svals and str(fm.get(sf) or "").lower() not in svals:
+                continue
             rows.append((dv, p, fm))
     rows.sort(key=lambda x: x[0], reverse=True)
     return rows
@@ -166,6 +172,17 @@ def _select_open(sec: dict) -> list[tuple[Path, dict]]:
         fm = _fm(p)
         if str(fm.get(sf) or "").lower() in vals:
             rows.append((p, fm))
+    # Optional "due soon": keep only open pages whose `secondary_field` date is on/before
+    # today+due_within_days — INCLUDES overdue (open past its date = needs grading) — sorted
+    # soonest-first. Absent -> every open page in walk order (backward-compatible).
+    due_within = sec.get("due_within_days")
+    sec_field = sec.get("secondary_field")
+    if due_within is not None and sec_field:
+        horizon = datetime.now(timezone.utc).date() + timedelta(days=int(due_within))
+        dated = [(_d(fm.get(sec_field)), p, fm) for p, fm in rows]
+        rows = [(p, fm) for dv, p, fm in
+                sorted((r for r in dated if r[0] is not None and r[0] <= horizon),
+                       key=lambda x: x[0])]
     return rows
 
 
@@ -209,12 +226,14 @@ def main() -> int:
                 L.append(f"| [{p.stem}]({rel(p)}.md) | {fm.get(sec.get('status_field','status'),'')} |{extra}")
         else:  # recent
             show_type = sec.get("show_type")
-            hdr_t = " Type |" if show_type else ""
+            show_status = sec.get("show_status")
+            hdr_t = (" Type |" if show_type else "") + (" Status |" if show_status else "")
             L += ["", f"## {title} (≤{days}d)", "", f"| Date | {sec['namespace'].title()} |{hdr_t}",
-                  "|---|---|" + ("---|" if show_type else "")]
+                  "|---|---|" + ("---|" if show_type else "") + ("---|" if show_status else "")]
             for dv, p, fm in rows[:cap]:
                 t = str(fm.get("title") or p.stem).replace("|", "\\|")[:80]
-                extra = f" {fm.get('type','')} |" if show_type else ""
+                extra = (f" {fm.get('type','')} |" if show_type else "") + \
+                        (f" {fm.get(sec.get('status_field', 'status'), '')} |" if show_status else "")
                 L.append(f"| {dv} | [{t}]({rel(p)}.md) |{extra}")
     L.append("")
     (WIKI / "HOT.md").write_text("\n".join(L), encoding="utf-8")

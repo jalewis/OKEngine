@@ -8,6 +8,7 @@
 </head>
 <body>
 <header id="topbar">
+  <button id="nav-toggle" class="nav-toggle" type="button" title="Menu" aria-label="Toggle navigation">☰</button>
   <div class="brand" id="brand-home" title="Home — the hot set" style="cursor:pointer">⬢ OKEngine · <span>vault reader</span></div>
   <nav class="tabs" id="tabs">
     <button class="tab active" data-view="browse">Browse</button>
@@ -18,14 +19,21 @@
     <div id="gresults" class="gresults" hidden></div>
   </div>
   <div class="clock" id="clock"></div>
+  <div class="fontsize" id="fontsize" title="Text size">
+    <button id="fs-dec" class="fs-btn" type="button" title="Smaller text" aria-label="Decrease text size">A−</button>
+    <button id="fs-inc" class="fs-btn" type="button" title="Larger text" aria-label="Increase text size">A+</button>
+  </div>
   <button id="about-btn" class="about-btn" title="About this reader">About</button>
 </header>
+
+<div id="nav-backdrop"></div>
 
 <div id="about-overlay" class="about-overlay" hidden>
   <div class="about-card">
     <button id="about-close" class="about-close" title="close (Esc)">✕</button>
     <h2>⬢ OKEngine Reader</h2>
     <p class="about-meta" id="about-meta"></p>
+    <div id="about-deploy"></div>
     <p>A read-only web browser for an <strong>OKEngine</strong> vault — markdown + YAML
        knowledge, cross-linked, with backlinks and embeds. It renders content only;
        it never writes to the vault.</p>

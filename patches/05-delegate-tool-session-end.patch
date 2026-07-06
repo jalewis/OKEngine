@@ -1,8 +1,8 @@
 diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
-index 40e19a0e4..e0de39071 100644
+index 893502ec0..974e72a54 100644
 --- a/tools/delegate_tool.py
 +++ b/tools/delegate_tool.py
-@@ -1910,6 +1910,19 @@ def _run_single_child(
+@@ -2312,6 +2312,19 @@ def _run_single_child(
          except Exception:
              logger.debug("Failed to close child agent after delegation")
  

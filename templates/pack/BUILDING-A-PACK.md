@@ -63,15 +63,35 @@ declares the **identity / load-bearing fields** that must be present (keep the
 `required` list minimal so the write-gate never rejects a legitimately-shaped page —
 everything else is optional via `common_optional`).
 
-Most KB packs share a spine of **cross-cutting types** — keep these:
+**The OKF core is engine-owned — you inherit it, you do not declare it** (okengine#90
+P2). The universal spine lives in the engine's `config/base-schema.yaml` and is merged
+*under* your `schema.yaml`, so every pack shares the same `source` / `concept` /
+`prediction` / `finding` / `dashboard` / `briefing` / `trend` types and the core
+namespaces (`entities`, `sources`, …). That shared core is what lets two packs compose
+into one graph; **re-declaring a core type breaks composition** (and `framework
+compose-preview` flags it). So your `types:` block declares **only your domain types** —
+do *not* copy the spine in.
 
-| Type | Role | Typical required |
+You inherit (from the core — for reference, don't re-declare):
+
+| Type | Role | Core required |
 |------|------|------------------|
-| `source` | a scored ingest item (provenance + dedupe) | `type, publisher, published, <quality fields>` |
+| `source` | a scored ingest item (provenance + dedupe) | `type, published` |
 | `concept` | a cross-cutting pattern / segment / cluster | `type` |
 | `prediction` | a falsifiable, dated forward claim | `type, status, confidence, subject, resolves_by` |
 | `finding` | analyst synthesis (often human-only — see §5) | `type, status` |
-| `dashboard` | a generated view / index / brief | `type, title` |
+| `dashboard` | a generated view / index | `type, title` |
+| `briefing` | a daily/weekly synthesized brief | `type, title, published` |
+| `trend` | a dated, directional shift | `type, title, period, direction` |
+
+Need an extra field on a core type (e.g. a `source_kind` on `source`)? Use `extends:`
+— **additive and OPTIONAL only**; a pack may never add a *required* field to a core type
+or otherwise tighten it (a stricter shared `source`/`finding` would reject another pack's
+pages). Validate the value with a `field_enums` entry, and enforce presence in your
+ingest workflow, not the gate. The cross-cutting optional fields the core already ships
+(`tlp`, `source_kind`, `severity`, `publisher`, `reliability`, `credibility`,
+`sensitivity`) are yours for free, and their base enums are extensible. Full model,
+rules, and examples: **[`docs/core-types-and-extensions.md`](../../docs/core-types-and-extensions.md)**.
 
 Then add your **domain entity types**. okpack-sec uses `host, ioc, threat-actor,
 malware, campaign, technique, vulnerability, detection, tool, software`. A finance pack
@@ -160,6 +180,13 @@ The pack dir is the vault, mounted into three services (gateway, reader, mcp). H
 ports are offset (`+{{PORT_OFFSET}}`) so multiple packs coexist on one host. Each
 service has explicit resource limits, `restart_policy` backoff, and (reader/mcp) a
 healthcheck. Full deploy steps live in the rendered pack's `README.md`.
+
+**Trust enforcement (okengine#90 P4a).** A `trust: private` pack's reader **fail-closes**:
+if it's exposed beyond loopback (`OKENGINE_BIND` != a loopback address) without an
+`OKENGINE_READER_PASSWORD` set, it refuses to serve rather than leak private content.
+`framework validate` is trust-aware to match — a private pack exposed without a password
+is a **FAIL**; a public one is a **WARN**. So set `trust:` honestly in `pack.yaml`, and if
+you expose a private vault on the LAN, set a real `OKENGINE_READER_PASSWORD`.
 
 ## 10. Validate
 

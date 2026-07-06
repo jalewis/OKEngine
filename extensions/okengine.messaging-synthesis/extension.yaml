@@ -1,0 +1,67 @@
+# okengine.messaging-synthesis — generic vendor positioning/messaging synthesis (ported from
+# the origin system, okengine#152).
+#
+# Two-tier model, same shape as okengine.competitive-analytics: the SYNTHESIS math (read
+# competitive intel + a product anchor, produce positioning artifacts) is generic; the EDGE —
+# which entity/concept IS "our product", what it can actually do — is pack/operator config
+# (PRODUCT_ANCHOR_PATH). The extension ships ZERO product identity. Absent config -> every
+# operation's wake-gate reports "no product anchor configured" and stays silent; nothing in
+# this extension assumes or fabricates a vendor identity for the vault it runs in.
+#
+# The origin system built this to help a specific vendor message against tracked
+# competitors — the 4-lane family (content-pegs -> battle-cards -> value-prop-gap-refresh ->
+# messaging-synthesis meta-layer) only makes sense for a vault that HAS a product to sell.
+# Most okengine vaults are pure market-observers with no such identity; hence the hard config
+# gate rather than a soft default.
+id: okengine.messaging-synthesis
+kind: operation
+version: 0.1.0
+name: Messaging synthesis
+description: >-
+  Generic vendor positioning/messaging synthesis over a vault's competitive intel graph —
+  content pegs, honest battle-cards, value-prop gap tracking, and a meta-layer synthesis brief.
+  The math is generic; the product identity (what "we" are, what "we" can claim) is pack config
+  (PRODUCT_ANCHOR_PATH), never shipped. Inactive (all ops silent) until configured.
+trust: in-gateway
+tier: analyze
+requires:
+  engine: ">=0.5.0"
+capabilities:
+  read: ["wiki/**"]
+  write: ["briefings/**"]           # writes the pack-owned `briefing`-aliased types (battle-card,
+                                     # value-prop-snapshot, marketing-pulse, messaging-brief, ...)
+  network: false
+config:
+  product_anchor_path:
+    type: string
+    default: "config/product-anchor.yaml"
+    description: >-
+      Pack/operator config naming OUR product: its entity/concept anchor pages (the source of
+      truth for what capabilities may be claimed), display name, and optionally which
+      okengine.competitive-analytics watchlist segments to message against. The extension ships
+      none; an absent file means every operation's wake-gate reports no anchor and stays silent.
+      Override via the PRODUCT_ANCHOR_PATH env. See README for the format.
+operations:
+  content-pegs:
+    schedule: {kind: cron, expr: "0 14 * * 5"}        # weekly (Fri) — cheap, drift-gated
+    entrypoint: select_content_pegs.py
+    prompt_file: prompts/content-pegs.md
+    toolsets: [hermes-cron, okengine-write, okengine]
+  positioning-battle-cards:
+    schedule: {kind: cron, expr: "@morning:0"}         # daily @ the deployment brief hour (#177); drift-gated (only refreshes a card
+                                                        # when its competitor has new activity)
+    entrypoint: select_positioning_battle_cards.py
+    prompt_file: prompts/battle-cards.md
+    toolsets: [hermes-cron, okengine-write, okengine]
+  value-prop-gap-refresh:
+    schedule: {kind: cron, expr: "0 14 * * 5"}        # weekly (Fri) — same slot as content-pegs;
+                                                        # both are cheap+drift-gated, fine to co-fire
+    entrypoint: select_value_prop_refresh.py
+    prompt_file: prompts/value-prop-refresh.md
+    toolsets: [hermes-cron, okengine-write, okengine]
+  messaging-synthesis:
+    schedule: {kind: cron, expr: "@morning:15"}        # daily @ brief hour +15 (after positioning); meta-layer; drift-gated on the
+                                                        # 3 upstream artifacts, rarely actually wakes
+    entrypoint: select_messaging_synthesis.py
+    prompt_file: prompts/messaging-synthesis.md
+    toolsets: [hermes-cron, okengine-write, okengine]

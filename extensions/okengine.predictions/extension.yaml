@@ -1,0 +1,100 @@
+# okengine.predictions — falsifiable, dated forecasts as a first-party extension.
+#
+# Migrated out of the engine cron fleet (was the engine-template prediction-* crons)
+# into an opt-in extension — the design's canonical example (extension-system.md §1).
+# Three wake-gated agent lanes: file candidates, grade overdue, re-grade on new evidence.
+#
+# Reuses the pack's `prediction` type (write: predictions/**) — it does NOT bring a schema
+# fragment, so a pack that wants predictions must declare the `prediction` type in its
+# schema.yaml (every current pack already does). The bundled prompts are generic and defer
+# domain specifics to $WIKI_PATH/CLAUDE.md; override per-deployment via
+# <pack>/.okengine/extension-prompts.json keyed by the job name (e.g. okengine.predictions:grade).
+id: okengine.predictions
+kind: operation
+version: 0.1.0
+name: Predictions
+description: >-
+  Falsifiable, dated forecasts: file prediction candidates from recently-active entities,
+  grade predictions whose resolution date has passed, and re-grade open ones as new
+  evidence lands.
+trust: in-gateway
+requires:
+  engine: ">=0.4.0"
+capabilities:
+  read: ["wiki/**"]
+  write: ["predictions/**", "dashboards/**"]   # predictions + derived dashboards (base-rates, outcome-eval)
+operations:
+  candidate-watch:
+    schedule: {kind: cron, expr: "17 6 * * *"}
+    entrypoint: select_prediction_candidates.py      # wake-gate selector
+    prompt_file: prompts/candidate-watch.md
+    toolsets: [hermes-cron, okengine-write, okengine]
+  grade:
+    schedule: {kind: cron, expr: "23 6 * * *"}
+    entrypoint: select_predictions_for_grading.py
+    prompt_file: prompts/grade.md
+    toolsets: [hermes-cron, okengine-write, okengine]
+  regrade:
+    schedule: {kind: cron, expr: "29 */6 * * *"}
+    entrypoint: select_regrade_batch.py
+    prompt_file: prompts/regrade.md
+    toolsets: [hermes-cron, okengine-write, okengine]
+  # Forecasting-discipline MEASUREMENT lanes (okengine#159) — deterministic, no_agent (no
+  # prompt_file): pure computation over resolved/open predictions, writing a dashboard. Zero model
+  # cost. Empty until predictions resolve; activate as the agent lanes above close them out.
+  calibration-refresh:
+    schedule: {kind: cron, expr: "40 6 * * *"}
+    entrypoint: calibration_refresh.py          # Brier + calibration table -> dashboards/calibration.md
+  prediction-date-audit:
+    schedule: {kind: cron, expr: "45 6 * * *"}
+    entrypoint: prediction_date_audit.py        # resolves_by hygiene -> dashboards/prediction-date-audit.md
+  prediction-schema-audit:
+    schedule: {kind: cron, expr: "50 6 * * *"}
+    entrypoint: prediction_schema_audit.py      # field hygiene (made_on/horizon/confidence/refutation
+                                                 # section) -> dashboards/prediction-schema-audit.md.
+                                                 # Complements prediction-date-audit, which only checks
+                                                 # resolves_by sanity — this is the general case (#159
+                                                 # follow-up; motivated by a live audit catching 87
+                                                 # miscalculated horizons the date-audit alone missed).
+  # Forecasting-discipline REMEDIATION lanes (okengine#159 follow-up) — agent ops that DRAIN what
+  # prediction-schema-audit measures (the audit is measure-only; these fix). Two complementary
+  # drains, deliberately kept separate by their safety contract:
+  #   structural-backfill — adds the missing `## What would refute this` SECTION (append-only; never
+  #     touches frontmatter). schema-drain — normalizes frontmatter VALUE drift (missing required
+  #     fields, non-canonical status/horizon, unparseable confidence) via merge writes; flags
+  #     batch-container files for human review. schema-drain does NOT do the structural-frontmatter
+  #     half (no/broken frontmatter) — the engine's generic repair-* lanes already own that.
+  prediction-schema-drain:
+    schedule: {kind: cron, expr: "30 21 * * 0"}   # ported cadence: weekly (Sun)
+    entrypoint: select_prediction_schema_drain.py
+    prompt_file: prompts/schema-drain.md
+    toolsets: [hermes-cron, okengine-write, okengine]
+  prediction-structural-backfill:
+    schedule: {kind: cron, expr: "45 */6 * * *"}   # ported cadence: every 6h, drains 5/run
+    entrypoint: select_prediction_structural_backfill.py
+    prompt_file: prompts/structural-backfill.md
+    toolsets: [hermes-cron, okengine-write, okengine]
+  # Forecasting-discipline JUDGMENT lanes (okengine#159 P2) — agent ops (wake-gate + prompt). The
+  # redundant candidates (backtest~=calibration, update-recommender~=regrade, portfolio-watch~=
+  # calibration+schema-audit combined) are deliberately NOT built.
+  forecast-review:
+    schedule: {kind: cron, expr: "0 16 * * 6"}   # weekly (Sat) — the meta-layer, ported from
+                                                  # the origin system's weekly-forecast-review
+    entrypoint: select_forecast_review.py
+    prompt_file: prompts/forecast-review.md
+    toolsets: [hermes-cron, okengine-write, okengine]
+  base-rates:
+    schedule: {kind: cron, expr: "50 6 * * 1"}
+    entrypoint: select_base_rates.py
+    prompt_file: prompts/base-rates.md
+    toolsets: [hermes-cron, okengine-write, okengine]
+  prediction-falsification-search:
+    schedule: {kind: cron, expr: "35 */6 * * *"}
+    entrypoint: select_falsification.py
+    prompt_file: prompts/falsification-search.md
+    toolsets: [hermes-cron, okengine-write, okengine]
+  output-outcome-eval:
+    schedule: {kind: cron, expr: "55 6 * * 1"}
+    entrypoint: select_output_outcome.py
+    prompt_file: prompts/output-outcome-eval.md
+    toolsets: [hermes-cron, okengine-write, okengine]

@@ -1,0 +1,49 @@
+# okengine.actor-risk-ranking — target-relative actor risk ranking (okengine#170).
+#
+# Deterministic v1 (docs/design/actor-risk-ranking.md): scores the #168 backlink
+# artifact + source dates — NOT frontmatter, which the census showed ~empty on a real
+# vault — into explainable per-target dashboards. Drivers are clickable edge counts
+# (direct / opportunity / capability / intent / recency); confidence counts DISTINCT
+# ORIGIN DOMAINS (a single syndicated report can never reach a high band); unknowns
+# are listed and cap the band. No model, no network, no agent. Person targets are
+# REFUSED at config parse — the deterministic ranker never scores people.
+#
+# Generic by construction: actor/evidence type names come from config (defaults match
+# the common security-taxonomy names); all targets/sectors/technologies/exclusions are
+# operator config; the extension ships zero seeds.
+id: okengine.actor-risk-ranking
+kind: operation
+version: 0.1.0
+name: Actor risk ranking
+description: >-
+  Ranks evidence-backed targeting relevance of actor pages against operator-configured
+  targets, from the precomputed backlink graph: explainable score decomposition with
+  evidence links, distinct-origin-domain confidence, explicit unknowns that cap the
+  band, and horizon-bound scores. Dashboard-only; refuses person targets.
+trust: in-gateway
+core: false                  # opt-in: zero model cost, but ranking output is an operator decision
+requires:
+  engine: ">=0.8.0"          # needs the backlinks-refresh artifact (okengine#168)
+capabilities:
+  read: [wiki/**]
+  write: [dashboards/**]     # dashboards/actor-risk/* only — v1 writes nothing else
+  network: false
+operations:
+  actor-risk-rank:
+    # Weekly, after the nightly 01:20 backlinks-refresh has stamped a fresh artifact.
+    schedule: {kind: cron, expr: "10 2 * * 1"}
+    entrypoint: actor_risk_rank.py       # no_agent: deterministic arithmetic
+config:
+  targets_file:
+    type: string
+    default: "config/actor-risk-targets.yaml"
+    description: >-
+      Vault-relative path to the operator's target definitions. Absent -> the lane
+      no-ops LOUDLY (never guess a boundary). Override via ACTOR_RISK_TARGETS.
+  artifact_max_age_hours:
+    type: string
+    default: "48"
+    description: >-
+      Reject a wiki/.backlinks.json older than this (two missed daily refreshes) —
+      the run SKIPS loudly rather than ranking on a stale graph. Override via
+      ACTOR_RISK_ARTIFACT_MAX_AGE_HOURS.

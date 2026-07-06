@@ -71,6 +71,9 @@ if [ -f "$MANIFEST" ]; then
     echo "stamped: $RT/engine-runtime.yaml  (engine ${_rel:-?} · Hermes ${_htag:-?})"
 fi
 
+# NB: no iwe binary is staged for the gateway anymore — backlinks-refresh builds the graph with an
+# in-process link-scanner (okengine#179). iwe is now used only by the MCP, which bakes its own.
+
 # --- MCP auth: keep the gateway's read-MCP client header in sync with the token ---
 # The read server requires `Bearer <OKENGINE_MCP_TOKEN>`, falling back to the
 # built-in "okengine-local" when that env var is unset. The seeded config.yaml
@@ -128,6 +131,88 @@ PY
             echo "mcp auth: read-MCP header synced to OKENGINE_MCP_TOKEN from .env"
         fi
     fi
+fi
+
+# --- pack trust -> OKENGINE_TRUST in .env (okengine#90 P4a) ---
+# Surface the pack's `trust` (pack.yaml) so the reader can fail-closed on a PRIVATE vault exposed
+# without a password. A PUBLIC pack MUST set this so it isn't wrongly refused when exposed; the
+# compose default is the fail-safe `private`. An operator-set OKENGINE_TRUST in .env is left as-is.
+if [ -f "$PACK/pack.yaml" ]; then
+    ENVF="$PACK/.env"
+    if [ ! -f "$ENVF" ] || ! grep -qE '^[[:space:]]*OKENGINE_TRUST[[:space:]]*=' "$ENVF"; then
+        PTRUST="$(PACK="$PACK" python3 <<'PY'
+import os, pathlib, yaml
+try:
+    m = yaml.safe_load(pathlib.Path(os.environ["PACK"], "pack.yaml").read_text()) or {}
+except Exception:
+    m = {}
+print(str(m.get("trust") or "private").strip().lower())
+PY
+)"
+        printf 'OKENGINE_TRUST=%s\n' "$PTRUST" >> "$ENVF"
+        echo "  trust: OKENGINE_TRUST=$PTRUST in .env (reader refuses a private vault exposed without a password — okengine#90 P4a)"
+    fi
+fi
+
+# --- read-MCP client URL: service name on the per-pack bridge (okengine#138) ---
+# The gateway shares the compose default bridge with okengine-mcp, so it dials the MCP by SERVICE
+# NAME on the container port (8730) — no host port, no port_offset, no cross-pack collision.
+# Normalize any pre-#138 seeded URL (http://localhost:<port>/mcp, offset or not) to that form.
+if grep -qE 'url: http://localhost:[0-9]+/mcp' "$CFG" 2>/dev/null; then
+    sed -i -E 's#url: http://localhost:[0-9]+/mcp#url: http://okengine-mcp:8730/mcp#' "$CFG"
+    echo "  mcp url: read-MCP client pointed at okengine-mcp:8730 (service name on the bridge — okengine#138)"
+fi
+
+# --- cron-plus: the REQUIRED scheduler plugin (engine-manifest dependencies.cron-plus) ---
+# The engine's whole cron fleet runs on it; without it the gateway comes up with a silently DEAD
+# scheduler (jobs.json deploys fine, nothing ever fires — a live deployment shipped exactly this
+# way). It is deploy-time runtime (NOT vendored, NOT baked into the gateway image): it lives at
+# <pack>/.hermes-data/plugins/cron-plus (= /opt/data/plugins/cron-plus in the gateway). Install it
+# here, pinned to the manifest SHA, so the documented quickstart cannot produce a dead scheduler.
+CP_DIR="$RT/plugins/cron-plus"
+if [ "${OKENGINE_CRON_PLUS_SKIP:-0}" = "1" ]; then
+    echo "  cron-plus: install skipped (OKENGINE_CRON_PLUS_SKIP=1 — host-run hermes keeps the plugin at ~/.hermes/plugins; tests run hermetic)"
+elif [ ! -f "$CP_DIR/runner.py" ]; then
+    MANIFEST="${ENGINE_DIR:-$(cd "$(dirname "$0")/.." && pwd)}/engine-manifest.yaml"
+    # awk block-scan, not grep -A<N>: the manifest's multi-line role: text once pushed
+    # upstream:/pinned_sha: outside a fixed -A window — and the failed grep inside $()
+    # killed the whole script under set -euo pipefail BEFORE the fail-loud branch could
+    # fire (a silent death that shipped a dead scheduler). Parse robustly + verify.
+    CP_URL="$(awk '/^  cron-plus:/{f=1;next} f&&/^  [a-z]/{exit} f&&/upstream:/{print $2; exit}' "$MANIFEST" || true)"
+    CP_SHA="$(awk '/^  cron-plus:/{f=1;next} f&&/^  [a-z]/{exit} f&&/pinned_sha:/{print $2; exit}' "$MANIFEST" || true)"
+    if [ -z "$CP_URL" ] || [ -z "$CP_SHA" ]; then
+        echo "ERROR: could not parse cron-plus upstream/pinned_sha from $MANIFEST — the" >&2
+        echo "       scheduler cannot be installed; refusing to continue silently." >&2
+        exit 1
+    fi
+    mkdir -p "$RT/plugins"
+    if git clone -q "$CP_URL" "$CP_DIR" 2>/dev/null && git -C "$CP_DIR" checkout -q "$CP_SHA" 2>/dev/null; then
+        echo "  cron-plus: installed at plugins/cron-plus @ ${CP_SHA:0:12} (the scheduler the cron fleet runs on)"
+    else
+        rm -rf "$CP_DIR"
+        cat >&2 <<CPMSG
+ERROR: cron-plus (the REQUIRED cron scheduler) is not installed and could not be cloned from
+       $CP_URL @ $CP_SHA
+       Without it NOTHING schedules — the gateway starts but every cron lane is dead.
+       Install it manually, then re-run:
+         git clone $CP_URL "$CP_DIR"
+         git -C "$CP_DIR" checkout $CP_SHA
+       (or copy plugins/cron-plus from a working deployment's .hermes-data/)
+CPMSG
+        exit 1
+    fi
+else
+    echo "  cron-plus: present at plugins/cron-plus"
+fi
+
+# --- SOUL.md write-lock vs config migration (Hermes v0.18.0 upgrade path) ---
+# Hermes protects SOUL.md read-only (444) by design — but v0.18.0's startup config migration
+# (schema 30 -> 32, scripts/docker_config_migrate.py) REWRITES it and dies on the read-only bit:
+# "Migration failed; restored config.yaml ... Permission denied: /opt/data/SOUL.md". The gateway
+# then boots on the OLD schema and the cron scheduler silently stops ticking (live incident,
+# first v0.18.0 deployment). Make it owner-writable pre-compose; harmless when already writable.
+if [ -f "$RT/SOUL.md" ] && [ ! -w "$RT/SOUL.md" ]; then
+    chmod u+w "$RT/SOUL.md" 2>/dev/null         && echo "  SOUL.md: made owner-writable (v0.18.0 config migration rewrites it; 444 kills the migration and the cron ticker)"         || echo "  WARN: SOUL.md is read-only and could not be unlocked — the v0.18.0 config migration will fail; chmod u+w it as its owner before compose"
 fi
 
 # --- writability: the gateway (uid HUID) must be able to write the runtime tree ---

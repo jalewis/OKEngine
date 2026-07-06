@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>OKEngine · cockpit</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand" id="brand">⬢ <span>cockpit</span></div>
+  <!-- tabs are built at runtime from /api/config (pack-driven, domain-agnostic) -->
+  <nav id="tabs"></nav>
+  <div class="gsearch-wrap">
+    <input id="gsearch" class="gsearch" type="search" autocomplete="off" placeholder="search all pages…  ( / )">
+    <div id="gresults" class="gresults" hidden></div>
+  </div>
+  <div class="fontsize" id="fontsize" title="Text size">
+    <button id="fs-dec" class="fs-btn" type="button" title="Smaller text" aria-label="Decrease text size">A−</button>
+    <button id="fs-inc" class="fs-btn" type="button" title="Larger text" aria-label="Increase text size">A+</button>
+  </div>
+  <div class="clock" id="clock"></div>
+  <button id="about-btn" class="about-btn" type="button" title="About this deployment">ⓘ</button>
+</header>
+
+<div id="about-overlay" class="about-overlay" hidden>
+  <div class="about-card">
+    <button id="about-close" class="about-close" title="close (Esc)">✕</button>
+    <h2>⬢ OKEngine Cockpit</h2>
+    <p class="about-meta" id="about-meta"></p>
+    <div id="about-deploy"></div>
+    <p>A read-only, function-oriented cockpit over an <strong>OKEngine</strong> vault —
+       briefings, dashboards, predictions and watchlists. It renders content only;
+       it never writes to the vault.</p>
+  </div>
+</div>
+
+<main>
+  <!-- BRIEFINGS -->
+  <section id="view-briefings" class="view active">
+    <aside id="brief-rail"><div class="rail-title">STREAM</div><div id="streams"></div></aside>
+    <div id="brief-pane" class="pane"><div class="empty">Loading…</div></div>
+  </section>
+
+  <!-- DASHBOARDS -->
+  <section id="view-dashboards" class="view">
+    <div id="dash-pane" class="pane"><div class="empty">Loading…</div></div>
+  </section>
+
+  <!-- PREDICTIONS -->
+  <section id="view-predictions" class="view">
+    <div id="pred-summary" class="summary"></div>
+    <div id="pred-filters" class="filters">
+      <label>status <select id="f-status"></select></label>
+      <label>horizon <select id="f-horizon"></select></label>
+      <label>set <select id="f-forecast"></select></label>
+      <label>subject <input id="f-subject" placeholder="all" size="14"></label>
+      <label>sort <select id="f-sort">
+        <option value="made">newest</option>
+        <option value="due">due (soonest)</option>
+        <option value="conf">confidence ▾</option>
+        <option value="moved">recently moved</option>
+      </select></label>
+      <input id="f-search" placeholder="/ search claims" size="22">
+    </div>
+    <div id="pred-table" class="pane"><div class="empty">Loading…</div></div>
+    <div id="pred-detail" class="detail" hidden></div>
+  </section>
+
+  <!-- COMPETITORS -->
+  <section id="view-competitors" class="view">
+    <div id="comp-pane" class="pane"><div class="empty">Loading…</div></div>
+  </section>
+
+  <!-- WATCHLIST & TRENDS -->
+  <section id="view-watchlist" class="view">
+    <div id="watch-pane" class="pane"><div class="empty">Loading…</div></div>
+  </section>
+
+  <!-- BROWSE (generic namespace explorer — ported from okengine-reader) -->
+  <section id="view-browse" class="view">
+    <aside id="dir-rail"><div class="rail-title" id="analysis-title" hidden></div><div id="analysis"></div><div class="rail-title rail-sep" id="groups-title" hidden>BY KIND</div><div id="groups"></div><div class="rail-title rail-sep" id="ns-title">NAMESPACES</div><div id="dirs"></div></aside>
+    <div id="list-pane" class="pane"><div class="empty">Loading…</div></div>
+  </section>
+
+  <!-- CHAT (relay to the vault agent — shown only when chat_enabled) -->
+  <section id="view-chat" class="view">
+    <div class="chat-wrap">
+      <div id="chat-log" class="chat-log">
+        <div class="chat-hint">Ask the agent. It answers from the <strong>vault it maintains</strong> — reading whole pages and following <code>[[links]]</code> as memory, not retrieving chunks. Answers cite their source pages; click to open them.</div>
+      </div>
+      <form id="chat-form" class="chat-form">
+        <textarea id="chat-input" rows="1" autocomplete="off" placeholder="Ask the agent…  (Enter to send · Shift+Enter for newline)"></textarea>
+        <button type="submit" id="chat-send">Send</button>
+      </form>
+    </div>
+  </section>
+</main>
+
+<div id="page-overlay" class="overlay" hidden>
+  <div class="ov-bar">
+    <button id="ov-back" title="back">←</button>
+    <span id="ov-title"></span>
+    <span id="ov-path"></span>
+    <span id="ov-dl" class="ov-dl"></span>
+    <button id="ov-close" title="close (Esc)">✕</button>
+  </div>
+  <div id="ov-content" class="md ov-content"></div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

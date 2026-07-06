@@ -87,3 +87,72 @@ def test_requires_presence_and_version():
 def test_mixed_trust_fails():
     metas = [_meta("a", trust="public"), _meta("b", trust="private")]
     assert any("mixed trust levels" in e for e in pm.validate_composition(metas))
+
+
+# --- okengine#181: kind: bundle ---------------------------------------------------
+
+def _bundle_meta(name="okpack-sec", host="host", compose=("g1", "g2"),
+                 requires=None, types=(), namespaces=()):
+    reqs = list(requires) if requires is not None else [host, *compose]
+    return {"name": name, "version": "1.0.0", "trust": "public", "kind": "bundle",
+            "owns_types": set(types), "owns_namespaces": set(namespaces),
+            "requires": reqs, "bundle_host": host, "bundle_compose": list(compose),
+            "dir": name}
+
+
+def test_load_pack_meta_reads_kind_and_bundle(tmp_path):
+    d = _pack(tmp_path, "okpack-sec",
+              "name: okpack-sec\nversion: 0.3.0\nkind: bundle\ntrust: public\n"
+              "owns: {types: [], namespaces: []}\n"
+              "requires: [okpack-a, okpack-b, okpack-c]\n"
+              "bundle: {host: okpack-a, compose: [okpack-b, okpack-c]}\n")
+    m = pm.load_pack_meta(d)
+    assert m["kind"] == "bundle"
+    assert m["bundle_host"] == "okpack-a"
+    assert m["bundle_compose"] == ["okpack-b", "okpack-c"]
+    # a plain pack defaults kind -> "pack" with an empty recipe
+    p = pm.load_pack_meta(_pack(tmp_path, "okpack-plain",
+                                "name: okpack-plain\ntrust: public\nowns: {types: [t]}\n"))
+    assert p["kind"] == "pack" and p["bundle_host"] == "" and p["bundle_compose"] == []
+
+
+def test_valid_bundle_recipe_clean():
+    assert pm.validate_bundle_recipe(_bundle_meta()) == []
+
+
+def test_bundle_recipe_rejects_malformed():
+    # owns something
+    assert any("must own nothing" in e
+               for e in pm.validate_bundle_recipe(_bundle_meta(types=["x"])))
+    # host listed in compose
+    assert any("lists its host" in e
+               for e in pm.validate_bundle_recipe(_bundle_meta(host="h", compose=["h", "g"],
+                                                               requires=["h", "g"])))
+    # missing host
+    assert any("missing bundle.host" in e
+               for e in pm.validate_bundle_recipe(_bundle_meta(host="", requires=["g1", "g2"])))
+    # empty compose
+    assert any("non-empty bundle.compose" in e
+               for e in pm.validate_bundle_recipe(_bundle_meta(compose=[], requires=["host"])))
+    # a member not declared in requires
+    assert any("does not declare it in requires" in e
+               for e in pm.validate_bundle_recipe(_bundle_meta(requires=["host"])))  # g1/g2 missing
+    # a non-bundle meta yields no recipe errors
+    assert pm.validate_bundle_recipe(_meta("plain", types=["t"])) == []
+
+
+def test_bundle_composes_clean_with_real_packs():
+    metas = [_bundle_meta(name="okpack-sec", host="okpack-a", compose=["okpack-b"],
+                          requires=["okpack-a", "okpack-b"]),
+             _meta("okpack-a", types=["actor"]),
+             _meta("okpack-b", types=["cve"])]
+    assert pm.validate_composition(metas) == []
+
+
+def test_bundle_cannot_nest():
+    inner = _bundle_meta(name="okpack-b", host="x", compose=["y"], requires=["x", "y"])
+    outer = _bundle_meta(name="okpack-sec", host="okpack-a", compose=["okpack-b"],
+                         requires=["okpack-a", "okpack-b"])
+    metas = [outer, inner, _meta("okpack-a", types=["actor"]),
+             _meta("x", types=["t1"]), _meta("y", types=["t2"])]
+    assert any("bundles cannot nest" in e for e in pm.validate_composition(metas))

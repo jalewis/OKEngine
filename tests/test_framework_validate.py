@@ -42,6 +42,39 @@ def test_scaffolded_pack_validates_clean(tmp_path):
     assert v.main([str(pack), "--quiet"]) == 0
 
 
+def test_compose_drift_ignores_commented_base_port(tmp_path):
+    """Regression (library deploy-matrix): the port-offset drift check greps the RAW compose
+    text, so a commented-out example binding that shows the un-offset base port — e.g. a doc
+    line `# ports: [...:8730:8730]` — was flagged as drift. A comment is not a binding: it must
+    not trip the check, while an actual (uncommented) base-port binding still must."""
+    v = _load("framework_validate", VAL)
+    _reader = ("services:\n"
+               "  okengine-reader:\n"
+               "    image: okengine-reader:latest\n"
+               "    environment:\n"
+               "      - OKENGINE_TRUST=public\n"
+               "      - OKENGINE_BIND=127.0.0.1\n"
+               "      - OKENGINE_READER_PASSWORD=changeme\n")
+
+    pack = tmp_path / "offset-pack"
+    _scaffold_with_compose(pack)
+    (pack / "pack.yaml").write_text((pack / "pack.yaml").read_text().rstrip() + "\nport_offset: 400\n")
+
+    # real binding is OFFSET (9600:9200); the only base-port mention is a COMMENT → no drift
+    (pack / "docker-compose.yml").write_text(
+        _reader +
+        '    ports: ["${OKENGINE_BIND:-127.0.0.1}:9600:9200"]\n'
+        '    # ports: ["${OKENGINE_BIND:-127.0.0.1}:8730:8730"]   # doc example, NOT a binding\n')
+    drift = [d for s, c, d in v.validate(pack).rows if s == "FAIL" and "port_offset" in d]
+    assert not drift, f"commented base-port wrongly flagged as drift: {drift}"
+
+    # sanity: an UNCOMMENTED un-offset base-port binding under an offset pack STILL fails
+    (pack / "docker-compose.yml").write_text(
+        _reader + '    ports: ["${OKENGINE_BIND:-127.0.0.1}:8730:8730"]\n')
+    drift2 = [d for s, c, d in v.validate(pack).rows if s == "FAIL" and "port_offset" in d]
+    assert drift2, "an uncommented un-offset base-port binding must still fail compose drift"
+
+
 def test_broken_schema_is_a_fail(tmp_path):
     pack = tmp_path / "pack"
     _scaffold(pack)
@@ -94,6 +127,53 @@ def test_runtime_config_context_aware(tmp_path):
     # (c) if .hermes-data isn't gitignored, a missing config is a real FAIL
     (pack / ".gitignore").write_text("# no runtime ignore\n.env\n")
     assert any(s == "FAIL" and "config.yaml" in c for s, c, d in v.validate(pack).rows)
+
+
+def _mini_exposed_pack(d, trust):
+    # minimal pack with an EXPOSED reader + no password, for the trust-aware surface-auth check
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "pack.yaml").write_text(f"name: demo\ntrust: {trust}\n")
+    (d / "docker-compose.yml").write_text(
+        'services:\n  okengine-reader:\n    image: okengine-reader\n'
+        '    ports: ["${OKENGINE_BIND:-127.0.0.1}:9300:9200"]\n')
+    (d / ".env").write_text("OKENGINE_BIND=0.0.0.0\n")   # exposed, no OKENGINE_READER_PASSWORD
+    return d
+
+
+def test_private_pack_exposed_without_password_fails(tmp_path):
+    # okengine#90 P4a: a PRIVATE vault exposed beyond loopback with no reader password is a FAIL.
+    v = _load("framework_validate", VAL)
+    r = v.validate(_mini_exposed_pack(tmp_path / "priv", "private"))
+    assert any(s == "FAIL" and c == "reader auth" for s, c, d in r.rows), [x for x in r.rows if "reader" in str(x[1])]
+
+
+def test_public_pack_exposed_without_password_warns_not_fails(tmp_path):
+    # a PUBLIC reference deployment is intentionally open — WARN, never FAIL on reader auth.
+    v = _load("framework_validate", VAL)
+    r = v.validate(_mini_exposed_pack(tmp_path / "pub", "public"))
+    assert not any(s == "FAIL" and c == "reader auth" for s, c, d in r.rows), r.rows
+    assert any(s == "WARN" and c == "reader auth" for s, c, d in r.rows), r.rows
+
+
+def test_private_pack_exposed_cockpit_without_password_fails(tmp_path):
+    # okengine#90 P4a extends to the cockpit: it is a SUPERSET of the reader on the same bind, so a
+    # cockpit-only deployment exposed with no password is just as much a FAIL. (Regression: the
+    # validator originally only checked okengine-reader, silently passing an exposed cockpit.)
+    d = tmp_path / "cockpit-only"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "pack.yaml").write_text("name: demo\ntrust: private\n")
+    (d / "docker-compose.yml").write_text(
+        'services:\n  okengine-cockpit:\n    image: okengine-cockpit\n'
+        '    ports: ["${OKENGINE_BIND:-127.0.0.1}:9400:9200"]\n')
+    (d / ".env").write_text("OKENGINE_BIND=0.0.0.0\n")   # exposed, no OKENGINE_READER_PASSWORD
+    v = _load("framework_validate", VAL)
+    r = v.validate(d)
+    assert any(s == "FAIL" and c == "cockpit auth" for s, c, d in r.rows), \
+        [x for x in r.rows if "cockpit" in str(x[1])]
+    # a shared password clears it (one credential protects both UIs)
+    (d / ".env").write_text("OKENGINE_BIND=0.0.0.0\nOKENGINE_READER_PASSWORD=hunter2\n")
+    r = v.validate(d)
+    assert not any(s == "FAIL" and c == "cockpit auth" for s, c, d in r.rows), r.rows
 
 
 def test_bad_runtime_config_keys_is_a_fail(tmp_path):
@@ -387,3 +467,114 @@ def test_cli_dispatches_validate(tmp_path):
     cli = _load("framework", CLI)
     assert cli.main(["validate", str(pack), "--quiet"]) == 0
     assert cli.main(["bogus-cmd"]) == 2
+
+
+def test_alias_shadowing_declared_type_is_a_fail(tmp_path):
+    """okengine v0.9.0 sweep class: an alias key that IS a declared type makes the
+    normalization drains silently retype canonical pages. Pack-side this was only a
+    WARN (deployment-validate and coinstall_preflight already FAILed it), which let
+    the digest-alias collision reach a live deployment — severity now agrees."""
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    schema = (pack / "schema.yaml").read_text()
+    schema += ("\n" if not schema.endswith("\n") else "")
+    schema = schema.replace("type_aliases: {}",
+                            "type_aliases: {funding-digest: briefing}", 1)
+    schema += "\n"
+    # declare the same name as a canonical type -> shadow
+    schema = schema.replace("types:", "types:\n  funding-digest: {required: [type]}", 1)
+    (pack / "schema.yaml").write_text(schema)
+    v = _load("framework_validate", VAL)
+    r = v.validate(pack)
+    hits = [(s, d) for s, c, d in r.rows if c == "schema.type_aliases" and s == "FAIL"]
+    assert hits and "funding-digest" in hits[0][1], r.rows
+    assert v.main([str(pack), "--quiet"]) == 1
+
+
+def test_subdomain_schema_without_partitioning_warns(tmp_path):
+    """First automated subtree install: a subdomain schema with types but no
+    partitioning leaves dir creation empty and the subtree namespace guard a no-op."""
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    import yaml as _yaml
+    main_schema = _yaml.safe_load((pack / "schema.yaml").read_text())
+    main_schema["types"] = main_schema.get("types") or {}   # scaffold ships a commented-empty block
+    main_schema["types"]["assumption"] = {"required": ["type"]}
+    (pack / "schema.yaml").write_text(_yaml.safe_dump(main_schema, sort_keys=False))
+    (pack / "subdomain").mkdir()
+    (pack / "subdomain" / "schema.yaml").write_text(
+        "types:\n  assumption: {required: [type]}\n")
+    v = _load("framework_validate", VAL)
+    r = v.validate(pack)
+    warns = [d for s, c, d in r.rows if s == "WARN" and c == "subdomain form"
+             and "partitioning" in d]
+    assert warns, r.rows
+    # and the fix silences it
+    (pack / "subdomain" / "schema.yaml").write_text(
+        "types:\n  assumption: {required: [type]}\n"
+        "partitioning:\n  namespaces:\n    assumptions: {strategy: flat}\n")
+    r2 = v.validate(pack)
+    assert not [d for s, c, d in r2.rows if s == "WARN" and "partitioning" in d], r2.rows
+
+
+def test_pack_description_mission_warns(tmp_path):
+    """description/mission feed About + catalog + framework list (multi-surface):
+    missing description WARNs; a scaffold-TODO mission WARNs; filled = silent."""
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    v = _load("framework_validate", VAL)
+    warns = lambda r: [c for s, c, d in r.rows if s == "WARN" and c.startswith("pack.yaml")]
+    # scaffold ships description filled + mission TODO -> exactly the mission warn
+    w = warns(v.validate(pack))
+    assert "pack.yaml mission" in w, w
+    # strip description -> the description warn
+    t = (pack / "pack.yaml").read_text()
+    import re
+    (pack / "pack.yaml").write_text(re.sub(r'^description:.*\n', "", t, flags=re.M))
+    w = warns(v.validate(pack))
+    assert "pack.yaml description" in w, w
+    # fill both -> neither
+    t = (pack / "pack.yaml").read_text()
+    t = "description: A test domain\n" + re.sub(r'^mission: >-\n(  .*\n)+', "mission: Real mission text.\n", t, flags=re.M)
+    (pack / "pack.yaml").write_text(t)
+    w = warns(v.validate(pack))
+    assert "pack.yaml mission" not in w and "pack.yaml description" not in w, w
+
+
+# --- okengine#181: kind: bundle validates its recipe, not domain content -----------
+
+def _make_bundle(pack: Path, recipe_yaml: str):
+    """Scaffold a clean normal pack (correct engine.version/README/.env), then convert it
+    into a kind: bundle: owns nothing, ships a recipe, no schema/contract."""
+    _scaffold(pack)
+    (pack / "pack.yaml").write_text(recipe_yaml)
+    (pack / "schema.yaml").unlink()          # a bundle ships no contract
+
+
+def test_bundle_validates_without_schema(tmp_path):
+    pack = tmp_path / "okpack-sec"
+    _make_bundle(pack,
+                 "name: okpack-sec\nversion: 0.3.0\nkind: bundle\ntrust: public\n"
+                 "description: security bundle\n"
+                 "owns: {types: [], namespaces: []}\n"
+                 "requires: [okpack-a, okpack-b]\n"
+                 "bundle: {host: okpack-a, compose: [okpack-b]}\n")
+    v = _load("framework_validate", VAL)
+    r = v.validate(pack)
+    fails = [(c, d) for s, c, d in r.rows if s == "FAIL"]
+    assert fails == [], f"unexpected FAILs for a bundle: {fails}"
+    assert any(s == "OK" and c == "bundle recipe" for s, c, d in r.rows)
+    assert v.main([str(pack), "--quiet"]) == 0
+
+
+def test_bundle_malformed_recipe_is_a_fail(tmp_path):
+    pack = tmp_path / "okpack-bad"
+    _make_bundle(pack,
+                 "name: okpack-bad\nkind: bundle\ntrust: public\ndescription: x\n"
+                 "owns: {types: [], namespaces: []}\n"
+                 "requires: []\n"
+                 "bundle: {host: okpack-a, compose: [okpack-a]}\n")  # host in compose + not required
+    v = _load("framework_validate", VAL)
+    r = v.validate(pack)
+    assert any(s == "FAIL" and c == "bundle recipe" for s, c, d in r.rows), r.rows
+    assert v.main([str(pack), "--quiet"]) == 1

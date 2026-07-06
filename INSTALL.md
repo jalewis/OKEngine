@@ -5,7 +5,7 @@ files) + **plugins** + **config**, then **one domain pack**. This is the procedu
 to take a stock Hermes install and bring it up to OKEngine — i.e. the exact
 stock→OKEngine delta.
 
-**Pinned dependency:** Hermes **v0.17.0** = upstream git tag **`v2026.6.19`**
+**Pinned dependency:** Hermes **v0.18.0** = upstream git tag **`v2026.7.1`**
 (`github.com/NousResearch/hermes-agent`). The engine is cut against this version;
 a different Hermes version may require rebasing the patches.
 
@@ -30,6 +30,8 @@ cd my-brain && bash ../okengine/scripts/deploy.sh             # 3. build image (
 ```
 
 Then add a model key to `my-brain/.env` to enable the LLM crons (the stack comes up without one).
+
+> **First deploy?** [`docs/cold-start-checklist.md`](docs/cold-start-checklist.md) lists the rough edges a from-scratch deploy hits and how to clear them.
 
 > **Where is `docker-compose.yml`?** Not in this engine repo — the engine is an *overlay*, not a
 > deployable stack. The compose file (wiring **gateway + `okengine-reader` + `okengine-mcp`**) ships
@@ -78,7 +80,7 @@ script does, if you prefer to do it by hand.
 ## 1. Pin Hermes
 ```bash
 git clone https://github.com/NousResearch/hermes-agent.git hermes
-cd hermes && git checkout v2026.6.19          # == Hermes v0.17.0
+cd hermes && git checkout v2026.7.1           # == Hermes v0.18.0
 ```
 
 ## 2. Apply the carried patches (6 core-file patches)
@@ -107,9 +109,12 @@ Copy the overlay paths from the OKEngine repo onto the Hermes tree. The
   it the deployed `config/cron-plus-jobs.json` (the engine + pack cron fleet) has
   nothing to schedule it. Clone it at the pin and enable it:
   ```bash
-  git clone https://github.com/jalewis/hermes-cron-plus ~/.hermes/plugins/cron-plus
-  git -C ~/.hermes/plugins/cron-plus checkout eacd1729859ff378be63cb13e25319abf9539eff
-  # then add `cron-plus` under plugins.enabled in ~/.hermes/config.yaml
+  # containerized deployment (the normal case): ensure-runtime.sh installs it automatically at
+  # <pack>/.hermes-data/plugins/cron-plus (= /opt/data/plugins/cron-plus in the gateway), pinned.
+  # Manual form (or for a HOST-run hermes, at ~/.hermes/plugins/cron-plus instead):
+  git clone https://github.com/jalewis/hermes-cron-plus <pack>/.hermes-data/plugins/cron-plus
+  git -C <pack>/.hermes-data/plugins/cron-plus checkout 6b230dc89171b0e21e89b7856e7a1a57628ca83c
+  # `cron-plus` under plugins.enabled in config.yaml (the seeded template already lists it)
   ```
 - **model-provider plugins** ship in the overlay (`plugins/model-providers/custom` — the local-Ollama `reasoning_effort:none` lever; `openrouter`).
 
@@ -118,7 +123,8 @@ Copy the overlay paths from the OKEngine repo onto the Hermes tree. The
 cp config/config.yaml.template ~/.hermes/config.yaml   # (or the pack's .hermes-data/config.yaml)
 ```
 Fill the load-bearing keys (template documents all):
-- `model.default` — your primary (e.g. `deepseek-v4-pro`).
+- `model.default` — your primary model (make it your economical workhorse; it carries every
+  cron lane that doesn't override it). Which model for which lane: `docs/model-selection.md`.
 - `terminal.backend: local` — **required**, or the agent can't see the vault mount.
 - `mcp_servers.okengine` (read, HTTP :8730) **and** `mcp_servers.okengine-write`
   (the enforced G1 write path, stdio, no token).

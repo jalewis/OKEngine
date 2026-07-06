@@ -51,7 +51,7 @@ python scripts/framework.py pull <pack-name> ../my-research-brain
 #   validates, and leaves the pack on safe defaults (no feeds active; schedules
 #   are disabled or wake-gated depending on the pack).
 #   Applies the pack's declared port_offset (pack.yaml) automatically; pass
-#   --port-offset N to override if 9200/8730 (+offset) still collide on this host.
+#   --port-offset N to override if the reader port 9200 (+offset) still collides on this host.
 
 # 4. configure the vault
 cd ../my-research-brain

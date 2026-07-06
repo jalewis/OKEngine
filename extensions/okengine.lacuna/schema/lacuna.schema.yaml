@@ -1,0 +1,23 @@
+# okengine.lacuna schema fragment — the §5 "Own" case (okengine#133).
+# Folded into the composed schema only when the extension is enabled; owner = ext:okengine.lacuna.
+# A pack that enables lacuna must NOT already own a `lacuna` type or namespace (own = new ids only;
+# the composer fails loud on a collision).
+#
+# The field set MIRRORS the 6-step method 1:1, so a page's frontmatter IS the procedure:
+#   field_mapped → step 1 (the region of the graph mapped)
+#   hidden_axis  → step 2 (what the field secretly optimizes for)
+#   force        → step 4 (the named force keeping the cell empty — LOAD-BEARING; no force ⇒ defer)
+#   fill         → step 6 (the proposed fill)
+# `discovered_vs_failed` (step 5), `confidence`/`surround_density` (step 6's MEASURED signal),
+# `prediction_candidate` (the soft predictions edge) are optional/additive.
+# `needs_review` is universal OKF scaffolding (the write path stamps/honors it) — NOT declared here.
+owns:
+  namespaces: [lacuna]
+  types:
+    lacuna:
+      # a structural gap: the field mapped, the hidden axis, the force keeping a cell empty,
+      # and the proposed fill. The four MUSTs make a page that omits the load-bearing parts invalid.
+      required: [type, field_mapped, hidden_axis, force, fill]
+      # step 5 sort + the density-derived confidence + grounding links + the soft prediction edge.
+      optional: [discovered_vs_failed, confidence, surround_density, fill_trigger,
+                 see_also, sources, prediction_candidate]

@@ -42,6 +42,12 @@ def by_name(substr):
     return [j for j in jobs().values()
             if j.get("enabled", True) and substr in j.get("name", "")]
 
+def by_tier(label):
+    # okengine#129: extension jobs that declared `tier: <label>` slot into that stage,
+    # rather than guessing a wall-clock time relative to the engine fleet.
+    return [j for j in jobs().values()
+            if j.get("enabled", True) and j.get("tier") == label]
+
 def cli(*args):
     subprocess.run([PYBIN, CLI, *args], capture_output=True, text=True)
 
@@ -78,9 +84,11 @@ STAGES = [
     ("graph",         ["source-backlink-drain", "broken-wikilinks-drain", "orphans-drain"], 420, 1),
     ("concepts",      ["concept-backfill"],                            600, 1),
     ("canonical",     ["canonical-assemble", "publisher-canonical-drain"], 420, 1),
-    ("predictions",   ["prediction-candidate-watch", "prediction-grade", "prediction-regrade"], 420, 1),
+    # predictions is now the opt-in okengine.predictions extension — these run only if it's
+    # enabled (by_name returns nothing otherwise, and the stage skips). See extensions/.
+    ("predictions",   ["okengine.predictions:candidate-watch", "okengine.predictions:grade", "okengine.predictions:regrade"], 420, 1),
     ("quality/audit", ["source-staleness-refresh", "page-quality-audit", "page-quality-enrich",
-                       "contradictions-refresh", "schema-drift-lint", "lint-watcher",
+                       "schema-drift-lint", "lint-watcher",
                        "wiki-health-audit"], 420, 1),
     ("index+dash",    ["reshelve", "tier-refresh", "corpus-indexer", "index-rebuild-daily",
                        "kb-health-refresh", "project-stats-refresh", "build-index-tree",
@@ -91,21 +99,24 @@ STAGES = [
 summary = {"ok": [], "FAIL": [], "timeout": [], "absent": []}
 for label, names, timeout, repeats in STAGES:
     print(f"\n=== stage: {label} ===", flush=True)
-    for substr in names:
-        crons = by_name(substr)
-        if not crons:
-            continue  # cron not present in this pack — fine
-        for job in crons:
-            name = job["name"]
-            last = None
-            for r in range(repeats):
-                status, detail = run_cron(job, timeout)
-                last = status
-                if status != "ok":
-                    break
-            tag = {"ok": "✓", "FAIL": "✗", "timeout": "⏳"}.get(last, "?")
-            print(f"  {tag} {name}" + (f"  [{detail}]" if last != "ok" else ""), flush=True)
-            summary.setdefault(last, []).append(name)
+    # the stage's engine/pack crons (by name) + any extension job that declared this
+    # tier (#129), deduped by id so a tier-tagged job named like a stage isn't run twice.
+    seen_ids, stage_jobs = set(), []
+    for job in [c for s in names for c in by_name(s)] + by_tier(label):
+        if job["id"] not in seen_ids:
+            seen_ids.add(job["id"])
+            stage_jobs.append(job)
+    for job in stage_jobs:
+        name = job["name"]
+        last = None
+        for r in range(repeats):
+            status, detail = run_cron(job, timeout)
+            last = status
+            if status != "ok":
+                break
+        tag = {"ok": "✓", "FAIL": "✗", "timeout": "⏳"}.get(last, "?")
+        print(f"  {tag} {name}" + (f"  [{detail}]" if last != "ok" else ""), flush=True)
+        summary.setdefault(last, []).append(name)
 
 print("\n==> kickstart summary")
 print(f"   ok: {len(summary['ok'])}  |  FAIL: {len(summary['FAIL'])}  |  timeout: {len(summary['timeout'])}")

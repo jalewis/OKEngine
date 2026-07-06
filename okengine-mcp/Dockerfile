@@ -51,6 +51,8 @@ COPY okengine-mcp/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY okengine-mcp/server.py .
+# per-extension token resolution (okengine#132)
+COPY okengine-mcp/scope.py .
 # Engine wrappers (source of truth: scripts/cron/) — copied, not vendored.
 COPY scripts/cron/kb_search.py scripts/cron/kb_graph.py scripts/cron/tier_lib.py ./scripts/
 

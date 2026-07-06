@@ -8,8 +8,12 @@ validates the composed page against the governing `schema.yaml` (walk-up, via
 and appends one line to `wiki/log.md` on success. This is the unbypassable
 counterpart to the `file`-tool write-guard (which stays as the backstop).
 
-Distinct from the read-only `server.py` (networked, vault mounted `:ro`). This
-server is STDIO-ONLY — no HTTP/bearer — and is mounted with a writable vault.
+Distinct from the read-only `server.py` (networked, vault mounted `:ro`). Default
+transport is STDIO (the trusted local gateway caller — full write). Set
+OKENGINE_WRITE_TRANSPORT=streamable-http to expose a NETWORKED, token-authenticated
+write surface so an out-of-process sidecar extension can write (okengine#132): the
+admin token keeps full write; an extension's minted token is limited to its declared
+write scopes, and its pages are stamped with `extension_id` provenance.
 
 Tools (each returns a short human-readable status string):
   create_entity(path, frontmatter_yaml, body)         — refuses if file exists
@@ -27,8 +31,10 @@ Env: WIKI_PATH (/opt/vault), OKENGINE_MCP_WRITE_DATE (override today()).
 """
 from __future__ import annotations
 
+import contextvars
 import datetime
 import difflib
+import hmac
 import os
 import re
 import sys
@@ -40,7 +46,9 @@ import yaml
 # Robust import of the engine validator regardless of CWD: repo root is the
 # parent of this file's directory (okengine-mcp/'s parent).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tools.schema_validator import schema_reject_reason, governing_policy, drift_policy  # noqa: E402
+import scope as _scope  # noqa: E402  per-extension token resolution (okengine#132)
 
 # Converge-on-write (composable okpacks P2) needs the id + schema + merge libs.
 # Optional: if any are absent, converge_entity is disabled but the rest works.
@@ -66,11 +74,25 @@ _H1 = re.compile(r"^#[ \t]+(.+?)[ \t]*$", re.M)
 
 
 def _today() -> str:
-    """ISO date for log/last_updated. Injectable via env for deterministic tests."""
+    """ISO date (YYYY-MM-DD) for the wiki/log.md ledger lines. Injectable for tests."""
     override = os.environ.get("OKENGINE_MCP_WRITE_DATE")
     if override:
         return override
     return datetime.date.today().isoformat()
+
+
+def _now() -> str:
+    """ISO-8601 UTC TIMESTAMP (YYYY-MM-DDTHH:MM:SSZ) for `last_updated`/`created`/`updated` — the
+    OKF envelope fields the spec defines as timestamps (guide-2), so the UI can track *when*, not
+    just *which day*. Injectable via OKENGINE_MCP_WRITE_NOW; falls back to the date override (so a
+    date-only test override still works) then real UTC now."""
+    override = os.environ.get("OKENGINE_MCP_WRITE_NOW")
+    if override:
+        return override
+    date_override = os.environ.get("OKENGINE_MCP_WRITE_DATE")
+    if date_override:
+        return date_override
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _wiki() -> Path:
@@ -78,22 +100,73 @@ def _wiki() -> Path:
     return Path(os.environ.get("WIKI_PATH") or str(VAULT)) / "wiki"
 
 
+# Per-request caller identity (okengine#132), set by the networked auth middleware.
+# None (stdio — the trusted local gateway caller) = admin = FULL write, which is the
+# pre-#132 behavior. A networked extension caller is limited to its write scopes.
+_caller_var: contextvars.ContextVar = contextvars.ContextVar("okengine_write_caller", default=None)
+
+
+def _caller() -> dict:
+    c = _caller_var.get()
+    return c if c is not None else {"kind": "admin", "write_scopes": None, "ext_id": None}
+
+
+def _authorize_write(path: str) -> bool:
+    """May the current caller write this wiki-relative path? Admin (stdio gateway) =
+    always; an extension = only within its declared write scopes."""
+    c = _caller()
+    if c.get("kind") == "admin":
+        return True
+    return _scope.path_in_scopes(str(path), c.get("write_scopes") or [])
+
+
+def _wauth_refusal(path) -> Optional[str]:
+    """Refuse if the caller can't write this path. Authorize on the NORMALIZED target, not the
+    raw agent string: _safe() collapses '..' and strips redundant prefixes, so a raw
+    'entities/../predictions/x' textually matches an 'entities/**' scope yet WRITES to
+    predictions/ — scope must gate the real destination, not the spelling (okengine#178). Accepts
+    a str or a resolved Path (converge re-auth passes the redirected canonical)."""
+    sp = _safe(str(path))
+    check = str(sp.relative_to(_wiki().resolve())) if sp is not None else str(path)
+    if not _authorize_write(check):
+        c = _caller()
+        return (f"refused: '{path}' is outside extension '{c.get('ext_id')}'"
+                f"'s write scope (declared: {c.get('write_scopes')})")
+    return None
+
+
 def _normalize_entity_shard(rel: str) -> str:
-    """Force the engine's one-level shard layout for entity canonicals:
-    `entities/<anything>/<slug>.md` -> `entities/<slug[0]>/<slug>.md`. The importers and the
-    assembler all write one-level; an agent that picks a two-level shard (e.g.
-    `entities/c/v/foo.md`) would otherwise create a stale DUPLICATE of `entities/c/foo.md`
-    that the assembler never updates (okengine#48). Other namespaces are left untouched."""
+    """Canonicalize an entity path to the shard layout the reshard drain + assembler use, so an
+    agent that picks the wrong shard doesn't create a stale DUPLICATE (okengine#48). The shard
+    letters are always recomputed from the SLUG (not trusted from the path). The vault may RESHARD
+    a hot first-letter leaf to two levels (`entities/<l>/<2nd>/<slug>.md`, 2nd = slug[1]) once it
+    exceeds the threshold (reshard_oversized.py); this must NOT collapse a valid resharded canonical
+    back to one level — that refuses/duplicates writes on a mature vault (okengine invariant-audit).
+    Choose one- vs two-level by what's actually on disk. Other namespaces are left untouched."""
     parts = rel.split("/")
-    # entities/<a>/<b>/.../<slug>.md where every shard segment is a SINGLE char = the engine's
-    # first-char-shard scheme (mis-)applied at one or more levels -> collapse to the canonical
-    # entities/<slug[0]>/<slug>.md. Multi-char segments are left alone (not the shard scheme).
-    if (len(parts) >= 3 and parts[0] == "entities"
+    # only the entities/ first-char-shard scheme (single-char intermediate segments); multi-char
+    # segments are some other layout and are left alone.
+    if not (len(parts) >= 3 and parts[0] == "entities"
             and all(len(seg) == 1 for seg in parts[1:-1])):
-        stem = parts[-1][:-3] if parts[-1].endswith(".md") else parts[-1]
-        if stem:
-            return f"entities/{stem[0].lower()}/{stem}.md"
-    return rel
+        return rel
+    stem = parts[-1][:-3] if parts[-1].endswith(".md") else parts[-1]
+    if not stem:
+        return rel
+    l1 = stem[0].lower()
+    one = f"entities/{l1}/{stem}.md"
+    second = stem[1].lower() if len(stem) > 1 and stem[1].isalnum() else "_"
+    two = f"entities/{l1}/{second}/{stem}.md"
+    try:
+        wiki = _wiki()
+        if (wiki / two).exists():
+            return two                              # already at the resharded canonical
+        leaf = wiki / "entities" / l1
+        if (not (wiki / one).exists() and leaf.is_dir()
+                and any(d.is_dir() and len(d.name) == 1 for d in leaf.iterdir())):
+            return two                              # this first-letter leaf HAS been resharded
+    except OSError:
+        pass
+    return one                                      # default / un-resharded: one level
 
 
 def _safe(path: str) -> Optional[Path]:
@@ -145,13 +218,74 @@ def _safe(path: str) -> Optional[Path]:
     return p
 
 
+_WIKILINK_FULL = re.compile(r"^\[\[\s*([^\]|#]+?)\s*(?:[#|][^\]]*)?\]\]$")
+
+
+def _strip_wikilink(s):
+    """'[[concepts/x]]' -> 'concepts/x' (drops any #anchor / |display); a non-wikilink value is
+    returned unchanged."""
+    if isinstance(s, str):
+        m = _WIKILINK_FULL.match(s.strip())
+        if m:
+            return m.group(1).strip()
+    return s
+
+
+def _looks_like_ref_list(v) -> bool:
+    """A list that needs canonicalizing: it either contains nested lists (the shape YAML produces
+    when a bare `[[x]]` wikilink is used as a value — `[[x]]` parses as a nested flow sequence) or
+    holds `[[..]]` wikilink strings."""
+    return isinstance(v, list) and (
+        any(isinstance(x, list) for x in v)
+        or any(isinstance(x, str) and x.strip().startswith("[[") for x in v))
+
+
+def _flatten_strip(v) -> list:
+    """Flatten arbitrarily-nested lists (the `[[..]]` YAML mangling) into a flat list of plain
+    wiki-relative path strings, wikilink-stripped, dropping blanks + dups (order-preserving)."""
+    out: list = []
+    def walk(x):
+        if isinstance(x, list):
+            for y in x:
+                walk(y)
+            return
+        s = _strip_wikilink(x)
+        if isinstance(s, str):
+            s = s.strip()
+        if s and s not in out:
+            out.append(s)
+    walk(v)
+    return out
+
+
+def _normalize_refs(fm: dict) -> dict:
+    """Canonicalize frontmatter reference values to plain wiki-relative path strings.
+
+    Agents are trained to write `[[wikilinks]]`, but `[[x]]` in YAML is flow syntax for a NESTED
+    sequence, so a bare wikilink in a frontmatter value silently mangles (`field_mapped: [[c/x]]`
+    -> `[[ "c/x" ]]`; a `see_also` list -> `- - - c/x`). Wikilinks are a *body* convention;
+    frontmatter holds structured data. Here, at the single enforced-write chokepoint (so every
+    extension's writes are fixed at once), we coerce: a bare `[[x]]` string -> `x`; a list that
+    mangled into nested lists, or holds `[[..]]` strings, -> a flat list of plain paths. Plain
+    strings and plain lists are left untouched."""
+    if not isinstance(fm, dict):
+        return fm
+    for k, v in list(fm.items()):
+        if isinstance(v, str):
+            fm[k] = _strip_wikilink(v)
+        elif _looks_like_ref_list(v):
+            fm[k] = _flatten_strip(v)
+    return fm
+
+
 def _coerce_fm(frontmatter_yaml: Union[str, dict, None]) -> Optional[dict]:
     """Accept a YAML string OR a dict; return a dict (or None to signal a parse
-    error vs an empty/absent value, which returns {})."""
+    error vs an empty/absent value, which returns {}). Frontmatter reference values are
+    canonicalized (wikilink -> plain path) via _normalize_refs."""
     if frontmatter_yaml is None:
         return {}
     if isinstance(frontmatter_yaml, dict):
-        return dict(frontmatter_yaml)
+        return _normalize_refs(dict(frontmatter_yaml))
     try:
         loaded = yaml.safe_load(frontmatter_yaml)
     except Exception:
@@ -160,7 +294,7 @@ def _coerce_fm(frontmatter_yaml: Union[str, dict, None]) -> Optional[dict]:
         return {}
     if not isinstance(loaded, dict):
         return None
-    return loaded
+    return _normalize_refs(loaded)
 
 
 def _compose(fm: dict, body: str) -> str:
@@ -260,13 +394,29 @@ def _reserved_refuse(p: Path) -> Optional[str]:
 #      `review_on_change_field`. Preserving an already-present value never flags.
 
 def _namespace(p: Path) -> str:
-    """Top-level wiki namespace for a page (e.g. 'predictions', 'entities')."""
+    """Knowledge namespace for a page (e.g. 'predictions', 'entities').
+
+    Sub-domain aware (okengine#173 walk-up multipack): in a co-installed vault a page lives at
+    ``wiki/<subdomain>/<namespace>/…`` where the sub-domain dir carries its OWN schema.yaml — the
+    namespace is the dir BELOW that container, not the container itself. Reading the container as
+    the namespace silently broke the enforced write path for every sub-domain vault: per-namespace
+    create/update permissions never matched (the human-only `findings` guard was BYPASSED on
+    update/patch/tombstone), and every create was rejected as an 'undeclared namespace'. For a
+    flat vault (no nested schema.yaml) the loop never advances, so this is identical to the old
+    ``parts[0]`` behavior."""
     try:
         rel = p.relative_to(_wiki())
     except ValueError:
         return ""
     parts = rel.parts
-    return parts[0] if parts else ""
+    if not parts:
+        return ""
+    wiki = _wiki()
+    i = 0
+    # skip leading sub-domain container dirs (each carries its own schema.yaml); never the filename
+    while i < len(parts) - 1 and (wiki.joinpath(*parts[: i + 1]) / "schema.yaml").is_file():
+        i += 1
+    return parts[i]
 
 
 def _ns_perm(policy: dict, ns: str) -> dict:
@@ -304,7 +454,7 @@ def _namespace_reject(p: Path) -> Optional[str]:
     if not ns:
         return None
     try:
-        schema = _governing(ns)
+        schema = _governing(p)
         declared = schema_lib.knowledge_namespaces(schema)
         allowed = declared | schema_lib.excluded_dirs(schema)
     except Exception:                       # pragma: no cover - schema load is best-effort
@@ -425,7 +575,7 @@ def _dedup_on_create(path: str, p: Path, fm: dict, body: str) -> Optional[str]:
         return None
     namespace = _namespace(p)
     try:
-        schema = _governing(namespace)
+        schema = _governing(p)      # sub-domain aware (okengine#177); namespace is the bare mint scope
         pid, kind = _page_id_and_kind(fm, schema, namespace, p.stem)
     except Exception:               # pragma: no cover - id derivation is best-effort
         return None
@@ -450,10 +600,36 @@ def _dedup_on_create(path: str, p: Path, fm: dict, body: str) -> Optional[str]:
             "flagged for review (slug ids never auto-merge)")
 
 
+def _prov_pack() -> str:
+    """The DEPLOYMENT's pack identity (pack.yaml `name`), injected as OKENGINE_PACK at deploy time.
+    Deployment-pinned, never client/agent-supplied, so composition provenance can't be spoofed.
+    Empty in a legacy single-pack deploy without the env (then provenance simply isn't stamped)."""
+    return os.environ.get("OKENGINE_PACK", "").strip()
+
+
+def _stamp_maintainer(fm: dict, *, creation: bool) -> None:
+    """Composition provenance (okengine#90 P3): union this deployment's pack into `maintained_by`
+    (the list of packs that have written the page) and, on CREATION, set `discovered_by` (the first
+    attributor). Idempotent; a no-op when OKENGINE_PACK is unset."""
+    pack = _prov_pack()
+    if not pack:
+        return
+    prov = fm.get("maintained_by")
+    prov = list(prov) if isinstance(prov, (list, tuple)) else ([prov] if prov else [])
+    if pack not in prov:
+        prov.append(pack)
+    fm["maintained_by"] = prov
+    if creation:
+        fm.setdefault("discovered_by", pack)
+
+
 def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> str:
     p = _safe(path)
     if p is None:
         return "refused: path outside the vault wiki/"
+    _wa = _wauth_refusal(path)
+    if _wa:
+        return _wa
     _rr = _reserved_refuse(p)
     if _rr:
         return _rr
@@ -479,9 +655,16 @@ def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> st
     if "version" not in fm:
         fm["version"] = 1
     if "created" not in fm:
-        fm["created"] = _today()
+        fm["created"] = _now()
     if "last_updated" not in fm:
-        fm["last_updated"] = _today()
+        fm["last_updated"] = _now()
+    _stamp_maintainer(fm, creation=True)   # composition provenance (okengine#90 P3)
+    # Provenance (okengine#132/#133): stamp the owning extension id when a networked
+    # extension caller writes — the key disable/orphan/purge reads. Server-side, derived
+    # from the scoped token, so a client can't spoof it. Stdio/admin writes get no stamp.
+    _c = _caller()
+    if _c.get("kind") == "extension" and _c.get("ext_id"):
+        fm["extension_id"] = _c["ext_id"]
     # Ensure every page carries a human `name`. The ingest agent (esp. source ingest:
     # select_raw_batch -> agent -> okengine-write) puts the article title in the body's
     # `# H1` but doesn't always set a `name`/`title` field, leaving the page nameless in
@@ -522,6 +705,9 @@ def _update(path: str, frontmatter_yaml: Union[str, dict, None] = None,
     p = _safe(path)
     if p is None:
         return "refused: path outside the vault wiki/"
+    _wa = _wauth_refusal(path)
+    if _wa:
+        return _wa
     _rr = _reserved_refuse(p)
     if _rr:
         return _rr
@@ -544,7 +730,8 @@ def _update(path: str, frontmatter_yaml: Union[str, dict, None] = None,
         new_fm["version"] = int(new_fm.get("version", 1)) + 1
     except (TypeError, ValueError):
         new_fm["version"] = 2
-    new_fm["last_updated"] = _today()
+    new_fm["last_updated"] = _now()
+    _stamp_maintainer(new_fm, creation=False)   # add this pack as a maintainer (okengine#90 P3)
     pol = _policy_reject(p, new_fm, "update", prev=cur_fm)
     if pol:
         return f"rejected: {pol}"  # existing file left untouched
@@ -566,12 +753,21 @@ def _tombstone(path: str, reason: str, superseded_by: Optional[str] = None) -> s
     p = _safe(path)
     if p is None:
         return "refused: path outside the vault wiki/"
+    _wa = _wauth_refusal(path)
+    if _wa:
+        return _wa
     _rr = _reserved_refuse(p)
     if _rr:
         return _rr
     if not p.is_file():
         return f"refused: {_rel(p)} does not exist — nothing to tombstone"
     cur_fm, cur_body = _read_page(p)
+    # a tombstone IS an update — it must clear the same namespace permission
+    # matrix as every other mutation (found via okengine#166: an agent-read-only
+    # lookup/ namespace could still be tombstoned through this one path)
+    pol = _policy_reject(p, cur_fm, "update", prev=cur_fm)
+    if pol:
+        return f"rejected: {pol}"  # file left untouched
     new_fm = dict(cur_fm)
     new_fm["status"] = "tombstoned"
     new_fm["tombstone_reason"] = reason
@@ -581,7 +777,7 @@ def _tombstone(path: str, reason: str, superseded_by: Optional[str] = None) -> s
         new_fm["version"] = int(new_fm.get("version", 1)) + 1
     except (TypeError, ValueError):
         new_fm["version"] = 2
-    new_fm["last_updated"] = _today()
+    new_fm["last_updated"] = _now()
     content = _compose(new_fm, cur_body)
     rej = schema_reject_reason(str(p), content)
     if rej:
@@ -596,6 +792,9 @@ def _flag(path: str, note: str) -> str:
     p = _safe(path)
     if p is None:
         return "refused: path outside the vault wiki/"
+    _wa = _wauth_refusal(path)
+    if _wa:
+        return _wa
     clean_note = " ".join((note or "").split())
     wiki = _wiki()
     wiki.mkdir(parents=True, exist_ok=True)
@@ -639,13 +838,16 @@ def _stamp(new_fm: dict, cur_fm: dict) -> None:
         new_fm["version"] = int(new_fm.get("version", cur_fm.get("version", 1))) + 1
     except (TypeError, ValueError):
         new_fm["version"] = 2
-    new_fm["last_updated"] = _today()
+    new_fm["last_updated"] = _now()
 
 
 def _patch(path: str, old_string: str, new_string: str) -> str:
     p = _safe(path)
     if p is None:
         return "refused: path outside the vault wiki/"
+    _wa = _wauth_refusal(path)
+    if _wa:
+        return _wa
     _rr = _reserved_refuse(p)
     if _rr:
         return _rr
@@ -732,6 +934,9 @@ def _append_section(path: str, heading: str, text: str) -> str:
     p = _safe(path)
     if p is None:
         return "refused: path outside the vault wiki/"
+    _wa = _wauth_refusal(path)
+    if _wa:
+        return _wa
     _rr = _reserved_refuse(p)
     if _rr:
         return _rr
@@ -775,9 +980,21 @@ def _registry() -> "id_index.IdIndex":
     return _registries[k]
 
 
-def _governing(namespace: str) -> dict:
+def _governing(p: Path) -> dict:
+    """The governing schema for a PAGE — sub-domain aware (okengine#177). Resolve by the page's
+    LOCATION (its wiki-relative dir, which merged_schema walks up to the nearest schema.yaml /
+    composed artifact), NOT a bare namespace. Passing the bare namespace lost the sub-domain and
+    always resolved the ROOT schema, so for a walk-up sub-domain page the id/type-authority/owner
+    guards saw root while the permission/shape guards (governing_policy -> _find_schema, a page-path
+    walk-up) saw the sub-domain — the split-brain. Now both resolve the same governing schema."""
     vault = Path(os.environ.get("WIKI_PATH") or str(VAULT))
-    return schema_lib.merged_schema(vault, namespace)
+    try:
+        nsdir = p.parent.relative_to(_wiki()).as_posix()   # 'acme/entities' | 'entities' | 'entities/a'
+    except ValueError:
+        nsdir = ""                                          # page outside wiki/ — vault-root schema
+    if nsdir == ".":
+        nsdir = ""
+    return schema_lib.merged_schema(vault, nsdir)
 
 
 def _page_id_and_kind(fm: dict, schema: dict, namespace: str, stem: str) -> tuple[str, str]:
@@ -801,11 +1018,15 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
               pack: str = "", remove: str = "") -> str:
     """Upsert a page by id: merge into a live page that already carries the id
     (page+field ownership), else create + claim. (RFC composable-okpacks §5a.)"""
+    pack = pack or _prov_pack()   # deployment-pinned provenance + field ownership (okengine#90 P3)
     if not _CONVERGE_OK:
         return "rejected: converge unavailable (id/schema libs not importable)"
     p = _safe(path)
     if p is None:
         return "refused: path outside the vault wiki/"
+    _wa = _wauth_refusal(path)
+    if _wa:
+        return _wa
     _rr = _reserved_refuse(p)
     if _rr:
         return _rr
@@ -813,7 +1034,7 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
     if fm is None:
         return "rejected: frontmatter_yaml is not a valid YAML mapping"
     namespace = _namespace(p)
-    schema = _governing(namespace)
+    schema = _governing(p)          # sub-domain aware (okengine#177); namespace is the bare mint scope
     pid, kind = _page_id_and_kind(fm, schema, namespace, p.stem)
     if not pid:
         return "rejected: cannot determine page id"
@@ -834,6 +1055,9 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
                 return (f"refused: slug id {pid} already used by {existing_rel} — "
                         "flagged for review (slug ids never auto-merge)")
             p = existing_path                       # authority id -> the canonical page
+            _wa = _wauth_refusal(p)                 # re-authorize: the redirect can point OUTSIDE
+            if _wa:                                 # the caller's declared scope (okengine#178)
+                return _wa
         if p.is_file():
             cur_fm, cur_body = _read_page(p)
             ftype = str(cur_fm.get("type") or fm.get("type") or "").strip()
@@ -966,7 +1190,55 @@ except ImportError:  # pragma: no cover - mcp absent (e.g. host test env)
     mcp = None
 
 
+class _ScopedWriteAuth:
+    """ASGI middleware for the networked write surface (okengine#132): resolve
+    `Bearer <token>` -> caller, 401 if unknown. The configured admin token
+    (OKENGINE_MCP_TOKEN / OKENGINE_WRITE_TOKEN) keeps FULL write; an extension token
+    from the vault store is limited to its write scopes. This surface is what lets an
+    out-of-process sidecar reach okengine-write at all — stdio cannot."""
+
+    def __init__(self, app, admin_token: str):
+        self.app, self.admin_token = app, admin_token
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            headers = dict(scope.get("headers") or [])
+            provided = headers.get(b"authorization", b"").decode()
+            token = provided[7:] if provided.startswith("Bearer ") else ""
+            caller = None
+            if self.admin_token and hmac.compare_digest(token, self.admin_token):
+                caller = {"kind": "admin", "write_scopes": None, "ext_id": None}
+            else:
+                rec = _scope.resolve(token)
+                if rec is not None:
+                    caller = {"kind": "extension", "ext_id": rec.get("ext_id"),
+                              "write_scopes": rec.get("write_scopes") or []}
+            if caller is None:
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"text/plain")]})
+                await send({"type": "http.response.body", "body": b"unauthorized"})
+                return
+            _caller_var.set(caller)
+        await self.app(scope, receive, send)
+
+
 if __name__ == "__main__":  # pragma: no cover
     if mcp is None:
-        raise SystemExit("mcp package not installed; cannot run the stdio server")
-    mcp.run(transport="stdio")
+        raise SystemExit("mcp package not installed; cannot run the server")
+    transport = os.environ.get("OKENGINE_WRITE_TRANSPORT", "stdio")
+    if transport in ("streamable-http", "http"):
+        # Networked write surface for out-of-process sidecars. Requires a scoped or
+        # admin token; refuses the built-in default unless explicitly allowed, and
+        # fails closed off-loopback with the default (mirrors the read server).
+        import uvicorn
+        host = os.environ.get("OKENGINE_WRITE_HOST", "127.0.0.1")
+        admin = (os.environ.get("OKENGINE_WRITE_TOKEN")
+                 or os.environ.get("OKENGINE_MCP_TOKEN") or "")
+        if not admin:
+            raise SystemExit("okengine-write: networked transport requires "
+                             "OKENGINE_WRITE_TOKEN (or OKENGINE_MCP_TOKEN) — refusing "
+                             "to serve writes unauthenticated.")
+        app = _ScopedWriteAuth(mcp.streamable_http_app(), admin)
+        uvicorn.run(app, host=host, port=int(os.environ.get("OKENGINE_WRITE_PORT", "8731")))
+    else:
+        mcp.run(transport="stdio")

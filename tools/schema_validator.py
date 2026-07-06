@@ -95,6 +95,14 @@ def _find_schema(start: str) -> Optional[Path]:
     cur = d
     found: Optional[Path] = None
     while True:
+        # Prefer the generated composed schema (engine ⊕ pack ⊕ enabled extensions,
+        # okengine#90/#133) when present at a vault root — it is authoritative for the
+        # whole tree, so extension-owned types validate. Absent => the pack schema.yaml
+        # walk-up below (pre-#133 behavior).
+        composed = cur / ".okengine" / "composed-schema.yaml"
+        if composed.is_file():
+            found = composed
+            break
         for name in _SCHEMA_NAMES:
             cand = cur / name
             if cand.is_file():
@@ -220,7 +228,11 @@ def _evaluate(abs_path: str, content: str) -> tuple[str, Optional[str]]:
         schema = _load_schema(sp)
         if not schema:
             return ("error", f"governing schema is unparsable or empty: {sp}")
-        root = sp.parent
+        # The apply-root is the dir the schema governs. A normal schema.yaml governs
+        # its own dir; the generated composed schema lives in <vault>/.okengine/ but
+        # governs the VAULT ROOT (its grandparent) — so pages under wiki/ resolve
+        # relative to the vault, not to .okengine/ (okengine#133).
+        root = sp.parent.parent if sp.parent.name == ".okengine" else sp.parent
         try:
             rel = Path(abs_path).resolve().relative_to(root)
         except (ValueError, OSError):

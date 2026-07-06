@@ -196,7 +196,7 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
 
 def _header(title: str, ts: str, note: str) -> list[str]:
     return ["---", "type: dashboard", f"title: {title}",
-            f"updated: {datetime.now(timezone.utc).date().isoformat()}",
+            f"updated: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
             "generator: scripts/cron/refresh_kb_dashboards.py", "---", "",
             f"# {title}", "", f"_Synced {ts} — {note}_", ""]
 

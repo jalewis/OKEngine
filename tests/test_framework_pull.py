@@ -186,3 +186,132 @@ def test_update_in_place_preserves_config_and_flags_changes(tmp_path):
     assert not (dest / "feeds.opml.upstream").exists()
     assert not (dest / "README.md.upstream").exists()
     assert s["unchanged"] >= 1
+
+
+def test_giturl_local_directory_is_first_class(tmp_path):
+    """Pre-publish testing must pull the content UNDER TEST: a local library checkout
+    as OKENGINE_LIBRARY (or a catalog repo that is a path) resolves to the plain path
+    for git clone — previously name-pulls always cloned the public GitHub repo, so a
+    releases-stale snapshot is what got tested (deploy-matrix finding)."""
+    fp = _load()
+    d = tmp_path / "okpacks-library"
+    d.mkdir()
+    assert fp._giturl(str(d)) == str(d.resolve())
+    # non-existent path still resolves as owner/repo -> github (unchanged behavior)
+    assert fp._giturl("jalewis/okpacks-library").startswith("https://github.com/")
+
+
+def test_port_offset_keeps_multi_reader_services_distinct(tmp_path):
+    """deploy-matrix live-tier finding: reader AND cockpit both publish container
+    9200; collapsing every mapping onto 9200+offset bound two services to one host
+    port and compose died mid-up. Sequential assignment keeps them distinct and
+    stays idempotent (file order is stable)."""
+    fp = _load()
+    d = tmp_path / "pack"
+    d.mkdir()
+    (d / "docker-compose.yml").write_text(
+        'reader:\n    ports: ["${OKENGINE_BIND:-127.0.0.1}:9200:9200"]\n'
+        'cockpit:\n    ports: ["${OKENGINE_BIND:-127.0.0.1}:9201:9200"]\n'
+        'mcp:\n    ports: ["${OKENGINE_BIND:-127.0.0.1}:8730:8730"]\n')
+    fp._apply_port_offset(d, 800)
+    t = (d / "docker-compose.yml").read_text()
+    assert ":10000:9200" in t and ":10001:9200" in t and ":9530:8730" in t, t
+    fp._apply_port_offset(d, 800)   # idempotent re-apply
+    t2 = (d / "docker-compose.yml").read_text()
+    assert t2 == t
+
+
+def test_port_offset_uniquifies_container_names(tmp_path):
+    """live-tier finding #8: pinned container_name makes a pack single-instance-per-
+    host — the ephemeral test instance collided with the PRODUCTION instance's
+    containers. An offset instance gets '-o<offset>' names; same-offset re-apply is
+    a no-op."""
+    fp = _load()
+    d = tmp_path / "pack"
+    d.mkdir()
+    (d / "docker-compose.yml").write_text(
+        'services:\n  gateway:\n    container_name: okpack-foo-gateway\n'
+        '    ports: ["${OKENGINE_BIND:-127.0.0.1}:9200:9200"]\n')
+    fp._apply_port_offset(d, 820)
+    t = (d / "docker-compose.yml").read_text()
+    assert "container_name: okpack-foo-gateway-o820" in t, t
+    fp._apply_port_offset(d, 820)
+    assert (d / "docker-compose.yml").read_text() == t
+
+
+# --- okengine#181: pulling a kind: bundle composes host + guests ------------------
+import os
+import subprocess
+import yaml
+
+
+def _write_pack_files(root: Path):
+    """A minimal git 'library' with a host pack, a taxonomy guest, and a bundle recipe —
+    the shapes proven to install cleanly by test_framework_install_domain."""
+    packs = root / "packs"
+    # host
+    h = packs / "okpack-host"
+    (h / "wiki").mkdir(parents=True); (h / "crons").mkdir(); (h / "feeds").mkdir()
+    (h / "schema.yaml").write_text(yaml.safe_dump(
+        {"name": "okpack-host", "types": {"actor": {"required": ["type", "id"]}}}))
+    (h / "pack.yaml").write_text("name: okpack-host\ntrust: public\nowns: {types: [actor]}\n")
+    (h / "CLAUDE.md").write_text("# host persona\n")
+    (h / "crons" / "domain-crons.json").write_text(json.dumps(
+        [{"id": "aa", "name": "okpack-host-feed-fetch"}]))
+    (h / "crons" / "engine-template-prompts.json").write_text(json.dumps({"daily-brief": "H"}))
+    (h / "feeds" / "feeds.opml").write_text(
+        '<?xml version="1.0"?><opml><body></body></opml>')
+    # taxonomy guest (owns a disjoint type; ships host-schema-additions)
+    g = packs / "okpack-guest"
+    (g / "subdomain").mkdir(parents=True); (g / "crons").mkdir(); (g / "feeds").mkdir()
+    (g / "schema.yaml").write_text(yaml.safe_dump(
+        {"name": "okpack-guest", "types": {"cve": {"required": ["type", "id"]}},
+         "partitioning": {"namespaces": {"cves": {"strategy": "flat"}}}}))
+    (g / "pack.yaml").write_text(
+        "name: okpack-guest\ntrust: public\nowns: {types: [cve], namespaces: [cves]}\n")
+    (g / "subdomain" / "host-schema-additions.yaml").write_text(yaml.safe_dump(
+        {"types": {"cve": {"required": ["type", "id"]}}}))
+    (g / "subdomain" / "PERSONA.md").write_text("curation rules for guest\n")
+    (g / "crons" / "domain-crons.json").write_text(json.dumps(
+        [{"id": "bb", "name": "okpack-guest-feed-fetch"}]))
+    (g / "crons" / "engine-template-prompts.json").write_text(json.dumps({"daily-brief": "G"}))
+    (g / "feeds" / "feeds.opml").write_text('<?xml version="1.0"?><opml><body></body></opml>')
+    # bundle recipe
+    b = packs / "okpack-testbundle"
+    b.mkdir(parents=True)
+    b.joinpath("pack.yaml").write_text(
+        "name: okpack-testbundle\nversion: 0.1.0\nkind: bundle\ntrust: public\n"
+        "description: test bundle\nowns: {types: [], namespaces: []}\n"
+        "requires: [okpack-host, okpack-guest]\n"
+        "bundle: {host: okpack-host, compose: [okpack-guest]}\n")
+
+
+def _git_library(tmp_path: Path) -> Path:
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    _write_pack_files(lib)
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"}
+    subprocess.run(["git", "init", "-q", "-b", "main", str(lib)], check=True, env=env)
+    subprocess.run(["git", "-C", str(lib), "add", "-A"], check=True, env=env)
+    subprocess.run(["git", "-C", str(lib), "commit", "-q", "-m", "init"], check=True, env=env)
+    return lib
+
+
+def test_pull_bundle_composes_host_and_guests(tmp_path):
+    lib = _git_library(tmp_path)
+    os.environ["OKENGINE_LIBRARY"] = str(lib)
+    try:
+        m = _load()                              # reads OKENGINE_LIBRARY at import
+        dest = tmp_path / "out"
+        rc = m.main(["okpacks-library:okpack-testbundle", str(dest),
+                     "--no-validate", "--catalog", str(tmp_path / "no-catalog.json")])
+        assert rc == 0
+        # the composed vault is the HOST with the guest's type + namespace merged in
+        sch = yaml.safe_load((dest / "schema.yaml").read_text())
+        assert "actor" in sch["types"] and "cve" in sch["types"], sch["types"].keys()
+        # guest namespace folded into the host partitioning
+        ns = (sch.get("partitioning") or {}).get("namespaces") or {}
+        assert "cves" in ns, ns
+    finally:
+        os.environ.pop("OKENGINE_LIBRARY", None)

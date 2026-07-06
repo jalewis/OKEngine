@@ -33,13 +33,14 @@ The framework = **Runtime + Engine**. A deployment = framework + **one domain pa
 | `scripts/cron-plus*.sh`, `deploy-cron-*.sh`, `dump-cron-plus-jobs.sh` | deploy/ops tooling |
 | `okengine-reader/` | generic vault reader UI (markdown + backlinks + PDF) — no domain knowledge |
 | `config/cron-tiers.yaml` | the engine/domain cron manifest (this layer's own contract) |
+| `config/base-schema.yaml` | the **engine-owned** universal OKF core (okengine#90 P2): core types (`source`/`concept`/`prediction`/`finding`/`dashboard`/`briefing`/`trend`), core namespaces, the cross-cutting optional fields + base enums, and the global toggles. Merged *under* every pack by `scripts/cron/schema_lib.py`; a pack inherits it and declares only its domain on top |
 | `config/config.yaml.template` | deployment-critical Hermes keys (reference) |
 | `docs/okf/`, `docs/kb-tooling.md`, `docs/okf-alignment.md` | engine docs |
 
 ### Domain pack (per-deployment — illustrative; the reference pack is okpack-sec, a separate repo)
 | Path | Role |
 |---|---|
-| **Vault repo** — `schema.yaml` | the structural contract: `partitioning` + `hot_set` + `types` (the domain's shape) |
+| **Vault repo** — `schema.yaml` | the structural contract: `partitioning` + `hot_set` + `types` — but **domain types only**. The universal OKF core now lives engine-side in `config/base-schema.yaml` (okengine#90 P2) and is merged under the pack; a pack inherits it and uses `extends:` to add optional fields to a core type (see [`core-types-and-extensions.md`](core-types-and-extensions.md)) |
 | Vault `wiki/`, vault `CLAUDE.md` | content + persona/curation rules (the domain's knowledge + voice) |
 | Vault `wiki/<subdomain>/schema.yaml` | a *second* domain in the same vault (the walk-up pattern) |
 | `pack/feeds/<lane>.opml` | feeds (domain sources) |

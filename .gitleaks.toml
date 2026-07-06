@@ -1,0 +1,11 @@
+# gitleaks config for okengine. Extends the default ruleset; allowlists a known FALSE POSITIVE so
+# the pre-publish secret scan (docs/release-checklist.md §3) passes cleanly.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Wiki page-path fixtures that trip generic-api-key. A `key`/`path` field holding a wiki namespace path (e.g. `briefings/daily`) is a PAGE PATH used as test data, not a credential."
+# matched against the captured secret value (a bare `briefings/daily`-shaped path), NOT a real key
+regexes = [
+  '''^(?:briefings|sources|entities|concepts|predictions|findings|trends|dashboards|techniques|indicators|detections|security-incidents|cves)/[a-z0-9/_.-]+$''',
+]

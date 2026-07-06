@@ -1,0 +1,38 @@
+id: okengine.timeline
+kind: operation
+version: 0.1.0
+name: Timeline
+description: >
+  Renders wiki/dashboards/timeline.md — a reverse-chronological view of the vault's dated
+  content (sources by `published:`, entities/pages by `updated:`/`created:`), grouped by month.
+  Deterministic and domain-agnostic; a derived dashboard in the same family as contradictions.
+  A first-party reference extension demonstrating a read-only "derived view" operation.
+
+requires:
+  engine: ">=0.5.0"
+
+# core (okengine#142): default-ON / opt-out. Like contradictions, it's a cheap deterministic
+# no_agent dashboard useful on any OKF vault, so it's part of the house baseline — active unless
+# explicitly disabled (`framework extensions disable <pack> okengine.timeline`).
+core: true
+
+# in-gateway, trusted first-party: a deterministic cron script that reads the vault and writes
+# its dashboard directly (the established pattern for engine dashboard generators).
+trust: in-gateway
+
+capabilities:
+  read: [wiki/**]
+  write: [dashboards/**]
+  network: false
+  secrets: []
+  delivery: false
+
+config:
+  max_entries:
+    default: 300
+    description: Cap the number of timeline rows (newest first).
+
+operation:
+  schedule: {kind: cron, expr: "20 4 * * *"}   # daily 04:20, after the dashboards refresh window
+  entrypoint: {script: build_timeline.py}
+  timeout: 600

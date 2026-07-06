@@ -21,6 +21,15 @@ HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
 STATE_PATH = HERMES_HOME / "scripts" / "lint-state.json"
 
 
+def _skip(name: str) -> bool:
+    """Generated / reserved files the lint never targets (they're regenerated, not authored):
+    the per-directory INDEX pages (build_index_tree), backups, and underscore/dot reserved.
+    Including them floods the changeset on every index rebuild and overruns the lint agent."""
+    return (name.startswith(("_", ".")) or ".bak." in name
+            or name in ("INDEX.md", "index.md")
+            or name.startswith(("INDEX-", "index-")))
+
+
 def load_state() -> dict:
     if not STATE_PATH.exists():
         return {"last_baseline_mtime": 0.0}
@@ -47,7 +56,7 @@ def main() -> int:
     state = load_state()
     baseline = float(state.get("last_baseline_mtime", 0.0))
 
-    files = [p for p in wiki_dir.rglob("*.md") if p.is_file()]
+    files = [p for p in wiki_dir.rglob("*.md") if p.is_file() and not _skip(p.name)]
     if not files:
         print("# wiki-change-check: wiki has no markdown pages yet")
         print('{"wakeAgent": false}')

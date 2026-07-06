@@ -8,7 +8,7 @@
 # Idempotent: already-applied patches are skipped. Exits non-zero on drift.
 set -euo pipefail
 
-PIN="v2026.6.19"   # Hermes v0.17.0 — the version these patches are cut against
+PIN="v2026.7.1"   # Hermes v0.18.0 — the version these patches are cut against
 HERMES="${1:-${HERMES_DIR:-$PWD}}"
 PATCHDIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -19,6 +19,17 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
 cur="$(git describe --tags --exact-match 2>/dev/null || git rev-parse --short HEAD)"
 echo "Hermes checkout: $cur   (patches cut against pin: $PIN)"
 [ "$cur" = "$PIN" ] || echo "  ⚠ not at the pinned version — patches may need a rebase if they fail."
+
+# GUARD (okengine#178): the loop below globs whatever [0-9]*.patch files EXIST and exits 0 with a
+# cosmetic count — so a patch dropped by a bad rebase / a digit-dropping rename would silently
+# reduce the applied set and bake a Hermes image MISSING a carried guard (e.g. the OKF write-guard),
+# with no failure. `git apply` can't catch a MISSING patch (there's nothing to reject). So assert
+# every patch the README registers is present on disk before we apply anything.
+expected="$(grep -oE '[0-9]{2}-[a-z0-9][a-z0-9-]*\.patch' "$PATCHDIR/README.md" 2>/dev/null | sort -u)"
+[ -n "$expected" ] || { echo "ERROR: could not read the patch registry from $PATCHDIR/README.md" >&2; exit 3; }
+for e in $expected; do
+  [ -f "$PATCHDIR/$e" ] || { echo "ERROR: README registers '$e' but the file is MISSING — a carried patch was dropped (bad rebase/rename?). Refusing to build a partially-patched Hermes." >&2; exit 3; }
+done
 
 applied=0 skipped=0
 for p in "$PATCHDIR"/[0-9]*.patch; do

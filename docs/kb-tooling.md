@@ -102,8 +102,14 @@ startup it **registers the `wiki` collection if missing** (so a fresh deploy sel
 search) and runs an incremental `qmd update`, then repeats every
 `OKENGINE_MCP_INDEX_REFRESH_HOURS` (default `6`; set `0` to disable). **Between full refreshes it
 also polls the vault every `OKENGINE_MCP_INDEX_POLL_SECONDS` (default `30`) and reindexes
-incrementally the moment any page's mtime changes** — so a page the agent just wrote is
-searchable within seconds, not up to 6h later (the write→recall loop; okengine#80). The full
+incrementally when a page's mtime changes** — so a page the agent just wrote is
+searchable within seconds on a quiet vault, not up to 6h later (the write→recall loop;
+okengine#80). Change-triggered updates are **debounced**: after each update the next one waits
+`max(OKENGINE_MCP_INDEX_MIN_UPDATE_SECONDS (default 60), 3 × the update's own duration)`, so on
+a large vault where an incremental `qmd update` takes minutes, a write burst (backfill lanes)
+coalesces into one update per cooldown instead of one per write — reindex churn previously
+starved MCP tool calls into the client's 300s timeout. Writes landing during the cooldown are
+picked up by the next update, never lost. The full
 refresh still runs on its timer to catch deletions/orphaned hashes the mtime check can't see.
 Lexical/FTS only —
 vector `qmd embed` stays manual (heavy; off the default search path). Recreating the mcp

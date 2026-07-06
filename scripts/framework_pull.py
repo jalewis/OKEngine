@@ -113,6 +113,14 @@ def read_catalog(src: str = DEFAULT_CATALOG) -> tuple[dict | None, str | None]:
 
 
 def _giturl(owner_repo: str) -> str:
+    # a LOCAL checkout is a first-class source (OKENGINE_LIBRARY=/path/to/library,
+    # or a catalog whose `repo` is a path): pre-publish testing must pull the pack
+    # content ACTUALLY UNDER TEST — pulling by name previously always cloned the
+    # public GitHub repo even with a local catalog, so a releases-stale snapshot
+    # is what got tested (the exact mismatch external users hit when publishes lag).
+    p = Path(owner_repo).expanduser()
+    if p.is_dir():
+        return str(p.resolve())            # git clone handles plain local paths
     if os.environ.get("OKENGINE_GIT_SSH") == "1":
         return f"git@github.com:{owner_repo}.git"
     return f"https://github.com/{owner_repo}.git"
@@ -212,8 +220,30 @@ def _apply_port_offset(dest: Path, offset: int) -> None:
     compose = dest / "docker-compose.yml"
     if compose.is_file():
         t = compose.read_text(encoding="utf-8")
-        t = re.sub(r":\d+:9200\b", f":{rport}:9200", t)   # reader host:container
-        t = re.sub(r":\d+:8730\b", f":{mport}:8730", t)   # mcp host:container
+
+        def _seq(base):
+            # SEQUENTIAL host ports per container port: several services publish
+            # container 9200 (reader + cockpit since v0.8.0) — collapsing them all
+            # onto base+offset made both bind the same host port, and compose died
+            # mid-up with half a stack running (found by the deploy-matrix live
+            # tier). File order is stable, so this stays idempotent on re-pull.
+            n = [0]
+            def repl(m):
+                port = base + offset + n[0]
+                n[0] += 1
+                return f":{port}:{base}"
+            return repl
+        t = re.sub(r":\d+:9200\b", _seq(9200), t)   # reader/cockpit host:container
+        t = re.sub(r":\d+:8730\b", _seq(8730), t)   # mcp host:container
+        # container_name must be instance-unique too: a pinned name makes the pack
+        # single-instance-per-host — the deploy-matrix live tier collided with the
+        # PRODUCTION instance's containers ("name already in use", stack died
+        # half-up). Suffix by offset; idempotent for the same offset.
+        suf = f"-o{offset}"
+        def _uname(m):
+            name = m.group(1)
+            return m.group(0) if name.endswith(suf) else f"container_name: {name}{suf}"
+        t = re.sub(r"container_name:\s*([A-Za-z0-9._-]+)", _uname, t)
         compose.write_text(t, encoding="utf-8")
     cfg = dest / ".hermes-data" / "config.yaml"
     if cfg.is_file():
@@ -301,6 +331,70 @@ def _validate(dest: Path) -> int:
     spec.loader.exec_module(m)
     rc = m.main([str(dest), "--quiet"])
     return rc
+
+
+def _install_domain(host_dest: Path, guest: Path) -> int:
+    """Run `framework install-domain <host_dest> <guest> --apply` in-process (import by path,
+    the same pattern as _validate). Folds a guest pack's types/namespaces/crons/aliases into
+    the composed host vault. Returns the subcommand's exit code (0 = installed)."""
+    spec = importlib.util.spec_from_file_location(
+        "framework_install_domain", ENGINE_ROOT / "scripts" / "framework_install_domain.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m.main([str(host_dest), str(guest), "--apply"])
+
+
+def _load_meta_safe(dest: Path):
+    try:
+        return _pack_meta_mod().load_pack_meta(dest)
+    except Exception:
+        return None
+
+
+def _resolve_member(name: str, bundle_spec: dict, catalog: dict | None) -> dict:
+    """Resolve a bundle recipe member (host or a compose pack) to a fetch spec. Prefer the
+    catalog (honors that pack's own repo/subdir/ref); otherwise treat it as a SIBLING of the
+    bundle in the same monorepo — swap the last path segment of the bundle's subdir. This
+    covers the library case (all okpack-* live under packs/ of one repo) without a catalog."""
+    for p in ((catalog or {}).get("packs") or []):
+        if p.get("name") == name:
+            return {"name": name, "giturl": _giturl(p["repo"]),
+                    "subdir": p.get("subdir") or "", "ref": p.get("ref")}
+    subdir = bundle_spec.get("subdir") or ""
+    if subdir:
+        parent = subdir.rsplit("/", 1)[0] if "/" in subdir else ""
+        return {"name": name, "giturl": bundle_spec["giturl"],
+                "subdir": f"{parent}/{name}" if parent else name, "ref": bundle_spec.get("ref")}
+    raise SystemExit(
+        f"ERROR: bundle member '{name}' is not in the catalog and can't be derived as a "
+        f"sibling of the bundle (the bundle was pulled as a whole repo, not a monorepo subdir).\n"
+        f"  Add '{name}' to the catalog, or pull the bundle via okpacks-library:<bundle>.")
+
+
+def _expand_bundle(meta: dict, bundle_spec: dict, dest: Path, catalog: dict | None) -> None:
+    """okengine#181: a `kind: bundle` pack is a RECIPE, not a vault. Turn `dest` into the
+    composed vault in place — fetch the recipe's `host` pack over the thin bundle dir (it
+    becomes the base vault), then `install-domain --apply` each `compose` pack onto it. This
+    automates the proven manual composition (the okcti assembly)."""
+    errs = _pack_meta_mod().validate_bundle_recipe(meta)
+    if errs:
+        raise SystemExit("ERROR: malformed bundle recipe in pack.yaml:\n  " + "\n  ".join(errs))
+    host, compose = meta["bundle_host"], meta["bundle_compose"]
+    print(f"  ⧉ bundle: host {host} + {len(compose)} composed pack(s): {', '.join(compose)}")
+    print(f"    ↓ host {host}")
+    fetch(_resolve_member(host, bundle_spec, catalog), dest, force=True)
+    for member in compose:
+        m_spec = _resolve_member(member, bundle_spec, catalog)
+        with tempfile.TemporaryDirectory() as td:
+            guest = Path(td) / member
+            fetch(m_spec, guest, force=True)
+            print(f"    ⊕ install-domain {member}")
+            rc = _install_domain(dest, guest)
+            if rc != 0:
+                raise SystemExit(
+                    f"ERROR: install-domain of bundle member '{member}' failed (exit {rc}) — "
+                    f"the recipe does not compose cleanly onto {host}.")
+    print(f"  ✓ bundle composed into {dest} (host {host} + {len(compose)} pack(s))")
 
 
 # Operator-owned trees an in-place update must NEVER touch (runtime, secrets,
@@ -406,12 +500,29 @@ def main(argv: list[str]) -> int:
 
     print(f"  ↓ {spec['name']}  ←  {where}{' @ ' + spec['ref'] if spec['ref'] else ''}")
     fetch(spec, dest, args.force)
+
+    # okengine#181: if what we pulled is a `kind: bundle` recipe, expand it in place — the host
+    # pack becomes the base vault and each compose pack is install-domain'd on. Capture the
+    # bundle's declared port_offset FIRST (expansion clobbers dest/pack.yaml with the host's).
+    bundle_meta = _load_meta_safe(dest)
+    is_bundle = bool(bundle_meta and bundle_meta.get("kind") == "bundle")
+    bundle_offset = int(bundle_meta.get("port_offset") or 0) if is_bundle else 0
+    if is_bundle:
+        _expand_bundle(bundle_meta, spec, dest, catalog)
+
     _jitter_crons(dest)
     _layer_runtime(dest)
-    offset, src = _resolve_offset(args.port_offset, dest)
+    # For a bundle, the RECIPE's port_offset governs the composed host (the host pack's own
+    # default is irrelevant here); an explicit --port-offset still wins over both.
+    cli_offset = args.port_offset
+    if cli_offset is None and is_bundle and bundle_offset:
+        cli_offset = bundle_offset
+    offset, src = _resolve_offset(cli_offset, dest)
     _apply_port_offset(dest, offset)
     if offset and src == "pack.yaml":
         print(f"    (offset {offset} is the pack's declared default — override with --port-offset)")
+    elif offset and is_bundle and cli_offset == bundle_offset and args.port_offset is None:
+        print(f"    (offset {offset} is the bundle recipe's default — override with --port-offset)")
     print(f"  ✓ fetched into {dest} (definition; runtime reset + config.yaml seeded)")
     _engine_check(dest)
 
