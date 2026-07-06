@@ -47,7 +47,7 @@ def test_defaults_with_no_cockpit_block(tmp_path, monkeypatch):
     assert cfg["streams"][0]["dir"] == "briefings"
     assert cfg["streams"][0]["pdf"] is False
     # generic default tabs, no tracker tabs
-    assert cfg["tabs"] == ["briefings", "predictions", "dashboards"]
+    assert cfg["tabs"] == ["home", "briefings", "predictions", "dashboards"]
     # no watchlist/competitors config
     assert cfg["watchlist"] is None
     assert cfg["competitors"] == []
@@ -63,7 +63,7 @@ def test_defaults_when_schema_present_but_no_cockpit_key(tmp_path, monkeypatch):
     _write_schema(vault, "types:\n  - entity\nexclude:\n  - operational\n")
     cfg = m.load_cockpit_config(vault)
     assert cfg["watchlist"] is None
-    assert cfg["tabs"] == ["briefings", "predictions", "dashboards"]
+    assert cfg["tabs"] == ["home", "briefings", "predictions", "dashboards"]
     assert [s["key"] for s in cfg["streams"]] == ["briefings"]
 
 
@@ -80,6 +80,8 @@ def test_tracker_tabs_dropped_without_watchlist(tmp_path, monkeypatch):
     assert cfg["watchlist"] is None
     assert "watchlist" not in cfg["tabs"]
     assert "competitors" not in cfg["tabs"]
+    # EXPLICIT tabs are respected verbatim (minus the dropped trackers) — home is only a
+    # DEFAULT-tabs addition; a pack that lists its own tabs opts into home by listing it.
     assert cfg["tabs"] == ["briefings", "predictions", "dashboards"]
 
 
@@ -182,7 +184,7 @@ def test_malformed_schema_falls_back_to_defaults(tmp_path, monkeypatch):
     _write_schema(vault, "cockpit: : : not yaml [\n")
     cfg = m.load_cockpit_config(vault)
     assert cfg["watchlist"] is None
-    assert cfg["tabs"] == ["briefings", "predictions", "dashboards"]
+    assert cfg["tabs"] == ["home", "briefings", "predictions", "dashboards"]
 
 
 def test_about_parity_with_reader(tmp_path, monkeypatch):

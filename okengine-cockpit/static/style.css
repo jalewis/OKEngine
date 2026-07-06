@@ -244,3 +244,10 @@ a.wl:hover{border-bottom-style:solid}
 .about-ext summary{cursor:pointer}
 .about-ext-list{margin:8px 0 0;padding-left:18px;display:flex;flex-direction:column;gap:6px;font-size:0.893rem;color:var(--muted)}
 .about-ext-list strong{color:var(--text)}
+
+/* analyst home */
+.home-note { color: var(--mut, #8b949e); margin: 0 0 8px; font-size: 12px; }
+.home-chips { display: flex; flex-wrap: wrap; gap: 8px; padding: 4px 0; }
+.home-chip { padding: 6px 12px; border: 1px solid var(--line, #30363d); border-radius: 6px;
+             text-decoration: none; font-size: 13px; }
+.home-chip:hover { border-color: var(--acc, #58a6ff); }

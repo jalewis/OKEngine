@@ -51,10 +51,10 @@
     "enabled": true,
     "schedule": {
       "kind": "cron",
-      "expr": "0 3 * * *"
+      "expr": "0 3,9,15,21 * * *"
     },
     "workdir": "/opt/vault",
-    "prompt": "Generate the OKF hierarchical INDEX.md tree + BUNDLE/HEALTH/AGENTS; pure script, wakeAgent=false.",
+    "prompt": "Generate the OKF hierarchical INDEX.md tree + BUNDLE/HEALTH/AGENTS; pure script, wakeAgent=false. Intraday cadence (every 6h): nightly-only meant same-day ingest didn't appear in namespace INDEX listings until the next morning; 09:00 lands after the morning content lanes (lacuna 06:00, brief 07:30). ~5s pure script even on an 11k-page vault. Hours sit outside the 01-02 DST transition window.",
     "script": "/opt/data/scripts/build_index_tree.py",
     "deliver": "local",
     "no_agent": true

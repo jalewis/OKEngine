@@ -12,7 +12,7 @@
 # (schema.yaml + persona + feeds + crons + content). See INSTALL.md and
 # docs/deploy-a-new-domain.md.
 version: 1
-engine_release: v0.10.1   # post-cut hardening from the v0.10.0 invariant audit (secret leaks, write-path, budget-guard, DST, test fixes); see CHANGELOG.md
+engine_release: v0.10.2  # analyst home tab + first-day-live boundary guards (future-date, briefing wikilinks) + intraday index default; see CHANGELOG.md
 
 runtime:
   # Hermes is a PINNED DEPENDENCY, not vendored into this repo. You clone Hermes

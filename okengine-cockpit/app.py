@@ -129,7 +129,7 @@ def split_fm(text: str) -> tuple[dict, str]:
 # ── cockpit config (the ONLY place domain knowledge enters — from the pack) ──
 # Generic defaults so the cockpit works zero-config on any OKF vault; a pack
 # overrides via an optional `cockpit:` block in <vault>/schema.yaml. See README.
-_DEFAULT_TABS = ["briefings", "predictions", "dashboards"]
+_DEFAULT_TABS = ["home", "briefings", "predictions", "dashboards"]
 _TRACKER_TABS = ("watchlist", "competitors")  # require a `watchlist:` config to show
 
 
@@ -829,6 +829,66 @@ def api_competitors():
 
 
 # ── dashboards grid (curated reading order, else auto-listed) ────────────────
+@app.get("/api/home")
+def api_home():
+    """Analyst home — the daily flow composed from the vault's LIVE surfaces, in triage order:
+    latest briefs → what moved (watchlist) → trends → open predictions → knowledge gaps →
+    curated dashboards. Sections use the watchlist tab's render contract ({group,title,html});
+    an empty/unconfigured surface is OMITTED, so the tab shows only what this deployment
+    actually maintains (a raw all-page-links dashboard is a map; this is the route)."""
+    cfg = cockpit_config()
+    sections: list[dict] = []
+
+    # 1. start here — latest issue of every stream (click → the briefings tab)
+    srows = []
+    for s in cfg["streams"]:
+        dates = _stream_dates(s["key"])
+        if dates:
+            srows.append([f'<a class="wl" data-stream="{_esc(s["key"])}">{_esc(s["label"])}</a>',
+                          _esc(dates[0]), str(len(dates))])
+    if srows:
+        sections.append({"group": "Start here", "title": "Latest briefings & digests",
+                         "html": _html_table(["Stream", "Latest", "Issues"], srows)})
+
+    # 2. what moved — cherry-picked from the watchlist (matrix + movement + active trends)
+    if cfg.get("watchlist"):
+        keep = ("matrix", "recently moved", "recently updated", "active")
+        for s in api_watchlist().get("sections", []):
+            t = s["title"].lower()
+            if any(k in t for k in keep) and not s["html"].startswith('<div class="empty"'):
+                sections.append({"group": "What moved", "title": f"{s['group']} — {s['title']}",
+                                 "html": s["html"]})
+
+    # 3. open predictions (top by nearest resolution)
+    pr = api_predictions()
+    if pr["total"]:
+        top = sorted([r for r in pr["rows"] if r["status"] == "open"],
+                     key=lambda r: r["resolves_by"] or "9999")[:8]
+        prows = [[f'<a class="wl" data-page="predictions/{_esc(r["id"])}">{_esc(r["subject"] or r["id"])}</a>',
+                  _esc(str(r["confidence"] or "—")), _esc(r["resolves_by"] or "—")] for r in top]
+        html = (f'<p class="home-note">{pr["total"]} tracked · {pr["due_soon"]} due ≤7d · '
+                f'{pr["idle"]} idle</p>' + _html_table(["Prediction", "Conf", "Resolves by"], prows))
+        sections.append({"group": "Predictions", "title": "Open predictions", "html": html})
+
+    # 4. knowledge gaps — latest lacuna findings, when the extension maintains that namespace
+    gaps = _load_dir("lacuna")
+    if gaps:
+        recent = sorted(gaps, key=lambda c: str(c.get("last_updated") or c.get("created") or ""),
+                        reverse=True)[:8]
+        grows = [[_page_link(c), _esc(str(c.get("created") or "")[:10] or "—")] for c in recent]
+        sections.append({"group": "Knowledge gaps", "title": "Latest lacuna findings",
+                         "html": _html_table(["Gap", "Found"], grows)})
+
+    # 5. jump-offs — the pack's CURATED dashboards (not the raw all-pages list)
+    if cfg.get("dashboards"):
+        links = "".join(f'<a class="wl home-chip" data-page="dashboards/{_esc(d)}">'
+                        f'{_esc(str(d).replace("-", " "))}</a>' for d in cfg["dashboards"])
+        sections.append({"group": "Jump off", "title": "Curated dashboards",
+                         "html": f'<div class="home-chips">{links}</div>'})
+
+    return {"sections": sections}
+
+
 @app.get("/api/dashboards")
 def api_dashboards():
     groups = cockpit_config()["dashboards"]

@@ -623,6 +623,93 @@ def _stamp_maintainer(fm: dict, *, creation: bool) -> None:
         fm.setdefault("discovered_by", pack)
 
 
+# --- future-date guard ------------------------------------------------------
+# The envelope's record-keeping dates say when a page WAS written/touched — a future value is
+# always fabricated (a weekly-brief lane hallucinated published: <next Sunday> onto an empty
+# stub, despite its prompt explicitly forbidding a guessed date; prompts are the unenforced
+# half). Enforced HERE — the boundary every writer crosses. Deliberately NARROW: only the
+# record-keeping fields — domain dates (a KEV due_date, an event date, a contract end) are
+# legitimately future and are never checked. +1 day tolerance absorbs TZ skew (a UTC-thinking
+# model just past midnight UTC is "tomorrow" relative to a US-eastern host clock).
+_RECORD_DATE_FIELDS = ("published", "updated", "created", "last_updated")
+
+
+def _future_date_reject(fm: dict, fields=_RECORD_DATE_FIELDS) -> Optional[str]:
+    try:
+        today = datetime.date.fromisoformat(_today())
+    except ValueError:          # unparseable test override — never block writes on guard plumbing
+        return None
+    limit = today + datetime.timedelta(days=1)
+    for k in fields:
+        v = fm.get(k)
+        d = None
+        if isinstance(v, datetime.datetime):    # before date: datetime IS a date subclass
+            d = v.date()
+        elif isinstance(v, datetime.date):
+            d = v
+        elif isinstance(v, str):
+            m = re.match(r"(\d{4}-\d{2}-\d{2})", v.strip())
+            if m:
+                try:
+                    d = datetime.date.fromisoformat(m.group(1))
+                except ValueError:
+                    d = None
+        if d and d > limit:
+            return (f"{k}: {d.isoformat()} is in the future (today is {today.isoformat()}) — "
+                    f"record-keeping dates must be the ACTUAL write date, never a guessed or "
+                    f"future one; use today's date")
+    return None
+
+
+# --- briefing wikilink guard --------------------------------------------------------------
+# Briefings are ANALYSIS pages that cite existing knowledge — every [[wikilink]] on one must
+# resolve, or the flagship page a human reads daily ships dead links (live incident: the daily
+# brief invented slugs from memory — [[entities/q/quimarat]] for the real quimat-rat page — and
+# the broken-wikilinks drain's >=3-inbound wake gate treats 1-ref brief links as orphan noise
+# forever). Scoped to briefings/ ONLY: source pages legitimately forward-reference entities that
+# don't exist yet (the stub-creation drain depends on that), so a vault-wide check would break
+# the ingest pattern. Rejection carries did-you-mean suggestions so the lane model can retry
+# with the real slug — the same feedback loop schema rejections use.
+_WIKILINK = re.compile(r"\[\[([^\]|#\n]+)")
+_STRICT_LINK_NS = ("briefings",)
+
+
+def _briefing_link_reject(p: Path, body: Optional[str]) -> Optional[str]:
+    if _namespace(p) not in _STRICT_LINK_NS or not body:
+        return None
+    targets = []
+    for m in _WIKILINK.finditer(body):
+        t = m.group(1).strip().strip("/")
+        if t.endswith(".md"):
+            t = t[:-3]
+        if t:
+            targets.append(t)
+    if not targets:
+        return None
+    # one walk builds both the exact rel-path set and the basename->rel-path map
+    rels: set[str] = set()
+    by_base: dict[str, str] = {}
+    for f in WIKI.rglob("*.md"):
+        rel = f.relative_to(WIKI).as_posix()[:-3]
+        rels.add(rel)
+        by_base.setdefault(f.stem, rel)
+    broken = []
+    for t in dict.fromkeys(targets):                      # de-dup, keep order
+        if t in rels or ("/" not in t and t in by_base):
+            continue
+        base = t.split("/")[-1]
+        if base in by_base:                               # right page, wrong dir/shard
+            broken.append(f"[[{t}]] — did you mean [[{by_base[base]}]]?")
+            continue
+        near = difflib.get_close_matches(base, list(by_base), n=2, cutoff=0.6)
+        hint = " — did you mean " + " or ".join(f"[[{by_base[n]}]]" for n in near) + "?" if near else ""
+        broken.append(f"[[{t}]] (no such page){hint}")
+    if broken:
+        return ("briefing links must resolve to existing pages (cite what you actually read; "
+                "do not guess slugs): " + "; ".join(broken))
+    return None
+
+
 def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> str:
     p = _safe(path)
     if p is None:
@@ -642,6 +729,12 @@ def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> st
     nsr = _namespace_reject(p)
     if nsr:
         return f"rejected: {nsr}"
+    fdr = _future_date_reject(fm)
+    if fdr:
+        return f"rejected: {fdr}"
+    blr = _briefing_link_reject(p, body)
+    if blr:
+        return f"rejected: {blr}"
     # Identity-based dedup BEFORE writing: route a cosmetic duplicate to the
     # existing canonical (authority) or flag+refuse a slug collision, instead of
     # minting a second canonical (okengine#98/#99/#100). Stamps fm["id"].
@@ -722,9 +815,18 @@ def _update(path: str, frontmatter_yaml: Union[str, dict, None] = None,
         patch = _coerce_fm(frontmatter_yaml)
         if patch is None:
             return "rejected: frontmatter_yaml is not a valid YAML mapping"
+        # Future-date guard on ONLY the fields this patch supplies: a legacy page that already
+        # carries a bad future date must stay fixable by an update that doesn't touch dates.
+        fdr = _future_date_reject(patch, fields=tuple(k for k in _RECORD_DATE_FIELDS if k in patch))
+        if fdr:
+            return f"rejected: {fdr}"
         new_fm.update(patch)
     new_fm, drift = _normalize_drift(new_fm, p)    # converge on schema vocab (okengine#46)
     new_body = cur_body if body is None else body
+    if body is not None:                           # only when this update REWRITES the body
+        blr = _briefing_link_reject(p, new_body)
+        if blr:
+            return f"rejected: {blr}"
     # Bump version, stamp last_updated.
     try:
         new_fm["version"] = int(new_fm.get("version", 1)) + 1

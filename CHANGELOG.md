@@ -14,6 +14,40 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
 > **About panel** (reader/cockpit deployment purpose + composition from live state); and now **pack
 > bundles** (v0.10.0). If you are jumping from v0.3.5, read v0.4.0 onward.
 
+## v0.10.2
+
+Patch+: the first day of v0.10.1 in production — every gap a live analyst hit, fixed at the
+enforced boundary with a red test, plus one real feature (the cockpit analyst home tab).
+
+### Added
+- **Cockpit analyst home tab** — the cockpit was a set of disconnected tabs plus a flat
+  all-page-links dashboard: a map, not a route. `/api/home` composes the vault's LIVE surfaces
+  in triage order — latest briefs → what moved (watchlist + trends) → open predictions →
+  knowledge gaps (lacuna) → the pack's curated dashboards as jump-off chips. Config-driven and
+  domain-agnostic; an empty/unconfigured surface is omitted, so a young vault never renders
+  placeholder walls. `home` joins the default tabs; packs with explicit `tabs:` opt in by
+  listing it.
+
+### Changed
+- **`build-index-tree` runs intraday (every 6h)** — a nightly-only INDEX build meant pages
+  ingested during the day didn't appear in namespace listings until the next morning (hit live
+  twice; cyber-market had a pack-level workaround, now retired). Freshness of an engine-generated
+  artifact is an engine default. Hours sit outside the 01–02 DST window; the DST guard test now
+  parses comma-list hour fields, and a red test pins the intraday cadence.
+
+### Fixed
+- **Write path rejects future record-keeping dates** — a weekly-brief lane fabricated
+  `published: <next Sunday>` onto an empty stub despite its prompt forbidding it; prompts are
+  the unenforced half. `create`/`update` now reject future `published`/`updated`/`created`/
+  `last_updated` (+1 day TZ tolerance; domain dates like a KEV `due_date` are never checked;
+  update checks only patch-supplied fields so legacy pages stay fixable).
+- **Briefing wikilinks must resolve** — the daily brief shipped 4 dead links from invented
+  slugs ([[entities/q/quimarat]] for the real `quimat-rat`), and the broken-wikilinks drain's
+  ≥3-inbound wake gate treats single-ref brief links as orphan noise forever. Create/body-update
+  of a `briefings/` page now rejects unresolvable `[[targets]]` with did-you-mean suggestions
+  (sources keep their legitimate forward-references); the drain treats any briefing-cited broken
+  target as high-impact regardless of inbound count.
+
 ## v0.10.1
 
 Patch: post-cut hardening from the v0.10.0 pre-release **invariant audit** (a 58-agent cross-surface

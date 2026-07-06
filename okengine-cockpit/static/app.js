@@ -25,7 +25,7 @@ function tick() {
 tick(); setInterval(tick, 30000);
 
 // ── tabs (built at runtime from /api/config — domain-agnostic) ───────────────
-const TAB_LABELS = { briefings: "Briefings", dashboards: "Dashboards", predictions: "Predictions", competitors: "Competitors", watchlist: "Watchlist", browse: "Browse", chat: "Chat" };
+const TAB_LABELS = { home: "Home", briefings: "Briefings", dashboards: "Dashboards", predictions: "Predictions", competitors: "Competitors", watchlist: "Watchlist", browse: "Browse", chat: "Chat" };
 let TABS = [];
 function buildTabs(tabs) {
   TABS = (tabs && tabs.length) ? tabs.slice() : ["briefings"];
@@ -41,6 +41,7 @@ function buildTabs(tabs) {
 function showTab(name) {
   $$("#tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
   $$(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + name));
+  if (name === "home" && !homeLoaded) loadHome();
   if (name === "dashboards" && !dashLoaded) loadDashboards();
   if (name === "predictions" && !predLoaded) loadPredictions();
   if (name === "competitors" && !compLoaded) loadCompetitors();
@@ -247,6 +248,24 @@ async function loadCompetitors() {
     pane.innerHTML = views.length ? views.map(v =>
       `<div class="cview"><div class="h">${esc(v.title)}${v.updated ? " · updated " + esc(v.updated) : ""}</div>
        <div class="b md">${v.html}</div></div>`).join("") : `<div class="empty">no competitor views found</div>`;
+  } catch (e) { pane.innerHTML = `<div class="empty">failed (${e.message})</div>`; }
+}
+
+// ── analyst home (the flow: latest briefs → what moved → predictions → gaps) ──
+let homeLoaded = false;
+async function loadHome() {
+  homeLoaded = true;
+  const pane = $("#home-pane");
+  try {
+    const { sections } = await j("/api/home");
+    let html = "", lastGroup = null;
+    sections.forEach(s => {
+      if (s.group !== lastGroup) { html += `<h2 class="watch-group">${esc(s.group)}</h2>`; lastGroup = s.group; }
+      html += `<div class="cview"><div class="h">${esc(s.title)}</div><div class="b md">${s.html}</div></div>`;
+    });
+    pane.innerHTML = html || `<div class="empty">nothing to show yet — surfaces appear as their lanes produce data</div>`;
+    // a stream row jumps to the briefings tab (a.wl data-page links use the global handler)
+    $$("[data-stream]", pane).forEach(a => a.onclick = (e) => { e.preventDefault(); showTab("briefings"); });
   } catch (e) { pane.innerHTML = `<div class="empty">failed (${e.message})</div>`; }
 }
 

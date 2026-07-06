@@ -206,7 +206,16 @@ def main() -> int:
         key=lambda kv: (-len(kv[1]), -sum(c for _, c in kv[1]), kv[0]),
     )
 
-    high_impact = [t for t in ranked if len(t[1]) >= MIN_INBOUND]
+    # High-impact = inbound threshold OR cited from a BRIEFING. >=MIN_INBOUND is right for the
+    # sources tree (single-orphan links are noise at 10k+ pages), but a briefing is the curated,
+    # user-facing surface — one dead link there is one a human hits TODAY. Without this, a
+    # brief's single-ref invented slug sat below the gate as "orphan noise" forever (live
+    # incident: 4 broken links on okcti's 2026-07-06 daily brief). The write path now rejects
+    # unresolvable briefing links at create/update; this is the backstop for anything already
+    # in the vault or written outside the enforced path.
+    high_impact = [t for t in ranked
+                   if len(t[1]) >= MIN_INBOUND
+                   or any(rel.split("/")[0] == "briefings" for rel, _ in t[1])]
     total_broken = len(ranked)
     total_high_impact = len(high_impact)
 
@@ -214,7 +223,7 @@ def main() -> int:
     print(f"  vault: {VAULT}")
     print(f"  total wiki pages scanned: {len(pages)}")
     print(f"  unique broken targets: {total_broken}")
-    print(f"  high-impact (>={MIN_INBOUND} inbound sources): {total_high_impact}")
+    print(f"  high-impact (>={MIN_INBOUND} inbound sources, or any briefing-cited): {total_high_impact}")
     print(f"  batch size: {BATCH_SIZE}")
     print()
 

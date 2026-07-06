@@ -554,7 +554,7 @@ def test_create_stamps_name_from_h1_when_absent(vault):
     m, root = vault
     body = "## Summary\nblah\n\n# Crypto Clipper uses Tor for propagation\nbody\n"
     res = m._create("sources/2026/06/crypto-clipper", "type: source\npublisher: MS\n"
-                    "source_kind: vendor-research\npublished: 2026-06-17", body)
+                    "source_kind: vendor-research\npublished: 2026-06-14", body)
     assert res.startswith("created"), res
     p = root / "wiki" / "sources" / "2026" / "06" / "crypto-clipper.md"
     assert _fm(p)["name"] == "Crypto Clipper uses Tor for propagation"   # from the # H1, not ## Summary
@@ -566,7 +566,7 @@ def test_create_stamps_name_from_h1_when_absent(vault):
     # no name and no true H1 -> left nameless (no spurious stamp; source has no
     # required `name`, so it still creates)
     m._create("sources/2026/06/nohdr", "type: source\npublisher: MS\n"
-              "source_kind: vendor-research\npublished: 2026-06-17", "## Summary only\nno h1 here\n")
+              "source_kind: vendor-research\npublished: 2026-06-14", "## Summary only\nno h1 here\n")
     assert "name" not in _fm(root / "wiki" / "sources" / "2026" / "06" / "nohdr.md")
 
 
@@ -736,3 +736,131 @@ def test_create_stamps_iso_timestamp(vault, monkeypatch):
     fm = yaml.safe_load((root / "wiki" / "entities" / "q" / "qilin.md").read_text().split("---")[1])
     assert fm["last_updated"] == "2026-06-28T14:30:00Z"   # a timestamp, not just a date
     assert fm["created"] == "2026-06-28T14:30:00Z"
+
+
+# --- future-date guard (record-keeping fields only) ---------------------------------------
+# Live incident: a weekly-brief lane hallucinated `published: <next Sunday>` onto an empty
+# stub (briefings/weekly-2026-07-12.md, written 2026-07-05) even though its prompt explicitly
+# said "use TODAY's actual date, not a guessed or future one" — the prompt is the unenforced
+# half. These pin the enforced half at the boundary every writer crosses.
+# The vault fixture pins today = 2026-06-15.
+
+def test_create_rejects_future_published(vault):
+    m, root = vault
+    res = m._create("entities/w/weekly-x",
+                    "type: entity\nname: Weekly X\npublished: 2026-06-21\nupdated: 2026-06-21",
+                    "body")
+    assert res.startswith("rejected:") and "future" in res, res
+    assert not (root / "wiki" / "entities" / "w" / "weekly-x.md").exists()
+
+
+def test_create_rejects_future_yaml_bare_date(vault):
+    """YAML parses a bare `published: 2026-07-12` into a datetime.date — the exact shape the
+    incident wrote. The guard must handle the parsed-date type, not only strings."""
+    m, root = vault
+    res = m._create("entities/w/weekly-y",
+                    {"type": "entity", "name": "Weekly Y",
+                     "published": __import__("datetime").date(2026, 7, 12)},
+                    "body")
+    assert res.startswith("rejected:") and "future" in res, res
+
+
+def test_create_allows_today_and_one_day_skew(vault):
+    m, root = vault
+    assert m._create("entities/t/today-page",
+                     "type: entity\nname: T\npublished: 2026-06-15", "b").startswith("created")
+    # +1 day = TZ-skew tolerance (UTC-thinking model past midnight UTC on a US-eastern host)
+    assert m._create("entities/t/skew-page",
+                     "type: entity\nname: S\npublished: 2026-06-16", "b").startswith("created")
+
+
+def test_create_ignores_future_domain_dates(vault):
+    """NARROW guard: domain dates are legitimately future (a KEV due_date, an event date,
+    a contract end) — only the record-keeping envelope fields are checked."""
+    m, root = vault
+    res = m._create("entities/k/kev-cve",
+                    "type: entity\nname: KEV\ndue_date: 2027-01-01\nevent_date: 2026-12-31",
+                    "b")
+    assert res.startswith("created"), res
+
+
+def test_update_rejects_future_date_in_patch_only(vault):
+    """The guard checks ONLY the fields the patch supplies — a legacy page already carrying a
+    bad future date must stay fixable by an update that doesn't touch dates."""
+    m, root = vault
+    # a legacy page with a future `published`, written OUTSIDE the write path
+    legacy = root / "wiki" / "entities" / "l" / "legacy.md"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("---\ntype: entity\nname: Legacy\nid: entities:legacy\npublished: 2026-07-12\n---\nold\n",
+                      encoding="utf-8")
+    # patching a future date -> rejected, file untouched
+    res = m._update("entities/l/legacy", "updated: 2026-06-30")
+    assert res.startswith("rejected:") and "future" in res, res
+    assert "old" in legacy.read_text()
+    # an update NOT touching record dates goes through (and can fix the page)
+    res = m._update("entities/l/legacy", "published: 2026-06-15", "fixed body")
+    assert res.startswith("updated"), res
+    assert "fixed body" in legacy.read_text()
+
+
+# --- briefing wikilink guard --------------------------------------------------------------
+# Live incident (okcti daily brief 2026-07-06): the lane invented slugs from memory —
+# [[entities/q/quimarat]] for the real entities/q/quimat-rat page — shipping 4 dead links on
+# the one page a human reads daily. The broken-wikilinks drain's >=3-inbound wake gate treats
+# single-ref brief links as orphan noise, so the boundary must reject them with suggestions.
+
+def _seed(root, rel, fm="type: entity\nname: X\n"):
+    p = root / "wiki" / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(f"---\n{fm}---\nbody\n", encoding="utf-8")
+
+
+def test_briefing_with_broken_link_rejected_with_suggestion(vault):
+    m, root = vault
+    _seed(root, "entities/q/quimat-rat.md")
+    res = m._create("briefings/daily-2026-06-15",
+                    "type: entity\nname: Daily\npublished: 2026-06-15",
+                    "New RAT [[entities/q/quimarat]] spotted.")
+    assert res.startswith("rejected:") and "quimat-rat" in res, res   # did-you-mean carries the real slug
+    assert not (root / "wiki" / "briefings" / "daily-2026-06-15.md").exists()
+
+
+def test_briefing_wrong_shard_suggests_exact_page(vault):
+    """Right basename, wrong dir (the [[entities/p/oauth-...]] shape) -> exact suggestion."""
+    m, root = vault
+    _seed(root, "entities/s/storm-2372.md")
+    res = m._create("briefings/daily-x", "type: entity\nname: D\n",
+                    "Actor [[entities/p/storm-2372]] is active.")
+    assert res.startswith("rejected:") and "[[entities/s/storm-2372]]" in res, res
+
+
+def test_briefing_with_resolving_links_created(vault):
+    m, root = vault
+    _seed(root, "entities/q/quimat-rat.md")
+    _seed(root, "entities/s/skillcloak.md")
+    res = m._create("briefings/daily-good", "type: entity\nname: D\n",
+                    "See [[entities/q/quimat-rat]] and bare [[skillcloak]] and [[entities/s/skillcloak|labeled]].")
+    assert res.startswith("created"), res
+
+
+def test_source_forward_reference_still_allowed(vault):
+    """Scope: sources legitimately link entities that DON'T exist yet (the stub-creation
+    drain depends on that declared-but-uncreated state) — the guard is briefings-only."""
+    m, root = vault
+    res = m._create("sources/2026/06/new-report",
+                    "type: source\npublisher: X\nsource_kind: vendor-research\npublished: 2026-06-14",
+                    "Updates [[entities/not-yet-created]] with new capability.")
+    assert res.startswith("created"), res
+
+
+def test_briefing_update_body_rechecked(vault):
+    m, root = vault
+    _seed(root, "entities/q/quimat-rat.md")
+    assert m._create("briefings/daily-upd", "type: entity\nname: D\n",
+                     "ok [[entities/q/quimat-rat]]").startswith("created")
+    # body rewrite introducing a broken link -> rejected, page untouched
+    res = m._update("briefings/daily-upd", None, "now broken [[entities/z/zzz-nope]]")
+    assert res.startswith("rejected:"), res
+    assert "quimat-rat" in (root / "wiki" / "briefings" / "daily-upd.md").read_text()
+    # fm-only update (no body) never walks the vault
+    assert m._update("briefings/daily-upd", "tags: [x]").startswith("updated")
