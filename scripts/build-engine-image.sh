@@ -86,6 +86,10 @@ cp -r "$ENGINE_DIR/plugins/model-providers/openrouter" "$WORK/plugins/model-prov
 # plugin (addition, not a fork). Auto-loads via kind: backend alongside the bundled web providers.
 mkdir -p "$WORK/plugins/web"
 cp -r "$ENGINE_DIR/plugins/web/serper" "$WORK/plugins/web/serper"
+# Bake the RUNNING engine version into the image (okengine#192) so deployment_validate can compare
+# it to the deployment's runtime stamp and self-heal an image-roll that skipped the re-stamp — the
+# About panel then never reports a version the deployment isn't running.
+printf '%s\n' "$RELEASE" > "$WORK/.okengine_release"
 # drop any __pycache__ that hitched along
 find "$WORK/okengine-mcp" "$WORK/okengine-reader" "$WORK/scripts" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
 

@@ -14,6 +14,21 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
 > **About panel** (reader/cockpit deployment purpose + composition from live state); and now **pack
 > bundles** (v0.10.0). If you are jumping from v0.3.5, read v0.4.0 onward.
 
+## v0.10.4
+
+A follow-on to the v0.10.3 release that closes the version-reporting drift the release itself
+exposed.
+
+### Fixed
+- **Runtime version stamp self-heals against the running engine** (okengine#192) — the About panel
+  and the `deployment_validate` pin check read the engine version from a deployment stamp written
+  ONLY by `ensure-runtime` at initial deploy, so an image roll (rebuild+recreate) without a re-stamp
+  left it stale — About reported a version the deployment wasn't running (found live: the whole fleet
+  showed v0.9.1 while running v0.10.3). `build-engine-image` now bakes the running version into the
+  image (`/opt/hermes/.okengine_release`); `check_pins` reads it (the Hermes INSTALL dir, not
+  `HERMES_HOME` which is the data dir) and, on a stamp desync, self-heals the stamp to the running
+  version + WARNs — so About self-corrects and the missing re-stamp in the roll is surfaced.
+
 ## v0.10.3
 
 A live-analyst iteration on v0.10.2: making cockpit aggregates navigable, load-balancing web

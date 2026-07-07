@@ -354,3 +354,43 @@ def test_partition_no_dups_passes(tmp_path, monkeypatch):
         "cves/2026/06/CVE-2026-48558": "cve",
     })
     assert [x for x in f if x[1] == "partition-dups"] == []
+def test_stale_stamp_selfheals_against_running_engine(tmp_path, monkeypatch):
+    """okengine#192: an image roll without a re-stamp leaves the runtime stamp behind the RUNNING
+    engine, so About reports the wrong version. check_pins compares the stamp to the baked
+    $HERMES/.okengine_release, refreshes the stamp (About corrects on next read), and WARNs so the
+    missing re-stamp in the roll is visible."""
+    vault = tmp_path / "vault"; data = tmp_path / "data"; hermes = tmp_path / "hermes"
+    (vault / "wiki").mkdir(parents=True); data.mkdir(); hermes.mkdir()
+    (vault / "engine.version").write_text("engine: okengine\nversion: v0.10.3\nhermes_pin: v2026.7.1\n")
+    (data / "engine-runtime.yaml").write_text(              # STALE stamp (rolled without re-stamp)
+        "engine_release: v0.9.1\nhermes_pin: v2026.7.1\nhermes_sha: abc\nengine_sha: def\n")
+    (hermes / ".okengine_release").write_text("v0.10.3\n")  # the RUNNING engine, baked in the image
+
+    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    m = importlib.util.module_from_spec(spec); sys.modules["deployment_validate"] = m
+    spec.loader.exec_module(m)
+    m.F.clear(); m.VAULT, m.DATA, m.HERMES = vault, data, hermes
+    m.check_pins()
+
+    # stamp self-healed to the running engine (so the About panel now reads v0.10.3)
+    assert "engine_release: v0.10.3" in (data / "engine-runtime.yaml").read_text()
+    # the desync is surfaced (a roll skipped the re-stamp), and it's a WARN not a FAIL (it fixed it)
+    warns = [f for f in m.F if f[0] == "WARN" and "auto-refreshed" in f[2]]
+    assert len(warns) == 1, m.F
+    # ...and no engine.version-vs-stamp FAIL, because after the heal the stamp matches the pin's series
+    assert not [f for f in m.F if f[0] == "FAIL" and f[1] == "pins"], m.F
+
+
+def test_stamp_matching_running_engine_is_silent(tmp_path, monkeypatch):
+    """No desync -> no refresh, no WARN (a correctly re-stamped deploy is quiet)."""
+    vault = tmp_path / "vault"; data = tmp_path / "data"; hermes = tmp_path / "hermes"
+    (vault / "wiki").mkdir(parents=True); data.mkdir(); hermes.mkdir()
+    (vault / "engine.version").write_text("engine: okengine\nversion: v0.10.3\nhermes_pin: v2026.7.1\n")
+    (data / "engine-runtime.yaml").write_text("engine_release: v0.10.3\nhermes_pin: v2026.7.1\n")
+    (hermes / ".okengine_release").write_text("v0.10.3\n")
+    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    m = importlib.util.module_from_spec(spec); sys.modules["deployment_validate"] = m
+    spec.loader.exec_module(m)
+    m.F.clear(); m.VAULT, m.DATA, m.HERMES = vault, data, hermes
+    m.check_pins()
+    assert not [f for f in m.F if "auto-refreshed" in f[2]], m.F

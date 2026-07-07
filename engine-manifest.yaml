@@ -12,7 +12,7 @@
 # (schema.yaml + persona + feeds + crons + content). See INSTALL.md and
 # docs/deploy-a-new-domain.md.
 version: 1
-engine_release: v0.10.3  # cockpit drilldowns (#189); web-search rotation + native Serper (#190); secure-by-default chat toolset; enforced-write-path fixes (invariant-audit); source-link + unmapped-code + partition-dedup (#54); see CHANGELOG.md
+engine_release: v0.10.4  # version-stamp self-heal against the running engine (invariant of the About panel; okengine#192); see CHANGELOG.md
 
 runtime:
   # Hermes is a PINNED DEPENDENCY, not vendored into this repo. You clone Hermes

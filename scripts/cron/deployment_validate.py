@@ -35,6 +35,9 @@ import yaml
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 DATA = Path(os.environ.get("OKENGINE_DATA", "/opt/data"))
+# The Hermes INSTALL dir (baked code + the okengine#192 version marker), NOT HERMES_HOME — which
+# Hermes sets to the DATA dir (/opt/data). Fixed /opt/hermes; overridable for tests.
+HERMES = Path(os.environ.get("OKENGINE_HERMES_DIR", "/opt/hermes"))
 F: list[tuple[str, str, str]] = []
 
 
@@ -52,7 +55,28 @@ def _yaml(p: Path):
 
 def check_pins():
     ev = _yaml(VAULT / "engine.version") if (VAULT / "engine.version").is_file() else None
-    rt = _yaml(DATA / "engine-runtime.yaml") if (DATA / "engine-runtime.yaml").is_file() else None
+    rt_path = DATA / "engine-runtime.yaml"
+    rt = _yaml(rt_path) if rt_path.is_file() else None
+    # okengine#192: the runtime stamp is written only by ensure-runtime at INITIAL deploy, so an
+    # image ROLL (rebuild+recreate) without a re-stamp leaves it stale — the About panel + the pin
+    # check below then report a version the deployment is NOT running. Compare the stamp to the
+    # RUNNING engine baked into the image ($HERMES/.okengine_release, written by build-engine-image);
+    # on desync, SELF-HEAL the stamp so the About is correct on the next read, and WARN so the
+    # missing re-stamp step in the roll is visible. No marker (pre-#192 image) -> skip silently.
+    baked = HERMES / ".okengine_release"
+    running = baked.read_text(encoding="utf-8").strip() if baked.is_file() else ""
+    if running and rt is not None:
+        stamped = str(rt.get("engine_release", ""))
+        if stamped and stamped != running:
+            rt["engine_release"] = running
+            try:
+                rt_path.write_text("".join(f"{k}: {v}\n" for k, v in rt.items()), encoding="utf-8")
+                add("WARN", "pins", f"runtime stamp said {stamped} but the running engine is {running} "
+                                    "— an image roll didn't re-stamp; auto-refreshed. Fold "
+                                    "`ensure-runtime` into the roll so the stamp never lags.")
+            except OSError:
+                add("FAIL", "pins", f"runtime stamp {stamped} != running engine {running} and the "
+                                    "stamp is not writable — About reports a version not running")
     if not ev or not rt:
         add("WARN", "pins", "engine.version or runtime stamp missing — pin drift undetectable")
         return
