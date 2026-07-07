@@ -838,8 +838,11 @@ def test_briefing_with_resolving_links_created(vault):
     m, root = vault
     _seed(root, "entities/q/quimat-rat.md")
     _seed(root, "entities/s/skillcloak.md")
+    _seed(root, "sources/2026/06/rep.md", "type: source\npublisher: X\n"
+          "source_kind: vendor-research\npublished: 2026-06-14\n")
     res = m._create("briefings/daily-good", "type: entity\nname: D\n",
-                    "See [[entities/q/quimat-rat]] and bare [[skillcloak]] and [[entities/s/skillcloak|labeled]].")
+                    "See [[entities/q/quimat-rat]] and bare [[skillcloak]] and "
+                    "[[entities/s/skillcloak|labeled]].\nSource: [[sources/2026/06/rep]]")
     assert res.startswith("created"), res
 
 
@@ -856,11 +859,113 @@ def test_source_forward_reference_still_allowed(vault):
 def test_briefing_update_body_rechecked(vault):
     m, root = vault
     _seed(root, "entities/q/quimat-rat.md")
+    _seed(root, "sources/2026/06/rep.md", "type: source\npublisher: X\n"
+          "source_kind: vendor-research\npublished: 2026-06-14\n")
     assert m._create("briefings/daily-upd", "type: entity\nname: D\n",
-                     "ok [[entities/q/quimat-rat]]").startswith("created")
+                     "ok [[entities/q/quimat-rat]]\nSource: [[sources/2026/06/rep]]").startswith("created")
     # body rewrite introducing a broken link -> rejected, page untouched
-    res = m._update("briefings/daily-upd", None, "now broken [[entities/z/zzz-nope]]")
+    res = m._update("briefings/daily-upd", None,
+                    "now broken [[entities/z/zzz-nope]]\nSource: [[sources/2026/06/rep]]")
     assert res.startswith("rejected:"), res
     assert "quimat-rat" in (root / "wiki" / "briefings" / "daily-upd.md").read_text()
     # fm-only update (no body) never walks the vault
     assert m._update("briefings/daily-upd", "tags: [x]").startswith("updated")
+
+
+# --- briefing source-citation enforcement -------------------------------------------------
+# Live (okcti weekly brief, 3x): analytically-sound briefs cited sources only as [^1] footnotes
+# / code-span paths — zero clickable [[sources/...]] links — so an analyst couldn't reach any
+# source. The grounded PROMPT didn't stop it; the write path must.
+
+def test_briefing_with_entity_claims_needs_a_source(vault):
+    m, root = vault
+    _seed(root, "entities/i/inc-ransom.md")
+    res = m._create("briefings/weekly-2026-06-15", "type: entity\nname: W\n",
+                    "INC Ransom [[entities/i/inc-ransom]] deployed Lynx this week.[^1]")
+    assert res.startswith("rejected:") and "no source" in res, res
+    assert not (root / "wiki" / "briefings" / "weekly-2026-06-15.md").exists()
+
+
+def test_briefing_with_a_source_link_passes(vault):
+    m, root = vault
+    _seed(root, "entities/i/inc-ransom.md")
+    _seed(root, "sources/2026/06/report.md", "type: source\npublisher: X\n"
+          "source_kind: vendor-research\npublished: 2026-06-14\n")
+    res = m._create("briefings/weekly-good", "type: entity\nname: W\n",
+                    "INC Ransom [[entities/i/inc-ransom]] deployed Lynx.\n"
+                    "Source: [[sources/2026/06/report]]")
+    assert res.startswith("created"), res
+
+
+def test_empty_nothing_happened_briefing_is_exempt(vault):
+    """A briefing with no entity claims (a one-line 'quiet week') needs no source."""
+    m, root = vault
+    res = m._create("briefings/daily-quiet", "type: entity\nname: Q\n",
+                    "Quiet week — nothing of analyst significance landed.")
+    assert res.startswith("created"), res
+
+
+def test_briefing_linking_only_a_dashboard_still_needs_a_source(vault):
+    """A nav link to a dashboard is not a claim's citation — if the brief makes an entity
+    claim it still needs a source; a dashboard-only link doesn't satisfy it."""
+    m, root = vault
+    _seed(root, "entities/i/inc-ransom.md")
+    _seed(root, "dashboards/top-actors.md", "type: dashboard\nname: Top\n")
+    res = m._create("briefings/daily-dash", "type: entity\nname: D\n",
+                    "See [[dashboards/top-actors]] — [[entities/i/inc-ransom]] active.")
+    assert res.startswith("rejected:") and "no source" in res, res
+
+
+# ── invariant-audit fixes (pre-release): three write-path-contract gaps ───────
+
+def test_tombstone_marks_registry_so_converge_cannot_resurrect_in_process(vault):
+    """invariant-audit HIGH: within ONE server process the id registry is cached; _tombstone wrote
+    status:tombstoned to disk but never updated reg.tombstoned, so a same-process converge saw a
+    stale set and RESURRECTED the tombstoned page. The tombstone must be registry-write-synchronous
+    (like create/converge)."""
+    m, root = vault
+    assert m._converge("entities/acme.md", "type: entity\nname: Acme\nid: authority:acme\n").startswith("created")
+    m._registry()                                  # registry now cached with the page ACTIVE
+    assert "tombstoned" in m._tombstone("entities/acme.md", "merged away")
+    out = m._converge("entities/acme.md", "type: entity\nname: Acme Reborn\nid: authority:acme\n")
+    assert "tombstoned" in out and "resurrect" in out, out          # refused, not resurrected
+    assert "status: tombstoned" in (root / "wiki" / "entities" / "acme.md").read_text()
+
+
+def test_schema_reserved_files_refuses_all_write_tools(tmp_path, monkeypatch):
+    """invariant-audit: `reserved_files` in schema.yaml is documented as a WRITE-PATH refusal and the
+    validator exempts those files from conformance — but the write path ignored the key, so declaring
+    a file reserved made it MORE writable. Every write tool must refuse a pack-reserved file."""
+    (tmp_path / "wiki").mkdir()
+    (tmp_path / "schema.yaml").write_text(_SCHEMA + "reserved_files: [SUMMARY.md]\n", encoding="utf-8")
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-06-15")
+    sys.modules.pop("write_server", None)
+    m = _load()
+    (tmp_path / "wiki" / "SUMMARY.md").write_text("---\ntype: source\n---\nbody\n", encoding="utf-8")
+    for out in (
+        m._update("SUMMARY.md", "type: source\nsource_kind: x\npublisher: y\npublished: 2026-06-01\n", "hacked"),
+        m._append_section("SUMMARY.md", "H", "x"),
+        m._patch("SUMMARY.md", "body", "hacked"),
+    ):
+        assert "refused" in out.lower() and "reserved" in out.lower(), out
+    assert "hacked" not in (tmp_path / "wiki" / "SUMMARY.md").read_text()
+
+
+def test_future_date_rejected_on_converge_patch_append(vault):
+    """invariant-audit: the future-record-date guard ('the boundary every writer crosses') was only on
+    create/update — converge, patch, and append skipped it, so a fabricated future published/updated
+    persisted through those tools. All three must reject a future record-keeping date."""
+    m, root = vault
+    assert m._converge("entities/x.md", "type: entity\nname: X\nid: authority:x\n").startswith("created")
+    # converge with a future `published` (survives _stamp, which only sets last_updated)
+    c = m._converge("entities/x.md", "type: entity\nname: X\nid: authority:x\npublished: 2099-01-01\n")
+    assert "future" in c.lower() and "reject" in c.lower(), c
+    # patch injecting a future `published`
+    pt = m._patch("entities/x.md", "name: X", "name: X\npublished: 2099-01-01")
+    assert "future" in pt.lower() and "reject" in pt.lower(), pt
+    # append to a page that already carries a future date (planted directly, bypassing the guard)
+    (root / "wiki" / "entities" / "y.md").write_text(
+        "---\ntype: entity\nname: Y\npublished: 2099-01-01\n---\nbody\n", encoding="utf-8")
+    ap = m._append_section("entities/y.md", "H", "note")
+    assert "future" in ap.lower() and "reject" in ap.lower(), ap

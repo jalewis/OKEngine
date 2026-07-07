@@ -27,11 +27,20 @@ tick(); setInterval(tick, 30000);
 // ── tabs (built at runtime from /api/config — domain-agnostic) ───────────────
 const TAB_LABELS = { home: "Home", briefings: "Briefings", dashboards: "Dashboards", predictions: "Predictions", competitors: "Competitors", watchlist: "Watchlist", browse: "Browse", chat: "Chat" };
 let TABS = [];
+let TAB_DEF_LABELS = {};   // pack-defined dataset tabs (from /api/config tab_labels)
 function buildTabs(tabs) {
   TABS = (tabs && tabs.length) ? tabs.slice() : ["briefings"];
   const nav = $("#tabs"); nav.innerHTML = "";
+  // pack-defined dataset tabs get their pane created dynamically (no static markup)
+  TABS.forEach(tname => {
+    if (TAB_LABELS[tname] || $("#view-" + tname)) return;
+    const sec = document.createElement("section");
+    sec.id = "view-" + tname; sec.className = "view";
+    sec.innerHTML = `<div class="pane dgrid" id="dpane-${tname}"><div class="empty">Loading…</div></div>`;
+    document.querySelector("main").appendChild(sec);
+  });
   TABS.forEach((t, i) => {
-    const b = el("button", i === 0 ? "active" : "", esc(TAB_LABELS[t] || t));
+    const b = el("button", i === 0 ? "active" : "", esc(TAB_LABELS[t] || TAB_DEF_LABELS[t] || t));
     b.dataset.tab = t;
     if (t === "predictions") b.insertAdjacentHTML("beforeend", '<span id="due-badge" class="badge" hidden></span>');
     b.onclick = () => showTab(t);
@@ -47,6 +56,7 @@ function showTab(name) {
   if (name === "competitors" && !compLoaded) loadCompetitors();
   if (name === "watchlist" && !watchLoaded) loadWatchlist();
   if (name === "browse" && !browseLoaded) loadBrowse();
+  if (TAB_DEF_LABELS[name] && !DTAB_LOADED[name]) loadDataTab(name);
   if (name === "chat") { const ci = $("#chat-input"); if (ci) ci.focus(); }
   if (location.hash.slice(1) !== name) location.hash = name;
 }
@@ -248,6 +258,27 @@ async function loadCompetitors() {
     pane.innerHTML = views.length ? views.map(v =>
       `<div class="cview"><div class="h">${esc(v.title)}${v.updated ? " · updated " + esc(v.updated) : ""}</div>
        <div class="b md">${v.html}</div></div>`).join("") : `<div class="empty">no competitor views found</div>`;
+  } catch (e) { pane.innerHTML = `<div class="empty">failed (${e.message})</div>`; }
+}
+
+// ── pack-defined dataset tabs (declarative boxes rendered by /api/tab/<key>) ──
+const DTAB_LOADED = {};
+async function loadDataTab(name) {
+  DTAB_LOADED[name] = true;
+  const pane = $("#dpane-" + name);
+  try {
+    const { boxes } = await j("/api/tab/" + encodeURIComponent(name));
+    pane.innerHTML = boxes.map(b => {
+      // partial labels-map drift: a compact header warning listing the raw codes (okengine#188)
+      const um = (b.unmapped && b.unmapped.length)
+        ? `<span class="um-warn" title="unmapped codes: ${esc(b.unmapped.join(", "))}">⚠ ${b.unmapped.length} unmapped</span>`
+        : "";
+      return `<section class="dbox s${Math.min(12, Math.max(3, b.span || 6))}">` +
+        `<header><span class="eb">${esc(b.title)}</span>` +
+        `<span class="dmeta">${um}${esc(b.meta || "")}</span></header>` +
+        `<div class="db">${b.html}</div></section>`;
+    }).join("")
+      || `<div class="empty">nothing to show yet — boxes appear as their lanes produce data</div>`;
   } catch (e) { pane.innerHTML = `<div class="empty">failed (${e.message})</div>`; }
 }
 
@@ -529,6 +560,36 @@ $("#ov-close").onclick = closeOverlay;
 $("#ov-back").onclick = () => { pageStack.pop(); const prev = pageStack[pageStack.length - 1]; prev ? openPage(prev, false) : closeOverlay(); };
 document.addEventListener("click", e => { const a = e.target.closest("a.wl"); if (a) { e.preventDefault(); openPage(a.dataset.page); } });
 
+// ── drilldown: a cockpit aggregate (bar/chip/bignum) → its filtered page list (okengine#189) ──
+async function openDrill(tab, box, qs) {
+  const ov = $("#page-overlay"), c = $("#ov-content");
+  ov.hidden = false; c.innerHTML = "<div class='empty'>Loading…</div>";
+  try {
+    const d = await j(`/api/drill/${encodeURIComponent(tab)}/${encodeURIComponent(box)}?${qs}`);
+    pageStack.length = 0;
+    $("#ov-title").textContent = d.title || "Matches";
+    $("#ov-path").textContent = `${d.count} page${d.count === 1 ? "" : "s"}`;
+    $("#ov-dl").innerHTML = "";
+    $("#ov-back").style.visibility = "hidden";
+    c.innerHTML = d.pages.length
+      ? `<div class="drill-list">` + d.pages.map(p =>
+          `<a class="wl drow" data-page="${esc(p.path)}"><span class="drow-t">${esc(p.title)}</span>` +
+          (p.type ? `<span class="drow-ty">${esc(p.type)}</span>` : "") + `</a>`).join("") + `</div>`
+      : `<div class="empty">no matching pages</div>`;
+    c.scrollTop = 0;
+  } catch (e) { c.innerHTML = `<div class='empty'>drilldown failed: ${esc(e.message)}</div>`; }
+}
+document.addEventListener("click", e => {
+  const el = e.target.closest("[data-drill]");
+  if (!el) return;
+  e.preventDefault();
+  if (el.dataset.dpage) { openPage(el.dataset.dpage); return; }   // value_field bar -> its page
+  const qs = el.dataset.ditem != null
+    ? "item=" + encodeURIComponent(el.dataset.ditem)
+    : "value=" + encodeURIComponent(el.dataset.dval || "");
+  openDrill(el.dataset.dtab, el.dataset.dbox, qs);
+});
+
 // ── global search ──────────────────────────────────────────────────────────
 let _searchTimer;
 const gsearch = $("#gsearch"), gresults = $("#gresults");
@@ -578,13 +639,15 @@ document.addEventListener("keydown", e => {
 async function bootstrap() {
   let cfg = { title: "cockpit", tabs: ["briefings"] };
   try { cfg = await j("/api/config"); } catch (e) { /* fall back to generic shell */ }
+  TAB_DEF_LABELS = cfg.tab_labels || {};
   document.title = cfg.title || "cockpit";
   $("#brand").innerHTML = `⬢ <span>${esc(cfg.title || "cockpit")}</span>`;
   // the cockpit's function tabs (pack-driven) + the two general-purpose tabs from
   // okengine-reader: Browse is always present; Chat only when an agent is configured.
   const tabs = (cfg.tabs && cfg.tabs.length ? cfg.tabs.slice() : ["briefings"]);
-  tabs.push("browse");
-  if (cfg.chat_enabled) tabs.push("chat");
+  // general-purpose tabs: append only when the pack config didn't place them itself
+  if (!tabs.includes("browse")) tabs.push("browse");
+  if (cfg.chat_enabled && !tabs.includes("chat")) tabs.push("chat");
   buildTabs(tabs);
 
   loadStreams();

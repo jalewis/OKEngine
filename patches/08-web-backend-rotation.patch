@@ -1,0 +1,46 @@
+diff --git a/tools/web_tools.py b/tools/web_tools.py
+index e66d0ee..097ff17 100644
+--- a/tools/web_tools.py
++++ b/tools/web_tools.py
+@@ -136,6 +136,32 @@ def _load_web_config() -> dict:
+     except (ImportError, Exception):
+         return {}
+ 
++# okengine (issue #190): opt-in round-robin across the keyed web-search backends. Set
++# `web.backend: rotate` (or `web.search_backend: rotate`) to spread load across providers
++# (e.g. Tavily + Exa) instead of pinning one, so no single free tier gets rate-limited. Config is
++# read live per call and the counter advances per call. Additive: any other value / unset is
++# unchanged. Pin extract to one provider with `web.extract_backend: <name>` if desired.
++_OKENGINE_ROTATE_I = -1
++
++
++def _okengine_rotate_backend() -> str:
++    """Next available (keyed) web backend, round-robin; normal single-pick order if none."""
++    global _OKENGINE_ROTATE_I
++    avail = [b for b, ok in (
++        ("tavily", _has_env("TAVILY_API_KEY")),
++        ("exa", _has_env("EXA_API_KEY")),
++        ("parallel", _has_env("PARALLEL_API_KEY")),
++        ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL")),
++        ("searxng", _has_env("SEARXNG_URL")),
++        ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
++        ("ddgs", _ddgs_package_importable()),
++    ) if ok]
++    if not avail:
++        return "firecrawl"
++    _OKENGINE_ROTATE_I = (_OKENGINE_ROTATE_I + 1) % len(avail)
++    return avail[_OKENGINE_ROTATE_I]
++
++
+ def _get_backend() -> str:
+     """Determine which web backend to use (shared fallback).
+ 
+@@ -144,6 +170,8 @@ def _get_backend() -> str:
+     keys manually without running setup.
+     """
+     configured = (_load_web_config().get("backend") or "").lower().strip()
++    if configured == "rotate":                       # okengine#190: spread load across providers
++        return _okengine_rotate_backend()
+     if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}:
+         return configured
+ 

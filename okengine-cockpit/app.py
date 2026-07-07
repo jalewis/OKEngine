@@ -40,6 +40,7 @@ import hmac
 import threading
 import time
 import datetime
+from collections import Counter
 import subprocess
 import tempfile
 import urllib.request
@@ -232,6 +233,20 @@ def load_cockpit_config(vault: Path) -> dict:
     # dashboards grid (optional curated reading order); None => auto-list dashboards/
     dashboards = raw.get("dashboards") if isinstance(raw.get("dashboards"), list) else None
 
+    # declarative dataset tabs — the pack defines a tab as a set of DATASET BOXES over the
+    # vault (each box = one dataset, one view). The engine ships the renderer; the pack
+    # supplies the policy (which datasets, which fields, which labels). A key in `tabs`
+    # that matches a tab_defs entry renders through /api/tab/<key>.
+    tab_defs: dict[str, dict] = {}
+    td = raw.get("tab_defs")
+    if isinstance(td, dict):
+        for k, v in td.items():
+            if isinstance(v, dict) and isinstance(v.get("boxes"), list):
+                tab_defs[str(k).strip()] = {
+                    "label": str(v.get("label") or str(k).replace("-", " ").title()).strip(),
+                    "boxes": [b for b in v["boxes"] if isinstance(b, dict)],
+                }
+
     return {
         "title": title,
         "streams": streams,
@@ -241,6 +256,7 @@ def load_cockpit_config(vault: Path) -> dict:
         "predictions_dirs": pdirs,
         "tabs": tabs,
         "dashboards": dashboards,
+        "tab_defs": tab_defs,
     }
 
 
@@ -348,12 +364,38 @@ def _inline_md(s: str) -> str:
     return s
 
 
+_SRC_LINK = re.compile(r'<a class="wl" data-page="(sources/[^"]+)">([^<]*)</a>')
+
+
+def _link_originals(html: str) -> str:
+    """A cited source page carries the ORIGINAL article's `url:` in its frontmatter. Promote the
+    citation so its TITLE links STRAIGHT to that article: swap the slug text for the page's real
+    title and point it at the original reporting — the analyst reaches the primary source in one
+    click, instead of the title pointing at the internal source stub with the real url demoted to
+    a small glyph. Falls back to the internal wikilink only when the source has no http(s) url."""
+    def _enrich(m):
+        rel, text = m.group(1), m.group(2)
+        title, url = "", ""
+        try:
+            fm, _b = split_fm(safe_read(WIKI, rel + ".md"))
+            title = str(fm.get("title") or fm.get("name") or "").strip()
+            url = str(fm.get("url") or "").strip()
+        except Exception:
+            pass
+        label = _esc(title or text)
+        if url.startswith(("http://", "https://")):
+            return (f'<a class="ext" href="{_esc(url)}" target="_blank" rel="noopener noreferrer"'
+                    f' title="original article">{label}</a>')
+        return f'<a class="wl" data-page="{_esc(rel)}">{label}</a>'
+    return _SRC_LINK.sub(_enrich, html)
+
+
 def render_md(body: str) -> str:
     body = _resolve_embeds(body)
     body = re.sub(r"```dataview(js)?\n.*?\n```",
                   "_[Dataview view — open in Obsidian to compute]_", body, flags=re.DOTALL)
     body = _linkify(body)
-    return md.markdown(body, extensions=["tables", "fenced_code", "sane_lists", "nl2br"])
+    return _link_originals(md.markdown(body, extensions=["tables", "fenced_code", "sane_lists", "nl2br"]))
 
 
 def safe_read(base: Path, rel: str) -> str:
@@ -375,6 +417,8 @@ def api_config():
     cfg = cockpit_config()
     return {"title": cfg["title"], "tabs": cfg["tabs"],
             "watchlist": cfg["watchlist"] is not None,
+            # labels for pack-defined dataset tabs (the frontend builds their panes dynamically)
+            "tab_labels": {k: v["label"] for k, v in (cfg.get("tab_defs") or {}).items()},
             "chat_enabled": _chat_enabled()}      # gate the Chat tab on a configured agent
 
 
@@ -678,6 +722,9 @@ def _load_dir(sub: str) -> list[dict]:
                 continue
             fm["_name"] = p.stem
             fm["_sub"] = sub
+            # the TRUE path under wiki/<sub> (shards included) — page links must carry it:
+            # basename resolution papers over it until two shards collide on a stem
+            fm["_rel"] = p.relative_to(base).as_posix()[:-3]
             out.append(fm)
     _DIR_CACHE[sub] = (now, out)
     return out
@@ -688,7 +735,8 @@ def _disp(fm: dict) -> str:
 
 
 def _page_link(fm: dict) -> str:
-    return f'<a class="wl" data-page="{_esc(fm["_sub"])}/{_esc(fm["_name"])}">{_esc(_disp(fm))}</a>'
+    rel = fm.get("_rel") or fm["_name"]          # true sharded path when _load_dir provided it
+    return f'<a class="wl" data-page="{_esc(fm["_sub"])}/{_esc(rel)}">{_esc(_disp(fm))}</a>'
 
 
 def _html_table(headers: list[str], rows: list[list[str]]) -> str:
@@ -879,14 +927,361 @@ def api_home():
         sections.append({"group": "Knowledge gaps", "title": "Latest lacuna findings",
                          "html": _html_table(["Gap", "Found"], grows)})
 
-    # 5. jump-offs — the pack's CURATED dashboards (not the raw all-pages list)
-    if cfg.get("dashboards"):
-        links = "".join(f'<a class="wl home-chip" data-page="dashboards/{_esc(d)}">'
-                        f'{_esc(str(d).replace("-", " "))}</a>' for d in cfg["dashboards"])
+    # 5. jump-offs — the pack's CURATED dashboards (not the raw all-pages list). Two config
+    # shapes exist: a flat slug list (["top-actors", ...] → dashboards/<slug>) and the grouped
+    # form ([{group, items: [{path, title?}]}] — paths already namespace-qualified).
+    chips: list[tuple[str, str]] = []            # (page path, label)
+    for d in cfg.get("dashboards") or []:
+        if isinstance(d, dict):
+            for it in d.get("items") or []:
+                path = str((it or {}).get("path") or "").strip().strip("/")
+                if path:
+                    chips.append((path, str(it.get("title") or path.split("/")[-1].replace("-", " "))))
+        else:
+            slug = str(d).strip().strip("/")
+            if slug:
+                chips.append((f"dashboards/{slug}", slug.replace("-", " ")))
+    if chips:
+        links = "".join(f'<a class="wl home-chip" data-page="{_esc(p)}">{_esc(lbl)}</a>'
+                        for p, lbl in chips)
         sections.append({"group": "Jump off", "title": "Curated dashboards",
                          "html": f'<div class="home-chips">{links}</div>'})
 
     return {"sections": sections}
+
+
+# ── declarative dataset tabs ─────────────────────────────────────────────────
+# The pack's cockpit config can define whole tabs as DATASET BOXES: each box names a
+# dataset (a dir + optional type/where filters) and a view (table / bars / chips /
+# bignums / cards / coverage / doc). The engine renders; the pack decides which datasets
+# an analyst sees and how they're labeled — including value maps for opaque codes
+# (e.g. NAICS sector numbers). A box whose dataset is EMPTY renders its `empty:` note
+# when one is configured (pipeline state is information), otherwise it is omitted —
+# never a wall of "none" placeholders. Design source: the okcti data-first redesign.
+
+_TONES = ("crit", "warn", "ok", "info", "mut", "acc")
+
+# Inline marker for a group_by value the pack's `labels:` map doesn't cover — the label falls
+# back to the raw code, so flag it as degraded rather than let an opaque code masquerade as a
+# curated label (okengine#188).
+_UM_FLAG = (' <span class="um-flag" title="unmapped value — no label configured '
+            '(okengine#188)">⚠</span>')
+
+
+def _ds_rows(spec: dict) -> list[dict]:
+    rows = _load_dir(str(spec.get("dir") or "").strip("/"))
+    types = spec.get("types") or ([spec["type"]] if spec.get("type") else [])
+    if types:
+        ts = {str(t) for t in types}
+        rows = [r for r in rows if str(r.get("type")) in ts]
+    for f, v in (spec.get("where") or {}).items():
+        rows = [r for r in rows if str(r.get(f)) == str(v)]
+    for f in (spec.get("has") or []):        # field-presence filter (e.g. theme pages vs
+        rows = [r for r in rows if r.get(f) not in (None, "", [])]   # shift docs in one dir)
+    tp = spec.get("today_prefix")            # e.g. published starts with today's date
+    if tp:
+        today = datetime.date.today().isoformat()
+        rows = [r for r in rows if str(r.get(tp) or "").startswith(today)]
+    return rows
+
+
+def _ds_sorted(rows: list[dict], srt: dict) -> list[dict]:
+    f = str(srt.get("field") or "")
+    if not f:
+        return rows
+    if srt.get("require"):
+        rows = [r for r in rows if r.get(f) not in (None, "", [])]
+
+    def key(r):
+        v = r.get(f)
+        try:
+            return (0, float(v))
+        except (TypeError, ValueError):
+            return (1, str(v))
+    return sorted(rows, key=key, reverse=bool(srt.get("desc")))
+
+
+def _defang(v: str) -> str:
+    return v.replace("http://", "hxxp://").replace("https://", "hxxps://").replace(".", "[.]")
+
+
+def _ds_cell(r: dict, col: dict) -> str:
+    if col.get("link"):
+        return _page_link(r)
+    v = r.get(str(col.get("field") or ""))
+    if isinstance(v, list):
+        v = ", ".join(str(x) for x in v[: int(col.get("max") or 3)])
+    v = "—" if v in (None, "", []) else str(v)
+    if col.get("date"):
+        v = v[:10]
+    if col.get("defang"):                    # IOC hygiene: never render a live URL/domain
+        return f"<code>{_esc(_defang(v))}</code>"
+    tone = col.get("tone")
+    cls = f' class="t-{tone}"' if tone in _TONES else ""
+    return f"<span{cls}>{_esc(v)}</span>"
+
+
+def _drill_attrs(drill, *, value=None, item=None, page=None):
+    """(class_suffix, attrs) that make an aggregate row/value navigable (okengine#189). A group_by
+    bucket (value) or bignums item opens its filtered page LIST via /api/drill; a value_field bar
+    (page) — already one page — opens that page directly. ('', '') when not navigable."""
+    if page:                                          # value_field bar -> open the page itself
+        return " drill", f' data-drill data-dpage="{_esc(page)}"'
+    if not drill or (value is None and item is None):
+        return "", ""
+    tab, bi = drill
+    sel = f' data-dval="{_esc(str(value))}"' if value is not None else f' data-ditem="{item}"'
+    return " drill", f' data-drill data-dtab="{_esc(tab)}" data-dbox="{bi}"{sel}'
+
+
+def _ds_pairs(box: dict, rows: list[dict]) -> list:
+    """(label, value, unmapped, key) tuples for bars/chips — a group_by count or explicit fields.
+    `unmapped` is True only when a `labels:` map is configured but this grouped value is absent
+    from it (okengine#188). `key` is the RAW group value (drives a group_by drilldown filter), or
+    None for value_field pairs (which are already one page each)."""
+    if box.get("group_by"):
+        labels = {str(k): str(v) for k, v in (box.get("labels") or {}).items()}
+        drop = {"", "None", "Unknown", "nan"}
+        cnt = Counter(str(r.get(box["group_by"])) for r in rows
+                      if str(r.get(box["group_by"]) or "") not in drop)
+        return [(labels.get(k, k), v, bool(labels) and k not in labels, k)
+                for k, v in cnt.most_common(int(box.get("limit") or 8))]
+    vf = str(box.get("value_field") or "")
+    lf = str(box.get("label_field") or "title")
+    rs = [r for r in rows if r.get(vf) not in (None, "")]
+    rs = _ds_sorted(rs, {"field": vf, "desc": True})[: int(box.get("limit") or 8)]
+    # key = the bar's own page path — a value_field bar is one page, so it opens directly
+    return [(str(r.get(lf) or r.get("name") or r.get("_name") or "?"), int(float(r.get(vf) or 0)),
+             False, f'{r.get("_sub", "")}/{r.get("_rel") or r.get("_name", "")}'.strip("/"))
+            for r in rs]
+
+
+def _v_table(box: dict, rows: list[dict]) -> str:
+    cols = [c for c in (box.get("columns") or []) if isinstance(c, dict)]
+    rows = _ds_sorted(rows, box.get("sort") or {})[: int(box.get("limit") or 10)]
+    if not rows or not cols:
+        return ""
+    return _html_table([str(c.get("label") or c.get("field") or "") for c in cols],
+                       [[_ds_cell(r, c) for c in cols] for r in rows])
+
+
+def _v_bars(box: dict, rows: list[dict], drill=None) -> str:
+    pairs = _ds_pairs(box, rows)
+    if not pairs:
+        return ""
+    mx = max(v for _, v, _, _ in pairs) or 1
+    tone = box.get("tone") if box.get("tone") in _TONES else "acc"
+    grp = bool(box.get("group_by"))
+    out = []
+    for l, v, um, key in pairs:
+        dc, da = _drill_attrs(drill, value=key) if grp else _drill_attrs(drill, page=key)
+        out.append(f'<div class="brow{" um" if um else ""}{dc}"{da}>'
+                   f'<span class="bl">{_esc(l)}{_UM_FLAG if um else ""}</span>'
+                   f'<span class="btrk"><i class="bfill t-{tone}" style="width:{100 * v / mx:.0f}%"></i></span>'
+                   f'<span class="bnum">{v:,}</span></div>')
+    return "".join(out)
+
+
+def _v_chips(box: dict, rows: list[dict], drill=None) -> str:
+    pairs = _ds_pairs(box, rows)
+    if not pairs:
+        return ""
+    grp = bool(box.get("group_by"))
+    out = []
+    for l, v, um, key in pairs:
+        dc, da = _drill_attrs(drill, value=key) if grp else _drill_attrs(drill, page=key)
+        out.append(f'<span class="dchip{" um" if um else ""}{dc}"{da}>'
+                   f'{_esc(l)}{_UM_FLAG if um else ""} <b>{v:,}</b></span>')
+    return '<div class="dchips">' + "".join(out) + "</div>"
+
+
+def _v_bignums(box: dict, rows: list[dict], drill=None) -> str:
+    out = []
+    for i, it in enumerate(box.get("items") or []):
+        if not isinstance(it, dict):
+            continue
+        rs = _ds_rows(it["dataset"]) if it.get("dataset") else rows
+        for f, v in (it.get("where") or {}).items():
+            rs = [r for r in rs if str(r.get(f)) == str(v)]
+        if it.get("stat") == "top" and it.get("group_by"):
+            cnt = Counter(str(r.get(it["group_by"])) for r in rs if r.get(it["group_by"]))
+            val = cnt.most_common(1)[0][0] if cnt else "—"
+        else:
+            val = f"{len(rs):,}"
+        tone = it.get("tone")
+        cls = f" t-{tone}" if tone in _TONES else ""
+        dc, da = _drill_attrs(drill, item=i)
+        out.append(f'<div class="bn-item{dc}"{da}><div class="bn-v{cls}">{_esc(val)}</div>'
+                   f'<div class="bn-l">{_esc(str(it.get("label") or ""))}</div></div>')
+    return f'<div class="bignums">{"".join(out)}</div>' if out else ""
+
+
+def _v_cards(box: dict, rows: list[dict]) -> str:
+    """Trend-style cards: name + direction glyph + status chip + per-bucket mini bars."""
+    tf = str(box.get("title_field") or "title")
+    df = str(box.get("dir_field") or "direction")
+    sf = str(box.get("status_field") or "trend_status")
+    series = str(box.get("series_field") or "count_by_year")
+    glyph = {"rising": ("▲", "ok"), "falling": ("▼", "crit")}
+    cards = []
+    for r in rows[: int(box.get("limit") or 12)]:
+        g, gc = glyph.get(str(r.get(df)), ("→", "mut"))
+        counts = r.get(series) if isinstance(r.get(series), dict) else {}
+        mini = ""
+        if counts:
+            try:
+                mx = max(int(v) for v in counts.values()) or 1
+                mini = '<div class="dmini">' + "".join(
+                    f'<i style="height:{max(3, 26 * int(v) / mx):.0f}px" title="{_esc(str(y))}: {_esc(str(v))}"></i>'
+                    for y, v in sorted(counts.items())) + "</div>"
+            except (TypeError, ValueError):
+                mini = ""
+        name = str(r.get(tf) or r.get("name") or r.get("_name") or "?")
+        cards.append(f'<div class="dcard"><div class="dc-n">{_page_link(r) if box.get("link") else _esc(name)}</div>'
+                     f'<div class="dc-m"><span class="t-{gc}">{g} {_esc(str(r.get(df) or "—"))}</span>'
+                     f'<span class="dchip">{_esc(str(r.get(sf) or "—"))}</span></div>{mini}</div>')
+    return f'<div class="dcards">{"".join(cards)}</div>' if cards else ""
+
+
+def _v_coverage(box: dict, rows: list[dict]) -> str:
+    """Join coverage: this dataset's `list_field` values vs a `versus` dataset's key field,
+    grouped by the versus dataset's group field (e.g. detections' covers_techniques vs
+    techniques' attack_id, grouped by tactic) — covered/total ratio bars, health-toned."""
+    lf = str(box.get("list_field") or "")
+    vs = box.get("versus") or {}
+    key_f = str(vs.get("key") or "")
+    grp_f = str(vs.get("group_by") or "")
+    if not (lf and key_f and grp_f):
+        return ""
+    covered = set()
+    for r in rows:
+        for t in (r.get(lf) or []):
+            covered.add(str(t))
+    cov: dict = {}
+    for t in _ds_rows(vs):
+        tid = str(t.get(key_f) or "")
+        tac = t.get(grp_f)
+        for x in (tac if isinstance(tac, list) else [tac]):
+            if x:
+                c = cov.setdefault(str(x), [0, 0])
+                c[1] += 1
+                if tid in covered:
+                    c[0] += 1
+    ranked = sorted(cov.items(), key=lambda kv: -kv[1][1])[: int(box.get("limit") or 10)]
+    out = []
+    for grp, (cvd, tot) in ranked:
+        pct = 100 * cvd / tot if tot else 0
+        tone = "ok" if pct >= 50 else "warn" if pct >= 30 else "crit"
+        out.append(f'<div class="brow"><span class="bl">{_esc(grp)}</span>'
+                   f'<span class="btrk"><i class="bfill t-{tone}" style="width:{pct:.0f}%"></i></span>'
+                   f'<span class="bnum">{cvd}/{tot}</span></div>')
+    return "".join(out)
+
+
+def _v_doc(box: dict):
+    """Render the LATEST matching document inline (dated filenames sort by name).
+    Returns (html, meta)."""
+    d = str(box.get("dir") or "").strip("/")
+    pat = str(box.get("glob") or "*.md")
+    if not pat.endswith(".md"):
+        pat += ".md"
+    base = WIKI / d
+    cands = sorted((p for p in base.glob(pat) if not p.name.startswith(("INDEX", "_", "."))),
+                   reverse=True) if base.is_dir() else []
+    if not cands:
+        return "", ""
+    fm, body = split_fm(safe_read(base, cands[0].name))
+    return f'<div class="ddoc">{render_md(body)}</div>', cands[0].stem
+
+
+@app.get("/api/tab/{key}")
+def api_tab(key: str):
+    cfg = cockpit_config()
+    d = (cfg.get("tab_defs") or {}).get(key)
+    if not d:
+        raise HTTPException(404, "no such tab")
+    views = {"table": _v_table, "bars": _v_bars, "chips": _v_chips,
+             "bignums": _v_bignums, "cards": _v_cards, "coverage": _v_coverage}
+    drillable = {"bars", "chips", "bignums"}
+    boxes = []
+    for bi, b in enumerate(d["boxes"]):
+        view = str(b.get("view") or "table")
+        meta = str(b.get("meta") or "")
+        unmapped: list = []
+        if view == "doc":
+            html, stem = _v_doc(b)
+            meta = meta or stem
+        else:
+            rows = _ds_rows(b.get("dataset") or {})
+            fn = views.get(view)
+            if not fn:
+                html = ""
+            elif view in drillable:           # rows/values open a filtered list (okengine#189)
+                html = fn(b, rows, (key, bi))
+            else:
+                html = fn(b, rows)
+            if not meta and rows:
+                meta = f"{len(rows):,} pages"
+            if view in ("bars", "chips"):     # surface partial-labels-map drift (okengine#188)
+                unmapped = [l for l, _v, um, _k in _ds_pairs(b, rows) if um]
+        if not html and b.get("empty"):      # honest-empty: pipeline state is information
+            html = f'<p class="dnote">{_esc(str(b["empty"]))}</p>'
+            meta = meta or "awaiting first data"
+        if html:
+            box = {"title": str(b.get("title") or ""), "meta": meta,
+                   "span": int(b.get("span") or 6), "html": html}
+            if unmapped:                      # only present when the card is degraded
+                box["unmapped"] = unmapped
+            boxes.append(box)
+    return {"label": d["label"], "boxes": boxes}
+
+
+_DRILL_CAP = 300
+
+
+def _row_page(r: dict) -> dict:
+    """{path, title, type} for a dataset row — the shape the browse/list renderer consumes."""
+    rel = r.get("_rel") or r.get("_name") or ""
+    return {"path": f'{r.get("_sub", "")}/{rel}'.strip("/"),
+            "title": _disp(r), "type": str(r.get("type") or "")}
+
+
+@app.get("/api/drill/{tab}/{box}")
+def api_drill(tab: str, box: int, value: str = Query(default=""), item: int = Query(default=-1)):
+    """The pages behind one aggregate value — a bars/chips group_by bucket, or a bignums item
+    (count / filtered-count / top-of-group). The dataset + filter are re-derived from the SAME
+    tab config the widget rendered from; the client only names the box + the bucket, never a raw
+    query (okengine#189). Returns browse-shaped pages so the UI reuses its list renderer."""
+    cfg = cockpit_config()
+    d = (cfg.get("tab_defs") or {}).get(tab)
+    if not d or not (0 <= box < len(d.get("boxes") or [])):
+        raise HTTPException(404, "no such box")
+    b = d["boxes"][box]
+    view = str(b.get("view") or "table")
+    heading = str(b.get("title") or tab)
+    if view == "bignums":
+        items = b.get("items") or []
+        if not (0 <= item < len(items)) or not isinstance(items[item], dict):
+            raise HTTPException(404, "no such item")
+        it = items[item]
+        rows = _ds_rows(it["dataset"]) if it.get("dataset") else _ds_rows(b.get("dataset") or {})
+        for f, v in (it.get("where") or {}).items():
+            rows = [r for r in rows if str(r.get(f)) == str(v)]
+        heading = str(it.get("label") or heading)
+        if it.get("stat") == "top" and it.get("group_by"):     # drill the WINNING bucket
+            cnt = Counter(str(r.get(it["group_by"])) for r in rows if r.get(it["group_by"]))
+            top = cnt.most_common(1)[0][0] if cnt else None
+            rows = [r for r in rows if str(r.get(it["group_by"])) == top] if top else []
+            heading = f"{heading}: {top}" if top else heading
+    elif view in ("bars", "chips") and b.get("group_by"):
+        gb = b["group_by"]
+        rows = [r for r in _ds_rows(b.get("dataset") or {}) if str(r.get(gb)) == value]
+        lbl = {str(k): str(v) for k, v in (b.get("labels") or {}).items()}.get(value, value)
+        heading = f"{heading}: {lbl}"
+    else:
+        raise HTTPException(400, "box is not drillable")
+    rows = _ds_sorted(rows, {"field": "title"})[:_DRILL_CAP]
+    return {"title": heading, "count": len(rows), "pages": [_row_page(r) for r in rows]}
 
 
 @app.get("/api/dashboards")

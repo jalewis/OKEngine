@@ -85,3 +85,78 @@ def test_two_sources_one_destination_both_held(tmp_path):
     assert "entities/vendor/x/xcorp" not in move_map
     assert "entities/xcorp" not in move_map
     assert len([c for c in collisions if c[1] == "entities/x/xcorp"]) == 2
+
+
+def test_canonical_key_and_find_page_agree_with_the_drain(tmp_path):
+    """okengine#54: the public helpers no_agent importers use must place a page EXACTLY where the
+    reshelve drain would (canonical_key), and must locate an existing page wherever it sits so the
+    importer merges in place instead of re-creating a flat duplicate (find_page)."""
+    m = _mod()
+    root = tmp_path
+    (root / "schema.yaml").write_text(
+        "partitioning:\n  namespaces:\n"
+        "    cves: {strategy: by-date, date_field: date_added, reshard_by: year}\n"
+        "types:\n  cve: {}\n")
+
+    # is_partitioned: cves declares a strategy; an undeclared/flat namespace does not
+    assert m.is_partitioned(root, "cves") is True
+    assert m.is_partitioned(root, "dashboards") is False
+
+    # canonical_key: by-date on date_added -> cves/YYYY/MM/slug (matches _new_key/the drain)
+    fm = {"type": "cve", "cve_id": "CVE-2026-45659", "date_added": "2026-07-01"}
+    assert m.canonical_key(root, "cves", "CVE-2026-45659", fm) == "cves/2026/07/CVE-2026-45659"
+    # no usable date -> falls back to flat, exactly where the drain would leave it
+    assert m.canonical_key(root, "cves", "CVE-2000-1", {"type": "cve"}) == "cves/CVE-2000-1"
+
+    w = root / "wiki" / "cves"
+    (w / "2026" / "07").mkdir(parents=True)
+    (w / "2026" / "07" / "CVE-2026-45659.md").write_text("---\ntype: cve\n---\ncanonical\n")
+    # only the sharded copy exists -> found despite the importer historically probing the flat root
+    got = m.find_page(root, "cves", "CVE-2026-45659")
+    assert got == w / "2026" / "07" / "CVE-2026-45659.md"
+    # duplicate (the bug): a stale flat copy alongside the shard -> the DEEPEST (canonical) wins,
+    # so repeated importer runs converge on the shard rather than ping-ponging
+    (w / "CVE-2026-45659.md").write_text("---\ntype: cve\n---\nstale flat\n")
+    assert m.find_page(root, "cves", "CVE-2026-45659") == w / "2026" / "07" / "CVE-2026-45659.md"
+    # absent -> None
+    assert m.find_page(root, "cves", "CVE-1999-9999") is None
+
+
+def test_dedup_partition_collisions_collapses_to_canonical(tmp_path):
+    """okengine#54 cleanup: same-slug copies at a flat root AND a wrong-shaped shard collapse onto
+    the ONE canonical path (chosen by canonical_key — same fn the importer uses), frontmatter is
+    union-merged, losers deleted, and [[links]] to a dropped path are rewritten."""
+    sys.path.insert(0, str(REPO / "scripts" / "cron"))
+    import dedup_partition_collisions as dd
+    import importlib
+    dd = importlib.reload(dd)
+    root = tmp_path
+    (root / "schema.yaml").write_text(
+        "partitioning:\n  namespaces:\n"
+        "    security-incidents: {strategy: by-date, date_field: incident_date, reshard_by: year}\n"
+        "types:\n  incident: {}\n")
+    w = root / "wiki" / "security-incidents"
+    # wrong-shape (year-only, from a partition-unaware writer) carries a curated field ...
+    (w / "2014").mkdir(parents=True)
+    (w / "2014" / "inc-x.md").write_text(
+        "---\ntype: incident\nincident_date: '2014-07-02'\nseverity: high\n---\nshort\n")
+    # ... and the canonical shard carries the fuller body
+    (w / "2014" / "07").mkdir(parents=True)
+    (w / "2014" / "07" / "inc-x.md").write_text(
+        "---\ntype: incident\nincident_date: '2014-07-02'\n---\nthe full incident writeup body\n")
+    # a page linking the wrong-shape path -> must be rewritten to canonical
+    (root / "wiki" / "notes").mkdir()
+    (root / "wiki" / "notes" / "n.md").write_text(
+        "---\ntype: note\n---\nsee [[security-incidents/2014/inc-x]]\n")
+
+    mm, review, removed = dd.dedup_namespace(root, "security-incidents", apply=True)
+    dd._rewrite_links(root, "security-incidents", mm, apply=True)
+
+    canonical = w / "2014" / "07" / "inc-x.md"
+    assert canonical.is_file() and not (w / "2014" / "inc-x.md").exists()   # collapsed to shard
+    assert removed == 1
+    fm, body = dd._read(canonical)
+    assert fm.get("severity") == "high"          # curated field merged in from the wrong-shape copy
+    assert "full incident writeup" in body       # longest body kept
+    note = (root / "wiki" / "notes" / "n.md").read_text()
+    assert "[[security-incidents/2014/07/inc-x]]" in note   # link rewritten to canonical

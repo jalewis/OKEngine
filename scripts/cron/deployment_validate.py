@@ -211,6 +211,51 @@ def check_timezone():
             "re-run ensure-runtime, and recreate the gateway.")
 
 
+def check_partition_dups():
+    """A partitioned namespace must hold each slug ONCE. The KEV/NVD importers wrote CVEs to the
+    flat `cves/CVE-X.md` root while the reshelve drain files them at `cves/YYYY/MM/CVE-X.md`, so a
+    partition-unaware importer re-created a flat copy every cycle → the same slug at two paths,
+    doubling every count built on it (okengine#54). Generic guard for ALL partitioned namespaces
+    across ALL domains: any slug appearing at more than one path is a FAIL (the earliest gate the
+    dup can be caught before it poisons the cockpit/indices). Flat namespaces are exempt — a slug
+    can only live at one place there anyway."""
+    wiki = VAULT / "wiki"
+    if not wiki.is_dir():
+        return
+    # every non-flat namespace declared by the root schema + any sub-domain schema
+    nss: list[str] = []
+    def _collect(sp: Path, prefix: str):
+        d = _yaml(sp)
+        for leaf, cfg in (((d or {}).get("partitioning") or {}).get("namespaces") or {}).items():
+            if (cfg or {}).get("strategy", "flat") != "flat":
+                nss.append(f"{prefix}{leaf}")
+    if (VAULT / "schema.yaml").is_file():
+        _collect(VAULT / "schema.yaml", "")
+    for sd in sorted(p for p in wiki.iterdir() if p.is_dir()):
+        if (sd / "schema.yaml").is_file():
+            _collect(sd / "schema.yaml", f"{sd.name}/")
+    for ns in nss:
+        base = wiki / ns
+        if not base.is_dir():
+            continue
+        seen: dict[str, list[str]] = {}
+        for p in base.rglob("*.md"):
+            slug = p.stem
+            # skip generated per-dir artifacts (INDEX, paginated INDEX-p02/03, _* scaffolding) —
+            # the same stem legitimately recurs in every shard dir; matches okf_migrate's skip.
+            if slug.startswith("_") or slug.startswith("INDEX") or slug in ("index", "log", "README"):
+                continue
+            seen.setdefault(slug, []).append(p.relative_to(wiki).as_posix())
+        dups = {s: paths for s, paths in seen.items() if len(paths) > 1}
+        if dups:
+            sample = "; ".join(f"{s} @ {', '.join(sorted(ps))}" for s, ps in list(dups.items())[:3])
+            add("FAIL", "partition-dups",
+                f"namespace '{ns}' has {len(dups)} slug(s) at multiple paths — partition-unaware "
+                f"writer duplicated pages (okengine#54); every count over this namespace is "
+                f"inflated. Re-file to the canonical shard and drop the stale copy. e.g. {sample}"
+                + (" …" if len(dups) > 3 else ""))
+
+
 def check_rules():
     cdir = VAULT / "config"
     for f in cdir.glob("*rules*.yaml") if cdir.is_dir() else []:  # glob-ok: vault config/ is a flat dir, not a sharded content namespace
@@ -299,8 +344,8 @@ def check_auth():
 
 def main() -> int:
     for c in (check_pins, check_schema, check_subdomains, check_crons,
-              check_timezone, check_rules, check_extensions, check_ownership,
-              check_runtime_ownership, check_auth):
+              check_timezone, check_partition_dups, check_rules, check_extensions,
+              check_ownership, check_runtime_ownership, check_auth):
         try:
             c()
         except Exception as e:

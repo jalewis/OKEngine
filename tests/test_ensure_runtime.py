@@ -185,3 +185,16 @@ def test_iwe_only_in_mcp():
     for f in ("okengine-reader/Dockerfile", "okengine-cockpit/Dockerfile", "scripts/ensure-runtime.sh"):
         assert "iwe-org/iwe/releases" not in (REPO / f).read_text(), \
             f"{f} still downloads iwe, but it no longer needs it (backlinks are in-process, #179)"
+
+
+def test_template_api_server_toolset_is_locked():
+    """Secure-by-default: the engine config template's api_server (Agent Chat) toolset must grant
+    ONLY vault read + enforced write — never web/terminal/code_execution/file/computer_use — so a
+    deployment that enables chat can't inherit a broad toolset by omission (docs/agent-chat.md's
+    'do not skip this' footgun, made the default). Add `web` per-deployment, deliberately."""
+    import yaml
+    cfg = yaml.safe_load(TEMPLATE.read_text(encoding="utf-8"))
+    api = (cfg.get("platform_toolsets") or {}).get("api_server")
+    assert api == ["okengine", "okengine-write"], api
+    forbidden = {"terminal", "code_execution", "coding", "file", "computer_use", "web", "shell"}
+    assert not (set(api) & forbidden), f"chat toolset leaked a dangerous tool: {set(api) & forbidden}"

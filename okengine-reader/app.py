@@ -315,7 +315,40 @@ def render_md(body: str) -> str:
     html = md.markdown(body, extensions=["tables", "fenced_code", "sane_lists", "nl2br"])
     for i, blk in enumerate(stash):
         html = html.replace(f"OKENGINEPANELSVG{i}MARKER", blk)
+    html = _link_originals(html)
     return nh3.clean(html, tags=_ALLOWED_TAGS, attributes=_ALLOWED_ATTRS)
+
+
+_SRC_WL = re.compile(r'<a class="wl" data-page="(sources/[^"]+)"[^>]*>([^<]*)</a>')
+
+
+def _link_originals(html: str) -> str:
+    """A cited source page carries the ORIGINAL article's `url:` in its frontmatter. Promote the
+    citation so its TITLE links STRAIGHT to that article — one click reaches the primary
+    reporting, instead of the title pointing at the internal source stub with the real url
+    demoted to a small glyph. Falls back to the internal wikilink only when the source has no
+    http(s) `url:`. Runs BEFORE nh3.clean: the anchor uses allowlisted attrs (href/target/class)
+    and nh3 stamps rel=noopener itself. Mirrors the cockpit's treatment — both UIs, same
+    affordance."""
+    def _add(m):
+        whole, rel, text = m.group(0), m.group(1), m.group(2)
+        try:
+            fp = (WIKI / (rel + ".md")).resolve()
+            if not str(fp).startswith(str(WIKI.resolve())) or not fp.is_file():
+                return whole
+            fm_m = re.match(r"\A---\s*\n(.*?\n)---", fp.read_text(encoding="utf-8", errors="replace"), re.S)
+            u = ""
+            if fm_m:
+                um = re.search(r"^url:\s*(\S+)", fm_m.group(1), re.M)
+                if um:
+                    u = um.group(1).strip("'\"")
+        except OSError:
+            return whole
+        if u.startswith(("http://", "https://")):
+            return (f'<a class="ext" href="{u}" target="_blank" '
+                    f'title="original article">{text}</a>')
+        return whole
+    return _SRC_WL.sub(_add, html)
 
 
 # ── browse: discover the vault structure at runtime ─────────────────────────

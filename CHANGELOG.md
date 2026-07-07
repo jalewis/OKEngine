@@ -14,6 +14,37 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
 > **About panel** (reader/cockpit deployment purpose + composition from live state); and now **pack
 > bundles** (v0.10.0). If you are jumping from v0.3.5, read v0.4.0 onward.
 
+## v0.10.3
+
+A live-analyst iteration on v0.10.2: making cockpit aggregates navigable, load-balancing web
+search across providers, enabling Agent Chat safely, and closing three enforced-write-path gaps
+the pre-release invariant audit surfaced.
+
+### Added
+- **Cockpit drilldowns** (okengine#189) — bignums/bars/chips were dead-end counts; every aggregate
+  now opens its filtered page list via `/api/drill` (or the page directly for `value_field` bars).
+- **Web-search provider rotation + native Serper** (okengine#190) — `web.backend: rotate`
+  round-robins across the keyed backends (carried patch 08) to spread free-tier rate-limit load; a
+  `plugins/web/serper/` overlay + patch 09 add Serper as a first-class backend, keeping Hermes pinned.
+- **Secure-by-default Agent Chat toolset** — `config.yaml.template` ships
+  `platform_toolsets.api_server: [okengine, okengine-write]` so enabling chat can't inherit a broad
+  (shell/code) toolset by omission.
+
+### Changed
+- **Source citations link the original article** — the brief's `Source: [[sources/…]]` title now
+  links straight to the source page's `url:` (reader + cockpit), not an internal stub.
+- **Unmapped `group_by` codes are flagged** (okengine#188) — a partial `labels:` map surfaces the raw
+  code as degraded instead of masquerading as a curated label.
+
+### Fixed
+- **Partition-unaware-writer duplication** (okengine#54) — `no_agent` importers wrote flat while the
+  reshelve drain sharded, re-creating duplicates (~5,800 across 8 namespaces live). `okf_migrate`
+  gains `canonical_key`/`find_page`/`is_partitioned`; a `check_partition_dups` FAIL gate + a
+  `dedup_partition_collisions` cleanup drain.
+- **Enforced write-path gaps** (invariant-audit) — tombstone now marks the in-process id registry
+  (a same-process tombstone→converge no longer resurrects a page); schema `reserved_files` is honored
+  by the write path (was validator/docs-only); the future-date guard runs on converge/patch/append.
+
 ## v0.10.2
 
 Patch+: the first day of v0.10.1 in production — every gap a live analyst hit, fixed at the

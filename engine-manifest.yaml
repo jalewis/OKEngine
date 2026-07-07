@@ -12,7 +12,7 @@
 # (schema.yaml + persona + feeds + crons + content). See INSTALL.md and
 # docs/deploy-a-new-domain.md.
 version: 1
-engine_release: v0.10.2  # analyst home tab + first-day-live boundary guards (future-date, briefing wikilinks) + intraday index default; see CHANGELOG.md
+engine_release: v0.10.3  # cockpit drilldowns (#189); web-search rotation + native Serper (#190); secure-by-default chat toolset; enforced-write-path fixes (invariant-audit); source-link + unmapped-code + partition-dedup (#54); see CHANGELOG.md
 
 runtime:
   # Hermes is a PINNED DEPENDENCY, not vendored into this repo. You clone Hermes
@@ -89,6 +89,7 @@ engine_layer:
   plugins:
     - plugins/model-providers/custom     # local OpenAI-compatible endpoint (reasoning_effort:none lever)
     - plugins/model-providers/openrouter # OpenRouter fallback provider
+    - plugins/web/serper                 # Serper web-search backend (okengine#190; pairs with patch 09)
   docs:
     - INSTALL.md                         # stock-Hermes -> OKEngine procedure
     - docs/deploy-a-new-domain.md        # pack spec + quickstart

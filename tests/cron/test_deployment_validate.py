@@ -306,3 +306,51 @@ def test_in_sync_composed_schema_artifact_is_clean(tmp_path):
     m.VAULT, m.DATA = vault, tmp_path / "data"
     m.check_schema()
     assert not any("STALE" in msg for _, _, msg in m.F), list(m.F)
+
+
+def _run_partition_check(tmp_path, monkeypatch, schema: str, pages: dict):
+    """Load the module and run ONLY check_partition_dups against a hand-built vault.
+    pages: {wiki-relative-path-without-.md: frontmatter-type}."""
+    vault = tmp_path / "vault"
+    (vault / "wiki").mkdir(parents=True)
+    (vault / "schema.yaml").write_text(schema)
+    for rel, typ in pages.items():
+        p = vault / "wiki" / (rel + ".md")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"---\ntype: {typ}\n---\n")
+    monkeypatch.setenv("WIKI_PATH", str(vault))
+    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["deployment_validate"] = m
+    spec.loader.exec_module(m)
+    m.F.clear()
+    m.VAULT = vault
+    m.check_partition_dups()
+    return list(m.F)
+
+
+_CVE_SCHEMA = ("partitioning:\n  namespaces:\n"
+               "    cves: {strategy: by-date, date_field: date_added, reshard_by: year}\n"
+               "types:\n  cve: {}\n")
+
+
+def test_partition_dup_fails(tmp_path, monkeypatch):
+    """okengine#54: the same slug at the flat root AND a shard is the double-count bug — a FAIL,
+    caught at the earliest gate before it inflates every downstream count."""
+    f = _run_partition_check(tmp_path, monkeypatch, _CVE_SCHEMA, {
+        "cves/CVE-2026-45659": "cve",            # stale flat copy
+        "cves/2026/07/CVE-2026-45659": "cve",    # canonical shard
+        "cves/2026/06/CVE-2026-48558": "cve",    # a clean, unique CVE
+    })
+    fails = [x for x in f if x[0] == "FAIL" and x[1] == "partition-dups"]
+    assert len(fails) == 1, f
+    assert "CVE-2026-45659" in fails[0][2] and "CVE-2026-48558" not in fails[0][2]
+
+
+def test_partition_no_dups_passes(tmp_path, monkeypatch):
+    """Each slug once (across shards) -> clean, no finding. A flat namespace is exempt entirely."""
+    f = _run_partition_check(tmp_path, monkeypatch, _CVE_SCHEMA, {
+        "cves/2026/07/CVE-2026-45659": "cve",
+        "cves/2026/06/CVE-2026-48558": "cve",
+    })
+    assert [x for x in f if x[1] == "partition-dups"] == []

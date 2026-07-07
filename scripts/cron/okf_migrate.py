@@ -110,6 +110,47 @@ def _new_key(namespace: str, slug: str, fm: dict, pcfg: dict, canonical: set) ->
     return None
 
 
+# ── public helpers for no_agent importers (okengine#54) ──────────────────────
+# A no_agent importer must write each page where the reshelve drain would file it, and merge
+# against the page WHEREVER it currently sits — not probe only the flat root and re-create a
+# stale duplicate every cycle (the KEV/NVD double-count). Both share okf_migrate as the SINGLE
+# source of the path logic, so importer and drain can never disagree and re-open the loop.
+
+def is_partitioned(root: Path, namespace: str) -> bool:
+    """Whether <namespace> declares a non-flat partition strategy in its governing schema — so a
+    shared writer can route partitioned pages through canonical_key while leaving flat namespaces'
+    paths (which may legitimately carry sub-segments) untouched."""
+    return _partition_cfg(_governing_schema(root, namespace), namespace).get(
+        "strategy", "flat") != "flat"
+
+
+def canonical_key(root: Path, namespace: str, slug: str, fm: dict | None = None) -> str:
+    """Wiki-relative key (no .md) where <namespace>/<slug> canonically lives, per the governing
+    schema.yaml `partitioning`. Falls back to the flat `namespace/slug` exactly where reshelve
+    leaves an un-bucketable page (flat strategy, or by-date with no usable date_field) — so the
+    importer's destination always agrees with the drain."""
+    schema = _governing_schema(root, namespace)
+    pcfg = _partition_cfg(schema, namespace)
+    canonical = set((schema.get("types") or {}).keys())
+    return _new_key(namespace, slug, fm or {}, pcfg, canonical) or f"{namespace}/{slug}"
+
+
+def find_page(root: Path, namespace: str, slug: str) -> Path | None:
+    """The existing page file for <namespace>/<slug>, wherever it currently sits under the
+    namespace — the canonical shard OR a stale flat/non-canonical location — so an importer can
+    merge in place instead of duplicating (and so NVD enrichment can actually FIND a sharded KEV
+    page). None if absent. When more than one copy exists (the okengine#54 bug), the DEEPEST path
+    wins deterministically: the sharded canonical outranks a flat root copy, so repeated runs
+    converge on the canonical seat rather than ping-ponging."""
+    base = root / "wiki" / namespace
+    if not base.is_dir():
+        return None
+    hits = [p for p in base.rglob(f"{slug}.md") if p.stem == slug]
+    if not hits:
+        return None
+    return sorted(hits, key=lambda p: (-len(p.parts), p.as_posix()))[0]
+
+
 def build_map(root: Path, namespace: str, only_types: set[str] | None = None,
               only_year: str | None = None) -> tuple[dict[str, str], list[tuple[str, str]]]:
     """(old-key -> new-key, collisions) for EVERY page under the namespace whose current

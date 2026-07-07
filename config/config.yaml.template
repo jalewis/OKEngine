@@ -85,6 +85,14 @@ platform_toolsets:
   cron:
     - hermes-cron
     - no_mcp
+  # Agent Chat (api_server, opt-in via API_SERVER_ENABLED). SECURE-BY-DEFAULT lockdown so a
+  # deployment that turns chat on gets read + ENFORCED-write only — never web/terminal/
+  # code_execution/file/computer_use (the "do not skip this" footgun in docs/agent-chat.md is
+  # now the default, not a manual step). Add `web` here per-deployment if chat should also
+  # research the internet. Inert unless the api_server platform is enabled.
+  api_server:
+    - okengine
+    - okengine-write
 
 # Agent-wide toolset hygiene. OKEngine agents curate the vault through the enforced MCP write
 # path; they never run arbitrary code. `execute_code` is already runtime-blocked for cron jobs,

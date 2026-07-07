@@ -82,6 +82,10 @@ cp -r "$ENGINE_DIR/scripts/." "$WORK/scripts/"
 cp -r "$ENGINE_DIR/config/."  "$WORK/config/"
 cp -r "$ENGINE_DIR/plugins/model-providers/custom"     "$WORK/plugins/model-providers/"
 cp -r "$ENGINE_DIR/plugins/model-providers/openrouter" "$WORK/plugins/model-providers/"
+# web-search provider overlay: Serper (okengine#190) — a backend Hermes doesn't ship, added as a
+# plugin (addition, not a fork). Auto-loads via kind: backend alongside the bundled web providers.
+mkdir -p "$WORK/plugins/web"
+cp -r "$ENGINE_DIR/plugins/web/serper" "$WORK/plugins/web/serper"
 # drop any __pycache__ that hitched along
 find "$WORK/okengine-mcp" "$WORK/okengine-reader" "$WORK/scripts" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
 

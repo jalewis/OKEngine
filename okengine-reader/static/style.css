@@ -258,3 +258,7 @@ a.wl:hover{border-bottom-style:solid}
 .ep-band{stroke:var(--border);stroke-width:1;stroke-dasharray:4 4}
 .ep-bandlbl{fill:var(--dim);font:0.62rem var(--mono);text-transform:uppercase;letter-spacing:.5px}
 .ep-edge{stroke:var(--border);stroke-width:1;opacity:.7}
+
+/* original-article jump on source citations */
+a.ext{color:var(--live,#58a6ff);text-decoration:none;font-size:.9em;padding:0 2px;opacity:.85}
+a.ext:hover{opacity:1;text-decoration:underline}

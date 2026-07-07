@@ -239,3 +239,30 @@ def test_about_extensions_prefer_effective_artifact(tmp_path, monkeypatch):
         "okengine.competitive-analytics", "okengine.contradictions", "okengine.timeline"]
     assert got[0]["description"] == "quadrants"
     assert got[1]["description"] == ""            # legacy entry -> empty description
+
+
+def test_source_citation_links_the_original_article(tmp_path, monkeypatch):
+    """Regression (live complaint, thrice): the daily brief's 'Source:' citation must link the
+    analyst STRAIGHT to the ORIGINAL article. The prior fix left the title as an internal
+    wikilink and demoted the real url: to a tiny ↗ glyph — so the obvious click still landed on
+    the source stub, not the article. Now the source TITLE itself is the external link to the
+    source page's url: frontmatter (anchor must SURVIVE the nh3 allowlist), no glyph. A source
+    with no http(s) url falls back to the internal wikilink."""
+    (tmp_path / "wiki" / "sources" / "2026" / "07").mkdir(parents=True)
+    (tmp_path / "wiki" / "sources" / "2026" / "07" / "kaspersky-report.md").write_text(
+        "---\ntype: source\ntitle: Device Code Phishing report\n"
+        "url: https://securelist.example/device-code\n---\nbody\n", encoding="utf-8")
+    (tmp_path / "wiki" / "sources" / "2026" / "07" / "no-url.md").write_text(
+        "---\ntype: source\ntitle: Local note\n---\nbody\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    html = m.render_md("Item.\nSource: [[sources/2026/07/kaspersky-report]]\n\n"
+                       "Other.\nSource: [[sources/2026/07/no-url]]\n")
+    # the TITLE is the clickable external link to the article (survives nh3), no demoted glyph
+    assert 'href="https://securelist.example/device-code"' in html
+    assert 'class="ext"' in html and "Device Code Phishing report" in html
+    assert "&#8599;" not in html and "↗" not in html
+    # the url'd source no longer renders an internal wikilink — the citation IS the article
+    assert 'data-page="sources/2026/07/kaspersky-report"' not in html
+    assert html.count("securelist.example") == 1
+    # no url -> fall back to the internal wikilink (still reachable, just no external link)
+    assert 'data-page="sources/2026/07/no-url"' in html

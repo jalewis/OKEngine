@@ -24,6 +24,8 @@ patch.
 | 05 | `05-delegate-tool-session-end.patch` | `tools/delegate_tool.py` | End delegate sub-agent rows in `state.db` (without it, sub-agent sessions leak `ended_at IS NULL` rows forever). |
 | 06 | `06-cron-per-job-ollama-num-ctx.patch` | `cron/scheduler.py`, `run_agent.py`, `agent/agent_init.py` | Thread a per-job `ollama_num_ctx` from `run_job` → `AIAgent` → `init_agent` (okengine#151). Inert unless a job carries the field. |
 | 07 | `07-api-server-inference-model.patch` | `gateway/platforms/api_server.py` | Pin the api_server (interactive chat) model + provider independently of the gateway default (`API_SERVER_INFERENCE_PROVIDER` / `API_SERVER_INFERENCE_MODEL`). Both empty → gateway default. |
+| 08 | `08-web-backend-rotation.patch` | `tools/web_tools.py` | **Opt-in web-search provider rotation** (okengine#190): `web.backend: rotate` round-robins across the keyed backends (Tavily/Exa/Brave/…) per call, spreading free-tier rate-limit load instead of pinning one. Additive — any other value / unset is the stock single-pick. |
+| 09 | `09-web-serper-backend.patch` | `tools/web_tools.py` | **Serper backend recognition** (okengine#190): teach `_get_backend()` (whitelist + fallback candidates), `_is_backend_available()`, and the #08 rotation list about `serper`. Pairs with the `plugins/web/serper/` OVERLAY provider (the actual Serper adapter) — together they make Serper a first-class backend that joins `web.backend: rotate`, keeping Hermes pinned. Applies on top of #08. |
 
 **Dropped at v0.18.0 (absorbed upstream):** the vercel_sandbox approval allowlist
 (was 06) — native in `tools/approval.py`; the read-echo write guard (half of old

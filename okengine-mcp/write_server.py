@@ -370,6 +370,20 @@ def _reserved_refuse(p: Path) -> Optional[str]:
         return (f"refused: {_rel(p)} is an engine-managed structural/reserved file "
                 "— not agent-writable via the MCP write tools (use the file tool only "
                 "if a human edit is truly intended)")
+    # A pack's schema `reserved_files` is ALSO a write-path refusal — docs/authoring-a-pack.md and
+    # okengine-conformance-spec.md define it as "paths the MCP write path refuses", and the
+    # validator already EXEMPTS them from conformance (schema_validator reserved_files). Without
+    # this the write path never read the key, so declaring a file reserved made it MORE writable
+    # (invariant-audit). UNION with the engine set above (never un-protect log/index); basename
+    # match, lowercased, mirroring the validator. Degrades to the engine set if the schema is
+    # unreadable.
+    try:
+        reserved = _governing(p).get("reserved_files")
+    except Exception:
+        reserved = None
+    if reserved and n in {str(r).lower() for r in reserved}:
+        return (f"refused: {_rel(p)} is a pack-reserved file (schema `reserved_files`) "
+                "— not agent-writable via the MCP write tools")
     return None
 
 
@@ -694,8 +708,15 @@ def _briefing_link_reject(p: Path, body: Optional[str]) -> Optional[str]:
         rels.add(rel)
         by_base.setdefault(f.stem, rel)
     broken = []
+    n_source = n_knowledge = 0                             # classify resolved links for the cite check
     for t in dict.fromkeys(targets):                      # de-dup, keep order
-        if t in rels or ("/" not in t and t in by_base):
+        rel = t if t in rels else (by_base.get(t) if "/" not in t else None)
+        if rel:
+            ns = rel.split("/")[0]
+            if ns == "sources":
+                n_source += 1
+            elif ns not in ("dashboards", "operational"):  # a substantive claim, not a nav/meta link
+                n_knowledge += 1
             continue
         base = t.split("/")[-1]
         if base in by_base:                               # right page, wrong dir/shard
@@ -707,6 +728,14 @@ def _briefing_link_reject(p: Path, body: Optional[str]) -> Optional[str]:
     if broken:
         return ("briefing links must resolve to existing pages (cite what you actually read; "
                 "do not guess slugs): " + "; ".join(broken))
+    # A briefing that makes ENTITY claims must be verifiable: at least one resolvable
+    # [[sources/...]] link. Footnotes and code-span paths are not links an analyst can click,
+    # and the brief lanes keep omitting real citations despite the prompt (unenforced half).
+    # A pure "nothing happened this week" briefing (no knowledge links) is exempt.
+    if n_knowledge and not n_source:
+        return (f"briefing cites {n_knowledge} entit{'y' if n_knowledge == 1 else 'ies'} but no source — "
+                "every development must end with a resolvable [[sources/<path>]] link (a footnote or "
+                "a code-span path is not a citation an analyst can verify)")
     return None
 
 
@@ -885,6 +914,19 @@ def _tombstone(path: str, reason: str, superseded_by: Optional[str] = None) -> s
     if rej:
         return f"rejected: {rej}"  # file left untouched
     p.write_text(content, encoding="utf-8")
+    # Keep the in-process id registry write-synchronous — like create/converge mutate reg.by_id —
+    # so the converge "never resurrect a tombstoned id" guard sees THIS tombstone within the same
+    # server process, not only after a cold rebuild. Without it a tombstone-then-converge in one
+    # process resurrected the page (invariant-audit HIGH). Best-effort: the registry is a cache
+    # that self-heals on the next build(); a mint/schema-lib gap must never block the tombstone.
+    try:
+        pid, _kind = _page_id_and_kind(cur_fm, _governing(p), _namespace(p), p.stem)
+        if pid:
+            reg = _registry()
+            reg.tombstoned.add(pid)
+            reg.by_id.setdefault(pid, _rel(p))
+    except Exception:
+        pass
     ver = new_fm["version"]
     _append_log(f"- {_today()} mcp-write tombstone {_rel(p)} v{ver} — {reason}")
     return f"tombstoned {_rel(p)} v{ver} (file retained, not deleted)"
@@ -986,6 +1028,9 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
     if body.startswith("\n"):
         body = body[1:]
     _stamp(new_fm, cur_fm)
+    fd = _future_date_reject(new_fm)   # the boundary every writer crosses (invariant-audit)
+    if fd:
+        return f"rejected: {fd}"        # file left untouched
     flags = _review_flags(p, new_fm, prev=cur_fm)
     if flags:
         new_fm["needs_review"] = True
@@ -1053,6 +1098,9 @@ def _append_section(path: str, heading: str, text: str) -> str:
     if pol:
         return f"rejected: {pol}"
     _stamp(new_fm, cur_fm)
+    fd = _future_date_reject(new_fm)   # the boundary every writer crosses (invariant-audit)
+    if fd:
+        return f"rejected: {fd}"        # file left untouched
     flags = _review_flags(p, new_fm, prev=cur_fm)
     if flags:
         new_fm["needs_review"] = True
@@ -1173,6 +1221,9 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
             _stamp(merged, cur_fm)
             if pack:
                 merged["last_modified_by"] = pack
+            fd = _future_date_reject(merged)   # the boundary every writer crosses (invariant-audit)
+            if fd:
+                return f"rejected: {fd}"        # file left untouched
             # Converge is an agent write into an EXISTING page: apply the same
             # write-governance as update_entity, not a bypass (#21). HARD namespace
             # permission gate first (a human-authored namespace refuses the write,

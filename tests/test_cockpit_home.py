@@ -73,3 +73,25 @@ def test_home_omits_everything_on_an_empty_vault(tmp_path, monkeypatch):
     (tmp_path / "wiki").mkdir()
     m = _load(tmp_path, monkeypatch)
     assert m.api_home() == {"sections": []}
+
+
+def test_home_dashboard_chips_handle_the_grouped_config_shape(tmp_path, monkeypatch):
+    """Regression (cyber-market): its `dashboards:` config uses the GROUPED shape
+    ([{group, items: [{path, title?}]}]) — the flat-slug chips code rendered raw dict
+    reprs as chip labels/targets. Grouped items chip per item with namespace-qualified
+    paths; flat slugs keep the dashboards/ prefix."""
+    (tmp_path / "schema.yaml").write_text(
+        "cockpit:\n"
+        "  dashboards:\n"
+        "  - group: Strategic\n"
+        "    items:\n"
+        "    - {path: lacuna/INDEX, title: Lacuna gaps}\n"
+        "    - {path: dashboards/frontier-map}\n"
+        "  tabs: [home]\n", encoding="utf-8")
+    (tmp_path / "wiki").mkdir()
+    m = _load(tmp_path, monkeypatch)
+    out = m.api_home()
+    html = next(s["html"] for s in out["sections"] if s["group"] == "Jump off")
+    assert 'data-page="lacuna/INDEX"' in html and "Lacuna gaps" in html
+    assert 'data-page="dashboards/frontier-map"' in html and "frontier map" in html
+    assert "{" not in html, html   # no dict reprs ever
