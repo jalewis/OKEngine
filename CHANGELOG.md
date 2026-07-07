@@ -14,6 +14,58 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
 > **About panel** (reader/cockpit deployment purpose + composition from live state); and now **pack
 > bundles** (v0.10.0). If you are jumping from v0.3.5, read v0.4.0 onward.
 
+## v0.10.7
+
+More shift-left + a UI fix from an operator report.
+
+### Fixed
+- **Dates never wrap in ledger tables** (operator report) — the "Open predictions" and other
+  `.ledger` views (date last, long title first) broke a date mid-token (`2026-09-30`) when the wide
+  first column squeezed the table; `.num` cells lacked `white-space:nowrap` and `_html_table` emitted
+  plain `<td>`. Now `.num` cells never wrap (cockpit + reader) and `_html_table` tags a bare
+  date/number/%/em-dash cell `.num`. Baked (cockpit + reader images).
+- **build-engine-image fails loud on an unreadable manifest** (okengine#193 shift-left) — the old
+  `${PIN:-v2026.6.19}` / `${RELEASE:-unknown}` fallbacks silently built against a stale pin / an
+  "unknown" version; PIN/RELEASE now resolve env → manifest and stop the build if empty.
+
+### Changed
+- **Invariant-audit seeded with this session's bug classes** (okengine#193/#195/#196) — two new
+  finder dimensions (silent-omission, consumer-shape-assumption) + sharpened mount-ownership /
+  two-gate-agreement charters, so the pre-release sweep catches the next one of each class.
+
+## v0.10.6
+
+Shift-left hardening: turn this session's live failure modes into gates + a typed write path.
+
+### Added
+- **Schema-declared field shapes** (okengine#196, generalizes the v0.10.5 hotfix) — `field_shapes`
+  in base-schema (pack-extensible) declares which fields are lists; the enforced write path coerces
+  a scalar written for ANY declared list field to a list at the single chokepoint, driven off the
+  composed schema (base ∪ pack) — no more hardcoded field set, no more per-field crash.
+
+### Changed
+- **deployment-validate runs DAILY, not weekly** (`10 12 * * 1` → `10 12 * * *`) — a weekly cadence
+  let a contract violation (a version desync, a mis-owned jobs.json) sit stale in fleet health for
+  up to a week.
+
+### Fixed
+- **Mis-owned cron-plus/jobs.json is caught** (okengine#193) — `check_runtime_ownership` now stats
+  the jobs.json FILE, not just the runtime dirs: the fleet-stall poison was a root-owned jobs.json
+  INSIDE a correctly-owned cron-plus dir, so the dir check passed while the scheduler went dark. A
+  mis-owned jobs.json now FAILs with the #193 diagnostic.
+
+## v0.10.5
+
+### Fixed
+- **Write path coerces a scalar list-field to a list** (okengine#196) — a list-valued frontmatter
+  field authored as a bare string (e.g. `aliases: A, B`) sailed through the open/untyped schema
+  unchanged and crashed a list-consuming lane: `normalize-bare-name-links` died with
+  `TypeError: list + str` and took the whole lane red (live on a CTI vault whose compile agent wrote
+  a scalar `aliases` on three entity pages). `write_server._normalize_refs` now coerces a scalar
+  string → list for the known list fields (`aliases`, `tags`, `maintained_by`, `discovered_by`) at
+  the single enforced-write chokepoint, so no such page can enter the vault; `normalize_bare_name_links`
+  also defends against a scalar before use. Red tests on both surfaces.
+
 ## v0.10.4
 
 A follow-on to the v0.10.3 release that closes the version-reporting drift the release itself

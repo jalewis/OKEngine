@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""deployment_validate.py — weekly in-gateway deployment self-validation. no_agent.
+"""deployment_validate.py — daily in-gateway deployment self-validation. no_agent.
 
 The gap it closes: pack-side validators (`framework validate`, validate_merged) run at
 authoring/deploy time on the HOST — nothing re-checked the LIVE deployment as it mutated
@@ -350,6 +350,18 @@ def check_runtime_ownership():
                 strays.append(f"{rel} (uid {d.stat().st_uid})")
         except OSError:
             strays.append(f"{rel} (unstattable)")
+    # The single most critical FILE: cron-plus/jobs.json mis-owned (e.g. root:0600 from a deploy run
+    # without the pack's HERMES_UID) is UNREADABLE by the lane uid, so the scheduler goes dark even
+    # though the cron-plus DIR above is correctly owned — the exact fleet-stall poison, hit live
+    # (okengine#193). The dir-level check misses a mis-owned file inside a well-owned dir; stat it.
+    jf = DATA / "cron-plus" / "jobs.json"
+    if jf.is_file():
+        try:
+            if jf.stat().st_uid != me:
+                strays.append(f"cron-plus/jobs.json (uid {jf.stat().st_uid}) — the scheduler can't "
+                              "read it and the WHOLE fleet stalls (okengine#193)")
+        except OSError:
+            strays.append("cron-plus/jobs.json (unstattable)")
     if strays:
         add("FAIL", "runtime-ownership",
             f"runtime dir(s) under /opt/data not owned by the lane uid ({me}) — the cron-plus "
@@ -381,7 +393,7 @@ def main() -> int:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     L = ["---", "type: dashboard", 'title: "Deployment validation"', f"updated: {now}", "---",
          "", f"# Deployment validation — {now}", "",
-         f"_Weekly in-gateway self-check of the LIVE deployment (pins, composed schema, "
+         f"_Daily in-gateway self-check of the LIVE deployment (pins, composed schema, "
          f"sub-domains, cron fleet, rules, extensions, auth). A FAIL marks this lane ERRORED "
          f"in fleet health on purpose._", "",
          f"**{'FAIL' if fails else 'PASS'}** — {fails} fail · {warns} warn", ""]

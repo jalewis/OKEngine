@@ -699,7 +699,7 @@
     "enabled": true,
     "schedule": {
       "kind": "cron",
-      "expr": "10 12 * * 1"
+      "expr": "10 12 * * *"
     },
     "workdir": "/opt/vault",
     "script": "deployment_validate.py",

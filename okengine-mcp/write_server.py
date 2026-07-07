@@ -258,34 +258,72 @@ def _flatten_strip(v) -> list:
     return out
 
 
-def _normalize_refs(fm: dict) -> dict:
-    """Canonicalize frontmatter reference values to plain wiki-relative path strings.
+# Field SHAPES are schema-DECLARED (base-schema `field_shapes`, pack-extensible) rather than
+# hardcoded (okengine#196 generalized): a list field authored as a SCALAR string (e.g.
+# `aliases: StealC, StealC info-stealer`) would otherwise sail through the open/untyped schema and
+# crash a list-consuming lane. The write path coerces scalar -> list for every schema-declared list
+# field at the single enforced-write chokepoint, so no such page can enter the vault.
+# Fallback if the schema declares no `field_shapes` (older base-schema) — the set okengine#196 first
+# hardcoded, now the safety net under the schema-driven resolution.
+_FALLBACK_LIST_FIELDS = frozenset({"aliases", "tags", "maintained_by", "discovered_by"})
+_base_list_fields_cache = None
 
-    Agents are trained to write `[[wikilinks]]`, but `[[x]]` in YAML is flow syntax for a NESTED
-    sequence, so a bare wikilink in a frontmatter value silently mangles (`field_mapped: [[c/x]]`
-    -> `[[ "c/x" ]]`; a `see_also` list -> `- - - c/x`). Wikilinks are a *body* convention;
-    frontmatter holds structured data. Here, at the single enforced-write chokepoint (so every
-    extension's writes are fixed at once), we coerce: a bare `[[x]]` string -> `x`; a list that
-    mangled into nested lists, or holds `[[..]]` strings, -> a flat list of plain paths. Plain
-    strings and plain lists are left untouched."""
+
+def _base_list_fields() -> frozenset:
+    """The universal list fields, read once from base-schema `field_shapes` (schema_lib may be
+    absent, or the base may predate field_shapes — fall back to the known set either way)."""
+    global _base_list_fields_cache
+    if _base_list_fields_cache is None:
+        try:
+            lf = schema_lib.list_fields(schema_lib.base_schema())
+        except Exception:
+            lf = set()
+        _base_list_fields_cache = frozenset(lf) or _FALLBACK_LIST_FIELDS
+    return _base_list_fields_cache
+
+
+def _list_fields_for(page_path) -> set:
+    """List fields governing a page: the universal base set ∪ any the page's COMPOSED schema declares
+    (so a pack's domain list field is honoured too). Base-only fallback if the schema can't load."""
+    lf = set(_base_list_fields())
+    if page_path is not None:
+        try:
+            lf |= schema_lib.list_fields(_governing(page_path))
+        except Exception:
+            pass
+    return lf
+
+
+def _normalize_refs(fm: dict, list_fields=frozenset()) -> dict:
+    """Canonicalize frontmatter values at the single enforced-write chokepoint (so every extension's
+    writes are fixed at once). Three coercions:
+      - a schema-declared list field written as a scalar string -> a list (okengine#196);
+      - a bare `[[x]]` wikilink string -> the plain path `x` (agents write `[[wikilinks]]`, but in a
+        frontmatter VALUE that mangles — `field_mapped: [[c/x]]` -> `[[ "c/x" ]]`);
+      - a list that mangled into nested lists, or holds `[[..]]` strings, -> a flat list of paths.
+    Plain strings and plain lists are left untouched."""
     if not isinstance(fm, dict):
         return fm
     for k, v in list(fm.items()):
-        if isinstance(v, str):
+        if k in list_fields and isinstance(v, str):
+            fm[k] = [s.strip() for s in v.split(",") if s.strip()]   # scalar list-field -> list (#196)
+        elif isinstance(v, str):
             fm[k] = _strip_wikilink(v)
         elif _looks_like_ref_list(v):
             fm[k] = _flatten_strip(v)
     return fm
 
 
-def _coerce_fm(frontmatter_yaml: Union[str, dict, None]) -> Optional[dict]:
-    """Accept a YAML string OR a dict; return a dict (or None to signal a parse
-    error vs an empty/absent value, which returns {}). Frontmatter reference values are
-    canonicalized (wikilink -> plain path) via _normalize_refs."""
+def _coerce_fm(frontmatter_yaml: Union[str, dict, None], page_path=None) -> Optional[dict]:
+    """Accept a YAML string OR a dict; return a dict (or None to signal a parse error vs an
+    empty/absent value, which returns {}). Frontmatter values are canonicalized via _normalize_refs
+    (wikilink -> plain path; scalar -> list for the page's schema-declared list fields). `page_path`
+    selects the governing schema's list fields; None falls back to the universal base set."""
+    list_fields = _list_fields_for(page_path)
     if frontmatter_yaml is None:
         return {}
     if isinstance(frontmatter_yaml, dict):
-        return _normalize_refs(dict(frontmatter_yaml))
+        return _normalize_refs(dict(frontmatter_yaml), list_fields)
     try:
         loaded = yaml.safe_load(frontmatter_yaml)
     except Exception:
@@ -294,7 +332,7 @@ def _coerce_fm(frontmatter_yaml: Union[str, dict, None]) -> Optional[dict]:
         return {}
     if not isinstance(loaded, dict):
         return None
-    return _normalize_refs(loaded)
+    return _normalize_refs(loaded, list_fields)
 
 
 def _compose(fm: dict, body: str) -> str:
@@ -751,7 +789,7 @@ def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> st
         return _rr
     if p.exists():
         return f"refused: {_rel(p)} already exists — use update_entity"
-    fm = _coerce_fm(frontmatter_yaml)
+    fm = _coerce_fm(frontmatter_yaml, p)
     if fm is None:
         return "rejected: frontmatter_yaml is not a valid YAML mapping"
     # Enforce the page lands in a schema-declared namespace (no stray-namespace fork, #115).
@@ -841,7 +879,7 @@ def _update(path: str, frontmatter_yaml: Union[str, dict, None] = None,
     cur_fm, cur_body = _read_page(p)
     new_fm = dict(cur_fm)
     if frontmatter_yaml is not None:
-        patch = _coerce_fm(frontmatter_yaml)
+        patch = _coerce_fm(frontmatter_yaml, p)
         if patch is None:
             return "rejected: frontmatter_yaml is not a valid YAML mapping"
         # Future-date guard on ONLY the fields this patch supplies: a legacy page that already
@@ -1180,7 +1218,7 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
     _rr = _reserved_refuse(p)
     if _rr:
         return _rr
-    fm = _coerce_fm(frontmatter_yaml)
+    fm = _coerce_fm(frontmatter_yaml, p)
     if fm is None:
         return "rejected: frontmatter_yaml is not a valid YAML mapping"
     namespace = _namespace(p)

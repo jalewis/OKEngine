@@ -82,7 +82,7 @@ table.ledger tr.sel{background:var(--panel)}
 .st.due{color:var(--warn)}
 .subj{color:var(--text);font-family:var(--mono);white-space:nowrap} .subj-ns{color:var(--dim);font-weight:400}
 .claim{color:var(--muted);white-space:normal;overflow-wrap:break-word}
-td.num,th.num{text-align:right;font-family:var(--mono)}
+td.num,th.num{text-align:right;font-family:var(--mono);white-space:nowrap}
 .spark{font-family:var(--mono);letter-spacing:-1px}
 .trend.up{color:var(--ok)} .trend.down{color:var(--fail)} .trend.flat{color:var(--dim)}
 .due-in{color:var(--warn);font-weight:600}

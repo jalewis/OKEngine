@@ -209,6 +209,12 @@ def _merge_base_pack(root: Path, namespace: str = "") -> dict:
     b_fe, p_fe = base.get("field_enums") or {}, pack.get("field_enums") or {}
     if b_fe or p_fe:
         out["field_enums"] = {**b_fe, **p_fe}
+    # Field SHAPES (okengine#196 generalized): base declares the universal list fields; a pack ADDS
+    # its domain field shapes (pack wins on a key). The enforced write path reads this to coerce a
+    # scalar written for a list field into a list, so no such page can enter the vault.
+    b_fs, p_fs = base.get("field_shapes") or {}, pack.get("field_shapes") or {}
+    if b_fs or p_fs:
+        out["field_shapes"] = {**b_fs, **p_fs}
     # Conformance rules (okengine#158): engine FLOOR (base) ⊕ pack additions, additive + deduped by
     # `id` (pack can't drop an engine rule; a same-id pack rule overrides the floor copy). So the
     # audit + write-guard see one merged rule set, not the raw pack's.
@@ -224,6 +230,14 @@ def _merge_base_pack(root: Path, namespace: str = "") -> dict:
                     seen.add(rid)
         out["conformance"] = {"rules": merged_rules}
     return out
+
+
+def list_fields(schema: dict) -> set:
+    """Field names a schema declares with `list` shape (`field_shapes`). The enforced write path
+    coerces a scalar string written for one of these into a list (okengine#196 generalized), so a
+    list-consuming lane can't crash on a page authored as `aliases: A, B`."""
+    shapes = (schema or {}).get("field_shapes") or {}
+    return {k for k, v in shapes.items() if v == "list"}
 
 
 def compose_schema(root: Path, fragments=None, namespace: str = "") -> tuple[dict, list[str]]:

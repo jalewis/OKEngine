@@ -41,3 +41,12 @@ def test_predictions_claim_wraps():
 def test_predictions_subject_cleaned():
     JS = (pathlib.Path(__file__).resolve().parents[1] / "okengine-cockpit/static/app.js").read_text()
     assert "function subjCell" in JS and "subjCell(p.subject)" in JS
+
+
+def test_num_cells_never_wrap():
+    """Operator report: date cells (Resolves by / Updated / Anchored) in .ledger tables broke
+    mid-token (2026-09-30) when a long first column squeezed the table. `.num` cells (right-aligned
+    mono — numbers AND dates) must never wrap. The .md-table rule only covers tables whose LONG
+    column is last; a ledger with the date last needs this."""
+    m = re.search(r"td\.num,th\.num\{[^}]*\}", CSS)
+    assert m and "white-space:nowrap" in m.group(0), "date/number cells must not wrap"

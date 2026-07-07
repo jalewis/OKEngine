@@ -148,3 +148,26 @@ def test_is_reference_page_noop_without_policy():
     m = _load()
     rp = m.reference_policy({})                      # pack didn't opt in
     assert m.is_reference_page({"type": "vulnerability", "mitre_id": "x"}, rp) is False
+
+
+def test_field_shapes_merge_and_list_fields(tmp_path):
+    """okengine#196 generalized: base declares the universal list fields; a pack ADDS its own
+    (and WINS on a conflicting key), same as field_enums. `list_fields` returns the list-shaped set
+    the write path coerces scalars into."""
+    m = _load()
+    root = _vault(tmp_path, (
+        "types:\n  entity: {required: [type]}\n"
+        "field_shapes:\n"
+        "  refs: list\n"        # pack ADDS a domain list field
+        "  aliases: scalar\n"   # pack OVERRIDES a base list field (proves pack-wins precedence)
+    ))
+    merged = m.merged_schema(root)
+    fs = merged.get("field_shapes") or {}
+    assert fs.get("tags") == "list" and fs.get("maintained_by") == "list"   # base contributes
+    assert fs.get("refs") == "list"                                          # pack adds
+    assert fs.get("aliases") == "scalar"                                     # pack wins on conflict
+    lf = m.list_fields(merged)
+    assert "refs" in lf and "tags" in lf
+    assert "aliases" not in lf                                               # now scalar per the pack
+    # base-only (packless) still exposes the universal list fields
+    assert "aliases" in m.list_fields(m.merged_schema(_vault(tmp_path / "p2", None)))

@@ -50,3 +50,74 @@ def test_deploy_kickstart_is_opt_in():
     assert "KICKSTART=0" in t, "kickstart must default OFF"
     assert "--kickstart)" in t and "kickstart.sh" in t, "deploy.sh must wire the --kickstart flag"
     assert 'if [ "$KICKSTART" = 1 ]' in t, "kickstart must run only when the flag is set"
+
+
+# --- okengine#193: kickstart must cover pack importers + tier:analyze lanes, and never SILENTLY
+#     skip an enabled lane (before this it ran 42/88 lanes and reported "done"). ------------------
+
+def test_ingest_stage_covers_pack_importers():
+    """A CTI pack ingests via structured importers (attack/kev/misp/…), not just RSS feed-fetch.
+    The ingest stage must match the generic `-import`/`-seed` suffixes so they run before compile."""
+    t = K.read_text()
+    ingest = t[t.index('("ingest"'):t.index('("compile"')]
+    assert '"-import"' in ingest and '"-seed"' in ingest, \
+        "ingest stage must match pack importers by -import/-seed suffix"
+
+
+def test_analyze_stage_exists_after_concepts():
+    t = K.read_text()
+    assert '("analyze"' in t, "kickstart must have an analyze stage (tier:analyze lanes had none)"
+    # ordering: analyze reads the graph, so it must come after concepts and canonical
+    assert t.index('("concepts"') < t.index('("analyze"'), "analyze must run after concepts"
+    assert 'okengine.lacuna' in t, "analyze stage should name the lacuna wake-gate"
+
+
+def _extract_literal(text, name):
+    """Pull a top-level `NAME = [ ... ]` list literal out of the embedded kickstart Python."""
+    import ast
+    start = text.index(f"{name} = [")
+    depth, i = 0, text.index("[", start)
+    for j in range(i, len(text)):
+        depth += {"[": 1, "]": -1}.get(text[j], 0)
+        if depth == 0:
+            return ast.literal_eval(text[i:j + 1])
+    raise AssertionError(f"unbalanced brackets for {name}")
+
+
+def test_no_enabled_lane_is_silently_skipped():
+    """Functional coverage guard: replicate kickstart's planner over the REAL STAGES/MONITORING
+    literals, and assert every enabled, non-monitoring lane is either claimed by a stage or swept
+    by the catch-all — a novel importer/analysis/extension lane can never be dropped without trace."""
+    t = K.read_text()
+    STAGES = _extract_literal(t, "STAGES")
+    MONITORING = _extract_literal(t, "MONITORING")
+    assert 'planned_ids' in t and 'remaining' in t, "kickstart must track planned + sweep remaining"
+
+    jobs = [
+        {"id": "j1", "name": "okpack-threat-actors-attack-import", "enabled": True},   # importer
+        {"id": "j2", "name": "okengine.lacuna", "enabled": True, "tier": "analyze"},   # tier:analyze
+        {"id": "j3", "name": "okpack-threat-actors-correlation", "enabled": True},     # unclassified
+        {"id": "j4", "name": "deployment-validate", "enabled": True},                  # monitoring
+        {"id": "j5", "name": "okpack-detections-feed-fetch", "enabled": True},         # feed
+        {"id": "j6", "name": "some-disabled-lane", "enabled": False},                  # ignored
+    ]
+    is_mon = lambda n: any(m in n for m in MONITORING)
+    planned = set()
+    for _label, names, _to, _rep in STAGES:
+        by_name = [j for j in jobs if j["enabled"] and any(s in j["name"] for s in names)]
+        by_tier = [j for j in jobs if j["enabled"] and j.get("tier") == _label]
+        for j in by_name + by_tier:
+            planned.add(j["id"])
+    swept = [j for j in jobs if j["enabled"] and j["id"] not in planned and not is_mon(j["name"])]
+    covered = planned | {j["id"] for j in swept}
+
+    assert "j1" in planned, "importer must be claimed by the ingest stage"
+    assert "j2" in planned, "tier:analyze lane must be claimed by the analyze stage"
+    assert "j5" in planned, "feed-fetch must be claimed by ingest"
+    assert "j3" in covered and "j3" in {j["id"] for j in swept}, \
+        "an unclassified enabled lane must be SWEPT, never silently dropped"
+    assert "j4" not in covered, "monitoring lanes stay on their own schedule, not the build sweep"
+    # the property that matters: nothing enabled + non-monitoring escapes coverage
+    for j in jobs:
+        if j["enabled"] and not is_mon(j["name"]):
+            assert j["id"] in covered, f"enabled lane {j['name']} silently skipped by kickstart"

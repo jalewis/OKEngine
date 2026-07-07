@@ -73,7 +73,10 @@ def run_cron(job, timeout):
 # (stage label, [name-substrings IN ORDER], per-cron timeout, repeats)
 # Ordered so each lane sees what the previous produced. Repeats drain batch processors.
 STAGES = [
-    ("ingest",        ["feed-fetch", "hf-import", "hf-papers-import"], 240, 1),
+    # ingest: engine feeds + ANY pack importer — a name carrying `-import`/`-seed` is a structured
+    # importer (attack/kev/misp/urlhaus/…) that must populate raw/ BEFORE compile. Matching only
+    # `feed-fetch` left every pack importer unrun by kickstart, so a CTI vault barely ingested (#193).
+    ("ingest",        ["feed-fetch", "-import", "-seed"],              240, 1),
     ("compile",       ["raw-backfill"],                                600, 1),
     ("score",         ["source-quality-backfill", "curated-fields-guard"], 600, 1),
     ("entities",      ["entity-backfill"],                             600, 1),
@@ -84,6 +87,10 @@ STAGES = [
     ("graph",         ["source-backlink-drain", "broken-wikilinks-drain", "orphans-drain"], 420, 1),
     ("concepts",      ["concept-backfill"],                            600, 1),
     ("canonical",     ["canonical-assemble", "publisher-canonical-drain"], 420, 1),
+    # analyze: graph-analysis lanes run AFTER concepts+canonical build the graph they read.
+    # contradictions/timeline/lacuna by name + any extension that declared `tier: analyze`
+    # (okengine.lacuna does) — which matched NO stage before and was silently skipped (#193).
+    ("analyze",       ["okengine.contradictions", "okengine.timeline", "okengine.lacuna"], 420, 1),
     # predictions is now the opt-in okengine.predictions extension — these run only if it's
     # enabled (by_name returns nothing otherwise, and the stage skips). See extensions/.
     ("predictions",   ["okengine.predictions:candidate-watch", "okengine.predictions:grade", "okengine.predictions:regrade"], 420, 1),
@@ -96,17 +103,17 @@ STAGES = [
     ("brief",         ["brief", "digest"],                            420, 1),
 ]
 
+# Lanes that REPORT/validate rather than BUILD content — kickstart is a build pass, so the
+# catch-all below leaves these to their own schedule (deployment-validate even exits non-zero on
+# a FAIL, which must not colour a kickstart run). Substring match against the job name.
+MONITORING = ["deployment-validate", "fleet-health", "health-export", "budget-guard",
+              "usage-rollup", "conformance-audit", "grounding-audit"]
+
 summary = {"ok": [], "FAIL": [], "timeout": [], "absent": []}
-for label, names, timeout, repeats in STAGES:
-    print(f"\n=== stage: {label} ===", flush=True)
-    # the stage's engine/pack crons (by name) + any extension job that declared this
-    # tier (#129), deduped by id so a tier-tagged job named like a stage isn't run twice.
-    seen_ids, stage_jobs = set(), []
-    for job in [c for s in names for c in by_name(s)] + by_tier(label):
-        if job["id"] not in seen_ids:
-            seen_ids.add(job["id"])
-            stage_jobs.append(job)
-    for job in stage_jobs:
+planned_ids = set()
+
+def run_jobs(jobs_list, timeout, repeats):
+    for job in jobs_list:
         name = job["name"]
         last = None
         for r in range(repeats):
@@ -117,6 +124,39 @@ for label, names, timeout, repeats in STAGES:
         tag = {"ok": "✓", "FAIL": "✗", "timeout": "⏳"}.get(last, "?")
         print(f"  {tag} {name}" + (f"  [{detail}]" if last != "ok" else ""), flush=True)
         summary.setdefault(last, []).append(name)
+
+for label, names, timeout, repeats in STAGES:
+    print(f"\n=== stage: {label} ===", flush=True)
+    # the stage's engine/pack crons (by name) + any extension job that declared this
+    # tier (#129), deduped by id so a tier-tagged job named like a stage isn't run twice.
+    seen_ids, stage_jobs = set(), []
+    for job in [c for s in names for c in by_name(s)] + by_tier(label):
+        if job["id"] not in seen_ids:
+            seen_ids.add(job["id"])
+            stage_jobs.append(job)
+    planned_ids.update(seen_ids)
+    run_jobs(stage_jobs, timeout, repeats)
+
+# Catch-all: any ENABLED lane no stage claimed, minus the monitoring/validation lanes. Closes the
+# silent-skip class (#193) — before this, a pack importer or extension with an unrecognised name was
+# dropped without a trace and "kickstart done" hid it. Now it runs exactly once here, and we LOG both
+# what got swept and what we deliberately left to the schedule. Declare a `tier:` to order a lane
+# earlier (into a real stage) instead of the sweep.
+remaining, skipped = [], []
+for j in jobs().values():
+    if not j.get("enabled", True) or j["id"] in planned_ids:
+        continue
+    (skipped if any(m in j.get("name", "") for m in MONITORING) else remaining).append(j)
+print("\n=== stage: remaining (uncategorized) ===", flush=True)
+if skipped:
+    print("  left to schedule (monitoring/validation): "
+          + ", ".join(sorted(j["name"] for j in skipped)), flush=True)
+if remaining:
+    print(f"  sweeping {len(remaining)} unclaimed lane(s) — declare a tier: to order these earlier: "
+          + ", ".join(sorted(j["name"] for j in remaining)), flush=True)
+    run_jobs(sorted(remaining, key=lambda j: j["name"]), 420, 1)
+else:
+    print("  (every enabled build lane was claimed by a stage)", flush=True)
 
 print("\n==> kickstart summary")
 print(f"   ok: {len(summary['ok'])}  |  FAIL: {len(summary['FAIL'])}  |  timeout: {len(summary['timeout'])}")

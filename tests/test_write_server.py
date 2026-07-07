@@ -969,3 +969,57 @@ def test_future_date_rejected_on_converge_patch_append(vault):
         "---\ntype: entity\nname: Y\npublished: 2099-01-01\n---\nbody\n", encoding="utf-8")
     ap = m._append_section("entities/y.md", "H", "note")
     assert "future" in ap.lower() and "reject" in ap.lower(), ap
+
+
+def test_scalar_list_field_coerced_via_base_schema():
+    """okengine#196 (generalized): the write path coerces a scalar string -> list for the fields
+    base-schema DECLARES as `list` shape (aliases/tags/maintained_by/discovered_by) — driven off the
+    schema, not a hardcoded set. Non-list scalars and correct lists are left untouched."""
+    m = _load()
+    out = m._coerce_fm({
+        "name": "StealC",
+        "aliases": "StealC, StealC info-stealer",   # scalar comma-string -> list
+        "tags": "malware",                           # scalar single value -> single-element list
+        "description": "an info-stealer",            # NON-list scalar field stays a string
+    })
+    assert out["aliases"] == ["StealC", "StealC info-stealer"]
+    assert out["tags"] == ["malware"]
+    assert out["description"] == "an info-stealer"
+    assert m._coerce_fm({"aliases": ["A", "B"]})["aliases"] == ["A", "B"]     # correct list untouched
+    assert m._coerce_fm({"aliases": " , "})["aliases"] == []                  # blank scalar -> []
+    # the base list fields come from the schema declaration, not a literal in the code
+    assert "aliases" in m._base_list_fields() and "tags" in m._base_list_fields()
+
+
+def test_pack_declared_list_field_is_coerced(vault):
+    """Proves it is SCHEMA-driven, not hardcoded: a PACK that declares its own `field_shapes` list
+    field has a scalar for it coerced too. The `vault` fixture's schema.yaml is extended with a
+    domain list field, and _coerce_fm is given the page path so the governing (composed) schema
+    supplies the field set."""
+    m, root = vault
+    sy = (root / "schema.yaml").read_text(encoding="utf-8")
+    (root / "schema.yaml").write_text(sy + "\nfield_shapes:\n  refs: list\n", encoding="utf-8")
+    p = root / "wiki" / "entities" / "x.md"
+    out = m._coerce_fm({"type": "entity", "name": "X", "refs": "a, b, c"}, p)
+    assert out["refs"] == ["a", "b", "c"], "a pack-declared list field must be coerced from a scalar"
+
+
+def test_coerce_fm_always_yields_valid_shapes_on_adversarial_input():
+    """Property/fuzz: whatever shape an agent authors for a declared list field, _coerce_fm produces
+    a dict where that field is a list (or absent) — never a bare string a consumer can crash on.
+    Guards the whole okengine#196 class, not one field at a time."""
+    m = _load()
+    adversarial = [
+        {"aliases": "one, two"},                      # scalar comma-string
+        {"aliases": "solo"},                          # scalar single
+        {"aliases": ["ok", "list"]},                  # already a list
+        {"aliases": ""},                              # empty scalar
+        {"tags": "a,b,,c"},                           # empties dropped
+        {"name": "X", "aliases": "a", "tags": "b"},   # multiple list fields at once
+    ]
+    for fm in adversarial:
+        out = m._coerce_fm(dict(fm))
+        for f in ("aliases", "tags"):
+            if f in out:
+                assert isinstance(out[f], list), f"{f} must be a list for {fm!r}, got {out[f]!r}"
+                assert all(isinstance(x, str) for x in out[f]), f"{f} elements must be strings"

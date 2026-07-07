@@ -20,15 +20,18 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC_DIR="$REPO_ROOT/scripts/cron"
-# Exec into the container as the SAME uid the gateway runs as (compose
-# `user: ${HERMES_UID:-10000}`), not the image's `hermes` name (10000): a pack
-# that overrides HERMES_UID owns /opt/data with that uid, so `-u hermes` would
-# mismatch and the tar extraction / mkdir hit permission-denied.
-HERMES_UID="${HERMES_UID:-10000}"
 # Two-repo split (slice 3): domain cron scripts + domain data live in the pack.
 # The deploy assembles /opt/data/{scripts,config}/ from BOTH the engine repo and
 # the pack — co-location means imports resolve regardless of source repo.
 PACK_DIR="${CRON_PACK_DIR:-/path/to/pack}"
+# Exec into the container as the SAME uid the gateway runs as (compose
+# `user: ${HERMES_UID:-10000}`), not the image's `hermes` name (10000): a pack
+# that overrides HERMES_UID owns /opt/data with that uid, so `-u hermes` would
+# mismatch and the tar extraction / mkdir hit permission-denied. Resolve from
+# env -> pack .env pin -> tree owner (okengine#185) — never silently 10000.
+# shellcheck source=lib/hermes_uid.sh
+. "$REPO_ROOT/scripts/lib/hermes_uid.sh"
+HERMES_UID="$(resolve_hermes_uid "$PACK_DIR")"
 PACK_SCRIPTS="$PACK_DIR/crons/scripts"
 PACK_DATA="$PACK_DIR/data"
 

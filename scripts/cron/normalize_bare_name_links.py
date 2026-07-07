@@ -77,7 +77,15 @@ def build_index() -> tuple[dict, set]:
             fm = None
         fm = fm if isinstance(fm, dict) else {}
         rel = str(p.relative_to(WIKI).with_suffix(""))
-        names = [fm.get("name")] + (fm.get("aliases") or []) + [p.stem]
+        # `aliases` is a list field, but a page authored with a scalar string (`aliases: A, B`) must
+        # not crash the whole lane (okengine#196 — the write path now coerces this, but stay robust
+        # to pre-existing/bypassed data). Coerce to a list before concatenating.
+        aliases = fm.get("aliases") or []
+        if isinstance(aliases, str):
+            aliases = [a.strip() for a in aliases.split(",") if a.strip()]
+        elif not isinstance(aliases, list):
+            aliases = []
+        names = [fm.get("name")] + aliases + [p.stem]
         for nm in names:
             if nm:
                 name_index.setdefault(_norm(nm), set()).add(rel)

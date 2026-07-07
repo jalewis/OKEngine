@@ -59,7 +59,7 @@ table.ledger thead th{position:sticky;top:0;background:var(--panel2);color:var(-
 table.ledger td{padding:5px 8px;border-bottom:1px solid var(--panel)}
 table.ledger tbody tr{cursor:pointer}
 table.ledger tbody tr:hover{background:var(--panel)}
-td.num,th.num{text-align:right;font-family:var(--mono)}
+td.num,th.num{text-align:right;font-family:var(--mono);white-space:nowrap}
 .pg-title{color:var(--text)}
 .pg-type{color:var(--violet);font-family:var(--mono);font-size:0.857rem}
 .pg-upd{color:var(--muted)}

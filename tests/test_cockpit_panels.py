@@ -75,3 +75,35 @@ def test_plain_page_gets_no_panel(tmp_path, monkeypatch):
     m = _load(tmp_path, monkeypatch)
     d = m.api_page(path="concepts/plain")
     assert d["panel"] is None
+
+
+def test_html_table_dates_and_numbers_get_num_class(tmp_path, monkeypatch):
+    """Operator report: a bare date/number cell in a `_html_table` (e.g. a prediction's 'Resolves
+    by') is tagged `.num` so it never wraps/breaks; a text or HTML cell stays a normal wrapping
+    cell. Guards the ledger-date-wrap fix."""
+    (tmp_path / "wiki").mkdir(parents=True)
+    m = _load(tmp_path, monkeypatch)
+    html = m._html_table(
+        ["Prediction", "Conf", "Resolves by"],
+        [['<a class="wl">Prediction: X</a>', "moderate-high", "2026-09-30"]])
+    assert '<td class="num">2026-09-30</td>' in html            # date -> nowrap
+    assert '<td>moderate-high</td>' in html                      # status text -> normal wrap
+    assert '<td><a class="wl">Prediction: X</a></td>' in html    # HTML cell -> normal
+    # numbers too
+    h2 = m._html_table(["a", "b"], [["x", "1,234"], ["y", "—"]])
+    assert '<td class="num">1,234</td>' in h2 and '<td class="num">—</td>' in h2
+
+
+def test_prediction_files_recurse_into_dated_partition(tmp_path, monkeypatch):
+    """Operator report: candidate-watch writes predictions into a resolution-quarter partition
+    (predictions/YYYY/qN/predict-*.md); a flat `predictions/*.md` glob found ZERO and the
+    Open-predictions view went empty. The scan must recurse into the dated subdirs."""
+    pred = tmp_path / "wiki" / "predictions" / "2026" / "q3"
+    pred.mkdir(parents=True)
+    (pred / "predict-x.md").write_text(
+        "---\ntype: prediction\nsubject: X pattern expands\nstatus: open\n"
+        "resolves_by: '2026-12-15'\n---\nbody\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    assert any("predict-x.md" in f for f in m._prediction_files()), "dated-partition prediction not found"
+    rows = m._load_predictions()
+    assert any(r.get("subject") == "X pattern expands" for r in rows), f"not loaded: {rows}"

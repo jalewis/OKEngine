@@ -579,9 +579,13 @@ def _claim(fm: dict, body: str) -> str:
 
 
 def _prediction_files() -> list[str]:
+    # RECURSIVE: the predictions extension writes into a resolution-quarter partition
+    # (predictions/YYYY/qN/predict-*.md), so a flat `predictions/*.md` glob found ZERO and the
+    # Open-predictions view went empty (operator report). `**` (recursive) matches both the flat
+    # and the date-partitioned layouts.
     files: list[str] = []
     for sub in cockpit_config()["predictions_dirs"]:
-        files += glob.glob(str(WIKI / sub / "*.md"))
+        files += glob.glob(str(WIKI / sub / "**" / "*.md"), recursive=True)
     return files
 
 
@@ -739,11 +743,21 @@ def _page_link(fm: dict) -> str:
     return f'<a class="wl" data-page="{_esc(fm["_sub"])}/{_esc(rel)}">{_esc(_disp(fm))}</a>'
 
 
+# A cell that is a bare date (YYYY-MM-DD), a number/percentage, or the em-dash placeholder is a
+# structured value that must never wrap or break across lines — dates like `2026-09-30` were breaking
+# mid-token when a long first column squeezed the table. Tag those cells `.num` (nowrap + right-align).
+# Matches only PLAIN values, so a cell holding HTML (a page link, a chip) stays a normal wrapping cell.
+_NUMISH_CELL = re.compile(r'\d{4}-\d{2}-\d{2}|-?\d[\d.,]*%?|[—-]')
+
+
 def _html_table(headers: list[str], rows: list[list[str]]) -> str:
     if not rows:
         return '<div class="empty" style="padding:10px;text-align:left">none</div>'
     head = "".join(f"<th>{_esc(h)}</th>" for h in headers)
-    body = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows)
+    def _cell(c: str) -> str:
+        cls = ' class="num"' if _NUMISH_CELL.fullmatch(str(c).strip()) else ''
+        return f'<td{cls}>{c}</td>'
+    body = "".join("<tr>" + "".join(_cell(c) for c in r) + "</tr>" for r in rows)
     return f'<table class="ledger"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>'
 
 

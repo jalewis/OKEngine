@@ -202,13 +202,17 @@ def test_disabled_daily_lane_does_not_warn(tmp_path, monkeypatch):
     assert f == [], f
 
 
-def _run_runtime_ownership(tmp_path, monkeypatch, dirs, euid):
+def _run_runtime_ownership(tmp_path, monkeypatch, dirs, euid, plant_jobs_json=False):
     """Drive check_runtime_ownership: create the given /opt/data subdirs (owned by the real test
     uid) and monkeypatch os.geteuid so the check sees `euid` as the lane uid. euid != real uid
-    simulates the muddle (runtime tree owned by someone the lane isn't)."""
+    simulates the muddle (runtime tree owned by someone the lane isn't). plant_jobs_json also lays
+    down cron-plus/jobs.json (okengine#193 — the critical file the dir-level check misses)."""
     data = tmp_path / "data"
     for rel in dirs:
         (data / rel).mkdir(parents=True, exist_ok=True)
+    if plant_jobs_json:
+        (data / "cron-plus").mkdir(parents=True, exist_ok=True)
+        (data / "cron-plus" / "jobs.json").write_text('{"jobs": []}')
     monkeypatch.setattr("os.geteuid", lambda: euid)
     spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
     m = importlib.util.module_from_spec(spec)
@@ -394,3 +398,26 @@ def test_stamp_matching_running_engine_is_silent(tmp_path, monkeypatch):
     m.F.clear(); m.VAULT, m.DATA, m.HERMES = vault, data, hermes
     m.check_pins()
     assert not [f for f in m.F if "auto-refreshed" in f[2]], m.F
+
+
+# --- okengine#193 shift-left: catch a mis-owned cron-plus/jobs.json (the fleet-stall poison) as a
+#     first-class deployment-validate invariant, and run the whole self-check DAILY not weekly. -----
+
+def test_runtime_ownership_flags_misowned_jobs_json(tmp_path, monkeypatch):
+    """A cron-plus/jobs.json whose owner != the lane uid (root:0600 from a deploy without the pack's
+    HERMES_UID — the fleet-stall poison) is FAILed with the #193 diagnostic. The dir-level check alone
+    missed this: a mis-owned FILE inside a correctly-owned dir went dark silently."""
+    import os
+    f = _run_runtime_ownership(tmp_path, monkeypatch, [], euid=os.getuid() + 1, plant_jobs_json=True)
+    assert [x for x in f if x[0] == "FAIL" and "jobs.json" in x[2] and "193" in x[2]], f
+
+
+def test_deployment_validate_runs_daily_not_weekly():
+    """Shift-left: a weekly cadence let a contract violation (version desync, mis-owned jobs.json)
+    sit stale in fleet health for up to a week. deployment-validate must run every day."""
+    import json as _json
+    crons = _json.loads((REPO / "config" / "engine-crons.json").read_text())
+    jobs = crons["jobs"] if isinstance(crons, dict) else crons
+    dv = next(j for j in jobs if j.get("name") == "deployment-validate")
+    dow = dv["schedule"]["expr"].split()[4]
+    assert dow == "*", f"deployment-validate must run daily (day-of-week '*'), got {dv['schedule']['expr']!r}"

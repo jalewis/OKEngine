@@ -26,7 +26,11 @@ PACK_DIR="${CRON_PACK_DIR:-/path/to/pack}"
 # `user: ${HERMES_UID:-10000}`), not the image's `hermes` name (10000): a pack
 # that overrides HERMES_UID owns /opt/data with that uid, and `-u hermes` would
 # mismatch -> permission-denied writing jobs.json (#18 follow-up).
-HERMES_UID="${HERMES_UID:-10000}"
+# Resolve from env -> pack .env pin -> tree owner (okengine#185): writing jobs.json as the wrong
+# uid stalls the cron fleet, so never silently fall through to 10000 when the pack pins otherwise.
+# shellcheck source=lib/hermes_uid.sh
+. "$REPO_ROOT/scripts/lib/hermes_uid.sh"
+HERMES_UID="$(resolve_hermes_uid "$PACK_DIR")"
 # cron-plus runs INSIDE the gateway and reads /opt/data/cron-plus/jobs.json (the
 # mounted pack .hermes-data) — NOT host ~/.hermes. Deploy into the container as
 # the `hermes` user so ownership is correct (#18).

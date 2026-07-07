@@ -16,10 +16,15 @@
 set -euo pipefail
 
 ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PIN="$(awk -F': *' '/pinned_tag:/{print $2; exit}' "$ENGINE_DIR/engine-manifest.yaml" | tr -d ' ')"
-PIN="${PIN:-v2026.6.19}"
-RELEASE="$(awk -F': *' '/^engine_release:/{print $2; exit}' "$ENGINE_DIR/engine-manifest.yaml" | awk '{print $1}')"
-RELEASE="${RELEASE:-unknown}"
+PIN="${PIN:-$(awk -F': *' '/pinned_tag:/{print $2; exit}' "$ENGINE_DIR/engine-manifest.yaml" | tr -d ' ')}"
+RELEASE="${RELEASE:-$(awk -F': *' '/^engine_release:/{print $2; exit}' "$ENGINE_DIR/engine-manifest.yaml" | awk '{print $1}')}"
+# Fail LOUD rather than silently building against a STALE hardcoded pin or an "unknown" version stamp
+# (okengine#193 shift-left, no-silent-omission): a mis-parsed / renamed engine-manifest.yaml must STOP
+# the build, not guess a literal that ships a mismatched base — the old hardcoded pin fallback would
+# clone a Hermes tag versions behind current. An explicit PIN/RELEASE env still wins (resolved
+# above). The pinned_sha verification below is a backstop, but it's opt-out (empty pinned_sha skips it).
+[ -n "$PIN" ]     || { echo "ERROR: could not read runtime.pinned_tag from $ENGINE_DIR/engine-manifest.yaml — refusing to build against a guessed pin" >&2; exit 1; }
+[ -n "$RELEASE" ] || { echo "ERROR: could not read engine_release from $ENGINE_DIR/engine-manifest.yaml — refusing to bake an 'unknown' version" >&2; exit 1; }
 ENG_SHA="$(git -C "$ENGINE_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 HERMES_REPO="${HERMES_REPO:-https://github.com/NousResearch/hermes-agent.git}"
 IMAGE="${OKENGINE_IMAGE:-hermes-agent}"
