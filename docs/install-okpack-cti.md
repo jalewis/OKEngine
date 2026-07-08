@@ -1,12 +1,15 @@
-# Install okpack-sec (the security bundle)
+# Install okpack-cti (the CTI bundle)
 
-`okpack-sec` is a **pack bundle** (okengine#181): it owns no types and declares a recipe that
+> **Renamed:** this bundle was `okpack-sec` through v0.10.8. Use `okpack-cti` — the old name no
+> longer resolves. See the [library catalog](https://github.com/jalewis/okpacks-library#composition--bundles).
+
+`okpack-cti` is a **pack bundle** (okengine#181): it owns no types and declares a recipe that
 composes six focused security packs into one STIX-aligned vault. Pulling it recomposes the full
 security KB — actors, campaigns, malware, tools, ATT&CK techniques, exploited CVEs, landscape
 metrics/publishers, indicators (IOCs), infrastructure, detections, mitigations, incidents, and
 identities — with STIX/legacy type names resolving to the friendly canonical types via `type_aliases`.
 
-The recipe (see [`pack.yaml`](../../okpacks-library/packs/okpack-sec/pack.yaml)):
+The recipe (see [`pack.yaml`](../../okpacks-library/packs/okpack-cti/pack.yaml)):
 
 | Pack | Owns | Seed |
 |------|------|------|
@@ -35,7 +38,7 @@ The recipe (see [`pack.yaml`](../../okpacks-library/packs/okpack-sec/pack.yaml))
 `framework install-domain --apply`s each compose pack onto it:
 
 ```bash
-python scripts/framework.py pull okpack-sec ../okcti
+python scripts/framework.py pull okpack-cti ../okcti
 cd ../okcti
 ```
 
@@ -43,7 +46,7 @@ If the public catalog is not reachable yet, point at a local catalog (recipe mem
 or as siblings of the bundle in the same monorepo):
 
 ```bash
-python scripts/framework.py pull okpack-sec ../okcti \
+python scripts/framework.py pull okpack-cti ../okcti \
   --catalog /path/to/okpacks-library/catalog.json
 ```
 
@@ -73,7 +76,7 @@ validates as a normal pack:
 
 ```bash
 # the bundle recipe (from the bundle source dir, before pull):
-python ../okengine/scripts/framework.py validate /path/to/okpacks-library/packs/okpack-sec
+python ../okengine/scripts/framework.py validate /path/to/okpacks-library/packs/okpack-cti
 # the composed vault (after pull):
 python ../okengine/scripts/framework.py validate .
 ```
@@ -96,7 +99,7 @@ importers on schedule; the STIX/OCSF projectors live under `projectors/` on the 
 ## Add or drop a pack
 
 Because it's a bundle, growing or shrinking the security vault is an edit to the `compose:` list in
-`okpack-sec/pack.yaml` (or a manual `framework install-domain <vault> <pack> --apply` onto a running
+`okpack-cti/pack.yaml` (or a manual `framework install-domain <vault> <pack> --apply` onto a running
 vault — exactly what `pull` automates). The library enforces globally-disjoint type ownership across
 the composed set.
 

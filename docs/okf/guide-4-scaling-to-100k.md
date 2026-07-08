@@ -361,7 +361,7 @@ How each strategy maps to a concrete engine mechanism:
 | 8 | Structural files | INDEX tree, log, AGENTS, BUNDLE, HEALTH, HOT all generated |
 | 9 | Tooling ecosystem | IWE + qmd + ripgrep + okengine-reader + okengine-mcp (read); MCP write path via `okengine-write` |
 
-The engine is also *ahead* of the bare reference design on deployability (engine/pack split, versioned engine, a public reference pack — okpack-sec, a separate repo — plus multi-domain-in-one-vault via walk-up schema), search, the INDEX/500-rule tree, and structural files. Every mechanism above is **pattern-level and domain-agnostic** — each lands in the engine and every pack inherits it.
+The engine is also *ahead* of the bare reference design on deployability (engine/pack split, versioned engine, a public reference pack — okpack-cti, a separate repo — plus multi-domain-in-one-vault via walk-up schema), search, the INDEX/500-rule tree, and structural files. Every mechanism above is **pattern-level and domain-agnostic** — each lands in the engine and every pack inherits it.
 
 ---
 

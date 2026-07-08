@@ -29,7 +29,7 @@ is Google's minimal markdown + YAML convention for sharing structured context
 with AI agents. It overlaps naturally with OKEngine because both use markdown
 pages, YAML frontmatter, and graph links:
 
-- **Lineage:** Andrej Karpathy's "LLM wiki" note ([gist](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f), 2026-04-04) is the *pattern* that sparked OKEngine. **Google's Open Knowledge Format is a named, minimal *format*** that later validated the direction and gives OKEngine a cheap compatibility floor. OKEngine is an LLM-wiki engine with OKF-compatible validation; okpack-sec is the first domain profile.
+- **Lineage:** Andrej Karpathy's "LLM wiki" note ([gist](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f), 2026-04-04) is the *pattern* that sparked OKEngine. **Google's Open Knowledge Format is a named, minimal *format*** that later validated the direction and gives OKEngine a cheap compatibility floor. OKEngine is an LLM-wiki engine with OKF-compatible validation; okpack-cti is the first domain profile.
 - **Form:** a directory of markdown files with YAML frontmatter, linked into a graph; reserved `index.md` + `log.md`; an `AGENTS.md`-style agent contract.
 - **Required field:** `type` (the *only* mandatory field).
 - **Conformance unit:** per-page conformance to the nearest `schema.yaml`.

@@ -83,7 +83,7 @@ field_enums:
 
 A pack may **add optional fields** to a core type. It may **not** add **required** fields or
 otherwise make a core type stricter. Why: under composition, a stricter `source`/`finding` would
-**reject another pack's pages** (okpack-sec's findings have `severity`; okpack-fintech's don't —
+**reject another pack's pages** (okpack-cti's findings have `severity`; okpack-fintech's don't —
 a shared `finding` cannot require `severity`). The core's required set is fixed; everything a pack
 adds is optional. If your domain genuinely needs a field present, enforce it in the pack's **ingest
 workflow** (`CLAUDE.md`) + validate the value with a `field_enums` entry — not by tightening the

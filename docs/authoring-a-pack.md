@@ -228,7 +228,7 @@ owns *nothing* and ships no schema — it declares a **recipe** of packs to comp
 family of focused packs can be installed as one:
 
 ```yaml
-name: okpack-sec
+name: okpack-cti
 kind: bundle              # "pack" (default) | "bundle"
 trust: public
 owns: {types: [], namespaces: []}   # a bundle MUST own nothing
@@ -516,7 +516,7 @@ Three hygiene rules do that:
 - **Taxonomy-augmenting pack** — the pack's value is entity-world coverage + lanes (feeds,
   curation, enrichment) over shared namespaces: the install *adds missing types to the
   host schema* (id-keyed additions file), merges feeds/lanes, and appends persona. Its
-  pages live in the host's namespaces, not a subtree. Reference: `okpack-sec/subdomain/`.
+  pages live in the host's namespaces, not a subtree. Reference: `okpack-cti/subdomain/`.
 
 Ship the co-install form under `subdomain/` (schema variant or host-schema additions +
 `INSTALL-*.md` with verification probes + `PERSONA.md`, the marked `## Installed domain:`

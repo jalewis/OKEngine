@@ -1,6 +1,6 @@
 # Pack-building challenges — what actually goes wrong
 
-Field notes from building and auditing five packs (okpack-sec, okpack-ai-research, okpack-example,
+Field notes from building and auditing five packs (okpack-cti, okpack-ai-research, okpack-example,
 okpack-competitive, okpack-cyber-market) plus porting a production system's lane fleet. This is the
 *why-packs-rot* companion to [`authoring-a-pack.md`](authoring-a-pack.md) (the how-to) and
 [`common-issues.md`](common-issues.md) (symptom→fix). Every item below was found in a real pack.

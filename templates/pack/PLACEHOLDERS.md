@@ -6,7 +6,7 @@ template is **not** expected to parse until rendered).
 
 | Token | Meaning | Example | Derivation |
 |-------|---------|---------|------------|
-| `{{PACK}}` | Pack name — the repo/dir name. Convention: `okpack-<domain>`. | `okpack-sec` | you choose |
+| `{{PACK}}` | Pack name — the repo/dir name. Convention: `okpack-<domain>`. | `okpack-cti` | you choose |
 | `{{DOMAIN}}` | Short domain tag — used in `raw/<DOMAIN>`, the feed source-tag, env prefix. | `sec` | `{{PACK}}` minus `okpack-` |
 | `{{TITLE}}` | Human title of the vault. | `security knowledge vault` | you choose |
 | `{{BLURB}}` | One-line description (README intro + GitHub "About"). | `Agent-curated security knowledge vault…` | you choose |

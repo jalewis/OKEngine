@@ -43,7 +43,7 @@ python /opt/data/scripts/kb_graph.py retrieve concepts/ransomware
 
 > The sections above describe the original terminal-wrapper design. In a deployment that
 > exposes the **`okengine` read MCP** (`okengine-mcp/server.py`), the agent reaches qmd/IWE
-> through that MCP server, which runs in the **mcp container** (`okpack-sec-*-mcp`) — that is
+> through that MCP server, which runs in the **mcp container** (`okpack-cti-*-mcp`) — that is
 > where qmd is installed and where `/opt/data/qmd/` lives. The **gateway** runs cron-plus but
 > does **not** have qmd installed. This topology has real consequences below.
 

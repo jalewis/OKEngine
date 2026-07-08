@@ -552,9 +552,9 @@ def _make_bundle(pack: Path, recipe_yaml: str):
 
 
 def test_bundle_validates_without_schema(tmp_path):
-    pack = tmp_path / "okpack-sec"
+    pack = tmp_path / "okpack-cti"
     _make_bundle(pack,
-                 "name: okpack-sec\nversion: 0.3.0\nkind: bundle\ntrust: public\n"
+                 "name: okpack-cti\nversion: 0.3.0\nkind: bundle\ntrust: public\n"
                  "description: security bundle\n"
                  "owns: {types: [], namespaces: []}\n"
                  "requires: [okpack-a, okpack-b]\n"

@@ -6,7 +6,7 @@ authoring. To build a NEW pack from scratch instead, use `framework init` and th
 
 Pack-specific walkthroughs:
 
-- [`install-okpack-sec.md`](install-okpack-sec.md) — security/threat-intel pack.
+- [`install-okpack-cti.md`](install-okpack-cti.md) — security/threat-intel pack.
 - [`install-okpack-ai-research.md`](install-okpack-ai-research.md) — AI/LLM
   research-watch pack.
 

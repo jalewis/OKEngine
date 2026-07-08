@@ -91,7 +91,7 @@ def test_mixed_trust_fails():
 
 # --- okengine#181: kind: bundle ---------------------------------------------------
 
-def _bundle_meta(name="okpack-sec", host="host", compose=("g1", "g2"),
+def _bundle_meta(name="okpack-cti", host="host", compose=("g1", "g2"),
                  requires=None, types=(), namespaces=()):
     reqs = list(requires) if requires is not None else [host, *compose]
     return {"name": name, "version": "1.0.0", "trust": "public", "kind": "bundle",
@@ -101,8 +101,8 @@ def _bundle_meta(name="okpack-sec", host="host", compose=("g1", "g2"),
 
 
 def test_load_pack_meta_reads_kind_and_bundle(tmp_path):
-    d = _pack(tmp_path, "okpack-sec",
-              "name: okpack-sec\nversion: 0.3.0\nkind: bundle\ntrust: public\n"
+    d = _pack(tmp_path, "okpack-cti",
+              "name: okpack-cti\nversion: 0.3.0\nkind: bundle\ntrust: public\n"
               "owns: {types: [], namespaces: []}\n"
               "requires: [okpack-a, okpack-b, okpack-c]\n"
               "bundle: {host: okpack-a, compose: [okpack-b, okpack-c]}\n")
@@ -142,7 +142,7 @@ def test_bundle_recipe_rejects_malformed():
 
 
 def test_bundle_composes_clean_with_real_packs():
-    metas = [_bundle_meta(name="okpack-sec", host="okpack-a", compose=["okpack-b"],
+    metas = [_bundle_meta(name="okpack-cti", host="okpack-a", compose=["okpack-b"],
                           requires=["okpack-a", "okpack-b"]),
              _meta("okpack-a", types=["actor"]),
              _meta("okpack-b", types=["cve"])]
@@ -151,7 +151,7 @@ def test_bundle_composes_clean_with_real_packs():
 
 def test_bundle_cannot_nest():
     inner = _bundle_meta(name="okpack-b", host="x", compose=["y"], requires=["x", "y"])
-    outer = _bundle_meta(name="okpack-sec", host="okpack-a", compose=["okpack-b"],
+    outer = _bundle_meta(name="okpack-cti", host="okpack-a", compose=["okpack-b"],
                          requires=["okpack-a", "okpack-b"])
     metas = [outer, inner, _meta("okpack-a", types=["actor"]),
              _meta("x", types=["t1"]), _meta("y", types=["t2"])]

@@ -79,7 +79,7 @@ types:
 
   # --- DOMAIN ENTITIES — REPLACE THESE with your domain's types. ---
   # Each entity lives under wiki/entities/ and declares its identity field.
-  # Example (from okpack-sec): an actor, a thing, an identifier.
+  # Example (from okpack-cti): an actor, a thing, an identifier.
   #
   # Identity (composable okpacks): a type MAY declare how its `id` is minted and
   # who owns it. The engine converges authority-id pages across packs into one

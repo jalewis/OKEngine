@@ -105,7 +105,7 @@ export HERMES_UID=10000 HERMES_GID=10000 && sudo chown -R 10000:10000 <pack>
      lane** — and how to point a cheap lane (glossary) or a reasoning lane (predictions
      grading) at a different model via the per-lane `model:` override — is in
      [`docs/model-selection.md`](model-selection.md).
-   (Or start from the reference pack — okpack-sec, a separate repo — instead of `init`.)
+   (Or start from the reference pack — okpack-cti, a separate repo — instead of `init`.)
    Then **validate before you go further** (catches a bad schema/cron JSON/script
    syntax/unfilled persona/committed `.env` up front):
    ```bash
@@ -226,8 +226,8 @@ files, and writes each changed definition file as `<file>.upstream` next to your
 
 ## 4. Reference pack
 
-- **okpack-sec** — a security-focused LLM-wiki pack, published in the
-  **pack catalog**: <https://github.com/jalewis/okpacks-library/tree/main/packs/okpack-sec>.
+- **okpack-cti** — a security-focused LLM-wiki pack, published in the
+  **pack catalog**: <https://github.com/jalewis/okpacks-library/tree/main/packs/okpack-cti>.
   This engine ships no pack content itself. Use it as a worked example of
   a complete pack — schema, persona `CLAUDE.md`, feeds, domain data, and
   `domain`/`engine-template` crons — when authoring your own.

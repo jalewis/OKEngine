@@ -5,7 +5,7 @@ Andrej Karpathy). These guides are the **domain-agnostic** reference for that
 pattern *as built here*. Google's Open Knowledge Format (OKF) is treated as a
 minimal compatibility/interoperability floor for markdown+YAML agent knowledge,
 not as the origin of the project. Security is the first concrete worked domain.
-The reference pack is **okpack-sec** (a security-focused LLM-wiki pack, maintained
+The reference pack is **okpack-cti** (a security-focused LLM-wiki pack, maintained
 in its own repo); this engine ships no pack content of its own.
 
 ## The generalized guides (current, domain-agnostic — start here)

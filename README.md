@@ -163,7 +163,7 @@ Controls:
 - [`INSTALL.md`](INSTALL.md) — install OKEngine on pinned Hermes.
 - [`docs/install-selected-pack.md`](docs/install-selected-pack.md) — install an
   existing pack.
-- [`docs/install-okpack-sec.md`](docs/install-okpack-sec.md) — install the
+- [`docs/install-okpack-cti.md`](docs/install-okpack-cti.md) — install the
   security/threat-intel pack.
 - [`docs/install-okpack-ai-research.md`](docs/install-okpack-ai-research.md) —
   install the AI/LLM research-watch pack.

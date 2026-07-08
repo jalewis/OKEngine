@@ -84,12 +84,12 @@ schedules. So **a public pack is always its own instance.**
 | Instance | Vault | Domains | Trust | Stack ports |
 |---|---|---|---|---|
 | **a private instance** | private vault | a root domain + a related sub-domain | private | reader 9200 · mcp 8730 |
-| **the reference pack** (okpack-sec) | separate vault | one public security domain | **public** | reader 9400 · mcp 8930 |
+| **the reference pack** (okpack-cti) | separate vault | one public security domain | **public** | reader 9400 · mcp 8930 |
 
 A root domain + a related sub-domain can live together (model A) — both private,
 related signal, same trust boundary. **A public domain is its own instance**
 (model B) because it is public: separate dir, separate git repo, separate stack.
-The public reference pack (okpack-sec, a separate repo) builds as model B and touches
+The public reference pack (okpack-cti, a separate repo) builds as model B and touches
 nothing in any private instance — they never co-mingle.
 
 ## Mental model

@@ -1,6 +1,6 @@
 # Integration Catalog: Connecting Data Sources to an Agent-Maintained Vault
 
-Domain-agnostic; generalized from the security integration catalog; reflects the engine as of 2026-06-15. Security sources are the first worked example; the reference pack is **okpack-sec** (a security-focused LLM-wiki pack, maintained in its own repo).
+Domain-agnostic; generalized from the security integration catalog; reflects the engine as of 2026-06-15. Security sources are the first worked example; the reference pack is **okpack-cti** (a security-focused LLM-wiki pack, maintained in its own repo).
 
 The Open Knowledge Format (OKF) gives a universal syntax for representing knowledge but deliberately omits guidance on *how* external data gets in. This catalog fills that gap **generically**: how any **domain pack** wires its sources into an agent-maintained vault without creating duplicate entities, losing provenance, or bloating the store with ephemera. The patterns here are the deliverable. The security source list (MITRE ATT&CK, CISA KEV, NVD, EPSS, MISP, Abuse.ch, STIX/TAXII, OCSF) is one worked example, summarized at the end.
 
@@ -80,7 +80,7 @@ pack/feeds/*.opml   →  feed_fetch.py  →  raw/<lane>/  →  wake-gated ingest
 3. **Raw landing** — new items accumulate in `raw/<lane>/` as immutable inputs. No knowledge is compiled yet; this is the queue.
 4. **Wake-gated ingest agent** — a separate cron compiles `raw/<lane>/` → `wiki/sources/` (plus `entities`/`concepts`/`predictions`) with **relevance triage**: the agent decides what is worth a permanent page, drops noise, resolves entities to canonical pages (§5), and writes provenance (§4). The "wake gate" means the agent only runs when there is new raw material, not on a blind schedule.
 
-**Worked reference — the okpack-sec pack** runs exactly this: a `<lane>.opml` feed list → `feed_fetch.py` → `raw/<lane>/` → a wake-gated `*-ingest` cron compiles into `wiki/`. Every pack that ingests feeds reuses this same engine path.
+**Worked reference — the okpack-cti pack** runs exactly this: a `<lane>.opml` feed list → `feed_fetch.py` → `raw/<lane>/` → a wake-gated `*-ingest` cron compiles into `wiki/`. Every pack that ingests feeds reuses this same engine path.
 
 ### 2.3 Enrichment hooks (Enrichment → fields on existing entities)
 
@@ -114,7 +114,7 @@ Every ingested entity carries provenance frontmatter so a downstream consumer ca
 | source citation (`url` / `source` / `raw`) | The originating source — always cite where it came from. |
 | sensitivity marking (`tlp`-analogue) | A sharing/sensitivity marking analogous to TLP (e.g. `clear` / `internal` / `restricted`). |
 
-**Trust scoring** is the pack's call: the okpack-sec pack scores reliability + credibility per a rubric in its persona `CLAUDE.md` (a curated source roster maps known publishers to ratings). A different pack supplies its own rubric. The engine carries the *fields*; the pack carries the *scoring*.
+**Trust scoring** is the pack's call: the okpack-cti pack scores reliability + credibility per a rubric in its persona `CLAUDE.md` (a curated source roster maps known publishers to ratings). A different pack supplies its own rubric. The engine carries the *fields*; the pack carries the *scoring*.
 
 **Inherit-most-restrictive.** A synthesized page (one compiled from several sources) inherits the **most restrictive** sensitivity marking among its inputs, and the **lowest** trust among load-bearing inputs. If a synthesis draws on a `restricted` source, the synthesis is `restricted`. When inputs carry mixed markings and you cannot honor the most-restrictive in one namespace, split the ingest by marking. Always cite each contributing source.
 
@@ -152,7 +152,7 @@ The cardinal cadence rule: **a high-velocity source stays Query.** Materializing
 
 These are illustrations of the patterns above, not the subject.
 
-**okpack-sec pack** (the security-focused LLM-wiki pack, maintained in its own repo) catalogs the security sources by class with no engine change: MITRE ATT&CK / D3FEND / ATLAS, CISA KEV, NVD as **Bundle** sources in `reference/`; EPSS as an **Enrichment** source (annotates `vulnerability` entities); MISP and Abuse.ch as **Query** sources at the MCP surface; STIX/TAXII as the transport for whichever class a given feed is; OCSF as a schema reference for event-shaped entities. It wires its feeds through the standard `<lane>.opml` → `feed_fetch.py` → `raw/<lane>/` → wake-gated ingest pipeline (§2.2), and scores reliability + credibility per a rubric in its persona `CLAUDE.md` (a curated source roster maps known publishers to Admiralty-style ratings). Same taxonomy, same mechanics — any pack supplies its own sources and rubric.
+**okpack-cti pack** (the security-focused LLM-wiki pack, maintained in its own repo) catalogs the security sources by class with no engine change: MITRE ATT&CK / D3FEND / ATLAS, CISA KEV, NVD as **Bundle** sources in `reference/`; EPSS as an **Enrichment** source (annotates `vulnerability` entities); MISP and Abuse.ch as **Query** sources at the MCP surface; STIX/TAXII as the transport for whichever class a given feed is; OCSF as a schema reference for event-shaped entities. It wires its feeds through the standard `<lane>.opml` → `feed_fetch.py` → `raw/<lane>/` → wake-gated ingest pipeline (§2.2), and scores reliability + credibility per a rubric in its persona `CLAUDE.md` (a curated source roster maps known publishers to Admiralty-style ratings). Same taxonomy, same mechanics — any pack supplies its own sources and rubric.
 
 ---
 
@@ -179,7 +179,7 @@ The original security integration catalog classified the major security sources 
 
 - Generalized from: *Security Integration Catalog: Reference Data Sources* (v0.2 draft).
 - Engine feed mechanism: `scripts/cron/feed_fetch.py`.
-- Reference pack feeds: the okpack-sec pack's `pack/feeds/<lane>.opml` lists (okpack-sec is a separate repo).
+- Reference pack feeds: the okpack-cti pack's `pack/feeds/<lane>.opml` lists (okpack-cti is a separate repo).
 - Pack data tables: the pack's `pack/data/*.yaml` / `pack/data/*.json` (e.g. a public-entity roster + curated entity fields).
 - Entity-type contract: `schema.yaml` `types` (root) and any `wiki/<subdomain>/schema.yaml` (sub-domain, resolved by the walk-up validator).
 - LLM-wiki pattern (origin of OKEngine): Andrej Karpathy, [LLM wiki gist](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f).

@@ -9,14 +9,14 @@ at deploy time. It is the file-layer companion to the runtime view in
 
 The codebase is a **pinned Hermes-Agent** (consumed as a dependency, not forked)
 with OKEngine's KB machinery layered on top. The engine ships no domain content of
-its own (the reference pack, **okpack-sec**, is a separate repo). The honest
+its own (the reference pack, **okpack-cti**, is a separate repo). The honest
 decomposition is three layers:
 
 | Layer | What it is | Lifecycle |
 |---|---|---|
 | **Runtime** | The pinned Hermes-Agent (consumed as a dependency, not forked): `gateway/`, `agent/`, `hermes_cli/`, `cron/`, `plugins/`, `providers/`, `acp_*`, `tui_gateway/`, `ui-tui/`, `locales/`, `skills/`, `tools/` (mostly), `Dockerfile`, `docker-compose.yml` | Pinned at a fixed tag; `git fetch upstream` to bump the pin; we patch sparingly. |
 | **Engine** | OKEngine's domain-agnostic value-add: LLM-wiki governance/maintenance, OKF-compatible validation, KB-maintenance machinery (`engine` + `engine-template` crons), retrieval/graph integration, deploy tooling | Ships with the framework; same for every deployment. |
-| **Domain pack** | Everything domain-specific: the vault (schema + content + persona), feeds, domain data files, `domain` crons + `engine-template` prompts, secrets | One per deployment; the reference pack is **okpack-sec** (separate repo). |
+| **Domain pack** | Everything domain-specific: the vault (schema + content + persona), feeds, domain data files, `domain` crons + `engine-template` prompts, secrets | One per deployment; the reference pack is **okpack-cti** (separate repo). |
 
 The framework = **Runtime + Engine**. A deployment = framework + **one domain pack**.
 
@@ -37,7 +37,7 @@ The framework = **Runtime + Engine**. A deployment = framework + **one domain pa
 | `config/config.yaml.template` | deployment-critical Hermes keys (reference) |
 | `docs/okf/`, `docs/kb-tooling.md`, `docs/okf-alignment.md` | engine docs |
 
-### Domain pack (per-deployment — illustrative; the reference pack is okpack-sec, a separate repo)
+### Domain pack (per-deployment — illustrative; the reference pack is okpack-cti, a separate repo)
 | Path | Role |
 |---|---|
 | **Vault repo** — `schema.yaml` | the structural contract: `partitioning` + `hot_set` + `types` — but **domain types only**. The universal OKF core now lives engine-side in `config/base-schema.yaml` (okengine#90 P2) and is merged under the pack; a pack inherits it and uses `extends:` to add optional fields to a core type (see [`core-types-and-extensions.md`](core-types-and-extensions.md)) |
@@ -127,5 +127,5 @@ domain pack (its own repo)
 └── .env.example
 ```
 
-The reference pack is **okpack-sec** (a security-focused LLM-wiki pack,
+The reference pack is **okpack-cti** (a security-focused LLM-wiki pack,
 maintained in its own repo).

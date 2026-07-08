@@ -135,7 +135,7 @@ Two load-bearing properties — **both already implemented today** (see
   `strict_types: true`. This is what makes the format **open/extensible**: packs
   add fields freely; the engine never strips "extra" data it doesn't recognise.
 - **Published, reusable pack schemas.** A pack defines *and publishes* its schema
-  (e.g. `okpack-sec` publishes the security types), so others reuse it instead of
+  (e.g. `okpack-cti` publishes the security types), so others reuse it instead of
   reinventing. Variants/forks of a published schema are a later concern.
 
 Implication for composition: merging packs = unioning their `types:` on top of the

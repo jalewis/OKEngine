@@ -41,15 +41,15 @@ def test_provenance_fields_render_in_secondary(tmp_path, monkeypatch):
     m = _load(tmp_path, monkeypatch)
     panel = m._meta_panel_items({
         "type": "source", "origin": "lab",                        # domain intel -> primary
-        "maintained_by": ["okpack-sec", "okpack-ai-research"],    # provenance -> secondary
-        "discovered_by": "okpack-sec",
+        "maintained_by": ["okpack-cti", "okpack-ai-research"],    # provenance -> secondary
+        "discovered_by": "okpack-cti",
     })
     sec_labels = {i["label"] for i in panel["secondary"]}
     pri_labels = {i["label"] for i in panel["primary"]}
     assert "Maintained by" in sec_labels and "Discovered by" in sec_labels
     assert "Origin" in pri_labels                                 # domain intel stays primary
     mb = next(i for i in panel["secondary"] if i["label"] == "Maintained by")
-    assert "okpack-sec" in str(mb["values"]) and "okpack-ai-research" in str(mb["values"])
+    assert "okpack-cti" in str(mb["values"]) and "okpack-ai-research" in str(mb["values"])
 
 
 def test_private_vault_exposed_without_password_refuses(tmp_path, monkeypatch):
@@ -198,7 +198,7 @@ def test_about_reports_purpose_and_composition(tmp_path, monkeypatch):
         "mission: Track the suppliers we depend on.\n")
     (tmp_path / "CLAUDE.md").write_text(
         "# persona\n\n## Installed domain: doctrine (okpack-doctrine sub-domain)\n\nrules\n"
-        "\n## Installed domain: security KB (okpack-sec co-install)\n\nrules\n")
+        "\n## Installed domain: security KB (okpack-cti co-install)\n\nrules\n")
     (tmp_path / ".okengine").mkdir()
     (tmp_path / ".okengine" / "extensions.yaml").write_text(
         "enabled:\n  okengine.events: {}\n  okengine.completeness: {}\n")
@@ -207,7 +207,7 @@ def test_about_reports_purpose_and_composition(tmp_path, monkeypatch):
     assert a["description"] == "Vendor risk watch"
     assert a["mission"] == "Track the suppliers we depend on."
     assert a["installed_domains"] == ["doctrine (okpack-doctrine sub-domain)",
-                                      "security KB (okpack-sec co-install)"]
+                                      "security KB (okpack-cti co-install)"]
     assert a["sub_domains"] == ["doctrine"]
     assert [e["id"] for e in a["extensions"]] == ["okengine.completeness", "okengine.events"]
 

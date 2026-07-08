@@ -851,5 +851,5 @@ tests/                         regressions — every fix ships one
 6. `scripts/cron_pack_split.py` — the composition pipeline.
 7. `docs/okf/guide-4-scaling-to-100k.md` + `docs/entity-partitioning.md` +
    `docs/common-issues.md` — the scale and failure-mode record.
-8. A pack repo (`okpack-sec` or the competitive pack) — see the domain layer
+8. A pack repo (`okpack-cti` or the competitive pack) — see the domain layer
    with the engine abstractions fresh in mind.

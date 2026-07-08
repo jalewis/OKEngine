@@ -10,7 +10,7 @@ This guide is the **conceptual companion** — the *decisions* you make when aut
 a pack. For the step-by-step walkthrough (scaffold → fill → validate → deploy) and
 the full v0.2.0 contract (`pack.yaml`, ids, composition, the conformance profile),
 follow **[`docs/authoring-a-pack.md`](../../docs/authoring-a-pack.md)** in the engine
-repo. The reference implementation is **okpack-sec** (security threat-intel);
+repo. The reference implementation is **okpack-cti** (security threat-intel);
 examples below point at it.
 
 ---
@@ -93,7 +93,7 @@ ingest workflow, not the gate. The cross-cutting optional fields the core alread
 `sensitivity`) are yours for free, and their base enums are extensible. Full model,
 rules, and examples: **[`docs/core-types-and-extensions.md`](../../docs/core-types-and-extensions.md)**.
 
-Then add your **domain entity types**. okpack-sec uses `host, ioc, threat-actor,
+Then add your **domain entity types**. okpack-cti uses `host, ioc, threat-actor,
 malware, campaign, technique, vulnerability, detection, tool, software`. A finance pack
 might use `institution, instrument, fraud-scheme, regulation, actor`. For each, pick
 the **identity field** that makes the page addressable (`ioc.value`, `technique.mitre_id`,
@@ -121,7 +121,7 @@ sync — `validate.py` checks that crons only write to declared namespaces.
 
 The default is `{create: true, update: true, delete: false}` (the agent writes; never
 hard-deletes — it tombstones). A namespace can be marked **human-authored** by setting
-`{create: false, update: false}`. okpack-sec gates `findings/` this way: analysts
+`{create: false, update: false}`. okpack-cti gates `findings/` this way: analysts
 author findings via git; the MCP write path *refuses* agent writes there. Use this for
 any namespace where a machine assertion shouldn't stand without a human.
 
@@ -166,7 +166,7 @@ build if a committed cron is `enabled: true`.
 Plus the **engine-driven ingest lane** (`crons/engine-template-prompts.json`): prompts
 the engine schedules to compile raw→entities, score sources, classify types, enrich
 thin pages, and grade predictions. All ingest crons are **local-only** (no web tools —
-shared paid budget). Start from okpack-sec's prompts and swap the domain nouns.
+shared paid budget). Start from okpack-cti's prompts and swap the domain nouns.
 
 > **Engine-side, tracked:** two deeper thundering-herd fixes live in the engine, not the
 > pack — (1) `feed_fetch.py` conditional GET (`ETag`/`If-Modified-Since` → cheap `304`s)
@@ -197,7 +197,7 @@ you expose a private vault on the LAN, set a real `OKENGINE_READER_PASSWORD`.
 - checks `type:` frontmatter the crons write maps to a real schema type;
 - validates human-only gates *generically* — any namespace declared
   `create:false, update:false` must keep that exact shape; a pack with no gate is
-  legal (set `REQUIRED_HUMAN_ONLY` to assert a specific one, as okpack-sec does for
+  legal (set `REQUIRED_HUMAN_ONLY` to assert a specific one, as okpack-cti does for
   `findings`);
 - checks schema cross-section drift — every `tier`/`hot_set` namespace must exist in
   `partitioning`;

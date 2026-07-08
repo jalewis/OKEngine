@@ -1,6 +1,6 @@
 # Building an Agent-Maintained Knowledge Vault
 
-Domain-agnostic. Security is the first concrete worked domain; the reference pack is **okpack-sec** (a security-focused LLM-wiki pack, maintained in its own repo).
+Domain-agnostic. Security is the first concrete worked domain; the reference pack is **okpack-cti** (a security-focused LLM-wiki pack, maintained in its own repo).
 
 This guide describes how to build a knowledge vault that an LLM agent maintains autonomously: a directory of markdown files the agent reads, writes, links, and lints over time so that knowledge **compounds** instead of being rediscovered per query. It is the pattern-level companion to this repo's actual engine; a "Reference implementation" callout at the end of each section maps the pattern to the real components, so the guide doubles as build documentation for the engine.
 
@@ -370,7 +370,7 @@ engine @ vX.Y.Z   +   <your pack>   →   a live second brain
 
 **Scaffolding.** A new pack is bootstrapped, then the engine version is pinned.
 
-> **Reference implementation.** The engine/pack boundary is declared in `engine-manifest.yaml` (the pinned Hermes-Agent stays at the repo root for clean upstream tracking, so the manifest *is* the logical boundary). Cron classification lives in `config/cron-tiers.yaml` (engine / engine-template / domain). The branded `framework` CLI scaffolds a new pack — `python scripts/framework.py init` (which calls `framework_init.py`) — with `framework validate` (`scripts/framework_validate.py`) as the pre-deploy pack check; the engine is versioned (`v0.2.0`) and a pack pins `engine.version`. Operator quickstart: `docs/deploy-a-new-domain.md`. The reference pack is **okpack-sec** (a security-focused LLM-wiki pack, maintained in its own repo).
+> **Reference implementation.** The engine/pack boundary is declared in `engine-manifest.yaml` (the pinned Hermes-Agent stays at the repo root for clean upstream tracking, so the manifest *is* the logical boundary). Cron classification lives in `config/cron-tiers.yaml` (engine / engine-template / domain). The branded `framework` CLI scaffolds a new pack — `python scripts/framework.py init` (which calls `framework_init.py`) — with `framework validate` (`scripts/framework_validate.py`) as the pre-deploy pack check; the engine is versioned (`v0.2.0`) and a pack pins `engine.version`. Operator quickstart: `docs/deploy-a-new-domain.md`. The reference pack is **okpack-cti** (a security-focused LLM-wiki pack, maintained in its own repo).
 
 ### Scheduler mechanics (cron-plus)
 
@@ -379,7 +379,7 @@ The autonomous loop runs on `cron-plus`: subprocess-per-job (true parallelism), 
 - **`no_agent: true`** — a pure-script job that writes its output as a side effect and never needs the LLM. The script *is* the job; no agent is constructed (no prompt, no tool loop, no token spend).
 - **wake-gate** — a script emits `{"wakeAgent": true|false}`; on `true` the agent runs the real work, on `false` the tick is silent. This keeps the LLM off the critical path until there's actually something to do.
 
-> **Reference implementation.** A fleet of cron-plus jobs; pure-script jobs carry `no_agent: true`; the rest are wake-gated (script gate → agent works) or always-on agent jobs. The engine *exceeds* this guide on deployability (engine/pack split, the `framework` CLI, versioned engine, a public reference pack — okpack-sec, a separate repo — plus multi-domain-in-one-vault via walk-up schema), on search (qmd hybrid + IWE + ripgrep), and on the conformance stack (walk-up multi-domain validator + rolling drains). The conformance machinery covers the full pattern:
+> **Reference implementation.** A fleet of cron-plus jobs; pure-script jobs carry `no_agent: true`; the rest are wake-gated (script gate → agent works) or always-on agent jobs. The engine *exceeds* this guide on deployability (engine/pack split, the `framework` CLI, versioned engine, a public reference pack — okpack-cti, a separate repo — plus multi-domain-in-one-vault via walk-up schema), on search (qmd hybrid + IWE + ripgrep), and on the conformance stack (walk-up multi-domain validator + rolling drains). The conformance machinery covers the full pattern:
 
 | Item | Engine mechanism |
 |---|---|

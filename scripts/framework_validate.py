@@ -335,7 +335,7 @@ def check_engine_version(pack: Path, r: Report) -> None:
     # Required: the pack must pin the engine release it targets, AND that pin must
     # match the engine running this validator — you validate (and deploy) against
     # one engine, so the pack must declare that one. This is the single coupling
-    # that catches engine/pack drift (the okpack-sec engine-v0.1.0 case).
+    # that catches engine/pack drift (the okpack-cti engine-v0.1.0 case).
     ev = pack / "engine.version"
     if not ev.is_file():
         r.fail("engine.version", "missing — pin the engine release the pack targets (e.g. v0.2.0)")
@@ -656,7 +656,7 @@ def check_vault_mount(pack: Path, r: Report) -> None:
     """WIKI_PATH must be a vault root whose last segment is NOT `wiki`. The engine derives the
     page tree as `WIKI_PATH/wiki` (write_server.py, build_hot_set.py, …), so `WIKI_PATH=/opt/wiki`
     doubles to `/opt/wiki/wiki` and a stray relative write forks the vault → split-brain
-    (okengine#110). The convention is `/opt/vault`; the skeleton + okpack-sec use it."""
+    (okengine#110). The convention is `/opt/vault`; the skeleton + okpack-cti use it."""
     compose = pack / "docker-compose.yml"
     if not compose.is_file() or yaml is None:
         return

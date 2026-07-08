@@ -208,7 +208,7 @@ For the majority of queries — lookups for specific identifiers — the first t
 
 ## Reference implementation
 
-The rest of this briefing is pattern. This section grounds it: the project this document lives in **is a working reference implementation** of the agent + LLM-wiki pattern, built to be domain-agnostic. The reference **domain pack** is **okpack-sec** (a security-focused LLM-wiki pack, maintained in its own repo) — the engine itself carries no domain knowledge.
+The rest of this briefing is pattern. This section grounds it: the project this document lives in **is a working reference implementation** of the agent + LLM-wiki pattern, built to be domain-agnostic. The reference **domain pack** is **okpack-cti** (a security-focused LLM-wiki pack, maintained in its own repo) — the engine itself carries no domain knowledge.
 
 ### Engine vs. domain pack
 
@@ -284,7 +284,7 @@ The implementation is built to be re-deployed into new domains, not just operate
 - `framework_init` scaffolds a new domain pack.
 - The engine is versioned (`v0.2.0`); packs pin `engine.version`.
 - Quickstart: `docs/deploy-a-new-domain.md`.
-- **The reference pack** is **okpack-sec** (a security-focused LLM-wiki pack, maintained in its own repo). A production deployment further proves the same engine spans multiple domains by hosting a root domain plus a related sub-domain in one vault.
+- **The reference pack** is **okpack-cti** (a security-focused LLM-wiki pack, maintained in its own repo). A production deployment further proves the same engine spans multiple domains by hosting a root domain plus a related sub-domain in one vault.
 
 ---
 

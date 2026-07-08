@@ -56,7 +56,7 @@ fields per type.
    breaks the index/dedup scans that assume `sources/YYYY/MM/`. Set **`raw:`** to the exact
    raw path — this is the dedupe key. Set `publisher`, `published`, `url`, and your `source_kind`.
 2. **Score every source.**
-   > TODO: define your source-quality rubric. okpack-sec uses Admiralty
+   > TODO: define your source-quality rubric. okpack-cti uses Admiralty
    > `reliability` (A–F, the channel) + `credibility` (1–6, the claim) + `tlp` +
    > `bias_flags`. Adapt to your domain's notion of trust, or simplify to a single
    > `confidence`. Add the scoring fields to `source.required` in schema.yaml if you

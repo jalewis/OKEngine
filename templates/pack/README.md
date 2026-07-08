@@ -4,7 +4,7 @@ A starting skeleton + generator for a new **okpack-`<domain>`** — a domain pac
 OKEngine framework ingests feeds into and curates as a compounding knowledge vault.
 
 > **Where this lives:** the OKEngine repo (`templates/pack/`) — the engine owns pack
-> scaffolding, no individual pack does. It was distilled from the `okpack-sec`
+> scaffolding, no individual pack does. It was distilled from the `okpack-cti`
 > reference pack and moved here.
 >
 > **`skeleton/` is the single template.** Two front-ends render it, and only it:

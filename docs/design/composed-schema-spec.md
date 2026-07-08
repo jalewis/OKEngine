@@ -105,8 +105,8 @@ owner map; source fragments use the §5 `owns/reuse/extends` blocks:
 ```yaml
 # <pack>/.okengine/composed-schema.yaml  (generated)
 owners:
-  namespaces:  {predictions: "ext:okengine.predictions", entities: "pack:okpack-sec"}
-  types:       {prediction: "ext:okengine.predictions",  entity: "pack:okpack-sec"}
+  namespaces:  {predictions: "ext:okengine.predictions", entities: "pack:okpack-cti"}
+  types:       {prediction: "ext:okengine.predictions",  entity: "pack:okpack-cti"}
   fields:      {"entity.predicted_by": "ext:okengine.predictions"}        # Level-3 extend
   enum_values: {"source_kind.forecast-derived": "ext:okengine.predictions"}
 types: {...}                 # merged
