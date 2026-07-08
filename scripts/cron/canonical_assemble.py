@@ -28,6 +28,9 @@ import sys
 from datetime import date
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import okf_migrate  # noqa: E402  — shared shard-aware page locator (find_page / canonical_key)
+
 _FM = re.compile(r"\A---[ \t]*\n(.*?\n)---[ \t]*\n?(.*)\Z", re.S)
 # A>...>F, higher rank = more reliable; unknown reliability sorts below F.
 _REL_RANK = {c: i for i, c in enumerate("FEDCBA")}
@@ -250,7 +253,12 @@ def write_canonical(vault: Path, slug: str, type_: str, fused: dict, conflicts: 
     body + any curated/non-owned frontmatter, UNIONing additive (union-policy) fields with
     the existing page (so agent/feed additions are never dropped), and flagging conflicts
     for G3 review. Returns the new page text."""
-    path = vault / "wiki" / "entities" / slug[0] / f"{slug}.md"
+    # The canonical seat, shard-correct: find the page wherever it currently sits (find_page), else
+    # the schema's canonical key for a new one. The old `entities/slug[0]/slug.md` used the RAW first
+    # char — wrong for an uppercase, digit, or symbol slug (canonical shards lowercase, map digits to
+    # `0-9` and symbols to `_`), so the assembler read/wrote a different shard than reshelve files to.
+    existing = okf_migrate.find_page(vault, "entities", slug)
+    path = existing if existing else vault / "wiki" / f"{okf_migrate.canonical_key(vault, 'entities', slug, fused)}.md"
     existing_fm, body = (read_fm(path) if path.exists() else ({}, ""))
     union_f = policy.get("union", set())
 

@@ -198,14 +198,60 @@ def resume(reason: str = "manual") -> int:
     return len(resumed)
 
 
+def reconcile_pause(state: dict, jobs: list) -> list[str]:
+    """Re-apply the budget pause to any recorded cron a jobs.json redeploy silently re-enabled.
+
+    The guard decides pause/resume from its own state file; it never re-derives whether the crons it
+    paused are STILL disabled in the live cron-plus jobs.json. A wholesale `deploy-cron-plus-jobs.sh`
+    redeploy overwrites jobs.json from the enabled:True source, re-enabling every cost-bearing cron
+    while state still says paused — so decide() no-ops and the cap is silently defeated. Re-derive
+    from the LIVE enabled-status and re-pause the drifted crons (okengine invariant-audit #13).
+
+    Returns the ids actually re-paused. A no-op when not paused, no ids recorded, or nothing drifted.
+    A job absent from jobs.json can't be paused (nothing to act on) — skip it."""
+    if not state.get("paused"):
+        return []
+    ids = state.get("paused_ids") or []
+    if not ids:
+        return []
+    live = {j.get("id"): j for j in jobs or [] if j.get("id")}
+    drifted = [jid for jid in ids
+               if (j := live.get(jid)) is not None and j.get("enabled", True)]
+    return [jid for jid in drifted if _cronplus("pause", jid)]
+
+
+def _parse_budget_env(name: str, cast) -> tuple[float, bool]:
+    """Parse a numeric budget env var, FAILING CLOSED on a malformed value.
+
+    Unset/empty -> (0, False): the disabled happy path (matches the old `or 0` read). A SET-but-
+    malformed value (a typo, `$50`, `1,000,000` thousands separators) must NOT crash the guard or
+    silently leave the deployment uncapped — the guard's whole reason for existing is the cap, and it
+    would fail open exactly when the operator tried hardest to configure it. Warn loudly and return
+    (0, True) so main() treats the deployment as over-budget and pauses (okengine invariant-audit
+    #22)."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return 0, False
+    try:
+        return cast(raw), False
+    except (TypeError, ValueError):
+        print(f"budget-guard: WARN {name}={raw!r} is not a valid number — treating the deployment as "
+              f"OVER BUDGET and pausing cost-bearing crons (fail-closed). Fix the value (a plain "
+              f"number, no '$' or thousands separators).", file=sys.stderr)
+        return 0, True
+
+
 def main(argv: list[str] | None = None) -> int:
-    tok_budget = int(os.environ.get("OKENGINE_BUDGET_TOKENS") or 0)
-    usd_budget = float(os.environ.get("OKENGINE_BUDGET_USD") or 0)
-    price = float(os.environ.get("OKENGINE_BUDGET_PRICE_PER_MTOK") or 0)
+    tok_budget, tok_bad = _parse_budget_env("OKENGINE_BUDGET_TOKENS", int)
+    usd_budget, usd_bad = _parse_budget_env("OKENGINE_BUDGET_USD", float)
+    price, price_bad = _parse_budget_env("OKENGINE_BUDGET_PRICE_PER_MTOK", float)
+    malformed = tok_bad or usd_bad or price_bad
     resume_policy = (os.environ.get("OKENGINE_BUDGET_RESUME") or "auto").strip().lower()
     win_name = os.environ.get("OKENGINE_BUDGET_WINDOW") or "day"
 
-    if not tok_budget and not usd_budget:
+    # A malformed budget must still enforce (fail-closed) — check it BEFORE the no-budget no-op, or a
+    # typo'd value (parsed to 0) would fall through here and run uncapped, the very bug this guards.
+    if not malformed and not tok_budget and not usd_budget:
         print("budget-guard: no budget set (OKENGINE_BUDGET_TOKENS/_USD) — disabled, no-op")
         return 0
     # A USD cap needs a token->USD price. Without OKENGINE_BUDGET_PRICE_PER_MTOK the `usd_budget
@@ -220,8 +266,8 @@ def main(argv: list[str] | None = None) -> int:
     win_s = window_seconds(win_name)
     tokens = tokens_in_window(_state_db_path(), win_s, now)
     usd = estimated_usd(tokens, price)
-    over = bool((tok_budget and tokens >= tok_budget)
-                or (usd_budget and price and usd >= usd_budget))
+    over = malformed or bool((tok_budget and tokens >= tok_budget)
+                             or (usd_budget and price and usd >= usd_budget))
 
     state = _load_state()
     paused = bool(state.get("paused"))
@@ -257,6 +303,15 @@ def main(argv: list[str] | None = None) -> int:
                   f"retrying next tick.", file=sys.stderr)
     elif action == "resume":
         resume("auto")
+    elif paused:
+        # noop by the budget decision, but we BELIEVE we're paused — reconcile against the live
+        # jobs.json in case a redeploy silently re-enabled the crons we paused (okengine
+        # invariant-audit #13). Without this the cap is defeated by any jobs.json redeploy.
+        repaused = reconcile_pause(state, _load_jobs())
+        if repaused:
+            print(f"budget-guard: ⚠ RECONCILE — {len(repaused)} cost-bearing cron(s) were re-enabled "
+                  f"(jobs.json redeploy?) while the budget pause is active; re-paused: "
+                  f"{', '.join(repaused)}. The kill-switch holds.", file=sys.stderr)
     return 0
 
 

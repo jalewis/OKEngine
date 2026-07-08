@@ -266,17 +266,39 @@ def snapshot(pack: Path, snap_id: str, meta_obj: Optional[dict] = None) -> Path:
     return snap_dir
 
 
-def restore(pack: Path, snap_dir: Path) -> int:
+def added_since_snapshot(pack: Path, snap_dir: Path) -> set:
+    """Rel paths present in the pack now but absent from the snapshot — the files the just-run
+    migration ADDED. Capture this right after apply (before the roll-forward gate) so a later
+    rollback removes only the migration's own additions and never live-vault content that a
+    concurrent writer (cron content lane / MCP write) creates during the — much slower —
+    validation window (invariant-audit #12)."""
+    tree = snap_dir / "tree"
+    snap_set = set(_scope_files(tree, (tree / SNAPSHOTS_REL).resolve()))
+    snapshots_abs = (pack / SNAPSHOTS_REL).resolve()
+    return {rel for rel in _scope_files(pack, snapshots_abs) if rel not in snap_set}
+
+
+def restore(pack: Path, snap_dir: Path, added: Optional[set] = None) -> int:
     """Roll the pack source back to a snapshot: delete files the migration added, then restore
-    every snapshotted file (reverting modifications and recreating deletions). Returns #changes."""
+    every snapshotted file (reverting modifications and recreating deletions). Returns #changes.
+
+    `added` is the migration's added-set captured right after apply (see added_since_snapshot):
+    when given, ONLY those files are removed, so live-vault writes made after the capture point
+    survive the rollback (invariant-audit #12). When None, fall back to 'everything newer than the
+    snapshot' — correct for a static pack, but on a LIVE vault this clobbers concurrent content
+    writes, so live callers MUST pass `added`."""
     tree = snap_dir / "tree"
     snapshots_abs = (pack / SNAPSHOTS_REL).resolve()
     snap_set = set(_scope_files(tree, (tree / SNAPSHOTS_REL).resolve()))
+    if added is None:
+        added = {rel for rel in _scope_files(pack, snapshots_abs) if rel not in snap_set}
     n = 0
-    for rel in list(_scope_files(pack, snapshots_abs)):       # added-since-snapshot -> remove
-        if rel not in snap_set:
-            (pack / rel).unlink()
-            n += 1
+    for rel in added:                                         # migration-added -> remove
+        if rel not in snap_set:                               # never delete a file the snapshot restores
+            f = pack / rel
+            if f.exists():
+                f.unlink()
+                n += 1
     for rel in snap_set:                                      # restore content (+ recreate deleted)
         dst = pack / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -371,6 +393,9 @@ def main(argv: list) -> int:
                          "migrations": [m.id for m in plan.migrations]})
         print(f"  snapshot: .okengine/snapshots/{snap.name} (pre-upgrade source)")
     changes = apply_upgrade(pack, plan, now_iso)
+    # Freeze the migration's added-set NOW — before the (slower) validation gate — so a rollback
+    # removes only what the migration added, not live-vault writes made during that window (#12).
+    added = added_since_snapshot(pack, snap) if snap else None
     print(f"\nApplied → pin {target}" + (f" (hermes {htag})" if htag else ""))
     for c in changes:
         print(f"  {c}")
@@ -385,7 +410,7 @@ def main(argv: list) -> int:
     print(f"\nRoll-forward check: {summary}")
     if not ok:
         if snap:
-            n = restore(pack, snap)
+            n = restore(pack, snap, added=added)
             shutil.rmtree(snap, ignore_errors=True)   # the failed attempt's snapshot is spent
             print(f"  ↩ ROLLED BACK to the pre-upgrade source ({n} files restored) — pack unchanged.")
         else:

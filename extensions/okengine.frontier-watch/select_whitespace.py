@@ -68,9 +68,14 @@ def _read_fm(md: Path) -> dict:
 
 
 def _recently_thesised() -> set[str]:
-    """Capability slugs covered by a `whitespace-thesis` dated within REANALYZE_DAYS (or undated —
-    treated as recent so we don't churn). A thesis declares its capability via the concept links
-    in its frontmatter/body; we read them all back."""
+    """Capability slugs a `whitespace-thesis` has already MAPPED within REANALYZE_DAYS (rotation).
+
+    The analyzed capability is declared authoritatively in the thesis's REQUIRED `capability`
+    frontmatter (a single `[[concepts/<slug>]]`) — read THAT, not every `[[concepts/…]]` the thesis
+    happens to cite. A thesis routinely references adjacent concepts (see_also, body comparisons);
+    treating those as "thesised" starved genuinely-un-thesised demand-rich/supply-thin
+    capabilities out of discovery for REANALYZE_DAYS (the same okengine.lacuna precedent). Legacy
+    theses without `capability` fall back to their bracketed links."""
     covered: set[str] = set()
     fdir = WIKI / "frontier"
     if not fdir.is_dir():
@@ -83,10 +88,15 @@ def _recently_thesised() -> set[str]:
         when = str(fm.get("updated") or fm.get("created") or "")[:10]
         if when and when < cutoff:
             continue
-        try:
-            covered |= set(_CONCEPT_LINK.findall(md.read_text(encoding="utf-8", errors="ignore")))
-        except OSError:
-            continue
+        cap = fm.get("capability")
+        if cap:
+            for ref in (cap if isinstance(cap, list) else [cap]):
+                covered |= set(_CONCEPT_LINK.findall(str(ref)))
+        else:                              # legacy thesis w/o the field — best-effort from links
+            try:
+                covered |= set(_CONCEPT_LINK.findall(md.read_text(encoding="utf-8", errors="ignore")))
+            except OSError:
+                continue
     return covered
 
 

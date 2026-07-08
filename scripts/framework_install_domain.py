@@ -646,6 +646,24 @@ def main(argv: list[str]) -> int:
     else:
         install_taxonomy(host, pack, slug, plan)
     rc = plan.run()
+    if rc == 0 and plan.steps and ns.apply and shape == "taxonomy":
+        # The taxonomy merge edited the host root schema.yaml — but the RUNTIME write path PREFERS
+        # <host>/.okengine/composed-schema.yaml (base ⊕ pack ⊕ extensions) whenever an enabled
+        # extension made that artifact exist, and it still predates the merge. Left stale, every
+        # okengine-write into the newly co-installed namespace/type is silently rejected ("namespace
+        # not declared", okengine#115) until the next full deploy. Regenerate it now so the write path
+        # sees the merge immediately; write_composed_schema self-heals the no-extension case too
+        # (no fragments → it removes any stale artifact so schema.yaml governs).
+        compose = _load_mod("extension_compose.py")
+        errs = compose.write_composed_schema(host)
+        if errs:
+            print("ERROR: schema.yaml merged, but composed-schema.yaml regeneration FAILED — the "
+                  "runtime write path will reject writes to the new namespace until the next deploy:",
+                  file=sys.stderr)
+            for e in errs:
+                print(f"  - {e}", file=sys.stderr)
+            return 1
+        print("  regenerated .okengine/composed-schema.yaml — runtime write path now sees the merge")
     if rc == 0 and plan.steps:
         print("\nnext steps:\n" + _checklist(shape, slug))
     return rc

@@ -296,6 +296,24 @@ _EMBED = re.compile(r"!\[\[\s*([^\]\n#|]+?)\s*(?:#[^\]\n|]+)?(?:\|[^\]\n]+)?\s*\
 # resolution fallback (no domain knowledge — just common wiki folder names).
 _EMBED_DIRS = ("operational", "dashboards", "marketing", "dailies", "briefings",
                "predictions", "reports")
+_EMBED_PATH_CACHE: dict = {}
+
+
+def _embed_rglob(name: str) -> "Path | None":
+    """First match for basename `name` under the generic embed dirs, memoized for the process
+    lifetime. Basename embeds are the norm on sharded OKF vaults, so without this each render
+    re-walks every `_EMBED_DIRS` subtree once per unresolved embed."""
+    if name in _EMBED_PATH_CACHE:
+        return _EMBED_PATH_CACHE[name]
+    hit = None
+    for d in _EMBED_DIRS:
+        base = WIKI / d
+        hits = list(base.rglob(name)) if base.is_dir() else []
+        if hits:
+            hit = hits[0]
+            break
+    _EMBED_PATH_CACHE[name] = hit
+    return hit
 
 
 def _resolve_embeds(text: str, depth: int = 0) -> str:
@@ -311,14 +329,7 @@ def _resolve_embeds(text: str, depth: int = 0) -> str:
             return f"_[embedded asset: {target}]_"
         cand = WIKI / (target + ".md")
         if not cand.is_file():
-            name = Path(target).name + ".md"
-            cand = None
-            for d in _EMBED_DIRS:
-                base = WIKI / d
-                hits = list(base.rglob(name)) if base.is_dir() else []
-                if hits:
-                    cand = hits[0]
-                    break
+            cand = _embed_rglob(Path(target).name + ".md")
         if not cand:
             return f"_[missing embed: {target}]_"
         try:
@@ -494,7 +505,9 @@ def api_doc(stream: str = Query(...), date: str = Query(...)):
     rel = _doc_path(stream, date)
     raw = safe_read(WIKI / cfg["dir"], rel)
     fm, body = split_fm(raw)
-    title = (fm.get("title") or "").strip()
+    # str-wrap: yaml.safe_load type-infers a bare `title: 2026`/`2026-07-08`/list
+    # to a non-str, and .strip() would 500 (matches _page_meta / _subject).
+    title = str(fm.get("title") or "").strip()
     if not title:
         h1 = _H1_RE.search(body)
         title = h1.group(0).lstrip("# ").strip() if h1 else f"{cfg['label']} — {date}"
@@ -1031,7 +1044,15 @@ def _ds_cell(r: dict, col: dict) -> str:
     if col.get("defang"):                    # IOC hygiene: never render a live URL/domain
         return f"<code>{_esc(_defang(v))}</code>"
     tone = col.get("tone")
-    cls = f' class="t-{tone}"' if tone in _TONES else ""
+    classes = [f"t-{tone}"] if tone in _TONES else []
+    # A structured single-token value — a date, a number, or an enum like "moderate-high" — must
+    # never break mid-token when the column squeezes (dates broke at their hyphens, confidence
+    # enums at theirs). `_html_table`'s .num heuristic can't see it here (the cell arrives as
+    # ready HTML), so tag it nowrap directly. Multi-word prose (a thesis/summary column) has
+    # internal whitespace and keeps its normal word-wrap.
+    if col.get("date") or (v.strip() and " " not in v.strip()):
+        classes.append("nw")
+    cls = f' class="{" ".join(classes)}"' if classes else ""
     return f"<span{cls}>{_esc(v)}</span>"
 
 
@@ -1452,7 +1473,7 @@ def _clean_markdown(raw: str, title: str | None = None) -> str:
     body = _resolve_embeds(body)
     body = re.sub(r"```dataview(js)?\n.*?\n```", "", body, flags=re.DOTALL)
     body = _delink(body)
-    t = (title or fm.get("title") or fm.get("name") or "").strip()
+    t = str(title or fm.get("title") or fm.get("name") or "").strip()
     if t and not body.lstrip().startswith("# "):
         body = f"# {t}\n\n{body}"
     return body.strip() + "\n"

@@ -71,7 +71,7 @@ iframe.deck{width:100%;height:calc(100vh - 120px);border:1px solid var(--border)
 .filters select,.filters input{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:2px 6px;font:inherit}
 .filters #f-search{margin-left:auto}
 table.ledger{width:100%;border-collapse:collapse;font-size:0.929rem}
-table.ledger thead th{position:sticky;top:0;background:var(--panel2);color:var(--dim);font:11px var(--mono);letter-spacing:.5px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border)}
+table.ledger thead th{position:sticky;top:0;background:var(--panel2);color:var(--dim);font:11px var(--mono);letter-spacing:.5px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
 table.ledger td{padding:5px 8px;border-bottom:1px solid var(--panel)}
 table.ledger tbody tr{cursor:pointer}
 table.ledger tbody tr:hover{background:var(--panel)}
@@ -83,6 +83,8 @@ table.ledger tr.sel{background:var(--panel)}
 .subj{color:var(--text);font-family:var(--mono);white-space:nowrap} .subj-ns{color:var(--dim);font-weight:400}
 .claim{color:var(--muted);white-space:normal;overflow-wrap:break-word}
 td.num,th.num{text-align:right;font-family:var(--mono);white-space:nowrap}
+/* a structured single-token dashboard value (date/number/enum) — never break mid-token */
+.nw{white-space:nowrap}
 .spark{font-family:var(--mono);letter-spacing:-1px}
 .trend.up{color:var(--ok)} .trend.down{color:var(--fail)} .trend.flat{color:var(--dim)}
 .due-in{color:var(--warn);font-weight:600}
@@ -266,7 +268,7 @@ a.wl:hover{border-bottom-style:solid}
 .dmeta{font:11.5px var(--mono);color:var(--muted);text-align:right}
 .db table{border-collapse:collapse;width:100%;font:12.5px var(--mono);font-variant-numeric:tabular-nums}
 .db th{text-align:left;font:600 10.5px var(--sans);text-transform:uppercase;letter-spacing:.07em;
-  color:var(--muted);padding:3px 10px 5px 0;border-bottom:1px solid var(--border)}
+  color:var(--muted);padding:3px 10px 5px 0;border-bottom:1px solid var(--border);white-space:nowrap}
 .db td{padding:5px 10px 5px 0;border-bottom:1px solid var(--border);vertical-align:top}
 .db tr:last-child td{border-bottom:none}
 .db td code{font:11.5px var(--mono);word-break:break-all}

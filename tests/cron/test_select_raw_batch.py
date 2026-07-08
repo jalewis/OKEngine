@@ -33,7 +33,7 @@ def test_batch_is_bounded_with_drain_guidance(tmp_path):
     for i in range(5):
         (raw / f"f{i}.txt").write_text("content")
     out = _run(tmp_path, batch="2")
-    assert "2 of 5 unprocessed" in out and "BATCH_SIZE=2" in out
+    assert "2 of 5 ingestable" in out and "BATCH_SIZE=2" in out
     assert "Remaining after this batch:** 3" in out
     assert "source** pages only" in out and "self-draining" in out
     assert out.count("derived_year=") == 2          # exactly BATCH_SIZE files listed

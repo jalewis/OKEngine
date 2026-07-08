@@ -57,7 +57,14 @@ DASH = WIKI / "dashboards" / "page-quality.md"
 SNAP = OP_DIR / "page-quality-snapshots.md"
 QUEUE_SIZE = int(os.environ.get("PQ_QUEUE_SIZE", "40"))
 
-AUDITED_DIRS = ("entities", "concepts")
+# Namespaces to audit = the vault's declared knowledge namespaces (the COMPOSED schema on a
+# multipack vault) minus excluded/derived dirs — NOT a hardcoded ('entities','concepts'), which
+# silently skipped every synthesized namespace on a composed vault (okcti: threat-actors,
+# security-incidents, cves, …), understating stub/thin debt with no warning. Falls back to the pair
+# only when the schema declares no knowledge namespaces.
+_PQ_MS = schema_lib.merged_schema(VAULT)
+AUDITED_DIRS = tuple(sorted(
+    schema_lib.knowledge_namespaces(_PQ_MS) - schema_lib.excluded_dirs(_PQ_MS))) or ("entities", "concepts")
 DEFICIENT = {"empty", "stub", "thin"}
 
 # Page types are PACK inputs (schema.yaml), read at runtime.

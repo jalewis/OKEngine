@@ -42,8 +42,29 @@ _SCHEMA_NAMES = ("schema.yaml", ".okf-schema.yaml")
 
 # OKF v0.1 reserves these filenames as special/structural files exempt from the
 # `type:` requirement (index = collection landing page, log = changelog,
-# AGENTS = agent instructions). A schema.yaml may override via `reserved_files`.
-_OKF_RESERVED_DEFAULT = ("index.md", "log.md", "agents.md")
+# AGENTS = agent instructions, README = human intro). A schema.yaml may override
+# via `reserved_files`. The engine ALSO generates root dashboards each cron run
+# (HOT/HEALTH/BUNDLE.md) that are `type: dashboard` with no `id` — non-page
+# artifacts that must be conformance-exempt on every surface. This set + the
+# structural predicate below are the shared contract with
+# okengine-mcp/write_server.py `_RESERVED_NAMES`/reserve-predicate and
+# scripts/cron/conformance_audit._is_structural; tests/test_reserved_files_contract.py
+# binds them so they cannot silently drift again (the okengine#193-class bug where
+# the validator's narrow default left engine-generated HOT.md permanently non-conformant).
+_OKF_RESERVED_DEFAULT = ("index.md", "log.md", "agents.md", "readme.md",
+                         "hot.md", "health.md", "bundle.md")
+
+
+def _is_generated_structural(basename: str) -> bool:
+    """True for an engine-GENERATED structural file (not an authored page): the hierarchical
+    index tree (INDEX.md and paginated INDEX-pNN.md), and any `_`/`.`-prefixed scaffold
+    (_review-queue.md, .backlinks.json-adjacent md, …). Mirrors write_server's `startswith("index-p")`
+    / `startswith("_")` reserve rule and conformance_audit._is_structural, so a page the write path
+    treats as generated is never flagged non-conformant by the drift lint."""
+    n = basename
+    return (n.startswith("_") or n.startswith(".")
+            or n == "INDEX.md" or n.startswith("INDEX-")
+            or n.lower().startswith("index-p"))
 
 # dir -> (cached_at_monotonic, schema path|None). Entries EXPIRE (okengine#49): a negative
 # result cached forever would leave a long-running validator/write-server fail-open for a tree
@@ -73,6 +94,39 @@ def _base_schema() -> dict:
         except Exception:
             _base_cache[p] = {}
     return _base_cache[p]
+
+
+def _base_merged(schema: dict) -> dict:
+    """`schema` (the resolved pack schema.yaml OR the composed artifact) with the engine base
+    schema merged UNDER it, for the keys the write gate enforces: `types`, `enums`, `field_enums`.
+
+    The write path PREFERS <vault>/.okengine/composed-schema.yaml (base ⊕ pack ⊕ extensions) when
+    present, but falls back to the RAW pack schema.yaml whenever no schema-bringing extension is
+    enabled — and that raw schema carries NONE of the engine-universal governance in
+    config/base-schema.yaml (the core-type `required` floors, the CLOSED tlp/source_kind/severity
+    enums). Without this merge the enforced write boundary silently under-enforced base governance on
+    any deployment lacking a composed artifact, and enforcement flipped on/off with any unrelated
+    schema-bringing extension toggle. Mirrors scripts/cron/schema_lib._merge_base_pack so the write
+    gate and the conformance audit agree on the governing schema. Re-merging base under the composed
+    artifact is idempotent — the artifact already contains base and the resolved copy wins per key."""
+    base = _base_schema()
+    if not base:
+        return schema
+    eff = dict(schema)
+    b_types, p_types = base.get("types") or {}, schema.get("types") or {}
+    if b_types or p_types:
+        eff["types"] = {**b_types, **p_types}            # pack/composed wins on a conflicting type
+    b_en, p_en = base.get("enums") or {}, schema.get("enums") or {}
+    if b_en or p_en:
+        merged = {k: list(v) for k, v in b_en.items()}
+        for k, vals in p_en.items():                     # a pack EXTENDS a base enum (adds values)
+            cur = merged.get(k, [])
+            merged[k] = cur + [v for v in (vals or []) if v not in cur]
+        eff["enums"] = merged
+    b_fe, p_fe = base.get("field_enums") or {}, schema.get("field_enums") or {}
+    if b_fe or p_fe:
+        eff["field_enums"] = {**b_fe, **p_fe}            # pack wins on a field->enum mapping
+    return eff
 
 
 def _find_schema(start: str) -> Optional[Path]:
@@ -245,10 +299,13 @@ def _evaluate(abs_path: str, content: str) -> tuple[str, Optional[str]]:
             return ("skip", None)
         if _excluded(rel_posix, schema):
             return ("skip", None)
-        # OKF reserved filenames (index.md / log.md / AGENTS.md) are exempt.
+        # OKF reserved filenames + engine-generated structural files are exempt from the
+        # `type:` contract (index.md/log.md/AGENTS.md/README.md, the regenerated root dashboards
+        # HOT/HEALTH/BUNDLE.md, the INDEX tree, and any `_`/`.`-prefixed scaffold).
+        bn = rel_posix.rsplit("/", 1)[-1]
         reserved = schema.get("reserved_files")
         reserved = tuple(str(r).lower() for r in reserved) if reserved else _OKF_RESERVED_DEFAULT
-        if rel_posix.rsplit("/", 1)[-1].lower() in reserved:
+        if bn.lower() in reserved or _is_generated_structural(bn):
             return ("skip", None)
 
         m = _FM_RE.match(content)
@@ -274,8 +331,12 @@ def _evaluate(abs_path: str, content: str) -> tuple[str, Optional[str]]:
         if missing:
             return ("fail", f"missing required field(s): {', '.join(missing)}")
 
+        # Governance is enforced against base ⊕ (resolved schema): the base-schema core types,
+        # required floors and CLOSED enums must bind even when no composed artifact exists and the
+        # raw pack omits them (else base governance silently toggles with unrelated extension state).
+        eff = _base_merged(schema)
         t = str(fm.get("type") or "").strip()
-        types = schema.get("types") or {}
+        types = eff.get("types") or {}
         if t not in types:
             # strict_types is ENGINE-OWNED (base), not pack-settable — a pack
             # cannot loosen/tighten the global type taxonomy under composition.
@@ -286,7 +347,7 @@ def _evaluate(abs_path: str, content: str) -> tuple[str, Optional[str]]:
         miss = [k for k in req if not _present(fm, k)]
         if miss:
             return ("fail", f"type '{t}' is missing required field(s): {', '.join(miss)}")
-        enum_reason = _enum_reject_reason(schema, t, fm)
+        enum_reason = _enum_reject_reason(eff, t, fm)
         if enum_reason:
             return ("fail", enum_reason)
         return ("ok", None)

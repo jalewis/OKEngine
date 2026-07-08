@@ -297,10 +297,25 @@ def check_extensions():
     if not ef.is_file():
         return
     d = _yaml(ef) or {}
+    # An enabled extension only stages a /opt/data/scripts/<id>/ dir when it ships in-gateway
+    # cron LANES (top-level *.py -> deploy-cron-scripts stages them; extension_compose synthesizes
+    # a job whose `script:` is <SCRIPTS_ROOT>/<id>/<file>). A sidecar (runs as its own container),
+    # a panels-only, or a schema-fragment-only extension stages NO *.py — deploy-cron-scripts skips
+    # it with a warning and creates no dir. FAILing those is a false positive that ERRORs the lane.
+    # So the missing-dir is only a real failure when a DEPLOYED cron job actually references that
+    # dir (a lane whose script isn't staged); check_crons independently FAILs the dangling ref too.
+    jf = DATA / "cron-plus" / "jobs.json"
+    jobs = []
+    if jf.is_file():
+        try:
+            jobs = json.loads(jf.read_text()).get("jobs", [])
+        except Exception:
+            pass  # check_crons already FAILs on an unparseable jobs.json
     for ext in (d.get("enabled") or {}):
-        if not (DATA / "scripts" / ext).is_dir():
-            add("FAIL", "extensions", f"enabled extension '{ext}' has no staged scripts dir — "
-                                      "its lanes are dead; run deploy-cron-scripts")
+        stages_lanes = any(f"/scripts/{ext}/" in (j.get("script") or "") for j in jobs)
+        if stages_lanes and not (DATA / "scripts" / ext).is_dir():
+            add("FAIL", "extensions", f"enabled extension '{ext}' has cron lanes but no staged "
+                                      "scripts dir — its lanes are dead; run deploy-cron-scripts")
 
 
 def check_ownership():

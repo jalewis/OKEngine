@@ -41,6 +41,19 @@ def _int(rx, text, default=None):
     return int(m.group(1)) if m else default
 
 
+def _parse_fleet(fh: str) -> "dict[str, int | None]":
+    """Fleet-lane counts from wiki/dashboards/fleet-health.md. fleet_health.py writes them as
+    PLAIN text ('🔴 stale: 0  ·  🔴 errored: 1'), so the pattern must tolerate 0-2 asterisks
+    (`\\*{0,2}`). The old bold-only `\\*\\*(\\d+)\\*\\*` matched nothing and silently parsed every
+    count as None/0 — a dead-monitor-reads-healthy fail (the fleet Prometheus metrics all read 0
+    regardless of real lane state). operator_dashboard.py already parses the plain form; the two
+    consumers must agree. Contract pinned by tests/cron/test_health_export_fleet_parse.py."""
+    def n(label: str):
+        return _int(rf"{label}:\s*\*{{0,2}}(\d+)", fh)
+    return {"stale": n("stale"), "errored": n("errored"),
+            "off-model": n("off-model"), "ok": n("ok")}
+
+
 def _dash_age_h(name: str) -> "float | None":
     """Hours since the dashboard file was last written, or None if it doesn't exist. health_export
     summarizes dashboards written by OTHER lanes, so a stale/absent source means the monitor DIED —
@@ -56,10 +69,8 @@ def _dash_age_h(name: str) -> "float | None":
 
 def main() -> int:
     fh, g, rq, cf = _body("fleet-health"), _body("source-grounding"), _body("review-queue"), _body("conformance")
-    stale = _int(r"stale: \*\*(\d+)\*\*", fh)
-    errored = _int(r"errored: \*\*(\d+)\*\*", fh)
-    offmodel = _int(r"off-model: \*\*(\d+)\*\*", fh)
-    fleet_ok = _int(r"ok: \*\*(\d+)\*\*", fh)
+    _fleet = _parse_fleet(fh)
+    stale, errored, offmodel, fleet_ok = _fleet["stale"], _fleet["errored"], _fleet["off-model"], _fleet["ok"]
     grounding = _int(r"grounded: \*\*\d+\*\* \((\d+)%\)", g)
     review = _int(r"\*\*(\d+) item\(s\) awaiting", rq)
     conf = _int(r"source-refs-are-pages: \*\*(\d+)\*\*", cf)

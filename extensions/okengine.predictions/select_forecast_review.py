@@ -27,7 +27,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pred_lib as P  # noqa: E402
 
 WINDOW_DAYS = int(os.environ.get("FORECAST_REVIEW_DAYS", "7"))
-_RESOLVED = {"confirmed", "refuted", "partial"}
 
 
 def _read_dashboard(v, name: str) -> str:
@@ -53,9 +52,9 @@ def main() -> int:
         updated = P.fm_date(fm, "updated", "last_updated")
         if not updated or updated < since:
             continue
-        if status in _RESOLVED:
+        if status in P.RESOLVED_VALUES:
             resolved_this_week.append((rel, fm))
-        elif status == P.OPEN:
+        elif status in P.OPEN_VALUES:
             reevaluated_this_week.append((rel, fm))
 
     if not resolved_this_week and not reevaluated_this_week:

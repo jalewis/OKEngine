@@ -31,6 +31,8 @@ PACK_DIR="${CRON_PACK_DIR:-/path/to/pack}"
 # env -> pack .env pin -> tree owner (okengine#185) — never silently 10000.
 # shellcheck source=lib/hermes_uid.sh
 . "$REPO_ROOT/scripts/lib/hermes_uid.sh"
+# shellcheck source=lib/pack_data.sh
+. "$REPO_ROOT/scripts/lib/pack_data.sh"
 HERMES_UID="$(resolve_hermes_uid "$PACK_DIR")"
 PACK_SCRIPTS="$PACK_DIR/crons/scripts"
 PACK_DATA="$PACK_DIR/data"
@@ -136,23 +138,26 @@ python3 "$REPO_ROOT/scripts/framework.py" extensions stage-panels "$PACK_DIR" ||
     echo "  (reader-panels staging skipped)"
 
 # --- domain data -> /opt/data/config/ ---
-# Domain data tables consumed at runtime (cron-plus mounts only /opt/data/, so
-# these must sit alongside the scripts). Sourced from the PACK now:
-#   - sec-cyber-pubcos.yaml      — used by ingest_sec_filings.py (domain)
-#   - curated-entity-fields.json — used by apply_curated_entity_fields.py (engine-template)
-# (publishers.canonical.json is NOT deployed here: the publisher-canonical-drain cron
-#  maintains it IN-PLACE in the vault at config/publishers.canonical.json — that's the
-#  live source of truth, also read by the scripts/normalize_publishers.py dev tool.)
+# Domain data tables consumed at runtime (cron-plus mounts only /opt/data/, so these must sit
+# alongside the scripts). The pack contract is `data/*` (docs/deploy-a-new-domain.md) — stage the
+# WHOLE data/ tree, not a curated allowlist, else a table a pack adds is silently dropped and its
+# cron FileNotFoundErrors at the tick (okengine invariant-audit #9). Enumeration lives in
+# scripts/lib/pack_data.sh so it's unit-testable without Docker.
+# (publishers.canonical.json is NOT shipped in a pack's data/: the publisher-canonical-drain cron
+#  maintains it IN-PLACE in the vault at config/publishers.canonical.json — that's the live source
+#  of truth, also read by the scripts/normalize_publishers.py dev tool.)
 if [ -d "$PACK_DATA" ]; then
     cfgs=()
-    for cfg in sec-cyber-pubcos.yaml curated-entity-fields.json; do
-        [ -f "$PACK_DATA/$cfg" ] && cfgs+=("$cfg")
-    done
+    while IFS= read -r cfg; do
+        [ -n "$cfg" ] && cfgs+=("$cfg")
+    done < <(enumerate_pack_data_files "$PACK_DATA")
     if [ "${#cfgs[@]}" -gt 0 ]; then
         docker exec -u "$HERMES_UID" "$CONTAINER" mkdir -p /opt/data/config
         ( cd "$PACK_DATA" && tar -cf - "${cfgs[@]}" ) \
             | docker exec -i -u "$HERMES_UID" "$CONTAINER" tar -xf - -C /opt/data/config/
         echo "  ${#cfgs[@]} pack data file(s) deployed to $CONTAINER:/opt/data/config/"
+    else
+        echo "  (no pack data files to deploy under $PACK_DATA)"
     fi
 else
     echo "  (pack data not found at $PACK_DATA — skipping domain data deploy)"

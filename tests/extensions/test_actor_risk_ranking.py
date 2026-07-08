@@ -83,7 +83,10 @@ def _vault(tmp_path, syndicated=False):
 
 
 def _run(vault, monkeypatch):
-    monkeypatch.setenv("VAULT_DIR", str(vault))
+    # Set WIKI_PATH — the canonical vault var the lane resolves first (VAULT_DIR is only a legacy
+    # fallback). monkeypatch overrides + restores, so this is immune to a sibling test that leaks
+    # WIKI_PATH into os.environ via a bare assignment.
+    monkeypatch.setenv("WIKI_PATH", str(vault))
     return mod.main()
 
 
@@ -99,7 +102,7 @@ def test_person_target_refused(tmp_path, monkeypatch):
     vault = _vault(tmp_path)
     (vault / "config" / "actor-risk-targets.yaml").write_text(yaml.safe_dump(
         {"targets": {"ceo": {"type": "person", "entity": "entities/p/someone"}}}))
-    monkeypatch.setenv("VAULT_DIR", str(vault))
+    monkeypatch.setenv("WIKI_PATH", str(vault))
     with pytest.raises(SystemExit) as ei:
         mod.main()
     assert ei.value.code == 2

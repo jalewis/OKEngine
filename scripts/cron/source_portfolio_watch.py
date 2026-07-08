@@ -37,8 +37,21 @@ from pathlib import Path
 import yaml
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
+WIKI = VAULT / "wiki"
 SOURCES_DIR = VAULT / "wiki" / "sources"
 PRED_DIR = VAULT / "wiki" / "predictions"
+
+
+def _bases(ns: str) -> list:
+    """Root wiki/<ns> + every walk-up sub-domain wiki/<sub>/<ns> (a dir carrying its own schema.yaml).
+    A root-only scan under-reports the concentration/coverage this dashboard exists to surface on a
+    co-installed (multipack) vault (okengine#178)."""
+    out = [WIKI / ns]
+    if WIKI.is_dir():
+        for sub in sorted(WIKI.iterdir()):
+            if sub.is_dir() and (sub / "schema.yaml").is_file():
+                out.append(sub / ns)
+    return out
 DASH_DIR = VAULT / "wiki" / "dashboards"
 TOP_PUBLISHERS = int(os.environ.get("PORTFOLIO_TOP_PUBLISHERS", "20"))
 
@@ -74,48 +87,50 @@ def _date(val) -> date | None:
 def _open_prediction_basis_slugs() -> set[str]:
     """Slugs cited in `basis:` by any prediction that is NOT resolved."""
     out: set[str] = set()
-    if not PRED_DIR.is_dir():
-        return out
-    for p in PRED_DIR.rglob("*.md"):
-        if p.name.startswith(("_", ".")):
+    for base in _bases("predictions"):         # root + walk-up sub-domain predictions (multipack)
+        if not base.is_dir():
             continue
-        try:
-            fm = _parse_fm(p.read_text(errors="replace"))
-        except OSError:
-            continue
-        if not fm or fm.get("type") != "prediction":
-            continue
-        if _RESOLVED_RE.search(str(fm.get("status") or "open")):
-            continue
-        basis = fm.get("basis")
-        for entry in (basis if isinstance(basis, list) else []):
-            for wm in _WIKILINK_RE.finditer(str(entry)):
-                slug = wm.group(1).strip().split("/")[-1]
-                out.add(slug[:-3] if slug.endswith(".md") else slug)
+        for p in base.rglob("*.md"):
+            if p.name.startswith(("_", ".")):
+                continue
+            try:
+                fm = _parse_fm(p.read_text(errors="replace"))
+            except OSError:
+                continue
+            if not fm or fm.get("type") != "prediction":
+                continue
+            if _RESOLVED_RE.search(str(fm.get("status") or "open")):
+                continue
+            basis = fm.get("basis")
+            for entry in (basis if isinstance(basis, list) else []):
+                for wm in _WIKILINK_RE.finditer(str(entry)):
+                    slug = wm.group(1).strip().split("/")[-1]
+                    out.add(slug[:-3] if slug.endswith(".md") else slug)
     return out
 
 
 def _collect() -> list[dict]:
     out = []
-    if not SOURCES_DIR.is_dir():
-        return out
-    for p in SOURCES_DIR.rglob("*.md"):
-        if p.name.startswith(("_", ".")):
+    for base in _bases("sources"):             # root + walk-up sub-domain sources (multipack)
+        if not base.is_dir():
             continue
-        try:
-            fm = _parse_fm(p.read_text(errors="replace"))
-        except OSError:
-            continue
-        if not fm:
-            continue
-        out.append({
-            "stem": p.stem,
-            "signal_class": fm.get("signal_class") or "(unset)",
-            "source_kind": fm.get("source_kind") or "(unset)",
-            "publisher": fm.get("publisher") or "(unset)",
-            "reliability": str(fm.get("reliability") or "(unset)"),
-            "ingested": _date(fm.get("ingested") or fm.get("created")),
-        })
+        for p in base.rglob("*.md"):
+            if p.name.startswith(("_", ".")):
+                continue
+            try:
+                fm = _parse_fm(p.read_text(errors="replace"))
+            except OSError:
+                continue
+            if not fm:
+                continue
+            out.append({
+                "stem": p.stem,
+                "signal_class": fm.get("signal_class") or "(unset)",
+                "source_kind": fm.get("source_kind") or "(unset)",
+                "publisher": fm.get("publisher") or "(unset)",
+                "reliability": str(fm.get("reliability") or "(unset)"),
+                "ingested": _date(fm.get("ingested") or fm.get("created")),
+            })
     return out
 
 

@@ -55,6 +55,24 @@ def test_collisions_reported_not_merged(tmp_path):
     assert set(cols["entities:acme"]) == {"entities/a/one.md", "entities/a/two.md"}
 
 
+def test_non_string_scalar_alias_does_not_crash_build(tmp_path):
+    """A page authored with a bare non-string scalar `aliases` (YAML int/bool)
+    must not raise `TypeError: 'int' object is not iterable` and crash the whole
+    build — the write path leaves such a scalar untouched (okengine#196)."""
+    m = _load()
+    _page(tmp_path, "entities/a/acme.md", "type: vendor\nid: 'entities:acme'\naliases: 3405")
+    _page(tmp_path, "entities/b/beta.md", "type: vendor\nid: 'entities:beta'\naliases: yes")
+    _page(tmp_path, "entities/g/good.md", "type: vendor\nid: 'entities:good'\naliases: ['entities:good-corp']")
+    idx = m.build(tmp_path)  # must not raise
+    # the bare scalar aliases are safely dropped (a non-list shape -> [], mirroring
+    # normalize_bare_name_links); the pages themselves still index by id, and a
+    # well-formed list alias on another page still resolves.
+    assert idx.resolve("entities:acme") == "entities/a/acme.md"
+    assert idx.resolve("entities:beta") == "entities/b/beta.md"
+    assert idx.resolve("3405") is None
+    assert idx.resolve("entities:good-corp") == "entities/g/good.md"
+
+
 def test_write_index_persists(tmp_path):
     m = _load()
     _page(tmp_path, "entities/a/acme.md", "type: vendor\nid: 'entities:acme'")

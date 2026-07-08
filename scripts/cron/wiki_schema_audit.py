@@ -41,7 +41,7 @@ def load_canonical_types() -> dict[str, list[str]]:
     required fields). Returns {} if the pack declared no `types:` — callers
     treat that as 'every type is acceptable' (no drift / no conformance gaps),
     never as a built-in domain taxonomy."""
-    schema = schema_lib.governing_schema(VAULT)
+    schema = schema_lib.merged_schema(VAULT)
     types = schema.get("types")
     if not isinstance(types, dict):
         return {}
@@ -57,16 +57,21 @@ def load_operational_types() -> set[str]:
     (dashboards, lint reports, overviews, generated artifacts). Read from the
     schema's `operational_types:` list if the pack declares one; otherwise
     empty (no operational suppression). Not flagged as drift."""
-    schema = schema_lib.governing_schema(VAULT)
+    schema = schema_lib.merged_schema(VAULT)
     ops = schema.get("operational_types")
     return {str(x) for x in ops} if isinstance(ops, (list, tuple, set)) else set()
 
 
-# Resolved once at import time from the governing schema. Empty when the pack
-# declares no taxonomy — the audit then reports the type distribution with no
-# drift/conformance judgments rather than inventing a taxonomy.
+# Resolved once at import time from the MERGED schema (engine base ⊕ pack ⊕ enabled extensions,
+# okengine#133) — NOT the raw pack schema. Reading the pack-only schema flagged engine-owned base
+# types (dashboard/prediction/source/concept…) as DRIFT on every norm-following vault (the skeleton
+# tells packs NOT to re-declare base types), advising the operator to canonize a type the engine
+# already owns. Empty only when nothing declares a taxonomy → distribution-only, no drift judgments.
 CANONICAL_TYPES: dict[str, list[str]] = load_canonical_types()
 OPERATIONAL_TYPES: set[str] = load_operational_types()
+# alias -> canonical (e.g. threat-actor -> actor); resolve before the drift check so a STIX/legacy
+# alias name isn't miscounted as an unsanctioned type.
+TYPE_ALIASES: dict[str, str] = schema_lib.type_aliases(schema_lib.merged_schema(VAULT))
 
 # Threshold: an unsanctioned type appearing on >= this many pages is a
 # canonization candidate (vault is telling us the schema needs this slot).
@@ -210,7 +215,8 @@ def scan_wiki(wiki_dir: Path):
         m = TYPE_RE.search(fm)
         if not m:
             continue
-        t = m.group(1).strip().strip("\"'")
+        t_raw = m.group(1).strip().strip("\"'")
+        t = TYPE_ALIASES.get(t_raw, t_raw)     # resolve a STIX/legacy alias to its canonical type
         type_counts[t] += 1
         type_files[t].append(path)
 

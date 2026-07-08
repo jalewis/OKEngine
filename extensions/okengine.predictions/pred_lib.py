@@ -11,7 +11,26 @@ import re
 from datetime import date, timedelta
 from pathlib import Path
 
-OPEN = "open"   # the unresolved status; resolved = confirmed/refuted/partial/expired-ungraded
+# Prediction status vocabulary — the single source of truth for "is this prediction open/resolved?".
+# OPEN_VALUES mirrors config/base-schema.yaml `tier.namespaces.predictions.open_values`; `active` is
+# a CANONICAL open synonym (predictions routinely carry status:active — grading, regrade and
+# forecast-review must treat it as open, not silently skip it, the pre-fix bug). RESOLVED_VALUES is
+# the terminal set the grading lane writes (prompts/schema-drain.md + grade.md — note the easily-
+# missed `expired-ungraded`). Env-overridable for a pack with a different vocabulary; both sets are
+# pinned to base-schema + the drain prompt by tests/cron/test_pred_status_contract.py.
+def _status_set(env: str, default: str) -> set:
+    return {s.strip().lower() for s in os.environ.get(env, default).split(",") if s.strip()}
+
+
+OPEN_VALUES = _status_set("OKENGINE_PREDICTION_OPEN_VALUES", "open,active")
+RESOLVED_VALUES = _status_set("OKENGINE_PREDICTION_RESOLVED_VALUES",
+                              "confirmed,refuted,partial,expired-ungraded")
+# GRADED_VALUES ⊂ RESOLVED_VALUES: the terminal statuses that carry a real OUTCOME (a hit/miss).
+# `expired-ungraded` is terminal but has NO gradeable result, so base-rate / output-outcome accuracy
+# stats deliberately EXCLUDE it — do NOT "fix" those lanes to RESOLVED_VALUES (it would poison the
+# rates with never-graded predictions). "resolved/closed" (RESOLVED_VALUES) ≠ "has an outcome" (GRADED).
+GRADED_VALUES = _status_set("OKENGINE_PREDICTION_GRADED_VALUES", "confirmed,refuted,partial")
+OPEN = "open"   # back-compat alias (the primary open status)
 _FM = re.compile(r"\A---\s*\n(.*?)\n---", re.S)
 _RESERVED = re.compile(r"^(INDEX|index)([.-]|$)")
 
@@ -66,7 +85,11 @@ def predictions(v: Path) -> list[tuple[Path, dict]]:
 
 
 def is_open(fm: dict) -> bool:
-    return str(fm.get("status", "")).strip().lower() == OPEN
+    return str(fm.get("status", "")).strip().lower() in OPEN_VALUES
+
+
+def is_resolved(fm: dict) -> bool:
+    return str(fm.get("status", "")).strip().lower() in RESOLVED_VALUES
 
 
 def fm_date(fm: dict, *keys: str) -> str:

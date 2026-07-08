@@ -110,3 +110,40 @@ def test_validator_jitter_bases_match_expander():  # anti-drift guard
     vtext = (REPO / "templates" / "pack" / "skeleton" / "validate.py").read_text()
     for base in expander:
         assert f'"{base}"' in vtext, f"validate.py no longer accepts the expander base '{base}'"
+
+
+def test_expand_jobs_handles_all_three_schedule_shapes():
+    """invariant-audit #2: framework validate accepts a dict schedule, a BARE STRING schedule, and a
+    top-level `expr`. The expander must handle all three — before the fix a string schedule raised
+    AttributeError (aborting the whole cron deploy under `set -euo pipefail`) and a top-level `expr`
+    sentinel was silently never expanded (cron-plus can't parse the raw sentinel → the lane dies)."""
+    m = _load()
+    jobs = [
+        {"name": "dict",     "schedule": {"kind": "cron", "expr": "@jitter:2h"}},
+        {"name": "string",   "schedule": "0 13 * * SUN"},        # bare string, concrete -> untouched
+        {"name": "str-sent", "schedule": "@jitter:daily"},       # bare string sentinel -> expands
+        {"name": "toplvl",   "expr": "@jitter:6h"},              # top-level expr sentinel -> expands
+    ]
+    n = m.expand_jobs(jobs, random.Random(7))
+    assert n == 3                                                # dict + str-sent + toplvl
+    assert jobs[0]["schedule"]["expr"].endswith("*/2 * * *")
+    assert jobs[1]["schedule"] == "0 13 * * SUN"                 # concrete string preserved (shape kept)
+    assert jobs[2]["schedule"].endswith("13 * * *") and not m.is_sentinel(jobs[2]["schedule"])
+    assert jobs[3]["expr"].endswith("*/6 * * *") and not m.is_sentinel(jobs[3]["expr"])
+
+
+def test_expand_brief_jobs_handles_all_three_schedule_shapes():
+    """invariant-audit #2: the same three-shape tolerance for `@morning[:MM]` brief expansion."""
+    m = _load()
+    jobs = [
+        {"name": "dict",     "schedule": {"expr": "@morning"}},
+        {"name": "string",   "schedule": "@morning:30"},
+        {"name": "toplvl",   "expr": "@morning"},
+        {"name": "concrete", "schedule": "0 9 * * *"},           # not a sentinel -> untouched, no crash
+    ]
+    n = m.expand_brief_jobs(jobs, 7)
+    assert n == 3
+    assert jobs[0]["schedule"]["expr"] == "0 7 * * *"
+    assert jobs[1]["schedule"] == "30 7 * * *"                   # bare-string shape preserved
+    assert jobs[2]["expr"] == "0 7 * * *"                        # top-level shape preserved
+    assert jobs[3]["schedule"] == "0 9 * * *"

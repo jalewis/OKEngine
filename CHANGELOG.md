@@ -14,6 +14,76 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
 > **About panel** (reader/cockpit deployment purpose + composition from live state); and now **pack
 > bundles** (v0.10.0). If you are jumping from v0.3.5, read v0.4.0 onward.
 
+## v0.10.8
+
+Correctness sweep: a cockpit-rendering fix from an operator report, the lacuna wake-gate
+rotation bug, and the **wiki-lane audit** — 100 analysis scripts triaged, 29 confirmed
+defects fixed (all 7 HIGH) — plus the reshard/reshelve churn and the ingest duplicate-loop.
+
+### Fixed
+- **Cockpit assessments / predictions tables** (operator report) — the predictions scan recurses
+  into the dated `predictions/YYYY/qN/` partition (Open-forecasts was silently empty); `table.ledger`
+  headers and config-driven `_ds_cell` value cells no longer wrap or break mid-token ("RESOLVES BY",
+  "moderate-high", "2026-07-07"); the A−/A+ text-size control scales the whole UI via `zoom` (content
+  is px, not rem, so it previously grew only the toolbar). Baked (cockpit image).
+- **Lacuna wake-gate rotation** — `_recently_analyzed` read every `[[concepts/…]]` link in a gap page
+  instead of the authoritative `field_mapped` frontmatter, so the densest just-analyzed field clogged
+  batch slot #1 forever (one gap, then near-zero output). Now keys off `field_mapped`; secondary
+  citations no longer over-exclude, and undated pages fall back to file mtime. `frontier-watch`
+  (whitespace) carried the identical bug against its `capability` field — fixed too.
+- **Wiki-lane audit — 29 confirmed defects across the analysis lanes**, all 7 HIGH, fixed at the
+  root in five recurring classes:
+  - *Wrong/proxy signal:* prediction status predicates honor the canonical `active` (open) and
+    `expired-ungraded` (terminal) — grading / regrade / forecast-review were silently skipping them
+    (18 open forecasts on a live vault); `health_export` parses fleet-health's plain-text counts
+    (were exporting 0 — a dead-monitor-reads-healthy fail); `daily-brief` reads the `last_updated`
+    envelope; glossary counts aliased/anchored wikilinks; falsification uses genuine publication
+    recency, not importer-churned `last_updated`.
+  - *Sharding:* `source-staleness`, `apply-curated-fields`, `canonical-assemble`, `page-quality-enrich`
+    route through the shard-aware `okf_migrate.find_page` / `canonical_key` / `<ns>/<slug>` keys.
+  - *Composed schema / walk-up sub-domains:* `wiki-schema-audit` classifies against `merged_schema`
+    + `type_aliases` (engine base types were reported as DRIFT); `page-quality-audit`, `tier-refresh`,
+    `source-portfolio-watch` read the composed knowledge namespaces + walk-up sub-domain bases.
+  - *cwd-vault:* `actor-risk-rank` resolves the vault from `WIKI_PATH`, never `os.getcwd()`.
+- **reshard / reshelve churn** — `reshard_oversized` split an oversized leaf one level deeper, but the
+  co-scheduled reshelve drain (`okf_migrate.build_map`) reverted it every 2h — the leaf-size invariant
+  was never satisfied and each pass rewrote `[[…]]` links vault-wide. `okf_migrate.reshard_seg` is now
+  the single shared reshard-key source; `build_map` treats a valid `<canonical>/<reshard-seg>/<slug>`
+  bucket as canonical instead of reverting it.
+- **Ingest no longer loops on duplicate raw files** — a duplicate raw file (its story already has a
+  source) never gets its own page, so it stayed "unprocessed" and was re-offered in every batch: the
+  lane drained nothing. An offer-count manifest skips a file after `RAW_STUCK_AFTER` fruitless offers,
+  and the agent is guided to append a duplicate's path to the existing source's `raw:` list.
+
+### Hardened (pre-release invariant audit — 23 confirmed cross-surface findings, all fixed + red-tested)
+- **Enforced write path — base governance + generated-file exemption** (HIGH/MED/LOW). The write gate
+  now applies engine-BASE governance (core-type `required` floors, CLOSED `tlp`/`source_kind`/`severity`
+  enums) regardless of whether a composed-schema artifact exists — previously it read types/enums
+  straight from the resolved schema, so base rules silently toggled with unrelated extension state. The
+  conformance validator exempts the engine-generated structural files (`HOT`/`HEALTH`/`BUNDLE.md`, the
+  INDEX tree, `_`-scaffold) that made a live vault permanently sub-100% conformant. `patch_entity` now
+  applies the #196 list-shape coercion and both `patch_entity`/`append_to_section` enforce the briefing
+  dead-link guard that `create`/`update` already did. The drift check's "always allowed" set now unions
+  base `common_optional`, so it no longer flags the engine's own stamped provenance
+  (`maintained_by`/`discovered_by`) as domain drift.
+- **`install-domain` regenerates the composed-schema artifact** (HIGH) — a taxonomy merge edited
+  `schema.yaml` but not `.okengine/composed-schema.yaml` (which the runtime write path prefers), so on
+  an extension-enabled host every write to the newly co-installed namespace was silently rejected.
+- **Cron sentinel expander tolerates all three documented schedule shapes** (HIGH) — a bare-string
+  `schedule` crashed the whole cron deploy; a top-level `expr` sentinel silently never fired.
+- **Deploy / rollback / ownership gates**: `framework upgrade` rollback no longer deletes live-vault
+  writes made during the apply→validate window; `deploy-cron-scripts` stages the full documented
+  `data/*` contract (not a 2-file allowlist); `post_deploy_verify` stats `jobs.json` itself for the
+  okengine#193 ownership poison and probes qmd writability with a correct diagnostic; `cron-plus-logs`
+  reads the in-container log dir and fails loud; the dead `deploy-cron-plus-plugin.sh` is removed (docs
+  corrected to `install-cron-plus.sh`).
+- **Fail-closed guards + consumer-shape robustness**: the budget guard fails closed on a malformed
+  budget env and re-pauses after a jobs.json redeploy defeats the kill-switch; `deployment_validate`
+  no longer false-FAILs a panels-only/schema-only extension; `id_index`/`select_entity_candidates`
+  tolerate a non-string `aliases`/`tags` member; the reader/cockpit briefing/download views and embed
+  resolver tolerate a non-string `title`/`name` (no 500) and memoize the embed lookup; the secret-scrub
+  regex covers base64 tokens.
+
 ## v0.10.7
 
 More shift-left + a UI fix from an operator report.

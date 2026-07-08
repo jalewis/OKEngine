@@ -321,3 +321,46 @@ def test_type_alias_merge_into_inline_flow_map_host(tmp_path):
     assert al["group"] == "actor"
     # guest aliases are merged in
     assert al["mitigation"] == "course-of-action" and al["ioc"] == "indicator"
+
+
+def _sibling(name):
+    spec = importlib.util.spec_from_file_location(name, REPO / "scripts" / f"{name}.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[name] = m
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_taxonomy_apply_regenerates_composed_schema_artifact(tmp_path):
+    """invariant-audit #3: on an extension-enabled host the RUNTIME write path PREFERS
+    <host>/.okengine/composed-schema.yaml. The taxonomy merge edits schema.yaml only, so a stale
+    artifact predating the merge would silently reject every write to the newly co-installed
+    namespace ('namespace not declared'). After --apply the artifact must be regenerated to carry
+    the merged namespace — while keeping the extension's own owned type."""
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    # live state: an enabled schema-bringing extension (like messaging-synthesis/predictions on the
+    # real deployments) made the composed artifact exist.
+    d = h / "extensions" / "demo.pred"
+    (d / "schema").mkdir(parents=True)
+    (d / "extension.yaml").write_text(yaml.safe_dump({
+        "id": "demo.pred", "kind": "operation", "version": "0.1.0", "trust": "in-gateway",
+        "requires": {"engine": ">=0.3.0"},
+        "capabilities": {"read": ["wiki/**"], "write": ["forecasts/**"]},
+        "schema": ["schema/forecasts.schema.yaml"],
+        "operation": {"schedule": {"kind": "cron", "expr": "0 4 * * *"},
+                      "entrypoint": {"script": "run.py"}}}))
+    (d / "schema" / "forecasts.schema.yaml").write_text(yaml.safe_dump({
+        "owns": {"namespaces": ["forecasts"], "types": {"forecast": {"required": ["claim"]}}}}))
+    disc, comp = _sibling("extension_discovery"), _sibling("extension_compose")
+    disc.set_enabled(h, "demo.pred", True)
+    assert comp.write_composed_schema(h) == []
+    art = h / ".okengine" / "composed-schema.yaml"
+    before = yaml.safe_load(art.read_text())
+    assert "tax-events" not in before.get("partitioning", {}).get("namespaces", {})   # stale: pre-merge
+
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+
+    after = yaml.safe_load(art.read_text())
+    assert "tax-events" in after.get("partitioning", {}).get("namespaces", {}), \
+        "composed artifact must be regenerated with the merged namespace (else writes are rejected)"
+    assert "forecast" in after.get("types", {}), "extension-owned type must survive the regeneration"

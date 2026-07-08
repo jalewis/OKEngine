@@ -192,6 +192,54 @@ def test_install_cron_plus_force_recovers_a_dirty_managed_clone(tmp_path):  # in
     assert "discarding LOCAL" in r.stderr, "must surface the discarded change, not silently drop it"
 
 
+def test_cron_plus_logs_reads_container_not_host_hermes():  # invariant-audit #15
+    """cron-plus-logs.sh must read the log stream from INSIDE the gateway container
+    (/opt/data/logs via `docker exec`), not the host ~/.hermes/logs. okengine deployments are
+    containerized (#138); the old default `${HERMES_HOME:-$HOME/.hermes}/logs` resolved to a
+    nonexistent host dir and — because every tail/ls/grep was 2>/dev/null — silently emitted
+    nothing, so a dead scheduler read the same as a healthy-quiet one."""
+    t = (S / "cron-plus-logs.sh").read_text()
+    assert "/opt/data/logs" in t, "cron-plus-logs.sh no longer reads the in-container log dir"
+    assert "$HOME/.hermes" not in t and "HERMES_HOME" not in t, \
+        "cron-plus-logs.sh still resolves logs on the host (~/.hermes) instead of the container"
+    assert "docker exec" in t, "cron-plus-logs.sh must shell into the gateway to read the logs"
+    # scoped to THIS pack's gateway on a multi-pack host, same idiom as cron-plus.sh (#108)
+    assert "CRON_PACK_DIR" in t and "com.docker.compose.service=gateway" in t, \
+        "cron-plus-logs.sh must scope to the pack gateway (CRON_PACK_DIR / compose label)"
+    r = subprocess.run(["bash", "-n", str(S / "cron-plus-logs.sh")], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_cron_plus_logs_fails_loud_on_missing_log_dir():  # invariant-audit #15
+    """A missing log dir must be surfaced with an ERROR + nonzero exit, never swallowed. Point the
+    helper at a bogus pack (no gateway container) — it must fail LOUDLY, not exit 0 with empty
+    output (the silent-default the audit flagged)."""
+    import os
+    r = subprocess.run(
+        ["bash", str(S / "cron-plus-logs.sh"), "tail"],
+        capture_output=True, text=True,
+        env={**os.environ, "CRON_PACK_DIR": "/nonexistent/pack-with-no-gateway"},
+    )
+    assert r.returncode != 0, "cron-plus-logs.sh exited 0 despite no gateway/log dir (silent default)"
+    assert "ERROR" in r.stderr, f"no loud error on missing gateway:\nstdout={r.stdout!r}\nstderr={r.stderr!r}"
+
+
+def test_dead_cron_plus_plugin_deploy_script_removed():  # invariant-audit #16
+    """scripts/deploy-cron-plus-plugin.sh was a broken, wrong-surface DEAD script: it read from
+    a never-vendored plugins/cron-plus and deployed to host ~/.hermes/plugins, a location the
+    runtime abandoned post-#138. It must stay removed, and CLAUDE.md's deploy-surface table must
+    no longer point operators at it — the real cron-plus plugin deploy is install-cron-plus.sh
+    (clones the pinned external dep into <pack>/.hermes-data/plugins/cron-plus)."""
+    assert not (S / "deploy-cron-plus-plugin.sh").exists(), \
+        "the dead deploy-cron-plus-plugin.sh is back — it targets an unvendored source + host ~/.hermes"
+    claude_md = (REPO / "CLAUDE.md").read_text()
+    assert "deploy-cron-plus-plugin.sh" not in claude_md, \
+        "CLAUDE.md still references the removed deploy-cron-plus-plugin.sh"
+    assert "install-cron-plus.sh" in claude_md, \
+        "CLAUDE.md deploy surfaces must name install-cron-plus.sh as the cron-plus plugin deploy path"
+    assert (S / "install-cron-plus.sh").is_file(), "the real cron-plus plugin installer is missing"
+
+
 def test_config_template_enables_cron_plus():  # #20
     c = yaml.safe_load((REPO / "config" / "config.yaml.template").read_text())
     assert "cron-plus" in (c.get("plugins") or {}).get("enabled", [])

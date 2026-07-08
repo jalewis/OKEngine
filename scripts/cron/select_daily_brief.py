@@ -86,7 +86,9 @@ def main() -> int:
             if p.name.startswith(("_", "INDEX")):
                 continue
             fm = _fm(p)
-            up = _d(fm.get("updated"))
+            # OKF's envelope carries `last_updated`, not `updated` — reading only `updated` left the
+            # movement section permanently empty. Mirror tier_lib's fallback chain.
+            up = _d(fm.get("updated") or fm.get("last_updated") or fm.get("created"))
             if up >= since:
                 kind = "new" if _d(fm.get("created")) >= since else "updated"
                 moved.append((up, kind, p.relative_to(WIKI).as_posix()[:-3],

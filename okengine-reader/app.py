@@ -218,6 +218,21 @@ def _delink(s: str) -> str:
     return _WIKILINK.sub(_wl_display, s)
 
 
+_EMBED_PATH_CACHE: dict = {}
+
+
+def _embed_rglob(name: str) -> "Path | None":
+    """First vault match for a basename `name` (`…​.md`), memoized for the process lifetime
+    (mirrors `_LINK_TITLE_CACHE`). Basename embeds ![[apt29]] are the norm on sharded OKF
+    vaults, so without this each render re-walks the WHOLE tree once per unresolved embed."""
+    if name in _EMBED_PATH_CACHE:
+        return _EMBED_PATH_CACHE[name]
+    hits = list(WIKI.rglob(name)) if WIKI.is_dir() else []
+    hit = hits[0] if hits else None
+    _EMBED_PATH_CACHE[name] = hit
+    return hit
+
+
 def _resolve_embeds(text: str, depth: int = 0) -> str:
     """Inline Obsidian embeds ![[target]] with the target file's body, recursively
     (depth-limited). Targets are resolved anywhere under the vault, so this works
@@ -231,9 +246,7 @@ def _resolve_embeds(text: str, depth: int = 0) -> str:
             return f"_[embedded asset: {target}]_"
         cand = WIKI / (target + ".md")
         if not cand.is_file():
-            name = Path(target).name + ".md"
-            hits = list(WIKI.rglob(name)) if WIKI.is_dir() else []
-            cand = hits[0] if hits else None
+            cand = _embed_rglob(Path(target).name + ".md")
         if not cand:
             return f"_[missing embed: {target}]_"
         try:
@@ -1136,7 +1149,9 @@ def _clean_markdown(raw: str, title: str | None = None) -> str:
     body = _resolve_embeds(body)
     body = re.sub(r"```dataview(js)?\n.*?\n```", "", body, flags=re.DOTALL)
     body = _delink(body)
-    t = (title or fm.get("title") or fm.get("name") or "").strip()
+    # str-wrap: yaml SafeLoader type-infers a bare `title: 2024`/`2026-07-08`/list
+    # to a non-str, and .strip() would 500 the export (matches api_page's str-wrap).
+    t = str(title or fm.get("title") or fm.get("name") or "").strip()
     if t and not body.lstrip().startswith("# "):
         body = f"# {t}\n\n{body}"
     return body.strip() + "\n"
@@ -1180,7 +1195,7 @@ def api_download(request: Request, fmt: str, path: str = Query(...)):
     cp = _resolve_page(path)
     raw = cp.read_text(encoding="utf-8", errors="replace")
     fm, _ = split_fm(raw)
-    title = (fm.get("title") or fm.get("name") or Path(path).stem).strip()
+    title = str(fm.get("title") or fm.get("name") or Path(path).stem).strip()
     clean = _clean_markdown(raw)
     if fmt == "md":                       # cheap: no subprocess, no gate
         data = clean.encode("utf-8")

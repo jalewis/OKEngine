@@ -151,6 +151,43 @@ def find_page(root: Path, namespace: str, slug: str) -> Path | None:
     return sorted(hits, key=lambda p: (-len(p.parts), p.as_posix()))[0]
 
 
+def _day(slug: str, fm: dict) -> str:
+    """Day-of-month reshard segment (reshard_by: day) — published date, else filename date, else 00."""
+    m = re.search(r"\d{4}-\d{2}-(\d{2})", str((fm or {}).get("published") or "")) \
+        or re.match(r"\d{4}-\d{2}-(\d{2})", slug)
+    return m.group(1) if m else "00"
+
+
+def _second(slug: str, fm: dict | None = None) -> str:
+    """Second-letter reshard segment (reshard_by: second-letter). `fm` unused — uniform keyfn sig."""
+    s = slug.lower()
+    return s[1] if len(s) > 1 and s[1].isalnum() else "_"
+
+
+_RESHARD_SEG = {"day": _day, "second-letter": _second}
+
+
+def reshard_seg(reshard_by: str, slug: str, fm: dict) -> "str | None":
+    """The segment reshard_oversized inserts between the canonical bucket and the slug when it splits
+    an oversized leaf. THE single source of the reshard-key logic — build_map and reshard_oversized
+    both call it, so a valid split can't be silently reverted by the drain (okengine#54 spirit).
+    None for a namespace with no/unknown reshard_by."""
+    fn = _RESHARD_SEG.get(reshard_by)
+    return fn(slug, fm) if fn else None
+
+
+def _is_reshard_bucket(cur: str, new: str, pcfg: dict, slug: str, fm: dict) -> bool:
+    """True when `cur` is the canonical key `new` split ONE level deeper into a VALID reshard
+    sub-bucket (`<canonical-prefix>/<reshard-seg>/<slug>`), so build_map leaves it in place instead
+    of reverting a legitimate reshard (which caused reshard@00:45 ↔ reshelve@02:35 churn forever)."""
+    seg = reshard_seg(pcfg.get("reshard_by"), slug, fm)
+    if seg is None:
+        return False
+    cp, np = cur.split("/"), new.split("/")
+    return (len(cp) == len(np) + 1 and cp[-1] == np[-1]
+            and cp[:-2] == np[:-1] and cp[-2] == seg)
+
+
 def build_map(root: Path, namespace: str, only_types: set[str] | None = None,
               only_year: str | None = None) -> tuple[dict[str, str], list[tuple[str, str]]]:
     """(old-key -> new-key, collisions) for EVERY page under the namespace whose current
@@ -189,8 +226,8 @@ def build_map(root: Path, namespace: str, only_types: set[str] | None = None,
         if new and only_year and new.startswith(f"{namespace}/") \
                 and not new.startswith(f"{namespace}/{only_year}/"):
             new = None
-        if not new or new == cur:
-            continue
+        if not new or new == cur or _is_reshard_bucket(cur, new, pcfg, slug, fm):
+            continue                       # already canonical, OR a valid reshard sub-bucket (don't revert)
         # collision guard: the canonical seat is already taken by a DIFFERENT file
         if (root / "wiki" / (new + ".md")).is_file():
             collisions.append((cur, new))

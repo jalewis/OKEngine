@@ -66,10 +66,27 @@ def _read_fm(md: Path) -> dict:
         return {}
 
 
+def _slug_of(ref: str) -> str:
+    """Reduce a concept reference to its bare slug. Handles the sharded path the schema stores
+    (`concepts/s/supply-chain-compromise`), a `[[concepts/…]]` wikilink, or a plain slug — all
+    fold to `supply-chain-compromise`. Returns '' for anything that isn't a concept ref."""
+    s = str(ref).strip().strip("[]").split("|", 1)[0].split("#", 1)[0].strip()
+    if "concepts/" in s:
+        s = s.split("concepts/", 1)[1]
+    return s.rstrip("/").split("/")[-1]
+
+
 def _recently_analyzed() -> set[str]:
-    """Concept slugs covered by a `lacuna` page dated within REANALYZE_DAYS (or undated —
-    treated as recent, so we don't churn). A lacuna page declares the field it analyzed via
-    the `[[concepts/<slug>]]` links in its frontmatter/body; we read them all back."""
+    """Concept slugs a `lacuna` page has already MAPPED within REANALYZE_DAYS (rotation).
+
+    The analyzed field is declared authoritatively in the page's REQUIRED `field_mapped`
+    frontmatter — read THAT, not every `[[concepts/…]]` the page happens to cite. Those
+    secondary links are context (a mapped field routinely cites neighbouring concepts), and
+    treating them as "analyzed" both (a) let the *mapped* field slip back into the batch when
+    it was recorded only as a bare `field_mapped:` path, not a bracketed link, and (b) retired
+    unrelated dense fields for 90 days, starving the candidate pool. Legacy pages without
+    `field_mapped` fall back to their bracketed links; undated pages fall back to the file
+    mtime so the rotation window can actually elapse."""
     cutoff = _cutoff()
     covered: set[str] = set()
     ldir = WIKI / "lacuna"
@@ -84,9 +101,21 @@ def _recently_analyzed() -> set[str]:
         if str(fm.get("type", "")).strip() != "lacuna":
             continue
         when = str(fm.get("updated") or fm.get("created") or "")[:10]
-        if when and when < cutoff:
-            continue                       # old enough to refresh — leave eligible
-        covered |= set(_CONCEPT_LINK.findall(text))
+        if not when:                       # undated page: fall back to when the file was written
+            try:
+                when = date.fromtimestamp(md.stat().st_mtime).isoformat()
+            except OSError:
+                when = _today()            # unreadable stat: treat as recent (stay excluded)
+        if when < cutoff:
+            continue                       # old enough to refresh — leave the field eligible
+        mapped = fm.get("field_mapped")
+        if mapped:
+            for ref in (mapped if isinstance(mapped, list) else [mapped]):
+                slug = _slug_of(ref)
+                if slug:
+                    covered.add(slug)
+        else:                              # legacy page (no field_mapped): best-effort from links
+            covered |= set(_CONCEPT_LINK.findall(text))
     return covered
 
 

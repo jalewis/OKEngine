@@ -35,7 +35,10 @@ def main() -> int:
     recent = []
     for p in P.iter_pages(v, "sources"):
         fm = P.read_fm(p)
-        d = P.fm_date(fm, "published", "last_updated", "updated")
+        # genuine publication recency only — `last_updated`/`updated` are bumped by the token-free
+        # importers on every ingest, so they'd flag long-old sources as "recent". Matches the
+        # published/created/date signal pred_lib.recent_source_slugs uses (keep the two consistent).
+        d = P.fm_date(fm, "published", "created", "date")
         if d and d >= cutoff:
             recent.append((d, p, str(fm.get("title") or p.stem)))
     recent.sort(key=lambda t: t[0], reverse=True)

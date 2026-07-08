@@ -37,9 +37,11 @@ DEFAULT_MAX = 500
 
 # reshard_by -> (glob suffix under the namespace dir locating leaf buckets,
 #                shard-key function for a file in that leaf)
+# Shard-key via okf_migrate.reshard_seg — THE single source shared with the reshelve drain, so a
+# split here can't be reverted there (they computed the same segment two different ways before).
 _RESHARD_BY = {
-    "day": ("*/*", lambda f: _day(f.stem, _fm(f))),
-    "second-letter": ("*", lambda f: _second(f.stem)),
+    "day": ("*/*", lambda f: okf_migrate.reshard_seg("day", f.stem, _fm(f))),
+    "second-letter": ("*", lambda f: okf_migrate.reshard_seg("second-letter", f.stem, _fm(f))),
 }
 
 
@@ -55,17 +57,6 @@ def _fm(p: Path) -> dict:
         return d if isinstance(d, dict) else {}
     except Exception:
         return {}
-
-
-def _day(slug: str, fm: dict) -> str:
-    m = re.search(r"\d{4}-\d{2}-(\d{2})", str(fm.get("published") or "")) \
-        or re.match(r"\d{4}-\d{2}-(\d{2})", slug)
-    return m.group(1) if m else "00"
-
-
-def _second(slug: str) -> str:
-    s = slug.lower()
-    return s[1] if len(s) > 1 and s[1].isalnum() else "_"
 
 
 def _reshardable_namespaces() -> list[tuple[str, str, int]]:

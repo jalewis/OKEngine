@@ -663,8 +663,10 @@ async function bootstrap() {
 }
 bootstrap();
 
-/* ── Text-size control (A−/A+ header) ── ported from okengine-reader; every UI size is
-   in rem, so scaling the root font-size scales the whole cockpit. Persisted per-browser. */
+/* ── Text-size control (A−/A+ header) ── the cockpit's content (dashboards, ledger,
+   detail panes) is styled in px, not rem, so scaling the root font-size only grew the
+   rem-based chrome (tabs/clock) and left the content untouched. Scale the whole UI with
+   `zoom` (relative to DEF) so px and rem alike grow together. Persisted per-browser. */
 (function () {
   var KEY = "okengine.cockpit.fontPx", MIN = 12, MAX = 24, STEP = 1, DEF = 14;
   var root = document.documentElement;
@@ -675,8 +677,8 @@ bootstrap();
     if (d) d.disabled = v <= MIN;
     if (i) i.disabled = v >= MAX;
   }
-  function apply(v) { root.style.fontSize = v + "px"; try { localStorage.setItem(KEY, v); } catch (e) {} refresh(v); }
-  root.style.fontSize = cur() + "px";
+  function apply(v) { root.style.zoom = (v / DEF).toFixed(4); try { localStorage.setItem(KEY, v); } catch (e) {} refresh(v); }
+  root.style.zoom = (cur() / DEF).toFixed(4);
   function wire() {
     refresh(cur());
     var d = document.getElementById("fs-dec"), i = document.getElementById("fs-inc");

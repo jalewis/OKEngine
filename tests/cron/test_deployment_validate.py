@@ -421,3 +421,97 @@ def test_deployment_validate_runs_daily_not_weekly():
     dv = next(j for j in jobs if j.get("name") == "deployment-validate")
     dow = dv["schedule"]["expr"].split()[4]
     assert dow == "*", f"deployment-validate must run daily (day-of-week '*'), got {dv['schedule']['expr']!r}"
+
+
+# --- invariant-audit #17: the type_alias SHADOW/target branch — the validator's headline drift --
+
+def test_type_alias_shadow_fails(tmp_path):
+    """A root type_alias whose KEY is also a composed canonical type is the drift this module was
+    built to catch: normalization drains silently retype those pages. Must FAIL and name the type.
+    (No test covered this branch before — a refactor that mis-sourced the shadow check would have
+    gone green.)"""
+    schema = ("types:\n  company: {required: [type, name]}\n"
+              "type_aliases: {company: vendor}\n"
+              "partitioning: {namespaces: {}}\n")
+    f = _run_schema_check(tmp_path, schema, schema)
+    assert any(lvl == "FAIL" and "SHADOWS" in msg and "company" in msg
+               for lvl, _, msg in f), f
+
+
+def test_type_alias_target_not_a_type_warns(tmp_path):
+    """An alias pointing at a target that is NOT a composed type is a dangling remap — WARN."""
+    schema = ("types:\n  entity: {required: [type, name]}\n"
+              "type_aliases: {org: no_such_type}\n"
+              "partitioning: {namespaces: {}}\n")
+    f = _run_schema_check(tmp_path, schema, schema)
+    assert any(lvl == "WARN" and "no_such_type" in msg and "not a composed type" in msg
+               for lvl, _, msg in f), f
+
+
+def test_type_alias_pointing_at_real_type_is_clean(tmp_path):
+    """A well-formed alias (key not a type, target IS a composed type) is the intended use — no
+    shadow FAIL, no dangling-target WARN."""
+    schema = ("types:\n  entity: {required: [type, name]}\n  vendor: {required: [type, name]}\n"
+              "type_aliases: {company: vendor}\n"
+              "partitioning: {namespaces: {}}\n")
+    f = _run_schema_check(tmp_path, schema, schema)
+    assert not any(lvl in ("FAIL", "WARN") and ("SHADOWS" in msg or "not a composed type" in msg)
+                   for lvl, _, msg in f), f
+
+
+# --- invariant-audit #8: check_extensions must not FALSE-FAIL a no-lane (sidecar/panels/schema)
+#     enabled extension that legitimately stages no /opt/data/scripts/<id>/ dir. ----------------
+
+def _run_extensions_check(tmp_path, enabled, jobs, staged_dirs):
+    """Drive check_extensions: enable `enabled` ids in .okengine/extensions.yaml, lay down a
+    jobs.json (`jobs`), and materialize the given staged /opt/data/scripts/<id>/ dirs."""
+    import json as _json
+    vault = tmp_path / "vault"
+    data = tmp_path / "data"
+    (vault / ".okengine").mkdir(parents=True)
+    (data / "scripts").mkdir(parents=True)
+    (data / "cron-plus").mkdir(parents=True)
+    (vault / ".okengine" / "extensions.yaml").write_text(
+        yaml.safe_dump({"enabled": {e: {} for e in enabled}}))
+    (data / "cron-plus" / "jobs.json").write_text(_json.dumps({"jobs": jobs}))
+    for sd in staged_dirs:
+        (data / "scripts" / sd).mkdir(parents=True, exist_ok=True)
+    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["deployment_validate"] = m
+    spec.loader.exec_module(m)
+    m.F.clear()
+    m.VAULT, m.DATA = vault, data
+    m.check_extensions()
+    return list(m.F)
+
+
+def _ext_job(ext_id, fname="run.py"):
+    """A synthesized extension cron job — script under <SCRIPTS_ROOT>/<id>/ (extension_compose)."""
+    return {"id": ext_id, "name": ext_id, "enabled": True,
+            "script": f"/opt/data/scripts/{ext_id}/{fname}"}
+
+
+def test_panels_only_extension_no_scripts_dir_is_clean(tmp_path):
+    """A schema-fragment-only / panels-only / sidecar extension stages NO *.py, so
+    deploy-cron-scripts creates no dir and synthesizes no cron lane. It must NOT be FAILed —
+    the false positive would ERROR the whole lane and bury real findings."""
+    f = _run_extensions_check(tmp_path, enabled=["okengine.embeddings"], jobs=[], staged_dirs=[])
+    assert not any(lvl == "FAIL" for lvl, _, _ in f), f
+
+
+def test_extension_with_lane_but_no_staged_dir_fails(tmp_path):
+    """A genuinely dead lane: the extension DID synthesize a cron job pointing at its scripts dir,
+    but the dir was never staged. That is a real FAIL."""
+    f = _run_extensions_check(tmp_path, enabled=["okengine.glossary"],
+                              jobs=[_ext_job("okengine.glossary", "glossary_refresh.py")],
+                              staged_dirs=[])
+    assert any(lvl == "FAIL" and "okengine.glossary" in msg for lvl, _, msg in f), f
+
+
+def test_extension_with_lane_and_staged_dir_is_clean(tmp_path):
+    """Lane synthesized AND its scripts dir staged — the healthy in-gateway extension. No finding."""
+    f = _run_extensions_check(tmp_path, enabled=["okengine.glossary"],
+                              jobs=[_ext_job("okengine.glossary", "glossary_refresh.py")],
+                              staged_dirs=["okengine.glossary"])
+    assert not any(lvl == "FAIL" for lvl, _, _ in f), f

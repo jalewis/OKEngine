@@ -82,6 +82,33 @@ def _load_year_index() -> dict[str, int]:
 
 _YEAR_INDEX = _load_year_index()
 
+# Offer-count manifest (raw/.batch-offered.json). A raw file is "processed" only when a source page
+# carries its path in `raw:`. But a DUPLICATE raw file (its story already has a source under another
+# slug) never gets its own source, so it's never processed and — being newest — stays in the top-N,
+# re-offered every run: the lane loops on the same batch forever instead of draining. This tracks how
+# many times each still-unprocessed file has been offered; once a file has been offered STUCK_AFTER
+# times without being processed it is a duplicate/low-signal the agent won't ingest, so we stop
+# offering it and the selector advances. A file that later gets a source drops out (pruned below).
+OFFER_MANIFEST = VAULT / "raw" / ".batch-offered.json"
+STUCK_AFTER = int(os.environ.get("RAW_STUCK_AFTER", "4"))
+
+
+def _load_offered() -> dict[str, int]:
+    try:
+        import json
+        d = json.loads(OFFER_MANIFEST.read_text())
+        return {str(k): int(v) for k, v in d.items()} if isinstance(d, dict) else {}
+    except (OSError, ValueError, ImportError):
+        return {}
+
+
+def _save_offered(d: dict[str, int]) -> None:
+    try:
+        import json
+        OFFER_MANIFEST.write_text(json.dumps(d))
+    except OSError:
+        pass
+
 
 def extract_processed_paths(text: str) -> set[str]:
     """Pull `raw:` field(s) out of a source page's YAML frontmatter.
@@ -224,6 +251,13 @@ def main() -> int:
     ]
     deferred_older = len(unprocessed_all) - len(unprocessed)
 
+    # Break the duplicate-loop: a file offered STUCK_AFTER times without ever getting a source is a
+    # duplicate / low-signal item the agent won't ingest — stop offering it so the batch advances to
+    # fresh files. Prune the manifest of anything that DID get a source (it succeeded).
+    offered = {k: v for k, v in _load_offered().items() if k not in processed}
+    stuck = [t for t in unprocessed if offered.get(normalize_path(t[0]), 0) >= STUCK_AFTER]
+    unprocessed_live = [t for t in unprocessed if offered.get(normalize_path(t[0]), 0) < STUCK_AFTER]
+
     def _emit_bogus_warning() -> None:
         if not bogus_paths:
             return
@@ -236,10 +270,14 @@ def main() -> int:
             print(f"- ... ({len(bogus_paths) - 10} more not shown)")
         print()
 
-    if not unprocessed:
+    if not unprocessed_live:
         print(f"# Raw-backfill batch — {datetime.now(timezone.utc).isoformat()}\n")
         _emit_bogus_warning()
-        msg = f"# Backfill complete\n\n0 unprocessed files remaining at MIN_YEAR={MIN_YEAR} ({len(all_raw)} total in raw/, all priority files indexed in wiki/sources/)."
+        msg = f"# Backfill complete\n\n0 ingestable files remaining at MIN_YEAR={MIN_YEAR} ({len(all_raw)} total in raw/, all priority files indexed in wiki/sources/)."
+        if stuck:
+            msg += (f"\n\n{len(stuck)} file(s) were offered {STUCK_AFTER}x without producing a source "
+                    "(duplicate of an existing story, or low-signal) and are now skipped — this is why "
+                    "the count stopped dropping, not a stall.")
         if deferred_older:
             msg += f"\n\n{deferred_older} pre-{MIN_YEAR} files are deferred — lower MIN_YEAR env var to ingest them."
         msg += "\n\nAction: run `hermes cron pause raw-backfill` and append a final log entry to $WIKI_PATH/wiki/log.md."
@@ -247,7 +285,13 @@ def main() -> int:
         print('{"wakeAgent": false}')
         return 0
 
-    chosen = sorted(unprocessed, key=lambda t: (path_tier(t[0]), -t[1], -t[2]))[:N]
+    chosen = sorted(unprocessed_live, key=lambda t: (path_tier(t[0]), -t[1], -t[2]))[:N]
+    # Record this offering. A file the agent keeps skipping accrues offers until it crosses
+    # STUCK_AFTER and drops out of the live pool above; one that gets a source is pruned next run.
+    for rel, _, _ in chosen:
+        _np = normalize_path(rel)
+        offered[_np] = offered.get(_np, 0) + 1
+    _save_offered(offered)
 
     by_year = {}
     for _, y, _ in unprocessed_all:
@@ -259,10 +303,13 @@ def main() -> int:
     print(f"**Total raw files:** {len(all_raw)}")
     print(f"**Already processed:** {len(processed)}")
     print(f"**Unprocessed (in scope, year>={MIN_YEAR}):** {len(unprocessed)}")
+    if stuck:
+        print(f"**Skipped (offered {STUCK_AFTER}x, no source — duplicate/low-signal):** {len(stuck)}")
+        print(f"**Ingestable this cycle:** {len(unprocessed_live)}")
     if deferred_older:
         print(f"**Unprocessed (deferred, year<{MIN_YEAR}):** {deferred_older}")
-    remaining = len(unprocessed) - len(chosen)
-    print(f"**This batch:** {len(chosen)} of {len(unprocessed)} unprocessed "
+    remaining = len(unprocessed_live) - len(chosen)
+    print(f"**This batch:** {len(chosen)} of {len(unprocessed_live)} ingestable "
           f"(bounded by `BATCH_SIZE={N}`, newest-first within scope)")
     if remaining > 0:
         print(f"**Remaining after this batch:** {remaining} — they drain on the next runs "
@@ -286,6 +333,10 @@ def main() -> int:
 
     print("## Files to ingest this batch (in order)\n")
     print("Process each in the order listed below. Each source page MUST set `raw:` to the relative path shown — that's the dedupe key.\n")
+    print("If a raw file DUPLICATES a story that already has a source page (different slug), do NOT "
+          "create a second page — instead APPEND this raw path to that existing source's `raw:` list "
+          "(via `mcp_okengine_write_update_entity`). That records it as processed so it stops being "
+          "re-queued; leaving it unmarked is what made the lane loop on duplicates.\n")
     for i, (rel, year, mtime) in enumerate(chosen, 1):
         mtime_iso = datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
         print(f"{i}. `{rel}` — derived_year={year}, mtime={mtime_iso}")

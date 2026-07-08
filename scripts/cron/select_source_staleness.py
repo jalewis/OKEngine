@@ -101,7 +101,13 @@ def to_date(v) -> date | None:
 
 
 def normalize_link(s) -> str | None:
-    """Extract the canonical sources/<stem> path from a frontmatter entry."""
+    """Canonical `<namespace>/<slug>` key for a citation — collapses the by-date / by-letter
+    partition segments (`sources/<yr>/<mo>/<slug>`, `entities/<L>/<slug>`) to the SAME stem key the
+    score map is built with (`score_all_sources` keys `sources/<stem>`). Without the collapse a
+    citation written as the full partition path (`sources/2026/07/foo`) never matched the
+    `sources/foo` score entry, so staleness was silently never applied to any date-partitioned
+    source — the common case. Stem-keying is partition-independent: a flat OR a partitioned citation
+    to the same slug both resolve."""
     if not isinstance(s, str):
         return None
     s = s.strip().strip('"').strip("'")
@@ -111,7 +117,10 @@ def normalize_link(s) -> str | None:
     s = s.strip()
     if s.endswith(".md"):
         s = s[:-3]
-    return s or None
+    parts = [seg for seg in s.split("/") if seg]
+    if len(parts) >= 2:
+        return f"{parts[0]}/{parts[-1]}"       # <namespace>/<slug>; partition/shard middle dropped
+    return (parts[0] if parts else None)
 
 
 # ─── source scoring ──────────────────────────────────────────────────

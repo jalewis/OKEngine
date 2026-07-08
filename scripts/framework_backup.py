@@ -41,7 +41,12 @@ _SECRET_PATHS = {".env", ".hermes-data/auth.json"}
 # (okengine invariant-audit). --include-secrets keeps the token verbatim.
 _REDACT_PATHS = {".hermes-data/config.yaml"}
 # The live secret in config.yaml is the MCP `Bearer <token>` — redact the token after "Bearer".
-_REDACT_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{6,}")
+# The class must cover every realistic token charset in ONE match, not just hex/urlsafe-base64:
+# OKENGINE_MCP_TOKEN is operator-settable to any string, so a STANDARD-base64 token
+# (e.g. `openssl rand -base64`) carries `+` `/` `=` — omitting those redacts only the leading run
+# and leaks the tail into a "(secrets excluded)" archive. A quote/whitespace/newline still ends the
+# match, so adding them can't over-run past the quoted value.
+_REDACT_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-+/=]{6,}")
 _MANIFEST = "MANIFEST.json"
 
 

@@ -245,8 +245,18 @@ def test_write_canonical_migration_preserves_unobserved_fields(tmp_path):
     assert fm["assembled_from"] == ["cisa-kev"]
 
 
+def _shard_schema(tmp):
+    """Governing schema.yaml so `entities` shards by-letter (matches config/base-schema.yaml),
+    like a real deployment — a NEW canonical lands at its sharded seat via canonical_key, not the
+    flat root. The pre-existing-page tests don't need this: find_page locates the page wherever
+    _canon already placed it."""
+    (tmp / "schema.yaml").write_text(
+        "partitioning:\n  namespaces:\n    entities: {strategy: by-letter}\n")
+
+
 def test_write_canonical_creates_when_absent(tmp_path):
     m = _load("canonical_assemble")
+    _shard_schema(tmp_path)
     m.write_canonical(tmp_path, "newactor", "intrusion-set", {"aliases": ["NA"]}, [],
                       ["thaicert"], POLICY, "2026-06-20")
     p = tmp_path / "wiki" / "entities" / "n" / "newactor.md"
@@ -257,6 +267,7 @@ def test_write_canonical_idempotent_skips_unchanged(tmp_path):
     """okengine#43: a re-run over unchanged owned content writes nothing and does NOT bump
     version; a genuine change still rewrites + bumps."""
     m = _load("canonical_assemble")
+    _shard_schema(tmp_path)
     args = (tmp_path, "apt29", "intrusion-set",
             {"aliases": ["Cozy Bear"], "suspected_origin": "Russia"},
             [], ["mitre-attack"], POLICY, "2026-06-20")

@@ -42,6 +42,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import schema_lib  # noqa: E402
+import okf_migrate  # noqa: E402  — shared shard-aware page locator (find_page)
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
@@ -61,17 +62,24 @@ def curated_namespaces() -> list[str]:
 
 
 def resolve_page(slug: str, namespaces: list[str]) -> Path | None:
-    """First existing `<namespace>/<slug>.md` (or `<slug>.md` at wiki root for
-    an empty namespace), in declared namespace order. None if the slug already
-    carries a namespace prefix that resolves, or nothing matches."""
-    # A slug may itself be namespace-qualified (e.g. "entities/acme").
+    """The existing page for `slug`, in declared namespace order — found WHEREVER it sits, including
+    the by-letter/by-date shard (`entities/a/acme.md`), not just the flat `<namespace>/<slug>.md`.
+    A flat-only probe silently skipped every sharded page, so curated fields were never enforced on
+    the entities/concepts namespaces that shard. None if the slug already carries a resolving
+    namespace prefix, or nothing matches."""
+    # A slug may itself be namespace-qualified (e.g. "entities/acme") — try it verbatim first.
     direct = WIKI / f"{slug}.md"
     if direct.exists():
         return direct
     for ns in namespaces:
-        cand = (WIKI / ns / f"{slug}.md") if ns else (WIKI / f"{slug}.md")
-        if cand.exists():
-            return cand
+        if ns:
+            hit = okf_migrate.find_page(VAULT, ns, slug)   # sharded OR flat, single source of path logic
+            if hit:
+                return hit
+        else:
+            cand = WIKI / f"{slug}.md"
+            if cand.exists():
+                return cand
     return None
 
 _FM_RE = re.compile(r"\A(---[ \t]*\n)(.*?\n)(---[ \t]*\n)(.*)\Z", re.S)

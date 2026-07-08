@@ -162,7 +162,19 @@ def test_manual_mode_pauses_and_resume_is_the_recovery(tmp_path, monkeypatch):
         monkeypatch.setenv(k, v)
     monkeypatch.setattr(m, "time", type("T", (), {"time": staticmethod(lambda: 1_000_000.0)}))
     calls = []
-    monkeypatch.setattr(m, "_cronplus", lambda action, jid: calls.append((action, jid)) or True)
+
+    def _fake_cronplus(action, jid):
+        # mirror real cron-plus: pause/resume flips the enabled flag in jobs.json, so the reconcile
+        # (invariant-audit #13) sees the true live state on the next tick.
+        calls.append((action, jid))
+        d = json.loads(jobs.read_text())
+        for j in d["jobs"]:
+            if j.get("id") == jid:
+                j["enabled"] = (action == "resume")
+        jobs.write_text(json.dumps(d))
+        return True
+
+    monkeypatch.setattr(m, "_cronplus", _fake_cronplus)
     assert m.main([]) == 0 and ("pause", "a") in calls          # trips
     calls.clear()
     assert m.main([]) == 0 and calls == []                      # manual: stays paused, no auto-resume
@@ -222,6 +234,57 @@ def test_trip_does_not_claim_paused_when_pause_fails(tmp_path, monkeypatch):
     assert state["paused_ids"] == []
     # decide() therefore re-attempts the pause rather than no-op'ing
     assert m.decide(over_budget=True, currently_paused=False, resume_policy="manual") == "pause"
+
+
+def test_malformed_budget_fails_closed(tmp_path, monkeypatch):  # invariant-audit #22
+    """A SET-but-malformed budget env (`$50`, `1,000,000`) must NOT crash the guard or silently run
+    uncapped (fail-open). It must fail CLOSED: pause the cost-bearing crons so the deployment isn't
+    left spending while the operator believes a cap is set."""
+    m = _load()
+    db = tmp_path / "state.db"
+    _make_db(db, [(1_000_000.0 - 10, 5, 5)])          # trivial usage, well under any real cap
+    jobs = tmp_path / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [{"id": "a", "name": "raw-backfill"}]}))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_STATE_DB", str(db))
+    monkeypatch.setenv("OKENGINE_CRON_PLUS_JOBS", str(jobs))
+    monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "1,000,000")   # thousands separators -> not int()
+    monkeypatch.delenv("OKENGINE_BUDGET_USD", raising=False)
+    monkeypatch.setattr(m, "time", type("T", (), {"time": staticmethod(lambda: 1_000_000.0)}))
+    calls = []
+    monkeypatch.setattr(m, "_cronplus", lambda action, jid: calls.append((action, jid)) or True)
+    assert m.main([]) == 0                              # does not crash
+    assert ("pause", "a") in calls                     # fail-closed: paused, not left uncapped
+    state = json.loads((tmp_path / "budget-guard-state.json").read_text())
+    assert state["paused"] is True
+
+
+def test_reconcile_repauses_after_jobs_redeploy(tmp_path, monkeypatch):  # invariant-audit #13
+    """The guard trusts its own state file. A wholesale jobs.json redeploy re-enables every
+    cost-bearing cron while state still says paused -> decide() no-ops and the cap is silently
+    defeated. The next tick must reconcile against the LIVE enabled-status and re-pause the crons."""
+    m = _load()
+    db = tmp_path / "state.db"
+    _make_db(db, [(1_000_000.0 - 10, 2_000_000, 0)])   # still over budget
+    # state says we paused "a"; a redeploy has re-enabled it in the live jobs.json
+    _seed_paused(tmp_path, ["a"])
+    jobs = tmp_path / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [{"id": "a", "name": "raw-backfill", "enabled": True}]}))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_STATE_DB", str(db))
+    monkeypatch.setenv("OKENGINE_CRON_PLUS_JOBS", str(jobs))
+    monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "1000000")
+    monkeypatch.setattr(m, "time", type("T", (), {"time": staticmethod(lambda: 1_000_000.0)}))
+    calls = []
+    monkeypatch.setattr(m, "_cronplus", lambda action, jid: calls.append((action, jid)) or True)
+    assert m.main([]) == 0
+    assert calls == [("pause", "a")]                   # drifted cron re-paused (kill-switch holds)
+
+    # and when the recorded cron is genuinely still disabled, reconcile is a no-op (no churn)
+    calls.clear()
+    jobs.write_text(json.dumps({"jobs": [{"id": "a", "name": "raw-backfill", "enabled": False}]}))
+    assert m.main([]) == 0
+    assert calls == []
 
 
 def test_resume_keeps_paused_when_some_resume_fails(tmp_path, monkeypatch):

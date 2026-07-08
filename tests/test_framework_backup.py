@@ -175,6 +175,26 @@ def test_config_yaml_bearer_token_redacted_in_no_secrets_backup(tmp_path):
         assert "abc123DEADBEEFtoken" in t.extractfile(".hermes-data/config.yaml").read().decode()
 
 
+def test_config_yaml_base64_bearer_token_fully_redacted(tmp_path):
+    """okengine invariant-audit #11: OKENGINE_MCP_TOKEN is operator-settable, so a STANDARD-base64
+    token (`openssl rand -base64`) carries `+` `/` `=`. The redaction char class must cover those in
+    ONE match — otherwise only the leading run is redacted and the token tail leaks verbatim into a
+    "(secrets excluded)" archive. Worst case: a token whose first run is <6 chars before a `+`/`/`/`=`
+    isn't matched at all and the WHOLE secret leaks."""
+    m = _mod()
+    p = _pack(tmp_path)
+    for token in ("Zm9vYmFy+ab/cd==", "ab+cdefghij"):  # padded base64; and <6-char leading run
+        (p / ".hermes-data" / "config.yaml").write_text(
+            f'model: qwen\nokengine:\n  authorization: "Bearer {token}"\n')
+        arch, _ = m.create(p, tmp_path / "out", include_secrets=False, stamp="20260101-000000")
+        with tarfile.open(arch) as t:
+            cfg = t.extractfile(".hermes-data/config.yaml").read().decode()
+        assert token not in cfg, f"token leaked into no-secrets archive: {token!r}"
+        # no stray base64 fragment survives after "<redacted>"
+        assert "<redacted>" in cfg and "+ab/cd" not in cfg and "cdefghij" not in cfg
+        assert "model: qwen" in cfg                                          # config preserved
+
+
 def test_skeleton_gitignore_excludes_okengine_secrets_keeps_enable_state():
     """okengine invariant-audit: the shipped pack scaffold must gitignore the GENERATED + SECRET
     .okengine/ artifacts (composed-schema, tokens) but keep the committed enable-state/model config."""

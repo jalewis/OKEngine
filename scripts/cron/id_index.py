@@ -82,7 +82,17 @@ class IdIndex:
             self._collisions.setdefault(page_id, [self.by_id[page_id]]).append(rel)
         else:
             self.by_id[page_id] = rel
-        for a in fm.get("aliases") or []:
+        # `aliases` is a list field, but a page authored with a scalar (string
+        # `aliases: A, B` or a bare YAML int/bool) must not crash the whole build
+        # (okengine#196 — the write path coerces a scalar STRING, but a non-string
+        # scalar reaches storage untouched). Mirror normalize_bare_name_links.py:
+        # coerce to a list before iterating, then str() each member.
+        aliases = fm.get("aliases") or []
+        if isinstance(aliases, str):
+            aliases = [a.strip() for a in aliases.split(",") if a.strip()]
+        elif not isinstance(aliases, list):
+            aliases = []
+        for a in aliases:
             self.aliases.setdefault(str(a), rel)
 
     def to_dict(self) -> dict:

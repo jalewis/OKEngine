@@ -95,13 +95,21 @@ def main() -> int:
         return 0
 
     state = _load_state()
+    def _nskey(s: str) -> str:
+        # <namespace>/<slug> from a page path or wikilink target — collapse partition/shard/alias/
+        # anchor so an entity and a concept sharing a slug never share an inbound bucket (the bare-
+        # stem key cross-wired homographs: a deficient entity got a concept's inbound context). '' if
+        # not namespace-qualified (a bare `[[slug]]` link is ambiguous — don't guess a namespace).
+        parts = [x for x in s.strip().strip("[]").split("|", 1)[0].split("#", 1)[0].strip().split("/") if x]
+        return f"{parts[0]}/{parts[-1]}" if len(parts) >= 2 else ""
+
     # candidates: deficient, inbound>=1, not enriched within cooldown; keep queue order (inbound desc)
     cands = [q for q in queue
              if q.get("inbound", 0) >= 1
              and _days_since(state.get(q["page"], "2000-01-01"), today) >= COOLDOWN]
-    targets = {q["page"].split("/")[-1]: q for q in cands[:BATCH * 3]}  # over-select; some may have no usable inbound
+    targets = {_nskey(q["page"]): q for q in cands[:BATCH * 3] if _nskey(q["page"])}  # over-select
 
-    # one pass over sources: collect inbound (source path, excerpt) per target stem
+    # one pass over sources: collect inbound (source path, excerpt) per target <ns>/<slug>
     inbound_ctx: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for p in (WIKI / "sources").rglob("*.md"):
         if p.name.startswith("_") or "_archive" in p.parts:
@@ -110,19 +118,20 @@ def main() -> int:
             txt = p.read_text(errors="replace")
         except OSError:
             continue
-        links = {l.strip().split("/")[-1] for l in _WIKILINK_RE.findall(txt)}
+        links = {_nskey(l) for l in _WIKILINK_RE.findall(txt)}
+        links.discard("")
         hit = links & targets.keys()
-        for stem in hit:
-            if len(inbound_ctx[stem]) < CTX:
-                ex = _excerpt_around(txt, stem)
-                inbound_ctx[stem].append((p.relative_to(WIKI).as_posix(), ex))
+        for key in hit:
+            if len(inbound_ctx[key]) < CTX:
+                ex = _excerpt_around(txt, key.split("/")[-1])
+                inbound_ctx[key].append((p.relative_to(WIKI).as_posix(), ex))
 
     # build batch: queue order, but only pages with usable inbound context
     batch = []
     for q in cands:
-        stem = q["page"].split("/")[-1]
-        if stem in inbound_ctx and inbound_ctx[stem]:
-            batch.append((q, inbound_ctx[stem]))
+        key = _nskey(q["page"])
+        if key in inbound_ctx and inbound_ctx[key]:
+            batch.append((q, inbound_ctx[key]))
         if len(batch) >= BATCH:
             break
 

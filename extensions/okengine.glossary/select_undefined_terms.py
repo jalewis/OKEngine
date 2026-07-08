@@ -17,7 +17,11 @@ from pathlib import Path
 
 WIKI = Path(os.environ.get("WIKI_PATH", "/opt/vault")) / "wiki"
 MIN_REFS = int(os.environ.get("OKENGINE_GLOSSARY_MIN_REFS", "3"))   # config.min_references
-_LINK = re.compile(r"\[\[glossary/([a-z0-9][a-z0-9-]*)\]\]")
+# Tolerate the alias/anchor wikilink forms — `[[glossary/api-gateway|API gateway]]` and
+# `[[glossary/api-gateway#usage]]` are canonical (rebuild_index / broken-wikilinks-drain / lacuna
+# all handle them). The old `]]`-immediately-after-slug pattern counted zero references for a term
+# only ever linked by its display alias, so a heavily-used undefined term never reached MIN_REFS.
+_LINK = re.compile(r"\[\[glossary/([a-z0-9][a-z0-9-]*)(?:[#|][^\]]*)?\]\]")
 
 
 def _undefined_terms() -> dict[str, int]:

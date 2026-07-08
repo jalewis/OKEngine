@@ -11,13 +11,14 @@ import pred_lib as P  # noqa: E402
 
 MIN = int(os.environ.get("BASE_RATES_MIN", "8"))
 MAX = int(os.environ.get("BASE_RATES_MAX", "60"))
-_RESOLVED = {"confirmed", "refuted", "partial"}
+# graded outcomes only — expired-ungraded has no result, so it must not enter a resolution rate
+# (P.GRADED_VALUES, not P.RESOLVED_VALUES; see pred_lib).
 
 
 def main() -> int:
     v = P.vault()
     resolved = [(p, fm) for p, fm in P.predictions(v)
-                if str(fm.get("status", "")).strip().lower() in _RESOLVED]
+                if str(fm.get("status", "")).strip().lower() in P.GRADED_VALUES]
     print("=== base-rates wake-gate ===")
     print(f"  vault: {v}\n  resolved predictions: {len(resolved)}")
     if len(resolved) < MIN:

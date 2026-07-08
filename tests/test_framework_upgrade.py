@@ -286,6 +286,30 @@ def test_main_apply_gate_fail_auto_rolls_back(tmp_path, monkeypatch):
     assert not snaps.is_dir() or not any(snaps.iterdir())
 
 
+def test_rollback_preserves_concurrent_vault_write(tmp_path, monkeypatch):  # invariant-audit #12
+    """A content lane / MCP write that lands DURING the roll-forward gate (after the snapshot)
+    must SURVIVE an automatic rollback — restore() may remove only the migration's own additions,
+    never live-vault pages written by another process. Before the fix restore() deleted every file
+    'newer than the snapshot', destroying the concurrent write."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    md = _transform_migration(tmp_path / "migs", id_="t1", frm="v0.4.0", to="v0.5.0")  # adds data.txt
+    live = pack / "wiki" / "a" / "concurrent-page.md"
+
+    def validator(p):
+        # simulate a concurrent live-vault write during the (slower) validation window, then FAIL
+        live.parent.mkdir(parents=True, exist_ok=True)
+        live.write_text("live content written after the snapshot", encoding="utf-8")
+        return (False, "stub: broken")
+
+    monkeypatch.setattr(m, "VALIDATOR", validator)
+    rc = m.main([str(pack), "--apply", "--migrations-dir", str(md)])
+    assert rc == 1
+    assert not (pack / "data.txt").exists()              # migration's own file rolled back
+    assert m.read_pin(pack)[0] == "v0.4.0"               # pin reverted
+    assert live.read_text() == "live content written after the snapshot"  # concurrent write SURVIVES
+
+
 def test_main_apply_no_snapshot_does_not_rollback(tmp_path, monkeypatch):
     m = _mod()
     pack = _pack(tmp_path, "v0.4.0")

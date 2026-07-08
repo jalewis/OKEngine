@@ -318,8 +318,16 @@ def render(vault: Path, cfg: dict, results: dict, unresolved: list,
     return written
 
 
+def _resolve_vault() -> Path:
+    """Vault root from WIKI_PATH — the engine-wide standard (fleet_health, lacuna, …), never cwd.
+    Falling back to os.getcwd() made this lane silently score whatever tree the cron happened to
+    run from (the backlinks_refresh cwd-resolution regression). VAULT_DIR kept as a legacy override,
+    but WIKI_PATH wins and the default is /opt/vault — cwd is never consulted."""
+    return Path(os.environ.get("WIKI_PATH") or os.environ.get("VAULT_DIR") or "/opt/vault").resolve()
+
+
 def main() -> int:
-    vault = Path(os.environ.get("VAULT_DIR") or os.getcwd()).resolve()
+    vault = _resolve_vault()
     if not (vault / "wiki").is_dir():
         print(f"ERROR: no wiki/ under {vault}", file=sys.stderr)
         return 2

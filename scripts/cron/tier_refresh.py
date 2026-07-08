@@ -60,7 +60,11 @@ def _count_namespace(ns: str, nscfg: dict, cfg: dict, today) -> dict:
             n = p.name
             if n == "INDEX.md" or n.startswith("INDEX-p") or n.startswith("_"):
                 continue
-            rel = p.relative_to(WIKI).as_posix()
+            # rel must start with the NAMESPACE for both root and sub-domain bases — tier_of infers
+            # the namespace from rel.split('/')[0]. From WIKI, a walk-up page reads as
+            # '<subdomain>/<ns>/…', so tier_of got the sub-domain name instead of the namespace and
+            # the namespace's date/status tiering config never applied (multipack under-count).
+            rel = f"{ns}/{p.relative_to(base).as_posix()}"
             fm = {} if from_path else tier_lib.fm_of(p)
             t = tier_lib.tier_of(rel, fm, cfg, today)
             if t in counts:

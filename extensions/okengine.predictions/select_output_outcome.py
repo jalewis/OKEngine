@@ -12,7 +12,7 @@ import pred_lib as P  # noqa: E402
 
 MIN_OUTCOMES = int(os.environ.get("OUTCOME_EVAL_MIN", "3"))
 RECENT_DAYS = int(os.environ.get("OUTCOME_EVAL_RECENT_DAYS", "30"))
-_RESOLVED = {"confirmed", "refuted", "partial"}
+# graded outcomes only (P.GRADED_VALUES) — an ungraded expiry is not a hit/miss.
 
 
 def main() -> int:
@@ -20,7 +20,7 @@ def main() -> int:
     cutoff = P.days_ago_iso(RECENT_DAYS)
     resolved = []
     for p, fm in P.predictions(v):
-        if str(fm.get("status", "")).strip().lower() in _RESOLVED:
+        if str(fm.get("status", "")).strip().lower() in P.GRADED_VALUES:
             d = P.fm_date(fm, "last_updated", "updated", "resolves_by")
             if d and d >= cutoff:
                 resolved.append((p, fm))

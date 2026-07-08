@@ -549,6 +549,25 @@ def _review_flags(p: Path, fm: dict, prev: dict | None = None) -> list[str]:
 _OKF_ALWAYS = {"type", "name", "title", "tlp", "version", "last_updated", "created", "updated",
                "needs_review", "conflicts", "assembled_from", "aliases", "refs", "tags",
                "status", "id", "raw", "sources", "source"}
+_okf_always_cache = None
+
+
+def _okf_always() -> set:
+    """`_OKF_ALWAYS` UNION the base-schema `common_optional` universals (id/description/confidence/
+    maintained_by/discovered_by/sensitivity/source_kind/publisher/reliability/credibility/severity/…).
+    The drift check must treat every base-schema universal — and the provenance the write path itself
+    stamps (maintained_by/discovered_by via _stamp_maintainer) — as KNOWN scaffolding, else
+    update_entity flags the engine's own stamped fields as domain drift on every update (spurious
+    needs_review + _review-queue noise). Read once from schema_lib.base_schema() with the same
+    fallback as _base_list_fields (schema_lib may be absent, or the base may predate the key)."""
+    global _okf_always_cache
+    if _okf_always_cache is None:
+        try:
+            base_universal = set(schema_lib.base_schema().get("common_optional") or [])
+        except Exception:
+            base_universal = set()
+        _okf_always_cache = _OKF_ALWAYS | base_universal
+    return _okf_always_cache
 
 
 def _normalize_drift(fm: dict, p: Path) -> tuple[dict, list[str]]:
@@ -571,7 +590,7 @@ def _normalize_drift(fm: dict, p: Path) -> tuple[dict, list[str]]:
     flags: list[str] = []
     allowed = (pol.get("allowed") or {}).get(str(out.get("type") or ""))
     if isinstance(allowed, list):
-        known = _OKF_ALWAYS | set(allowed) | set((pol.get("field_aliases") or {}).values())
+        known = _okf_always() | set(allowed) | set((pol.get("field_aliases") or {}).values())
         unknown = sorted(k for k in out if k not in known)
         if unknown:
             flags.append(f"unknown field(s) for type `{out.get('type')}` "
@@ -1056,6 +1075,10 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
         return f"rejected: edit produced invalid frontmatter YAML: {str(e)[:120]}"
     if not isinstance(new_fm, dict):
         return "rejected: edit produced non-mapping frontmatter"
+    # patch_entity is a full write chokepoint: apply the SAME shape coercion _create/_update/_converge
+    # do (#196 — a schema-declared list field authored as a scalar becomes a list; bare [[wikilink]]
+    # values are stripped), so an edit can't land a malformed shape that poisons a downstream lane.
+    new_fm = _coerce_fm(new_fm, p)
     fl = _field_loss(cur_fm, new_fm)
     if fl:
         return f"rejected: {fl}"
@@ -1065,6 +1088,9 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
     body = m.group(2)
     if body.startswith("\n"):
         body = body[1:]
+    blr = _briefing_link_reject(p, body)   # briefings must have only resolvable links + a citation
+    if blr:
+        return f"rejected: {blr}"
     _stamp(new_fm, cur_fm)
     fd = _future_date_reject(new_fm)   # the boundary every writer crosses (invariant-audit)
     if fd:
@@ -1132,6 +1158,9 @@ def _append_section(path: str, heading: str, text: str) -> str:
     cur_fm, cur_body = _read_page(p)
     new_body, where = _insert_into_section(cur_body, heading, text)
     new_fm = dict(cur_fm)
+    blr = _briefing_link_reject(p, new_body)   # append is the hot path for growing a briefing's
+    if blr:                                    # `## Recent activity` — apply the same dead-link guard
+        return f"rejected: {blr}"
     pol = _policy_reject(p, new_fm, "update", prev=cur_fm)
     if pol:
         return f"rejected: {pol}"

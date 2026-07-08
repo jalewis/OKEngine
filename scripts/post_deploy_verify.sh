@@ -143,10 +143,20 @@ else wn "no .tick.lock — scheduler may not have ticked yet" "give it a minute,
 # regardless of scheduler health (deployment-validate can't: a dead ticker never runs its lane).
 want_uid="$(dcx "$GW" sh -c 'echo ${HERMES_UID:-10000}' 2>/dev/null | tr -d '[:space:]')"
 got_uid="$(dcx "$GW" stat -c '%u' /opt/data/cron-plus 2>/dev/null | tr -d '[:space:]')"
+# The single most critical FILE: cron-plus/jobs.json mis-owned (e.g. root:0600 from a bare
+# `docker compose exec`/`docker exec` regenerate with NO -u on the s6 gateway) is UNREADABLE by the
+# lane uid, so the scheduler goes dark even though the cron-plus DIR above is correctly owned — the
+# exact fleet-stall poison hit live (okengine#193). The dir-level stat misses a mis-owned file in a
+# well-owned dir; stat the FILE too, matching deployment_validate.check_runtime_ownership. Empty =>
+# absent (already FAILed by the jobs.json check above), so skip.
+job_uid="$(dcx "$GW" stat -c '%u' /opt/data/cron-plus/jobs.json 2>/dev/null | tr -d '[:space:]')"
 if [ -n "$want_uid" ] && [ -n "$got_uid" ] && [ "$got_uid" != "$want_uid" ]; then
     bad "runtime /opt/data/cron-plus owned by uid $got_uid but the gateway runs as $want_uid" \
         "the scheduler dies on .tick.lock; pin HERMES_UID=$got_uid in .env + recreate, or chown .hermes-data to $want_uid"
-else ok "runtime dir owned by the gateway uid (${got_uid:-?})"; fi
+elif [ -n "$want_uid" ] && [ -n "$job_uid" ] && [ "$job_uid" != "$want_uid" ]; then
+    bad "runtime /opt/data/cron-plus/jobs.json owned by uid $job_uid but the gateway runs as $want_uid" \
+        "the scheduler can't READ it (root:0600 poison) and the WHOLE fleet stalls (okengine#193); chown jobs.json to $want_uid, or re-run deploy-cron-plus-jobs.sh with HERMES_UID=$want_uid"
+else ok "runtime dir + jobs.json owned by the gateway uid (${got_uid:-?})"; fi
 
 # 5b. NB: backlinks-refresh no longer needs an iwe binary (okengine#179 — it builds the graph
 # with an in-process link-scanner), so there is no gateway iwe dependency to verify here anymore.
@@ -157,9 +167,24 @@ else ok "runtime dir owned by the gateway uid (${got_uid:-?})"; fi
 echo "[6] search index (qmd)"
 QC=${OKENGINE_QMD_CACHE:-/opt/data/qmd/cache}
 QCFG=${OKENGINE_QMD_CONFIG:-/opt/data/qmd/config}
+QDIR=${OKENGINE_QMD_DIR:-/opt/data/qmd}
 ndocs=$(dcx "$MCP" sh -c "XDG_CACHE_HOME=$QC XDG_CONFIG_HOME=$QCFG qmd status 2>/dev/null | grep -iE 'Total:' | grep -oE '[0-9]+' | head -1")
 if [ -n "$ndocs" ] && [ "$ndocs" -gt 0 ] 2>/dev/null; then ok "qmd index ready ($ndocs files indexed)"
-else wn "qmd index not ready (0 files or status unreadable)" "run 'qmd update' in $MCP, or wait for the corpus-indexer cron to build it"; fi
+else
+    # 0 docs is ambiguous: a fresh index still building, OR a PERMANENTLY broken one because the
+    # qmd subdir (its own bind-mount, docker-compose.yml `.hermes-data/qmd:/opt/data/qmd`) is owned
+    # by a uid the mcp container can't write (e.g. `rm .hermes-data/qmd` + a bare `docker compose up`
+    # re-creates the source as root; ensure-runtime.sh only probes the top-level .hermes-data). No
+    # cron builds qmd — corpus_indexer.py writes state/corpus-index/*.jsonl, a DIFFERENT index — so
+    # "wait for a cron" is a false remedy. Probe writability to tell the two apart.
+    if dcx "$MCP" sh -c "touch $QDIR/.pdv_wtest 2>/dev/null && rm -f $QDIR/.pdv_wtest 2>/dev/null"; then
+        wn "qmd index not ready (0 files) but $QDIR is writable — still building" \
+           "run 'qmd update' in $MCP to build it now, or let the next 'qmd update' populate it"
+    else
+        bad "qmd index empty and $QDIR is NOT writable by $MCP — 'qmd update' fails with a PermissionError, the index stays empty forever" \
+            "chown .hermes-data/qmd to the mcp uid (HERMES_UID) + recreate $MCP; a bare 'docker compose up' after 'rm .hermes-data/qmd' re-creates it root-owned"
+    fi
+fi
 
 # summary --------------------------------------------------------------------
 echo "================================="

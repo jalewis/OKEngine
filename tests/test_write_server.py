@@ -1023,3 +1023,65 @@ def test_coerce_fm_always_yields_valid_shapes_on_adversarial_input():
             if f in out:
                 assert isinstance(out[f], list), f"{f} must be a list for {fm!r}, got {out[f]!r}"
                 assert all(isinstance(x, str) for x in out[f]), f"{f} elements must be strings"
+
+
+# ── invariant-audit (v0.10.8): patch/append are full write chokepoints too ──────────────────
+
+def test_patch_coerces_scalar_list_field(vault):
+    """#6: patch_entity applies the #196 shape guard like create/update/converge — a list field
+    edited to a scalar string is coerced to a list, so it can't poison id_index / entity_resolve
+    (which iterate the value and do NOT defensively split a scalar)."""
+    import yaml
+    m, root = vault
+    m._create("entities/s/stealc", "type: entity\nname: StealC\naliases: [StealC]", "body")
+    fpath = root / "wiki" / "entities" / "s" / "stealc.md"
+    old = "aliases:\n- StealC"                          # block form as _compose serialises the list
+    assert old in fpath.read_text(), fpath.read_text()
+    res = m._patch("entities/s/stealc", old, "aliases: StealC, StealV")
+    assert res.startswith("patched"), res
+    fm = yaml.safe_load(fpath.read_text().split("---")[1])
+    assert fm["aliases"] == ["StealC", "StealV"]        # scalar coerced to a list, not left a string
+
+
+def test_briefing_dead_link_guard_applies_to_append_and_patch(vault):
+    """#7: append_to_section and patch_entity enforce the briefings dead-link guard that
+    create/update enforce — the two body-mutating primitives used to grow a briefing incrementally
+    cannot write an unresolvable [[wikilink]] into the flagship daily page."""
+    m, root = vault
+    m._create("sources/2026/s0",
+              "type: source\nsource_kind: report\npublisher: X\npublished: 2026-06-01", "s")
+    ok = m._create("briefings/2026-06-14", "type: briefing\ntitle: Daily\npublished: 2026-06-14",
+                   "## Recent activity\n\n- context [[sources/2026/s0]]\n")
+    assert ok.startswith("created"), ok
+    bpath = root / "wiki" / "briefings" / "2026-06-14.md"
+    before = bpath.read_text()
+    res = m._append_section("briefings/2026-06-14", "Recent activity",
+                            "- [[entities/q/ghost]] resurfaced")           # dead link
+    assert res.startswith("rejected"), res
+    assert bpath.read_text() == before                                     # file left untouched
+    res2 = m._patch("briefings/2026-06-14", "context [[sources/2026/s0]]",
+                    "context [[entities/q/ghost]]")                        # dead link via patch
+    assert res2.startswith("rejected"), res2
+
+
+def test_drift_check_does_not_flag_base_universals(drift_vault):
+    """#14: the drift 'always allowed' set is _OKF_ALWAYS ∪ base-schema common_optional, so the
+    check treats engine-stamped provenance (maintained_by/discovered_by) and base universals
+    (confidence, …) as KNOWN scaffolding — not domain drift flagged on every update_entity."""
+    m, root = drift_vault
+    p = root / "wiki" / "entities" / "i" / "apt-x.md"
+    fm = {"type": "intrusion-set", "name": "APT X", "maintained_by": ["mypack"],
+          "discovered_by": "mypack", "confidence": 0.7, "suspected_origin": "China"}
+    _out, flags = m._normalize_drift(fm, p)
+    assert flags == [], f"base universals flagged as domain drift: {flags}"
+
+
+def test_okf_always_covers_base_common_optional(drift_vault):
+    """Binding contract: the drift-check 'always allowed' set ⊇ base-schema common_optional, so the
+    two hand-maintained lists can't silently drift apart again (the maintained_by/discovered_by
+    omission that flagged the engine's own provenance)."""
+    import yaml
+    m, _root = drift_vault
+    base = yaml.safe_load((REPO / "config" / "base-schema.yaml").read_text(encoding="utf-8"))
+    missing = set(base.get("common_optional") or []) - m._okf_always()
+    assert not missing, f"_okf_always() omits base common_optional field(s): {sorted(missing)}"

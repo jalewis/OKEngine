@@ -143,7 +143,17 @@ def main() -> int:
         print("_(none yet)_\n")
     else:
         for e in existing_entities:
-            tags = ", ".join(e["tags"][:5]) if e["tags"] else ""
+            # `tags` is a list field, but a page may carry a scalar (`tags: 2024`)
+            # or a list with non-string members (`tags: [2024, ai-labs]`) — the
+            # write path coerces a scalar STRING but not a numeric scalar or list
+            # members (okengine#196). Coerce to a list of strings so one malformed
+            # page can't crash the whole digest.
+            raw_tags = e["tags"]
+            if isinstance(raw_tags, str):
+                raw_tags = [raw_tags]
+            elif not isinstance(raw_tags, list):
+                raw_tags = [raw_tags] if raw_tags else []
+            tags = ", ".join(str(t) for t in raw_tags[:5]) if raw_tags else ""
             print(f"- `entities/{e['slug']}` — {e['title']}" + (f" — tags: {tags}" if tags else ""))
         print()
 

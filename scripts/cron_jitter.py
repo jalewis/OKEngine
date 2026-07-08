@@ -80,17 +80,46 @@ def expand_morning_one(expr: str, brief_hour: int) -> str | None:
     return f"{minute} {brief_hour % 24} * * *"
 
 
+def _job_expr(job: dict):
+    """The cron expression string from ANY of the three schedule shapes `framework validate`
+    accepts (all three are documented in authoring-a-pack.md): a dict schedule
+    `{"schedule": {"expr": ...}}`, a BARE STRING schedule `{"schedule": "0 13 * * SUN"}`, or a
+    top-level `{"expr": ...}`. Returns the string, or None. Before this, the expanders did
+    `(job.get("schedule") or {}).get("expr")`, which raised AttributeError on the string shape
+    (aborting the whole cron deploy) and returned None for the top-level shape (silently leaving a
+    `@morning`/`@jitter` sentinel unexpanded → cron-plus can't parse it → the lane never fires)."""
+    sched = job.get("schedule")
+    if isinstance(sched, dict):
+        expr = sched.get("expr")
+    elif isinstance(sched, str):
+        expr = sched
+    else:
+        expr = job.get("expr")
+    return expr if isinstance(expr, str) else None
+
+
+def _set_job_expr(job: dict, expr: str) -> None:
+    """Write `expr` back into whichever schedule shape `job` uses (see _job_expr), preserving it."""
+    sched = job.get("schedule")
+    if isinstance(sched, dict):
+        sched["expr"] = expr
+    elif isinstance(sched, str):
+        job["schedule"] = expr
+    elif "expr" in job:
+        job["expr"] = expr
+    else:
+        job["schedule"] = {"expr": expr}
+
+
 def expand_brief_jobs(jobs: list, brief_hour: int) -> int:
     """Expand every `@morning[:MM]` schedule to the deployment's brief hour, in place.
     Returns the count expanded. Call at DEPLOY time (like expand_jobs for @jitter),
     so the same source ships to every deployment and each picks its own morning."""
     n = 0
     for job in jobs:
-        sched = job.get("schedule") or {}
-        concrete = expand_morning_one(sched.get("expr"), brief_hour)
+        concrete = expand_morning_one(_job_expr(job), brief_hour)
         if concrete is not None:
-            sched["expr"] = concrete
-            job["schedule"] = sched
+            _set_job_expr(job, concrete)
             n += 1
     return n
 
@@ -102,14 +131,12 @@ def expand_jobs(jobs: list, rng: random.Random | None = None) -> int:
     rng = rng or random.Random()
     n = 0
     for job in jobs:
-        sched = job.get("schedule") or {}
-        expr = sched.get("expr")
+        expr = _job_expr(job)
         if is_sentinel(expr):
             # Jitter to minutes 1-59, never 0: a :00 minute is the herd-prone case the
             # jitter exists to avoid, and the schedule validator rejects it (okengine#103).
             concrete = expand_one(expr, rng.randint(1, 59))
-            sched["expr"] = concrete
-            job["schedule"] = sched
+            _set_job_expr(job, concrete)
             n += 1
         elif isinstance(expr, str) and expr.strip().startswith("@jitter:"):
             # Looks like a jitter sentinel but the base isn't one of the SUPPORTED set, so
