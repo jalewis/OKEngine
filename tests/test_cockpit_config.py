@@ -205,3 +205,14 @@ def test_about_parity_with_reader(tmp_path, monkeypatch):
                     ("extensions", [{"id": "okengine.events", "name": "okengine.events",
                                      "description": ""}])):
         assert a[k] == want, (k, a[k])
+
+
+def test_humanize_preserves_acronyms(tmp_path, monkeypatch):
+    """A vault dir name / watchlist tab key humanizes for display without mangling common
+    initialisms — ai-research -> 'AI Research' (not 'Ai Research'), iot -> 'IoT' (operator report:
+    the pack-side theme titles had the same bug; this is the engine display-fallback half)."""
+    m = _load(tmp_path, monkeypatch)
+    cases = {"ai-research": "AI Research", "iot-fleet": "IoT Fleet", "my-vault": "My Vault",
+             "api-monitoring": "API Monitoring", "saas-metrics": "SaaS Metrics", "okcti": "Okcti"}
+    for slug, want in cases.items():
+        assert m._humanize(slug) == want, (slug, m._humanize(slug))

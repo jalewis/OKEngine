@@ -133,6 +133,26 @@ def split_fm(text: str) -> tuple[dict, str]:
 _DEFAULT_TABS = ["home", "briefings", "predictions", "dashboards"]
 _TRACKER_TABS = ("watchlist", "competitors")  # require a `watchlist:` config to show
 
+# Common initialisms a naive .title() mangles when humanizing a slug/key for display (a vault dir
+# name, a watchlist tab key). GENERIC computing/universal acronyms only — domain-specific ones
+# (CVE, IOC, OT/ICS, …) belong in the pack that emits the content, not the engine display layer.
+# Mixed-case forms (IoT, SaaS) are spelled out.
+_DISPLAY_ACRONYMS = {
+    "ai": "AI", "ml": "ML", "llm": "LLM", "api": "API", "apis": "APIs", "id": "ID", "ids": "IDs",
+    "url": "URL", "urls": "URLs", "uri": "URI", "ip": "IP", "dns": "DNS", "os": "OS", "ui": "UI",
+    "ux": "UX", "http": "HTTP", "https": "HTTPS", "html": "HTML", "css": "CSS", "json": "JSON",
+    "yaml": "YAML", "xml": "XML", "csv": "CSV", "pdf": "PDF", "sql": "SQL", "cpu": "CPU", "gpu": "GPU",
+    "iot": "IoT", "saas": "SaaS", "faq": "FAQ", "kpi": "KPI", "kpis": "KPIs", "roi": "ROI",
+}
+
+
+def _humanize(s: str) -> str:
+    """Slug/key -> display title, preserving common initialisms a naive `.title()` mangles
+    (`ai-research` -> "AI Research", not "Ai Research"; `iot` -> "IoT"). Generic acronym set only —
+    domain-specific acronyms live in the pack that generates the content."""
+    words = re.sub(r"[-_]+", " ", str(s)).split()
+    return " ".join(_DISPLAY_ACRONYMS.get(w.lower(), w.capitalize()) for w in words)
+
 
 def load_cockpit_config(vault: Path) -> dict:
     """Parse the OPTIONAL `cockpit:` block from <vault>/schema.yaml into a normalized
@@ -149,11 +169,10 @@ def load_cockpit_config(vault: Path) -> dict:
         except Exception:
             raw = {}
 
-    # title — default: titleized vault dir name
+    # title — default: humanized vault dir name (acronym-aware, so "ai-research" -> "AI Research")
     title = str(raw.get("title") or "").strip()
     if not title:
-        nm = (vault.resolve().name or "vault")
-        title = re.sub(r"[-_]+", " ", nm).strip().title() or "Vault"
+        title = _humanize(vault.resolve().name or "vault") or "Vault"
 
     # streams (the rail) — default: one "Recent briefings" stream over briefings/
     streams: list[dict] = []
@@ -243,7 +262,7 @@ def load_cockpit_config(vault: Path) -> dict:
         for k, v in td.items():
             if isinstance(v, dict) and isinstance(v.get("boxes"), list):
                 tab_defs[str(k).strip()] = {
-                    "label": str(v.get("label") or str(k).replace("-", " ").title()).strip(),
+                    "label": str(v.get("label") or _humanize(k)).strip(),
                     "boxes": [b for b in v["boxes"] if isinstance(b, dict)],
                 }
 
