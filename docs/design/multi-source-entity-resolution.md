@@ -1,6 +1,6 @@
 # Multi-source entity resolution — the canonical overlay (design / RFC)
 
-**Status:** draft · **Scope:** engine (data model, write path, reader) + okf-sec instantiation
+**Status:** draft · **Scope:** engine (data model, write path, reader) + okf-cti instantiation
 · **Tracking:** okengine#38
 
 ## Problem
@@ -51,7 +51,7 @@ than reinvent it.
 **Domain instance:** the security industry already lives this. The Microsoft + CrowdStrike
 **"Rosetta Stone"** (June 2025, 80+ deconflicted actors) and **MISP galaxies** (where our
 ThaiCERT data comes from) and **Malpedia** are all cross-vendor identity overlays. The
-okf-sec spec's **Admiralty reliability (A–F) / credibility (1–6)** is the natural fusion
+okf-cti spec's **Admiralty reliability (A–F) / credibility (1–6)** is the natural fusion
 weight when sources conflict.
 
 ## Proposed architecture: canonical hub + per-source observation pages
@@ -186,7 +186,7 @@ machine-usable *and* visible to a human judging a conflict. Three layers:
    producer's general reliability; it's set deliberately, not guessed per page.
 2. **Stamped on every observation.** Each `observations/<source>/<slug>` page records
    `source`, `reliability` (from the registry), and — where the source expresses
-   per-claim confidence — `credibility` (1–6). These reuse the existing okf-sec
+   per-claim confidence — `credibility` (1–6). These reuse the existing okf-cti
    `reliability` / `credibility` enums (the `source` type already requires them), so no
    new vocabulary. The score travels *with* the data.
 3. **Visible to humans, two ways:**
@@ -255,7 +255,7 @@ source_registry:
     importer: okpack_sec_nvd_import.py
 ```
 
-`reliability` / `credibility_default` reuse the existing okf-sec enums (`A–F`, `"1"–"6"`).
+`reliability` / `credibility_default` reuse the existing okf-cti enums (`A–F`, `"1"–"6"`).
 The importer reads its own registry entry and stamps `source`, `reliability`,
 `credibility` onto each `observations/<key>/<slug>.md` it writes; the assembler reads
 `source_registry` to weight conflicts; `validate.py` checks each `reliability` against the
