@@ -232,11 +232,16 @@ def test_dead_cron_plus_plugin_deploy_script_removed():  # invariant-audit #16
     (clones the pinned external dep into <pack>/.hermes-data/plugins/cron-plus)."""
     assert not (S / "deploy-cron-plus-plugin.sh").exists(), \
         "the dead deploy-cron-plus-plugin.sh is back — it targets an unvendored source + host ~/.hermes"
-    claude_md = (REPO / "CLAUDE.md").read_text()
-    assert "deploy-cron-plus-plugin.sh" not in claude_md, \
-        "CLAUDE.md still references the removed deploy-cron-plus-plugin.sh"
-    assert "install-cron-plus.sh" in claude_md, \
-        "CLAUDE.md deploy surfaces must name install-cron-plus.sh as the cron-plus plugin deploy path"
+    # CLAUDE.md is engine-internal and EXCLUDED from the public snapshot, so only assert its
+    # deploy-surface table when it is present (the GitLab tree / a dev checkout) — never require it
+    # (public CI runs on the scrubbed snapshot where CLAUDE.md does not exist).
+    claude = REPO / "CLAUDE.md"
+    if claude.is_file():
+        claude_md = claude.read_text()
+        assert "deploy-cron-plus-plugin.sh" not in claude_md, \
+            "CLAUDE.md still references the removed deploy-cron-plus-plugin.sh"
+        assert "install-cron-plus.sh" in claude_md, \
+            "CLAUDE.md deploy surfaces must name install-cron-plus.sh as the cron-plus plugin deploy path"
     assert (S / "install-cron-plus.sh").is_file(), "the real cron-plus plugin installer is missing"
 
 
