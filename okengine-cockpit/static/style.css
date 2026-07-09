@@ -156,6 +156,18 @@ a.wl:hover{border-bottom-style:solid}
 .gempty,.gmore{padding:8px 12px;color:var(--dim);font:12px var(--mono)}
 
 /* IWE backlinks panel (overlay "what links here") */
+/* trust/provenance strip — top of every page overlay */
+.provenance{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 14px;padding-bottom:11px;border-bottom:1px solid var(--border)}
+.pv-chip{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:11px;border:1px solid var(--border);background:var(--panel);color:var(--muted);font:600 11px/16px var(--mono);white-space:nowrap}
+.pv-chip.pv-ok{color:var(--ok);border-color:var(--ok)}
+.pv-chip.pv-warn{color:#0d1117;background:var(--warn);border-color:var(--warn)}
+.pv-chip.pv-dim{color:var(--dim)}
+.pv-chip.pv-tlp{font-weight:700}
+.pv-tlp-clear{color:#0d1117;background:#f5f5f5;border-color:#c9d1d9}
+.pv-tlp-green{color:#0d1117;background:#33ff00;border-color:#33ff00}
+.pv-tlp-amber,.pv-tlp-amberstrict{color:#0d1117;background:#ffc000;border-color:#ffc000}
+.pv-tlp-red{color:#fff;background:#ff2b2b;border-color:#ff2b2b}
+
 .backlinks{margin-top:22px;border-top:1px solid var(--border);padding-top:12px}
 .bl-head{font:600 12px var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px}
 .bl-head .bl-n{color:var(--live);margin-left:4px}

@@ -526,6 +526,30 @@ function panelHtml(panel) {
 
 // ── page overlay (click-through to any wiki page) ────────────────────────────
 const pageStack = [];
+// Trust/provenance strip (okengine, ported from the reader): a compact "can I trust this?" band
+// at the top of every page overlay, from fields the trust lanes + write path already stamp.
+function provenanceHtml(p) {
+  if (!p || !Object.keys(p).length) return "";
+  // clip free-text values so a malformed/garbage field (e.g. a run-on `reliability`) can't blow the
+  // strip layout; the full value stays available on hover via title=.
+  const clip = (s, n = 40) => { s = String(s); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
+  const chip = (v, cls = "") => `<span class="pv-chip ${cls}" title="${esc(v)}">`;
+  const chips = [];
+  if (p.needs_review) chips.push(`<span class="pv-chip pv-warn">⚠ Needs review</span>`);
+  if (p.sources) chips.push(`<span class="pv-chip">🔗 ${p.sources} source${p.sources === 1 ? "" : "s"}${p.source_pages ? ` · ${p.source_pages} linked` : ""}</span>`);
+  if (p.grounding) {
+    const s = p.grounding.supported || 0, u = p.grounding.unsupported || 0;
+    chips.push(`<span class="pv-chip ${u ? "pv-warn" : "pv-ok"}">grounding ✓${s}${u ? ` ✗${u}` : ""}</span>`);
+  }
+  if (p.reviewed_by) chips.push(chip(p.reviewed_by, "pv-ok") + `✓ ${esc(clip(p.reviewed_by))}${p.reviewed_on ? ` · ${esc(clip(p.reviewed_on, 12))}` : ""}</span>`);
+  if (p.tlp) chips.push(`<span class="pv-chip pv-tlp pv-tlp-${esc(String(p.tlp).toLowerCase().replace(/[^a-z]/g, ""))}">TLP:${esc(clip(p.tlp, 16))}</span>`);
+  if (p.sensitivity) chips.push(chip(p.sensitivity) + `${esc(clip(p.sensitivity))}</span>`);
+  if (p.reliability || p.credibility) chips.push(chip(`${p.reliability || ""} ${p.credibility || ""}`.trim()) + `${p.reliability ? `Rel ${esc(clip(p.reliability))}` : ""}${p.reliability && p.credibility ? " · " : ""}${p.credibility ? `Cred ${esc(clip(p.credibility))}` : ""}</span>`);
+  if (p.maintained_by) chips.push(chip(p.maintained_by, "pv-dim") + `maintained: ${esc(clip(p.maintained_by))}</span>`);
+  if (p.discovered_by) chips.push(chip(p.discovered_by, "pv-dim") + `discovered: ${esc(clip(p.discovered_by))}</span>`);
+  return chips.length ? `<div class="provenance">${chips.join("")}</div>` : "";
+}
+
 async function openPage(path, push = true) {
   const ov = $("#page-overlay"), c = $("#ov-content");
   ov.hidden = false; c.innerHTML = "<div class='empty'>Loading…</div>";
@@ -535,7 +559,7 @@ async function openPage(path, push = true) {
     $("#ov-title").textContent = d.title || path;
     $("#ov-path").textContent = (d.type ? d.type + " · " : "") + (d.rel || path);
     $("#ov-dl").innerHTML = dlLinks(`path=${encodeURIComponent(path)}`);
-    c.innerHTML = panelHtml(d.panel) + d.html + `<div id="backlinks" class="backlinks"></div>`; c.scrollTop = 0;
+    c.innerHTML = provenanceHtml(d.provenance) + panelHtml(d.panel) + d.html + `<div id="backlinks" class="backlinks"></div>`; c.scrollTop = 0;
     $("#ov-back").style.visibility = pageStack.length > 1 ? "visible" : "hidden";
     loadBacklinks(d.rel || path);
   } catch (e) { c.innerHTML = `<div class='empty'>page not found: ${esc(path)}</div>`; }

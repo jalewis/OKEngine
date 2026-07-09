@@ -140,3 +140,46 @@ def test_dashboard_autolist_includes_nested_namespaces(tmp_path, monkeypatch):
     assert "dashboards/competitive/quadrants" in paths   # nested now visible
     assert "dashboards/top" in paths
     assert "dashboards/_scaffold" not in paths            # scaffold still skipped
+
+
+def test_provenance_strip_surfaces_trust_fields(tmp_path, monkeypatch):
+    """Provenance/trust strip (ported from the reader): api_page carries a `provenance` dict that
+    answers 'can I trust this?' from fields the trust lanes + write path stamp — source coverage,
+    grounding tally, review sign-off, tlp/sensitivity, reliability/credibility, composition
+    provenance. A plain page with no trust signals gets {} (no empty strip)."""
+    d = tmp_path / "wiki" / "entities" / "a"
+    d.mkdir(parents=True)
+    (d / "apt-x.md").write_text(
+        "---\ntype: entity\nname: APT-X\n"
+        "sources: [sources/2026/s1, 'https://ex.com/report']\n"
+        "needs_review: true\ntlp: AMBER\nreviewed_by: analyst\nreviewed_on: 2026-07-01\n"
+        "reliability: A\ncredibility: '2'\nmaintained_by: [okpack-cti]\ndiscovered_by: okpack-cti\n"
+        "---\nBody.\n\n## Grounding check\n\n- claim 1 - **supported**\n- claim 2 - **unsupported**\n",
+        encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    p = m.api_page(path="entities/a/apt-x")["provenance"]
+    assert p["sources"] == 2 and p["source_pages"] == 1          # one source PAGE, one external URL
+    assert p["needs_review"] is True and p["tlp"] == "AMBER"
+    assert p["reviewed_by"] == "analyst" and p["reviewed_on"] == "2026-07-01"
+    assert p["reliability"] == "A" and p["credibility"] == "2"
+    assert p["maintained_by"] == "okpack-cti" and p["discovered_by"] == "okpack-cti"
+    assert p["grounding"] == {"supported": 1, "unsupported": 1}
+    (d / "plain.md").write_text("---\ntype: entity\nname: Plain\n---\njust text\n", encoding="utf-8")
+    assert m.api_page(path="entities/a/plain")["provenance"] == {}   # no signals -> no strip
+
+
+def test_api_page_route_serves_provenance_over_http(tmp_path, monkeypatch):
+    """Routing regression: /api/page must resolve to api_page (not a helper). A decorator that
+    slipped onto _provenance served the wrong signature -> HTTP 422, while the direct-call unit
+    test still passed. Exercise the real route with a client so it can't regress silently."""
+    from starlette.testclient import TestClient
+    d = tmp_path / "wiki" / "entities" / "a"
+    d.mkdir(parents=True)
+    (d / "apt-x.md").write_text(
+        "---\ntype: entity\nname: APT-X\ntlp: AMBER\nneeds_review: true\n---\nBody.\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    r = TestClient(m.app).get("/api/page", params={"path": "entities/a/apt-x"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["title"] == "APT-X"
+    assert body["provenance"]["tlp"] == "AMBER" and body["provenance"]["needs_review"] is True

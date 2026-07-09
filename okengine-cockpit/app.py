@@ -1447,6 +1447,46 @@ def _panel_for(fm: dict, body: str = "") -> dict | None:
     return None
 
 
+def _provenance(fm: dict, body: str) -> dict:
+    """Trust strip for the page overlay (ported from the reader's provenance view, extended). Answers
+    "can I trust this?" from fields the trust lanes + write path already stamp: source coverage
+    (cited source PAGES vs total refs), the Tier-2 grounding-check tally, human sign-off, handling
+    markers (tlp/sensitivity), Admiralty grading (reliability/credibility), and composition
+    provenance (maintained_by/discovered_by). Returns {} for a plain page with no trust signals so
+    the overlay shows no empty strip."""
+    srcs = fm.get("sources")
+    srcs = srcs if isinstance(srcs, list) else ([srcs] if srcs else [])
+    # a cited SOURCE PAGE (vault-internal) vs a bare external URL — a URL also contains "/", so
+    # exclude an http(s) scheme (tighter than the reader's port, which double-counted URLs as pages).
+    page_srcs = sum(1 for s in srcs if not str(s).lower().startswith(("http://", "https://"))
+                    and ("/" in str(s) or str(s).lower().endswith(".md")))
+    grounding = None
+    g = re.search(r"##\s+Grounding check(.*?)(?:\n##\s|\Z)", body, re.S | re.I)
+    if g:
+        seg = g.group(1)
+        grounding = {"supported": len(re.findall(r"\*\*\s*supported", seg, re.I)),
+                     "unsupported": len(re.findall(r"\*\*\s*(?:unsupported|not[- ]found|contradict)", seg, re.I))}
+
+    def _v(k):                                   # normalize a fm value to a display string, or None
+        x = fm.get(k)
+        if x in (None, "", [], {}):
+            return None
+        return ", ".join(str(i) for i in x) if isinstance(x, list) else str(x)
+
+    prov = {
+        "sources": len(srcs), "source_pages": page_srcs, "grounding": grounding,
+        "needs_review": bool(fm.get("needs_review")),
+        "reviewed_by": _v("reviewed_by"), "reviewed_on": _v("reviewed_on"),
+        "tlp": _v("tlp"), "sensitivity": _v("sensitivity"),
+        "reliability": _v("reliability"), "credibility": _v("credibility"),
+        "maintained_by": _v("maintained_by"), "discovered_by": _v("discovered_by"),
+    }
+    has_signal = (prov["sources"] or grounding or prov["needs_review"] or prov["reviewed_by"]
+                  or prov["tlp"] or prov["sensitivity"] or prov["reliability"] or prov["credibility"]
+                  or prov["maintained_by"] or prov["discovered_by"])
+    return prov if has_signal else {}
+
+
 @app.get("/api/page")
 def api_page(path: str = Query(...)):
     """Render any wiki page (entity/source/concept/...) for click-through navigation."""
@@ -1471,7 +1511,7 @@ def api_page(path: str = Query(...)):
     title = fm.get("title") or fm.get("name") or Path(path).name
     return {"path": path, "title": str(title), "type": str(fm.get("type") or ""),
             "rel": str(cp.relative_to(WIKI.resolve())), "html": render_md(body),
-            "panel": _panel_for(fm, body)}
+            "panel": _panel_for(fm, body), "provenance": _provenance(fm, body)}
 
 
 @app.get("/api/rollup")
