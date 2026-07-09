@@ -25,7 +25,7 @@ function tick() {
 tick(); setInterval(tick, 30000);
 
 // ── tabs (built at runtime from /api/config — domain-agnostic) ───────────────
-const TAB_LABELS = { home: "Home", briefings: "Briefings", dashboards: "Dashboards", predictions: "Predictions", competitors: "Competitors", watchlist: "Watchlist", browse: "Browse", chat: "Chat" };
+const TAB_LABELS = { home: "Home", briefings: "Briefings", dashboards: "Dashboards", predictions: "Predictions", ops: "Ops", competitors: "Competitors", watchlist: "Watchlist", browse: "Browse", chat: "Chat" };
 let TABS = [];
 let TAB_DEF_LABELS = {};   // pack-defined dataset tabs (from /api/config tab_labels)
 function buildTabs(tabs) {
@@ -52,6 +52,7 @@ function showTab(name) {
   $$(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + name));
   if (name === "home" && !homeLoaded) loadHome();
   if (name === "dashboards" && !dashLoaded) loadDashboards();
+  if (name === "ops" && !opsLoaded) loadOps();
   if (name === "predictions" && !predLoaded) loadPredictions();
   if (name === "competitors" && !compLoaded) loadCompetitors();
   if (name === "watchlist" && !watchLoaded) loadWatchlist();
@@ -128,6 +129,30 @@ async function loadDashboards() {
         `<a class="dash-card" data-page="${esc(it.path)}">` +
         `<span class="dash-t">${esc(it.title || it.path)}</span>` +
         (it.desc ? `<span class="dash-d">${esc(it.desc)}</span>` : "") + `</a>`).join("") +
+      `</div></div>`).join("");
+    $$(".dash-card", pane).forEach(a => a.onclick = () => openPage(a.dataset.page));
+  } catch (e) { pane.innerHTML = `<div class="empty">failed (${e.message})</div>`; }
+}
+
+// ── ops (engine health/audit surface) ────────────────────────────────────────
+// Read-only grid over the operational/health pages the engine crons generate
+// (fleet-health, kb-health, conformance, review queue, grounding, operator, …).
+// Auto-appended to the nav by /api/config when that content exists; cards open
+// the underlying page in the overlay. Reuses the dashboards grid styling.
+let opsLoaded = false;
+async function loadOps() {
+  opsLoaded = true;
+  const pane = $("#ops-pane");
+  try {
+    const { groups } = await j("/api/ops");
+    if (!groups || !groups.length) { pane.innerHTML = `<div class="empty">no operational pages</div>`; return; }
+    pane.innerHTML = groups.map(g =>
+      `<div class="dash-group">${g.group ? `<div class="dash-h">${esc(g.group)}</div>` : ""}` +
+      `<div class="dash-grid">` + (g.items || []).map(it =>
+        `<a class="dash-card" data-page="${esc(it.path)}">` +
+        `<span class="dash-t">${esc(it.title || it.path)}</span>` +
+        (it.desc ? `<span class="dash-d">${esc(it.desc)}</span>` : "") +
+        (it.updated ? `<span class="dash-d dim">updated ${esc(it.updated)}</span>` : "") + `</a>`).join("") +
       `</div></div>`).join("");
     $$(".dash-card", pane).forEach(a => a.onclick = () => openPage(a.dataset.page));
   } catch (e) { pane.innerHTML = `<div class="empty">failed (${e.message})</div>`; }
@@ -225,6 +250,30 @@ function renderLedger() {
     : `<div class="empty">no predictions match</div>`;
   $$("table.ledger tbody tr").forEach(tr => tr.onclick = (e) => { if (e.target.closest("a.wl")) return; showDetail(tr.dataset.id, tr); });
 }
+// Evidence drilldown: the actual regrade log behind the ledger's ev tally — each row's
+// date, direction glyph, confidence move, note, and source link. Source paths open in the
+// page overlay (a.wl delegation); http(s) sources open externally.
+function evidenceHtml(entries) {
+  if (!entries || !entries.length) return "";
+  const cls = { reinforces: "up", contradicts: "down", partial: "flat", neutral: "flat" };
+  const glyph = { reinforces: "↑", contradicts: "✗", partial: "≈", neutral: "•" };
+  const rows = entries.map(e => {
+    const dc = cls[e.direction] || "flat", dg = glyph[e.direction] || "•";
+    const cb = e.confidence_before, ca = e.confidence_after;
+    const conf = (cb != null || ca != null)
+      ? `<span class="ev-conf">${cb != null ? cb.toFixed(2) : "?"}→${ca != null ? ca.toFixed(2) : "?"}</span>` : "";
+    let src = "";
+    if (e.source) {
+      src = /^https?:\/\//.test(e.source)
+        ? `<a class="ev-src" href="${esc(e.source)}" target="_blank" rel="noopener">source ↗</a>`
+        : `<a class="ev-src wl" data-page="${esc(e.source)}" title="${esc(e.source)}">${esc(e.source.split("/").pop())}</a>`;
+    }
+    return `<li class="ev-row"><span class="ev-dir trend ${dc}" title="${esc(e.tag || e.direction || "note")}">${dg}</span>` +
+      `<span class="ev-date">${esc(e.date || "—")}</span>${conf}` +
+      `<span class="ev-note">${esc(e.note || "")}</span>${src}</li>`;
+  }).join("");
+  return `<ul class="ev-list">${rows}</ul>`;
+}
 async function showDetail(id, tr) {
   $$("table.ledger tr.sel").forEach(n => n.classList.remove("sel"));
   if (tr) tr.classList.add("sel");
@@ -243,6 +292,7 @@ async function showDetail(id, tr) {
       <div class="claimq">"${p.claim_html || esc(p.claim || "")}"</div>
       <div class="traj">trajectory: ${traj}</div>
       ${evLine}
+      ${evidenceHtml(p.evidence)}
       <div class="meta">${row.forecast_set ? "set: " + esc(row.forecast_set) + "  ·  " : ""}${fm.measurement_method ? "measurement: " + esc(fm.measurement_method) + "  ·  " : ""}made ${esc(fm.made_on || fm.created || "—")} · updated ${esc(fm.updated || "—")} · confidence ${esc(fm.confidence || "—")}</div>`;
     $("#x").onclick = () => { d.hidden = true; };
   } catch (e) { d.innerHTML = `failed (${e.message})`; }

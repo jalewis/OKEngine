@@ -183,3 +183,83 @@ def test_api_page_route_serves_provenance_over_http(tmp_path, monkeypatch):
     body = r.json()
     assert body["title"] == "APT-X"
     assert body["provenance"]["tlp"] == "AMBER" and body["provenance"]["needs_review"] is True
+
+
+def test_evidence_entries_parse_string_and_dict_shapes(tmp_path, monkeypatch):
+    """UI feature #7: evidence arrives as `[date tag] note` strings (regrade lanes) OR dicts.
+    _evidence_entries normalizes both, buckets the direction, keeps confidence moves + source,
+    and sorts oldest→newest."""
+    m = _load(tmp_path, monkeypatch)
+    ent = m._evidence_entries({"evidence": [
+        {"date": "2026-07-01", "direction": "contradicts", "note": "Countersignal",
+         "confidence_before": 0.6, "confidence_after": 0.5, "source": "https://ex.com/r"},
+        "[2026-06-01 regrade] Vendor report reinforces the pattern.",
+        "plain note with no bracket",
+    ]})
+    assert [e["date"] for e in ent] == [None, "2026-06-01", "2026-07-01"]   # sorted; None first
+    reg = next(e for e in ent if e["date"] == "2026-06-01")
+    assert reg["tag"] == "regrade" and reg["direction"] == "neutral"
+    assert reg["note"] == "Vendor report reinforces the pattern."
+    con = next(e for e in ent if e["date"] == "2026-07-01")
+    assert con["direction"] == "contradicts" and con["confidence_after"] == 0.5
+    assert con["source"] == "https://ex.com/r"
+    assert m._evidence_entries({"evidence": "not a list"}) == []
+
+
+def test_prediction_evidence_drilldown_and_string_tally(tmp_path, monkeypatch):
+    """UI feature #7 (+ nested-bug pairing): api_prediction exposes the evidence log, and the ledger
+    tally counts STRING-shaped regrade entries — the old dict-only tally scored them zero, wrongly
+    flagging an evidenced open prediction (made >60d ago) as idle."""
+    p = tmp_path / "wiki" / "predictions" / "2026" / "q4"
+    p.mkdir(parents=True)
+    (p / "predict-alpha.md").write_text(
+        "---\ntype: prediction\nstatus: open\nconfidence: 0.6\nsubject: Alpha\n"
+        "made_on: 2026-01-01\nresolves_by: 2026-12-31\n"
+        "evidence:\n"
+        "  - '[2026-06-01 regrade] Vendor report reinforces the pattern.'\n"
+        "  - {date: 2026-07-01, direction: contradicts, note: Countersignal}\n"
+        "---\nAlpha will happen.\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    r = next(x for x in m._load_predictions() if x["id"] == "predict-alpha")
+    assert r["evidence_n"] == 2                       # string entry counted, not zero
+    assert r["ev_dir"]["contradicts"] == 1
+    assert r["idle"] is False                         # evidenced -> not idle despite old made_on
+    d = m.api_prediction(id="predict-alpha")
+    assert len(d["evidence"]) == 2
+    assert d["evidence"][0]["note"].startswith("Vendor report")   # sorted oldest-first
+
+
+def test_ops_tab_surfaces_operational_health_pages(tmp_path, monkeypatch):
+    """UI feature #2: an engine-level Ops tab groups the health/audit pages the engine crons
+    generate. Pages are grouped, only existing ones show, extras under operational/ aren't hidden,
+    and /api/config auto-appends the tab when that content exists."""
+    w = tmp_path / "wiki"
+    (w / "dashboards").mkdir(parents=True)
+    (w / "operational").mkdir(parents=True)
+    (w / "dashboards" / "fleet-health.md").write_text(
+        "---\ntitle: Fleet health\nsummary: uptime\n---\nx\n", encoding="utf-8")
+    (w / "operational" / "schema-conformance.md").write_text(
+        "---\ntitle: Conformance\n---\nx\n", encoding="utf-8")
+    (w / "_review-queue.md").write_text("---\ntitle: Review queue\n---\nx\n", encoding="utf-8")
+    for dt in ("2026-07-06", "2026-07-07", "2026-07-08"):                   # a daily series
+        (w / "operational" / f"lint-watch-{dt}.md").write_text(
+            "---\ntitle: Lint\n---\nx\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    by = {g["group"]: {it["path"] for it in g["items"]} for g in m.api_ops()["groups"]}
+    assert "dashboards/fleet-health" in by["Health"]
+    assert "operational/schema-conformance" in by["Conformance"]
+    assert "_review-queue" in by["Review & grounding"]
+    # daily series collapses to only its newest page (no page-per-day flood)
+    assert "operational/lint-watch-2026-07-08" in by["Operational log"]
+    assert "operational/lint-watch-2026-07-06" not in by["Operational log"]
+    assert "operational/lint-watch-2026-07-07" not in by["Operational log"]
+    assert "ops" in m.api_config()["tabs"]                                  # auto-appended
+
+
+def test_ops_tab_absent_when_no_operational_pages(tmp_path, monkeypatch):
+    """Ops is content-gated: a vault the engine health crons haven't populated shows no Ops tab
+    (no empty nav entry)."""
+    (tmp_path / "wiki" / "briefings").mkdir(parents=True)
+    m = _load(tmp_path, monkeypatch)
+    assert m.api_ops()["groups"] == []
+    assert "ops" not in m.api_config()["tabs"]

@@ -445,7 +445,13 @@ def _file_date(name: str) -> str | None:
 @app.get("/api/config")
 def api_config():
     cfg = cockpit_config()
-    return {"title": cfg["title"], "tabs": cfg["tabs"],
+    # Ops is an engine-level operational surface (health/audit pages every OKF vault produces),
+    # so it's auto-appended when that content exists — no per-pack schema authoring needed. A pack
+    # that lists "ops" in its own `tabs:` controls its position; otherwise it trails the nav.
+    tabs = list(cfg["tabs"])
+    if "ops" not in tabs and _ops_available():
+        tabs.append("ops")
+    return {"title": cfg["title"], "tabs": tabs,
             "watchlist": cfg["watchlist"] is not None,
             # labels for pack-defined dataset tabs (the frontend builds their panes dynamically)
             "tab_labels": {k: v["label"] for k, v in (cfg.get("tab_defs") or {}).items()},
@@ -583,6 +589,65 @@ def _trajectory(fm: dict) -> list[float]:
     return pts
 
 
+# evidence entries arrive as dicts (`{date, direction, note, source, confidence_*}`) OR as
+# `[YYYY-MM-DD tag] free text` strings (the regrade lanes stamp this compact form). Parse both
+# into one render-ready shape so the ledger tally and the detail drilldown agree.
+_EV_PREFIX_RE = re.compile(r"^\s*\[(\d{4}-\d{2}-\d{2})(?:\s+([^\]]+?))?\]\s*(.*)$", re.S)
+_EV_DIR_SYNONYM = {
+    "reinforces": "reinforces", "reinforce": "reinforces", "supports": "reinforces",
+    "support": "reinforces", "confirms": "reinforces", "confirm": "reinforces", "up": "reinforces",
+    "contradicts": "contradicts", "contradict": "contradicts", "refutes": "contradicts",
+    "refute": "contradicts", "weakens": "contradicts", "down": "contradicts",
+    "partial": "partial", "mixed": "partial",
+    "neutral": "neutral", "regrade": "neutral", "note": "neutral", "context": "neutral",
+}
+
+
+def _evidence_entries(fm: dict) -> list[dict]:
+    """Normalize the `evidence` frontmatter into render-ready rows sorted oldest→newest:
+    {date, direction (bucketed to reinforces/contradicts/partial/neutral), tag (raw),
+    note, source, confidence_before, confidence_after}. Handles dict- AND string-shaped
+    entries; drops anything with neither a date nor a note."""
+    ev = fm.get("evidence")
+    if not isinstance(ev, list):
+        return []
+    out: list[dict] = []
+    for e in ev:
+        src = None
+        cb = ca = None
+        if isinstance(e, dict):
+            date = str(e.get("date") or e.get("on") or e.get("when") or "")[:10] or None
+            raw = str(e.get("direction") or e.get("tag") or "").strip().lower()
+            note = str(e.get("note") or e.get("text") or e.get("summary") or e.get("detail") or "").strip()
+            src = e.get("source") or e.get("url") or e.get("ref") or e.get("link")
+            b, a = e.get("confidence_before"), e.get("confidence_after")
+            cb = round(float(b), 3) if isinstance(b, (int, float)) else None
+            ca = round(float(a), 3) if isinstance(a, (int, float)) else None
+            if ca is None and isinstance(e.get("confidence"), (int, float)):
+                ca = round(float(e["confidence"]), 3)
+        elif isinstance(e, str):
+            m = _EV_PREFIX_RE.match(e)
+            if m:
+                date, raw, note = m.group(1), (m.group(2) or "").strip().lower(), m.group(3).strip()
+            else:
+                date, raw, note = None, "", e.strip()
+        else:
+            continue
+        if not (date or note):
+            continue
+        out.append({
+            "date": date,
+            "direction": _EV_DIR_SYNONYM.get(raw) if raw else None,
+            "tag": raw or None,
+            "note": note,
+            "source": str(src).strip() if src else None,
+            "confidence_before": cb,
+            "confidence_after": ca,
+        })
+    out.sort(key=lambda r: r.get("date") or "")
+    return out
+
+
 def _conf(fm: dict) -> float | None:
     c = fm.get("confidence")
     if isinstance(c, (int, float)):
@@ -646,16 +711,16 @@ def _load_predictions() -> list[dict]:
                     rb_date = None
         status = str(fm.get("status") or "?").strip().lower()
         traj = _trajectory(fm)
-        # evidence direction tally + idle detection
-        ev = fm.get("evidence")
-        ev_list = [e for e in ev if isinstance(e, dict)] if isinstance(ev, list) else []
+        # evidence direction tally + idle detection (handles dict- AND string-shaped evidence;
+        # the compact `[date tag]` regrade strings previously counted as zero → wrongly flagged idle)
+        ev_entries = _evidence_entries(fm)
         ev_dir = {"reinforces": 0, "contradicts": 0, "partial": 0, "neutral": 0}
-        for e in ev_list:
-            d = str(e.get("direction") or "").strip().lower()
+        for e in ev_entries:
+            d = e.get("direction")
             if d in ev_dir:
                 ev_dir[d] += 1
         made = _as_date(fm.get("made_on") or fm.get("created"))
-        idle = status == "open" and not ev_list and made is not None and (today - made).days > 60
+        idle = status == "open" and not ev_entries and made is not None and (today - made).days > 60
         rows.append({
             "id": Path(p).stem,
             "status": status,
@@ -672,7 +737,7 @@ def _load_predictions() -> list[dict]:
             "forecast_set": str(fm.get("forecast_set") or "").strip() or None,
             "trajectory": traj,
             "last_move": round(traj[-1] - traj[-2], 3) if len(traj) >= 2 else None,
-            "evidence_n": len(ev_list),
+            "evidence_n": len(ev_entries),
             "ev_dir": ev_dir,
             "idle": idle,
         })
@@ -715,6 +780,7 @@ def api_prediction(id: str = Query(...)):
             return {
                 "id": id, "fm": {k: str(v) for k, v in fm.items() if k != "evidence"},
                 "trajectory": _trajectory(fm),
+                "evidence": _evidence_entries(fm),
                 "claim": _strip_md(_claim(fm, body)),
                 "claim_html": _inline_md(_claim(fm, body)),
                 "html": render_md(body),
@@ -1403,6 +1469,89 @@ def api_dashboards():
                           "title": str(fm.get("title") or p.stem).strip(),
                           "desc": str(fm.get("summary") or fm.get("description") or "").strip()})
     return {"groups": [{"group": "Dashboards", "items": items}] if items else []}
+
+
+# Engine-generated operational/health artifacts, grouped for the Ops tab. These filenames are
+# ENGINE outputs (produced by engine crons on any OKF vault) — not domain facts — so a curated
+# map is legitimate here. Each group lists candidate page paths (without .md); only those that
+# exist on disk are shown, and any remaining wiki/operational/*.md is swept into "Operational log"
+# so a new artifact is never silently hidden.
+_DATED_SERIES_RE = re.compile(r"^(.*)-(\d{4}-\d{2}-\d{2})$")   # `<series>-YYYY-MM-DD` daily snapshots
+_OPS_GROUPS = [
+    ("Health", ["dashboards/fleet-health", "HEALTH", "operational/kb-health-snapshots",
+                "operational/page-quality-snapshots", "operational/page-quality-queue"]),
+    ("Conformance", ["operational/schema-conformance", "dashboards/schema-drift",
+                     "operational/schema-drift", "operational/deployment-validation",
+                     "operational/field-loss-snapshots", "operational/bare-name-link-normalize"]),
+    ("Review & grounding", ["_review-queue", "dashboards/source-grounding",
+                            "dashboards/source-staleness", "operational/source-staleness"]),
+    ("Operator", ["dashboards/operator"]),
+]
+
+
+def _ops_meta(path: str) -> dict:
+    p = WIKI / (path + ".md")
+    try:
+        fm, _ = split_fm(p.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return {}
+    return fm if isinstance(fm, dict) else {}
+
+
+def _ops_item(path: str) -> dict:
+    fm = _ops_meta(path)
+    return {"path": path,
+            "title": str(fm.get("title") or path.rsplit("/", 1)[-1]).strip(),
+            "desc": str(fm.get("summary") or fm.get("description") or "").strip(),
+            "updated": str(fm.get("updated") or fm.get("generated_at") or fm.get("date") or "")[:10] or None}
+
+
+def _ops_groups() -> list[dict]:
+    """The operational/health page groups surfaced in the Ops tab. Only pages that exist are
+    included; empty groups are dropped. Present on any OKF vault the engine crons have run."""
+    out, seen = [], set()
+    for label, paths in _OPS_GROUPS:
+        items = []
+        for path in paths:
+            if path in seen or not (WIKI / (path + ".md")).is_file():
+                continue
+            seen.add(path)
+            items.append(_ops_item(path))
+        if items:
+            out.append({"group": label, "items": items})
+    # nothing hides: anything else under operational/ (new artifacts, per-day snapshots). A daily
+    # series (`<series>-YYYY-MM-DD.md`) is collapsed to its NEWEST page so the log doesn't drown in
+    # a page-per-day; the rolled-up `-snapshots` variants are already pinned in the groups above.
+    base = WIKI / "operational"
+    latest: dict[str, tuple[str, str]] = {}   # series-prefix -> (date, stem); "" key = non-dated (kept as-is)
+    if base.is_dir():
+        for p in sorted(base.glob("*.md")):
+            if p.name.startswith(("_", ".")) or p.name == "INDEX.md":
+                continue
+            path = f"operational/{p.stem}"
+            if path in seen:
+                continue
+            seen.add(path)
+            md = _DATED_SERIES_RE.match(p.stem)
+            if md:
+                series, date = md.group(1), md.group(2)
+                if series not in latest or date > latest[series][0]:
+                    latest[series] = (date, p.stem)
+            else:
+                latest[p.stem] = ("", p.stem)   # non-dated: unique key, always kept
+    extra = [_ops_item(f"operational/{stem}") for _, stem in sorted(latest.values(), key=lambda v: v[1])]
+    if extra:
+        out.append({"group": "Operational log", "items": extra})
+    return out
+
+
+def _ops_available() -> bool:
+    return bool(_ops_groups())
+
+
+@app.get("/api/ops")
+def api_ops():
+    return {"groups": _ops_groups()}
 
 
 # generic OKF/Obsidian namespaces a page basename might resolve under (resolution
