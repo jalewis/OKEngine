@@ -704,8 +704,13 @@ def api_prediction(id: str = Query(...)):
     if "/" in id or ".." in id:
         raise HTTPException(400, "bad id")
     for sub in cockpit_config()["predictions_dirs"]:
-        p = (WIKI / sub / f"{id}.md")
-        if p.is_file():
+        # Rows are discovered RECURSIVELY (predictions/YYYY/qN/predict-*.md), so resolve the detail
+        # the same way — a flat WIKI/<sub>/{id}.md missed every partitioned prediction (the row
+        # appeared in the ledger, then 404'd on click). id is slash-free (validated above).
+        for hp in sorted(glob.glob(str(WIKI / sub / "**" / f"{id}.md"), recursive=True)):
+            p = Path(hp)
+            if not p.is_file():
+                continue
             fm, body = split_fm(p.read_text(encoding="utf-8", errors="replace"))
             return {
                 "id": id, "fm": {k: str(v) for k, v in fm.items() if k != "evidence"},
@@ -1384,14 +1389,17 @@ def api_dashboards():
     base = WIKI / "dashboards"
     items = []
     if base.is_dir():
-        for p in sorted(base.glob("*.md")):
-            if p.name.startswith(("_", ".")) or p.name == "INDEX.md":
+        # RECURSIVE: extensions write nested dashboards (dashboards/<ns>/*.md, e.g. competitive/);
+        # a flat *.md glob left them invisible in the grid unless a pack curated them explicitly.
+        for p in sorted(base.rglob("*.md")):
+            if p.name.startswith(("_", ".")) or p.name == "INDEX.md" or p.name.startswith("INDEX-"):
                 continue
             try:
                 fm, _ = split_fm(p.read_text(encoding="utf-8", errors="replace"))
             except OSError:
                 continue
-            items.append({"path": f"dashboards/{p.stem}",
+            rel = p.relative_to(base).as_posix()[:-3]   # keep the sub-namespace in the path
+            items.append({"path": f"dashboards/{rel}",
                           "title": str(fm.get("title") or p.stem).strip(),
                           "desc": str(fm.get("summary") or fm.get("description") or "").strip()})
     return {"groups": [{"group": "Dashboards", "items": items}] if items else []}

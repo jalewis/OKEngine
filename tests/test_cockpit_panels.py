@@ -107,3 +107,36 @@ def test_prediction_files_recurse_into_dated_partition(tmp_path, monkeypatch):
     assert any("predict-x.md" in f for f in m._prediction_files()), "dated-partition prediction not found"
     rows = m._load_predictions()
     assert any(r.get("subject") == "X pattern expands" for r in rows), f"not loaded: {rows}"
+
+
+def test_prediction_detail_resolves_nested_partition(tmp_path, monkeypatch):
+    """UI feedback #1: prediction rows are discovered recursively (predictions/YYYY/qN/…), but the
+    detail endpoint looked up a FLAT predictions/<id>.md — so a partitioned prediction appeared in
+    the ledger then 404'd on click. api_prediction must resolve the nested page by id."""
+    p = tmp_path / "wiki" / "predictions" / "2026" / "q3"
+    p.mkdir(parents=True)
+    (p / "predict-widget-adoption.md").write_text(
+        "---\ntype: prediction\nstatus: open\nconfidence: 0.6\nsubject: Widgets\n"
+        "resolves_by: 2026-12-31\n---\nWidgets will ship.\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    d = m.api_prediction(id="predict-widget-adoption")           # nested id, no slash
+    assert d["id"] == "predict-widget-adoption"
+    assert "Widgets" in (d.get("claim") or "") or d["fm"].get("subject") == "Widgets"
+
+
+def test_dashboard_autolist_includes_nested_namespaces(tmp_path, monkeypatch):
+    """UI feedback #2: dashboard auto-discovery used a flat dashboards/*.md glob, so nested
+    extension dashboards (dashboards/<ns>/*.md) were invisible unless a pack curated them. The
+    auto-list must recurse and keep the sub-namespace in the path."""
+    base = tmp_path / "wiki" / "dashboards"
+    (base / "competitive").mkdir(parents=True)
+    (base / "top.md").write_text("---\ntype: dashboard\ntitle: Top\n---\nx\n", encoding="utf-8")
+    (base / "competitive" / "quadrants.md").write_text(
+        "---\ntype: dashboard\ntitle: Quadrants\n---\nx\n", encoding="utf-8")
+    (base / "_scaffold.md").write_text("---\ntype: dashboard\n---\nx\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    groups = m.api_dashboards()["groups"]
+    paths = {it["path"] for g in groups for it in g["items"]}
+    assert "dashboards/competitive/quadrants" in paths   # nested now visible
+    assert "dashboards/top" in paths
+    assert "dashboards/_scaffold" not in paths            # scaffold still skipped
