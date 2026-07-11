@@ -83,7 +83,7 @@ fi
 if [ -f "$CFG" ]; then
     MTOK=""
     if [ -f "$PACK/.env" ]; then
-        _t="$(grep -E '^[[:space:]]*OKENGINE_MCP_TOKEN[[:space:]]*=' "$PACK/.env" | tail -1 | cut -d= -f2-)"
+        _t="$(grep -E '^[[:space:]]*OKENGINE_MCP_TOKEN[[:space:]]*=' "$PACK/.env" | tail -1 | cut -d= -f2- || true)"
         _t="$(printf '%s' "$_t" | sed -E 's/^[[:space:]"'\'']+//; s/[[:space:]"'\'']+$//')"
         [ -n "$_t" ] && MTOK="$_t"
     fi

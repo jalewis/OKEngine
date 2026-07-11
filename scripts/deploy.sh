@@ -57,8 +57,12 @@ fi
 # see docs/deploy-a-new-domain.md §2.
 _env_uid=""; _env_gid=""
 if [ -f "$PACK/.env" ]; then
-    _env_uid="$(grep -oE '^HERMES_UID=[0-9]+' "$PACK/.env" | cut -d= -f2 | head -1)"
-    _env_gid="$(grep -oE '^HERMES_GID=[0-9]+' "$PACK/.env" | cut -d= -f2 | head -1)"
+    # `|| true`: an .env with no pinned uid (the normal fresh-install shape — .env.example
+    # doesn't pin one) makes grep exit 1, and under `set -euo pipefail` a bare no-match
+    # substitution kills the whole deploy INSTANTLY and SILENTLY (5th instance of this class;
+    # caught by the paste-block clean-host test — every prior deploy had HERMES_UID pinned).
+    _env_uid="$(grep -oE '^HERMES_UID=[0-9]+' "$PACK/.env" | cut -d= -f2 | head -1 || true)"
+    _env_gid="$(grep -oE '^HERMES_GID=[0-9]+' "$PACK/.env" | cut -d= -f2 | head -1 || true)"
 fi
 export HERMES_UID="${HERMES_UID:-${_env_uid:-$(id -u)}}" HERMES_GID="${HERMES_GID:-${_env_gid:-$(id -g)}}"
 PYTHON="${PYTHON:-python3}"
