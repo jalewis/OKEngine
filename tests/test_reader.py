@@ -442,12 +442,17 @@ def test_observations_by_canonical_hides_archived(tmp_path, monkeypatch):
     assert all("_archive" not in str(o) for o in obs)
 
 
-def test_ttl_caches_are_fresh_host_safe():  # okengine reader: monotonic-vs-uptime cache trap
-    """The _DIR_TTL-gated caches must init to -inf (not 0.0): on a freshly-booted host monotonic() can
-    be < _DIR_TTL, so a (0.0, EMPTY) init reads as 'fresh' and serves an empty result for up to 15 min
-    after start. The earlier caches already do this; the observations/source-reliability caches
-    regressed to 0.0 (blank canonical drill-down + blank reliability labels on a fresh reader)."""
-    src = APP.read_text()
-    for name in ("_OBS_INDEX_CACHE", "_SRC_REL_CACHE"):
-        assert re.search(rf"{name}\s*:.*=\s*\(float\(.-inf.\)", src), \
-            f"{name} inits to a finite timestamp — serves EMPTY as 'fresh' on a freshly-booted host"
+def test_no_fresh_host_vulnerable_ttl_caches():  # reader + cockpit: monotonic-vs-uptime cache trap
+    """A monotonic()-TTL-gated `_*_CACHE` must init its timestamp to -inf (so the first call always
+    misses), UNLESS its payload sentinel is None (an `is not None` guard makes 0.0 safe). A finite
+    `(0.0, <EMPTY>)` init reads the empty entry as 'fresh' on a low-uptime host — a CI runner or any
+    just-started container — and serves BLANK data for up to the TTL (blank canonical drill-down,
+    blank source-reliability grades, blank page-quality badges). This bit BOTH the reader and cockpit
+    apps (5 caches); scan both so it can't regress in either."""
+    bad = []
+    for app in (REPO / "okengine-reader" / "app.py", REPO / "okengine-cockpit" / "app.py"):
+        for m in re.finditer(r"(_\w*CACHE)\s*:[^=\n]*=\s*\((?:0\.0|0),\s*(?:\{\}|\[\]|frozenset\(\)|\(\s*\))",
+                             app.read_text()):
+            bad.append(f"{app.name}:{m.group(1)}")
+    assert not bad, ("TTL caches init to a finite timestamp with an EMPTY payload — they serve "
+                     f"stale-empty on a freshly-booted host; init to float('-inf') instead: {bad}")
