@@ -22,22 +22,29 @@ export HERMES_UID=10000 HERMES_GID=10000 && sudo chown -R 10000:10000 <pack>   #
 Most users never touch §1–§8 below — **`deploy.sh` runs the whole stock→engine delta** (clone
 Hermes → apply `patches/` → overlay → `docker build`) on first run, then brings the stack up:
 
-```bash
-# 1. Clone the engine (the overlay + image build source).
-git clone <engine-repo> okengine
+The block below is paste-able end to end — it builds the **okpack-cti** cyber-threat-intelligence
+stack (a composed bundle: adversaries + vulnerabilities + landscape + indicators + detections +
+incidents). Swap in any pack from `framework.py list` at step 2. The only line you must edit by
+hand is the model key at step 4.
 
-# Browse the pack catalog.
-python okengine/scripts/framework.py list
+```bash
+# 0. Prereqs: Docker + git + Python 3 with PyYAML.
+sudo apt-get install -y python3-yaml || python3 -m pip install --user pyyaml
+
+# 1. Clone the engine (the overlay + image build source).
+git clone https://github.com/jalewis/OKEngine.git okengine
 
 # 2. Fetch a domain pack into a SIBLING vault dir (engine and vault stay side by side).
-python okengine/scripts/framework.py pull <pack> my-brain
-cd my-brain
+#    Browse alternatives with: python3 okengine/scripts/framework.py list
+python3 okengine/scripts/framework.py pull okpack-cti okcti
+cd okcti
 
 # 3. Activate ingest. Packs ship feeds/feeds.opml EMPTY (deliberately inert) —
 #    skip this step and the stack runs but pulls NOTHING.
 cp feeds/feeds.opml.example feeds/feeds.opml
 
-# 4. Add a model key (ANTHROPIC_API_KEY / OPENROUTER_API_KEY / DEEPSEEK_API_KEY).
+# 4. Add a model key: edit .env and set ANTHROPIC_API_KEY, OPENROUTER_API_KEY,
+#    or DEEPSEEK_API_KEY (the one step you can't paste).
 cp .env.example .env
 
 # 5. Build the image (once), start gateway/reader/mcp, deploy the crons, verify —
@@ -53,14 +60,15 @@ you'd rather let the schedule fill the vault over its first day. Review `feeds/f
 copying: the example list is a *suggestion* — prune or add sources to taste (some example feeds
 are intermittent; see `docs/cold-start-checklist.md`).
 
-**Where to look once it's up** (ports assume the default `--port-offset 0`; a pack pulled with an
-offset — or a bundle recipe that sets one — adds it to each):
+**Where to look once it's up.** Base ports are reader `9200` / cockpit `9201` / MCP `8730`, plus
+the pack's port offset — a pack pulled with `--port-offset N`, or a bundle recipe that sets one,
+adds N to each. **okpack-cti's recipe sets offset 200**, so the block above lands at:
 
-| UI | URL | What it is |
-|---|---|---|
-| **Reader** | `http://localhost:9200` | browse/search the wiki, page detail + backlinks, agent Chat |
-| **Cockpit** | `http://localhost:9201` | the function-oriented dashboard: briefings, watchlists, data tabs |
-| MCP (read) | `:8730` | the agent's query API — not a browser UI (401 without a token is healthy) |
+| UI | URL (okpack-cti) | Base (offset 0) | What it is |
+|---|---|---|---|
+| **Reader** | `http://localhost:9400` | `:9200` | browse/search the wiki, page detail + backlinks, agent Chat |
+| **Cockpit** | `http://localhost:9401` | `:9201` | the function-oriented dashboard: briefings, watchlists, data tabs |
+| MCP (read) | `:8930` | `:8730` | the agent's query API — not a browser UI (401 without a token is healthy) |
 
 Both UIs bind to `OKENGINE_BIND` (default `127.0.0.1` — this machine only). To reach them from
 another machine on your LAN, set `OKENGINE_BIND=0.0.0.0` in `.env` **and** set the real passwords
