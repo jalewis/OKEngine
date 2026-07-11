@@ -85,7 +85,10 @@ The engine ships zero domain knowledge. A **pack** supplies the domain:
 `schema.yaml`, persona, feeds, prompts, crons, optional seed content, and runtime
 configuration.
 
-One active pack per instance is the supported deployment model today.
+A pack deploys standalone, or several **compose** into one vault: `kind: bundle`
+recipes and `framework install-domain` merge packs with disjoint type/namespace
+ownership behind a coinstall preflight (`framework compose-preview` shows the merged
+shape first).
 
 ## What's Included
 

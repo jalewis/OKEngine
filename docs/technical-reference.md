@@ -792,9 +792,11 @@ dashboards.
 
 Stated plainly, because a research paper should know where the edges are:
 
-- **One pack per instance.** Multi-pack composition in one vault needs schema,
-  cron, trust, secret, and ownership isolation checks that don't exist yet
-  (`docs/design/composable-okpacks.md` is the design track).
+- **Composition needs disjoint ownership.** Multiple packs share one vault via
+  `kind: bundle` / `framework install-domain` behind a coinstall preflight (types,
+  namespaces, crons), but two packs that claim the same type or namespace is a
+  blocking conflict — arbitrary mutually-untrusted packs aren't sandboxed to share a
+  vault automatically (`docs/design/composable-okpacks.md` tracks the harder cases).
 - **Federation.** A two-instance pattern — a protected vault consulting a
   curated public vault as a lookup peer via the read-MCP — is designed
   (trust-asymmetric, read-only edges) but not yet built.

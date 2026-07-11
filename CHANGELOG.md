@@ -51,6 +51,16 @@ out-of-taxonomy *retype* — fail-open by engine design) and `okengine#208`'s de
 - **Entity fusion (`canonical_assemble.py`).** `_key` `json.dumps`'d a frontmatter value without a
   default, so a union-mode dict field carrying a bare ISO date crashed the whole canonical-assembly
   run; it now serializes (dates/sets, deterministically).
+- **Reader fresh-host cache (`okengine-reader/app.py`).** `_OBS_INDEX_CACHE` and `_SRC_REL_CACHE`
+  initialized to `(0.0, {})` instead of `-inf`: `monotonic()` is seconds-since-boot, so on a
+  freshly-started reader (a CI runner, or any just-deployed container) `now - 0.0 < _DIR_TTL` read the
+  EMPTY initial entry as "fresh" and served a blank canonical→source drill-down + blank reliability
+  labels for up to 15 minutes after every start (the sibling caches already used `-inf` per the
+  documented note; these two regressed). Caught by GitHub CI (low-uptime runner) after the release.
+- **Docs: composition is shipped, not future.** Corrected `README.md`, `docs/overview.md`, and
+  `docs/technical-reference.md` — they claimed "one pack per instance" / that multi-pack composition
+  "doesn't exist yet." It does: `framework install-domain` + `kind: bundle` merge ownership-disjoint
+  packs into one vault behind a coinstall preflight (`framework compose-preview` shows the shape).
 - **Health export (`health_export.py`).** Added a scheduler-independent heartbeat gauge
   (`okengine_health_export_timestamp_seconds`) so an alert fires when the exporter itself stops and
   Prometheus scrapes a frozen `.prom`.

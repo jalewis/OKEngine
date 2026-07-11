@@ -85,10 +85,12 @@ A pack defines what the engine should build for a domain: schema, persona, feeds
 domain crons, prompts, and optional seed content. The engine supplies the shared
 machinery.
 
-Composition is the direction of travel. Today, one active pack per instance is the
-supported model; first-class multi-pack composition needs schema, cron, trust,
-secret, and ownership checks before arbitrary packs can safely share one vault. See
-[`design/composable-okpacks.md`](design/composable-okpacks.md).
+Packs **compose**: `framework install-domain` and `kind: bundle` recipes merge
+multiple packs with disjoint type/namespace ownership into one vault, gated by a
+coinstall preflight (types, namespaces, crons); `framework compose-preview` shows the
+merged shape first. Two packs that claim the same type or namespace is a blocking
+conflict — arbitrary mutually-untrusted packs aren't sandboxed to share a vault
+automatically. See [`design/composable-okpacks.md`](design/composable-okpacks.md).
 
 ---
 

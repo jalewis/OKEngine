@@ -1,4 +1,5 @@
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -432,6 +433,21 @@ def test_observations_by_canonical_hides_archived(tmp_path, monkeypatch):
     arch = tmp_path / "wiki" / "observations" / "_archive"; arch.mkdir(parents=True)
     (arch / "old.md").write_text("---\ncanonical: apt29\n---\nretired\n", encoding="utf-8")
     m = _load(tmp_path, monkeypatch)
+    # Simulate a freshly-booted host: monotonic() near 0 (a CI runner / just-started deployment). If
+    # the cache inits to (0.0, {}) instead of -inf, `now - 0.0 < _DIR_TTL` reads the EMPTY initial
+    # entry as "fresh" and the index is blank for 15 min after start. Pin it deterministically.
+    monkeypatch.setattr(m.time, "monotonic", lambda: 5.0)
     obs = m._observations_by_canonical().get("apt29", [])
     assert len(obs) == 1, "archived observation must not appear in the canonical index"
     assert all("_archive" not in str(o) for o in obs)
+
+
+def test_ttl_caches_are_fresh_host_safe():  # okengine reader: monotonic-vs-uptime cache trap
+    """The _DIR_TTL-gated caches must init to -inf (not 0.0): on a freshly-booted host monotonic() can
+    be < _DIR_TTL, so a (0.0, EMPTY) init reads as 'fresh' and serves an empty result for up to 15 min
+    after start. The earlier caches already do this; the observations/source-reliability caches
+    regressed to 0.0 (blank canonical drill-down + blank reliability labels on a fresh reader)."""
+    src = APP.read_text()
+    for name in ("_OBS_INDEX_CACHE", "_SRC_REL_CACHE"):
+        assert re.search(rf"{name}\s*:.*=\s*\(float\(.-inf.\)", src), \
+            f"{name} inits to a finite timestamp — serves EMPTY as 'fresh' on a freshly-booted host"

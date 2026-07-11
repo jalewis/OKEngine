@@ -1005,7 +1005,7 @@ _META_SECONDARY = {"tlp", "created", "updated", "last_updated", "last_seen", "fi
 
 
 # ── multi-source conflict / provenance view (okengine#42) ────────────────────
-_SRC_REL_CACHE: tuple[float, dict] = (0.0, {})
+_SRC_REL_CACHE: tuple[float, dict] = (float("-inf"), {})   # -inf, not 0.0 — see the note at _DIR_TTL
 _REL_RANK = {c: i for i, c in enumerate("FEDCBA")}    # A=5 (highest) … F=0; unknown -> -1
 
 
@@ -1072,7 +1072,7 @@ def _shape_conflicts(fm: dict) -> list[dict]:
     return out
 
 
-_OBS_INDEX_CACHE: tuple[float, dict] = (0.0, {})
+_OBS_INDEX_CACHE: tuple[float, dict] = (float("-inf"), {})   # -inf, not 0.0 — see the note at _DIR_TTL
 
 
 def _observations_by_canonical() -> dict:
