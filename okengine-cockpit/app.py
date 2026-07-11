@@ -1318,17 +1318,31 @@ def _ds_sorted(rows: list[dict], srt: dict) -> list[dict]:
     #      DATE-sorted box (ISO dates aren't floatable, so a date box lives entirely in this bucket):
     #      `sort: {field: created, desc: true}` showed OLDEST gaps first. Direction must apply
     #      within the bucket; ISO date strings/objects order correctly via str().
+    # An optional `then:` field breaks ties on the PRIMARY field (same direction). Without it a date
+    # box where dozens of rows share one COARSE date (annual-report YYYY-01-01 -> 50+ actors on the
+    # "Recently active" board) falls to arbitrary glob order; `then: recent_reports` ranks the most
+    # active first WITHIN each date. Default (no `then`) keeps the prior stable-within-tie order.
     desc = bool(srt.get("desc"))
+    then = str(srt.get("then") or "")
+
+    def _sec(r: dict) -> float:
+        if not then:
+            return 0.0                        # no tie-break -> constant key -> stable order preserved
+        try:
+            return float(r.get(then))
+        except (TypeError, ValueError):
+            return float("-inf")              # missing/non-numeric secondary sinks within the tie
+
     nums, others = [], []
     for r in rows:
         v = r.get(f)
         try:
-            nums.append((float(v), r))
+            nums.append((float(v), _sec(r), r))
         except (TypeError, ValueError):
-            others.append((str(v), r))
-    nums.sort(key=lambda t: t[0], reverse=desc)
-    others.sort(key=lambda t: t[0], reverse=desc)
-    return [r for _, r in nums] + [r for _, r in others]
+            others.append((str(v), _sec(r), r))
+    nums.sort(key=lambda t: (t[0], t[1]), reverse=desc)
+    others.sort(key=lambda t: (t[0], t[1]), reverse=desc)
+    return [r for _, _, r in nums] + [r for _, _, r in others]
 
 
 def _defang(v: str) -> str:
@@ -2357,14 +2371,27 @@ def api_download(fmt: str, stream: str | None = None, date: str | None = None,
 # The contract asks the agent to keep these out of a report, but local models still emit them; we
 # strip them from the EXPORTED report (they're fine as live feedback in the chat).
 _NARRATION = re.compile(
-    r"^\s*(checking|pulling|retrieving|searching|assessing|reviewing|looking|gathering|fetching|"
-    r"scanning|querying|good\b|i (now|have|'ll|'ve)|let me|now (pulling|checking|retrieving|"
-    r"searching))\b", re.I)
+    r"^\s*(?:"
+    r"(?:checking|pulling|retrieving|searching|assessing|reviewing|looking|gathering|fetching|"
+    r"scanning|querying|reading|opening|examining|compiling|cross-referencing|digging|"
+    r"good|okay|alright)\b"
+    r"|found (?:a|an|the|no|it|some|several|\d|pages?|entries|entit|nothing)"
+    r"|(?:based on|from|according to|per|drawing on|pulling from) the vault"
+    r"|here(?:'s| is| are) what"
+    r"|one moment"
+    r"|i (?:now|have|'ll|'ve|'m)\b"
+    r"|let me\b"
+    r"|now (?:pulling|checking|retrieving|searching)\b"
+    r")", re.I)
 
 
 def _strip_report_preamble(md: str) -> str:
-    """Drop a leading block of progress-narration IFF it's clearly delimited by a `---` / heading —
-    conservative so real content is never removed."""
+    """Drop the agent's leading progress-narration from an EXPORTED report. The narration
+    ('Checking the vault…', 'Found the page…', 'Based on the vault, here's what we know…') is useful
+    LIVE feedback in the chat but noise in a saved document. Strip the leading RUN of narration lines
+    and stop at the first line that is NOT narration — so a report whose first line is real content is
+    returned untouched (never removes real content). A `---`/`***`/`___` break left between the
+    narration and the body is dropped too."""
     lines = md.split("\n")
     n = len(lines)
     i = 0
@@ -2373,25 +2400,23 @@ def _strip_report_preamble(md: str) -> str:
     start = i
     while i < n:
         s = lines[i].strip()
-        if not s:
+        if not s:                                    # blanks inside the run are skipped
             i += 1
             continue
-        if _NARRATION.match(s) or s.endswith("now") or s.endswith("now."):
+        if _NARRATION.match(s) or s.endswith(("now", "now.")):
             i += 1
             continue
-        break
-    if i == start:                                   # no leading narration
+        break                                        # first non-narration line -> the report body
+    if i == start:                                   # nothing recognizably narration at the top
         return md
-    j = i
-    while j < n and not lines[j].strip():
-        j += 1
-    if j < n:
-        b = lines[j].strip()
-        if b in ("---", "***", "___"):               # narration → thematic break → report
-            return "\n".join(lines[j + 1:]).lstrip("\n")
-        if b.startswith(("#", "**")):                # narration → title/heading → report
-            return "\n".join(lines[j:]).lstrip("\n")
-    return md                                        # not clearly delimited — leave it untouched
+    while i < n and not lines[i].strip():            # eat blanks before the body
+        i += 1
+    if i < n and lines[i].strip() in ("---", "***", "___"):   # drop a leftover thematic break
+        i += 1
+        while i < n and not lines[i].strip():
+            i += 1
+    stripped = "\n".join(lines[i:]).lstrip("\n")
+    return stripped or md                            # all-narration reply -> keep the original
 
 
 def _clean_chat_markdown(md: str, title: str | None = None) -> str:

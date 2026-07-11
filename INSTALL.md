@@ -23,13 +23,48 @@ Most users never touch §1–§8 below — **`deploy.sh` runs the whole stock→
 Hermes → apply `patches/` → overlay → `docker build`) on first run, then brings the stack up:
 
 ```bash
-git clone <engine-repo> okengine                              # 1. the engine (overlay + build source)
-python okengine/scripts/framework.py list                     #    browse the pack catalog
-python okengine/scripts/framework.py pull <pack> my-brain     # 2. a domain pack -> SIBLING vault dir
-cd my-brain && bash ../okengine/scripts/deploy.sh             # 3. build image (once) + up gateway/reader/mcp + crons + verify
+# 1. Clone the engine (the overlay + image build source).
+git clone <engine-repo> okengine
+
+# Browse the pack catalog.
+python okengine/scripts/framework.py list
+
+# 2. Fetch a domain pack into a SIBLING vault dir (engine and vault stay side by side).
+python okengine/scripts/framework.py pull <pack> my-brain
+cd my-brain
+
+# 3. Activate ingest. Packs ship feeds/feeds.opml EMPTY (deliberately inert) —
+#    skip this step and the stack runs but pulls NOTHING.
+cp feeds/feeds.opml.example feeds/feeds.opml
+
+# 4. Add a model key (ANTHROPIC_API_KEY / OPENROUTER_API_KEY / DEEPSEEK_API_KEY).
+cp .env.example .env
+
+# 5. Build the image (once), start gateway/reader/mcp, deploy the crons, verify —
+#    then POPULATE the vault now (ingest -> compile -> dashboards -> brief).
+bash ../okengine/scripts/deploy.sh --kickstart
 ```
 
-Then add a model key to `my-brain/.env` to enable the LLM crons (the stack comes up without one).
+Completing these five steps yields a **working, populated system**: `--kickstart` walks the whole
+build fleet once in dependency order (feed ingest + every pack importer → compile → entities →
+graph → dashboards → brief) so the wiki and dashboards fill immediately instead of waiting out the
+schedule (feeds ~2h, dashboards daily, brief weekly). It spends model budget — drop the flag if
+you'd rather let the schedule fill the vault over its first day. Review `feeds/feeds.opml` after
+copying: the example list is a *suggestion* — prune or add sources to taste (some example feeds
+are intermittent; see `docs/cold-start-checklist.md`).
+
+**Where to look once it's up** (ports assume the default `--port-offset 0`; a pack pulled with an
+offset — or a bundle recipe that sets one — adds it to each):
+
+| UI | URL | What it is |
+|---|---|---|
+| **Reader** | `http://localhost:9200` | browse/search the wiki, page detail + backlinks, agent Chat |
+| **Cockpit** | `http://localhost:9201` | the function-oriented dashboard: briefings, watchlists, data tabs |
+| MCP (read) | `:8730` | the agent's query API — not a browser UI (401 without a token is healthy) |
+
+Both UIs bind to `OKENGINE_BIND` (default `127.0.0.1` — this machine only). To reach them from
+another machine on your LAN, set `OKENGINE_BIND=0.0.0.0` in `.env` **and** set the real passwords
+there, then `docker compose up -d` again (deliberate choice — see the `.env.example` comments).
 
 > **First deploy?** [`docs/cold-start-checklist.md`](docs/cold-start-checklist.md) lists the rough edges a from-scratch deploy hits and how to clear them.
 
@@ -138,8 +173,12 @@ from** (sibling to) this engine checkout. Two paths:
 
 **Use an existing catalog pack** (operator happy path — `docs/install-selected-pack.md`):
 ```bash
-python scripts/framework.py list                         # browse the catalog
-python scripts/framework.py pull <pack> ../my-brain      # fetch into a SIBLING vault dir
+# Browse the catalog, then fetch into a SIBLING vault dir.
+python scripts/framework.py list
+python scripts/framework.py pull <pack> ../my-brain
+
+# Activate ingest (packs ship feeds.opml inert).
+cp ../my-brain/feeds/feeds.opml.example ../my-brain/feeds/feeds.opml
 ```
 **Author a new pack from scratch:**
 ```bash
@@ -155,6 +194,7 @@ at this engine checkout). **One command** — `deploy.sh` does validate → seed
 cron-plus → build the image (if missing) → `docker compose up` → deploy crons → verify:
 ```bash
 # HERMES_UID/HERMES_GID default to your uid (you own the clone) — export a fixed uid only for a portable/shared vault.
+# Add --kickstart to populate the vault NOW instead of waiting for the schedule.
 cd <pack> && bash $ENGINE_DIR/scripts/deploy.sh
 ```
 Or step by step (exactly what `deploy.sh` runs in order):

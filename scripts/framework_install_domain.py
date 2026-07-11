@@ -591,7 +591,21 @@ def merge_cockpit(host: Path, pack: Path, plan: Plan) -> None:
             block = f"    # --- co-installed tabs (okpack: {pack_name(pack)}, install-domain) ---\n"
             block += "".join(_dump_entry(k, v, 4) for k, v in add.items())
             nt = _insert_under(t, r"^  tab_defs:\s*$", block)
-            assert nt is not None, "host cockpit has no `tab_defs:` block (add a cockpit: block to the host pack)"
+            if nt is None:
+                # A bare/minimal host is legitimate (a fresh `framework init` scaffold ships no
+                # cockpit config at all) — SEED the block instead of failing the whole install.
+                # This crashed every coinstall of a cockpit-bearing guest (vuln/indicators/
+                # detections/incidents) onto a scaffold host in the deploy-matrix gate.
+                if re.search(r"^cockpit:\s*(#.*)?$", t, re.M):
+                    # cockpit block exists but has no tab_defs: — open one at the top of the block
+                    nt = _insert_under(t, r"^cockpit:\s*(#.*)?$", "  tab_defs:\n" + block)
+                else:
+                    # no cockpit at all — append a minimal block; tabs seeds [browse] so the
+                    # _do_tabs step below can slot the guest tabs before it.
+                    seed = (f"# --- co-installed cockpit (okpack: {pack_name(pack)}, install-domain) ---\n"
+                            "cockpit:\n  tabs: [browse]\n  tab_defs:\n" + block)
+                    nt = t + ("" if t.endswith("\n") else "\n") + seed
+            assert nt is not None, "host cockpit block is malformed — merge the guest tab_defs by hand"
             assert set(add) <= set(((yaml.safe_load(nt).get("cockpit") or {}).get("tab_defs") or {})), \
                 "cockpit tab_def merge failed to parse back"
             hschema.write_text(nt, encoding="utf-8")

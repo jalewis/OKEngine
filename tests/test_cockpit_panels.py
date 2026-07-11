@@ -616,9 +616,20 @@ def test_report_export_strips_progress_narration(tmp_path, monkeypatch):
     # heading-delimited narration also stripped
     out2 = m._strip_report_preamble("Searching now.\nGood leads.\n\n# Report\n\nBody.")
     assert out2.startswith("# Report") and "Searching now" not in out2
+    # UNDELIMITED narration (the real failure): 'Found…' / 'Based on the vault, here's what…' run
+    # straight into a plain section label — no `---`/heading between them — must still be stripped.
+    real = ("Checking the vault for information on Dark Hotel…\n"
+            "Found a page for this actor. Pulling the full details…\n"
+            "Based on the vault, here's what we know about Dark Hotel:\n\n"
+            "## Overview\n\nDarkhotel is a suspected South Korean threat actor.")
+    out3 = m._strip_report_preamble(real)
+    assert out3.startswith("## Overview"), out3
+    assert "Checking the vault" not in out3 and "Found a page" not in out3 and "here's what" not in out3
     # NO false strip: prose that merely starts with a plain sentence is untouched
     prose = "LockBit is a ransomware group.\n\nIt targets finance."
     assert m._strip_report_preamble(prose) == prose
+    # and an all-narration reply is never emptied (fall back to the original)
+    assert m._strip_report_preamble("Checking the vault now.\nPulling pages now.") != ""
 
 
 def test_chat_export_md_returns_flattened_markdown(tmp_path, monkeypatch):

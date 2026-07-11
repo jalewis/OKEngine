@@ -215,6 +215,41 @@ def test_taxonomy_merges_guest_cockpit_tab(tmp_path):
     assert ck2["tabs"].count("taxtab") == 1
 
 
+def test_taxonomy_seeds_cockpit_on_a_bare_host(tmp_path):
+    """A cockpit-bearing guest onto a host with NO cockpit block must SEED one, not crash. A bare
+    `framework init` scaffold ships no cockpit config, and merge_cockpit used to assert on the
+    missing `tab_defs:` anchor — which failed every coinstall of vuln/indicators/detections/
+    incidents onto a scaffold host in the library's deploy-matrix gate."""
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    # strip the host's cockpit block entirely (the scaffold-host shape)
+    schema = (h / "schema.yaml").read_text()
+    (h / "schema.yaml").write_text(schema[:schema.index("cockpit:\n")])
+    assert "cockpit" not in yaml.safe_load((h / "schema.yaml").read_text())
+
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    ck = yaml.safe_load((h / "schema.yaml").read_text())["cockpit"]
+    assert "taxtab" in ck["tab_defs"], ck                               # seeded + merged
+    assert ck["tab_defs"]["taxtab"]["boxes"][0]["title"] == "Events"
+    assert ck["tabs"].index("taxtab") < ck["tabs"].index("browse"), ck  # browse stays last
+    # idempotent: a second apply neither duplicates nor re-seeds
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    ck2 = yaml.safe_load((h / "schema.yaml").read_text())["cockpit"]
+    assert ck2["tabs"].count("taxtab") == 1 and ck2["tabs"].count("browse") == 1
+
+
+def test_taxonomy_opens_tab_defs_in_an_existing_cockpit(tmp_path):
+    """Host has a cockpit: block (tabs only) but no tab_defs: line — the merge must open one inside
+    the existing block rather than assert."""
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    schema = (h / "schema.yaml").read_text()
+    (h / "schema.yaml").write_text(schema[:schema.index("cockpit:\n")]
+                                   + "cockpit:\n  tabs: [overview, browse]\n")
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    ck = yaml.safe_load((h / "schema.yaml").read_text())["cockpit"]
+    assert "taxtab" in ck["tab_defs"], ck
+    assert "overview" in ck["tabs"] and ck["tabs"].index("taxtab") < ck["tabs"].index("browse")
+
+
 def test_taxonomy_idempotent(tmp_path):
     h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
     mod.main([str(h), str(p), "--apply"])
