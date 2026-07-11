@@ -101,6 +101,27 @@ def test_pending_writes_survive_the_cooldown(monkeypatch):
     assert state["last_seen"] == mtime["v"]
 
 
+def test_full_refresh_captures_last_seen_before_refresh(monkeypatch):  # invariant-audit M9
+    """A page written DURING the (slow) full refresh must stay pending, not be marked already-seen.
+    The full-refresh branch must snapshot the vault mtime BEFORE _refresh_index() runs — capturing
+    it AFTER records a mtime the just-started index never saw, so the mid-refresh write reads as
+    'already indexed' and is not picked up until the next full refresh hours later."""
+    s, clock, state, updates, mtime = _rig(monkeypatch, qmd_duration=0.0)
+    state["last_full"] = 0.0            # force the startup full-refresh branch
+    mtime["v"] = 100.0                  # the vault state the refresh actually indexes
+
+    def fake_refresh():
+        mtime["v"] = 200.0             # a page is written mid-refresh -> mtime advances past the index
+
+    monkeypatch.setattr(s, "_refresh_index", fake_refresh)
+    s._index_maintainer_step(state)
+    assert state["last_seen"] == 100.0            # the PRE-refresh mtime, so the 200 write stays pending
+    clock.now = state["cooldown_until"] + 1.0
+    s._index_maintainer_step(state)               # next poll, cooldown expired
+    assert len(updates) == 1                       # the mid-refresh write got indexed incrementally
+    assert state["last_seen"] == 200.0
+
+
 def test_idle_vault_never_updates(monkeypatch):
     s, clock, state, updates, mtime = _rig(monkeypatch)
     for _ in range(10):

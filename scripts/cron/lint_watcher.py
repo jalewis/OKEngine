@@ -385,7 +385,11 @@ def write_today_report(today, queues, prior, alerts):
 
 
 def main() -> int:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # LOCAL date, not UTC: the ledger filename/stamp is the OPERATOR's calendar day. A nightly lane
+    # running late-evening in a TZ-behind-UTC deployment (the fleet is America/New_York) is already
+    # tomorrow in UTC, so a UTC date files "today's" ops report under TOMORROW (invariant-audit B6.2).
+    # datetime.now() honors the process TZ env (which the gateway sets); UTC deployments are unchanged.
+    today = datetime.now().strftime("%Y-%m-%d")
     queues = scan_queues()
     prior = read_prior_snapshot()
 

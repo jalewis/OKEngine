@@ -1,6 +1,7 @@
 """framework upgrade — pin reconciliation + migration registry + state (okengine#66 Phase 1)."""
 import importlib.util
 import json
+import pytest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -206,6 +207,32 @@ def test_pack_migration_overrides_engine_by_id(tmp_path):
     assert (pack / "PACK.txt").exists() and not (pack / "ENGINE.txt").exists()   # pack won
 
 
+def test_pack_migration_diff_toversion_id_collision_fails_loud(tmp_path):  # invariant-audit B5.2
+    """A pack migration reusing an ENGINE migration's id but with a DIFFERENT to_version is an
+    accidental collision that would silently suppress the engine migration forever. Fail loud."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    eng = _transform_migration(tmp_path / "eng", id_="dup", frm="v0.4.0", to="v0.5.0", target="ENGINE.txt")
+    _transform_migration(m.pack_migrations_dir(pack), id_="dup", frm="v0.5.0", to="v0.6.0", target="PACK.txt")
+    with pytest.raises(SystemExit, match="collides with the ENGINE"):
+        m.load_all_migrations(eng, pack)
+
+
+def test_roll_forward_gate_samples_page_conformance(tmp_path, monkeypatch):  # invariant-audit B5.3
+    """The roll-forward gate must catch a migration that corrupted vault pages — `framework validate`
+    only checks wiki/ exists. _sample_page_failures runs pages through the OKF conformance gate."""
+    m = _mod()
+    monkeypatch.setenv("OKENGINE_BASE_SCHEMA", str(REPO / "config" / "base-schema.yaml"))
+    pack = tmp_path / "pack"
+    (pack / "wiki" / "entities").mkdir(parents=True)
+    (pack / "schema.yaml").write_text("types:\n  entity: {required: [type]}\n", encoding="utf-8")
+    (pack / "wiki" / "entities" / "good.md").write_text("---\ntype: entity\nid: entities:good\nname: Good\n---\nbody\n", encoding="utf-8")
+    (pack / "wiki" / "entities" / "bad.md").write_text("no frontmatter — a migration mangled this\n", encoding="utf-8")
+    fails = m._sample_page_failures(pack, cap=300)
+    assert any("bad.md" in f for f in fails), fails
+    assert not any("good.md" in f for f in fails), fails
+
+
 def test_main_apply_gate_fails_returns_one(tmp_path, monkeypatch):
     m = _mod()
     pack = _pack(tmp_path, "v0.1.0")
@@ -310,6 +337,30 @@ def test_rollback_preserves_concurrent_vault_write(tmp_path, monkeypatch):  # in
     assert live.read_text() == "live content written after the snapshot"  # concurrent write SURVIVES
 
 
+def test_rollback_preserves_concurrent_modification(tmp_path, monkeypatch):  # invariant-audit M8
+    """The #12 sibling for MODIFY, not ADD: a content lane / MCP write that EDITS a pre-existing
+    page during the roll-forward gate must survive rollback. The migration never touched that page,
+    so restore() must not revert it to the snapshot. Before the fix restore() rewrote every
+    snapshotted file to snapshot content, silently reverting the concurrent edit."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    live = pack / "wiki" / "a" / "existing-page.md"
+    live.parent.mkdir(parents=True, exist_ok=True)
+    live.write_text("pre-upgrade content", encoding="utf-8")   # exists BEFORE the snapshot
+    md = _transform_migration(tmp_path / "migs", id_="t1", frm="v0.4.0", to="v0.5.0")  # touches only data.txt
+
+    def validator(p):
+        live.write_text("edited by a concurrent lane during validation", encoding="utf-8")
+        return (False, "stub: broken")
+
+    monkeypatch.setattr(m, "VALIDATOR", validator)
+    rc = m.main([str(pack), "--apply", "--migrations-dir", str(md)])
+    assert rc == 1
+    assert not (pack / "data.txt").exists()                    # migration's own file rolled back
+    assert m.read_pin(pack)[0] == "v0.4.0"                     # pin reverted
+    assert live.read_text() == "edited by a concurrent lane during validation"  # concurrent EDIT survives
+
+
 def test_main_apply_no_snapshot_does_not_rollback(tmp_path, monkeypatch):
     m = _mod()
     pack = _pack(tmp_path, "v0.4.0")
@@ -343,3 +394,227 @@ def test_unparseable_migration_version_fails_loud(tmp_path):  # invariant-audit 
     migs = m.load_migrations(md)
     with pytest.raises(ValueError, match="unparseable to_version"):
         m.applicable(migs, "v0.9.0", "v0.10.0", meta)
+
+
+def _raising_migration(dir_, *, id_, frm, to):
+    dir_.mkdir(exist_ok=True)
+    (dir_ / f"m_{id_}.py").write_text(
+        f'ID = "{id_}"\nFROM = "{frm}"\nTO = "{to}"\nDESCRIPTION = "raises mid-apply"\n'
+        f'def apply(pack, dry_run):\n'
+        f'    if not dry_run:\n'
+        f'        (pack / "half.txt").write_text("partial")\n'
+        f'        raise IOError("boom on page 137")\n'
+        f'    return ["would write half.txt"]\n', encoding="utf-8")
+    return dir_
+
+
+def test_migration_raising_mid_apply_rolls_back(tmp_path, monkeypatch):
+    """A migration that mutates files THEN raises must auto-rollback (the Phase-3 promise), not leave
+    the pack half-upgraded. Regression: rollback was wired only to the roll-forward gate, so an
+    apply-time exception fell through to a stack trace with the snapshot untouched (invariant-audit)."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    (pack / "orig.txt").write_text("before")
+    md = _raising_migration(tmp_path / "migs", id_="boom", frm="v0.4.0", to="v0.5.0")
+    monkeypatch.setattr(m, "VALIDATOR", lambda p: (True, "ok"))   # never reached — apply raises first
+    rc = m.main([str(pack), "--apply", "--migrations-dir", str(md)])
+    assert rc == 1                                      # apply failed
+    assert not (pack / "half.txt").exists()             # the partial write was rolled back
+    assert (pack / "orig.txt").read_text() == "before"  # untouched
+    assert m.read_pin(pack)[0] == "v0.4.0"              # pin NOT bumped
+
+
+def test_pack_migration_override_semver_spelling_not_a_collision(tmp_path):  # invariant-audit B5.2 re-verify
+    """The collision guard must compare to_version SEMANTICALLY, not by raw string. A LEGIT override
+    (same id, same FROM, same version) that merely SPELLS the version differently — "v0.6.0" vs
+    "0.6.0" — is the sanctioned same-to_version override and must NOT trip the collision SystemExit."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.5.0")
+    eng = _transform_migration(tmp_path / "eng", id_="dup", frm="v0.5.0", to="v0.6.0", target="ENGINE.txt")
+    # pack spells the SAME target version without the leading 'v'
+    _transform_migration(m.pack_migrations_dir(pack), id_="dup", frm="v0.5.0", to="0.6.0", target="PACK.txt")
+    merged = m.load_all_migrations(eng, pack)            # must NOT raise
+    dup = [x for x in merged if x.id == "dup"]
+    assert len(dup) == 1                                 # de-duped, pack won — a real override
+    dup[0].apply_fn(pack, False)
+    assert (pack / "PACK.txt").exists() and not (pack / "ENGINE.txt").exists()
+
+
+def test_collision_guard_distinguishes_fourth_version_component(tmp_path):  # invariant-audit B5.2 re-verify
+    """The semantic compare must NOT be the lossy 3-tuple _semver: "0.6.0" and "0.6.0.1" are
+    GENUINELY different versions that happen to share X.Y.Z, so an id-reuse across them is a real
+    accidental collision and must still fail loud (not be waved through as a same-version override)."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.5.0")
+    eng = _transform_migration(tmp_path / "eng", id_="dup", frm="v0.5.0", to="0.6.0", target="ENGINE.txt")
+    _transform_migration(m.pack_migrations_dir(pack), id_="dup", frm="v0.5.0", to="0.6.0.1", target="PACK.txt")
+    with pytest.raises(SystemExit, match="collides with the ENGINE"):
+        m.load_all_migrations(eng, pack)
+
+
+def test_roll_forward_catches_minority_type_corruption(tmp_path, monkeypatch):  # invariant-audit B5.3
+    """A migration corrupts by TYPE, and a single OKF namespace holds MANY types. The exhaustive scan
+    must catch a MINORITY type corrupted inside a large mixed namespace — 6 `metric` pages stripped
+    of a required field among 200 conformant `vendor` pages, in ONE namespace."""
+    m = _mod()
+    monkeypatch.setenv("OKENGINE_BASE_SCHEMA", str(REPO / "config" / "base-schema.yaml"))
+    pack = tmp_path / "pack"
+    ns = pack / "wiki" / "landscape"
+    ns.mkdir(parents=True)
+    (pack / "schema.yaml").write_text(
+        "types:\n  vendor: {required: [type]}\n  metric: {required: [type, value]}\n", encoding="utf-8")
+    for i in range(200):
+        (ns / f"v{i:03d}.md").write_text(
+            f"---\ntype: vendor\nid: landscape:v{i:03d}\nname: V{i}\n---\nbody\n", encoding="utf-8")
+    for i in range(6):
+        (ns / f"m{i:02d}.md").write_text(     # type:metric but the required `value` was dropped
+            f"---\ntype: metric\nid: landscape:m{i:02d}\nname: M{i}\n---\nbody\n", encoding="utf-8")
+    fails = m._sample_page_failures(pack, cap=20)
+    assert any("landscape/m" in f for f in fails), f"scan missed the corrupt minority type: {fails}"
+    assert not any("landscape/v" in f for f in fails), fails         # majority type not falsely flagged
+
+
+def test_roll_forward_catches_partial_within_type_corruption(tmp_path, monkeypatch):  # invariant-audit B5.3 (3 re-verify rounds)
+    """The case every SAMPLED approach missed: a PARTIAL / retype corruption — only 6 pages of a
+    10,000-page type are broken (a botched retype that omitted a newly-required field). A per-type
+    strided sample skips them ~96% of the time; the exhaustive scan must catch them. Downsized to 400
+    conformant + 6 corrupt pages of the SAME type (so no stratification could isolate the 6)."""
+    m = _mod()
+    monkeypatch.setenv("OKENGINE_BASE_SCHEMA", str(REPO / "config" / "base-schema.yaml"))
+    pack = tmp_path / "pack"
+    ns = pack / "wiki" / "indicators"
+    ns.mkdir(parents=True)
+    (pack / "schema.yaml").write_text(
+        "types:\n  indicator: {required: [type, value]}\n", encoding="utf-8")
+    for i in range(400):
+        (ns / f"i{i:04d}.md").write_text(
+            f"---\ntype: indicator\nid: indicators:i{i:04d}\nvalue: v{i}\n---\nbody\n", encoding="utf-8")
+    for i in range(6):                        # same type, missing the required `value` — a partial break
+        (ns / f"bad{i:02d}.md").write_text(
+            f"---\ntype: indicator\nid: indicators:bad{i:02d}\n---\nbody\n", encoding="utf-8")
+    fails = m._sample_page_failures(pack, cap=50)
+    assert any("indicators/bad" in f for f in fails), \
+        f"exhaustive scan missed a partial-within-type corruption: {fails}"
+
+
+def test_roll_forward_does_not_flag_unknown_type_retype(tmp_path, monkeypatch):  # invariant-audit B5.3 boundary
+    """CHARACTERIZATION of a deliberate boundary (B5.3 re-verify round 4): the roll-forward gate uses
+    the fail-OPEN schema_reject_reason (strict_types:false engine base default), so a retype to a
+    type NOT in the taxonomy (actor→threatactor, never added to schema.yaml) is NOT flagged. This is
+    intentional — a strict FAIL here would false-roll-back an upgrade over a PRE-EXISTING out-of-
+    taxonomy page (no before/after diff) and false-positive under multipack composition. Pinned so a
+    future reader doesn't assume unknown-type retypes are covered by this gate."""
+    m = _mod()
+    monkeypatch.setenv("OKENGINE_BASE_SCHEMA", str(REPO / "config" / "base-schema.yaml"))
+    pack = tmp_path / "pack"
+    ns = pack / "wiki" / "actors"
+    ns.mkdir(parents=True)
+    (pack / "schema.yaml").write_text("types:\n  actor: {required: [type, id]}\n", encoding="utf-8")
+    for i in range(20):
+        (ns / f"a{i:02d}.md").write_text(
+            f"---\ntype: actor\nid: actors:a{i:02d}\n---\nbody\n", encoding="utf-8")
+    for i in range(6):     # retyped to a type absent from schema.yaml, but both required keys present
+        (ns / f"r{i:02d}.md").write_text(
+            f"---\ntype: threatactor\nid: actors:r{i:02d}\n---\nbody\n", encoding="utf-8")
+    fails = m._sample_page_failures(pack, cap=50)
+    # fail-open by design: the unknown type is NOT reported (documents the boundary, not an endorsement)
+    assert not any("actors/r" in f for f in fails), \
+        f"unexpected: fail-open gate flagged an unknown type — boundary changed: {fails}"
+
+
+# --- roll-forward is a REGRESSION gate, not an absolute-conformance gate (fleet-roll regression) ---
+
+def _vault_pack(tmp_path, version="v0.11.2"):
+    """A pack with engine.version + schema.yaml + a wiki/, for exercising the conformance gate."""
+    pack = _pack(tmp_path, version)
+    (pack / "schema.yaml").write_text("types:\n  entity: {required: [type, id]}\n", encoding="utf-8")
+    ent = pack / "wiki" / "entities"
+    ent.mkdir(parents=True)
+    return pack, ent
+
+
+def _corrupting_migration(dir_, *, id_, frm, to, target_rel):
+    """A migration that overwrites `target_rel` (wiki-relative) with a non-conformant page."""
+    dir_.mkdir(parents=True, exist_ok=True)
+    (dir_ / f"m_{id_}.py").write_text(
+        f'ID = "{id_}"\nFROM = "{frm}"\nTO = "{to}"\nDESCRIPTION = "corrupt"\n'
+        f'def apply(pack, dry_run):\n'
+        f'    p = pack / "{target_rel}"\n'
+        f'    if not dry_run: p.write_text("no frontmatter — corrupted by a bad migration\\n")\n'
+        f'    return ["corrupted {target_rel}"]\n', encoding="utf-8")
+    return dir_
+
+
+def test_pin_bump_no_migration_ignores_preexisting_nonconformance(tmp_path, monkeypatch):  # fleet-roll regression
+    """A pin-bump-only upgrade (no migrations) transformed nothing, so it must NOT roll back over
+    PRE-EXISTING non-conformant pages — a real vault has them (older/agent-authored pages missing
+    `id`). This is the exact regression the baseline-less exhaustive scan caused: it flagged 100+
+    pre-existing pages and rolled back a clean pin bump on every fleet deployment."""
+    m = _mod()
+    monkeypatch.setenv("OKENGINE_BASE_SCHEMA", str(REPO / "config" / "base-schema.yaml"))
+    monkeypatch.setattr(m, "VALIDATOR", lambda p: (True, "ok"))   # bypass structural framework-validate noise
+    pack, ent = _vault_pack(tmp_path)
+    (ent / "good.md").write_text("---\ntype: entity\nid: entities:good\n---\nx\n", encoding="utf-8")
+    (ent / "stale.md").write_text("---\ntype: entity\n---\npre-existing: missing id\n", encoding="utf-8")
+    rc = m.main([str(pack), "--apply", "--migrations-dir", str(tmp_path / "none")])   # no migrations
+    assert rc == 0, "pin-bump-only upgrade rolled back over pre-existing non-conformance"
+    assert (ent / "stale.md").exists()                            # nothing rolled back / deleted
+
+
+def test_conformance_regression_rolls_back(tmp_path, monkeypatch):  # roll-forward gate still works
+    """A migration that MAKES a page non-conformant (conformant before, broken after) is a genuine
+    regression — the gate must catch it and roll back."""
+    m = _mod()
+    monkeypatch.setenv("OKENGINE_BASE_SCHEMA", str(REPO / "config" / "base-schema.yaml"))
+    monkeypatch.setattr(m, "VALIDATOR", lambda p: (True, "ok"))
+    pack, ent = _vault_pack(tmp_path)
+    (ent / "x.md").write_text("---\ntype: entity\nid: entities:x\n---\nfine before\n", encoding="utf-8")
+    md = _corrupting_migration(tmp_path / "migs", id_="wreck", frm="v0.11.2", to="v0.11.3",
+                               target_rel="wiki/entities/x.md")
+    rc = m.main([str(pack), "--apply", "--migrations-dir", str(md)])
+    assert rc == 1                                                # regression → rolled back
+    assert "frontmatter" in (ent / "x.md").read_text() or "type: entity" in (ent / "x.md").read_text()
+    # after rollback the page is conformant again
+    assert m._page_failure_map(pack) == {}, "rollback left a corrupted page behind"
+
+
+def test_conformance_regression_ignores_preexisting_failure(tmp_path, monkeypatch):  # no false-rollback
+    """A migration that touches OTHER pages must not roll back because a PRE-EXISTING page is already
+    non-conformant — only pages the migration regressed count."""
+    m = _mod()
+    monkeypatch.setenv("OKENGINE_BASE_SCHEMA", str(REPO / "config" / "base-schema.yaml"))
+    monkeypatch.setattr(m, "VALIDATOR", lambda p: (True, "ok"))
+    pack, ent = _vault_pack(tmp_path)
+    (ent / "stale.md").write_text("---\ntype: entity\n---\npre-existing: missing id\n", encoding="utf-8")
+    # a benign migration that writes a NEW, conformant page (doesn't touch stale.md)
+    md = tmp_path / "migs"
+    md.mkdir()
+    (md / "m_add.py").write_text(
+        'ID = "add"\nFROM = "v0.11.2"\nTO = "v0.11.3"\nDESCRIPTION = "add"\n'
+        'def apply(pack, dry_run):\n'
+        '    p = pack / "wiki/entities/new.md"\n'
+        '    if not dry_run: p.write_text("---\\ntype: entity\\nid: entities:new\\n---\\nok\\n")\n'
+        '    return ["added new.md"]\n', encoding="utf-8")
+    rc = m.main([str(pack), "--apply", "--migrations-dir", str(md)])
+    assert rc == 0, "rolled back over a pre-existing failure the migration didn't cause"
+    assert (ent / "new.md").exists()                             # the migration's change stuck
+
+
+def test_conformance_regressions_diff_is_before_after(tmp_path, monkeypatch):  # unit
+    """`_conformance_regressions` reports only NEW or CHANGED failures, never unchanged pre-existing ones."""
+    m = _mod()
+    monkeypatch.setenv("OKENGINE_BASE_SCHEMA", str(REPO / "config" / "base-schema.yaml"))
+    before = tmp_path / "before"; after = tmp_path / "after"
+    for r in (before, after):
+        (r / "wiki" / "entities").mkdir(parents=True)
+        (r / "schema.yaml").write_text("types:\n  entity: {required: [type, id]}\n", encoding="utf-8")
+    be, ae = before / "wiki" / "entities", after / "wiki" / "entities"
+    # a page that is BROKEN on both sides (pre-existing) — must NOT be reported
+    for e in (be, ae):
+        (e / "stale.md").write_text("---\ntype: entity\n---\nno id\n", encoding="utf-8")
+    # a page conformant before, broken after — a regression → reported
+    (be / "reg.md").write_text("---\ntype: entity\nid: entities:reg\n---\nok\n", encoding="utf-8")
+    (ae / "reg.md").write_text("no frontmatter\n", encoding="utf-8")
+    out = m._conformance_regressions(before, after)
+    assert any("reg.md" in x for x in out)
+    assert not any("stale.md" in x for x in out), f"pre-existing failure leaked into regressions: {out}"

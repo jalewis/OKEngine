@@ -58,11 +58,12 @@ services:
       # Override here, NOT the Dockerfile — every build-engine-image re-bakes =/opt/data.
       # Any custom compose that mounts its vault outside /opt/data must replicate this.
       - HERMES_WRITE_SAFE_ROOT=/opt
-      # Free-tier survival: the engine ships a free model default (config.yaml.template), and
-      # a :free tier is rate-limited — so cap how many agent cron lanes run at once. Without
-      # this, a burst of coincident lanes stampedes the free tier into 429s. Trade: lanes run
-      # more serially (slower) but COMPLETE instead of dying. Raise/remove it for a paid
-      # primary + high throughput. See docs/model-selection.md § running on free models.
+      # NOTE: this var only governs NATIVE Hermes cron. The OKEngine fleet runs under the
+      # cron-plus scheduler, which spawns a subprocess PER due job with no global parallel cap
+      # (it reads this var nowhere), so it is INERT here — do not rely on it to throttle the
+      # free tier. The real levers against a 429 stampede are the free-first fallback chain and
+      # STAGGERING schedules so lanes don't fire on the same minute. See docs/model-selection.md
+      # § running on free models. Kept only for a deployment that swaps back to native cron.
       - HERMES_CRON_MAX_PARALLEL=${HERMES_CRON_MAX_PARALLEL:-2}
       # ── Agent Chat (OPT-IN, off by default) ──────────────────────────────────────────────
       # Turn on the okengine-reader Chat tab — it relays to this OpenAI-compatible api_server

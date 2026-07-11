@@ -16,8 +16,7 @@ usage: new-pack.sh <pack-name> [title] [options]
 options:
   --offset N         host-port offset (reader=9200+N, mcp=8730+N)   [default 0]
   --engine TAG       engine pin                                     [default v0.2.0]
-  --hermes-pin TAG   Hermes runtime pin (engine.version)            [default v2026.7.1]
-  --brief-hour H     UTC hour (0-23) for the daily brief            [default 13]
+  --hermes-pin TAG   Hermes runtime pin (engine.version)            [default v2026.7.7.2]
   --owner NAME       GitHub owner for the README CI badge           [default REPLACE_OWNER]
   --license NAME     LICENSE to ship: apache-2.0 | none             [default apache-2.0]
   --blurb TEXT       one-line description (README + GitHub About)
@@ -26,14 +25,13 @@ EOF
   exit 2
 }
 
-PACK="" TITLE="" OFFSET=0 ENGINE="" HERMES_PIN="v2026.7.1" BRIEF_HOUR=13 OWNER="REPLACE_OWNER" LICENSE="apache-2.0" BLURB="" OUT=""
+PACK="" TITLE="" OFFSET=0 ENGINE="" HERMES_PIN="v2026.7.7.2" OWNER="REPLACE_OWNER" LICENSE="apache-2.0" BLURB="" OUT=""
 POSITIONAL=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --offset)     OFFSET="$2"; shift 2 ;;
     --engine)     ENGINE="$2"; shift 2 ;;
     --hermes-pin) HERMES_PIN="$2"; shift 2 ;;
-    --brief-hour) BRIEF_HOUR="$2"; shift 2 ;;
     --owner)      OWNER="$2"; shift 2 ;;
     --license)    LICENSE="$2"; shift 2 ;;
     --blurb)      BLURB="$2"; shift 2 ;;
@@ -69,7 +67,7 @@ COCKPIT_PORT=$((9201 + OFFSET))   # skeleton compose uses {{COCKPIT_PORT}} (adde
 LICENSE_YEAR=$(date +%Y)
 case "$LICENSE" in apache-2.0|none) ;; *) echo "error: --license must be 'apache-2.0' or 'none'" >&2; exit 2 ;; esac
 mint_id() { openssl rand -hex 6 2>/dev/null || python3 -c "import secrets;print(secrets.token_hex(6))"; }
-CRON_ID_1=$(mint_id); CRON_ID_2=$(mint_id)
+CRON_ID_1=$(mint_id)
 OUT="${OUT:-$PWD/$PACK}"
 # refuse to render inside the template's own dir/git tree (would commit a pack into it)
 out_parent=$(cd "$(dirname "$OUT")" 2>/dev/null && pwd || true)
@@ -94,8 +92,8 @@ done < <(find "$OUT" -depth -name '*{{PACK_UNDERSCORE}}*')
 [ "$LICENSE" = "none" ] && rm -f "$OUT/LICENSE"
 
 # substitute tokens in every text file
-export PACK DOMAIN TITLE BLURB ENGINE HERMES_PIN BRIEF_HOUR OWNER LICENSE_YEAR ENV_PREFIX PACK_UNDERSCORE \
-       READER_PORT MCP_PORT COCKPIT_PORT CRON_ID_1 CRON_ID_2 OFFSET
+export PACK DOMAIN TITLE BLURB ENGINE HERMES_PIN OWNER LICENSE_YEAR ENV_PREFIX PACK_UNDERSCORE \
+       READER_PORT MCP_PORT COCKPIT_PORT CRON_ID_1 OFFSET
 python3 - "$OUT" <<'PY'
 import os, sys
 root = sys.argv[1]
@@ -106,8 +104,8 @@ repl = {
     "{{PORT_OFFSET}}": e["OFFSET"], "{{READER_PORT}}": e["READER_PORT"], "{{MCP_PORT}}": e["MCP_PORT"],
     "{{COCKPIT_PORT}}": e["COCKPIT_PORT"],
     "{{ENV_PREFIX}}": e["ENV_PREFIX"], "{{PACK_UNDERSCORE}}": e["PACK_UNDERSCORE"],
-    "{{BRIEF_HOUR}}": e["BRIEF_HOUR"], "{{OWNER}}": e["OWNER"], "{{LICENSE_YEAR}}": e["LICENSE_YEAR"],
-    "{{CRON_ID_1}}": e["CRON_ID_1"], "{{CRON_ID_2}}": e["CRON_ID_2"],
+    "{{OWNER}}": e["OWNER"], "{{LICENSE_YEAR}}": e["LICENSE_YEAR"],
+    "{{CRON_ID_1}}": e["CRON_ID_1"],
 }
 for dp, _, fs in os.walk(root):
     for fn in fs:

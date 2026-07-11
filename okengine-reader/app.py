@@ -190,9 +190,8 @@ def _link_title(target: str) -> str | None:
     try:
         cand = (WIKI / (key + ".md")).resolve()
         hit = cand if (cand.is_file() and _within(WIKI, cand)) else None
-        if hit is None and WIKI.is_dir():
-            hits = [p for p in WIKI.rglob(Path(key).name + ".md") if not _skip(p.name)]
-            hit = hits[0] if len(hits) == 1 else None
+        if hit is None:
+            hit = _resolve_basename(Path(key).name + ".md")
         if hit is not None:
             fm, _ = split_fm(_read_head(hit))
             title = (str(fm.get("title") or fm.get("name") or "").strip()) or None
@@ -218,17 +217,45 @@ def _delink(s: str) -> str:
     return _WIKILINK.sub(_wl_display, s)
 
 
+# `[APT41](entities/a/apt41)` — an INTERNAL vault link (the agent's linked-title citations). Not an
+# image (`!` excluded), not external (http/mailto/# excluded).
+_MD_LOCAL_LINK = re.compile(r"(?<!\!)\[([^\]\n]+)\]\((?!https?://|mailto:|#)[^)\n]*\)")
+
+
+def _deref_local_links(s: str) -> str:
+    """Flatten internal markdown links to their text for portable export — `[APT41](entities/a/apt41)`
+    -> `APT41`. External http(s)/mailto links are kept. Vault paths resolve only inside the reader,
+    so an exported md/docx/pdf must not carry them as dead links."""
+    return _MD_LOCAL_LINK.sub(r"\1", s)
+
+
 _EMBED_PATH_CACHE: dict = {}
 
 
+def _resolve_basename(name: str) -> "Path | None":
+    """Resolve a bare basename (`slug.md`) to its CANONICAL page, exactly as _resolve_page does: skip
+    generated/reserved files, then on a multi-hit DROP schema-excluded namespaces and PREFER the
+    entities/ page (a multi-source entity also has observations/<src>/… copies with the same slug),
+    then require uniqueness. Shared by the embed + link-title resolvers so all three agree — a naive
+    len==1 gate rendered a multi-source entity as "missing" (invariant-audit #16 / L7)."""
+    if not WIKI.is_dir():
+        return None
+    hits = [p for p in WIKI.rglob(name) if not _skip(p.name)]
+    if len(hits) > 1:
+        excl = _excluded_dirs()
+        pref = [p for p in hits if not (_ns_dirs(p) & excl)] or hits
+        ent = [p for p in pref if "entities" in _ns_dirs(p)]
+        hits = ent or pref
+    return hits[0] if len(hits) == 1 else None
+
+
 def _embed_rglob(name: str) -> "Path | None":
-    """First vault match for a basename `name` (`…​.md`), memoized for the process lifetime
+    """Canonical vault match for a basename `name` (`…​.md`), memoized for the process lifetime
     (mirrors `_LINK_TITLE_CACHE`). Basename embeds ![[apt29]] are the norm on sharded OKF
     vaults, so without this each render re-walks the WHOLE tree once per unresolved embed."""
     if name in _EMBED_PATH_CACHE:
         return _EMBED_PATH_CACHE[name]
-    hits = list(WIKI.rglob(name)) if WIKI.is_dir() else []
-    hit = hits[0] if hits else None
+    hit = _resolve_basename(name)
     _EMBED_PATH_CACHE[name] = hit
     return hit
 
@@ -313,6 +340,16 @@ _ALLOWED_ATTRS = {
 _PANEL_SVG_RE = re.compile(r"<!--\s*panel-svg\b.*?<!--\s*/panel-svg\s*-->", re.DOTALL)
 
 
+# Agents across lanes "highlight" a wikilink by wrapping it in backticks (`[[x]]`). That makes
+# _linkify inject the <a> INSIDE an inline-code span, so markdown escapes it to visible `<a …>` text
+# in the UI. Strip the backticks around a bare wikilink first — the author meant a link, not code.
+_UNCODE_WIKILINK = re.compile(r"`(\[\[[^`]+?\]\])`")
+
+
+def _uncode_wikilinks(s: str) -> str:
+    return _UNCODE_WIKILINK.sub(r"\1", s)
+
+
 def render_md(body: str) -> str:
     body = _resolve_embeds(body)
     body = re.sub(r"```dataview(js)?\n.*?\n```",
@@ -324,6 +361,7 @@ def render_md(body: str) -> str:
         return f"OKENGINEPANELSVG{len(stash) - 1}MARKER"
 
     body = _PANEL_SVG_RE.sub(_stash, body)
+    body = _uncode_wikilinks(body)
     body = _linkify(body)
     html = md.markdown(body, extensions=["tables", "fenced_code", "sane_lists", "nl2br"])
     for i, blk in enumerate(stash):
@@ -385,6 +423,33 @@ _RAILTOP_CACHE: tuple[float, tuple[str, tuple[str, ...]]] = (float("-inf"), ("",
 # generated pages), NOT reader visibility — so the reader SURFACES dashboards/ (flagged
 # `derived` in the rail) and only hides operator-internal excludes like operational/ (okengine#117).
 _SURFACED_DERIVED = frozenset({"dashboards"})
+
+
+def _ns_dirs(p: "Path") -> frozenset:
+    """The directory components of a page's vault-relative path (filename dropped). In a flat vault
+    the namespace is parts[0]; in a WALK-UP co-installed vault it is nested under a sub-domain
+    container (wiki/<subdomain>/<namespace>/…, okengine#173), so a parts[0]-only check missed the
+    excluded-namespace drop + entities preference and a multi-source entity in a sub-domain 409'd /
+    vanished (invariant-audit HIGH). Matching ALL dir components is layout-agnostic — namespace names
+    (entities, observations, …) never collide with shard letters or slugs."""
+    try:
+        return frozenset(p.relative_to(WIKI).parts[:-1])
+    except ValueError:
+        return frozenset()
+
+
+def _is_reserved_seg(seg: str) -> bool:
+    """A reserved DIRECTORY segment (`_archive`/`.git`-style). A BARE `_` is NOT reserved — it's the
+    engine's reshard second-letter bucket for a non-alnum slug (entities/x/_/x-force.md), a legitimate
+    canonical location that must stay visible everywhere (batch-2 re-verify over-drop)."""
+    return len(seg) > 1 and seg.startswith(("_", "."))
+
+
+def _reserved_seg(p: "Path") -> bool:
+    """True if any DIRECTORY segment under wiki/ is a reserved (`_archive/`-style) dir that leaf-only
+    `_skip(p.name)` misses. The discovery surfaces (browse count + `_scan_dir` ledger + observations)
+    must hide these so they AGREE with search's ripgrep `!_*` pruning (invariant-audit batch-2)."""
+    return any(_is_reserved_seg(seg) for seg in _ns_dirs(p))
 
 
 def _excluded_dirs() -> frozenset[str]:
@@ -568,9 +633,13 @@ def _scan_dir(sub: str, force: bool = False) -> list[dict]:
         return hit[1]
     base = (WIKI / sub).resolve()
     out: list[dict] = []
+    excluded = _excluded_dirs()
     if base.is_dir() and _within(WIKI, base):
         for p in base.rglob("*.md"):
-            if _skip(p.name):
+            # drop reserved leaves, reserved sub-dirs (_archive/…), AND pages crossing an excluded
+            # namespace nested under a walk-up sub-domain — so this served ledger AGREES with the
+            # api_tree count AND search's `!_*`/`!**/{ns}/**` pruning (M-1310 + batch-2 re-verify).
+            if _skip(p.name) or _reserved_seg(p) or (_ns_dirs(p) & excluded):
                 continue
             out.append(_page_meta(p.resolve()))
     out.sort(key=lambda r: (r["title"].lower(), r["path"]))
@@ -709,13 +778,17 @@ _AGENT_SYSTEM = os.environ.get("OKENGINE_AGENT_SYSTEM") or (
     "You are the OKEngine vault agent. This OKF knowledge vault is your long-term memory and "
     "the FIRST place you look for anything. Open EVERY reply with a one-line acknowledgement "
     "of what you're about to do (e.g. \"Checking the vault for Scattered Spider…\") before you "
-    "call any tools, so the user gets immediate feedback. Then:\n"
+    "call any tools, so the user gets immediate feedback. Keep it to that ONE line — do not narrate "
+    "each search round (\"good leads\", \"pulling the pages now\", \"good data\"). Then:\n"
     "1. SEARCH THE VAULT FIRST — use your tools (search, then get_page / retrieve_context / "
     "find_references) and build your answer from those pages. Search is lexical, so it matches "
     "words not meanings: if the first query is thin, RETRY with synonyms and related terms "
     "before concluding the vault lacks it (e.g. health → medical / clinical / hospital / "
-    "patient; actor → group / intrusion-set / threat-actor; ransomware → extortion). Cite each "
-    "page you used inline as `path` (e.g. `entities/s/scattered-spider`).\n"
+    "patient; actor → group / intrusion-set / threat-actor; ransomware → extortion). Prefer the "
+    "most RECENT pages — the vault is fed continuously, so current-year material exists; lead with "
+    "it and don't lean on old advisories when fresher reporting is present. Cite each page you use "
+    "as a linked title — `[Page Title](path)`, e.g. `[Scattered Spider](entities/s/scattered-spider)` "
+    "— never a bare file path.\n"
     "2. If the vault already covers it, answer ONLY from the vault — do not add outside or "
     "prior knowledge.\n"
     "3. If the vault is missing or thin on the topic, RESEARCH IT WITH YOUR WEB TOOLS — you "
@@ -728,7 +801,23 @@ _AGENT_SYSTEM = os.environ.get("OKENGINE_AGENT_SYSTEM") or (
     "every external fact you rely on gets captured so the next query finds it here.\n"
     "4. Never fabricate — and never claim you lack external access: you HAVE web search, so use "
     "it before giving up. Only call a fact unverifiable after a web search has actually failed "
-    "to confirm it."
+    "to confirm it.\n"
+    "5. Speak as the vault's own analyst, never as software. Do NOT name or describe the machinery "
+    "behind you: never mention Hermes, your model or model provider, or the tools/functions you use "
+    "(search, web research, retrieve_context, write tools, and the like), and do not sign a reply "
+    "or report off as any \"agent\". Referring to THE VAULT and citing your sources is expected — "
+    "describe WHAT you found and WHERE (linked page titles, web sources), never the plumbing that "
+    "fetched it.\n"
+    "6. Be specific and disciplined. Surface the concrete detail the pages hold — dates, CVEs, "
+    "IOCs, named techniques/TTPs — not generic advice; state the time window your assessment covers "
+    "and say so plainly if the freshest evidence is old. Stay within the question's scope: if you "
+    "raise an adjacent but DISTINCT threat (different actor class or motivation), label it as "
+    "context, don't blend it into the main assessment.\n"
+    "7. Only when asked for a REPORT, BRIEFING, or DECK (not a quick question): make it a "
+    "SELF-CONTAINED document that BEGINS at its title / executive summary — your search-and-pull "
+    "narration must NOT appear anywhere in it. Structure it: a short impact-framed executive "
+    "summary, comparison TABLES where you contrast actors/options, and a specific "
+    "detection/mitigation section drawn from the vault. Keep ordinary questions concise."
 )
 
 
@@ -816,7 +905,10 @@ def api_tree():
         for d in sorted(WIKI.iterdir()):
             if not d.is_dir() or _skip(d.name) or d.name in excluded:
                 continue
-            mds = [p for p in d.rglob("*.md") if not _skip(p.name)]
+            # Drop reserved sub-dirs (_archive/…) AND excluded namespaces nested under a walk-up
+            # sub-domain, so the browse count matches the _scan_dir ledger + search (M-1310 + re-verify).
+            mds = [p for p in d.rglob("*.md")
+                   if not _skip(p.name) and not _reserved_seg(p) and not (_ns_dirs(p) & excluded)]
             if mds:
                 dirs.append({"dir": d.name, "count": len(mds), "derived": _dir_is_derived(mds)})
     label, ns = _rail_top_section()
@@ -883,8 +975,8 @@ def _resolve_page(path: str) -> Path:
             # which has entities/<l>/<slug> PLUS observations/<src>/<l>/<slug> — is "ambiguous"
             # and 404s). Drop excluded namespaces, then prefer the entity page.
             excl = _excluded_dirs()
-            pref = [p for p in hits if p.relative_to(WIKI).parts[0] not in excl] or hits
-            ent = [p for p in pref if p.relative_to(WIKI).parts[0] == "entities"]
+            pref = [p for p in hits if not (_ns_dirs(p) & excl)] or hits   # walk-up-aware (invariant-audit HIGH)
+            ent = [p for p in pref if "entities" in _ns_dirs(p)]
             hits = ent or pref
         if len(hits) > 1:
             raise HTTPException(409, "ambiguous page basename; use the full wiki-relative path")
@@ -949,14 +1041,28 @@ def _shape_conflicts(fm: dict) -> list[dict]:
     >= B filter, and the headline (winning) value flagged."""
     rel = _source_reliability()
     out: list[dict] = []
-    for c in (fm.get("conflicts") or []):
+    conflicts = fm.get("conflicts")
+    if not isinstance(conflicts, list):     # `conflicts: 42` -> `for c in 42` TypeError (M28)
+        conflicts = []
+    for c in conflicts:
         if not isinstance(c, dict):
             continue
         headline = c.get("headline")
         vals: list[dict] = []
-        for v in (c.get("values") or []):
-            srcs = [{"name": str(s), "reliability": rel.get(str(s), "")}
-                    for s in (v.get("sources") or [])]
+        values = c.get("values")
+        # Guard BOTH the container and each entry: `values: 42` is a non-iterable scalar (TypeError
+        # in the loop header), `values: [high, medium]` / `values: high` are scalar entries (.get()
+        # AttributeError). `conflicts` is in _OKF_ALWAYS so the write path shape-checks none of it —
+        # a malformed value reaches the page view unguarded and 500s it (invariant-audit M28).
+        if not isinstance(values, list):
+            values = []
+        for v in values:
+            if not isinstance(v, dict):
+                continue
+            v_sources = v.get("sources")            # third container: `sources: 42` -> for s in 42 (M28)
+            if not isinstance(v_sources, list):
+                v_sources = []
+            srcs = [{"name": str(s), "reliability": rel.get(str(s), "")} for s in v_sources]
             rank = max((_REL_RANK.get(str(s["reliability"]).upper()[:1], -1) for s in srcs),
                        default=-1)
             vals.append({"value": _val_text(v.get("value")), "sources": srcs, "rank": rank,
@@ -980,7 +1086,7 @@ def _observations_by_canonical() -> dict:
     base = WIKI / "observations"
     if base.is_dir():
         for p in base.rglob("*.md"):
-            if _skip(p.name):
+            if _skip(p.name) or _reserved_seg(p):   # skip _archive/ retired observations (batch-2 twin of cockpit)
                 continue
             fm, _ = split_fm(_read_head(p))
             canon = str(fm.get("canonical") or "").strip().lower()
@@ -1148,13 +1254,35 @@ def _clean_markdown(raw: str, title: str | None = None) -> str:
     fm, body = split_fm(raw)
     body = _resolve_embeds(body)
     body = re.sub(r"```dataview(js)?\n.*?\n```", "", body, flags=re.DOTALL)
+    body = _uncode_wikilinks(body)
     body = _delink(body)
+    body = _deref_local_links(body)
     # str-wrap: yaml SafeLoader type-infers a bare `title: 2024`/`2026-07-08`/list
     # to a non-str, and .strip() would 500 the export (matches api_page's str-wrap).
     t = str(title or fm.get("title") or fm.get("name") or "").strip()
     if t and not body.lstrip().startswith("# "):
         body = f"# {t}\n\n{body}"
     return body.strip() + "\n"
+
+
+# Print stylesheet for the weasyprint PDF path. Pandoc ships no CSS, so a wide markdown table or a
+# long unbreakable token (URL, hash, IOC) runs off the right edge of the page. Constrain everything
+# to the page box: real margins, fixed-layout full-width tables, and word-breaking in every cell.
+_PDF_CSS = (
+    "@page{size:A4;margin:1.8cm 1.7cm}"
+    "html{font-family:'DejaVu Serif',serif;font-size:10.5pt;line-height:1.42}"
+    "body{max-width:100%}"
+    "h1{font-size:18pt;margin:0 0 .3em}h2{font-size:13.5pt;margin:1.1em 0 .3em}"
+    "h3{font-size:11.5pt;margin:.9em 0 .2em}"
+    "p,li{overflow-wrap:break-word;word-wrap:break-word}"
+    "pre,code{white-space:pre-wrap;word-break:break-word;font-size:9pt}"
+    "pre{background:#f5f5f5;padding:6px 8px;border-radius:4px}"
+    "table{width:100%;table-layout:fixed;border-collapse:collapse;font-size:8.6pt;margin:.6em 0}"
+    "th,td{border:1px solid #bbb;padding:3px 5px;vertical-align:top;"
+    "overflow-wrap:break-word;word-break:break-word}"
+    "th{background:#f0f0f0;text-align:left}"
+    "img{max-width:100%}a{color:inherit;text-decoration:none}"
+)
 
 
 def _pandoc(clean_md: str, fmt: str, title: str | None = None) -> bytes:
@@ -1170,6 +1298,9 @@ def _pandoc(clean_md: str, fmt: str, title: str | None = None) -> bytes:
             cmd += ["--standalone"]
         if fmt == "pdf":
             cmd += ["--pdf-engine=weasyprint"]
+            hdr = Path(td) / "style.html"
+            hdr.write_text(f"<style>{_PDF_CSS}</style>", encoding="utf-8")
+            cmd += ["--standalone", "-H", str(hdr)]
         try:
             # cwd must be writable: pandoc creates temp files in CWD, and /app is
             # root-owned (we run as the reader uid).
@@ -1223,8 +1354,14 @@ def api_search(request: Request, q: str = Query(...), limit: int = 40):
     release = _guard(request, _SEARCH_SEM)   # rate-limit + bound concurrent ripgreps
     # Keep search consistent with the browse rail: drop backups/reserved, the
     # generated index pages, and any schema-excluded dir (#25).
-    ignore = ["!*.bak.*", "!_*", "!INDEX.md", "!index.md", "!INDEX-*", "!index-*"]
-    ignore += [f"!{d}/**" for d in _excluded_dirs()]
+    # `!_?*` (underscore + ≥1 char), NOT `!_*` — the latter also prunes the engine reshard
+    # second-letter bucket `entities/x/_/x-force.md` (a bare `_` dir), making a legit resharded entity
+    # browsable-but-unfindable. Mirrors _is_reserved_seg's bare-`_` exemption (batch-2 gate).
+    ignore = ["!*.bak.*", "!_?*", "!INDEX.md", "!index.md", "!INDEX-*", "!index-*"]
+    # `!**/{d}/**` (any depth), NOT `!{d}/**` (root-anchored): in a WALK-UP co-installed vault the
+    # excluded namespace lives at <subdomain>/observations/… and a root-anchored glob leaks it into
+    # search results (invariant-audit M-1310). The leading **/ still matches the root case.
+    ignore += [f"!**/{d}/**" for d in _excluded_dirs()]
     glob_args = ["-g", "*.md"]
     for g in ignore:
         glob_args += ["-g", g]
@@ -1300,12 +1437,18 @@ def _skip_backlink_src(key: str) -> bool:
         name += ".md"
     if _skip(name) or name in _RESERVED_BL_NAMES:
         return True
-    ns = key.split("/")[0] if "/" in key else ""
-    # Browse-visibility and backlink-skip differ: dashboards/ is SURFACED for READING
-    # (okengine#117) but its auto-generated digests aren't meaningful "what links here" edges,
-    # so skip the surfaced-derived dirs as backlink SOURCES too. The backlink-drop set (sources/
-    # by default; pack-configurable via schema.yaml `backlink_drop:`) is dropped both ways.
-    return bool(ns) and ns in (_excluded_dirs() | _SURFACED_DERIVED | _backlink_drop_dirs())
+    parts = key.split("/")
+    # A reserved sub-dir (_archive/…) at ANY depth: a leaf-only _skip lets an archived page contribute
+    # "what links here" edges that browse + search hide — the discovery surfaces must agree (batch-2
+    # re-verify). The engine guards the DIRECTORY (`'_archive' in p.parts`).
+    if any(_is_reserved_seg(seg) for seg in parts[:-1]):
+        return True
+    # Browse-visibility and backlink-skip differ: dashboards/ is SURFACED for READING (okengine#117)
+    # but its auto-generated digests aren't meaningful edges, so skip surfaced-derived dirs as backlink
+    # SOURCES too. The backlink-drop set (sources/ by default; pack `backlink_drop:`) is dropped both
+    # ways. Match at ANY depth so a walk-up <subdomain>/<ns>/ is caught, not just parts[0].
+    drop = _excluded_dirs() | _SURFACED_DERIVED | _backlink_drop_dirs()
+    return any(seg in drop for seg in parts[:-1])
 
 
 def _backlink_title(src: str) -> str:

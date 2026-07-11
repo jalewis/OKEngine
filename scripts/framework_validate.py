@@ -704,6 +704,20 @@ def check_surface_auth(pack: Path, r: Report) -> None:
     has_mcp = "okengine-mcp" in text and "ports:" in text
     if not _is_exposed(text, env):
         r.info("network exposure", "host ports bind loopback (local-first default)")
+        # False-confidence trap (okengine#208): the MCP CONTAINER binds 0.0.0.0 internally
+        # (Dockerfile ENV OKENGINE_MCP_HOST=0.0.0.0 — Docker port-forwarding needs it), so
+        # server.py's #50 fail-closed guard keys "exposed" on THAT, not the loopback HOST-port
+        # mapping. With the built-in default token and no ALLOW_DEFAULT_TOKEN, the MCP SystemExits at
+        # startup and crash-loops — even on a loopback deploy. deploy.sh avoids it (ensure-runtime
+        # generates a secret token into .env); a bare `compose up` following .env.example does not.
+        tok = (env.get("OKENGINE_MCP_TOKEN") or "").strip()
+        allow = (env.get("OKENGINE_MCP_ALLOW_DEFAULT_TOKEN") or "").strip() == "1"
+        if has_mcp and tok == "okengine-local" and not allow:
+            r.warn("MCP auth", "OKENGINE_MCP_TOKEN is the built-in default 'okengine-local' — the "
+                   "containerized MCP binds 0.0.0.0 and FAILS CLOSED at startup regardless of the "
+                   "loopback host-port mapping (#50/#208), so a bare `docker compose up` crash-loops "
+                   "it. Run deploy.sh (ensure-runtime generates a secret token), set a real "
+                   "OKENGINE_MCP_TOKEN, or OKENGINE_MCP_ALLOW_DEFAULT_TOKEN=1 for a throwaway stack.")
         return
     r.warn("network exposure", "OKENGINE_BIND exposes services beyond localhost — real auth required")
     tok = (env.get("OKENGINE_MCP_TOKEN") or "").strip()

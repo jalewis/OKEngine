@@ -269,6 +269,25 @@ def check_streams_dashboards(host: Path, pack: Path) -> None:
                                           "maintains — prefix the pack's dashboard")
 
 
+_TRUST_RANK = {"public": 0, "private": 1}   # higher = more restrictive
+
+
+def check_trust(host: Path, pack: Path) -> None:
+    """The reader/cockpit serve ONE global trust — the HOST's, frozen at first deploy by
+    ensure-runtime. Co-installing a guest serves its content at the HOST's trust, so a guest that is
+    MORE RESTRICTIVE than the host (a `private` guest on a `public` host) is exposed on the
+    unauthenticated reader — the leak. The reverse (a public guest on a private host) is merely
+    over-protected and safe. FAIL only the exposing direction (invariant-audit HIGH #2). An unknown
+    trust token is treated as most-restrictive (fail-safe)."""
+    ht = str((_yaml(host / "pack.yaml") or {}).get("trust") or "private").strip().lower()
+    gt = str((_yaml(pack / "pack.yaml") or {}).get("trust") or "private").strip().lower()
+    if _TRUST_RANK.get(ht, 1) < _TRUST_RANK.get(gt, 1):
+        add("FAIL", "trust",
+            f"host trust '{ht}' is MORE PUBLIC than guest trust '{gt}' — co-install would serve the "
+            f"guest's content at the host's '{ht}' trust, exposing a '{gt}' pack on the host's "
+            f"reader. Raise the guest's declared exposure, or don't co-install it here.")
+
+
 def main(argv) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("host")
@@ -284,6 +303,7 @@ def main(argv) -> int:
         return 2
     additions = Path(a.additions) if a.additions else None
 
+    check_trust(host, pack)
     check_types(host, pack, additions, subtree=a.subtree)
     check_namespaces(host, pack, subtree=a.subtree)
     check_crons(host, pack)

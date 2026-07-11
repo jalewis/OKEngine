@@ -13,6 +13,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libjpeg62-turbo libopenjp2-7 fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
+# marp-cli (+ headless chromium) renders the marp deck `.md`s that pdf-enabled streams serve, on
+# demand — the pinned gateway ships no browser, so the render lives here. CHROME_PATH points at a
+# wrapper that forces --no-sandbox (chromium can't use its sandbox as non-root inside a container).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        nodejs npm chromium \
+    && npm install -g @marp-team/marp-cli@4.4.1 \
+    && npm cache clean --force \
+    && printf '#!/bin/sh\nexec /usr/bin/chromium --no-sandbox --disable-gpu --disable-dev-shm-usage "$@"\n' \
+         > /usr/local/bin/chromium-nosandbox \
+    && chmod +x /usr/local/bin/chromium-nosandbox \
+    && rm -rf /var/lib/apt/lists/*
+ENV CHROME_PATH=/usr/local/bin/chromium-nosandbox
+
 # NB: backlinks are built by an in-process link-scanner (okengine#179) — no iwe binary needed.
 
 COPY requirements.txt .

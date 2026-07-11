@@ -46,6 +46,20 @@
     "no_agent": true
   },
   {
+    "id": "a1d9c3e07f52",
+    "name": "id-index-refresh",
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "40 */6 * * *"
+    },
+    "workdir": "/opt/vault",
+    "prompt": "Rebuild the id->path index artifact (/opt/data/state/id-index.json) so the MCP write path LOADS it instead of full-scanning the 64k-page vault on the first write after a restart (create_entity 300s timeout). Pure script, wakeAgent=false.",
+    "script": "/opt/data/scripts/id_index.py",
+    "deliver": "local",
+    "no_agent": true
+  },
+  {
     "id": "b95727d6a983",
     "name": "build-index-tree",
     "enabled": true,
@@ -703,6 +717,34 @@
     },
     "workdir": "/opt/vault",
     "script": "deployment_validate.py",
+    "no_agent": true,
+    "deliver": "local"
+  },
+  {
+    "id": "8c38eae908b2",
+    "name": "content-lint",
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "0 4 * * *"
+    },
+    "workdir": "/opt/vault",
+    "prompt": "Report-only content-quality monitor: flags degenerate generations (repetition-loop word-salad, code-switching CJK-fusion); script writes wiki/operational/content-lint.md and emits wakeAgent=false.",
+    "script": "content_lint.py",
+    "no_agent": true,
+    "deliver": "local"
+  },
+  {
+    "id": "4c6a0cc42561",
+    "name": "render-lint",
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "30 3 * * *"
+    },
+    "workdir": "/opt/vault",
+    "prompt": "Report-only render-surface monitor: crawls every page through the reader and flags rendered-output defects (leaked builder markup, literal wikilinks, broken embeds); writes wiki/operational/render-lint.md and emits wakeAgent=false.",
+    "script": "render_lint.py",
     "no_agent": true,
     "deliver": "local"
   },

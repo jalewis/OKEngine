@@ -92,6 +92,19 @@ def test_regrade_needs_open_and_recent_sources(tmp_path, monkeypatch):
     assert "fresh" in out and "old" not in out            # only recent source
 
 
+def test_regrade_digest_specifies_canonical_evidence_fields(tmp_path, monkeypatch):
+    """Contract: the cockpit reads structured `evidence:` entry fields (confidence_before/after
+    → trajectory sparkline; direction → reinforces/contradicts tally) that NO writer used to name,
+    so agents wrote free-text strings and those columns stayed empty. The regrade digest must spell
+    out the canonical entry shape the cockpit consumes."""
+    _vault(tmp_path, monkeypatch)
+    _, out = _run(_load("select_regrade_batch"))
+    for field in ("date:", "direction:", "confidence_before:", "confidence_after:", "source:", "note:"):
+        assert field in out, f"regrade digest omits `{field}` — cockpit reads it (starves the ledger)"
+    assert "reinforces" in out and "contradicts" in out          # the direction vocabulary
+    assert "evidence:" in out and "confidence:" in out            # both the list + top-level field
+
+
 def test_regrade_skips_with_no_recent_sources(tmp_path, monkeypatch):
     _vault(tmp_path, monkeypatch)
     # widen "recent" to nothing by making cutoff exclude even s-new

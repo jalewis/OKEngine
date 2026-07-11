@@ -96,6 +96,96 @@ def test_main_noop_when_no_budget(monkeypatch, capsys):
     assert "disabled" in capsys.readouterr().out
 
 
+def test_save_state_is_atomic(tmp_path, monkeypatch):  # invariant-audit HIGH
+    """A torn state write (OOM mid-write) must not corrupt the guard's state. _save_state writes to a
+    .tmp and renames (atomic on the same fs)."""
+    m = _load()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    m._save_state({"paused": True, "paused_ids": ["a"]})
+    assert json.loads((tmp_path / "budget-guard-state.json").read_text())["paused"] is True
+    assert not (tmp_path / "budget-guard-state.json.tmp").exists()   # temp cleaned by rename
+
+
+def test_orphaned_guard_pause_self_heals_but_spares_operator_pause(tmp_path, monkeypatch):  # invariant-audit HIGH
+    """The unrecoverable direction: a prior tick paused a cost-bearing cron but its FINAL state write
+    was lost — the write-AHEAD `pausing_ids` intent survives, so the guard still OWNS 'a'. On an
+    under-budget auto tick it resumes 'a'. Crucially it must NOT resume a byte-identical OPERATOR
+    pause ('c': enabled:false + paused_at, but NOT in the guard's owned set) — cron-plus's only
+    disable verb is pause, so paused_at cannot be the discriminator (re-verify regression)."""
+    m = _load()
+    db = tmp_path / "state.db"
+    _make_db(db, [(1_000_000.0 - 10, 10, 0)])              # usage UNDER budget
+    jobs = tmp_path / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [
+        {"id": "a", "name": "raw-backfill", "enabled": False, "paused_at": "2026-07-10T00:00:00Z"},   # guard-owned
+        {"id": "b", "name": "reshelve", "no_agent": True},
+        {"id": "c", "name": "operator-paused", "enabled": False, "paused_at": "2026-07-09T00:00:00Z"}, # operator pause — identical shape
+    ]}))
+    # state has only the write-ahead intent for 'a' (final write was lost) — 'c' is NOT owned
+    (tmp_path / "budget-guard-state.json").write_text(json.dumps({"paused": False, "pausing_ids": ["a"]}))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_STATE_DB", str(db))
+    monkeypatch.setenv("OKENGINE_CRON_PLUS_JOBS", str(jobs))
+    monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "1000000")   # budget high -> under budget
+    monkeypatch.setattr(m, "time", type("T", (), {"time": staticmethod(lambda: 1_000_000.0)}))
+    calls = []
+    monkeypatch.setattr(m, "_cronplus", lambda action, jid: calls.append((action, jid)) or True)
+    assert m.main([]) == 0
+    assert calls == [("resume", "a")]                        # guard-owned healed; operator 'c' untouched
+
+
+def test_pause_retry_keeps_prior_tick_paused_ids_owned(tmp_path, monkeypatch):  # invariant-audit HIGH (re-verify)
+    """Multi-tick partial pause: tick1 paused 'a' (success) but 'b' failed. On tick2 (still over
+    budget) cost_bearing_ids EXCLUDES 'a' (now disabled), so a wholesale rebuild would drop 'a' from
+    the owned record and strand it. The retry must UNION the prior owned set: 'a' stays owned, 'b' is
+    paused this tick."""
+    m = _load()
+    db = tmp_path / "state.db"
+    _make_db(db, [(1_000_000.0 - 10, 2_000_000, 0)])       # OVER budget
+    jobs = tmp_path / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [
+        {"id": "a", "name": "lane-a", "enabled": False, "paused_at": "2026-07-10T00:00:00Z"},  # paused tick1
+        {"id": "b", "name": "lane-b"},                     # still enabled (its tick1 pause failed)
+    ]}))
+    (tmp_path / "budget-guard-state.json").write_text(json.dumps(
+        {"paused": False, "paused_ids": ["a"], "pausing_ids": ["a", "b"]}))   # tick1's partial record
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_STATE_DB", str(db))
+    monkeypatch.setenv("OKENGINE_CRON_PLUS_JOBS", str(jobs))
+    monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "1000000")
+    monkeypatch.setattr(m, "time", type("T", (), {"time": staticmethod(lambda: 1_000_000.0)}))
+    calls = []
+    monkeypatch.setattr(m, "_cronplus", lambda action, jid: calls.append((action, jid)) or True)
+    assert m.main([]) == 0
+    assert ("pause", "b") in calls                          # b (still enabled) paused this tick
+    st = json.loads((tmp_path / "budget-guard-state.json").read_text())
+    assert set(st["paused_ids"]) == {"a", "b"}              # 'a' NOT dropped from the owned record
+    assert "a" in st["pausing_ids"] and "b" in st["pausing_ids"]
+
+
+def test_pause_writes_intent_before_pausing(tmp_path, monkeypatch):  # invariant-audit HIGH
+    """Write-ahead: the guard persists `pausing_ids` atomically BEFORE the first cron-plus pause, so a
+    crash mid-pause leaves a durable record to recover from."""
+    m = _load()
+    db = tmp_path / "state.db"
+    _make_db(db, [(1_000_000.0 - 10, 2_000_000, 0)])         # OVER budget
+    jobs = tmp_path / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [{"id": "a", "name": "raw-backfill"}]}))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_STATE_DB", str(db))
+    monkeypatch.setenv("OKENGINE_CRON_PLUS_JOBS", str(jobs))
+    monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "1000000")
+    monkeypatch.setattr(m, "time", type("T", (), {"time": staticmethod(lambda: 1_000_000.0)}))
+    order = []
+    def _cp(action, jid):
+        # capture the state file's contents AT the moment of the first pause call
+        order.append(("pause-call", json.loads((tmp_path / "budget-guard-state.json").read_text()).get("pausing_ids")))
+        return True
+    monkeypatch.setattr(m, "_cronplus", _cp)
+    assert m.main([]) == 0
+    assert order and order[0][1] == ["a"]                    # pausing_ids was already on disk before the pause
+
+
 def test_main_pauses_over_budget(tmp_path, monkeypatch):
     m = _load()
     # state db over the token budget
@@ -117,6 +207,34 @@ def test_main_pauses_over_budget(tmp_path, monkeypatch):
     assert paused == [("pause", "a")]                       # only the agent job paused
     state = json.loads((tmp_path / "budget-guard-state.json").read_text())
     assert state["paused"] is True and state["paused_ids"] == ["a"]
+
+
+def test_main_warns_on_unknown_window(tmp_path, monkeypatch, capsys):  # invariant-audit M10
+    """A typo'd OKENGINE_BUDGET_WINDOW silently collapses to a 1-day window (tripping ~30x too
+    eagerly for someone who meant 'month'). main() must surface it loudly, not swallow it."""
+    m = _load()
+    db = tmp_path / "state.db"
+    _make_db(db, [(1_000_000.0 - 10, 10, 0)])               # usage far UNDER budget -> no pause
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_STATE_DB", str(db))
+    monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "1000000")
+    monkeypatch.setenv("OKENGINE_BUDGET_WINDOW", "moth")    # typo for "month"
+    monkeypatch.setattr(m, "time", type("T", (), {"time": staticmethod(lambda: 1_000_000.0)}))
+    assert m.main([]) == 0
+    assert "not a recognized window" in capsys.readouterr().err
+
+
+def test_main_no_window_warning_for_valid_window(tmp_path, monkeypatch, capsys):
+    m = _load()
+    db = tmp_path / "state.db"
+    _make_db(db, [(1_000_000.0 - 10, 10, 0)])
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_STATE_DB", str(db))
+    monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "1000000")
+    monkeypatch.setenv("OKENGINE_BUDGET_WINDOW", "month")
+    monkeypatch.setattr(m, "time", type("T", (), {"time": staticmethod(lambda: 1_000_000.0)}))
+    assert m.main([]) == 0
+    assert "not a recognized window" not in capsys.readouterr().err
 
 
 def _seed_paused(tmp_path, ids):
@@ -300,3 +418,20 @@ def test_resume_keeps_paused_when_some_resume_fails(tmp_path, monkeypatch):
     state = json.loads((tmp_path / "budget-guard-state.json").read_text())
     assert state["paused"] is True                   # still paused (not falsely cleared)
     assert state["paused_ids"] == ["c"]              # only the still-disabled one retained
+
+
+def test_reconcile_repauses_cron_added_mid_trip(tmp_path, monkeypatch):
+    """L8/L9: a cost-bearing cron ADDED during an active pause must be re-paused (fail-closed) and
+    folded into paused_ids so a later resume lifts it. reconcile now re-derives the CURRENT set."""
+    m = _load()
+    calls = []
+    monkeypatch.setattr(m, "_cronplus", lambda action, jid: calls.append((action, jid)) or True)
+    jobs = [
+        {"id": "old", "name": "old-lane", "enabled": True},   # originally paused, still cost-bearing
+        {"id": "new", "name": "new-lane", "enabled": True},   # ADDED mid-trip (not in paused_ids)
+    ]
+    state = {"paused": True, "paused_ids": ["old"], "paused_names": ["old-lane"]}
+    repaused = m.reconcile_pause(state, jobs)
+    assert "new-lane" in repaused                          # the mid-trip cron got re-paused
+    assert ("pause", "new") in calls
+    assert "new" in state["paused_ids"] and "old" in state["paused_ids"]   # folded in for resume

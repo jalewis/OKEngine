@@ -27,6 +27,12 @@ from dataclasses import dataclass, field
 _SERVER_KEYS = {"id", "version", "updated", "last_modified_by",
                 "maintained_by", "discovered_by", "created", "created_by"}
 
+# The subset of server keys that are PROVENANCE — set once at create and never re-stamped by the
+# write path. A converge merge must PRESERVE these (never take an incoming value), or a caller forges
+# them (invariant-audit M19). The other server keys (id/version/updated/last_modified_by) ARE
+# re-stamped after the merge, so passing them through here is harmless and back-compatible.
+_PROVENANCE_KEYS = {"created", "created_by", "discovered_by"}
+
 
 @dataclass
 class MergeDecision:
@@ -73,7 +79,12 @@ def merge_frontmatter(prev_fm: dict, incoming_fm: dict, *,
 
     for key, new_val in incoming_fm.items():
         if key in _SERVER_KEYS:
-            merged[key] = new_val          # server-managed; not a pack conflict
+            # Server-managed; never a pack conflict. PRESERVE provenance keys (created/created_by/
+            # discovered_by) — a caller must not forge them, and the write path does NOT re-stamp them
+            # (invariant-audit M19). `merged` already carries prev_fm's value, so skip. The rest
+            # (id/version/updated/last_modified_by) are re-stamped after merge → pass through as before.
+            if key not in _PROVENANCE_KEYS:
+                merged[key] = new_val
             continue
         if key not in prev_fm:
             merged[key] = new_val

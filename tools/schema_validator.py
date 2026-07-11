@@ -423,6 +423,23 @@ def governing_policy(abs_path: str) -> dict:
         return {}
 
 
+def reserved_files_for(abs_path: str) -> frozenset:
+    """The RESERVED basenames (lowercased) for the schema governing `abs_path`: the pack's schema.yaml
+    `reserved_files` if declared, else the OKF engine default (_OKF_RESERVED_DEFAULT). These are the
+    files the MCP write path REFUSES and the conformance gate EXEMPTS. The file-tool write-guard
+    (patch 01) reads this so it mirrors the write path's PACK-reserved refusal, not just the hardcoded
+    engine set — otherwise declaring a file reserved makes it MORE writable via the file tool
+    (invariant-audit M12 re-verify). Never raises (fail-open -> empty set; the caller's hardcoded
+    engine set still covers the always-present engine files)."""
+    try:
+        sp = _find_schema(abs_path)
+        schema = (_load_schema(sp) or {}) if sp is not None else {}
+        reserved = schema.get("reserved_files")
+        return frozenset(str(r).lower() for r in reserved) if reserved else frozenset(_OKF_RESERVED_DEFAULT)
+    except Exception:
+        return frozenset()
+
+
 def drift_policy(abs_path: str) -> dict:
     """Pack-declared field-drift normalization for the schema governing `abs_path`:
 

@@ -171,3 +171,20 @@ def test_field_shapes_merge_and_list_fields(tmp_path):
     assert "aliases" not in lf                                               # now scalar per the pack
     # base-only (packless) still exposes the universal list fields
     assert "aliases" in m.list_fields(m.merged_schema(_vault(tmp_path / "p2", None)))
+
+
+def test_int_fields_from_base_and_pack(tmp_path):
+    """The `int` shape class (machine-owned counts — the recent_reports live incident): base declares
+    the universal count fields; a pack can add its own; int_fields returns the set the write path
+    coerces digit-strings for and REJECTS other shapes on."""
+    m = _load()
+    root = _vault(tmp_path, (
+        "types:\n  entity: {required: [type]}\n"
+        "field_shapes:\n"
+        "  citation_count: int\n"    # pack ADDS a domain count field
+    ))
+    merged = m.merged_schema(root)
+    infl = m.int_fields(merged)
+    assert "recent_reports" in infl and "total_mentions" in infl   # base contributes
+    assert "citation_count" in infl                                # pack adds
+    assert "aliases" not in infl                                   # list fields stay out

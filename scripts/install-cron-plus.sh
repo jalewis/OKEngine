@@ -30,28 +30,36 @@ fi
 DEST="$PACK/.hermes-data/plugins/cron-plus"
 echo "  cron-plus: $URL @ ${SHA:0:12}"
 
+# The managed clone lives under the pack's .hermes-data, which deploy.sh chowns to HERMES_UID (so
+# the container's uid-1003 scheduler can write it). When that uid != the operator running the deploy,
+# every `git -C "$DEST"` here aborts with "detected dubious ownership in repository" and bricks the
+# deploy at step 2 — and git's own hint (chown the tree, or add a --global safe.directory) is a trap:
+# chowning it away from HERMES_UID breaks the container. Scope safe.directory to THIS repo instead —
+# no chown, container ownership preserved (invariant-audit B7.1).
+gitd() { git -C "$DEST" -c safe.directory="$DEST" "$@"; }
+
 if [ -d "$DEST/.git" ]; then
-    if [ "$(git -C "$DEST" rev-parse HEAD 2>/dev/null)" = "$SHA" ]; then
+    if [ "$(gitd rev-parse HEAD 2>/dev/null)" = "$SHA" ]; then
         echo "  already at the pinned commit ($DEST) — skipping"
     else
-        git -C "$DEST" fetch --quiet --depth 1 origin "$SHA" 2>/dev/null || git -C "$DEST" fetch --quiet origin
+        gitd fetch --quiet --depth 1 origin "$SHA" 2>/dev/null || gitd fetch --quiet origin
         # The plugin dir is an engine-MANAGED clone — the pin is authoritative, not a place for
         # local edits. A plain `checkout` ABORTS on any local modification, which blocks the WHOLE
         # deploy (this bit a live redeploy: an old-pin jobs.py carried a hand-ported TZ-aware patch,
         # so `checkout` refused and deploy.sh died at step 2). FORCE the tree to the pin instead,
         # but SURFACE any discarded change so a real hand-edit isn't lost silently (okengine#178).
-        if [ -n "$(git -C "$DEST" status --porcelain 2>/dev/null)" ]; then
+        if [ -n "$(gitd status --porcelain 2>/dev/null)" ]; then
             echo "  ⚠ discarding LOCAL modification(s) in the managed cron-plus clone (the pin is authoritative):" >&2
-            git -C "$DEST" status --porcelain 2>/dev/null | sed 's/^/        /' >&2
+            gitd status --porcelain 2>/dev/null | sed 's/^/        /' >&2
         fi
-        git -C "$DEST" checkout --quiet --force "$SHA"
+        gitd checkout --quiet --force "$SHA"
         echo "  updated to the pinned commit"
     fi
 else
     mkdir -p "$(dirname "$DEST")"
     rm -rf "$DEST"
     git clone --quiet "$URL" "$DEST"
-    git -C "$DEST" checkout --quiet "$SHA"
+    gitd checkout --quiet "$SHA"
     echo "  cloned to $DEST"
 fi
 

@@ -47,9 +47,20 @@ def main() -> int:
     srcs = recent_sources[:MAX_SRC]
     print(f"  batch: {len(preds)} open prediction(s) vs {len(srcs)} recent source(s)\n")
     print("=== open predictions ===")
-    print("For each source below that bears on a claim, append a record to the "
-          "prediction's `## Evidence log` and update its `evidence:` + `confidence:`. "
-          "No-op is correct when no new source bears.\n")
+    print(
+        "For each source below that bears on a claim, update that prediction:\n"
+        "  1. append a one-line prose entry to the body `## Evidence log` (append_to_section), and\n"
+        "  2. append a STRUCTURED record to the frontmatter `evidence:` list and set top-level\n"
+        "     `confidence:` to the new value — send the COMPLETE evidence list via update_entity.\n"
+        "Each `evidence:` entry MUST carry these fields (the cockpit reads them to build the\n"
+        "trajectory sparkline, the reinforces/contradicts tally, and the confidence-move column):\n"
+        "  - date: <YYYY-MM-DD>\n"
+        "    direction: reinforces | contradicts | partial | neutral\n"
+        "    confidence_before: <this prediction's confidence shown below, BEFORE this update>\n"
+        "    confidence_after: <your new confidence — also becomes the new top-level confidence:>\n"
+        "    source: <the source page path below that drove the update>\n"
+        "    note: <one line — what changed>\n"
+        "No-op is correct when no new source bears.\n")
     for i, (p, fm) in enumerate(preds, 1):
         rel = p.relative_to(v).as_posix()
         title = str(fm.get("title") or fm.get("name") or p.stem)

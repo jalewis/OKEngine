@@ -5,6 +5,7 @@ deployed cron-plus-jobs.json must round-trip losslessly through split→merge, a
 every live job must be classified in config/cron-tiers.yaml exactly once.
 """
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -13,10 +14,11 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent.parent
 MOD_PATH = REPO / "scripts" / "cron_pack_split.py"
 
-pytestmark = pytest.mark.skipif(
-    not (MOD_PATH.is_file() and (REPO / "config" / "cron-plus-jobs.json").is_file()),
-    reason="cron_pack_split.py or cron-plus-jobs.json not present",
-)
+# NB: NO module-level skip on config/cron-plus-jobs.json (invariant-audit B7.7). That file is a
+# gitignored DEPLOYMENT artifact — absent on a fresh clone / public CI — and gating the WHOLE module
+# on it silently skipped the generator-LOGIC tests (regen/split/merge/validators) too, which are
+# self-contained (they seed a pack in tmp_path) and MUST run in CI. Only the handful of live-FLEET
+# snapshot assertions genuinely need the artifact; they skip LOUDLY + individually via _live_jobs().
 
 
 def _mod():
@@ -27,9 +29,20 @@ def _mod():
     return m
 
 
+def _live_jobs(m):
+    """Load THIS host's generated fleet file, or skip LOUDLY. These assertions pin the live deployed
+    cron-plus-jobs.json (gitignored, absent on a fresh clone / CI) — unlike the generator-logic tests
+    which build their own pack in tmp_path and always run."""
+    if not m.JOBS.is_file():
+        pytest.skip("config/cron-plus-jobs.json absent (no local deployment) — live-fleet assertion "
+                    "skipped; the generator-logic tests still ran. Regenerate via a deploy or "
+                    "`python scripts/cron_pack_split.py` against a pack to exercise these too.")
+    return m._load_jobs(m.JOBS)
+
+
 def test_every_live_job_classified_exactly_once():
     m = _mod()
-    jobs = m._load_jobs(m.JOBS)
+    jobs = _live_jobs(m)
     tier_of = m._tier_map(m.TIERS)
     names = [j["name"] for j in jobs]
     assert len(names) == len(set(names)), "duplicate job names in cron-plus-jobs.json"
@@ -42,7 +55,7 @@ def test_every_live_job_classified_exactly_once():
 
 def test_round_trip_is_lossless():
     m = _mod()
-    jobs = m._load_jobs(m.JOBS)
+    jobs = _live_jobs(m)
     tier_of = m._tier_map(m.TIERS)
     parts = m.split(jobs, tier_of)
     merged = m.merge(parts[m.ENGINE_CRONS], parts[m.DOMAIN_CRONS], parts[m.DOMAIN_PROMPTS],
@@ -54,7 +67,7 @@ def test_engine_template_prompt_moves_to_pack_and_returns():
     """An engine-template job's prompt is stripped from the engine half and lives
     only in the domain pack, but the merge restores it byte-for-byte."""
     m = _mod()
-    jobs = m._load_jobs(m.JOBS)
+    jobs = _live_jobs(m)
     tier_of = m._tier_map(m.TIERS)
     et = [j for j in jobs if tier_of.get(j["name"]) == "engine-template" and j.get("prompt")]
     if not et:
@@ -68,7 +81,7 @@ def test_engine_template_prompt_moves_to_pack_and_returns():
 
 def test_split_partitions_counts():
     m = _mod()
-    jobs = m._load_jobs(m.JOBS)
+    jobs = _live_jobs(m)
     tier_of = m._tier_map(m.TIERS)
     parts = m.split(jobs, tier_of)
     n_tmpl = sum(1 for t in tier_of.values() if t == "engine-template")
@@ -92,9 +105,40 @@ def test_sanitize_strips_runtime_fields():
     assert "completed" not in clean["repeat"]
 
 
+def test_every_deployed_job_gets_an_id():  # invariant-audit CRITICAL
+    """An id-less cron crashes the pinned scheduler's eager `job.get("name", job["id"])` heal on the
+    first tick and stalls the WHOLE fleet forever. No deployed job may lack an id — mint a stable one
+    from the name at the _dump_jobs chokepoint; an existing id is preserved."""
+    m = _mod()
+    import json
+    dumped = json.loads(m._dump_jobs([
+        {"name": "pack:no-id-lane", "schedule": {"kind": "cron", "expr": "0 4 * * *"}},   # no id
+        {"name": "has-id-lane", "id": "abc123def456", "schedule": {"kind": "cron", "expr": "0 5 * * *"}},
+    ]))
+    by_name = {j["name"]: j for j in dumped["jobs"]}
+    assert by_name["pack:no-id-lane"]["id"] and len(by_name["pack:no-id-lane"]["id"]) == 12
+    assert by_name["has-id-lane"]["id"] == "abc123def456"          # existing id untouched
+    assert m._ensure_id({"name": "pack:no-id-lane"})["id"] == by_name["pack:no-id-lane"]["id"]  # stable
+
+
+def test_sanitize_unpauses_a_runtime_paused_job():  # invariant-audit HIGH
+    """A budget-guard/manual PAUSE lives in jobs.json as {enabled:false, paused_at:...}. `dump`
+    captures source truth, and regen drops enabled:false jobs — so capturing a pause would silently
+    remove cost-bearing crons from the next deploy. sanitize must un-pause (drop the markers, restore
+    enabled:true); a genuine source-level enabled:false (no paused_at) is left alone."""
+    m = _mod()
+    paused, shipped_off = m.sanitize([
+        {"name": "raw-backfill", "enabled": False, "paused_at": "2026-07-10T00:00:00Z",
+         "paused_reason": "over budget", "schedule": {}},
+        {"name": "disabled-placeholder", "enabled": False, "schedule": {}},   # intentional, no paused_at
+    ])
+    assert paused["enabled"] is True and not (set(paused) & m.PAUSE_MARKERS)
+    assert shipped_off["enabled"] is False                          # source disable preserved
+
+
 def _seed_slice2(m, tmp_path):
     """Point the module's file paths at tmp and seed sources from the real jobs."""
-    jobs = m._load_jobs(m.JOBS)
+    jobs = _live_jobs(m)
     parts = m.split(jobs, m._tier_map(m.TIERS))
     pack = tmp_path / "pack" / "crons"
     pack.mkdir(parents=True)
@@ -211,3 +255,130 @@ def test_missing_lane_scripts_catches_unstaged(tmp_path):
         ("lacuna", "/opt/data/scripts/okengine.lacuna/select_lacuna_field.py")]
     (tmp_path / "okengine.lacuna" / "select_lacuna_field.py").write_text("#")               # stage it
     assert cron_pack_split.missing_lane_scripts(jobs, str(tmp_path)) == []
+
+
+def test_bare_string_schedule_normalized_to_dict():
+    """HIGH #1: a documented bare-string schedule must be normalized to {kind:cron, expr:...} in the
+    deployed jobs.json — else it reaches cron-plus verbatim and crashes every tick, stalling the fleet."""
+    import json
+    m = _mod()
+    out = json.loads(m._dump_jobs([{"name": "z", "schedule": "0 13 * * SUN", "prompt": "x", "enabled": True}]))
+    assert out["jobs"][0]["schedule"] == {"kind": "cron", "expr": "0 13 * * SUN"}   # dict, not bare string
+    # a dict schedule is passed through unchanged
+    out2 = json.loads(m._dump_jobs([{"name": "a", "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+                                     "prompt": "y", "enabled": True}]))
+    assert out2["jobs"][0]["schedule"] == {"kind": "cron", "expr": "0 9 * * *"}
+
+
+def test_validate_unique_ids_flags_collisions():  # invariant-audit M37
+    """cron-plus keys by id (minted from name); a dup id/name means one job runs the other's def and
+    the twin never fires. The single-pack merge + extension pass had no gate, and _by_name/
+    validate_ordering both collapse a dup name into one dict entry (blind to it)."""
+    m = _mod()
+    # duplicate explicit id
+    errs = m.validate_unique_ids([{"name": "a", "id": "x1"}, {"name": "b", "id": "x1"}])
+    assert any("x1" in e for e in errs), errs
+    # duplicate name (mints a colliding id)
+    assert m.validate_unique_ids([{"name": "dup"}, {"name": "dup"}]), "dup name must error"
+    # disabled placeholders never deploy -> not counted
+    assert m.validate_unique_ids([{"name": "c", "id": "y"},
+                                  {"name": "d", "id": "y", "enabled": False}]) == []
+    # a clean fleet passes
+    assert m.validate_unique_ids([{"name": "a", "id": "1"}, {"name": "b", "id": "2"}]) == []
+
+
+def test_current_fleet_has_no_id_collisions():  # invariant-audit M37 (regression on real data)
+    m = _mod()
+    assert m.validate_unique_ids(_live_jobs(m)) == [], "the deployed fleet has a colliding id/name"
+
+
+def test_dump_restores_source_sentinels_and_profiles(tmp_path, monkeypatch):  # invariant-audit M20
+    """dump-from-live reads the DEPLOYED jobs.json (schedules + models already EXPANDED by the deploy
+    transform). Writing the resolved per-install values back to SHARED source would bake one install's
+    jitter minute / endpoint for everyone — the sentinel + @profile representation must be restored
+    from the current source for jobs that still exist there."""
+    m = _mod()
+    src = tmp_path / "engine-crons.json"
+    src.write_text(json.dumps([
+        {"name": "canonical-assemble", "schedule": {"kind": "cron", "expr": "@jitter:weekly"}},
+        {"name": "brief", "schedule": {"kind": "cron", "expr": "@morning:30"}},
+        {"name": "reason-lane", "model": "@reasoning"},
+    ]))
+    monkeypatch.setattr(m, "ENGINE_CRONS_FILE", src)
+    monkeypatch.setattr(m, "PACK_DIR", tmp_path / "nopack")     # no domain-crons file -> skipped cleanly
+    live = [
+        {"name": "canonical-assemble", "schedule": {"kind": "cron", "expr": "10 13 * * 1"}},   # jitter-resolved
+        {"name": "brief", "schedule": {"kind": "cron", "expr": "30 7 * * *"}},                 # morning-resolved
+        {"name": "reason-lane", "model": "qwen3.5:27b", "provider": "custom",                  # profile-baked
+         "base_url": "http://h:1/v1", "ollama_num_ctx": 65536},
+        {"name": "new-live-job", "schedule": {"kind": "cron", "expr": "0 5 * * *"}},           # not in source
+    ]
+    out = {j["name"]: j for j in m._restore_source_reprs(live)}
+    assert out["canonical-assemble"]["schedule"]["expr"] == "@jitter:weekly", "jitter sentinel restored"
+    assert out["brief"]["schedule"]["expr"] == "@morning:30", "morning sentinel restored"
+    assert out["reason-lane"]["model"] == "@reasoning", "@profile ref restored"
+    assert not ({"provider", "base_url", "ollama_num_ctx"} & set(out["reason-lane"])), "baked endpoint dropped"
+    assert out["new-live-job"]["schedule"]["expr"] == "0 5 * * *", "a genuinely-new live job stays verbatim"
+
+
+def test_merge_packs_rewrites_intra_pack_after_targets():  # invariant-audit batch-3 re-verify (ordering)
+    """merge_packs prefixes domain job names to <pack>:<job>; an intra-pack `after:` target names a
+    SIBLING domain job that was ALSO prefixed, so it must be rewritten too — else the dependency
+    dangles at the bare pre-prefix name and validate_ordering rejects/misroutes it. An engine target
+    stays bare."""
+    m = _mod()
+    engine = [{"name": "engine-lane", "enabled": True},
+              {"name": "entity-backfill", "enabled": True}]        # an engine-template lane the pack drives
+    tier_of = {"engine-lane": "engine", "entity-backfill": "engine-template"}
+    packs = [{"name": "acme",
+              "prompts": {"entity-backfill": "do the backfill"},   # -> entity-backfill@acme
+              "domain": [
+                  {"name": "jobB", "enabled": True},
+                  # after: a sibling domain job, a driven engine-TEMPLATE lane, AND a pure-engine lane
+                  {"name": "jobA", "enabled": True,
+                   "after": ["jobB", "entity-backfill", "engine-lane"]}]}]
+    out, errors = m.merge_packs(engine, packs, tier_of=tier_of)
+    assert errors == [], errors
+    ja = next(j for j in out if j["name"] == "acme:jobA")
+    # sibling domain -> <pack>:, driven engine-template -> <job>@<pack>, pure-engine -> bare
+    assert ja["after"] == ["acme:jobB", "entity-backfill@acme", "engine-lane"], ja["after"]
+    # the composed fleet's ordering is now sound (no dangling after) — the whole point
+    assert m.validate_ordering(out)[1] == [], "rewritten after graph must validate"
+
+
+def test_restore_source_reprs_all_shapes_rename_and_profile_fields(tmp_path, monkeypatch):  # M20 re-verify
+    """_restore_source_reprs must: (a) restore a sentinel in the TOP-LEVEL `expr` shape (not just the
+    dict shape), (b) match a RENAMED live job by id, (c) preserve a PROFILE field the source set
+    independently of the @ref while dropping the deploy-baked ones."""
+    m = _mod()
+    src = tmp_path / "engine-crons.json"
+    src.write_text(json.dumps([
+        {"name": "toplevel-lane", "id": "t1", "expr": "@jitter:2h"},                 # top-level expr shape
+        {"name": "renamed-lane", "id": "r1", "schedule": {"kind": "cron", "expr": "@jitter:weekly"}},
+        {"name": "profile-lane", "id": "p1", "model": "@reasoning", "ollama_num_ctx": 8192},  # source-set field
+    ]))
+    monkeypatch.setattr(m, "ENGINE_CRONS_FILE", src)
+    monkeypatch.setattr(m, "PACK_DIR", tmp_path / "nopack")
+    live = [
+        {"name": "toplevel-lane", "id": "t1", "expr": "55 */2 * * *"},               # jitter-resolved top-level
+        {"name": "renamed-in-scheduler", "id": "r1", "schedule": {"kind": "cron", "expr": "10 13 * * 1"}},
+        {"name": "profile-lane", "id": "p1", "model": "qwen3.5:27b", "provider": "custom",
+         "base_url": "http://h:1/v1", "ollama_num_ctx": 65536},
+    ]
+    out = {j["id"]: j for j in m._restore_source_reprs(live)}
+    assert out["t1"]["expr"] == "@jitter:2h", "top-level-expr sentinel must be restored"
+    assert "schedule" not in out["t1"], "must keep source's top-level shape, not inject a schedule dict"
+    assert out["r1"]["schedule"]["expr"] == "@jitter:weekly", "renamed job matched by id + restored"
+    assert out["p1"]["model"] == "@reasoning"
+    assert out["p1"]["ollama_num_ctx"] == 8192, "source-set profile field preserved (source's value)"
+    assert not ({"provider", "base_url"} & set(out["p1"])), "deploy-baked endpoint fields dropped"
+
+
+def test_merge_packs_rejects_domain_name_shadowing_engine_lane():  # batch-3 re-verify (low)
+    """A domain job whose bare name shadows an engine (or driven engine-template) lane makes an
+    intra-pack after: target ambiguous — it would silently rebind to the domain twin. Fail loud."""
+    m = _mod()
+    engine = [{"name": "reshelve", "enabled": True}]
+    packs = [{"name": "acme", "domain": [{"name": "reshelve", "enabled": True}]}]   # shadows the engine lane
+    _, errors = m.merge_packs(engine, packs, tier_of={"reshelve": "engine"})
+    assert any("shadows" in e and "reshelve" in e for e in errors), errors

@@ -1,8 +1,8 @@
 diff --git a/tools/file_operations.py b/tools/file_operations.py
-index 78bdd8d63..38d41c3d0 100644
+index 78bdd8d..753c781 100644
 --- a/tools/file_operations.py
 +++ b/tools/file_operations.py
-@@ -73,6 +73,48 @@ def _strip_terminal_fence_leaks(text: str) -> str:
+@@ -73,6 +73,107 @@ def _strip_terminal_fence_leaks(text: str) -> str:
      return "".join(cleaned_lines)
  
  
@@ -48,10 +48,93 @@ index 78bdd8d63..38d41c3d0 100644
 +        return None
 +
 +
++_RESERVED_VAULT_FILES = {"log.md", "index.md", "agents.md", "hot.md", "readme.md",
++                         "health.md", "bundle.md"}
++
++
++def _reserved_file_reject(path: str) -> Optional[str]:
++    """The file tool must not be a weaker second write path around the enforced okengine-write MCP: a
++    cron agent carries BOTH, so this mirrors the write path's structural refusals for `.md` writes UNDER
++    the vault (WIKI_PATH) — non-vault file ops (logs, `_`-prefixed scripts) stay writable; fail-open on
++    any uncertainty (never block a legit write). Three refusals, matching write_server (invariant-audit
++    M12 + re-verify):
++      1. engine-managed reserved files (HOT/log/INDEX*/health/bundle/`_`/`.` — schema-EXEMPT, so
++         _schema_reject misses them);
++      2. PACK-declared `reserved_files` (else declaring a file reserved makes it MORE writable here);
++      3. a page whose current frontmatter is `status: tombstoned` (never resurrect — M18); a tombstoned
++         NORMAL page keeps its content slug, so a basename check alone cannot catch it."""
++    import os
++    if not path.lower().endswith(".md"):
++        return None
++    wiki = os.environ.get("WIKI_PATH")
++    if not wiki:
++        return None
++    try:
++        ap = os.path.realpath(path)
++        roots = [os.path.realpath(os.path.join(wiki, "wiki")), os.path.realpath(wiki)]
++        if not any(ap == r or ap.startswith(r + os.sep) for r in roots):
++            return None
++    except Exception:
++        return None
++    # basename from the RESOLVED target, not the raw path — a symlink 'innocent.md' -> 'HOT.md' must be
++    # judged by what it actually writes (re-verify).
++    base = os.path.basename(ap)
++    n = base.lower()
++    if n in _RESERVED_VAULT_FILES or n.startswith("index-") or base.startswith(("_", ".")):
++        return (f"'{path}' is an engine-managed structural/reserved vault file — not agent-writable "
++                "via the file tool. Curate the vault through the okengine-write MCP path (or hand-edit "
++                "out of band if a human change is truly intended).")
++    try:
++        from tools.schema_validator import reserved_files_for
++        if n in reserved_files_for(ap):
++            return (f"'{path}' is a pack-reserved file (schema reserved_files) — not agent-writable "
++                    "via the file tool.")
++    except Exception:
++        pass
++    try:
++        if os.path.isfile(ap):
++            import re as _re
++            with open(ap, "r", encoding="utf-8", errors="replace") as _fh:
++                _head = _fh.read(1000000)   # whole page: a heavily-cited entity's frontmatter can
++                                            # exceed 4KB, and _tombstone() preserves the full fm — a
++                                            # truncated read would miss the closing fence and fail open
++            _fm = _re.match(r"^\ufeff?---\r?\n(.*?)\r?\n---", _head, _re.DOTALL)
++            if _fm and _re.search(r"(?im)^status:\s*[\"']?tombstoned\b", _fm.group(1)):
++                return (f"'{path}' is tombstoned — not agent-writable via the file tool; write to its "
++                        "successor (superseded_by) or use the okengine-write tombstone tool.")
++    except Exception:
++        pass
++    return None
++
++
  def _detect_line_ending(sample: str) -> Optional[str]:
      """Return the dominant line ending in ``sample`` or None if undetermined.
  
-@@ -1337,6 +1379,16 @@ class ShellFileOperations(FileOperations):
+@@ -1251,6 +1352,9 @@ class ShellFileOperations(FileOperations):
+         path = self._expand_path(path)
+         if _is_write_denied(path):
+             return WriteResult(error=f"Delete denied: {path} is a protected path")
++        _rf = _reserved_file_reject(path)   # M12: don't let the file tool hard-delete an engine/pack-
++        if _rf:                             # reserved or tombstoned vault file (the MCP path never deletes)
++            return WriteResult(error=f"Delete denied: {_rf}")
+ 
+         # We can't shell out to ``rm`` here — it doesn't exist on Windows
+         # ``cmd.exe`` or PowerShell, so this code path is what's left when
+@@ -1297,6 +1401,13 @@ class ShellFileOperations(FileOperations):
+         for p in (src, dst):
+             if _is_write_denied(p):
+                 return WriteResult(error=f"Move denied: {p} is a protected path")
++        import os as _os                             # M12: a Move must not resurrect a tombstoned page or
++        _eff_dst = (_os.path.join(dst, _os.path.basename(src))   # land on/remove an engine/pack-reserved
++                    if _os.path.isdir(dst) else dst)             # vault file. `mv src DIR` lands at
++        for p in (src, _eff_dst):                    # DIR/basename(src) — guard the EFFECTIVE dest, not
++            _rf = _reserved_file_reject(p)           # the bare dir (which isn't .md and would slip it).
++            if _rf:
++                return WriteResult(error=f"Move denied: {_rf}")
+         result = self._exec(
+             f"mv {self._escape_shell_arg(src)} {self._escape_shell_arg(dst)}"
+         )
+@@ -1337,6 +1448,22 @@ class ShellFileOperations(FileOperations):
          if _is_write_denied(path):
              return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
  
@@ -65,10 +148,16 @@ index 78bdd8d63..38d41c3d0 100644
 +        if _sr:
 +            return WriteResult(error=f"Write rejected (schema): {_sr}")
 +
++        # Block a file-tool bypass of the enforced okengine-write MCP path for engine-managed
++        # structural vault files (HOT/log/INDEX/health/… — schema-exempt, so _schema_reject misses them).
++        _rf = _reserved_file_reject(path)
++        if _rf:
++            return WriteResult(error=f"Write rejected: {_rf}")
++
          # Capture pre-write content.  Two consumers want it:
          #
          #   1. The lint-delta layer (for in-process linters like ast.parse
-@@ -1483,6 +1535,11 @@ class ShellFileOperations(FileOperations):
+@@ -1483,6 +1610,17 @@ class ShellFileOperations(FileOperations):
          if _is_write_denied(path):
              return PatchResult(error=f"Write denied: '{path}' is a protected system/credential file.")
  
@@ -76,6 +165,12 @@ index 78bdd8d63..38d41c3d0 100644
 +        _echo = _detect_read_echo_corruption(new_string)
 +        if _echo:
 +            return PatchResult(error=f"Patch rejected: {_echo}")
++
++        # A str-replace edit of an engine-managed structural vault file is the same bypass as a full
++        # write — refuse it too (invariant-audit M12).
++        _rf = _reserved_file_reject(path)
++        if _rf:
++            return PatchResult(error=f"Patch rejected: {_rf}")
 +
          # Read current content
          read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"

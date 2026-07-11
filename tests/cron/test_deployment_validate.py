@@ -73,6 +73,20 @@ def test_keyless_stamp_warns_not_silently_passes(tmp_path, monkeypatch):
     assert any(lvl == "WARN" and "undetectable" in msg for lvl, _, msg in f), f
 
 
+def test_hermes_pin_one_sided_warns_not_silently_passes(tmp_path, monkeypatch):
+    """M22 one-sided-drift rule on the hermes_pin leg (sibling of the engine_release leg): an
+    older/partial ensure-runtime stamp can carry engine_release but NO hermes_pin (the key postdates
+    okengine#119). engine.version still pins a Hermes, so `hp and hr and hp != hr` short-circuits to
+    a silent PASS — a stale Hermes pin sails through the pin-drift gate. It must WARN 'undetectable',
+    never pass clean (invariant-audit completeness sweep)."""
+    f = _run_check(tmp_path, monkeypatch,
+                   {"version": "v0.9.0", "hermes_pin": "v2026.7.1"},   # engine.version pins a Hermes
+                   "engine_release: v0.9.0\n")                          # stamp has NO hermes_pin key
+    assert any(lvl == "WARN" and "hermes_pin" in msg and "undetectable" in msg
+               for lvl, _, msg in f), f
+    assert not any(lvl == "FAIL" for lvl, _, msg in f), f               # not a FAIL — it's undetectable
+
+
 def test_stamp_format_matches_ensure_runtime():
     """Cross-file contract: the keys this validator reads must be the keys
     ensure-runtime.sh actually prints."""
@@ -255,6 +269,16 @@ def test_runtime_ownership_root_lane_is_exempt(tmp_path, monkeypatch):
     assert f == [], f
 
 
+def test_runtime_ownership_covers_qmd_and_state(tmp_path, monkeypatch):  # invariant-audit M-B4.3
+    """qmd (search index bind-source) and state/ join the runtime tree — a root-recreated one is
+    unwritable by the lane uid and silently kills the index rebuild / stateful lanes, exactly like
+    jobs.json. The ownership check must cover them, not just cron-plus/scripts/config."""
+    import os
+    f = _run_runtime_ownership(tmp_path, monkeypatch, ["qmd", "state"], euid=os.getuid() + 1)
+    assert any(lvl == "FAIL" and "qmd" in msg for lvl, _, msg in f), f
+    assert any("state" in msg for _, _, msg in f), f
+
+
 def _run_schema_check(tmp_path, vault_schema, artifact):
     """Drive check_schema with a vault schema.yaml and an on-disk composed-schema.yaml artifact."""
     vault = tmp_path / "vault"
@@ -383,6 +407,51 @@ def test_stale_stamp_selfheals_against_running_engine(tmp_path, monkeypatch):
     assert len(warns) == 1, m.F
     # ...and no engine.version-vs-stamp FAIL, because after the heal the stamp matches the pin's series
     assert not [f for f in m.F if f[0] == "FAIL" and f[1] == "pins"], m.F
+
+
+def test_stale_hermes_pin_selfheals_against_baked_marker(tmp_path, monkeypatch):
+    """The HERMES half of okengine#192, found live on the v0.18.2 canary: a Hermes-bump image roll
+    without a re-stamp left About claiming the OLD Hermes and NOTHING validated it (the engine check
+    only covers engine_release). check_pins must compare the stamp's hermes_pin to the baked
+    $HERMES/.hermes_pin, self-heal, and WARN — exactly like the engine half."""
+    vault = tmp_path / "vault"; data = tmp_path / "data"; hermes = tmp_path / "hermes"
+    (vault / "wiki").mkdir(parents=True); data.mkdir(); hermes.mkdir()
+    (vault / "engine.version").write_text("engine: okengine\nversion: v0.10.9\nhermes_pin: v2026.7.1\n")
+    (data / "engine-runtime.yaml").write_text(              # STALE hermes_pin (canary roll, no re-stamp)
+        "engine_release: v0.10.9\nhermes_pin: v2026.7.1\nhermes_sha: abc\nengine_sha: def\n")
+    (hermes / ".okengine_release").write_text("v0.10.9\n")
+    (hermes / ".hermes_pin").write_text("v2026.7.7.2\n")    # the RUNNING Hermes, baked in the image
+
+    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    m = importlib.util.module_from_spec(spec); sys.modules["deployment_validate"] = m
+    spec.loader.exec_module(m)
+    m.F.clear(); m.VAULT, m.DATA, m.HERMES = vault, data, hermes
+    m.check_pins()
+
+    # stamp self-healed (About now reports the Hermes actually running)
+    assert "hermes_pin: v2026.7.7.2" in (data / "engine-runtime.yaml").read_text()
+    warns = [f for f in m.F if f[0] == "WARN" and "auto-refreshed" in f[2] and "Hermes" in f[2]]
+    assert len(warns) == 1, m.F
+    # NOTE: the pack's engine.version still pins the OLD hermes — that residual hp!=hr FAIL is the
+    # separate, pre-existing pack-pin check doing its job (the pack must re-validate + bump), so we
+    # only assert the STAMP was healed here.
+
+
+def test_no_hermes_pin_marker_is_silent(tmp_path, monkeypatch):
+    """A pre-marker image (no baked .hermes_pin) must not warn/heal — undetectable is skip, and the
+    stamp is left alone."""
+    vault = tmp_path / "vault"; data = tmp_path / "data"; hermes = tmp_path / "hermes"
+    (vault / "wiki").mkdir(parents=True); data.mkdir(); hermes.mkdir()
+    (vault / "engine.version").write_text("engine: okengine\nversion: v0.10.9\nhermes_pin: v2026.7.1\n")
+    (data / "engine-runtime.yaml").write_text("engine_release: v0.10.9\nhermes_pin: v2026.7.1\n")
+    (hermes / ".okengine_release").write_text("v0.10.9\n")   # no .hermes_pin baked
+    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    m = importlib.util.module_from_spec(spec); sys.modules["deployment_validate"] = m
+    spec.loader.exec_module(m)
+    m.F.clear(); m.VAULT, m.DATA, m.HERMES = vault, data, hermes
+    m.check_pins()
+    assert "hermes_pin: v2026.7.1" in (data / "engine-runtime.yaml").read_text()
+    assert not [f for f in m.F if "Hermes" in f[2] and "auto-refreshed" in f[2]], m.F
 
 
 def test_stamp_matching_running_engine_is_silent(tmp_path, monkeypatch):
@@ -515,3 +584,328 @@ def test_extension_with_lane_and_staged_dir_is_clean(tmp_path):
                               jobs=[_ext_job("okengine.glossary", "glossary_refresh.py")],
                               staged_dirs=["okengine.glossary"])
     assert not any(lvl == "FAIL" for lvl, _, _ in f), f
+
+
+def _load(tmp_path, monkeypatch):
+    """Import deployment_validate to exercise its pure helpers (env set so module import succeeds)."""
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["deployment_validate"] = m
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_staleness_subset_ignores_extension_additions(tmp_path, monkeypatch):
+    """The composed artifact (base⊕pack⊕extensions) must NOT read as STALE just because it carries
+    extension-owned types/namespaces/enum-values the base⊕pack recompose lacks — the bug that
+    false-flagged every lacuna/frontier deployment. Only MISSING/DISAGREEING pack governance is stale.
+    """
+    m = _load(tmp_path, monkeypatch)
+    f = m._artifact_missing_pack_governance
+    live = {"types": {"actor": {"required": ["type"]}}, "enums": {"tlp": ["clear", "amber"]}}
+    # artifact is a SUPERSET: an extension added `lacuna` + extended the tlp enum
+    disk = {"types": {"actor": {"required": ["type"]}, "lacuna": {"required": ["type"]}},
+            "enums": {"tlp": ["clear", "amber", "red"]}}
+    assert f(live.get("types"), disk.get("types")) is False      # extra ext type -> not stale
+    assert f(live.get("enums"), disk.get("enums")) is False       # extended enum -> not stale
+
+
+def test_staleness_subset_catches_real_drift(tmp_path, monkeypatch):
+    m = _load(tmp_path, monkeypatch)
+    f = m._artifact_missing_pack_governance
+    live = {"actor": {"required": ["type", "aliases"]}}
+    assert f(live, {"actor": {"required": ["type"]}}) is True     # artifact DISAGREES on a pack type
+    assert f(live, {}) is True                                    # artifact MISSING a pack type
+    assert f({"tlp": ["clear", "amber"]}, {"tlp": ["clear"]}) is True  # pack enum value dropped in artifact
+    assert f({"x": 1}, {"x": 1, "y": 2}) is False                 # pure superset scalar -> not stale
+
+
+def _load_dv(monkeypatch, vault, data, hermes):
+    monkeypatch.setenv("WIKI_PATH", str(vault))
+    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["deployment_validate"] = m
+    spec.loader.exec_module(m)
+    m.F.clear()
+    m.VAULT, m.DATA, m.HERMES = vault, data, hermes
+    return m
+
+
+def _write_path_dirs(tmp_path):
+    vault = tmp_path / "v"; (vault / "wiki").mkdir(parents=True)
+    hermes = tmp_path / "h"; (hermes / "scripts" / "cron").mkdir(parents=True)
+    (hermes / "config").mkdir(parents=True)
+    data = tmp_path / "d"; (data / "scripts").mkdir(parents=True)
+    (data / "config").mkdir(parents=True)
+    for name in ("schema_lib.py", "id_lib.py", "id_index.py", "converge.py"):
+        (hermes / "scripts" / "cron" / name).write_text("v1")
+        (data / "scripts" / name).write_text("v1")
+    (hermes / "config" / "base-schema.yaml").write_text("shape: v1\n")   # baked base-schema
+    (data / "config" / "base-schema.yaml").write_text("shape: v1\n")     # staged, in sync
+    return vault, hermes, data
+
+
+def test_write_path_libs_drift_fails(tmp_path, monkeypatch):
+    """The write path imports schema_lib/id_lib/id_index/converge from the BAKED /opt/hermes/scripts/
+    cron; a stage-only deploy leaves it stale. check_write_path_libs must FAIL on baked!=staged."""
+    vault, hermes, data = _write_path_dirs(tmp_path)
+    (data / "scripts" / "schema_lib.py").write_text("STAGED-NEWER")   # staged diverged from baked
+    m = _load_dv(monkeypatch, vault, data, hermes)
+    m.check_write_path_libs()
+    assert any(l == "FAIL" and a == "write-path" and "schema_lib.py" in msg for l, a, msg in m.F), m.F
+
+
+def test_write_path_base_schema_drift_fails(tmp_path, monkeypatch):  # invariant-audit M5
+    """The write server also validates against the engine base-schema, loaded from the BAKED
+    HERMES/config — same stale-vs-staged trap as the libs. A field-shape change staged but not
+    rebuilt must FAIL, not ship green."""
+    vault, hermes, data = _write_path_dirs(tmp_path)
+    (data / "config" / "base-schema.yaml").write_text("shape: v2  # staged newer\n")   # diverged from baked
+    m = _load_dv(monkeypatch, vault, data, hermes)
+    m.check_write_path_libs()
+    assert any(l == "FAIL" and a == "write-path" and "base-schema.yaml" in msg
+               for l, a, msg in m.F), m.F
+
+
+def test_write_path_libs_match_pass(tmp_path, monkeypatch):
+    vault, hermes, data = _write_path_dirs(tmp_path)
+    m = _load_dv(monkeypatch, vault, data, hermes)
+    m.check_write_path_libs()
+    assert not any(l == "FAIL" for l, _, _ in m.F), m.F
+
+
+def test_write_path_libs_missing_dir_warns_not_silent_pass(tmp_path, monkeypatch):
+    vault, hermes, data = _write_path_dirs(tmp_path)
+    m = _load_dv(monkeypatch, vault, data, tmp_path / "no-such-hermes")   # baked tree absent
+    m.check_write_path_libs()
+    assert any(l == "WARN" and a == "write-path" for l, a, _ in m.F), m.F   # undetectable, not a pass
+    assert not any(l == "FAIL" for l, _, _ in m.F)
+
+
+def test_write_path_lib_present_one_side_warns_not_silent(tmp_path, monkeypatch):  # invariant-audit M22
+    """A lib present baked-only or staged-only (e.g. a new _WRITE_PATH_LIBS entry that a rebuild or a
+    stage didn't carry across) is REAL drift — the write path may be running a lib the fleet can't
+    see. The old `if not (baked and staged): continue` silently skipped it (a per-file vacuous pass).
+    It must WARN (undetectable), never nothing."""
+    vault, hermes, data = _write_path_dirs(tmp_path)
+    (data / "scripts" / "id_index.py").unlink()                # staged copy gone, baked present
+    m = _load_dv(monkeypatch, vault, data, hermes)
+    m.check_write_path_libs()
+    assert any(l == "WARN" and a == "write-path" and "id_index.py" in msg and "MISSING" in msg
+               for l, a, msg in m.F), m.F
+    assert not any(l == "FAIL" for l, _, _ in m.F)             # one-sided is undetectable, not a spurious FAIL
+
+
+def test_write_path_base_schema_present_one_side_warns(tmp_path, monkeypatch):  # invariant-audit M22
+    """Same one-sided-drift hole for the baked base-schema: present on only one side is undetectable,
+    not a pass."""
+    vault, hermes, data = _write_path_dirs(tmp_path)
+    (data / "config" / "base-schema.yaml").unlink()            # staged gone, baked present
+    m = _load_dv(monkeypatch, vault, data, hermes)
+    m.check_write_path_libs()
+    assert any(l == "WARN" and a == "write-path" and "base-schema.yaml" in msg and "MISSING" in msg
+               for l, a, msg in m.F), m.F
+
+
+def test_write_path_libs_pins_write_server_imports():  # invariant-audit M1/M23
+    """_WRITE_PATH_LIBS is a hand-copy of the libs write_server imports from the BAKED tree; when it
+    drifts, check_write_path_libs silently stops guarding a lib (id_index was ADDED to write_server's
+    imports and nearly slipped past this list — the cross-surface contract that already broke once).
+    Bind them: every LOCAL module write_server imports must be either a tracked write-path lib OR an
+    explicitly MCP-image-only module (baked into the image, never staged to the cron tree, so it has
+    no baked-vs-staged drift surface). And no dead entries the server no longer imports."""
+    import ast
+    ws_src = (REPO / "okengine-mcp" / "write_server.py").read_text()
+    local_dirs = [REPO / "scripts" / "cron", REPO / "okengine-mcp"]
+    imported = set()
+    for n in ast.walk(ast.parse(ws_src)):
+        # cover both `import X` and `from X import ...` (a 5th lib pulled in via from-import must not
+        # slip the pin — the round-2 re-verify flagged the Import-only scan as bypassable)
+        mods = []
+        if isinstance(n, ast.Import):
+            mods = [a.name for a in n.names]
+        elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
+            mods = [n.module]
+        for mod in mods:
+            if "." in mod or mod == "write_server":
+                continue
+            if any((d / f"{mod}.py").is_file() for d in local_dirs):
+                imported.add(f"{mod}.py")
+    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    dv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dv)
+    tracked = set(dv._WRITE_PATH_LIBS)
+    # Image-only: baked beside write_server.py (okengine-mcp/) and imported from its OWN dir, NEVER
+    # staged to scripts/cron — so no baked-vs-staged drift pair exists to compare. converge.py is here
+    # (not scripts/cron; no cron script imports it) and so is scope.py. A change to either needs an
+    # image rebuild (caught by the version stamp), but it must NOT be in _WRITE_PATH_LIBS or the drift
+    # check hits the both-absent branch and silently never compares it (invariant-audit M23).
+    IMAGE_ONLY = {"scope.py", "converge.py"}
+    unclassified = imported - tracked - IMAGE_ONLY
+    assert not unclassified, (
+        f"write_server imports {sorted(unclassified)} but they are neither in _WRITE_PATH_LIBS "
+        f"(baked-vs-staged drift-checked) nor the image-only allowlist — classify each (is it staged "
+        f"to scripts/cron, or baked-only in okengine-mcp?) or the drift check silently skips it.")
+    dead = tracked - imported
+    assert not dead, f"_WRITE_PATH_LIBS lists {sorted(dead)} which write_server no longer imports"
+    # every tracked lib must actually live in scripts/cron (the staged tree) — an image-only lib parked
+    # here (the converge misclassification) has no staged copy and would be a permanent both-absent skip
+    for lib in tracked:
+        assert (REPO / "scripts" / "cron" / lib).is_file(), (
+            f"_WRITE_PATH_LIBS entry {lib} is not in scripts/cron — it has no staged copy to drift "
+            f"against, so it belongs in the image-only set, not the drift check")
+
+
+def test_report_write_failure_delivers_diagnosis_not_crash(tmp_path, monkeypatch, capsys):
+    """When the report file is foreign-owned/unwritable — the exact condition check_ownership catches —
+    main() must not crash on its OWN output; it prints the remedy to stderr and still emits findings."""
+    vault = tmp_path / "v"; (vault / "wiki" / "operational").mkdir(parents=True)
+    data = tmp_path / "d"; data.mkdir()
+    (vault / "wiki" / "operational" / "deployment-validation.md").mkdir()   # a dir -> write_text raises
+    m = _load_dv(monkeypatch, vault, data, tmp_path / "h")
+    rc = m.main()                                        # must NOT raise
+    assert isinstance(rc, int)
+    assert "fix-vault-ownership.sh" in capsys.readouterr().err
+
+
+def test_check_auth_fails_private_exposed_without_password(tmp_path, monkeypatch):
+    """L4: the in-gateway security gate must FAIL a private vault bound beyond loopback with no
+    password. It had no failing-case test."""
+    vault = tmp_path / "v"; (vault / "wiki").mkdir(parents=True)
+    m = _load_dv(monkeypatch, vault, tmp_path / "d", tmp_path / "h")
+    monkeypatch.setenv("OKENGINE_TRUST", "private")
+    monkeypatch.setenv("OKENGINE_BIND", "0.0.0.0")
+    monkeypatch.delenv("OKENGINE_READER_PASSWORD", raising=False)
+    monkeypatch.delenv("API_SERVER_ENABLED", raising=False); monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    m.check_auth()
+    assert any(l == "FAIL" and a == "auth" for l, a, _ in m.F), m.F
+
+
+def test_check_auth_passes_with_password(tmp_path, monkeypatch):
+    vault = tmp_path / "v"; (vault / "wiki").mkdir(parents=True)
+    m = _load_dv(monkeypatch, vault, tmp_path / "d", tmp_path / "h")
+    monkeypatch.setenv("OKENGINE_TRUST", "private")
+    monkeypatch.setenv("OKENGINE_BIND", "0.0.0.0")
+    monkeypatch.setenv("OKENGINE_READER_PASSWORD", "secret")
+    monkeypatch.delenv("API_SERVER_ENABLED", raising=False); monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    m.check_auth()
+    assert not any(a == "auth" for _, a, _ in m.F), m.F
+
+
+def _auth_env(monkeypatch):
+    monkeypatch.setenv("OKENGINE_TRUST", "public")   # isolate the api_server check from the bind rule
+    monkeypatch.setenv("OKENGINE_BIND", "127.0.0.1")
+    monkeypatch.delenv("API_SERVER_ENABLED", raising=False)
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+
+
+def test_check_auth_fails_chat_enabled_with_unlocked_api_server_toolset(tmp_path, monkeypatch):  # invariant-audit HIGH
+    """A config.yaml seeded before the v0.10.7 lockdown that later enables Agent Chat inherits the
+    broad default toolset (terminal/code_execution/...). The gate must FAIL it."""
+    vault = tmp_path / "v"; (vault / "wiki").mkdir(parents=True)
+    data = tmp_path / "d"; data.mkdir()
+    (data / "config.yaml").write_text("model: {default: x}\n")   # NO platform_toolsets.api_server
+    m = _load_dv(monkeypatch, vault, data, tmp_path / "h")
+    _auth_env(monkeypatch); monkeypatch.setenv("API_SERVER_ENABLED", "true")
+    m.check_auth()
+    assert any(l == "FAIL" and a == "auth" and "api_server" in msg for l, a, msg in m.F), m.F
+
+
+def test_check_auth_fails_non_allowlisted_api_server_toolset(tmp_path, monkeypatch):
+    """Allowlist, not blocklist: a dangerous name AND a composite alias that expands to broad tools
+    both fail (the alias would slip a dangerous-name blocklist — re-verify)."""
+    for toolset in ("[okengine, terminal]", "[okengine, hermes-api-server]"):
+        vault = tmp_path / f"v{hash(toolset)}"; (vault / "wiki").mkdir(parents=True)
+        data = tmp_path / f"d{hash(toolset)}"; data.mkdir()
+        (data / "config.yaml").write_text(
+            f"platforms: {{api_server: {{enabled: true}}}}\nplatform_toolsets: {{api_server: {toolset}}}\n")
+        m = _load_dv(monkeypatch, vault, data, tmp_path / "h")
+        _auth_env(monkeypatch)
+        m.check_auth()
+        assert any(l == "FAIL" and a == "auth" for l, a, _ in m.F), (toolset, m.F)
+
+
+def test_check_auth_fails_scalar_api_server_toolset(tmp_path, monkeypatch):
+    """A non-list value (scalar/dict) is treated by Hermes as unset -> broad default; must FAIL."""
+    vault = tmp_path / "v"; (vault / "wiki").mkdir(parents=True)
+    data = tmp_path / "d"; data.mkdir()
+    (data / "config.yaml").write_text("platform_toolsets: {api_server: okengine}\n")   # scalar
+    m = _load_dv(monkeypatch, vault, data, tmp_path / "h")
+    _auth_env(monkeypatch); monkeypatch.setenv("API_SERVER_ENABLED", "true")
+    m.check_auth()
+    assert any(l == "FAIL" and a == "auth" and "not a list" in msg for l, a, msg in m.F), m.F
+
+
+def test_check_auth_chat_enabled_by_key_alone_is_checked(tmp_path, monkeypatch):
+    """Hermes enables chat on API_SERVER_KEY alone — the gate must treat that as enabled too."""
+    vault = tmp_path / "v"; (vault / "wiki").mkdir(parents=True)
+    data = tmp_path / "d"; data.mkdir()
+    (data / "config.yaml").write_text("model: {default: x}\n")   # no lockdown
+    m = _load_dv(monkeypatch, vault, data, tmp_path / "h")
+    _auth_env(monkeypatch); monkeypatch.setenv("API_SERVER_KEY", "sk-something")
+    m.check_auth()
+    assert any(l == "FAIL" and a == "auth" for l, a, _ in m.F), m.F
+
+
+def test_check_auth_passes_locked_api_server_toolset(tmp_path, monkeypatch):
+    vault = tmp_path / "v"; (vault / "wiki").mkdir(parents=True)
+    data = tmp_path / "d"; data.mkdir()
+    (data / "config.yaml").write_text(
+        "platform_toolsets: {api_server: [okengine, okengine-write, web]}\n")   # web is allowlisted
+    m = _load_dv(monkeypatch, vault, data, tmp_path / "h")
+    _auth_env(monkeypatch); monkeypatch.setenv("API_SERVER_ENABLED", "true")
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    m.check_auth()
+    assert not any(a == "auth" for _, a, _ in m.F), m.F
+
+
+def test_check_crons_fails_dup_id_dup_name_missing_script(tmp_path, monkeypatch):
+    """L5: check_crons's FAIL branches (dup id/name, dangling script) were untested."""
+    import json as _json
+    vault = tmp_path / "v"; (vault / "wiki").mkdir(parents=True)
+    data = tmp_path / "d"; (data / "cron-plus").mkdir(parents=True); (data / "scripts").mkdir()
+    (data / "scripts" / "present.py").write_text("# ok")
+    (data / "cron-plus" / "jobs.json").write_text(_json.dumps({"jobs": [
+        {"id": "x", "name": "a", "script": "present.py"},
+        {"id": "x", "name": "b", "script": "gone.py"},      # dup id + dangling script
+        {"id": "y", "name": "a", "script": "present.py"},   # dup name
+    ]}))
+    m = _load_dv(monkeypatch, vault, data, tmp_path / "h")
+    m.check_crons()
+    msgs = " | ".join(msg for _, _, msg in m.F)
+    assert "duplicate job id x" in msgs, m.F
+    assert "duplicate job name a" in msgs, m.F
+    assert "missing script gone.py" in msgs, m.F
+
+
+def test_check_crons_missing_jobs_json_fails(tmp_path, monkeypatch):
+    vault = tmp_path / "v"; (vault / "wiki").mkdir(parents=True)
+    data = tmp_path / "d"; data.mkdir()
+    m = _load_dv(monkeypatch, vault, data, tmp_path / "h")
+    m.check_crons()
+    assert any(l == "FAIL" and "jobs.json missing" in msg for l, _, msg in m.F), m.F
+
+
+def test_staged_but_not_folded_warns_even_for_a_core_extension(tmp_path):  # invariant-audit M-B4.2 + re-verify
+    """A staged extension lane not folded into jobs.json is WARNed — and, critically, driven off the
+    STAGED dirs, NOT the extensions.yaml `enabled` map. A CORE default-on extension (okengine.
+    contradictions/timeline) is active + staged yet absent from `enabled`; the old enabled-map loop
+    missed exactly that worst case. Here `enabled` is EMPTY, yet the staged, unfolded lane still WARNs."""
+    import importlib.util as _il
+    import json as _json
+    import sys as _sys
+    import yaml as _yaml
+    vault = tmp_path / "vault"; data = tmp_path / "data"
+    (vault / ".okengine").mkdir(parents=True); (data / "cron-plus").mkdir(parents=True)
+    (vault / ".okengine" / "extensions.yaml").write_text(_yaml.safe_dump({"enabled": {}}))   # NOT in the map
+    (data / "cron-plus" / "jobs.json").write_text(_json.dumps({"jobs": []}))                 # nothing folded
+    extd = data / "scripts" / "okengine.contradictions"; extd.mkdir(parents=True)
+    (extd / "contradictions_scan.py").write_text("# a core lane script\n")                   # staged lane present
+    spec = _il.spec_from_file_location("deployment_validate", MOD)
+    m = _il.module_from_spec(spec); _sys.modules["deployment_validate"] = m
+    spec.loader.exec_module(m); m.F.clear(); m.VAULT, m.DATA = vault, data
+    m.check_extensions()
+    assert any(lvl == "WARN" and "okengine.contradictions" in msg and "NO lane" in msg
+               for lvl, _, msg in m.F), list(m.F)
+    assert not any(lvl == "FAIL" for lvl, _, _ in m.F), "staged-but-not-folded is a WARN, not a FAIL"

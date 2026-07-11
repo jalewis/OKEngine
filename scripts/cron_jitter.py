@@ -117,10 +117,18 @@ def expand_brief_jobs(jobs: list, brief_hour: int) -> int:
     so the same source ships to every deployment and each picks its own morning."""
     n = 0
     for job in jobs:
-        concrete = expand_morning_one(_job_expr(job), brief_hour)
+        expr = _job_expr(job)
+        concrete = expand_morning_one(expr, brief_hour)
         if concrete is not None:
             _set_job_expr(job, concrete)
             n += 1
+        elif isinstance(expr, str) and expr.strip().startswith("@morning"):
+            # Looks like a @morning sentinel but doesn't match @morning[:MM], so expand_morning_one
+            # returned None and the raw sentinel would ship to cron-plus — which can't parse it, so
+            # the brief lane silently never fires. Fail loud at the deploy gate, like @jitter above
+            # (the @morning path had no guard at any layer — invariant-audit).
+            raise ValueError(
+                f"malformed @morning schedule {expr!r} — expected @morning or @morning:MM (MM 0-59)")
     return n
 
 

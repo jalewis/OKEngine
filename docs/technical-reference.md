@@ -7,7 +7,7 @@ is domain-agnostic and shareable; deployment-specific details (hostnames, brands
 private packs) are deliberately absent, per the engine's own scrub rule.*
 
 *Current as of engine **v0.9.1** on Hermes-Agent **v0.18.0** (upstream tag
-`v2026.7.1`), July 2026. Pointers into the repo are given throughout; where this
+`v2026.7.7.2`), July 2026. Pointers into the repo are given throughout; where this
 document and the code disagree, the code wins.*
 
 ---
@@ -219,8 +219,9 @@ small set of carried patches, and overlays its own code. The discipline:
 
 ### 4.2 Upgrading the pin
 
-Moving to a new Hermes version is a documented procedure
-(`docs/hermes-upgrades/`): bump the pin → re-apply patches (3-way rebase of any
+Moving to a new Hermes version is a documented procedure (kept in the
+maintainer-internal `docs/hermes-upgrades/`, excluded from the public snapshot):
+bump the pin → re-apply patches (3-way rebase of any
 that fail; drop patches upstream absorbed) → acid-test all patches against a
 stock tree → build the image → roll a **guinea-pig deployment** first and run a
 gauntlet (config migration, cron ticker liveness, a `no_agent` lane, an agent

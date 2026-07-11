@@ -139,8 +139,12 @@ The engine ships **free-first** (a free Nemotron default + an all-`:free` fallba
 is only usable with the survival levers below — the trade is **throughput for completion**:
 lanes run more serially and slower, but finish instead of dying in a rate-limit storm.
 
-- **Cap concurrency** — `HERMES_CRON_MAX_PARALLEL` (gateway env; skeleton ships `2`). Set `1`
-  for the most rate-limit-tolerant (fully serial). This is the biggest lever.
+- **Stagger the schedules** — the OKEngine fleet runs under the **cron-plus** scheduler, which
+  spawns a subprocess per due job with **no global parallelism cap**, so the busiest minute is
+  set by how many lanes share a `schedule`. Spread coincident lanes across different minutes/hours
+  so they don't fire at once. This is the biggest lever under cron-plus. (`HERMES_CRON_MAX_PARALLEL`
+  in the skeleton compose governs only *native* Hermes cron and is **inert** under cron-plus —
+  cron-plus reads it nowhere; don't rely on it to throttle the free tier.)
 - **Keep the *whole* chain free** — `model.default` AND every `fallback_providers` entry on a
   `:free` tier (or `openrouter/free`, the **Free Models Router**, which routes to any available
   free model — the free counterpart of `openrouter/auto`; never use `openrouter/auto` itself, it

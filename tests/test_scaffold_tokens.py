@@ -46,3 +46,20 @@ def test_framework_init_supplies_every_skeleton_token():
     fi = INIT.read_text()
     missing = [t for t in _skeleton_tokens() if ('"' + t + '"') not in fi]
     assert not missing, f"framework_init.py _tokens is missing skeleton token(s): {sorted(missing)}"
+
+
+def test_no_dead_scaffold_tokens():  # invariant-audit B8.2
+    """The CONVERSE of the two tests above: a front-end must not carry a repl token that no skeleton
+    file references. Such a token is a DEAD knob — a `--brief-hour` flag / `{{BRIEF_HOUR}}` that
+    substitutes nothing (and misleads: its default differed from the real OKENGINE_BRIEF_HOUR env
+    knob), or a `{{CRON_ID_2}}` left behind when the skeleton dropped to one domain cron."""
+    skel = _skeleton_tokens()
+    # new-pack.sh: tokens in its repl dict ("{{TOKEN}}": e["TOKEN"])
+    np_repl = set(re.findall(r'"\{\{([A-Z][A-Z0-9_]*)\}\}":\s*e\[', NEWPACK.read_text()))
+    dead_np = sorted(np_repl - skel)
+    assert not dead_np, f"new-pack.sh substitutes token(s) that no skeleton file uses (dead knob): {dead_np}"
+    # framework_init.py: keys in its _tokens dict ("TOKEN": ...)
+    fi_keys = set(re.findall(r'"([A-Z][A-Z0-9_]*)":\s', INIT.read_text()))
+    # only consider keys that look like scaffold tokens (present in either front-end's vocabulary)
+    dead_fi = sorted((fi_keys & np_repl) - skel)
+    assert not dead_fi, f"framework_init.py supplies token(s) no skeleton file uses (dead knob): {dead_fi}"

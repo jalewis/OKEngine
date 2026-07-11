@@ -165,9 +165,21 @@ def _rewrite_links(root: Path, ns: str, move_map: dict[str, str], apply: bool) -
             continue
         if f"[[{ns}/" not in c:
             continue
-        new_c, n = pat.subn(repl, c)
-        if n and new_c != c:
-            changed += n
+        # Count ACTUAL rewrites, not `re.subn`'s match count: make_rewriter's repl returns the link
+        # UNCHANGED for any target not in move_map (every `[[ns/…]]` link is a match), so subn's tally
+        # counted untouched links too — it reported ~19675 "rewrites" when 6 links changed. Tally only
+        # matches whose replacement text actually differs.
+        n = [0]
+
+        def _repl(m, _r=repl, _n=n):
+            out = _r(m)
+            if out != m.group(0):
+                _n[0] += 1
+            return out
+
+        new_c = pat.sub(_repl, c)
+        if n[0] and new_c != c:
+            changed += n[0]
             if apply:
                 try:
                     p.write_text(new_c, encoding="utf-8")

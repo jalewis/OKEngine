@@ -109,8 +109,17 @@ def looks_like_drift_variant(name: str, canonical: set[str]) -> str | None:
 def main() -> int:
     canonical = load_canonical_list()
     if not canonical:
-        print("ERROR: could not parse canonical publisher list from vault CLAUDE.md", file=sys.stderr)
-        return 1
+        # No canonical publisher list configured (the vault CLAUDE.md has no `**Canonical names**`
+        # block) — there is nothing to drain against. A wake-gate must SKIP cleanly here, NOT exit 1:
+        # the list is OPTIONAL pack config, so a vault that doesn't curate one (e.g. a persona with no
+        # publisher taxonomy) must not error the lane every run — that reads as a fleet failure and
+        # feeds a spurious `## Script Error` to the agent. Add a backtick-quoted, comma-separated
+        # `**Canonical names**` block to CLAUDE.md to activate the drain.
+        print("=== publisher-canonical-drain wake-gate ===")
+        print(f"  vault: {VAULT}")
+        print("  SKIP: no canonical publisher list in CLAUDE.md (**Canonical names** block absent)")
+        print(json.dumps({"wakeAgent": False}))
+        return 0
     counts = scan_publishers()
 
     new_publishers: list[tuple[str, int]] = []

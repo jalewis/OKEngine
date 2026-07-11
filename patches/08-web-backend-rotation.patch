@@ -1,31 +1,38 @@
 diff --git a/tools/web_tools.py b/tools/web_tools.py
-index e66d0ee..097ff17 100644
+index 409b46f..0f46c62 100644
 --- a/tools/web_tools.py
 +++ b/tools/web_tools.py
-@@ -136,6 +136,32 @@ def _load_web_config() -> dict:
-     except (ImportError, Exception):
-         return {}
+@@ -201,6 +201,39 @@ def _list_registered_web_providers():
+         return []
  
-+# okengine (issue #190): opt-in round-robin across the keyed web-search backends. Set
-+# `web.backend: rotate` (or `web.search_backend: rotate`) to spread load across providers
-+# (e.g. Tavily + Exa) instead of pinning one, so no single free tier gets rate-limited. Config is
-+# read live per call and the counter advances per call. Additive: any other value / unset is
-+# unchanged. Pin extract to one provider with `web.extract_backend: <name>` if desired.
+ 
++# okengine (issue #190): opt-in round-robin across the AVAILABLE web-search backends. Set
++# `web.backend: rotate` to spread load across providers (e.g. Tavily + Exa + a plugin backend)
++# instead of pinning one, so no single free tier gets rate-limited. Availability resolves through
++# _is_backend_available (the upstream chokepoint) for the built-ins and through the
++# web_search_registry for plugin providers, so a registered provider (e.g. serper) joins the
++# rotation automatically — no hardcoded list to maintain. Config is read live per call and the
++# counter advances per call. Additive: any other value / unset is unchanged.
 +_OKENGINE_ROTATE_I = -1
++# xai deliberately excluded: its availability probe may hold OAuth state and it is a paid,
++# non-rate-limited tier — rotation exists to spread FREE-tier load.
++_OKENGINE_ROTATE_LEGACY_ORDER = (
++    "tavily", "exa", "parallel", "firecrawl", "searxng", "brave-free", "ddgs")
 +
 +
 +def _okengine_rotate_backend() -> str:
-+    """Next available (keyed) web backend, round-robin; normal single-pick order if none."""
++    """Next available web backend, round-robin; normal single-pick order if none."""
 +    global _OKENGINE_ROTATE_I
-+    avail = [b for b, ok in (
-+        ("tavily", _has_env("TAVILY_API_KEY")),
-+        ("exa", _has_env("EXA_API_KEY")),
-+        ("parallel", _has_env("PARALLEL_API_KEY")),
-+        ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL")),
-+        ("searxng", _has_env("SEARXNG_URL")),
-+        ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
-+        ("ddgs", _ddgs_package_importable()),
-+    ) if ok]
++    avail = [b for b in _OKENGINE_ROTATE_LEGACY_ORDER if _is_backend_available(b)]
++    for provider in _list_registered_web_providers():
++        name = getattr(provider, "name", "")
++        if not name or name == "xai" or name in _LEGACY_WEB_BACKENDS or name in avail:
++            continue
++        try:
++            if provider.is_available():
++                avail.append(name)
++        except Exception:  # noqa: BLE001 — a broken provider is skipped
++            continue
 +    if not avail:
 +        return "firecrawl"
 +    _OKENGINE_ROTATE_I = (_OKENGINE_ROTATE_I + 1) % len(avail)
@@ -35,12 +42,12 @@ index e66d0ee..097ff17 100644
  def _get_backend() -> str:
      """Determine which web backend to use (shared fallback).
  
-@@ -144,6 +170,8 @@ def _get_backend() -> str:
+@@ -209,6 +242,8 @@ def _get_backend() -> str:
      keys manually without running setup.
      """
      configured = (_load_web_config().get("backend") or "").lower().strip()
 +    if configured == "rotate":                       # okengine#190: spread load across providers
 +        return _okengine_rotate_backend()
-     if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}:
+     if configured in _LEGACY_WEB_BACKENDS or _registered_web_provider(configured) is not None:
          return configured
  

@@ -32,6 +32,28 @@ handles alerting + history + graphs. Example rule:
   expr: okengine_grounding_pct < 50
 ```
 
+**Also alert on the metrics going STALE — a dead fleet reads as healthy.** The value alerts above
+only fire while `health-export` keeps rewriting the textfile. If that cron (or the whole gateway)
+dies, the textfile collector keeps exporting the LAST-written values — frozen green — so
+`okengine_health_overall >= 2` never fires and the outage is invisible. Guard the freshness of the
+file itself, using the collector's built-in per-file mtime metric plus an `absent()` catch:
+
+```yaml
+- alert: OkengineMetricsStale       # health-export stopped rewriting the file (dead cron/fleet)
+  expr: time() - node_textfile_mtime_seconds{file="okengine.prom"} > 3 * 3600
+  for: 15m
+  annotations: {summary: "okengine health metrics are stale (>3h) — fleet may be dead"}
+- alert: OkengineMetricsAbsent       # series gone entirely (gateway down / scrape target lost)
+  expr: absent(okengine_health_overall)
+  for: 15m
+  annotations: {summary: "okengine health metrics absent — gateway or scrape target down"}
+```
+
+Set the `3 * 3600` threshold above `health-export`'s own schedule interval (a couple of run
+periods) so a single skipped run doesn't page. Deployments without a textfile collector that emits
+`node_textfile_mtime_seconds` should instead alert on `absent()` alone, or add a self-timestamp
+gauge to the export.
+
 ## Alerts (standalone)
 For deployments without Prometheus, `health-export` is **transition-based** (no fatigue): when the
 overall goes red, or a lane newly errors / falls off-model, it appends a timestamped line to

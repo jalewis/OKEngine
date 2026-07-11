@@ -14,6 +14,201 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
 > **About panel** (reader/cockpit deployment purpose + composition from live state); and now **pack
 > bundles** (v0.10.0). If you are jumping from v0.3.5, read v0.4.0 onward.
 
+## v0.11.3
+
+Invariant-audit **medium batches 4–8** — cron/lane robustness, the upgrade roll-forward gate,
+install/build/verify hygiene, and scaffold cleanup. Every fix carries a red test and was hardened by
+the checked-in adversarial re-verify runner, which ran to a clean pass across several rounds and
+repeatedly surfaced deeper residuals (including a regression introduced by an earlier fix). Two
+low-severity residuals are tracked, not shipped: `okengine#207` (roll-forward can't flag an
+out-of-taxonomy *retype* — fail-open by engine design) and `okengine#208`'s deeper deploy-path fix.
+
+### Fixed
+- **Roll-forward upgrade gate (`framework_upgrade.py`).** `framework validate` only asserted `wiki/`
+  *exists*, so a migration that corrupted page frontmatter passed and never rolled back. The gate now
+  runs a **conformance REGRESSION diff** against the pre-upgrade snapshot: it fails only on pages a
+  migration made non-conformant (conformant before, broken after), **never** on pre-existing
+  non-conformance (a real vault carries some — older/agent-authored pages missing `id`), and it is
+  skipped entirely for a pin-bump with no migrations. (An earlier baseline-less exhaustive scan
+  false-rolled-back every real vault; the fleet-roll canary caught it.) The migration-id collision
+  guard compares `to_version` on a prefix-normalized spelling (`v0.6.0` == `0.6.0`, but `0.6.0` ≠
+  `0.6.0.1`), and a same-id pack override with a genuinely different version fails loud. Apply-time
+  exceptions now roll back too.
+- **Deployment validator (`deployment_validate.py`).** `check_runtime_ownership` now covers the `qmd`
+  and `state` dirs; `check_extensions` drives off the **staged** extension dirs (catching a core
+  default-on extension the enabled-map iteration missed); the read-MCP baked-vs-staged lib drift and
+  the `check_pins` `hermes_pin` one-sided-drift case are now surfaced (M22 "undetectable, never a
+  vacuous pass").
+- **Panel SVG (`extensions/okengine.viz`).** An agent-authored `two-axis` panel with a malformed
+  shape (non-numeric x/y, scalar node, missing coords, a bare-date/`!!set` frontmatter field) crashed
+  the *entire* panel refresh lane. Coordinates coerce safely, the node/band/edge collections are
+  shape-filtered, `panel_hash` serializes dates/sets **deterministically** (no per-run churn), and the
+  lane-facing `svg_block` is guarded so one bad panel skips instead of aborting the sweep.
+- **Nightly ledger dates.** `lint_watcher`, `detect_field_loss`, `kb_health` and `page_quality_audit`
+  stamped their per-day ops ledgers with `datetime.now(timezone.utc)` — a late-evening lane in a
+  TZ-behind-UTC deployment (the fleet is `America/New_York`) filed "tonight's" report under *tomorrow*
+  and desynced the cohort. All four now use the deployment-local date.
+- **Entity fusion (`canonical_assemble.py`).** `_key` `json.dumps`'d a frontmatter value without a
+  default, so a union-mode dict field carrying a bare ISO date crashed the whole canonical-assembly
+  run; it now serializes (dates/sets, deterministically).
+- **Health export (`health_export.py`).** Added a scheduler-independent heartbeat gauge
+  (`okengine_health_export_timestamp_seconds`) so an alert fires when the exporter itself stops and
+  Prometheus scrapes a frozen `.prom`.
+- **Deploy / install / build hygiene.** `deploy-cron-scripts.sh` no longer swallows a `stage-panels`
+  failure (a panel-type collision) as a cosmetic "skipped"; `install-cron-plus.sh` scopes git
+  `safe.directory` so a HERMES_UID-owned managed clone can't brick the deploy on "dubious ownership";
+  `install-extract-cron.sh` refuses to install a host cron with no `WIKI_PATH` (it would silently
+  no-op on the container-only `/opt/vault`); `framework budget --status/--resume` fails loud on the
+  host instead of silently no-oping; `build-engine-image.sh` refuses a *dirty* reused `HERMES_SRC`
+  checkout; `post_deploy_verify.sh` checks the cockpit service; the smoke suite now exercises the MCP
+  surface (and, in dev mode, a DOM layer skipped for want of playwright no longer fails the run).
+- **`framework validate` false confidence (`okengine#208`).** On a loopback deploy it returned at the
+  "host ports bind loopback" branch before checking the MCP token — but the containerized MCP binds
+  `0.0.0.0` internally, so the built-in default token fails closed (`okengine#50`) and crash-loops even
+  on loopback. It now WARNs on the default token with no `ALLOW_DEFAULT_TOKEN`; `.env.example`'s
+  misleading "safe on loopback" comment is corrected. (`deploy.sh` is unaffected — `ensure-runtime`
+  generates a secret token.)
+- **Scaffold cleanup.** Removed the dead `--brief-hour`/`{{BRIEF_HOUR}}` knob (the real control is the
+  `OKENGINE_BRIEF_HOUR` env; the knob substituted nothing and even documented a different default) and
+  the sibling dead `{{CRON_ID_2}}`; a new test forbids a repl token no skeleton file uses. Dropped a
+  specific pack name from a first-party engine extension README (the engine layer stays
+  domain-agnostic). The cron-generator test suite no longer silently skips its whole self-contained
+  half when the gitignored generated artifact is absent (CI/fresh clone).
+
+## v0.11.2
+
+Invariant-audit **medium batch 3** — cron-generator contracts + the file-tool write-guard. Each fix
+with a red test, hardened by the checked-in re-verify runner (multiple rounds; see
+`docs/testing-and-audit.md` §6).
+
+### Fixed
+- **Cron generator (`cron_pack_split.py`).** A duplicate deployed job **id/name** silently ran one
+  job's definition and dropped its twin (cron-plus keys by id) — `validate_unique_ids` now gates every
+  write path (regen / regen_composed / the `compose` + `check` CLIs). `dump-from-live` clobbered the
+  source's `@jitter`/`@morning` schedule sentinels and `@profile` model refs with one install's
+  resolved values — it now restores the source representation across all three schedule shapes
+  (name-or-id matched). Multi-pack compose now rewrites intra-pack `after:` targets (domain **and**
+  driven engine-template) and runs `validate_ordering`, so a composed fleet can't ship a dangling
+  dependency; a domain job that shadows an engine/engine-template lane fails loud.
+- **File-tool write-guard (carried patch 01).** The Hermes file tool was a weaker second write path
+  around the enforced `okengine-write` MCP: a cron agent carries both, and the file tool enforced only
+  schema + read-echo. It now mirrors the write path's structural refusals for `.md` writes under the
+  vault — engine-managed **reserved files**, pack-declared **`reserved_files`**
+  (`schema_validator.reserved_files_for`), and **tombstoned** pages (never resurrect) — on **every**
+  write leg (`write_file` / `patch_replace` / `move_file` / `delete_file`; the V4A patch mode delegates
+  through them), so the enforced contract can't be bypassed via the file tool.
+
+## v0.11.1
+
+The invariant-audit **medium burn-down** (the follow-up to v0.11.0's critical/highs + first
+medium fold). Two fix batches, each finding fixed with a red test and hardened by the
+adversarial **re-verify loop** (see `docs/testing-and-audit.md` §6); the batch-2 render work
+took **seven** re-verify rounds to reach a consistent fix across every surface.
+
+### Fixed
+- **Write-path integrity** (batch 1). Tombstone-resurrect: the never-resurrect guard existed only
+  on the converge lane, so `update_entity`/`patch_entity`/`append_to_section` could silently
+  un-tombstone a retained tombstone — a shared `_tombstone_refuse` now guards all three. Converge
+  provenance-forgery: `merge_frontmatter` took the caller's value for server-managed keys; it now
+  preserves `created`/`created_by`/`discovered_by` (a caller could otherwise forge provenance).
+- **Cockpit + reader render on partitioned & walk-up vaults** (batch 2 — the flat-glob-vs-
+  partitioned / hardcoded-namespace / reserved-subdir class). A stream/doc/dataset/dashboard/
+  observation/prediction/backlink glob that didn't recurse showed nothing on a date-partitioned
+  dir; a hardcoded namespace tuple 404'd pack-owned and walk-up sub-domain pages; a leaf-only
+  reserved check surfaced `_archive/` retired pages in some surfaces but not others. Now a single
+  discoverability guard (`_visible_page`/`_reserved_seg`/`_hidden_page`, and `_skip_backlink_src`)
+  is applied uniformly across **every enumeration surface in both apps**, so browse count, served
+  ledger, dataset tabs, dashboards, observations, predictions, backlinks, and search all AGREE:
+  partitioned/walk-up content is found, `_archive/` retired pages are hidden everywhere, and the
+  engine's bare-`_` reshard bucket (`entities/x/_/x-force.md`) stays visible in both browse
+  (`len>1` exemption) and search (`!_?*`). The read/write `_safe` twin was aligned on `.md`
+  handling (a dotted slug like `openssl-3.0.7-advisory` no longer truncates/desyncs read from write).
+
+### Notes
+- Remaining audit mediums (30) + lows (33) are tracked in GitLab issues #203 / #202 with per-item
+  FIX/WAIVE dispositions; batches land on `main` and roll to the fleet per point release.
+
+## v0.11.0
+
+Runtime release: **Hermes pin bump v0.18.0 (v2026.7.1) → v0.18.2 (v2026.7.7.2)** — pulled for the
+upstream MCP stdio stability series (bounded initialize handshake, orphan reaping, idle-server
+recycling; our enforced write path and read MCP are stdio MCP servers) and the /stop-signal +
+provider-credential-corruption fix. Canaried on two deployments before the fleet roll.
+
+### Changed
+- **Carried patches 9 → 8.** Patch 09 (Serper backend recognition) DROPPED — v0.18.2's web-provider
+  registry resolves any registered plugin natively, so the `plugins/web/serper/` overlay needs no
+  patch. Patch 08 (`web.backend: rotate`) RESHAPED registry-based: plugin providers join the
+  rotation automatically; the hardcoded backend list is gone. Patch 02 re-anchored (content
+  identical). Full record: `docs/hermes-upgrades/v2026.7.7.2-v0.18.2.md`.
+
+### Added
+- **Baked Hermes-pin marker** (`.hermes_pin`) + `check_pins` validation/self-heal — the okengine#192
+  second half, found live when the canary's About panel kept claiming the old Hermes after the roll.
+- **`int` field-shape class** (base-schema `field_shapes`, pack-extensible): machine-computed counts
+  (`recent_reports`, `total_mentions`) REJECT a hand-authored non-int at the enforced write path
+  with the field named (digit-strings coerce). Live incident: an agent hand-set `recent_reports:`
+  to a list of source paths.
+
+### Fixed
+- **Cockpit numeric sorts rank junk last** in both directions — one malformed count value was taking
+  the #1 slot of the Most-active table (desc `reverse=True` flipped the numeric/junk key buckets).
+- **Pre-release invariant audit — 7 critical/high + 6 folded mediums**, each with a red regression
+  test and re-verified by targeted adversarial rounds (two rounds caught 5 further gaps, including a
+  read/write ship-blocker, before the tag). Highlights:
+  - **Enforced write path.** `_safe` now APPENDS `.md` instead of `with_suffix()` (a dotted slug like
+    `openssl-3.0.7-advisory` was truncated to `openssl-3.0.md`, colliding distinct pages and
+    dead-linking wikilinks) — fixed in BOTH the write path and its read-MCP twin (`server.py`), which
+    had desynced. `converge` merge now runs the machine-owned `int` guard (a dedup-redirected
+    `create_entity` bypassed it). `HEALTH.md`/`BUNDLE.md` and the full `INDEX-*`/dotfile family are
+    write-refused in lockstep with the validator's conformance exemption (else forgeable-yet-invisible).
+  - **Deployment validator.** `check_write_path_libs` no longer vacuously passes when a write-path lib
+    (or base-schema) is present on only one of the baked/staged sides; a contract test pins
+    `_WRITE_PATH_LIBS` to write_server's actual imports (and reclassifies `converge.py` as image-only,
+    so the drift check stops silently skipping it). The api_server auth gate uses a toolset allowlist
+    (a composite alias bypassed the old blocklist). The tick-lock post-deploy check measures lock AGE
+    against container start (a fossil lock can never signal a dead scheduler by presence alone).
+  - **Budget guard / cron dump.** Guard-pauses keyed on guard-owned ids (not job-side `paused_at`,
+    which can't discriminate an operator pause), write-ahead intent + cumulative owned-set across retry
+    ticks, atomic state; cron dump mints stable ids and un-pauses on truthiness.
+  - **Backup / reader / cockpit.** `TarInfo.mtime` preserved (restores no longer date every file to
+    1970); reader/cockpit sub-domain (walk-up) namespace resolution; cockpit open-prediction vocabulary
+    honors `{open, active}` (pinned to `pred_lib.OPEN_VALUES`); `_shape_conflicts` guards malformed
+    scalar `conflicts`/`values`/`sources` shapes (was a 500 in both surfaces).
+
+## v0.10.9
+
+Testing-depth release: the layer that catches **render/integration bugs on real data** — the class
+that kept reaching users past clean-fixture unit tests. A seeded **render-surface smoke harness**, two
+**vault-wide lints** (render + content) wired as nightly crons, a **write-time degeneration guard**,
+plus the second-round invariant-audit mediums and a cockpit cold-load fix.
+
+### Added
+- **Render-surface smoke harness** (`tests/e2e/smoke/`, `make smoke-e2e`) — stands up reader + cockpit
+  + mcp over a frozen seeded vault (no gateway/model) and asserts on the ACTUAL rendered HTML/PDF +
+  rendered DOM (playwright): fact-panel-below-body, wikilink cleanliness, nested-dashboard visibility,
+  deck PDF, multi-source embed resolution. A release gate (`docs/release-checklist.md` §2).
+- **Vault-wide render lint** (`scripts/cron/render_lint.py`, `make render-lint`) — crawls every page
+  through the reader and flags rendered-output defects (leaked builder markup, literal wikilinks,
+  broken embeds) on stored content that clean fixtures pass.
+- **Content-quality lint** (`scripts/cron/content_lint.py`, `make content-lint`) — flags degenerate
+  generations (repetition-loop word-salad); comma/wikilink-aware and validated across five live
+  vaults for zero false positives (a CJK-fusion signal was tried and dropped — it can't tell
+  code-switching from legitimate Chinese CTI).
+- Both lints **registered as nightly `no_agent` engine crons** (write `wiki/operational/{render,content}-lint.md`).
+- **Write-time degeneration guard** — `write_server` soft-flags a repetition-loop word-salad
+  `needs_review` at the enforced boundary, model-agnostic; mirrors the content lint (cross-surface
+  contract test).
+
+### Fixed
+- **8 medium invariant-audit findings** (run-2): the `HERMES_CRON_MAX_PARALLEL` no-op under cron-plus,
+  `kickstart.sh` exec-uid resolution, baked-vs-staged `base-schema` drift detection, Prometheus
+  dead-fleet staleness alerting, the cockpit curated-"Other" nested-dashboard glob, `framework upgrade`
+  rollback clobbering concurrently-modified pages, the mcp index-maintainer `last_seen` ordering, and
+  `budget_guard` unknown-window fail-loud.
+- **Cockpit overview cold-load** — the tab blocked ~8s re-scanning thousands of entity/source pages
+  whenever the 120s dir cache expired; now stale-while-revalidate + a startup warm (sub-second).
+
 ## v0.10.8
 
 Correctness sweep: a cockpit-rendering fix from an operator report, the lacuna wake-gate

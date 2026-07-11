@@ -424,6 +424,10 @@ function mdLite(s) {
   });
   h = h.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
     (m, t, u) => `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${t}</a>`);
+  // internal linked-title citation `[APT41](entities/a/apt41)` -> clickable page link (openPage);
+  // http links already became <a> above so they won't match here.
+  h = h.replace(/\[([^\]]+)\]\(([^\s)]+)\)/g,
+    (m, t, p) => `<a class="wl" data-page="${esc(p.replace(/\.md$/, ""))}">${t}</a>`);
   return h.replace(/\n/g, "<br>");
 }
 function appendBubble(role, text) {

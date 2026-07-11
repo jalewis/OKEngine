@@ -31,9 +31,35 @@ def _esc(s) -> str:
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+def _num(v) -> float:
+    """Coerce a coordinate to a float, defaulting to 0.0. The panel is agent-authored,
+    so a node/band can carry a non-numeric x/y ("high", None, a list). float() would raise
+    and crash the whole refresh lane; here it degrades to the axis origin (invariant-audit B6.1)."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _hash_default(o):
+    """Deterministic JSON fallback for panel values yaml.safe_load yields that json can't serialize:
+    a bare ISO date -> datetime.date, a !!set -> set. Sets are SORTED, not str(set) — str(set)'s
+    order is PYTHONHASHSEED-dependent, so hashing it would change every process run and rewrite the
+    page's SVG block on every refresh (perpetual churn, violating the idempotent contract). Bare
+    dates were already deterministic; this pins the set case too (invariant-audit B6.1 re-verify)."""
+    if isinstance(o, (set, frozenset)):
+        return sorted(map(str, o))
+    return str(o)
+
+
 def panel_hash(panel: dict) -> str:
+    # The panel comes from yaml.safe_load of page frontmatter, which turns bare ISO dates into
+    # datetime.date and !!set into set — both non-JSON-serializable. Without a default, json.dumps
+    # raises TypeError on a perfectly VALID panel carrying an `as_of: 2026-07-10` field, and (since
+    # this runs after render) the exception escaped svg_block's render-only guard and aborted the
+    # whole panel-svg refresh lane. _hash_default serializes them DETERMINISTICALLY (invariant-audit B6.1).
     return hashlib.sha1(f"r{_RENDERER_REV}:".encode()
-                        + json.dumps(panel, sort_keys=True).encode()).hexdigest()[:8]
+                        + json.dumps(panel, sort_keys=True, default=_hash_default).encode()).hexdigest()[:8]
 
 
 def render_panel_svg(panel: dict) -> str | None:
@@ -46,11 +72,13 @@ def render_panel_svg(panel: dict) -> str | None:
     W, H = 820, 520
     ML, MR, MT, MB = 50, 30, 46, 56
     PW, PH = W - ML - MR, H - MT - MB
-    px = lambda v: ML + max(0.0, min(1.0, float(v or 0))) * PW          # noqa: E731
-    py = lambda v: MT + PH - max(0.0, min(1.0, float(v or 0))) * PH     # noqa: E731
-    nodes = panel.get("nodes") or []
-    bands = panel.get("x_bands") or []
-    edges = panel.get("edges") or []
+    px = lambda v: ML + max(0.0, min(1.0, _num(v))) * PW          # noqa: E731
+    py = lambda v: MT + PH - max(0.0, min(1.0, _num(v))) * PH     # noqa: E731
+    # agent-authored — keep only well-shaped entries so one bad node/band/edge can't crash the
+    # lane. nodes/bands must be dicts; an edge is any 2+-element sequence of slugs (invariant-audit B6.1).
+    nodes = [n for n in (panel.get("nodes") or []) if isinstance(n, dict)]
+    bands = [b for b in (panel.get("x_bands") or []) if isinstance(b, dict)]
+    edges = [e for e in (panel.get("edges") or []) if isinstance(e, (list, tuple)) and len(e) >= 2]
 
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="100%" '
              f'style="max-width:{W}px;font-family:system-ui,-apple-system,sans-serif;">',
@@ -60,7 +88,7 @@ def render_panel_svg(panel: dict) -> str | None:
         x0, x1 = px(b.get("from", 0)), px(b.get("to", 1))
         if i % 2:
             parts.append(f'<rect x="{x0:.1f}" y="{MT}" width="{x1 - x0:.1f}" height="{PH}" fill="{_C["band"]}"/>')
-        if float(b.get("from", 0)) > 0:
+        if _num(b.get("from")) > 0:
             parts.append(f'<line x1="{x0:.1f}" y1="{MT}" x2="{x0:.1f}" y2="{MT + PH}" '
                          f'stroke="{_C["grid"]}" stroke-width="0.8" stroke-dasharray="3,3"/>')
         parts.append(f'<text x="{(x0 + x1) / 2:.1f}" y="{MT + PH + 16}" text-anchor="middle" '
@@ -79,11 +107,11 @@ def render_panel_svg(panel: dict) -> str | None:
             continue
         a, b = by_slug.get(e[0]), by_slug.get(e[1])
         if a and b:
-            parts.append(f'<line x1="{px(a["x"]):.1f}" y1="{py(a["y"]):.1f}" x2="{px(b["x"]):.1f}" '
-                         f'y2="{py(b["y"]):.1f}" stroke="{_C["edge"]}" stroke-width="1"/>')
+            parts.append(f'<line x1="{px(a.get("x")):.1f}" y1="{py(a.get("y")):.1f}" x2="{px(b.get("x")):.1f}" '
+                         f'y2="{py(b.get("y")):.1f}" stroke="{_C["edge"]}" stroke-width="1"/>')
     # label slotting: within loose x-columns, spread labels that would overlap vertically
     laid = []
-    for n in sorted(nodes, key=lambda n: (float(n.get("x") or 0), float(n.get("y") or 0))):
+    for n in sorted(nodes, key=lambda n: (_num(n.get("x")), _num(n.get("y")))):
         cx, cy = px(n.get("x")), py(n.get("y"))
         ly = cy
         for ox, oy in laid:
@@ -106,10 +134,18 @@ def render_panel_svg(panel: dict) -> str | None:
 def svg_block(panel: dict) -> str | None:
     """The marker-wrapped block embedded in a page body. The hash lets a refresh
     lane skip pages whose panel data hasn't changed."""
-    svg = render_panel_svg(panel)
-    if svg is None:
+    # The field-level coercions above cover the known bad shapes; this outer guard is the
+    # lane's last line of defense — an unforeseen shape skips ONE page's panel instead of
+    # aborting the whole refresh lane mid-sweep. It MUST wrap panel_hash too: that runs after
+    # render and json.dumps'd the raw panel, so a non-serializable field escaped a render-only
+    # guard and crashed the lane (invariant-audit B6.1 re-verify).
+    try:
+        svg = render_panel_svg(panel)
+        if svg is None:
+            return None
+        return f"{MARK_OPEN} v={panel_hash(panel)} -->\n{svg}\n{MARK_CLOSE}"
+    except Exception:
         return None
-    return f"{MARK_OPEN} v={panel_hash(panel)} -->\n{svg}\n{MARK_CLOSE}"
 
 
 def upsert_block(body: str, panel: dict) -> str | None:

@@ -201,13 +201,33 @@ def pack_migrations_dir(pack: Path) -> Path:
 
 def load_all_migrations(engine_dir: Path, pack: Path) -> list:
     """Engine migrations + the pack's own, merged and ordered by to_version (then id).
-    A pack-local migration with the same id as an engine one overrides it (pack wins)."""
-    by_id = {}
-    for m in load_migrations(engine_dir):
-        by_id[m.id] = m
-    for m in load_migrations(pack_migrations_dir(pack)):      # pack-aware hook
-        by_id[m.id] = m
+    A pack-local migration with the same id as an engine one may INTENTIONALLY override it (pack
+    wins) — but ONLY when they share a to_version; a same-id/DIFFERENT-to_version pair is an accidental
+    id collision that would silently suppress the engine migration forever (invariant-audit B5.2),
+    so fail loud and make the author pick a unique id."""
+    eng = {m.id: m for m in load_migrations(engine_dir)}
+    by_id = dict(eng)
     meta = _engine_meta()
+
+    def _same_version(a: str, b: str) -> bool:
+        # Compare on a NORMALIZED spelling, not the lossy 3-tuple _semver (invariant-audit B5.2, two
+        # re-verify rounds): a legit override may spell the shared version differently ("v0.6.0" vs
+        # "0.6.0" vs "engine-v0.6.0") and must NOT trip the collision guard — but _semver captures
+        # only X.Y.Z, so it wrongly equated "0.6.0" with a genuinely-different "0.6.0.1"/"0.6.0-rc1"
+        # and let a real suppression through. Strip only the prefix noise (case, "engine-", leading
+        # "v"); everything after the patch component stays significant.
+        def _norm(v: str) -> str:
+            return str(v).strip().lower().removeprefix("engine-").lstrip("v")
+        return _norm(a) == _norm(b)
+
+    for m in load_migrations(pack_migrations_dir(pack)):      # pack-aware hook
+        prior = eng.get(m.id)
+        if prior is not None and not _same_version(prior.to_version, m.to_version):
+            raise SystemExit(
+                f"pack migration id {m.id!r} (to_version {m.to_version}) collides with the ENGINE "
+                f"migration of the same id (to_version {prior.to_version}) — the pack would silently "
+                "SUPPRESS the engine migration. Give the pack migration a UNIQUE id.")
+        by_id[m.id] = m
     return sorted(by_id.values(), key=lambda m: (meta._semver(m.to_version) or (0, 0, 0), m.id))
 
 
@@ -222,16 +242,76 @@ def preview_upgrade(pack: Path, plan: Plan) -> list:
 
 
 def _default_validator(pack: Path):
-    """Roll-forward gate: re-run `framework validate`; returns (ok, summary)."""
+    """Roll-forward gate — STRUCTURAL half: re-run `framework validate`. The page-conformance
+    REGRESSION half (`_conformance_regressions`) is done separately in the orchestration, where the
+    pre-upgrade snapshot is available as a baseline — it MUST have one, else pre-existing
+    non-conformant pages (a real vault has them: older/agent-authored pages missing `id`, etc.)
+    false-roll-back a legitimate upgrade (the fleet-roll regression the exhaustive scan caused)."""
     try:
         spec = importlib.util.spec_from_file_location(
             "framework_validate", _HERE / "framework_validate.py")
         fv = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fv)
         rc = fv.main([str(pack), "--quiet"])
-        return (rc == 0, f"framework validate → exit {rc}")
+        if rc != 0:
+            return (False, f"framework validate → exit {rc}")
+        return (True, "framework validate → exit 0")
     except Exception as e:                  # never let a broken validator wedge an upgrade
         return (True, f"validation skipped ({e})")
+
+
+def _page_failure_map(root: Path) -> dict:
+    """{wiki-relative-posix: reason} for EVERY non-conformant page under `root/wiki` (root = a pack
+    OR a snapshot's `tree/`). Complete (no cap): the failing set must be whole to diff before/after.
+    Fail-open on import error; a per-page read/parse error is skipped, never aborts the scan."""
+    try:
+        sv = importlib.util.spec_from_file_location(
+            "schema_validator", _HERE.parent / "tools" / "schema_validator.py")
+        schema_validator = importlib.util.module_from_spec(sv)
+        sv.loader.exec_module(schema_validator)
+    except Exception:
+        return {}
+    wiki = root / "wiki"
+    if not wiki.is_dir():
+        return {}
+    out: dict = {}
+    for p in sorted(wiki.rglob("*.md")):
+        if p.name.startswith(("_", ".")) or p.name.startswith("INDEX"):
+            continue
+        try:
+            reason = schema_validator.schema_reject_reason(str(p), p.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            reason = None
+        if reason:
+            out[p.relative_to(wiki).as_posix()] = reason
+    return out
+
+
+def _sample_page_failures(pack: Path, cap: int = 300) -> list:
+    """EXHAUSTIVE OKF conformance scan of `pack/wiki`; up to `cap` `path: reason` strings for pages
+    that violate their type's schema (missing/invalid required field, bad YAML, absent type). This is
+    the raw after-scan; the roll-forward GATE diffs it against the pre-upgrade baseline via
+    `_conformance_regressions` so pre-existing failures don't roll back a legit upgrade. Does NOT flag
+    an out-of-taxonomy retype (schema_reject_reason is fail-open; `strict_types:false` engine base
+    default) — see `okengine#207`."""
+    return [f"{rel}: {reason}" for rel, reason in sorted(_page_failure_map(pack).items())[:cap]]
+
+
+def _conformance_regressions(before_root: Path, after_root: Path, cap: int = 300) -> list:
+    """Pages that REGRESSED conformance across the migration: non-conformant AFTER but conformant
+    (or failing DIFFERENTLY) BEFORE. Pre-existing failures with the same reason on both sides are NOT
+    the migration's fault and are excluded — else a legitimate upgrade rolls back over stale data
+    (the false-rollback the baseline-less exhaustive scan caused on every real vault). Returns up to
+    `cap` `path: reason` strings."""
+    before = _page_failure_map(before_root)
+    after = _page_failure_map(after_root)
+    out = []
+    for rel, reason in sorted(after.items()):
+        if before.get(rel) != reason:       # NEW failure, or a page now failing for a DIFFERENT reason
+            out.append(f"{rel}: {reason}")
+            if len(out) >= cap:
+                break
+    return out
 
 
 # Overridable so callers/tests can inject a validator without a full pack on disk.
@@ -278,15 +358,46 @@ def added_since_snapshot(pack: Path, snap_dir: Path) -> set:
     return {rel for rel in _scope_files(pack, snapshots_abs) if rel not in snap_set}
 
 
-def restore(pack: Path, snap_dir: Path, added: Optional[set] = None) -> int:
+def changed_since_snapshot(pack: Path, snap_dir: Path) -> set:
+    """Rel paths present in BOTH the pack and the snapshot whose bytes now differ — the files the
+    just-run migration MODIFIED. Capture this right after apply (alongside added_since_snapshot,
+    before the roll-forward gate) so a rollback reverts ONLY the migration's own edits. A page that
+    a concurrent writer (cron content lane / MCP write) modifies during the slow validation window
+    is NOT in this frozen set, so restore() leaves it untouched instead of clobbering it back to the
+    pre-upgrade snapshot (invariant-audit — #12 only covered ADDED files, not modified ones)."""
+    tree = snap_dir / "tree"
+    snap_set = set(_scope_files(tree, (tree / SNAPSHOTS_REL).resolve()))
+    out = set()
+    for rel in snap_set:
+        cur = pack / rel
+        if not cur.exists():
+            continue                                             # deleted -> restore() always recreates
+        try:
+            if cur.read_bytes() != (tree / rel).read_bytes():
+                out.add(rel)
+        except OSError:
+            out.add(rel)                                         # unreadable now -> treat as changed
+    return out
+
+
+def restore(pack: Path, snap_dir: Path, added: Optional[set] = None,
+            modified: Optional[set] = None) -> int:
     """Roll the pack source back to a snapshot: delete files the migration added, then restore
-    every snapshotted file (reverting modifications and recreating deletions). Returns #changes.
+    the snapshotted files it changed (reverting modifications and recreating deletions). Returns
+    #changes.
 
     `added` is the migration's added-set captured right after apply (see added_since_snapshot):
     when given, ONLY those files are removed, so live-vault writes made after the capture point
     survive the rollback (invariant-audit #12). When None, fall back to 'everything newer than the
     snapshot' — correct for a static pack, but on a LIVE vault this clobbers concurrent content
-    writes, so live callers MUST pass `added`."""
+    writes, so live callers MUST pass `added`.
+
+    `modified` is the migration's changed-set (see changed_since_snapshot), captured at the same
+    point. When given, a snapshotted file that STILL EXISTS is reverted only if it is in this set —
+    so a page that a concurrent writer edits during the validation window (and which the migration
+    never touched) keeps its new content instead of being clobbered back to the snapshot. Deleted
+    snapshotted files are always recreated regardless. When None, every snapshotted file is reverted
+    (correct for a static pack; live callers MUST pass `modified`)."""
     tree = snap_dir / "tree"
     snapshots_abs = (pack / SNAPSHOTS_REL).resolve()
     snap_set = set(_scope_files(tree, (tree / SNAPSHOTS_REL).resolve()))
@@ -301,6 +412,8 @@ def restore(pack: Path, snap_dir: Path, added: Optional[set] = None) -> int:
                 n += 1
     for rel in snap_set:                                      # restore content (+ recreate deleted)
         dst = pack / rel
+        if modified is not None and dst.exists() and rel not in modified:
+            continue                                          # concurrent write to an untouched file — keep it
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(tree / rel, dst)
         n += 1
@@ -392,10 +505,29 @@ def main(argv: list) -> int:
                         {"at": now_iso, "from": plan.pin, "to": target,
                          "migrations": [m.id for m in plan.migrations]})
         print(f"  snapshot: .okengine/snapshots/{snap.name} (pre-upgrade source)")
-    changes = apply_upgrade(pack, plan, now_iso)
-    # Freeze the migration's added-set NOW — before the (slower) validation gate — so a rollback
-    # removes only what the migration added, not live-vault writes made during that window (#12).
+    try:
+        changes = apply_upgrade(pack, plan, now_iso)
+    except Exception as e:
+        # A migration that mutates several files THEN raises (bad transform, missing file, a perms
+        # error on one page) would leave the pack HALF-UPGRADED. The Phase-3 doc promises auto-rollback
+        # on a bad migration, but that path was wired ONLY to the roll-forward VALIDATION result — an
+        # apply-time exception fell straight through to a CLI stack trace, snapshot untouched
+        # (invariant-audit). Roll back on ANY apply failure, not just a failed gate.
+        if snap:
+            n = restore(pack, snap, added=added_since_snapshot(pack, snap),
+                        modified=changed_since_snapshot(pack, snap))
+            shutil.rmtree(snap, ignore_errors=True)
+            print(f"\n  ✗ migration FAILED mid-apply: {e}")
+            print(f"  ↩ ROLLED BACK to the pre-upgrade source ({n} files restored) — pack unchanged.")
+        else:
+            print(f"\n  ✗ migration FAILED mid-apply: {e}; --no-snapshot was set, so NO automatic "
+                  "rollback. Restore the pack manually.")
+        return 1
+    # Freeze the migration's added- AND modified-sets NOW — before the (slower) validation gate — so
+    # a rollback removes only what the migration added and reverts only what it changed, never
+    # live-vault writes (new OR edited pages) made during that window (#12 + the modified-set gap).
     added = added_since_snapshot(pack, snap) if snap else None
+    modified = changed_since_snapshot(pack, snap) if snap else None
     print(f"\nApplied → pin {target}" + (f" (hermes {htag})" if htag else ""))
     for c in changes:
         print(f"  {c}")
@@ -406,11 +538,22 @@ def main(argv: list) -> int:
         if snap:
             prune_snapshots(pack, a.keep_snapshots)
         return 0
-    ok, summary = VALIDATOR(pack)               # roll-forward gate
+    ok, summary = VALIDATOR(pack)               # roll-forward gate (structural: framework validate)
+    # Page-conformance REGRESSION check — ONLY when a migration actually transformed pages (a
+    # pin-bump-only upgrade changed nothing, so it can't corrupt anything) AND we have a snapshot to
+    # diff against. Fail only on pages the migration made non-conformant, never on pre-existing
+    # failures a real vault carries — else a legit upgrade rolls back over stale data (the fleet-roll
+    # regression the baseline-less exhaustive scan caused).
+    if ok and snap and plan.migrations:
+        reg = _conformance_regressions(snap / "tree", pack, cap=300)
+        if reg:
+            ok = False
+            summary = (f"{len(reg)}+ vault page(s) REGRESSED conformance after the migration "
+                       f"(e.g. {reg[0]}) — rolling back")
     print(f"\nRoll-forward check: {summary}")
     if not ok:
         if snap:
-            n = restore(pack, snap, added=added)
+            n = restore(pack, snap, added=added, modified=modified)
             shutil.rmtree(snap, ignore_errors=True)   # the failed attempt's snapshot is spent
             print(f"  ↩ ROLLED BACK to the pre-upgrade source ({n} files restored) — pack unchanged.")
         else:

@@ -77,6 +77,25 @@ def check_pins():
             except OSError:
                 add("FAIL", "pins", f"runtime stamp {stamped} != running engine {running} and the "
                                     "stamp is not writable — About reports a version not running")
+    # The HERMES half of the same #192 desync: the engine check above never covered the stamp's
+    # hermes_pin, so a Hermes-bump image roll left About claiming the OLD Hermes with nothing
+    # catching it (found live on the v0.18.2 canary). build-engine-image now bakes the pin as
+    # $HERMES/.hermes_pin; compare + self-heal exactly like the engine release. Pre-marker image
+    # -> skip silently.
+    baked_hp = HERMES / ".hermes_pin"
+    running_hp = baked_hp.read_text(encoding="utf-8").strip() if baked_hp.is_file() else ""
+    if running_hp and rt is not None:
+        stamped_hp = str(rt.get("hermes_pin", ""))
+        if stamped_hp and stamped_hp != running_hp:
+            rt["hermes_pin"] = running_hp
+            try:
+                rt_path.write_text("".join(f"{k}: {v}\n" for k, v in rt.items()), encoding="utf-8")
+                add("WARN", "pins", f"runtime stamp said Hermes {stamped_hp} but the running gateway "
+                                    f"is {running_hp} — an image roll didn't re-stamp; auto-refreshed. "
+                                    "Fold `ensure-runtime` into the roll so the stamp never lags.")
+            except OSError:
+                add("FAIL", "pins", f"runtime stamp Hermes {stamped_hp} != running {running_hp} and "
+                                    "the stamp is not writable — About reports a Hermes not running")
     if not ev or not rt:
         add("WARN", "pins", "engine.version or runtime stamp missing — pin drift undetectable")
         return
@@ -93,8 +112,34 @@ def check_pins():
                             "re-validate the pack against the running engine and bump the pin")
     hp = str(ev.get("hermes_pin", ""))
     hr = str(rt.get("hermes_pin", rt.get("hermes", rt.get("hermes_tag", ""))))
-    if hp and hr and hp != hr:
+    if hp and not hr:
+        # M22 one-sided-drift rule (also enforced on the engine_release leg above and in
+        # check_write_path_libs / post_deploy_verify): a pin present on only ONE side is
+        # UNDETECTABLE, never a silent pass. An older/partial ensure-runtime stamp can carry
+        # engine_release but no hermes_pin (the key predates okengine#119), so a stale Hermes pin
+        # would sail through here vacuously — WARN instead (invariant-audit completeness sweep).
+        add("WARN", "pins", "runtime stamp carries no hermes_pin — Hermes pin drift undetectable")
+    elif hp and hr and hp != hr:
         add("FAIL", "pins", f"hermes_pin {hp} != runtime Hermes {hr}")
+
+
+def _artifact_missing_pack_governance(live, disk) -> bool:
+    """True iff `disk` (the on-disk composed artifact = base ⊕ pack ⊕ ENABLED EXTENSIONS) is MISSING
+    or DISAGREES on something `live` (a fresh base ⊕ pack recompose, WITHOUT extension fragments)
+    produces. A SUBSET test, not equality: the artifact legitimately carries extra extension-owned
+    types/namespaces/owners and extension-added enum values, which an equality check wrongly read as
+    drift — false-flagging STALE on EVERY schema-bringing-extension deployment (lacuna/frontier/…).
+    Trade-off: a pack that REMOVES a type/enum without regenerating the artifact isn't caught here
+    (rare; surfaced by the type_alias-shadow / orphaned-namespace checks)."""
+    if isinstance(live, dict):
+        if not isinstance(disk, dict):
+            return True
+        return any(k not in disk or _artifact_missing_pack_governance(v, disk[k]) for k, v in live.items())
+    if isinstance(live, list):
+        if not isinstance(disk, list):
+            return True
+        return any(x not in disk for x in live)     # every base⊕pack value must survive in the artifact
+    return live != disk
 
 
 def check_schema():
@@ -119,22 +164,24 @@ def check_schema():
     for ns in ((root.get("partitioning") or {}).get("namespaces") or {}):
         if not (VAULT / "wiki" / ns).is_dir():
             add("WARN", "schema", f"partitioned namespace wiki/{ns}/ does not exist")
-    # STALENESS (#12): the enforced write path (merged_schema) prefers the on-disk
-    # .okengine/composed-schema.yaml UNCONDITIONALLY when present, but ONLY `framework extensions
-    # enable/disable` ever regenerates it — no deploy/upgrade/edit does. So a schema.yaml edit not
-    # paired with an extension toggle is silently IGNORED on the write path (the frozen artifact
-    # wins). We already recomputed the live `composed` above; compare the governance-bearing
-    # sections and WARN on drift (the write path is using stale rules).
+    # STALENESS (#12): the enforced write path prefers the on-disk .okengine/composed-schema.yaml
+    # UNCONDITIONALLY when present, but ONLY `framework extensions enable/disable` regenerates it —
+    # no deploy/upgrade/edit does. So a schema.yaml edit not paired with an extension toggle is
+    # silently IGNORED on the write path (the frozen artifact wins). The live `composed` above is
+    # base⊕pack ONLY (schema_lib.compose_schema takes no extension fragments here, and the extension
+    # composer isn't staged in the gateway). The ARTIFACT is base⊕pack⊕extensions — so compare as a
+    # SUBSET, never equality: it's stale only if MISSING/DISAGREEING on current base⊕pack governance;
+    # its extra extension-owned entries are legitimate. (Equality here false-flagged every deployment
+    # with a schema-bringing extension — lacuna/frontier/… — enabled.)
     art = VAULT / ".okengine" / "composed-schema.yaml"
     if art.is_file() and composed and not any(l == "FAIL" and c == "schema" for l, c, _ in F):
         on_disk = _yaml(art) or {}
         keys = ("types", "enums", "partitioning", "permissions", "owners", "review")
-        if {k: composed.get(k) for k in keys} != {k: on_disk.get(k) for k in keys}:
-            add("WARN", "schema", "composed-schema.yaml is STALE — it differs from a live recompose "
-                "of schema.yaml + base + extensions, and the enforced write path uses the on-disk "
-                "(stale) copy, so recent schema.yaml edits are not applied. Regenerate it: re-run "
-                "the deploy (it recomposes an existing artifact) or any `framework extensions "
-                "enable/disable`.")
+        if any(_artifact_missing_pack_governance(composed.get(k), on_disk.get(k)) for k in keys):
+            add("WARN", "schema", "composed-schema.yaml is STALE — it is missing or disagrees with a "
+                "live base+pack recompose of schema.yaml, and the enforced write path uses the on-disk "
+                "copy, so recent schema.yaml edits are not applied. Regenerate it: re-run the deploy "
+                "(it recomposes an existing artifact) or any `framework extensions enable/disable`.")
 
 
 def check_subdomains():
@@ -293,17 +340,6 @@ def check_rules():
 
 
 def check_extensions():
-    ef = VAULT / ".okengine" / "extensions.yaml"
-    if not ef.is_file():
-        return
-    d = _yaml(ef) or {}
-    # An enabled extension only stages a /opt/data/scripts/<id>/ dir when it ships in-gateway
-    # cron LANES (top-level *.py -> deploy-cron-scripts stages them; extension_compose synthesizes
-    # a job whose `script:` is <SCRIPTS_ROOT>/<id>/<file>). A sidecar (runs as its own container),
-    # a panels-only, or a schema-fragment-only extension stages NO *.py — deploy-cron-scripts skips
-    # it with a warning and creates no dir. FAILing those is a false positive that ERRORs the lane.
-    # So the missing-dir is only a real failure when a DEPLOYED cron job actually references that
-    # dir (a lane whose script isn't staged); check_crons independently FAILs the dangling ref too.
     jf = DATA / "cron-plus" / "jobs.json"
     jobs = []
     if jf.is_file():
@@ -311,11 +347,32 @@ def check_extensions():
             jobs = json.loads(jf.read_text()).get("jobs", [])
         except Exception:
             pass  # check_crons already FAILs on an unparseable jobs.json
-    for ext in (d.get("enabled") or {}):
-        stages_lanes = any(f"/scripts/{ext}/" in (j.get("script") or "") for j in jobs)
-        if stages_lanes and not (DATA / "scripts" / ext).is_dir():
-            add("FAIL", "extensions", f"enabled extension '{ext}' has cron lanes but no staged "
-                                      "scripts dir — its lanes are dead; run deploy-cron-scripts")
+    # Drive off the STAGED extension dirs (/opt/data/scripts/<id>/), NOT the extensions.yaml `enabled`
+    # map: that map lists OPT-IN extensions only, while deploy-cron-scripts stages the EFFECTIVE active
+    # set (explicit ∪ core-not-disabled). A core default-on lane extension (okengine.contradictions /
+    # timeline) is active + staged yet absent from `enabled`, so an enabled-map loop misses exactly the
+    # worst under-reported case (invariant-audit M-B4.2, re-verify). A staged dir with a *.py IS a lane
+    # extension (deploy-cron-scripts only creates a dir + stages *.py for job/lane extensions; panels/
+    # sidecar/schema-only stage nothing), so the WARN can't false-positive on those.
+    sroot = DATA / "scripts"
+    staged = sorted(p.name for p in sroot.iterdir() if p.is_dir()) if sroot.is_dir() else []
+    referenced = set()
+    for j in jobs:
+        mm = re.search(r"/scripts/([^/]+)/", j.get("script") or "")
+        if mm:
+            referenced.add(mm.group(1))
+    # FAIL: a deployed job references an extension dir that isn't staged — the lane is dead.
+    for ext in sorted(referenced):
+        if not (sroot / ext).is_dir():
+            add("FAIL", "extensions", f"cron job references /scripts/{ext}/ but no staged scripts "
+                                      "dir — its lane is dead; run deploy-cron-scripts")
+    # WARN: an extension staged lane scripts (*.py) but NO job references it — the fold never ran
+    # (deploy-cron-plus-jobs skipped), so the extension is active while its lanes never schedule:
+    # silently inert with every gate green. WARN, not FAIL (never hard-block a deploy on this).
+    for ext in staged:
+        if ext not in referenced and any((sroot / ext).glob("*.py")):  # glob-ok: a staged extension scripts dir is FLAT, never a sharded namespace
+            add("WARN", "extensions", f"extension '{ext}' staged scripts but has NO lane in "
+                "jobs.json — its cron lanes may not have been folded (run deploy-cron-plus-jobs)")
 
 
 def check_ownership():
@@ -356,7 +413,10 @@ def check_runtime_ownership():
         return  # root writes regardless of owner — no muddle. The muddle is a NON-root lane uid
                 # that doesn't match the tree (e.g. compose default 10000 vs an operator's 1003).
     strays = []
-    for rel in ("cron-plus", "plugins/cron-plus", "scripts", "config"):
+    # qmd (the search index bind-source) and state/ join the runtime tree: a root-recreated
+    # .hermes-data/qmd or state/ is unwritable by the lane uid, so the index rebuild / stateful lanes
+    # silently die the same way jobs.json does — check them too (invariant-audit M-B4.3).
+    for rel in ("cron-plus", "plugins/cron-plus", "scripts", "config", "qmd", "state"):
         d = DATA / rel
         if not d.is_dir():
             continue
@@ -385,6 +445,13 @@ def check_runtime_ownership():
             "repair with a root `docker run -v <pack>:/p alpine chown -R <uid>:<gid> /p/.hermes-data`.")
 
 
+# ALLOWLIST, not a dangerous-name blocklist: chat's api_server toolset may ONLY contain these. A
+# blocklist missed the ways broad tools get in — a composite alias (`hermes-api-server`) that Hermes
+# expands to terminal/code_execution, or a non-list value that Hermes treats as unset -> broad
+# default (re-verify). Anything outside this set (or a non-list, or unset while enabled) FAILs.
+_API_SERVER_SAFE_TS = {"okengine", "okengine-write", "web", "no_mcp"}
+
+
 def check_auth():
     trust = os.environ.get("OKENGINE_TRUST", "private")
     bind = os.environ.get("OKENGINE_BIND", "127.0.0.1")
@@ -392,11 +459,105 @@ def check_auth():
     if trust == "private" and bind not in ("", "127.0.0.1", "localhost") and not pw:
         add("FAIL", "auth", "private vault exposed beyond loopback with NO password")
 
+    # config.yaml is seeded ONCE from the template and never reconciled (ensure-runtime leaves an
+    # existing one untouched). The secure `platform_toolsets.api_server: [okengine, okengine-write]`
+    # lockdown was added to the template later (v0.10.7) — so a deployment seeded before it that then
+    # enables Agent Chat inherits the BROAD default toolset (terminal / code_execution / file /
+    # computer_use) on a network-exposed endpoint, and nothing validated it (invariant-audit HIGH).
+    # Chat enables on ANY of: API_SERVER_ENABLED, an API_SERVER_KEY (Hermes enables on the key alone),
+    # or platforms.api_server.enabled (re-verify: the first two were unchecked).
+    enabled = (str(os.environ.get("API_SERVER_ENABLED", "")).strip().lower() in ("1", "true", "yes", "on")
+               or bool(str(os.environ.get("API_SERVER_KEY", "")).strip()))
+    cfg = _yaml(DATA / "config.yaml") if (DATA / "config.yaml").is_file() else None
+    if cfg:
+        plats = cfg.get("platforms") or {}
+        if isinstance(plats.get("api_server"), dict) and plats["api_server"].get("enabled"):
+            enabled = True
+    if enabled:
+        if cfg is None:
+            add("WARN", "auth", "Agent Chat (api_server) appears enabled but config.yaml is unreadable "
+                "here — the api_server toolset lockdown is UNVERIFIABLE (undetectable, not a pass).")
+        else:
+            ts = ((cfg.get("platform_toolsets") or {}).get("api_server"))
+            if not isinstance(ts, list):
+                add("FAIL", "auth", "Agent Chat (api_server) is enabled but platform_toolsets.api_server "
+                    f"is not a list ({type(ts).__name__}) — Hermes then uses the broad default toolset "
+                    "(terminal/code_execution/file/computer_use) on a network endpoint. Set it to "
+                    "[okengine, okengine-write] (see config/config.yaml.template).")
+            elif (bad := {str(x).strip() for x in ts} - _API_SERVER_SAFE_TS):
+                add("FAIL", "auth", f"Agent Chat (api_server) toolset has non-allowlisted member(s) "
+                    f"{sorted(bad)} — a composite/alias can expand to terminal/code_execution/file. "
+                    f"Restrict platform_toolsets.api_server to {sorted(_API_SERVER_SAFE_TS)}.")
+
+
+# The libs the enforced okengine-write MCP (write_server.py) imports from the BAKED scripts/cron tree
+# (HERMES/scripts/cron) AND that deploy-cron-scripts.sh ALSO stages to DATA/scripts. Only libs present
+# in BOTH places have a baked-vs-staged drift surface: a stage-only deploy leaves the WRITE PATH on the
+# OLD baked lib while the cron fleet + this validator (which import the staged copy) run the NEW one —
+# it ships green while the write guard is stale (invariant-audit).
+#   NB converge.py is NOT here: it lives only in okengine-mcp/ (baked beside write_server.py, imported
+#   from its own dir) and is never staged to scripts/cron, so it has no baked-vs-staged pair to compare
+#   — it's image-only like scope.py (a change needs an image rebuild, caught by the version stamp, not
+#   this drift check). Listing it here made check_write_path_libs hit the both-absent branch and never
+#   actually compare it, and the M23 pin enshrined the wrong bucket (invariant-audit round-2 re-verify).
+_WRITE_PATH_LIBS = ("schema_lib.py", "id_lib.py", "id_index.py")
+
+
+def check_write_path_libs():
+    baked_dir, staged_dir = HERMES / "scripts" / "cron", DATA / "scripts"
+    if not baked_dir.is_dir() or not staged_dir.is_dir():
+        add("WARN", "write-path", f"cannot compare baked vs staged write-path libs — "
+            f"{baked_dir if not baked_dir.is_dir() else staged_dir} absent (undetectable, not a pass)")
+        return
+    for name in _WRITE_PATH_LIBS:
+        baked, staged = baked_dir / name, staged_dir / name
+        if not (baked.is_file() and staged.is_file()):
+            # Present on one side, absent on the other = a real drift (a lib newly added to
+            # _WRITE_PATH_LIBS that a rebuild/stage didn't carry across), NOT a pass. Only when
+            # BOTH are absent is there nothing to compare. Silent `continue` here masked exactly
+            # the drift this check exists to catch (invariant-audit M22 — missing key is a WARN
+            # "undetectable", never a vacuous pass).
+            if baked.is_file() != staged.is_file():
+                present, absent = (baked, staged) if baked.is_file() else (staged, baked)
+                add("WARN", "write-path", f"{name} exists in {present.parent} but is MISSING from "
+                    f"{absent.parent} — cannot verify the write path runs the current lib "
+                    f"(undetectable, not a pass). Rebuild the gateway image and re-stage.")
+            continue
+        try:
+            if baked.read_bytes() != staged.read_bytes():
+                add("FAIL", "write-path", f"{name} DIFFERS between the baked write path ({baked}) and "
+                    f"the staged copy ({staged}) — the enforced MCP write server is running a STALE "
+                    f"lib. Rebuild the gateway image (build-engine-image.sh, or the id-index overlay); "
+                    f"staging alone does not reach write_server. See docs/id-index-runbook.md.")
+        except OSError as e:
+            add("WARN", "write-path", f"{name}: cannot compare ({e})")
+    # The write server ALSO validates against the engine-owned base-schema layer, which it loads from
+    # the BAKED HERMES/config — same stale-vs-staged trap as the libs above: a schema field-shape
+    # change staged to DATA/config but not rebuilt into the image leaves the write guard enforcing the
+    # OLD shape (invariant-audit M5). Compare the two copies the same way.
+    baked_bs, staged_bs = HERMES / "config" / "base-schema.yaml", DATA / "config" / "base-schema.yaml"
+    if baked_bs.is_file() and staged_bs.is_file():
+        try:
+            if baked_bs.read_bytes() != staged_bs.read_bytes():
+                add("FAIL", "write-path", f"base-schema.yaml DIFFERS between the baked write path "
+                    f"({baked_bs}) and the staged copy ({staged_bs}) — the enforced MCP write server "
+                    f"validates against a STALE base schema. Rebuild the gateway image; staging alone "
+                    f"does not reach write_server. See docs/id-index-runbook.md.")
+        except OSError as e:
+            add("WARN", "write-path", f"base-schema.yaml: cannot compare ({e})")
+    elif baked_bs.is_file() != staged_bs.is_file():
+        # Same one-sided-drift hole as the libs: present baked-only or staged-only is undetectable,
+        # not a pass (invariant-audit M22).
+        present, absent = (baked_bs, staged_bs) if baked_bs.is_file() else (staged_bs, baked_bs)
+        add("WARN", "write-path", f"base-schema.yaml exists in {present.parent} but is MISSING from "
+            f"{absent.parent} — cannot verify the write path validates against the current base "
+            f"schema (undetectable, not a pass).")
+
 
 def main() -> int:
     for c in (check_pins, check_schema, check_subdomains, check_crons,
               check_timezone, check_partition_dups, check_rules, check_extensions,
-              check_ownership, check_runtime_ownership, check_auth):
+              check_ownership, check_runtime_ownership, check_auth, check_write_path_libs):
         try:
             c()
         except Exception as e:
@@ -417,12 +578,22 @@ def main() -> int:
         L += [f"| {l} | {a} | {m} |" for l, a, m in F]
     L.append("")
     out = VAULT / "wiki" / "operational" / "deployment-validation.md"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("\n".join(L), encoding="utf-8")
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("\n".join(L), encoding="utf-8")
+        dest = "-> wiki/operational/deployment-validation.md"
+    except OSError as e:
+        # The report file (or its dir) is foreign-owned (root, from a bare `docker exec` write), so
+        # the lane uid can't overwrite it — the exact uid-desync condition check_ownership exists to
+        # catch. A raw PermissionError here would crash ON THE VALIDATOR'S OWN OUTPUT, swallowing the
+        # FAIL diagnosis it just computed (which names that very file). Fail loud with the remedy but
+        # STILL print the findings below, so the diagnosis is never lost (okengine#178 peer pattern).
+        print(f"deployment-validate: ERROR cannot write {out}: {e} — likely a foreign-owned (root) "
+              "report file. Repair: scripts/fix-vault-ownership.sh <deployment-dir>", file=sys.stderr)
+        dest = "(report unwritable — see stderr)"
     for l, a, m in F:
         print(f"  {l:<4} [{a}] {m}")
-    print(f"deployment-validate: {'FAIL' if fails else 'PASS'} ({fails} fail, {warns} warn) "
-          "-> wiki/operational/deployment-validation.md")
+    print(f"deployment-validate: {'FAIL' if fails else 'PASS'} ({fails} fail, {warns} warn) {dest}")
     print(json.dumps({"wakeAgent": False}))
     return 1 if fails else 0
 

@@ -46,3 +46,17 @@ def test_engine_daily_brief_ships_the_sentinel():
     crons = json.loads((REPO / "config" / "engine-crons.json").read_text())
     brief = next(j for j in crons if j["name"] == "daily-brief")
     assert brief["schedule"]["expr"] == "@morning:30", brief["schedule"]
+
+
+def test_malformed_morning_fails_loud():
+    """A @morning-prefixed but unexpandable expr (a typo) must fail loud at the deploy expander —
+    else the raw sentinel ships to cron-plus and the brief lane silently never fires (invariant-audit).
+    The sibling @jitter path already raises; @morning had no guard at any layer."""
+    import pytest
+    with pytest.raises(ValueError, match="malformed @morning"):
+        cj.expand_brief_jobs([{"id": "x", "schedule": {"expr": "@morning:7:30"}}], 7)
+    # well-formed @morning still expands; a plain cron is left untouched
+    jobs = [{"id": "a", "schedule": {"expr": "@morning:30"}}, {"id": "b", "schedule": {"expr": "0 9 * * *"}}]
+    assert cj.expand_brief_jobs(jobs, 7) == 1
+    assert jobs[0]["schedule"]["expr"] == "30 7 * * *"
+    assert jobs[1]["schedule"]["expr"] == "0 9 * * *"

@@ -18,6 +18,7 @@ set -uo pipefail
 GW=${OKENGINE_GATEWAY_SVC:-gateway}
 MCP=${OKENGINE_MCP_SVC:-okengine-mcp}
 READER=${OKENGINE_READER_SVC:-okengine-reader}
+COCKPIT=${OKENGINE_COCKPIT_SVC:-okengine-cockpit}
 
 pass=0; warn=0; fail=0
 ok()  { printf "  \033[32mPASS\033[0m  %s\n" "$1"; pass=$((pass+1)); }
@@ -39,7 +40,15 @@ echo "================================="
 
 # 1. containers running ------------------------------------------------------
 echo "[1] containers"
-for svc in "$GW" "$MCP" "$READER"; do
+# The cockpit renders briefings/dashboards/predictions/decks — verify it too, but only when the
+# compose actually defines it (minimal stacks legitimately omit it). A hardcoded 3-service list
+# never checked the cockpit, so a cockpit that failed to start passed verification (invariant-audit
+# B7.5).
+svcs="$GW $MCP $READER"
+if docker compose config --services 2>/dev/null | grep -Fxq "$COCKPIT"; then
+    svcs="$svcs $COCKPIT"
+fi
+for svc in $svcs; do
     state=$(docker compose ps --status running --services 2>/dev/null | grep -Fx "$svc")
     if [ -n "$state" ]; then ok "$svc is running"
     else bad "$svc is not running" "docker compose up -d $svc  (then: docker compose logs $svc)"; fi
@@ -91,6 +100,25 @@ else
     else bad "MCP /mcp returned $code" "docker compose logs $MCP"; fi
 fi
 
+# 3a. read-MCP baked-lib drift (okengine invariant-audit M-B4.1) -------------
+# The read-MCP image BAKES kb_search/kb_graph/tier_lib into /app/scripts and SHELLS OUT to them for
+# search/graph — so a change needs a read-MCP image REBUILD, exactly the baked-vs-STAGED trap the
+# write-path libs have a check for. Compare the read-MCP's baked copy against the STAGED source of
+# truth (/opt/data/scripts, refreshed by deploy-cron-scripts, read via the gateway which mounts it):
+# a stage-only deploy makes the staged copy NEW while the read-MCP baked copy stays OLD -> stale
+# search. Present on only one side is UNDETECTABLE, never a pass (the M22 one-sided-drift rule).
+for lib in kb_search.py kb_graph.py tier_lib.py; do
+  mh=$(dcx "$MCP" sh -c "sha256sum /app/scripts/$lib 2>/dev/null | cut -d' ' -f1")
+  sh_=$(dcx "$GW" sh -c "sha256sum /opt/data/scripts/$lib 2>/dev/null | cut -d' ' -f1")
+  if [ -n "$mh" ] && [ -n "$sh_" ]; then
+    [ "$mh" != "$sh_" ] && bad "read-MCP $lib is STALE vs the staged source — served search/graph is out of date" \
+        "rebuild the read-MCP image (docker compose build $MCP && up -d $MCP); a stage-only deploy misses it"
+  elif [ -n "$mh" ] || [ -n "$sh_" ]; then
+    wn "cannot compare read-MCP $lib — present on only one of {read-MCP baked, staged}" \
+       "undetectable, not a pass: ensure both the read-MCP image and /opt/data/scripts carry $lib"
+  fi
+done
+
 # 3b. gateway api_server exposure (okengine#120) ----------------------------
 # The host-net gateway's OpenAI-compatible api_server (the reader Chat relay target)
 # binds per API_SERVER_HOST. If it's listening on a NON-loopback interface it's
@@ -133,8 +161,35 @@ else bad "cron-plus not enabled in config.yaml" "without it NO cron schedules; s
 njobs=$(dcx "$GW" sh -c 'python3 -c "import json;print(len(json.load(open(\"/opt/data/cron-plus/jobs.json\")).get(\"jobs\",[])))"' 2>/dev/null)
 if [ -n "$njobs" ] && [ "$njobs" -gt 0 ] 2>/dev/null; then ok "cron-plus has $njobs jobs registered"
 else bad "cron-plus jobs.json empty/absent" "CRON_PACK_DIR=<pack> bash ../okengine/scripts/deploy-cron-plus-jobs.sh"; fi
-if dcx "$GW" test -f /opt/data/cron-plus/.tick.lock; then ok "cron-plus is ticking (.tick.lock present)"
-else wn "no .tick.lock — scheduler may not have ticked yet" "give it a minute, then re-check; else docker compose logs $GW"; fi
+# FRESHNESS, not presence: the pinned plugin re-opens .tick.lock with open("w") EVERY tick (verified
+# scheduler.py _try_acquire_lock @ 6b230dc; run_ticker tick()s once at startup before the first
+# sleep), so a HEALTHY ticker's lock mtime is >= this gateway's start AND advances ~every 60s. But
+# the lock is NEVER unlinked and lives on the bind-mounted .hermes-data, so a PRESENCE test passes
+# forever off a fossil from a prior life (invariant-audit HIGH). The zero-wait discriminator: a lock
+# whose mtime PREDATES the container start is a fossil the CURRENT scheduler never refreshed — it is
+# dead on arrival (plugin dir missing / import crash / CRON_PLUS_DISABLED — causes not covered by the
+# ownership gate 5c). This closes the re-verify gap where a <180s-old fossil passed right after a roll.
+# $GW is the compose SERVICE name (for `docker compose exec`), NOT a container name — resolve the
+# real container id for docker inspect (a bare `docker inspect gateway` errors -> empty; and
+# `date -d ""` returns TODAY-MIDNIGHT, a bogus nonzero epoch, so guard the empty case explicitly —
+# both re-verify gaps that made the fossil discriminator inert on a real deployment).
+cid="$(docker compose ps -q "$GW" 2>/dev/null | head -1)"
+started="$(docker inspect "$cid" --format '{{.State.StartedAt}}' 2>/dev/null)"
+started_epoch=0
+[ -n "$started" ] && started_epoch=$(date -d "$started" +%s 2>/dev/null || echo 0)
+lock_mtime=$(dcx "$GW" sh -c 'f=/opt/data/cron-plus/.tick.lock; [ -f "$f" ] && stat -c %Y "$f" || echo -1' 2>/dev/null | tr -d '[:space:]')
+now_epoch=$(date +%s)
+if [ "$lock_mtime" = "-1" ] || [ -z "$lock_mtime" ]; then
+  wn "no .tick.lock — scheduler may not have ticked yet" "give it a minute, then re-check; else docker compose logs $GW"
+elif [ "$started_epoch" -gt 0 ] 2>/dev/null && [ "$lock_mtime" -lt "$started_epoch" ] 2>/dev/null; then
+  bad "cron-plus .tick.lock is a FOSSIL — its mtime predates this gateway's start, so the CURRENT scheduler has NEVER ticked (dead on arrival)" \
+      "docker compose logs $GW | grep -iE 'tick error|cron-plus'; check CRON_PLUS_DISABLED in the gateway env and that plugins/cron-plus is present"
+elif [ $(( now_epoch - lock_mtime )) -le 180 ] 2>/dev/null; then
+  ok "cron-plus is ticking (.tick.lock fresh, $(( now_epoch - lock_mtime ))s old)"
+else
+  bad "cron-plus .tick.lock is STALE ($(( now_epoch - lock_mtime ))s old, > 3 ticks) — the scheduler ticked once then STOPPED" \
+      "docker compose logs $GW | grep -i 'tick error'; check CRON_PLUS_DISABLED in the gateway env and that plugins/cron-plus is present"
+fi
 # 5c. runtime-dir ownership — the ticker + every lane run AS $HERMES_UID and must OWN /opt/data to
 # write .tick.lock/jobs.json. A tree owned by a DIFFERENT uid (brought up with the compose default
 # 10000 while the mounted .hermes-data is the operator's uid) kills the scheduler on a

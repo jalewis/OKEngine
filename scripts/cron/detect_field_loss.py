@@ -171,7 +171,7 @@ def write_report(losses: list[dict], baseline: str | None, today: str) -> None:
 
 
 def main() -> int:
-    today = datetime.now(timezone.utc).date().isoformat()
+    today = datetime.now().date().isoformat()  # LOCAL ledger day, not UTC (TZ-behind-UTC files tomorrow) — invariant-audit B6.2
     losses, baseline = detect()
     write_report(losses, baseline, today)
     print("=== detect-field-loss ===")

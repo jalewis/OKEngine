@@ -41,7 +41,8 @@ def _host(tmp_path) -> Path:
         "name": "okpack-host",
         "types": {"entity": {"required": ["type", "id"]},
                   "vendor": {"required": ["type", "id", "name"]}},
-    }))
+    }) + "cockpit:\n  tabs: [overview, browse]\n  tab_defs:\n"
+        "    overview: {label: Overview, boxes: []}\n")
     (h / "pack.yaml").write_text("name: okpack-host\nowns:\n  types: [vendor]\n")
     (h / "config" / "completeness-rules.yaml").write_text(yaml.safe_dump(
         {"rules": [{"id": "host-rule", "when": {"type": "vendor"}, "expect": "field"}]}))
@@ -106,6 +107,10 @@ def _taxonomy_pack(tmp_path) -> Path:
     (p / "subdomain" / "host-schema-additions.yaml").write_text(yaml.safe_dump({
         "types": {"intrusion-set": {"required": ["type", "id"]},
                   "vendor": {"required": ["type", "id", "name"]}},
+        # the guest contributes its cockpit tab so a composed vault surfaces it (okengine#<n>)
+        "cockpit": {"tabs": ["taxtab"], "tab_defs": {
+            "taxtab": {"label": "Tax", "boxes": [
+                {"title": "Events", "view": "table", "dataset": {"dir": "tax-events", "type": "intrusion-set"}}]}}},
     }))
     (p / "subdomain" / "PERSONA.md").write_text("curation rules for tax\n")
     (p / "crons" / "domain-crons.json").write_text(json.dumps([
@@ -191,6 +196,23 @@ def test_taxonomy_apply(tmp_path):
     # whose script never stages fails at deploy (first real install caught this)
     assert (h / "crons" / "scripts" / "okpack_tax_feed_fetch.py").is_file()
     assert "okpack-tax" in (h / "CLAUDE.md").read_text()
+
+
+def test_taxonomy_merges_guest_cockpit_tab(tmp_path):
+    """A guest's cockpit tab_def + tab name fold into the host's cockpit block, so a composed vault
+    surfaces the guest domain's tab (the canonical home a hand-added tab lacked). Host wins on a tab
+    it already declares; the guest tab is added BEFORE `browse` so browse stays last."""
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    ck = yaml.safe_load((h / "schema.yaml").read_text())["cockpit"]
+    assert "taxtab" in ck["tab_defs"]                                  # tab_def merged
+    assert ck["tab_defs"]["taxtab"]["boxes"][0]["title"] == "Events"   # ...with its boxes intact
+    assert "overview" in ck["tab_defs"]                                # host's own tab preserved
+    assert "taxtab" in ck["tabs"] and ck["tabs"].index("taxtab") < ck["tabs"].index("browse")
+    # idempotent: a second apply doesn't duplicate the tab
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    ck2 = yaml.safe_load((h / "schema.yaml").read_text())["cockpit"]
+    assert ck2["tabs"].count("taxtab") == 1
 
 
 def test_taxonomy_idempotent(tmp_path):

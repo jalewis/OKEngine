@@ -66,7 +66,21 @@ if [ -n "$PINNED_SHA" ]; then
     echo "       (tag $PIN must resolve to $PINNED_SHA — refusing to build a mismatched base)" >&2
     exit 1                                  # the EXIT trap removes the temp clone
   fi
-  echo "==> verified Hermes @ $PINNED_SHA"
+  # HEAD-sha alone is not integrity: a reused HERMES_SRC checkout can sit AT the pinned commit yet
+  # carry uncommitted local edits (Docker's `COPY . .` bakes the working tree, not HEAD), so a dirty
+  # sibling checkout would ship as a "verified" image. Refuse a dirty tree (invariant-audit B7.4).
+  # A fresh clone is clean by construction, so this only ever bites a reused checkout.
+  # NB: intentionally NOT `--ignored` — that would flag every normal gitignored artifact (__pycache__,
+  # *.pyc) and false-fail routine builds. Residual (B7.4 re-verify, low): a gitignored file in a
+  # Hermes-only path OUTSIDE the overlay-clobbered trees can still be COPY'd unless .dockerignore
+  # excludes it; ordinary modified/untracked edits — the real risk — are caught here.
+  if [ -n "$(git -C "$WORK" status --porcelain 2>/dev/null)" ]; then
+    echo "ERROR: Hermes source at $WORK is at the pinned commit but has UNCOMMITTED changes —" >&2
+    echo "       building would bake local edits into a supposedly-verified image. Clean the tree" >&2
+    echo "       (git -C '$WORK' stash) or unset HERMES_SRC to build from a fresh clone." >&2
+    exit 1
+  fi
+  echo "==> verified Hermes @ $PINNED_SHA (working tree clean)"
 else
   echo "WARNING: engine-manifest.yaml has no pinned_sha — skipping commit verification" >&2
 fi
@@ -95,6 +109,10 @@ cp -r "$ENGINE_DIR/plugins/web/serper" "$WORK/plugins/web/serper"
 # it to the deployment's runtime stamp and self-heal an image-roll that skipped the re-stamp — the
 # About panel then never reports a version the deployment isn't running.
 printf '%s\n' "$RELEASE" > "$WORK/.okengine_release"
+# Same for the HERMES pin (the #192 second half): without a baked marker the stamp's hermes_pin is
+# unvalidatable, so a Hermes-bump canary roll left About claiming the OLD Hermes with nothing
+# catching it (found live on the v0.18.2 canary). check_pins compares + self-heals from this.
+printf '%s\n' "$PIN" > "$WORK/.hermes_pin"
 # drop any __pycache__ that hitched along
 find "$WORK/okengine-mcp" "$WORK/okengine-reader" "$WORK/scripts" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
 

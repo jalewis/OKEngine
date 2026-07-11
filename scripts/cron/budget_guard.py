@@ -134,10 +134,41 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict) -> None:
+    # ATOMIC (tmp + rename): a torn/partial state write (OOM-kill mid-write, a documented event on
+    # this deployment) would leave the guard's own state corrupt/unreadable while jobs.json already
+    # holds the applied pauses — the unrecoverable divergence the orphan self-heal below also guards
+    # (invariant-audit HIGH). rename is atomic on the same filesystem.
     try:
-        _state_path().write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        p = _state_path()
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(p)
     except OSError as e:
         print(f"budget-guard: WARN could not write state: {e}", file=sys.stderr)
+
+
+def _guard_owned_ids(state: dict) -> list:
+    """Ids the guard itself recorded as (about to be) paused — its `paused_ids` (confirmed) plus its
+    write-AHEAD `pausing_ids` (intent, persisted BEFORE the jobs.json mutation so it survives a lost
+    final write). Order-preserving + de-duped (paused_ids first) — resume() pauses in this order."""
+    return list(dict.fromkeys((state.get("paused_ids") or []) + (state.get("pausing_ids") or [])))
+
+
+def orphaned_guard_pauses(jobs: list, state: dict) -> list:
+    """(id, name) of cost-bearing jobs the GUARD owns (id in its own persisted intent/paused set) that
+    are still disabled — to resume on an under-budget tick when a lost state write stranded them.
+    KEYED ON THE GUARD'S OWN RECORD, never the job's `paused_at`: cron-plus's only disable verb is
+    `pause`, which writes {enabled:false, paused_at} for an OPERATOR maintenance pause too, so a
+    paused_at-keyed heal would silently resume a deliberate operator pause (okengine#178 / the exact
+    regression the re-verify caught). The write-ahead pausing_ids means the guard's record survives
+    even a totally-lost final state write."""
+    owned = set(_guard_owned_ids(state))
+    out = []
+    for j in jobs or []:
+        jid = j.get("id")
+        if jid and jid in owned and not j.get("enabled", True):
+            out.append((jid, j.get("name") or jid))
+    return out
 
 
 def _load_jobs() -> list:
@@ -175,10 +206,13 @@ def resume(reason: str = "manual") -> int:
     OKENGINE_BUDGET_RESUME=manual); auto mode calls it from main() once window usage ages
     back under budget. Idempotent: a no-op when there is no active trip."""
     state = _load_state()
-    if not state.get("paused"):
+    # Recover a STRANDED trip too: resume every id the guard OWNS (confirmed paused_ids OR write-ahead
+    # pausing_ids), not only when state.paused is truthy — otherwise a lost final write leaves
+    # `framework budget --resume` a no-op on the exact case it exists to recover (re-verify gap).
+    ids = _guard_owned_ids(state)
+    if not ids:
         print("budget-guard: not paused — nothing to resume.")
         return 0
-    ids = state.get("paused_ids") or []
     resumed = [jid for jid in ids if _cronplus("resume", jid)]
     still = [jid for jid in ids if jid not in resumed]
     if not still:
@@ -207,17 +241,21 @@ def reconcile_pause(state: dict, jobs: list) -> list[str]:
     while state still says paused — so decide() no-ops and the cap is silently defeated. Re-derive
     from the LIVE enabled-status and re-pause the drifted crons (okengine invariant-audit #13).
 
-    Returns the ids actually re-paused. A no-op when not paused, no ids recorded, or nothing drifted.
-    A job absent from jobs.json can't be paused (nothing to act on) — skip it."""
+    Re-derives from the CURRENT cost-bearing set (not just the recorded paused_ids), so it also
+    catches a cron ADDED or re-enabled MID-TRIP — co-installing a pack during an active pause — whose
+    lanes the old recorded-set-only reconcile let spend past the cap (invariant-audit L8/L9). Folds
+    every current cost-bearing cron into state.paused_ids/names IN PLACE so a later resume lifts them
+    all; the caller persists state. Returns the display names actually re-paused this tick."""
     if not state.get("paused"):
         return []
-    ids = state.get("paused_ids") or []
-    if not ids:
-        return []
+    current = cost_bearing_ids(jobs)
     live = {j.get("id"): j for j in jobs or [] if j.get("id")}
-    drifted = [jid for jid in ids
-               if (j := live.get(jid)) is not None and j.get("enabled", True)]
-    return [jid for jid in drifted if _cronplus("pause", jid)]
+    repaused = [name for jid, name in current
+                if (j := live.get(jid)) is not None and j.get("enabled", True) and _cronplus("pause", jid)]
+    if current:                                     # keep the recorded set complete for resume()
+        state["paused_ids"] = sorted({*(state.get("paused_ids") or []), *(jid for jid, _ in current)})
+        state["paused_names"] = sorted({*(state.get("paused_names") or []), *(n for _, n in current)})
+    return repaused
 
 
 def _parse_budget_env(name: str, cast) -> tuple[float, bool]:
@@ -262,6 +300,15 @@ def main(argv: list[str] | None = None) -> int:
               "is unset — the USD cap is INERT (no token->USD conversion) and will NEVER trip. "
               "Set the price, or cap with OKENGINE_BUDGET_TOKENS instead.", file=sys.stderr)
 
+    # An unrecognized window name (a typo like "moth", or an unsupported unit like "hour"/"year")
+    # silently falls back to a 1-DAY window — so an operator who believes they set a monthly cap gets
+    # daily enforcement, tripping ~30x too eagerly with no signal. Surface it loudly (invariant-audit
+    # M10); window_seconds() still returns the day fallback so the guard stays fail-closed.
+    if win_name.strip().lower() not in WINDOWS:
+        print(f"budget-guard: WARN OKENGINE_BUDGET_WINDOW={win_name!r} is not a recognized window "
+              f"({'|'.join(WINDOWS)}) — falling back to a 1-day window. Fix the env value.",
+              file=sys.stderr)
+
     now = time.time()
     win_s = window_seconds(win_name)
     tokens = tokens_in_window(_state_db_path(), win_s, now)
@@ -280,17 +327,30 @@ def main(argv: list[str] | None = None) -> int:
           f"over={over} paused={paused} -> {action}")
 
     if action == "pause":
-        ids = cost_bearing_ids(_load_jobs())
-        # pause each cost-bearing cron; track which ACTUALLY paused. `paused` is True only when the
-        # cap is genuinely enforced (every cost-bearing cron paused, or there were none). If some/all
-        # pauses failed (cron-plus down, jobs.json unreadable/corrupt -> ids==[], lock race), leaving
-        # paused=True would make decide() no-op forever while crons keep spending past the cap — a
-        # fail-OPEN circuit breaker. Keeping paused=False lets the next tick RE-attempt (idempotent)
-        # until the cap actually holds (okengine invariant-audit #3).
+        prior = state                                    # the state read above (this trip's record so far)
+        prior_owned = _guard_owned_ids(prior)
+        prior_names = dict(zip(prior.get("paused_ids") or [], prior.get("paused_names") or []))
+        ids = cost_bearing_ids(_load_jobs())             # currently-ENABLED cost-bearing (excludes already-paused)
+        # OWNED is CUMULATIVE across a multi-tick trip: a cron a PRIOR partial tick already paused is
+        # excluded from cost_bearing_ids here (it's disabled), so rebuilding the record from only THIS
+        # tick's ids would drop it from the owned set -> stranded forever when usage drops (re-verify).
+        # Union the prior owned set into the intent + final record.
+        owned = list(dict.fromkeys(prior_owned + [jid for jid, _ in ids]))
+        # WRITE-AHEAD the owned set atomically BEFORE mutating jobs.json — a crash between the pause
+        # and the final write still leaves the guard's durable discriminator (never an operator pause).
+        _save_state({"paused": False, "pausing_ids": owned, "tripped_at": now, "window": win_name,
+                     "usage_tokens": tokens, "reason": f"over budget ({usage_str} >= {budget_str})"})
+        # pause each still-enabled cost-bearing cron; `paused` (cap fully enforced) is True only when
+        # THIS tick's targets all paused — combined with the prior-paused set, that means every
+        # cost-bearing cron is disabled. If some fail (cron-plus down, lock race), paused=False lets
+        # the next tick RE-attempt the still-enabled ones until the cap holds (invariant-audit #3).
         paused = [(jid, name) for jid, name in ids if _cronplus("pause", jid)]
         fully = len(paused) == len(ids)
-        state = {"paused": fully, "paused_ids": [jid for jid, _ in paused],
-                 "paused_names": [name for _, name in paused], "tripped_at": now, "window": win_name,
+        paused_ids = list(dict.fromkeys((prior.get("paused_ids") or []) + [jid for jid, _ in paused]))
+        names = {**prior_names, **{jid: name for jid, name in paused}}
+        state = {"paused": fully, "paused_ids": paused_ids,
+                 "paused_names": [names.get(jid, jid) for jid in paused_ids], "pausing_ids": owned,
+                 "tripped_at": now, "window": win_name,
                  "usage_tokens": tokens, "reason": f"over budget ({usage_str} >= {budget_str})"}
         _save_state(state)
         if fully:
@@ -304,14 +364,33 @@ def main(argv: list[str] | None = None) -> int:
     elif action == "resume":
         resume("auto")
     elif paused:
-        # noop by the budget decision, but we BELIEVE we're paused — reconcile against the live
-        # jobs.json in case a redeploy silently re-enabled the crons we paused (okengine
-        # invariant-audit #13). Without this the cap is defeated by any jobs.json redeploy.
+        # noop by the budget decision, but we BELIEVE we're paused — reconcile against the LIVE
+        # jobs.json: re-pause any cost-bearing cron a redeploy re-enabled (#13) OR one added/re-enabled
+        # mid-trip (co-install during the pause — L8/L9). Without this the cap is defeated by a
+        # redeploy or a mid-trip pack install.
+        before = len(state.get("paused_ids") or [])
         repaused = reconcile_pause(state, _load_jobs())
+        if len(state.get("paused_ids") or []) != before:
+            _save_state(state)   # persist the widened paused set so a later resume lifts mid-trip adds
         if repaused:
-            print(f"budget-guard: ⚠ RECONCILE — {len(repaused)} cost-bearing cron(s) were re-enabled "
-                  f"(jobs.json redeploy?) while the budget pause is active; re-paused: "
+            print(f"budget-guard: ⚠ RECONCILE — {len(repaused)} cost-bearing cron(s) re-enabled or "
+                  f"newly added while the budget pause is active; re-paused: "
                   f"{', '.join(repaused)}. The kill-switch holds.", file=sys.stderr)
+
+    # SELF-HEAL the unrecoverable direction: if a prior tick's state write was lost after pausing, the
+    # guard-paused crons are stranded (state says not-paused, decide() never resumes them, and
+    # cost_bearing_ids skips them as "already disabled"). On an under-budget auto tick, resume the
+    # jobs the guard OWNS (its own persisted intent/paused ids) that are still disabled — never an
+    # operator pause it doesn't own — and clear the record so the heal doesn't loop (HIGH + re-verify).
+    if not over and resume_policy == "auto":
+        st = _load_state()
+        orphans = orphaned_guard_pauses(_load_jobs(), st)
+        healed = [name for jid, name in orphans if _cronplus("resume", jid)]
+        if healed:
+            _save_state({"paused": False, "resumed_at": now, "note": "self-heal",
+                         "resumed_count": len(healed)})
+            print(f"budget-guard: ⚠ SELF-HEAL — resumed {len(healed)} orphaned guard-pause(s) "
+                  f"(a prior state write was lost after pausing): {', '.join(healed)}.", file=sys.stderr)
     return 0
 
 

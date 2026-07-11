@@ -566,6 +566,52 @@ def install_subtree(host: Path, pack: Path, slug: str, plan: Plan) -> None:
     append_persona(host, pack, slug, plan)
 
 
+def merge_cockpit(host: Path, pack: Path, plan: Plan) -> None:
+    """Taxonomy shape: fold a guest's cockpit `tab_defs` + `tabs` (from host-schema-additions.yaml)
+    into the host's `cockpit:` block, so a composed vault surfaces the guest domain's tab (a
+    Vulnerabilities pack contributes its Vulnerabilities tab). Host wins on a tab it already declares.
+    Presentation config, not the enforced write schema — but without this merge a guest tab had NO
+    canonical home: it was only ever hand-added to the composed vault, so a recompose dropped it."""
+    add_ck = _yaml(pack / "subdomain" / "host-schema-additions.yaml").get("cockpit") or {}
+    add_defs = add_ck.get("tab_defs") if isinstance(add_ck.get("tab_defs"), dict) else {}
+    add_names = [str(t).strip() for t in (add_ck.get("tabs") or []) if str(t).strip()]
+    if not add_defs and not add_names:
+        return
+    hschema = host / "schema.yaml"
+    hcock = _yaml(hschema).get("cockpit") or {}
+    htabdefs, htabs = hcock.get("tab_defs") or {}, hcock.get("tabs") or []
+
+    new_defs = {k: v for k, v in add_defs.items() if k not in htabdefs}
+    if [k for k in add_defs if k in htabdefs]:
+        plan.info(f"skip cockpit tab_def(s) the host already declares (host wins): "
+                  f"{[k for k in add_defs if k in htabdefs]}")
+    if new_defs:
+        def _do_defs(add=new_defs):
+            t = hschema.read_text(encoding="utf-8")
+            block = f"    # --- co-installed tabs (okpack: {pack_name(pack)}, install-domain) ---\n"
+            block += "".join(_dump_entry(k, v, 4) for k, v in add.items())
+            nt = _insert_under(t, r"^  tab_defs:\s*$", block)
+            assert nt is not None, "host cockpit has no `tab_defs:` block (add a cockpit: block to the host pack)"
+            assert set(add) <= set(((yaml.safe_load(nt).get("cockpit") or {}).get("tab_defs") or {})), \
+                "cockpit tab_def merge failed to parse back"
+            hschema.write_text(nt, encoding="utf-8")
+        plan.step(f"merge {len(new_defs)} cockpit tab_def(s): {sorted(new_defs)}", _do_defs)
+
+    missing = [n for n in add_names if n not in htabs]
+    if missing:
+        def _do_tabs(missing=missing):
+            t = hschema.read_text(encoding="utf-8")
+            m = re.search(r"^(  tabs:\s*)\[([^\]\n]*)\]\s*$", t, re.M)
+            assert m is not None, "host cockpit `tabs:` is not a single-line flow list — merge by hand"
+            cur = [x.strip() for x in m.group(2).split(",") if x.strip()]
+            for n in missing:                              # add before `browse` so browse stays last
+                if n not in cur:
+                    cur.insert(cur.index("browse") if "browse" in cur else len(cur), n)
+            hschema.write_text(t[:m.start()] + m.group(1) + "[" + ", ".join(cur) + "]" + t[m.end():],
+                               encoding="utf-8")
+        plan.step(f"add {len(missing)} tab(s) to the cockpit nav: {missing}", _do_tabs)
+
+
 def install_taxonomy(host: Path, pack: Path, slug: str, plan: Plan) -> None:
     added = merge_types(host, pack, plan)
     merge_type_aliases(host, pack, plan)
@@ -574,6 +620,7 @@ def install_taxonomy(host: Path, pack: Path, slug: str, plan: Plan) -> None:
     merge_feeds(host, pack, plan)
     merge_crons(host, pack, plan)
     merge_lane_scripts(host, pack, plan)
+    merge_cockpit(host, pack, plan)
     append_persona(host, pack, slug, plan)
 
 

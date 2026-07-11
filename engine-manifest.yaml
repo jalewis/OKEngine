@@ -12,16 +12,16 @@
 # (schema.yaml + persona + feeds + crons + content). See INSTALL.md and
 # docs/deploy-a-new-domain.md.
 version: 1
-engine_release: v0.10.8  # cockpit render fix + lacuna rotation + wiki-lane audit (29 fixes) + reshard/ingest-loop; see CHANGELOG.md
+engine_release: v0.11.3  # invariant-audit medium batches 4-8: cron/lane robustness, exhaustive roll-forward gate, install/build/verify hygiene, scaffold cleanup; see CHANGELOG.md
 
 runtime:
   # Hermes is a PINNED DEPENDENCY, not vendored into this repo. You clone Hermes
   # at the pinned tag, apply patches/, then overlay the engine_layer below.
   description: pinned Hermes-Agent (cloned separately, patched + overlaid — see INSTALL.md)
   upstream: https://github.com/NousResearch/hermes-agent.git
-  pinned_version: v0.18.0          # upstream git tag v2026.7.1
-  pinned_tag: v2026.7.1
-  pinned_sha: 7c1a029553d87c43ecff8a3821336bc95872213b   # commit the tag resolves to; build-engine-image.sh verifies the clone matches
+  pinned_version: v0.18.2          # upstream git tag v2026.7.7.2
+  pinned_tag: v2026.7.7.2
+  pinned_sha: 9de9c25f620ff7f1ce0fd5457d596052d5159596   # commit the tag resolves to; build-engine-image.sh verifies the clone matches
   carried_patches: patches/        # 7 core-file patches + apply.sh (idempotent) + README
 
 dependencies:

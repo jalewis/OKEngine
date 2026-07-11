@@ -172,3 +172,125 @@ def test_converge_applies_review_flags(tmp_path):
     assert "flagged for review" in out
     fm = _read_id(m, "entities/acme.md")
     assert fm.get("needs_review") is True and fm.get("confidence") == "confirmed"
+
+
+def test_converge_normalizes_schema_drift(tmp_path):
+    """okengine#46: converge must run the SAME vocab-drift guard as create/update — rename a drifted
+    alias key, map an aliased value. Regression: the converge merge path bypassed _normalize_drift, so
+    a composed-multipack import landed `country: CN`/`status: active` verbatim (invariant-audit)."""
+    schema = (
+        "types:\n"
+        "  intrusion-set: {required: [type], id_authority: actor, id_field: actor_id, owner: sec}\n"
+        "partitioning:\n"
+        "  namespaces: {intrusion-set: {strategy: flat}}\n"
+        "field_aliases: {country: suspected_origin}\n"
+        "value_aliases: {status: {active: live}}\n"
+    )
+    m = _load(tmp_path, schema)
+    assert m._converge("intrusion-set/apt-x.md",
+                       "type: intrusion-set\nactor_id: APTX\nname: APT-X", pack="sec").startswith("created")
+    out = m._converge("intrusion-set/apt-x.md",
+                      "type: intrusion-set\nactor_id: APTX\ncountry: CN\nstatus: active", pack="sec")
+    assert out.startswith("converged")
+    fm = _read_id(m, "intrusion-set/apt-x.md")
+    assert fm.get("suspected_origin") == "CN" and "country" not in fm   # alias KEY renamed (was bypassed)
+    assert fm.get("status") == "live"                                    # aliased VALUE mapped
+
+
+def test_scalar_sources_coerced_to_list(tmp_path):
+    """okengine#196's write-path list-coercion forgot `sources` — the very citation field it was for.
+    A scalar comma-string must split, not land as one blob, or the grounding/staleness graph sees zero
+    primary citations (invariant-audit). Guarded by base-schema field_shapes now including sources."""
+    m = _load(tmp_path)   # default schema + the REAL base-schema (field_shapes now has `sources`)
+    m._create("entities/acme.md",
+              "type: vendor\nname: Acme\nsources: sources/2026/07/a, sources/2026/07/b", "body")
+    assert _read_id(m, "entities/acme.md")["sources"] == ["sources/2026/07/a", "sources/2026/07/b"]
+
+
+def test_converge_briefing_rejects_broken_link(tmp_path):
+    """L3: converge must enforce the briefing dead-link guard (like create/update/patch/append) —
+    a briefings/ merge whose body carries an unresolvable [[wikilink]] is rejected, file untouched."""
+    schema = (
+        "types: {briefing: {required: [type]}, source: {required: [type]}}\n"
+        "partitioning:\n  namespaces: {briefings: {strategy: flat}}\n"
+    )
+    m = _load(tmp_path, schema)
+    (tmp_path / "wiki" / "sources").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "wiki" / "sources" / "s1.md").write_text("---\ntype: source\n---\nx")
+    assert m._converge("briefings/b1.md", "type: briefing\ntitle: B1",
+                       "Cited [[sources/s1]].").startswith(("created", "converged"))
+    out = m._converge("briefings/b1.md", "type: briefing\ntitle: B1",
+                      "Now cites [[entities/does-not-exist]].")
+    assert out.startswith("rejected") and "resolve" in out.lower()
+
+
+def _created_rel(out: str) -> str:
+    return out.split("created ", 1)[1].split(" v")[0].strip()
+
+
+def test_write_time_link_guard_flags_curated_not_sources(tmp_path):
+    """link-audit: a concepts/entities page that INTRODUCES an unresolvable wikilink is soft-flagged
+    needs_review (not rejected — organic growth preserved); a resolvable link is clean; a SOURCE page
+    (forward-refs are its nature) is NOT flagged; briefings still HARD-reject."""
+    schema = (
+        "types: {concept: {required: [type]}, source: {required: [type]}, vendor: {required: [type]}}\n"
+        "partitioning:\n"
+        "  namespaces: {concepts: {strategy: by-letter}, entities: {strategy: by-letter},\n"
+        "               sources: {strategy: flat}}\n"
+    )
+    m = _load(tmp_path, schema)
+    m._create("entities/a/acme.md", "type: vendor\nname: Acme", "body")   # a real link target
+    # concept with a broken path link + a bare-name link -> flagged, still created
+    out = m._create("concepts/f/foo.md", "type: concept\nname: Foo",
+                    "See [[entities/a/acme]] (ok), [[entities/does-not-exist]] (broken), [[BareName]].")
+    assert out.startswith("created")
+    assert _read_id(m, _created_rel(out)).get("needs_review") is True
+    # concept with ONLY a resolvable link -> no flag
+    out2 = m._create("concepts/b/bar.md", "type: concept\nname: Bar", "Only [[entities/a/acme]].")
+    assert not _read_id(m, _created_rel(out2)).get("needs_review")
+    # a SOURCE page with a broken forward-ref -> NOT flagged (excluded namespace)
+    out3 = m._create("sources/s1.md", "type: source", "Forward [[concepts/not-yet-created]].")
+    assert not _read_id(m, _created_rel(out3)).get("needs_review")
+
+
+def test_converge_enforces_int_field_guard_on_merge(tmp_path):
+    """The merge branch must run the machine-owned int guard (recent_reports/total_mentions) like
+    create/update/patch — else it's a hole: _dedup_on_create redirects a create_entity for an
+    already-known id INTO converge, so even the create tool bypasses the guard on a live entity
+    (invariant-audit M15). recent_reports/total_mentions shapes come from config/base-schema.yaml."""
+    m = _load(tmp_path)
+    # establish the entity (int count as an int -> fine)
+    assert m._converge("entities/acme.md",
+                       "type: vendor\ntitle: Acme Corp\nrecent_reports: 3").startswith("created")
+    # a SECOND converge into the same page (same minted slug id) with recent_reports as a hand-written
+    # LIST (the live incident: agent misread the field) must be REJECTED at the merge, not written.
+    out = m._converge("entities/acme.md",
+                      "type: vendor\ntitle: Acme Corp\nrecent_reports:\n  - sources/2026/07/x")
+    assert out.startswith("rejected:") and "recent_reports" in out, out
+    # the stored page is untouched (still the int)
+    assert _read_id(m, "entities/acme.md")["recent_reports"] == 3
+
+
+def test_merge_frontmatter_never_overwrites_server_provenance():
+    """converge's _SERVER_KEYS are server-managed — the merge must PRESERVE them, never take an
+    incoming payload's value, or a caller forges provenance (created/discovered_by). The old code did
+    `merged[key] = new_val` for every server key, the exact opposite of its own docstring
+    (invariant-audit M19). Pure-function test — no stamping dependency."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("converge", REPO / "okengine-mcp" / "converge.py")
+    cv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cv)
+    prev = {"type": "actor", "created": "2026-01-01", "created_by": "atk",
+            "discovered_by": "atk", "maintained_by": ["atk"], "id": "mitre:t1"}
+    incoming = {"created": "1999-01-01", "created_by": "attacker",
+                "discovered_by": "attacker", "name": "X"}
+    merged, dec = cv.merge_frontmatter(prev, incoming, owner_pack="atk", caller_pack="atk")
+    assert merged["created"] == "2026-01-01", "caller must not forge `created`"
+    assert merged["created_by"] == "atk", "caller must not forge `created_by`"
+    assert merged["discovered_by"] == "atk", "caller must not forge `discovered_by`"
+    assert merged["name"] == "X", "a non-server key is still added normally"
+    assert "atk" in merged["maintained_by"], "maintained_by provenance union preserved"
+    # forged provenance keys are not counted as legitimate updates
+    assert not ({"created", "created_by", "discovered_by"} & set(dec.updated))
+    # id/version/updated ARE re-stamped by the write path, so merge pass-through of them is fine
+    # (this test targets provenance forgery, not the re-stamped keys).

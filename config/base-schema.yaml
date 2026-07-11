@@ -61,12 +61,26 @@ field_enums:
 # a page that crashes a downstream lane (generalizes the ad-hoc list coercion of okengine#196). Today:
 #   list  — a scalar string is split (on commas) into a list, so a list-consuming lane never sees a
 #           bare `aliases: A, B`. An unlisted field is free-form (passed through unchanged).
+#   int   — a machine-owned COUNT. A digit-string coerces to int; anything else REJECTS the write
+#           with the field named, so an agent that misreads the field name semantically (live
+#           incident: `recent_reports:` hand-set to a LIST of source paths, which then topped the
+#           cockpit's Most-active sort) gets an actionable error instead of poisoning dashboards.
 # Packs EXTEND this for their domain fields (a pack key wins on conflict), same as `field_enums`.
 field_shapes:
   aliases:       list   # alternate names/ids (id resolver + normalize-bare-name-links consume as list)
   tags:          list
   maintained_by: list   # provenance: packs that maintain the page (composition)
   discovered_by: list   # provenance: where the knowledge was first attributed
+  sources:       list   # primary citations — the ref_fields rule + grounding/staleness graph read
+                        # these as a list; a scalar `sources: a, b` must split, not land as one blob
+                        # (okengine#196's coercion forgot the very field it was for — invariant-audit)
+  see_also:      list   # related-page refs (concepts/entities a page maps to)
+  related:       list
+  refs:          list
+  basis:         list   # supporting refs on inference/lacuna pages
+  recent_reports: int   # computed activity metric (a pack metrics lane stamps the count) —
+                        # agents must not hand-author it; a non-int write REJECTS
+  total_mentions: int   # computed mention count — same contract as recent_reports
 
 # ── Core OKF structure (engine-owned) — okengine#90 P2 ──────────────────────
 # The universal knowledge-graph spine. ENGINE-owned so it is NOT re-declared per pack, which lets

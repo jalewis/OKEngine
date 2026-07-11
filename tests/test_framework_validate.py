@@ -271,6 +271,43 @@ def test_exposed_with_real_secrets_passes(tmp_path):
     assert not any(s == "FAIL" and "auth" in c for s, c, d in r.rows)
 
 
+def test_loopback_default_token_warns_mcp_will_crash(tmp_path):  # invariant-audit #208
+    """A LOOPBACK deploy whose .env still carries the built-in default MCP token: the containerized
+    MCP binds 0.0.0.0 internally, so it FAILS CLOSED at startup (crash-loop) regardless of the
+    loopback host-port mapping. framework validate must WARN — not stay silent behind the
+    'host ports bind loopback' INFO (the false-confidence trap #208) — and must NOT hard-FAIL a
+    loopback deploy."""
+    pack = tmp_path / "pack"
+    _scaffold_with_compose(pack)
+    (pack / ".env").write_text("OKENGINE_BIND=127.0.0.1\nOKENGINE_MCP_TOKEN=okengine-local\n")
+    v = _load("framework_validate", VAL)
+    r = v.validate(pack)
+    assert any(s == "WARN" and "MCP auth" in c and "0.0.0.0" in (d or "") for s, c, d in r.rows), \
+        f"expected a fail-closed WARN on the loopback default token: {r.rows}"
+    assert not any(s == "FAIL" for s, c, d in r.rows), \
+        f"loopback default token is a WARN, not a FAIL: {[(c, d) for s, c, d in r.rows if s == 'FAIL']}"
+
+
+def test_loopback_default_token_ok_with_allow_or_real_token(tmp_path):  # invariant-audit #208
+    """The #208 fail-closed WARN must NOT fire when the operator accepts the default
+    (OKENGINE_MCP_ALLOW_DEFAULT_TOKEN=1) or sets a real token — both boot fine — nor on a fresh
+    scaffold with no .env (deploy.sh/ensure-runtime will generate one)."""
+    v = _load("framework_validate", VAL)
+    ok_envs = [
+        "OKENGINE_BIND=127.0.0.1\nOKENGINE_MCP_TOKEN=okengine-local\nOKENGINE_MCP_ALLOW_DEFAULT_TOKEN=1\n",
+        "OKENGINE_BIND=127.0.0.1\nOKENGINE_MCP_TOKEN=s3cret-xyz\n",
+        None,   # no .env at all (fresh scaffold)
+    ]
+    for i, env in enumerate(ok_envs):
+        pack = tmp_path / f"p{i}"
+        _scaffold_with_compose(pack)
+        if env is not None:
+            (pack / ".env").write_text(env)
+        r = v.validate(pack)
+        assert not any(s == "WARN" and "MCP auth" in c and "0.0.0.0" in (d or "")
+                       for s, c, d in r.rows), f"unexpected #208 WARN for env {env!r}: {r.rows}"
+
+
 def test_scaffold_writes_valid_pack_yaml(tmp_path):
     pack = tmp_path / "pack"
     _scaffold(pack)

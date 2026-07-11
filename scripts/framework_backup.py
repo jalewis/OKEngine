@@ -100,18 +100,30 @@ def default_dest(pack: Path) -> Path:
 
 
 def create(pack: Path, dest_dir: Path, include_secrets: bool, stamp: str) -> tuple:
+    # SINGLE-PASS: hash each file from the SAME bytes we write into the tar. The old two-pass path
+    # (build_manifest read every file, then the tar re-read every file) hashed and archived snapshots
+    # taken minutes apart on a 10k-page + ~2GB-qmd vault — any file that changed between its two reads
+    # produced an archive whose bytes no longer matched its manifest sha256, which verify()/restore()
+    # then rejected as corrupt (invariant-audit HIGH). Reading once closes the window.
     files = iter_files(pack, include_secrets)
-    manifest = build_manifest(pack, files, include_secrets)
-    manifest.update(created=stamp, pack=pack.name, include_secrets=include_secrets)
     dest_dir.mkdir(parents=True, exist_ok=True)
     archive = dest_dir / f"{pack.name}-{stamp}.tar.gz"
+    entries = {}
     with tarfile.open(archive, "w:gz") as tar:
         for rel in files:
             data = _file_bytes(pack, rel, include_secrets)
+            entries[rel.as_posix()] = hashlib.sha256(data).hexdigest()
+            st = (pack / rel).stat()
             info = tarfile.TarInfo(rel.as_posix())
             info.size = len(data)
-            info.mode = (pack / rel).stat().st_mode & 0o777
+            info.mode = st.st_mode & 0o777
+            info.mtime = int(st.st_mtime)          # preserve mtime — restore was dating every file to
+                                                   # 1970-01-01, deranging mtime-keyed engine lanes (#39)
             tar.addfile(info, io.BytesIO(data))
+        rollup = hashlib.sha256(
+            "\n".join(f"{k} {v}" for k, v in sorted(entries.items())).encode()).hexdigest()
+        manifest = {"files": entries, "digest": rollup, "count": len(entries),
+                    "created": stamp, "pack": pack.name, "include_secrets": include_secrets}
         data = (json.dumps(manifest, indent=2) + "\n").encode()
         info = tarfile.TarInfo(_MANIFEST)
         info.size = len(data)

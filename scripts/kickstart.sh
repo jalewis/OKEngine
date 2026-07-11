@@ -16,7 +16,16 @@
 set -euo pipefail
 
 PACK_DIR="${1:-${CRON_PACK_DIR:-$PWD}}"
-HUID="${HERMES_UID:-$(id -u)}"
+
+# Resolve the uid the gateway runs as the SAME way every other deploy script does — env pin ->
+# pack .env -> /opt/data tree owner — NOT the caller's `id -u` (invariant-audit M4). On a host where
+# the operator invokes kickstart as root or a different login, `id -u` picked the WRONG uid, so the
+# in-container docker exec ran the build lanes as a uid that doesn't own /opt/data and stalled on
+# permission-denied — the exact pre-okengine#185 anti-pattern the shared helper exists to kill.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/hermes_uid.sh
+. "$REPO_ROOT/scripts/lib/hermes_uid.sh"
+HUID="$(resolve_hermes_uid "$PACK_DIR")"
 
 # THIS pack's gateway via its compose project (not the first gateway on a multi-pack host, #108).
 CONTAINER="$(docker compose -f "$PACK_DIR/docker-compose.yml" ps -q gateway 2>/dev/null | head -1)"

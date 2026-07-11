@@ -29,6 +29,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -59,12 +60,31 @@ PACK_DIR = Path(os.environ.get("CRON_PACK_DIR", "/path/to/pack"))
 # Runtime fields stripped when capturing from the live scheduler state.
 RUNTIME_FIELDS = {"next_run_at", "last_run_at", "last_run_success",
                   "last_error", "last_delivery_error"}
+# A runtime PAUSE (budget-guard cost cap, or a manual `cron-plus pause`) is stored IN jobs.json as
+# {enabled: false, paused_at: ...}. `paused_at` is the marker that distinguishes a pause from an
+# intentional source-level `enabled: false` (a ship-disabled placeholder).
+PAUSE_MARKERS = {"paused_at", "paused_reason", "paused_by"}
 
 
 def sanitize(jobs: list[dict]) -> list[dict]:
     out = []
     for j in jobs:
         sj = {k: v for k, v in j.items() if k not in RUNTIME_FIELDS}
+        # A runtime pause must NOT be captured as source truth: `dump` writes the sanitized jobs into
+        # config/engine-crons.json + the pack's domain-crons.json, and regen() drops every
+        # enabled:false job from the deployed artifact — so a `dump` run while the budget guard has
+        # cost-bearing crons paused would SILENTLY REMOVE them from the fleet on the next deploy
+        # (invariant-audit HIGH). A pause is runtime state; un-pause it on capture. TRUTHINESS, not
+        # key-presence: cron-plus RESUME sets paused_at back to None but KEEPS the key, so a
+        # paused-then-resumed job carries paused_at:null forever — a key-presence check would then
+        # force-flip a later OPERATOR-disabled (plain enabled:false) job back to enabled on dump
+        # (re-verify regression). Only a job actually paused NOW has a truthy paused_at.
+        if sj.get("paused_at"):
+            for m in PAUSE_MARKERS:
+                sj.pop(m, None)
+            sj["enabled"] = True
+        else:
+            sj.pop("paused_at", None)          # drop a lingering paused_at:null (never source truth)
         if isinstance(sj.get("repeat"), dict) and "completed" in sj["repeat"]:
             sj["repeat"] = {k: v for k, v in sj["repeat"].items() if k != "completed"}
         out.append(sj)
@@ -75,6 +95,33 @@ def _by_name(jobs: list[dict]) -> list[dict]:
     return sorted(jobs, key=lambda j: j.get("name", ""))
 
 
+def _normalize_schedule(job: dict) -> dict:
+    """cron-plus requires `schedule` to be a DICT ({kind:cron, expr:...}); the pack-authoring docs
+    also show a BARE STRING ("0 13 * * SUN"). Normalize the string shape into the dict HERE — the
+    single chokepoint that writes the deployed jobs.json — so a documented bare-string schedule can't
+    reach cron-plus verbatim and crash every tick with 'str has no attribute get', stalling the whole
+    fleet (invariant-audit HIGH #1)."""
+    s = job.get("schedule")
+    if isinstance(s, str) and s.strip():
+        job = dict(job)
+        job["schedule"] = {"kind": "cron", "expr": s.strip()}
+    return job
+
+
+def _ensure_id(job: dict) -> dict:
+    """Every deployed cron MUST carry an `id`. The pinned cron-plus scheduler's null-next_run_at heal
+    logs via `job.get("name", job["id"])` — Python evaluates the default arg EAGERLY, so an id-less
+    job raises KeyError('id') on the FIRST tick (even with a name present), the exception escapes the
+    claim before anything persists, and the ticker re-crashes every 60s FOREVER — stalling the WHOLE
+    fleet, engine lanes included, with every gate green (invariant-audit CRITICAL). The pack-authoring
+    docs never require id, so mint a stable one from the (already pack-prefixed, unique) name at this
+    single deploy chokepoint — no id-less job can reach the deployed jobs.json."""
+    if not str(job.get("id") or "").strip():
+        job = dict(job)
+        job["id"] = hashlib.sha1(str(job.get("name") or "").encode("utf-8")).hexdigest()[:12]
+    return job
+
+
 def _dump_jobs(jobs: list[dict]) -> str:
     """Canonical cron-plus-jobs.json text — name-sorted. DISABLED jobs
     (`enabled: false` placeholders) are NOT written to the deployed artifact:
@@ -82,7 +129,7 @@ def _dump_jobs(jobs: list[dict]) -> str:
     every tick and log 'invalid cron expr' noise (#27). They stay in the SOURCE
     (the pack's domain-crons.json); flip enabled:true + set a real expr to deploy
     one. The in-memory merge keeps them, so split/compose stay lossless."""
-    live = [j for j in jobs if j.get("enabled", True)]
+    live = [_ensure_id(_normalize_schedule(j)) for j in jobs if j.get("enabled", True)]
     return json.dumps({"jobs": _by_name(live)}, indent=2, ensure_ascii=False) + "\n"
 
 
@@ -189,13 +236,41 @@ def merge_packs(engine: list[dict], packs: list[dict],
 
     for pk in packs:
         pname = pk["name"]
+        # Build the pack's FULL rename map first: engine-template stubs the pack drives ->
+        # <job>@<pack>, domain jobs -> <pack>:<job>. An intra-pack `after:` target names a SIBLING that
+        # was ALSO renamed (a domain job OR a driven engine-template lane) — rewrite it against this map
+        # so the dependency resolves to the renamed fleet member instead of dangling at the bare
+        # pre-rename name (which validate_ordering then rejects, making the pack undeployable). A target
+        # naming a PURE-engine job stays bare — those ship unrenamed (invariant-audit + batch-3 re-verify).
+        template_driven = {jn for jn in (pk.get("prompts") or {})
+                           if engine_by_name.get(jn) is not None and tier_of.get(jn) == "engine-template"}
+        domain_bare = {j.get("name") for j in (pk.get("domain") or [])}
+        # The rename map is keyed by BARE name across three namespaces (pure-engine / driven-template /
+        # domain); a domain job whose bare name shadows an engine or driven-template lane makes an
+        # intra-pack after: target ambiguous — it would silently rebind to the domain twin instead of
+        # the engine/template lane the author meant (a silently misordered dependency). Fail loud rather
+        # than guess (invariant-audit batch-3 re-verify).
+        for nm in sorted(domain_bare & (template_driven | set(engine_by_name))):
+            errors.append(f"{pname}: domain job {nm!r} shadows an engine/engine-template lane of the "
+                          "same name — rename the domain job so after: targets are unambiguous")
+        rename: dict[str, str] = {}
+        for jn in template_driven:
+            rename[jn] = f"{jn}@{pname}"
+        for j in (pk.get("domain") or []):
+            rename[j.get("name")] = f"{pname}:{j.get('name')}"
+
+        def _rewrite_after(job: dict) -> dict:
+            if job.get("after"):
+                job["after"] = [rename.get(a, a) for a in job["after"]]
+            return job
+
         for jobname, prompt in (pk.get("prompts") or {}).items():
             base = engine_by_name.get(jobname)
             if base is None or tier_of.get(jobname) != "engine-template":
                 errors.append(f"{pname}: prompt for '{jobname}' which is not an "
                               "engine-template job")
                 continue
-            inst = dict(base)
+            inst = _rewrite_after(dict(base))   # the inherited engine after: may name a lane this pack drives
             inst["name"] = f"{jobname}@{pname}"
             inst["prompt"] = prompt
             if inst["name"] in seen:
@@ -203,9 +278,9 @@ def merge_packs(engine: list[dict], packs: list[dict],
             seen[inst["name"]] = pname
             out.append(inst)
         for j in (pk.get("domain") or []):
-            j2 = dict(j)
+            j2 = _rewrite_after(dict(j))
             j2["name"] = f"{pname}:{j.get('name')}"
-            j2.setdefault("pack", pname)       # provenance marker (okengine#143)
+            j2.setdefault("pack", pname)        # provenance marker (okengine#143)
             if j2["name"] in seen:
                 errors.append(f"job-id collision: {j2['name']}")
             seen[j2["name"]] = pname
@@ -274,6 +349,12 @@ def regen_composed(packs_dir: Path) -> list[dict]:
     jobs, errors = compose(packs_dir)
     if errors:
         raise SystemExit("composition errors (not deploying):\n  " + "\n  ".join(errors))
+    _, order_errors = validate_ordering(jobs)          # #129: the composed path skipped this gate
+    if order_errors:                                   # (single-pack regen had it) — re-verify M-ordering
+        raise SystemExit("cron ordering errors (not deploying):\n  " + "\n  ".join(order_errors))
+    id_errors = validate_unique_ids(jobs)              # M37: final safety net after N-way compose
+    if id_errors:
+        raise SystemExit("cron id/name collisions (not deploying):\n  " + "\n  ".join(id_errors))
     JOBS.write_text(_dump_jobs(jobs), encoding="utf-8")
     return jobs
 
@@ -323,16 +404,78 @@ def regen() -> list[dict]:
     _, order_errors = validate_ordering(merged)        # okengine#129: fail-loud on broken/cyclic after:
     if order_errors:
         raise SystemExit("cron ordering errors (not deploying):\n  " + "\n  ".join(order_errors))
+    id_errors = validate_unique_ids(merged)            # M37: fail-loud on a colliding deployed id/name
+    if id_errors:
+        raise SystemExit("cron id/name collisions (not deploying):\n  " + "\n  ".join(id_errors))
     JOBS.write_text(_dump_jobs(merged), encoding="utf-8")
     print(f"regen: {len(engine)} engine-half + {len(domain)} domain + {len(prompts)} "
           f"prompts + {len(ext_jobs)} extension -> {JOBS.name} ({len(merged)} jobs)")
     return merged
 
 
+def _restore_source_reprs(jobs: list[dict]) -> list[dict]:
+    """dump-from-live reads the DEPLOYED jobs.json, whose schedules + models were EXPANDED by the
+    deploy-only transform (deploy-cron-plus-jobs.sh): cron_jitter turned `@jitter:*`/`@morning[:MM]`
+    into a concrete PER-INSTALL cron expr, and model_profiles expanded an `@profile` model ref into
+    concrete provider/base_url/model/ollama_num_ctx. Writing those resolved values back to the SHARED
+    source would bake ONE install's jitter minute + endpoint into everyone's source, permanently
+    destroying the sentinel / profile indirection (invariant-audit M20). For every job that still
+    exists in the current source, restore the source's sentinel schedule + `@profile` model (and drop
+    the deploy-baked profile fields), so a live->source round-trip is idempotent for the deploy-only
+    transforms. Non-transformed edits (enabled, prompt, after, new jobs) are still captured from live."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import cron_jitter
+        import model_profiles
+    except Exception:
+        return jobs                                     # resolver libs absent -> capture live verbatim
+    src_by_name: dict[str, dict] = {}
+    src_by_id: dict[str, dict] = {}
+    for f in (ENGINE_CRONS_FILE, PACK_DIR / "crons" / DOMAIN_CRONS):
+        try:
+            for j in json.loads(f.read_text()):
+                src_by_name.setdefault(j.get("name"), j)
+                if j.get("id"):
+                    src_by_id.setdefault(j.get("id"), j)
+        except Exception:
+            pass
+    out = []
+    for j in jobs:
+        s = src_by_name.get(j.get("name")) or src_by_id.get(j.get("id"))   # also match a RENAMED job by id
+        if s:
+            j = dict(j)
+            # Schedule: use cron_jitter._job_expr — it reads ALL THREE documented shapes (dict,
+            # bare-string, top-level `expr`); a hand-rolled `schedule.expr` read misses the top-level
+            # shape and re-bakes its per-install jitter (re-verify). Restore the source's schedule
+            # representation verbatim (drop the live resolved fields first).
+            if cron_jitter.is_sentinel(cron_jitter._job_expr(s) or "") \
+                    or cron_jitter.is_morning_sentinel(cron_jitter._job_expr(s) or ""):
+                j.pop("schedule", None)
+                j.pop("expr", None)
+                if "schedule" in s:
+                    j["schedule"] = s["schedule"]
+                if "expr" in s:
+                    j["expr"] = s["expr"]
+            # Model: restore the @profile ref, but only DROP a profile field the deploy actually baked
+            # (absent from source); a field the SOURCE set independently of the profile is preserved.
+            if model_profiles.is_ref(s.get("model") or ""):
+                j["model"] = s["model"]
+                for pf in model_profiles.PROFILE_FIELDS:
+                    if pf == "model":
+                        continue
+                    if pf in s:
+                        j[pf] = s[pf]                   # source-set field -> keep source's value
+                    else:
+                        j.pop(pf, None)                 # deploy-baked endpoint field -> drop
+        out.append(j)
+    return out
+
+
 def dump_from_live(livefile: str) -> None:
     """Capture live scheduler state -> engine half + pack, then regenerate."""
     live = json.loads(Path(livefile).read_text())
     jobs = sanitize(live["jobs"] if isinstance(live, dict) else live)
+    jobs = _restore_source_reprs(jobs)   # keep source sentinels/@profiles, not the deploy-baked values (M20)
     parts = split(jobs, _tier_map(TIERS))
     ENGINE_CRONS_FILE.write_text(_dump_list(parts[ENGINE_CRONS]), encoding="utf-8")
     (PACK_DIR / "crons").mkdir(parents=True, exist_ok=True)
@@ -384,6 +527,31 @@ def validate_ordering(jobs: list[dict]) -> tuple[list[str], list[str]]:
     return order, errors
 
 
+def validate_unique_ids(jobs: list[dict]) -> list[str]:
+    """cron-plus keys every job by `id` (minted from `name` when absent — see _ensure_id), so a
+    duplicate deployed id — or name, which mints a colliding id — means one job silently runs the
+    OTHER's definition and the twin NEVER fires: a whole lane vanishes with every gate green
+    (invariant-audit M37). The multi-pack composer prefixes names to avoid this, but single-pack
+    merge + the extension pass have no gate, and validate_ordering/_by_name both collapse a dup name
+    into one dict entry (so they can't see it). Check the FINAL deployed shape (post _ensure_id) over
+    the ENABLED jobs (disabled placeholders never deploy). Returns errors — non-empty = do not deploy."""
+    errors: list[str] = []
+    seen_id: dict[str, str] = {}
+    seen_name: dict[str, str] = {}
+    for j in (_ensure_id(x) for x in jobs if x.get("enabled", True)):
+        jid, nm = j.get("id"), j.get("name")
+        if jid in seen_id:
+            errors.append(f"duplicate cron id {jid!r}: {seen_id[jid]!r} and {nm!r} "
+                          "(cron-plus keys by id — one runs the other's def, the twin never fires)")
+        else:
+            seen_id[jid] = nm
+        if nm in seen_name:
+            errors.append(f"duplicate cron name {nm!r} (mints a colliding id)")
+        else:
+            seen_name[nm] = jid
+    return errors
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", nargs="?", default="check",
@@ -403,6 +571,8 @@ def main(argv: list[str]) -> int:
         if not pdir:
             ap.error("compose requires --packs DIR (or CRON_PACKS_DIR)")
         jobs, errors = compose(Path(pdir))
+        _, order_errors = validate_ordering(jobs)          # same gates as regen_composed — the CLI
+        errors = errors + order_errors + validate_unique_ids(jobs)   # subcommand bypassed both (re-verify)
         if errors:
             print("composition errors (not writing):")
             for e in errors:
@@ -464,6 +634,8 @@ def main(argv: list[str]) -> int:
           f"{len(parts[DOMAIN_CRONS])} domain / {len(parts[DOMAIN_PROMPTS])} prompts), "
           f"merged={len(merged)} jobs")
     order, order_errors = validate_ordering(jobs)      # okengine#129: after: graph soundness
+    id_errors = validate_unique_ids(jobs)              # M37: the self-test guarding the committed
+    order_errors = order_errors + id_errors            # artifact must catch a colliding id/name too
     if order_errors:
         print("✗ ORDERING", file=sys.stderr)
         for e in order_errors:

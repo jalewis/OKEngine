@@ -1,0 +1,68 @@
+# Barebones smoke stack — the three READ/RENDER surfaces (reader, cockpit, mcp) over a frozen
+# seeded vault. Deliberately NO gateway/Hermes/model: these surfaces are standalone read-only over
+# the vault (`./vault:ro`), so the smoke run needs no API keys, no feeds, and is fully deterministic.
+# Ports bind to loopback only. Brought up + torn down by smoke-e2e.sh.
+name: okengine-smoke
+
+services:
+  reader:
+    build: ../../../okengine-reader
+    image: okengine-reader
+    container_name: okengine-smoke-reader
+    restart: "no"
+    ports: ["127.0.0.1:9880:9200"]
+    environment:
+      - OKENGINE_TRUST=public
+      - OKENGINE_BIND=127.0.0.1
+    volumes: ["./vault:/vault:ro"]
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: 512M}
+
+  okengine-mcp:
+    build:
+      context: ../../../
+      dockerfile: okengine-mcp/Dockerfile
+    image: okengine-mcp
+    container_name: okengine-smoke-mcp
+    restart: "no"
+    ports: ["127.0.0.1:8880:8730"]
+    environment:
+      - WIKI_PATH=/opt/vault
+      - OKENGINE_MCP_TRANSPORT=streamable-http
+      - OKENGINE_MCP_TOKEN=okengine-local
+      # The container binds 0.0.0.0 (baked) so the 127.0.0.1:8880 port map can reach it, which makes
+      # the server see itself as "exposed" — with the built-in DEFAULT token that trips the okengine#50
+      # fail-CLOSED guard and the container EXITS at startup (so the MCP surface was never actually up
+      # in smoke). This is a throwaway loopback-only smoke stack, so accept the well-known token
+      # explicitly; without this the B7.6 MCP smoke check hits connection-refused (invariant-audit).
+      - OKENGINE_MCP_ALLOW_DEFAULT_TOKEN=1
+    volumes:
+      - ./vault:/opt/vault:ro
+      - smoke-qmd:/opt/data/qmd
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: 1G}
+
+  cockpit:
+    build: ../../../okengine-cockpit
+    image: okengine-cockpit
+    container_name: okengine-smoke-cockpit
+    restart: "no"
+    ports: ["127.0.0.1:9881:9200"]
+    environment:
+      - VAULT_DIR=/vault
+      - OKENGINE_TRUST=public
+      - OKENGINE_BIND=127.0.0.1
+      # marp render-on-miss for the weekly deck: the home-less container uid needs HOME/TMPDIR/XDG
+      # pointed at writable paths or chromium EACCES-404s the deck PDF (the deck-render gotcha).
+      - HOME=/tmp/cockpit-home
+      - TMPDIR=/tmp
+      - XDG_CACHE_HOME=/tmp/cockpit-cache
+    volumes: ["./vault:/vault:ro"]
+    deploy:
+      resources:
+        limits: {cpus: "1.5", memory: 1G}
+
+volumes:
+  smoke-qmd:

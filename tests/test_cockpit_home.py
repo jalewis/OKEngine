@@ -75,6 +75,42 @@ def test_home_omits_everything_on_an_empty_vault(tmp_path, monkeypatch):
     assert m.api_home() == {"sections": []}
 
 
+def test_active_predictions_count_as_open(tmp_path, monkeypatch):
+    """The prediction 'open' vocabulary is a cross-surface contract: base-schema
+    `open_values: [open, active]`, mirrored by pred_lib.OPEN_VALUES and read config-driven by the cron
+    lanes. The cockpit is a fourth consumer — a status:active prediction (routine for migrated/drained
+    sets) must appear under 'Open predictions' and in the due-soon tally, not be silently dropped
+    because the code hardcoded status=='open' (invariant-audit M11)."""
+    (tmp_path / "schema.yaml").write_text("cockpit:\n  tabs: [home]\n", encoding="utf-8")
+    _mk(tmp_path, "predictions/p-active.md",
+        "type: prediction\nstatus: active\nsubject: APT X pivots\nresolves_by: 2026-08-01\n")
+    m = _load(tmp_path, monkeypatch)
+    pr = m.api_predictions()
+    assert pr["total"] == 1
+    m2 = _load(tmp_path, monkeypatch)
+    home = m2.api_home()
+    pred = next((s for s in home["sections"] if s["group"] == "Predictions"), None)
+    assert pred is not None, "status:active prediction must surface under Open predictions"
+    assert "APT X pivots" in pred["html"]
+
+
+def test_cockpit_open_status_matches_pred_lib_contract():
+    """Pin the cockpit's _OPEN_STATUS to the single source of truth (pred_lib.OPEN_VALUES) so the two
+    can't drift apart (the multi-surface-contract rule) — invariant-audit M11."""
+    import os as _os
+    _os.environ.setdefault("VAULT_DIR", "/tmp")   # module import only needs the env present
+    sys.path.insert(0, str(APP.parent))
+    sys.modules.pop("cockpit_app", None)
+    spec = importlib.util.spec_from_file_location("cockpit_app", APP)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    pl_path = REPO / "extensions" / "okengine.predictions" / "pred_lib.py"
+    pl_spec = importlib.util.spec_from_file_location("pred_lib", pl_path)
+    pl = importlib.util.module_from_spec(pl_spec)
+    pl_spec.loader.exec_module(pl)
+    assert m._OPEN_STATUS == set(pl.OPEN_VALUES), (m._OPEN_STATUS, pl.OPEN_VALUES)
+
+
 def test_home_dashboard_chips_handle_the_grouped_config_shape(tmp_path, monkeypatch):
     """Regression (cyber-market): its `dashboards:` config uses the GROUPED shape
     ([{group, items: [{path, title?}]}]) — the flat-slug chips code rendered raw dict
@@ -95,3 +131,57 @@ def test_home_dashboard_chips_handle_the_grouped_config_shape(tmp_path, monkeypa
     assert 'data-page="lacuna/INDEX"' in html and "Lacuna gaps" in html
     assert 'data-page="dashboards/frontier-map"' in html and "frontier map" in html
     assert "{" not in html, html   # no dict reprs ever
+
+
+def test_cockpit_browse_hides_archived_and_walkup_excluded(tmp_path, monkeypatch):
+    """Cockpit discovery surfaces — browse ledger (_scan_dir), rail count (api_tree), dataset scan
+    (_scan_dir_meta) — must hide reserved _archive/ sub-dirs (all three) and walk-up-nested excluded
+    namespaces (the browse pair), matching the reader + /api/streams (batch-2 completeness re-verify)."""
+    (tmp_path / "schema.yaml").write_text("exclude: [observations]\n", encoding="utf-8")
+    e = tmp_path / "wiki" / "entities" / "a"; e.mkdir(parents=True)
+    (e / "live.md").write_text("---\ntype: actor\n---\nL\n", encoding="utf-8")
+    arch = tmp_path / "wiki" / "entities" / "_archive"; arch.mkdir(parents=True)
+    (arch / "retired.md").write_text("---\ntype: actor\n---\nR\n", encoding="utf-8")
+    wu = tmp_path / "wiki" / "sub" / "observations"; wu.mkdir(parents=True)
+    (wu / "o.md").write_text("---\ntype: observation\n---\nO\n", encoding="utf-8")
+    (tmp_path / "wiki" / "sub" / "entities").mkdir(parents=True)
+    (tmp_path / "wiki" / "sub" / "entities" / "x.md").write_text("---\ntype: actor\n---\nX\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    tree = {x["dir"]: x["count"] for x in m.api_tree()["dirs"]}
+    assert tree.get("entities") == 1, "archived page must not inflate the rail count"
+    assert tree.get("sub") == 1, "walk-up excluded observations must not be counted"
+    assert len(m._scan_dir("entities")) == 1
+    assert all("_archive" not in r["path"] for r in m._scan_dir("entities"))
+    assert len(m._scan_dir_meta("entities")) == 1, "dataset scan must skip _archive/ retired pages"
+
+
+def test_predictions_and_backlinks_hide_archived(tmp_path, monkeypatch):
+    """Two more cockpit discovery surfaces the completeness sweep's fix must cover: the Open-predictions
+    view (_prediction_files) and the cockpit's own backlinks (_skip_backlink_src) must hide reserved
+    _archive/ pages, matching browse/streams/search (batch-2 completeness re-verify)."""
+    _mk(tmp_path, "predictions/p1.md",
+        "type: prediction\nstatus: open\nsubject: Live\nresolves_by: 2026-09-01\n")
+    _mk(tmp_path, "predictions/_archive/old.md",
+        "type: prediction\nstatus: open\nsubject: Retired\nresolves_by: 2020-01-01\n")
+    m = _load(tmp_path, monkeypatch)
+    assert m.api_predictions()["total"] == 1, "archived prediction must not appear in the view"
+    assert m._skip_backlink_src("entities/_archive/old") is True
+    assert m._skip_backlink_src("entities/_archive/2026/old") is True
+    assert m._skip_backlink_src("entities/a/live") is False
+
+
+def test_reshard_bucket_page_stays_visible(tmp_path, monkeypatch):
+    """The bare-`_` reshard second-letter bucket (entities/x/_/x-force.md for a non-alnum slug) is a
+    LEGITIMATE canonical location — the reserved-segment guard must NOT over-drop it (batch-2 over-drop
+    re-verify: x-force / e-commerce / t-mobile all reshard into a `_` bucket)."""
+    b = tmp_path / "wiki" / "entities" / "x" / "_"; b.mkdir(parents=True)
+    (b / "x-force.md").write_text("---\ntype: actor\nname: X-Force\n---\nbody\n", encoding="utf-8")
+    ea = tmp_path / "wiki" / "entities" / "a"; ea.mkdir(parents=True)
+    (ea / "apt.md").write_text("---\ntype: actor\n---\nA\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    assert m._is_reserved_seg("_archive") is True and m._is_reserved_seg(".git") is True
+    assert m._is_reserved_seg("_") is False and m._is_reserved_seg("entities") is False
+    tree = {x["dir"]: x["count"] for x in m.api_tree()["dirs"]}
+    assert tree.get("entities") == 2, "the _ reshard bucket page must be counted, not over-dropped"
+    assert any("x-force" in r["path"] for r in m._scan_dir("entities")), "resharded x-force missing from ledger"
+    assert len(m._scan_dir_meta("entities")) == 2, "reshard bucket page missing from dataset scan"

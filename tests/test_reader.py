@@ -266,3 +266,172 @@ def test_source_citation_links_the_original_article(tmp_path, monkeypatch):
     assert html.count("securelist.example") == 1
     # no url -> fall back to the internal wikilink (still reachable, just no external link)
     assert 'data-page="sources/2026/07/no-url"' in html
+
+
+def test_embed_ambiguous_basename_resolves_to_none(tmp_path, monkeypatch):
+    """L7: an ambiguous ![[dup]] embed (two files same basename) resolves to None, not an arbitrary
+    first match; a unique basename still resolves (mirrors _link_title's uniqueness guard)."""
+    (tmp_path / "wiki" / "a").mkdir(parents=True)
+    (tmp_path / "wiki" / "b").mkdir(parents=True)
+    (tmp_path / "wiki" / "a" / "dup.md").write_text("---\ntype: x\n---\nAAA")
+    (tmp_path / "wiki" / "b" / "dup.md").write_text("---\ntype: x\n---\nBBB")
+    (tmp_path / "wiki" / "a" / "solo.md").write_text("---\ntype: x\n---\nSOLO")
+    m = _load(tmp_path, monkeypatch)
+    m._EMBED_PATH_CACHE.clear()
+    assert m._embed_rglob("dup.md") is None            # ambiguous -> unresolved
+    assert m._embed_rglob("solo.md") is not None       # unique -> resolves
+
+
+def test_embed_multi_source_entity_prefers_entities_page(tmp_path, monkeypatch):
+    """#16: an embed of a multi-source entity (entities/<l>/slug PLUS observations/<src>/slug copies
+    sharing the basename) resolves to the ENTITY page, not 'missing' — the naive len==1 gate (L7)
+    regressed this by returning None for any multi-hit basename."""
+    (tmp_path / "wiki" / "entities" / "a").mkdir(parents=True)
+    (tmp_path / "wiki" / "observations" / "src1" / "a").mkdir(parents=True)
+    (tmp_path / "wiki" / "entities" / "a" / "apt29.md").write_text("---\ntype: actor\ntitle: APT29\n---\nE")
+    (tmp_path / "wiki" / "observations" / "src1" / "a" / "apt29.md").write_text("---\ntype: observation\n---\nO")
+    m = _load(tmp_path, monkeypatch)
+    m._EMBED_PATH_CACHE.clear()
+    hit = m._embed_rglob("apt29.md")
+    assert hit is not None and hit.parts[-3] == "entities"   # the entity, not None
+
+
+def test_walkup_subdomain_multi_source_entity_resolves(tmp_path, monkeypatch):  # invariant-audit HIGH
+    """In a WALK-UP co-installed vault the namespace is nested under a sub-domain container
+    (wiki/<subdomain>/entities/... + wiki/<subdomain>/observations/...). The parts[0]-only check saw
+    the sub-domain container, never fired the excluded-drop/entities-preference, and left the basename
+    409-ambiguous. _ns_dirs makes it layout-agnostic."""
+    sub = tmp_path / "wiki" / "cti-sub"
+    (tmp_path / "schema.yaml").write_text("exclude: [observations]\n")
+    (sub / "entities" / "a").mkdir(parents=True)
+    (sub / "observations" / "src1" / "a").mkdir(parents=True)
+    (sub / "entities" / "a" / "apt29.md").write_text("---\ntype: actor\ntitle: APT29\n---\nE")
+    (sub / "observations" / "src1" / "a" / "apt29.md").write_text("---\ntype: observation\n---\nO")
+    m = _load(tmp_path, monkeypatch)
+    got = m._resolve_basename("apt29.md")
+    assert got is not None and "entities" in got.parts and "observations" not in got.parts
+    assert m._resolve_page("apt29") == (sub / "entities" / "a" / "apt29.md").resolve()  # no spurious 409
+
+
+def test_shape_conflicts_survives_scalar_values(tmp_path, monkeypatch):
+    """conflicts.values authored as scalars (`values: [high, medium]`, or a bare string that then
+    iterates per-character) must not 500 the page view — the inner loop called .get() on each value
+    assuming dicts (invariant-audit M28). `conflicts` is in _OKF_ALWAYS so the write path applies NO
+    shape check, so a scalar reaches the reader unchecked and it must degrade, not crash."""
+    (tmp_path / "wiki").mkdir()
+    m = _load(tmp_path, monkeypatch)
+    # scalar ENTRIES (list of scalars / bare string) AND scalar CONTAINERS (values is a non-iterable
+    # scalar, e.g. 42) must all degrade, not 500 — the round-2 re-verify showed the entry-only guard
+    # still crashed on `values: 42` (TypeError in the loop header, before the isinstance guard runs).
+    fm = {"conflicts": [{"field": "severity", "headline": "high", "values": ["high", "medium"]},
+                        {"field": "actor", "headline": "x", "values": "scalar-string"},
+                        {"field": "count", "headline": "y", "values": 42},
+                        {"field": "flag", "headline": "z", "values": True}]}
+    out = m._shape_conflicts(fm)                       # must not raise AttributeError/TypeError
+    assert isinstance(out, list) and len(out) == 4
+    assert all(c["values"] == [] for c in out)         # every malformed shape skipped cleanly
+    # a scalar `conflicts` container itself must not crash the loop header either
+    assert m._shape_conflicts({"conflicts": 42}) == []
+    assert m._shape_conflicts({"conflicts": "nope"}) == []
+    # THIRD container: a well-shaped entry whose `sources` is a scalar must not crash (round-2 re-verify)
+    fm2 = {"conflicts": [{"field": "f", "headline": "h",
+                          "values": [{"value": "high", "sources": 42},
+                                     {"value": "low", "sources": True}]}]}
+    out2 = m._shape_conflicts(fm2)
+    assert out2[0]["values"][0]["sources"] == [] and out2[0]["values"][1]["sources"] == []
+
+
+def test_browse_tree_excludes_nested_namespace_in_walkup(tmp_path, monkeypatch):
+    """api_tree's page count must not include pages in an EXCLUDED namespace nested under a walk-up
+    sub-domain — the root-anchored `d.name in excluded` only dropped a TOP-LEVEL excluded dir, so a
+    walk-up <subdomain>/observations/ leaked into the browse count (invariant-audit M-1310)."""
+    (tmp_path / "schema.yaml").write_text("exclude: [observations]\n", encoding="utf-8")
+    sd = tmp_path / "wiki" / "acme-sub"
+    (sd / "observations" / "s1").mkdir(parents=True)
+    (sd / "observations" / "s1" / "obs1.md").write_text("---\ntype: observation\n---\nO\n", encoding="utf-8")
+    (sd / "entities" / "a").mkdir(parents=True)
+    (sd / "entities" / "a" / "apt.md").write_text("---\ntype: actor\n---\nE\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    acme = next((x for x in m.api_tree()["dirs"] if x["dir"] == "acme-sub"), None)
+    assert acme is not None
+    assert acme["count"] == 1, "nested excluded observations must not be counted in browse"
+    # the count MUST agree with the served ledger (_scan_dir behind api_pages) — the round-2 re-verify
+    # caught api_tree excluding the nested page while _scan_dir still listed it (count 1 vs list 2).
+    served = m._scan_dir("acme-sub")
+    assert len(served) == acme["count"], f"browse count {acme['count']} != served list {len(served)}"
+    assert all("observations" not in r["path"] for r in served), "excluded namespace leaked into the ledger"
+
+
+def test_scan_dir_and_tree_hide_archived_subdir(tmp_path, monkeypatch):
+    """Browse count + served ledger must hide reserved _archive/ SUB-DIR pages (leaf-only _skip missed
+    them), so discovery surfaces AGREE with search's ripgrep `!_*` pruning (round-3 re-verify)."""
+    (tmp_path / "wiki" / "entities" / "a").mkdir(parents=True)
+    (tmp_path / "wiki" / "entities" / "a" / "live.md").write_text("---\ntype: actor\n---\nL\n", encoding="utf-8")
+    arch = tmp_path / "wiki" / "entities" / "_archive" / "2026"
+    arch.mkdir(parents=True)
+    (arch / "retired.md").write_text("---\ntype: actor\n---\nR\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    tree = {x["dir"]: x["count"] for x in m.api_tree()["dirs"]}
+    assert tree.get("entities") == 1, "archived _archive/ page must not be counted in browse"
+    served = m._scan_dir("entities")
+    assert len(served) == 1 and all("_archive" not in r["path"] for r in served)
+
+
+def test_search_exclusion_is_any_depth(tmp_path, monkeypatch):
+    """The search ripgrep ignore for an excluded namespace must match at ANY depth (`!**/{d}/**`),
+    not root-anchored (`!{d}/**`) — else a walk-up <subdomain>/observations/ leaks into search
+    results (invariant-audit M-1310). Capture the rg argv without needing ripgrep installed."""
+    import subprocess as _sp
+    (tmp_path / "schema.yaml").write_text("exclude: [observations]\n", encoding="utf-8")
+    (tmp_path / "wiki").mkdir()
+    m = _load(tmp_path, monkeypatch)
+    monkeypatch.setattr(m, "_guard", lambda *a, **k: (lambda: None))   # bypass rate-limit guard
+    cap = {}
+
+    class _P:
+        stdout = ""
+    monkeypatch.setattr(m.subprocess, "run", lambda cmd, **k: (cap.__setitem__("cmd", cmd), _P())[1])
+    m.api_search(None, q="hello")
+    assert "!**/observations/**" in cap["cmd"], cap["cmd"]
+    assert "!observations/**" not in cap["cmd"], "root-anchored exclusion still present"
+    # reserved-dir prune must EXEMPT the bare-`_` reshard bucket: `!_?*` (underscore + ≥1 char), never
+    # `!_*` which also drops entities/x/_/x-force.md — search must agree with browse (batch-2 gate).
+    assert "!_?*" in cap["cmd"] and "!_*" not in cap["cmd"], cap["cmd"]
+
+
+def test_backlinks_skip_archived_source_at_any_depth(tmp_path, monkeypatch):
+    """_skip_backlink_src must drop a source in a reserved _archive/ sub-dir at ANY depth — a leaf-only
+    check let archived pages contribute 'what links here' edges that browse + search already hide, an
+    inconsistency (batch-2 completeness re-verify). Live pages still contribute."""
+    (tmp_path / "wiki").mkdir()
+    m = _load(tmp_path, monkeypatch)
+    assert m._skip_backlink_src("entities/_archive/oldactor") is True
+    assert m._skip_backlink_src("entities/_archive/2026/oldactor") is True
+    assert m._skip_backlink_src("entities/a/liveactor") is False
+
+
+def test_reshard_bucket_page_stays_visible(tmp_path, monkeypatch):
+    """Reader twin of the over-drop guard: the bare-`_` reshard bucket (entities/x/_/x-force.md) must
+    stay visible in browse count + ledger, never dropped by the reserved-segment check (batch-2)."""
+    b = tmp_path / "wiki" / "entities" / "x" / "_"; b.mkdir(parents=True)
+    (b / "x-force.md").write_text("---\ntype: actor\nname: X-Force\n---\nbody\n", encoding="utf-8")
+    ea = tmp_path / "wiki" / "entities" / "a"; ea.mkdir(parents=True)
+    (ea / "apt.md").write_text("---\ntype: actor\n---\nA\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    assert m._is_reserved_seg("_archive") is True and m._is_reserved_seg("_") is False
+    tree = {x["dir"]: x["count"] for x in m.api_tree()["dirs"]}
+    assert tree.get("entities") == 2, "the _ reshard bucket page must be counted, not over-dropped"
+    assert any("x-force" in r["path"] for r in m._scan_dir("entities"))
+
+
+def test_observations_by_canonical_hides_archived(tmp_path, monkeypatch):
+    """Reader _observations_by_canonical twin (the cockpit's was fixed first) must skip _archive/
+    retired observations so the page overlay's source drill-down agrees with browse/search (batch-2)."""
+    live = tmp_path / "wiki" / "observations" / "s1"; live.mkdir(parents=True)
+    (live / "o1.md").write_text("---\ncanonical: apt29\n---\nlive\n", encoding="utf-8")
+    arch = tmp_path / "wiki" / "observations" / "_archive"; arch.mkdir(parents=True)
+    (arch / "old.md").write_text("---\ncanonical: apt29\n---\nretired\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    obs = m._observations_by_canonical().get("apt29", [])
+    assert len(obs) == 1, "archived observation must not appear in the canonical index"
+    assert all("_archive" not in str(o) for o in obs)

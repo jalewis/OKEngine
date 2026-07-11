@@ -21,6 +21,20 @@ WRAPPER="$REPO/scripts/extract-raw.sh"
 LOG="${EXTRACT_LOG:-$HOME/.okengine-extract-raw.log}"
 SCHEDULE="${SCHEDULE:-*/15 * * * *}"
 
+# This installs a HOST crontab entry. extract-raw.sh resolves its raw root as
+# ${WIKI_PATH:-/opt/vault}/raw — and /opt/vault is a CONTAINER path that doesn't exist on the host,
+# so a WIKI_PATH-less install writes a cron that logs "raw root not found" and no-ops every 15 min,
+# silently. Refuse rather than install a dead schedule (invariant-audit B7.2).
+if [ -z "${WIKI_PATH:-}" ]; then
+    echo "ERROR: WIKI_PATH is not set. This installs a host cron; without it the scheduled" >&2
+    echo "       extract-raw.sh falls back to the container-only /opt/vault/raw and silently" >&2
+    echo "       no-ops every run. Set WIKI_PATH to the vault root on THIS host and re-run." >&2
+    exit 1
+fi
+if [ ! -d "$WIKI_PATH/raw" ]; then
+    echo "  ⚠ $WIKI_PATH/raw does not exist yet — the cron will skip until raw/ appears." >&2
+fi
+
 # Carry WIKI_PATH / EXTRACT_PYTHON into the cron environment (cron has a bare env)
 # so the scheduled run resolves the same raw/ root and interpreter as this install.
 env_prefix=""

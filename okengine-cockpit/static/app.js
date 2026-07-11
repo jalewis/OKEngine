@@ -460,7 +460,41 @@ function mdLite(s) {
   });
   h = h.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
     (m, t, u) => `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${t}</a>`);
+  // internal linked-title citation `[APT41](entities/a/apt41)` -> clickable page link (openPage);
+  // http links already became <a> above so they won't match here.
+  h = h.replace(/\[([^\]]+)\]\(([^\s)]+)\)/g,
+    (m, t, p) => `<a class="wl" data-page="${esc(p.replace(/\.md$/, ""))}">${t}</a>`);
   return h.replace(/\n/g, "<br>");
+}
+// Export the finished assistant report through the server clean+pandoc pipeline (internal vault
+// links flattened to text). One file per format; the browser downloads it.
+async function downloadChatExport(text, fmt, btn) {
+  const title = ((text.match(/^#{1,6}\s*(.+)$/m) || [])[1]
+    || (text.split("\n").find(l => l.trim()) || "report")).replace(/[*_`#]/g, "").slice(0, 80).trim();
+  const old = btn.textContent; btn.disabled = true; btn.textContent = "…";
+  try {
+    const res = await fetch(`/api/chat_export?fmt=${encodeURIComponent(fmt)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: text, title })
+    });
+    if (!res.ok) throw new Error(res.status);
+    const blob = await res.blob();
+    const cd = res.headers.get("Content-Disposition") || "";
+    const fn = decodeURIComponent((cd.match(/filename="?([^"]+)"?/) || [])[1] || `report.${fmt}`);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.download = fn; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  } catch (e) { btn.textContent = "err"; setTimeout(() => (btn.textContent = old), 1500); return; }
+  finally { btn.disabled = false; if (btn.textContent === "…") btn.textContent = old; }
+}
+function chatExportBar(text) {
+  const bar = el("div", "chat-dl", `<span class="chat-dl-l">Export report</span>`);
+  ["md", "docx", "pdf"].forEach(f => {
+    const b = el("button", "chat-dl-b"); b.type = "button"; b.textContent = f;
+    b.onclick = () => downloadChatExport(text, f, b);
+    bar.appendChild(b);
+  });
+  return bar;
 }
 function appendBubble(role, text) {
   const log = $("#chat-log");
@@ -512,7 +546,10 @@ async function sendChat(text) {
     bubble.innerHTML = mdLite(acc) + `<span class="chat-err"> — connection lost</span>`;
   }
   bubble.classList.remove("streaming");
-  if (acc) CHAT.push({ role: "assistant", content: acc });
+  if (acc) {
+    CHAT.push({ role: "assistant", content: acc });
+    if (acc.length > 400) bubble.appendChild(chatExportBar(acc));   // offer export on substantial replies
+  }
   log.scrollTop = log.scrollHeight;
   _chatBusy = false; $("#chat-send").disabled = false;
 }
@@ -600,6 +637,88 @@ function provenanceHtml(p) {
   return chips.length ? `<div class="provenance">${chips.join("")}</div>` : "";
 }
 
+// Page quality/status badges: a problem-only flag row at the very top of the overlay (needs-review,
+// no-sources, ungrounded, conflicting, stale, thin, missing-required). Server computes them from
+// data already present; a clean page yields none (no row). level -> colour.
+function qualityHtml(badges) {
+  if (!badges || !badges.length) return "";
+  return `<div class="qbadges">` + badges.map(b =>
+    `<span class="qb qb-${esc(b.level || "warn")}" title="${esc(b.title || b.label)}">${esc(b.label)}</span>`).join("") + `</div>`;
+}
+// Fact panel + record details (ported from the reader): the SURFACED frontmatter is the page's
+// profile (aliases, origin, refs, …) shown below the body; record-keeping/provenance is tucked
+// into a collapsed disclosure. A value resolving to a vault page -> internal a.wl link (the global
+// delegated handler opens it); a url-valued field -> external link; otherwise a plain chip.
+function _metaRows(meta) {
+  const chip = v => v.page
+    ? `<a class="wl" data-page="${esc(v.page)}">${esc(v.text)}</a>`
+    : v.url
+      ? `<a class="mlink" href="${esc(v.url)}" target="_blank" rel="noopener noreferrer">${esc(v.text)}</a>`
+      : `<span class="mchip">${esc(v.text)}</span>`;
+  return meta.map(m => {
+    const single = m.values.length === 1 && !m.values[0].url && !m.values[0].page;
+    const vals = single ? `<span class="mtext">${esc(m.values[0].text)}</span>` : m.values.map(chip).join("");
+    return `<div class="mrow"><div class="mk">${esc(m.label)}</div><div class="mv">${vals}</div></div>`;
+  }).join("");
+}
+function factPanel(meta) {
+  return (meta && meta.length) ? `<div class="meta-panel meta-facts">${_metaRows(meta)}</div>` : "";
+}
+function auxPanel(meta) {
+  return (meta && meta.length)
+    ? `<details class="meta-details"><summary>Record details</summary><div class="meta-panel">${_metaRows(meta)}</div></details>` : "";
+}
+// Multi-source provenance (okengine#42): the assembler's per-field "what each source says" +
+// per-source observation records, each source tagged with Admiralty reliability.
+const relBadge = s => s.reliability
+  ? ` <b class="rel rel-${esc(s.reliability)}" title="Admiralty reliability ${esc(s.reliability)}">${esc(s.reliability)}</b>` : "";
+function provPanel(d) {
+  const conflicts = d.conflicts || [], obs = d.observations || [];
+  if (!conflicts.length && !obs.length) return "";
+  let h = `<div class="prov">`;
+  if (conflicts.length) {
+    h += `<div class="prov-head"><span>⚠ Sources disagree${d.needs_review ? ` <span class="nr">needs review</span>` : ""}</span>` +
+      `<label class="prov-filter"><input type="checkbox" id="prov-bfilter"> ≥ B-reliability only</label></div>`;
+    conflicts.forEach(c => {
+      h += `<div class="cf"><div class="cf-field">${esc(c.field)}</div>` +
+        c.values.map(v =>
+          `<div class="cf-val${v.is_headline ? " cf-head" : ""}" data-rank="${v.rank}">` +
+          `<span class="cf-v">${esc(v.value)}</span>` +
+          `<span class="cf-srcs">` + (v.sources.map(s => `<span class="cf-src">${esc(s.name)}${relBadge(s)}</span>`).join("") || "—") + `</span>` +
+          (v.is_headline ? `<span class="cf-pick">chosen</span>` : "") + `</div>`).join("") + `</div>`;
+    });
+  }
+  if (obs.length) {
+    h += `<div class="prov-head">Per-source records</div><div class="obs-list">` +
+      obs.map(o => `<a class="wl obs-item" data-page="${esc(o.key)}">${esc(o.source || o.key.split("/").pop())} ↗</a>`).join("") +
+      `</div>`;
+  }
+  return h + `</div>`;
+}
+// ≥B filter: dim any conflicting value whose best source reliability ranks below B (4).
+function wireProvFilter(root) {
+  const cb = $("#prov-bfilter", root); if (!cb) return;
+  cb.onchange = () => $$(".cf-val", root).forEach(el =>
+    el.classList.toggle("dim", cb.checked && (+el.dataset.rank) < 4));
+}
+
+// Evidence section: the page's cited sources as graded, dated citations (not a bare list) —
+// name (linked if it resolves to a source page), Admiralty reliability badge, recency date.
+function citationsHtml(cites) {
+  if (!cites || !cites.length) return "";
+  const rows = cites.map(c => {
+    const nm = c.page
+      ? `<a class="wl cite-n" data-page="${esc(c.page)}">${esc(c.name)}</a>`
+      : `<span class="cite-n">${esc(c.name)}</span>`;
+    const rel = c.reliability
+      ? ` <b class="rel rel-${esc(c.reliability)}" title="Admiralty reliability ${esc(c.reliability)}">${esc(c.reliability)}</b>` : "";
+    const dt = c.date ? `<span class="cite-d">${esc(c.date)}</span>` : "";
+    return `<div class="cite">${nm}${rel}${dt}</div>`;
+  }).join("");
+  return `<div class="prov"><div class="prov-head">Evidence <span class="bl-n">${cites.length}</span></div>` +
+    `<div class="cite-list">${rows}</div></div>`;
+}
+
 async function openPage(path, push = true) {
   const ov = $("#page-overlay"), c = $("#ov-content");
   ov.hidden = false; c.innerHTML = "<div class='empty'>Loading…</div>";
@@ -609,7 +728,16 @@ async function openPage(path, push = true) {
     $("#ov-title").textContent = d.title || path;
     $("#ov-path").textContent = (d.type ? d.type + " · " : "") + (d.rel || path);
     $("#ov-dl").innerHTML = dlLinks(`path=${encodeURIComponent(path)}`);
-    c.innerHTML = provenanceHtml(d.provenance) + panelHtml(d.panel) + d.html + `<div id="backlinks" class="backlinks"></div>`; c.scrollTop = 0;
+    // The prose body always leads. The fact panel is reference detail (aliases, techniques,
+    // metrics) and follows the body; record-keeping (meta_aux) trails it. The `profiled` flag
+    // still governs which fields are primary (fact panel) vs secondary (Record details) — it no
+    // longer moves the panel above the body.
+    const facts = factPanel(d.meta);
+    c.innerHTML = qualityHtml(d.quality) + provenanceHtml(d.provenance) + panelHtml(d.panel) +
+      d.html + facts +
+      citationsHtml(d.citations) + provPanel(d) + auxPanel(d.meta_aux) +
+      `<div id="backlinks" class="backlinks"></div>`; c.scrollTop = 0;
+    wireProvFilter(c);
     $("#ov-back").style.visibility = pageStack.length > 1 ? "visible" : "hidden";
     loadBacklinks(d.rel || path);
   } catch (e) { c.innerHTML = `<div class='empty'>page not found: ${esc(path)}</div>`; }
@@ -621,11 +749,17 @@ async function loadBacklinks(path) {
   box.innerHTML = `<div class="bl-head">↩ Backlinks</div><div class="bl-empty">finding references…</div>`;
   try {
     const d = await j(`/api/backlinks?path=${encodeURIComponent(path)}`);
-    if (!d.count) { box.innerHTML = `<div class="bl-head">↩ Backlinks <span class="bl-n">0</span></div><div class="bl-empty">No pages link here.</div>`; return; }
-    box.innerHTML = `<div class="bl-head">↩ Backlinks <span class="bl-n">${d.count}</span></div>` +
-      `<div class="bl-list">` + d.backlinks.map(b =>
-        `<a class="bl-item" data-page="${esc(b.key)}"><span class="bl-dir">${esc((b.key.split("/")[0]) || "")}</span><span class="bl-title">${esc(b.title)}</span></a>`).join("") +
-      `</div>`;
+    if (!d.count) { box.innerHTML = `<div class="bl-head">↩ Related <span class="bl-n">0</span></div><div class="bl-empty">No pages reference this.</div>`; return; }
+    // typed rail: one section per referrer namespace (predictions/findings/entities/…), each with
+    // its true count; items capped server-side with a "+N more" tail.
+    const groups = (d.groups && d.groups.length) ? d.groups : [{ label: "", count: d.count, items: d.backlinks }];
+    box.innerHTML = `<div class="bl-head">↩ Related <span class="bl-n">${d.count}</span></div>` +
+      groups.map(g =>
+        `<div class="bl-group"><div class="bl-gh">${esc(g.label || g.ns)}<span class="bl-n">${g.count}</span></div>` +
+        `<div class="bl-list">` + (g.items || []).map(b =>
+          `<a class="bl-item" data-page="${esc(b.key)}"><span class="bl-title">${esc(b.title)}</span></a>`).join("") +
+        (g.count > (g.items || []).length ? `<div class="bl-more">+${g.count - (g.items || []).length} more</div>` : "") +
+        `</div></div>`).join("");
     $$(".bl-item", box).forEach(a => a.onclick = () => openPage(a.dataset.page));
   } catch (e) { box.innerHTML = `<div class="bl-head">↩ Backlinks</div><div class="bl-empty">unavailable</div>`; }
 }

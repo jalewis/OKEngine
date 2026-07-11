@@ -289,3 +289,19 @@ def test_write_canonical_idempotent_skips_unchanged(tmp_path):
     assert w3 is True
     fm, _ = m.read_fm(p)
     assert fm["version"] == 2 and "The Dukes" in fm["aliases"]
+
+
+def test_key_serializes_date_and_set_dict_fields_deterministically():  # invariant-audit completeness
+    """A union-mode field can be a list of dicts whose values include a datetime.date (yaml.safe_load
+    of a bare ISO date). _key(dict) json.dumps'd it WITHOUT default=str, so a TypeError propagated out
+    of the unguarded fuse() and aborted the ENTIRE canonical-assembly run (zero canonicals). It must
+    serialize, and a !!set field must key DETERMINISTICALLY (sorted, not PYTHONHASHSEED-order str(set))."""
+    import datetime
+    m = _load("canonical_assemble")
+    d = datetime.date(2026, 7, 10)
+    obs = [_obs("mitre", "A", "2026-06-01", refs=[{"url": "https://example.com", "seen": d}]),
+           _obs("thaicert", "B", "2026-06-02", refs=[{"url": "https://example.com", "seen": d}])]
+    out = m.fuse(obs, POLICY)["fields"]                     # must NOT raise on the date-bearing dict
+    assert out["refs"] == [{"url": "https://example.com", "seen": d}]   # identical dicts deduped to one
+    # a set inside a dict field keys deterministically regardless of insertion order
+    assert m._key({"tags": {"b", "a"}}) == m._key({"tags": {"a", "b"}})

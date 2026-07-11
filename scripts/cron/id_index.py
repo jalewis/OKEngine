@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sys
+import threading
 from pathlib import Path
 
 import yaml
@@ -105,7 +106,29 @@ class IdIndex:
         }
 
 
-def build(vault: Path = VAULT) -> IdIndex:
+def from_dict(d: dict) -> IdIndex:
+    """Reconstruct an IdIndex from a persisted `to_dict()` payload."""
+    idx = IdIndex()
+    idx.by_id = dict(d.get("by_id") or {})
+    idx.aliases = dict(d.get("aliases") or {})
+    idx.tombstoned = set(d.get("tombstoned") or [])
+    idx._collisions = dict(d.get("collisions") or {})
+    return idx
+
+
+def load(path: Path = INDEX_PATH) -> IdIndex | None:
+    """Load the persisted id-index artifact; None if absent or unreadable."""
+    try:
+        return from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return None
+
+
+_REFRESH_LOCK = threading.RLock()
+_REFRESHING: set[str] = set()
+
+
+def _scan(vault: Path) -> IdIndex:
     """Walk wiki/ (recursively, sharded pages included) and index every page that
     carries an `id`. Pages without an `id` are skipped (backfill stamps them)."""
     idx = IdIndex()
@@ -131,6 +154,48 @@ def build(vault: Path = VAULT) -> IdIndex:
     return idx
 
 
+def _refresh_into(idx: IdIndex, vault: Path, key: str) -> None:
+    """Background: full-scan the vault, then update `idx` IN PLACE (so a holder's reference sees the
+    fresh data) and re-persist the artifact. In-session ids the live index gained since load are
+    unioned in so a write racing the rebuild isn't dropped."""
+    try:
+        fresh = _scan(vault)
+        with _REFRESH_LOCK:
+            for pid, rel in list(idx.by_id.items()):
+                fresh.by_id.setdefault(pid, rel)
+            idx.by_id, idx.aliases = fresh.by_id, fresh.aliases
+            idx.tombstoned, idx._collisions = fresh.tombstoned, fresh._collisions
+        try:
+            write_index(fresh)
+        except OSError:
+            pass
+    finally:
+        with _REFRESH_LOCK:
+            _REFRESHING.discard(key)
+
+
+def build(vault: Path = VAULT, *, force: bool = False) -> IdIndex:
+    """Return a ready id-index for `vault`.
+
+    `force=True` (the cron) full-scans wiki/ — 64k pages, read+parse each, tens of seconds.
+    `force=False` (the write path) LOADS the persisted artifact instantly and kicks a one-shot
+    background refresh so the huge scan never blocks a write. Falls back to a live scan only when no
+    artifact exists yet (first deploy, before the refresh cron has run)."""
+    if force:
+        return _scan(vault)
+    idx = load()
+    if idx is None:
+        return _scan(vault)                     # no artifact yet — scan once (first deploy)
+    key = str(vault)
+    with _REFRESH_LOCK:
+        kick = key not in _REFRESHING
+        if kick:
+            _REFRESHING.add(key)
+    if kick:
+        threading.Thread(target=_refresh_into, args=(idx, vault, key), daemon=True).start()
+    return idx
+
+
 def write_index(idx: IdIndex, path: Path = INDEX_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
@@ -139,7 +204,7 @@ def write_index(idx: IdIndex, path: Path = INDEX_PATH) -> None:
 
 
 def main(argv: list[str]) -> int:
-    idx = build()
+    idx = build(force=True)          # the cron always full-scans, then persists the artifact
     write_index(idx)
     cols = idx.collisions()
     print(f"id-index: {len(idx.by_id)} ids, {len(idx.aliases)} aliases, "

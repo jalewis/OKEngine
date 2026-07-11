@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import contextvars
 import hmac
+import json
 import os
 import re
 import subprocess
@@ -85,7 +86,12 @@ def _safe(path: str) -> Path | None:
     """Resolve a wiki-relative path, refusing escapes outside the vault wiki/."""
     p = WIKI / path.lstrip("/")
     if p.suffix != ".md":
-        p = p.with_suffix(".md")
+        # APPEND, never with_suffix() — it strips everything after the last dot and truncates a
+        # dotted slug, desyncing the read path from the write path (write_server._safe stores
+        # 'openssl-3.0.7-advisory.md'; a with_suffix() read would look for 'openssl-3.0.md' and 404
+        # the page). This aligns the .md handling with write_server._safe; the two still diverge on
+        # entity-shard / over-qualified / wiki-prefix normalization (pre-existing, tracked for v0.11.1).
+        p = p.with_name(p.name + ".md")
     try:
         p = p.resolve()
         p.relative_to(WIKI.resolve())
@@ -141,23 +147,121 @@ def get_page(path: str) -> str:
     return p.read_text(encoding="utf-8", errors="replace")[:16000]
 
 
+# ── knowledge-graph backlinks: serve the cron-precomputed artifact, not live IWE ──────────────────
+# The `backlinks-refresh` cron writes the inverted {target -> [{key,title}]} graph to
+# wiki/.backlinks.json (okengine#168/#179); the reader + cockpit serve it directly. This MCP used to
+# rebuild the IWE graph live on EVERY find_references/retrieve_context call (kb_graph -> iwe
+# subprocess) — O(rebuild-whole-graph), which on a 60k-page vault blew past the MCP call timeout
+# (cyber-market, recurring). Read the artifact instead (O(dict lookup)); fall back to live IWE only
+# when the artifact is absent/stale (small vault without the cron, or a missed refresh).
+_BL_ARTIFACT_MAX_AGE = max(3600, int(os.environ.get("OKENGINE_BACKLINKS_MAX_AGE", "172800")))
+_BL_CACHE: dict = {"map": None, "mtime": None}
+_WL_RE = re.compile(r"\[\[([^\]|#\n]+?)(?:[#|][^\]]*)?\]\]")
+
+
+def _artifact_backlinks() -> dict | None:
+    """The precomputed {target -> [{key,title}]} backlink map (wiki/.backlinks.json), or None when
+    absent / stale / corrupt — callers then fall back to live IWE. mtime-cached (steady-state cost
+    per call is one stat)."""
+    p = WIKI / ".backlinks.json"
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    if time.time() - st.st_mtime > _BL_ARTIFACT_MAX_AGE:
+        return None
+    if _BL_CACHE["mtime"] == st.st_mtime and _BL_CACHE["map"] is not None:
+        return _BL_CACHE["map"]
+    try:
+        m = json.loads(p.read_text(encoding="utf-8")).get("backlinks")
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(m, dict):
+        return None
+    _BL_CACHE["map"], _BL_CACHE["mtime"] = m, st.st_mtime
+    return m
+
+
+def _resolve_key(target: str, bl: dict) -> str | None:
+    """Resolve an agent-supplied `target` (a page path OR a bare name) to a canonical backlink key:
+    exact key, then a page on disk, then a unique basename match against the artifact's keys."""
+    t = target.strip().strip("/")
+    t = t[:-3] if t.endswith(".md") else t
+    if t in bl:
+        return t
+    if (WIKI / (t + ".md")).is_file():
+        return t
+    slug = t.split("/")[-1].lower()
+    hits = {k for k in bl if k.split("/")[-1].lower() == slug}
+    if not hits:                                    # also scan referrer keys (pages with no inbound)
+        for refs in bl.values():
+            for r in refs:
+                k = str(r.get("key", ""))
+                if k.split("/")[-1].lower() == slug:
+                    hits.add(k)
+    return next(iter(hits)) if len(hits) == 1 else None
+
+
+def _forward_links(key: str) -> list[str]:
+    """A page's own outbound [[wikilinks]] (forward refs) — a cheap body parse, no IWE."""
+    try:
+        txt = (WIKI / (key + ".md")).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out, seen = [], set()
+    for m in _WL_RE.finditer(txt):
+        k = m.group(1).strip()
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def _fmt_refs(head: str, items: list, cap: int) -> list[str]:
+    lines = [f"## {head} ({len(items)})"]
+    for it in items[:cap]:
+        lines.append(f"- [[{it}]]" if isinstance(it, str)
+                     else f"- [[{it.get('key','')}]] — {it.get('title','')}")
+    if len(items) > cap:
+        lines.append(f"- … and {len(items) - cap} more")
+    return lines
+
+
 @mcp.tool()
 def find_references(target: str) -> str:
-    """Knowledge-graph lookup via IWE: find pages matching `target` and show
-    their resolved references / backlinks. Use to traverse the corpus graph."""
-    return _run([str(SCRIPTS / "kb_graph.py"), "find", str(target)])[:8000]
+    """Knowledge-graph lookup: pages that reference `target` (backlinks) plus `target`'s own outbound
+    references. Served from the cron-precomputed backlink graph (wiki/.backlinks.json); falls back to
+    live IWE when that artifact is absent/stale. `target` is a page path or name."""
+    bl = _artifact_backlinks()
+    key = _resolve_key(str(target), bl) if bl is not None else None
+    if bl is None or key is None:                   # artifact missing OR target unresolved -> live IWE
+        return _run([str(SCRIPTS / "kb_graph.py"), "find", str(target)])[:8000]
+    lines = [f"# {key}", ""]
+    lines += _fmt_refs("Referenced by", bl.get(key, []), 50) + [""]
+    lines += _fmt_refs("References", _forward_links(key), 50)
+    return "\n".join(lines)[:8000]
 
 
 @mcp.tool()
 def retrieve_context(path: str) -> str:
-    """Retrieve a page WITH its knowledge-graph context expanded (via IWE): the
-    page plus its resolved outbound references and incoming backlinks, one hop out.
-    Richer than get_page (which is the raw file) — use it to load a page together
-    with its neighbourhood when you need the surrounding graph, not just the text.
-    `path` is a vault page id/path, e.g. 'entities/a/example' or 'concepts/topic'."""
+    """Retrieve a page WITH its knowledge-graph context expanded: the page plus its outbound
+    references and incoming backlinks, one hop out. Richer than get_page (the raw file) — use it to
+    load a page together with its neighbourhood. Served from the precomputed backlink graph; falls
+    back to live IWE when absent/stale. `path` is a vault page id/path, e.g. 'entities/a/example'."""
     if not _authorize_read(str(path)):
         return "(refused: outside this caller's read scope)"
-    return _run([str(SCRIPTS / "kb_graph.py"), "retrieve", "-k", str(path)])[:16000]
+    bl = _artifact_backlinks()
+    key = _resolve_key(str(path), bl) if bl is not None else None
+    if bl is None or key is None:
+        return _run([str(SCRIPTS / "kb_graph.py"), "retrieve", "-k", str(path)])[:16000]
+    try:
+        body = (WIKI / (key + ".md")).read_text(encoding="utf-8", errors="replace")[:12000]
+    except OSError:
+        body = "(page body unavailable)"
+    lines = [body, "", "---"]
+    lines += _fmt_refs("Incoming backlinks", bl.get(key, []), 30) + [""]
+    lines += _fmt_refs("Outbound references", _forward_links(key), 30)
+    return "\n".join(lines)[:16000]
 
 
 @mcp.tool()
@@ -400,10 +504,15 @@ def _index_maintainer_step(state: dict) -> None:
     now = time.monotonic()
     due_full = _INDEX_REFRESH_HOURS > 0 and (now - state["last_full"]) >= _INDEX_REFRESH_HOURS * 3600
     if state["last_full"] == 0.0 or due_full:
+        # Snapshot the vault's max mtime BEFORE the (slow) refresh — a page written DURING the
+        # refresh would otherwise bump last_seen to a value the just-started index never saw, so its
+        # change would read as "already indexed" and never trigger the incremental branch until the
+        # next full refresh hours later (invariant-audit M9). Capturing first keeps it pending.
+        seen_before = _vault_max_mtime()
         _refresh_index()                          # registers collection + full incremental
         done = time.monotonic()
         state["last_full"] = now
-        state["last_seen"] = _vault_max_mtime()
+        state["last_seen"] = seen_before
         state["cooldown_until"] = done + _index_update_cooldown(done - now)
         return
     cur = _vault_max_mtime()

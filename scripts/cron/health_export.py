@@ -89,7 +89,15 @@ def main() -> int:
         overall = 1
 
     # --- Prometheus textfile ---
+    # Heartbeat FIRST and ALWAYS emitted: the unix time THIS exporter last wrote. The other gauges
+    # only detect the upstream fleet-health dashboard going stale (monitor_stale) — nothing catches
+    # health_export ITSELF dying, after which Prometheus keeps scraping the frozen .prom (last value
+    # green) indefinitely. A scheduler-independent alert `time() - okengine_health_export_timestamp_seconds
+    # > N` fires when this lane stops running, regardless of what the frozen file says (invariant-audit B6.3).
     metrics = [
+        ("okengine_health_export_timestamp_seconds",
+         "unix time health_export last wrote (heartbeat; alert if time()-this exceeds ~2x the cadence)",
+         int(datetime.now(timezone.utc).timestamp())),
         ("okengine_health_overall", "0=green 1=yellow 2=red", overall),
         ("okengine_health_monitor_stale", "1=fleet-health dashboard missing/stale (monitor dead)",
          1 if monitor_dead else 0),

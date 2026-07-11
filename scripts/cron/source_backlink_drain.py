@@ -184,7 +184,7 @@ def main() -> int:
         f"# Source→Entity Backlink Drain — {now.date().isoformat()}",
         "",
         f"Reconnected **{len(applied)}** declared source→entity backlinks "
-        f"this run (batch cap {BATCH}). Each adds `[[sources/<stem>]]` to the "
+        f"this run (batch cap {BATCH}). Each adds `sources/<stem>` to the "
         "entity's `sources:` list so the LLM entity-backfill cron can fold in "
         "the content.",
         "",

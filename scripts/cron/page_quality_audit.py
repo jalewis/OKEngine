@@ -230,11 +230,16 @@ def classify(sub: str, fm: dict, body: str, today: date) -> dict:
 
 
 def main() -> int:
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now().date()  # LOCAL ledger day, not UTC — same cohort as kb_health/field-loss (TZ-behind-UTC files tomorrow) — invariant-audit B6.2/completeness
     pages = list(all_pages())
     inbound = build_inbound(pages)
 
-    by_tier = {"entities": Counter(), "concepts": Counter()}
+    # One Counter per AUDITED namespace — NOT a hardcoded {entities, concepts}. AUDITED_DIRS is
+    # derived from the schema's knowledge namespaces (line 66), so it grows as the pack adds them
+    # (e.g. `briefings`); a fixed two-key map KeyError'd on `by_tier[sub]` for any extra namespace
+    # (crashed the daily run fleet-wide). entities/concepts stay present (knowledge_namespaces +
+    # the fallback always include them), so the entities/concepts-specific dashboard table is safe.
+    by_tier = {s: Counter() for s in AUDITED_DIRS}
     deficient = []  # (inbound, sub, stem, tier, words, sections, sources, type)
     for sub, p in pages:
         fm, body = read_fm_body(p)
@@ -283,14 +288,16 @@ def main() -> int:
     DASH.parent.mkdir(parents=True, exist_ok=True)
     DASH.write_text("\n".join(L) + "\n")
 
-    # machine-readable enrich queue for a future enrichment drain
+    # machine-readable enrich queue for a future enrichment drain. Ensure operational/ exists FIRST
+    # — this write and the snapshot below both land there, and a bare vault (no prior operational
+    # lane) would FileNotFoundError otherwise.
+    OP_DIR.mkdir(parents=True, exist_ok=True)
     (OP_DIR / "page-quality-queue.json").write_text(json.dumps(
         [{"page": f"{s}/{st}", "tier": ti, "inbound": ib, "words": w,
           "sections": sec, "sources": ns}
          for ib, s, st, ti, w, sec, ns, _t in deficient[:200]], indent=0))
 
     # ── snapshot ────────────────────────────────────────────────────
-    OP_DIR.mkdir(parents=True, exist_ok=True)
     header = ("---\ntype: dashboard\ntitle: Page-quality snapshots\n---\n\n"
               "# Page-quality snapshots\n\n"
               "| date | deficient | empty | ent-stub% | ent-thin% | con-stub% | con-thin% |\n"

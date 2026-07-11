@@ -40,6 +40,18 @@ def main(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     guard = _guard()
 
+    # The guard's state dir defaults to HERMES_HOME (or the container-only /opt/data). Run on the
+    # HOST with that default and _load_state() reads a non-existent file -> returns {} -> --status
+    # cheerfully prints "not paused" and --resume no-ops, even while the deployment IS paused. This
+    # is the documented manual-recovery path, so a silent no-op is dangerous: fail loud and point the
+    # operator at the deployment's data dir instead of guessing (invariant-audit B7.3).
+    home = Path(guard._hermes_home())
+    if not home.is_dir():
+        print(f"budget-guard: state dir {home} not found on this host. `budget --status/--resume` must "
+              f"target the DEPLOYMENT's data dir — set HERMES_HOME=<pack>/.hermes-data (or run inside "
+              f"the gateway), then retry.", file=sys.stderr)
+        return 2
+
     if args.resume:
         guard.resume("manual")
         return 0

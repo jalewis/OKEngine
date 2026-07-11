@@ -149,7 +149,7 @@ def main() -> int:
     )
     for slug, typ, this_c, prior_c, ratio, recent in movers:
         rs = f"{ratio:.1f}x" if ratio != float("inf") else "new (no prior)"
-        print(f"## `[[entities/{slug}]]` ({typ}) — {this_c} recent vs {prior_c} prior ({rs})")
+        print(f"## `entities/{slug}` ({typ}) — {this_c} recent vs {prior_c} prior ({rs})")
         for d, r in recent:
             print(f"    - {d.isoformat()}  [[sources/{r}]]")
         print()

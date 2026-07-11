@@ -16,9 +16,8 @@ template is **not** expected to parse until rendered).
 | `{{READER_PORT}}` | reader host port = `9200 + offset`. | `9400` | computed |
 | `{{MCP_PORT}}` | mcp host port = `8730 + offset`. | `8930` | computed |
 | `{{ENV_PREFIX}}` | Uppercase env prefix for the feeds var. | `OKPACK_SEC` | `{{PACK}}` upper, `-`→`_` |
-| `{{BRIEF_HOUR}}` | UTC hour (0–23) for the daily-brief cron. | `13` | you choose |
 | `{{LICENSE_YEAR}}` | Copyright year in the skeleton `LICENSE`. | `2026` | current year |
-| `{{CRON_ID_1}}` / `{{CRON_ID_2}}` | Arbitrary unique hex ids for the two crons. | `7c0ff9a23fcf` | generator mints |
+| `{{CRON_ID_1}}` | Arbitrary unique hex id for the skeleton's domain cron. | `7c0ff9a23fcf` | generator mints |
 
 **Internal ports are fixed** (reader `9200`, mcp `8730`); only the host-side port
 changes via `{{PORT_OFFSET}}`. Keep the offset unique per host.

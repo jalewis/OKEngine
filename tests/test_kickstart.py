@@ -31,6 +31,17 @@ def test_stages_run_in_dependency_order():
         assert lane in t, f"kickstart is missing the {lane!r} lane"
 
 
+def test_resolves_hermes_uid_via_shared_helper():  # invariant-audit M4
+    """kickstart must resolve the exec uid the way every deploy script does — the shared
+    resolve_hermes_uid helper (env -> pack .env -> /opt/data tree owner, okengine#185) — NOT the
+    caller's `id -u`, which picks the wrong uid when run as root/another login and stalls the
+    in-container build lanes on permission-denied."""
+    t = K.read_text()
+    assert "lib/hermes_uid.sh" in t, "kickstart must source the shared hermes_uid helper"
+    assert 'HUID="$(resolve_hermes_uid' in t, "HUID must come from resolve_hermes_uid"
+    assert '$(id -u)' not in t, "kickstart must not fall back to the caller's id -u for the exec uid"
+
+
 def test_scopes_gateway_to_pack_project():
     # must target THIS pack's gateway, not the first gateway on a multi-pack host (#108)
     assert 'docker compose -f "$PACK_DIR/docker-compose.yml" ps -q gateway' in K.read_text()

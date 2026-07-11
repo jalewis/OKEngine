@@ -102,7 +102,7 @@ def main() -> int:
     print(f"For each missing concept below, create `wiki/concepts/<slug>.md` with frontmatter and a body synthesized from the citing sources. Per the vault CLAUDE.md, a concept page describes a category, pattern, policy, or trend — NOT a specific organization or named actor (those are entities).\n")
 
     for i, (slug, paths) in enumerate(chosen, 1):
-        print(f"## {i}. `[[concepts/{slug}]]` ({len(paths)} inbound refs)")
+        print(f"## {i}. `concepts/{slug}` ({len(paths)} inbound refs)")
         print()
         print(f"  expected file: `wiki/concepts/{slug}.md`")
         print(f"  citing pages (showing up to {MAX_CITING_SOURCES}):")

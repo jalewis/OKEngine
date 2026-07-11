@@ -99,3 +99,29 @@ def test_webhook_failure_does_not_advance_state(tmp_path, monkeypatch):  # invar
     sf = md / ".health-state.json"
     state = json.loads(sf.read_text()) if sf.is_file() else {}
     assert state.get("overall", 0) != 2, "dedup state advanced despite webhook failure — RED alert lost"
+
+
+def test_heartbeat_gauge_emitted_even_when_monitor_dead(tmp_path, monkeypatch):  # invariant-audit B6.3
+    """The other gauges only detect the UPSTREAM fleet-health dashboard going stale. Nothing catches
+    health_export ITSELF dying, after which Prometheus scrapes the frozen .prom (last value maybe
+    green) forever. A heartbeat gauge (unix time this exporter last wrote) lets an alert fire on
+    `time() - okengine_health_export_timestamp_seconds > N` regardless of the frozen values. It must
+    be present ALWAYS — including the dead-upstream-monitor path — and carry a fresh timestamp."""
+    import time, re
+    (tmp_path / "wiki" / "dashboards").mkdir(parents=True)   # no fleet-health -> upstream monitor dead
+    md = tmp_path / "metrics"
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("METRICS_DIR", str(md))
+    monkeypatch.delenv("ALERT_WEBHOOK", raising=False)
+    before = time.time()
+    spec = importlib.util.spec_from_file_location("health_export", REPO / "scripts/cron/health_export.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["health_export"] = m
+    spec.loader.exec_module(m)
+    assert m.main() == 0
+    prom = (md / "okengine.prom").read_text()
+    mt = re.search(r"^okengine_health_export_timestamp_seconds (\d+)$", prom, re.MULTILINE)
+    assert mt, f"heartbeat gauge missing from export:\n{prom}"
+    ts = int(mt.group(1))
+    assert before - 5 <= ts <= time.time() + 5, f"heartbeat timestamp {ts} not fresh"
+    assert "okengine_health_overall 2" in prom              # emitted alongside the RED dead-monitor verdict

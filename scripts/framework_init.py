@@ -90,11 +90,9 @@ def _tokens(dest: Path, domain: str, offset: int) -> dict[str, str]:
         "COCKPIT_PORT": str(9201 + offset),
         "ENV_PREFIX": re.sub(r"[^A-Z0-9]", "_", pack.upper()),
         "PACK_UNDERSCORE": pack.replace("-", "_"),
-        "BRIEF_HOUR": "13",
         "OWNER": "REPLACE_OWNER",
         "LICENSE_YEAR": str(date.today().year),
         "CRON_ID_1": secrets.token_hex(6),
-        "CRON_ID_2": secrets.token_hex(6),
     }
 
 

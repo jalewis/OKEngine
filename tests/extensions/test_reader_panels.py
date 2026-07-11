@@ -58,3 +58,19 @@ def test_collect_reader_panels_composes_and_dedups():
     }
     _, errs2 = COMP.collect_reader_panels(clash)
     assert errs2 and "bound by both" in errs2[0]
+
+
+def test_deploy_does_not_swallow_reader_panels_staging_failure():  # invariant-audit B6.4
+    """The collision above is detected by collect_reader_panels and surfaced as a non-zero
+    `stage-panels` exit — but the deploy step used to run it as `stage-panels … || echo "skipped"`,
+    swallowing that exit (and every real extension-config error) and shipping the deploy GREEN with an
+    ambiguous panel map. stage-panels writes `{}` and exits 0 even with zero panels, so a non-zero
+    exit is ALWAYS real: deploy-cron-scripts.sh must FAIL the deploy on it."""
+    import re
+    sh = (REPO / "scripts" / "deploy-cron-scripts.sh").read_text()
+    assert "extensions stage-panels" in sh                              # still invoked
+    assert "reader-panels staging skipped" not in sh, "stage-panels failure still swallowed as 'skipped'"
+    assert "|| \\\n    echo" not in sh.split("stage-panels", 1)[1][:120], "still swallowed with `|| echo`"
+    # the failure fails the deploy (exit 1 in the block right after the invocation)
+    after = sh.split("extensions stage-panels", 1)[1][:400]
+    assert "exit 1" in after, "stage-panels failure no longer fails the deploy"

@@ -47,13 +47,27 @@ def test_covers_every_required_surface():
         "qmd index": "qmd status",
         "reader auth": "OKENGINE_READER_PASSWORD",
         "MCP token": "OKENGINE_MCP_TOKEN",
+        "cockpit service (B7.5)": "$COCKPIT",
+        "cockpit checked only if compose defines it (B7.5)": 'grep -Fxq "$COCKPIT"',
         "api_server exposure (#120)": "api_server is LAN-exposed",
+        "read-MCP baked-lib drift (M-B4.1)": "read-MCP $lib is STALE",
         # NB: the iwe-dep check (#168) was intentionally removed by #179 — backlinks-refresh now
         # builds the graph with an in-process link-scanner and needs no gateway iwe binary, so the
         # verifier no longer probes for it. (Stale required-surface entry dropped.)
     }
     missing = [name for name, token in required.items() if token not in body]
     assert not missing, f"verifier no longer checks: {missing}"
+
+
+def test_tick_lock_check_tests_freshness_not_presence():  # invariant-audit HIGH
+    """The .tick.lock is never unlinked (bind-mounted, survives every recreate), so a presence test
+    passes forever off a fossil and can never FAIL on a dead scheduler. The gate must compare the
+    lock's AGE (mtime) and FAIL when stale."""
+    body = VERIFY.read_text()
+    assert "stat -c %Y" in body and "lock_mtime" in body, "tick-lock check no longer measures mtime"
+    assert "STALE" in body, "tick-lock check has no stale-scheduler FAIL branch"
+    # zero-wait fossil discriminator: a lock predating container start = dead-on-arrival scheduler
+    assert "StartedAt" in body and "FOSSIL" in body, "tick-lock check missing the container-start fossil discriminator"
 
 
 def test_reports_pass_warn_fail_and_exit_code():

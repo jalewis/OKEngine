@@ -1,0 +1,4 @@
+# marp/chromium render cache + any local qmd index leak into the mounted vault
+vault/.hermes-data/
+vault/**/.qmd/
+*.pdf

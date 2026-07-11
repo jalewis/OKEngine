@@ -1,5 +1,5 @@
 diff --git a/tools/file_tools.py b/tools/file_tools.py
-index 7bf51aa90..9b862319a 100644
+index 61e6ecc..385e188 100644
 --- a/tools/file_tools.py
 +++ b/tools/file_tools.py
 @@ -3,6 +3,7 @@
@@ -9,10 +9,10 @@ index 7bf51aa90..9b862319a 100644
 +import re
  import logging
  import os
- import threading
-@@ -876,6 +877,38 @@ def _is_internal_file_tool_content(content: str) -> bool:
-         or _looks_like_read_file_line_numbered_content(content)
+ import posixpath
+@@ -1001,6 +1002,39 @@ def _is_internal_file_tool_content(content: str) -> bool:
      )
+ 
  
 +def _doubled_path_segment(path_str: str) -> str | None:
 +    """Return the doubled segment if the resolved write path contains the
@@ -46,10 +46,11 @@ index 7bf51aa90..9b862319a 100644
 +            return f"{a}/{a}"
 +    return None
 +
- 
++
  def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
      """Get or create ShellFileOperations for a terminal environment.
-@@ -1503,6 +1536,15 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
+ 
+@@ -1659,6 +1693,15 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
              "Strip read_file line-number prefixes or reconstruct the intended "
              "file contents before writing."
          )

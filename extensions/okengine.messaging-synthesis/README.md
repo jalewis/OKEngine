@@ -66,8 +66,7 @@ the upstream lanes have real deltas to synthesize.
 Written as the pack's `briefing`-aliased types (`marketing-pulse`, `battle-card`,
 `value-prop-snapshot`, `messaging-brief`) under `briefings/` — most packs already carry these
 aliases from the origin-system-derived schema lineage; if yours doesn't, add
-`<type>: briefing` entries to `schema.yaml`'s type-alias block (see `okpack-cyber-market` for the
-pattern). Writes via `okengine-write`.
+`<type>: briefing` entries to `schema.yaml`'s type-alias block. Writes via `okengine-write`.
 
 ## Enable
 

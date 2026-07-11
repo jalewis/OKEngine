@@ -209,7 +209,10 @@ def _safe(path: str) -> Optional[Path]:
     rel = _normalize_entity_shard(rel)
     p = wiki / rel
     if p.suffix != ".md":
-        p = p.with_suffix(".md")
+        # APPEND '.md' — never with_suffix(), which strips everything after the LAST dot and so
+        # truncates a dotted slug ('sources/2026/07/openssl-3.0.7-advisory' -> '...openssl-3.0.md',
+        # colliding distinct prefixes onto one file and dead-linking every wikilink). invariant-audit.
+        p = p.with_name(p.name + ".md")
     try:
         p = p.resolve()
         p.relative_to(wiki.resolve())
@@ -292,6 +295,52 @@ def _list_fields_for(page_path) -> set:
         except Exception:
             pass
     return lf
+
+
+# INT-shaped fields are machine-owned COUNTS (a metrics lane stamps them). An agent that misreads
+# the field name semantically writes garbage that a numeric-consuming dashboard then renders/sorts —
+# live incident: `recent_reports:` hand-set to a LIST of source paths topped the cockpit's
+# Most-active table. A digit-string coerces (the intent is unambiguous); anything else REJECTS with
+# the field named, the same actionable-feedback loop as a schema reject. Pre-shape schemas declare
+# no int fields, so the check is inert there.
+_base_int_fields_cache = None
+
+
+def _base_int_fields() -> frozenset:
+    global _base_int_fields_cache
+    if _base_int_fields_cache is None:
+        try:
+            _base_int_fields_cache = frozenset(schema_lib.int_fields(schema_lib.base_schema()))
+        except Exception:
+            _base_int_fields_cache = frozenset()
+    return _base_int_fields_cache
+
+
+def _int_fields_for(page_path) -> set:
+    fields = set(_base_int_fields())
+    if page_path is not None:
+        try:
+            fields |= schema_lib.int_fields(_governing(page_path))
+        except Exception:
+            pass
+    return fields
+
+
+def _int_shape_reject(p, fm) -> Optional[str]:
+    """Coerce digit-strings in place; return a reject reason when a schema-declared int field holds
+    anything else (list/path/prose/bool). None = clean."""
+    if not isinstance(fm, dict):
+        return None
+    for k in _int_fields_for(p):
+        v = fm.get(k)
+        if v is None or (isinstance(v, int) and not isinstance(v, bool)):
+            continue
+        if isinstance(v, str) and v.strip().isdigit():
+            fm[k] = int(v.strip())                      # unambiguous intent — coerce
+            continue
+        return (f"field `{k}` must be an integer count (it is machine-computed by a metrics lane) "
+                f"— got {type(v).__name__}: {str(v)[:80]!r}. Drop the field; do not hand-author it.")
+    return None
 
 
 def _normalize_refs(fm: dict, list_fields=frozenset()) -> dict:
@@ -399,12 +448,24 @@ def _rel(p: Path) -> str:
 # server-managed, and `_`-prefixed files are internal. Writing them through the
 # entity tools would (e.g.) inject a YAML frontmatter block into a plain
 # changelog. Every agent-facing write helper refuses them up front.
-_RESERVED_NAMES = {"log.md", "index.md", "agents.md", "hot.md", "readme.md"}
+# health.md + bundle.md are engine-generated root dashboards (build_index_tree.py regenerates
+# HEALTH.md each run; BUNDLE.md is composed). schema_validator broadened its reserved DEFAULT to
+# exempt them from conformance (876fceb) — so if the write path does NOT also refuse them the two
+# guards compose into ZERO protection (validator skips, write path allows fabricated content).
+# Keep the two lists in lockstep; test_write_server pins them. invariant-audit.
+_RESERVED_NAMES = {"log.md", "index.md", "agents.md", "hot.md", "readme.md",
+                   "health.md", "bundle.md"}
 
 
 def _reserved_refuse(p: Path) -> Optional[str]:
     n = p.name.lower()
-    if n in _RESERVED_NAMES or n.startswith("index-p") or p.name.startswith("_"):
+    # Mirror schema_validator._is_generated_structural EXACTLY: the validator exempts these basenames
+    # from conformance, so the write path MUST refuse the same set or the two guards compose into zero
+    # protection — an agent forges a conformance-invisible page (invariant-audit M17). That predicate
+    # is: any `_`- or `.`-prefixed file, and the whole INDEX family (INDEX.md + INDEX-<anything>, incl.
+    # the paginated INDEX-pNN.md). `index-` (lowercased) covers INDEX-glossary etc., not just index-p.
+    if (n in _RESERVED_NAMES or n.startswith("index-")
+            or p.name.startswith("_") or p.name.startswith(".")):
         return (f"refused: {_rel(p)} is an engine-managed structural/reserved file "
                 "— not agent-writable via the MCP write tools (use the file tool only "
                 "if a human edit is truly intended)")
@@ -422,6 +483,17 @@ def _reserved_refuse(p: Path) -> Optional[str]:
     if reserved and n in {str(r).lower() for r in reserved}:
         return (f"refused: {_rel(p)} is a pack-reserved file (schema `reserved_files`) "
                 "— not agent-writable via the MCP write tools")
+    return None
+
+
+def _tombstone_refuse(cur_fm: dict, p: Path) -> Optional[str]:
+    """Never resurrect a tombstoned page. The converge lane already refuses a write to a tombstoned
+    id (id-based); update/patch/append operate by PATH and read a retained tombstone file, so they
+    must refuse it here too or an agent silently un-tombstones it (invariant-audit M18). Re-tombstoning
+    or recording a successor is the tombstone_entity tool's job, not a plain content write."""
+    if str(cur_fm.get("status") or "").strip().lower() == "tombstoned":
+        return (f"refused: {_rel(p)} is tombstoned — write to its successor (superseded_by) or use "
+                "tombstone_entity; never resurrect a tombstoned page")
     return None
 
 
@@ -743,6 +815,83 @@ def _future_date_reject(fm: dict, fields=_RECORD_DATE_FIELDS) -> Optional[str]:
 # with the real slug — the same feedback loop schema rejections use.
 _WIKILINK = re.compile(r"\[\[([^\]|#\n]+)")
 _STRICT_LINK_NS = ("briefings",)
+# Namespaces where an unresolvable wikilink is a DEFECT worth a SOFT needs_review flag at write time
+# (curated content), vs sources/indicators where a forward-ref to a not-yet-created page is the norm.
+# Briefings get the HARD reject (_briefing_link_reject); these get a flag — surface broken links AT
+# WRITE so they're attributable and don't just accrue for the drains to chase (link-audit 2026-07-09).
+# A cheap per-link existence check, NOT a full-vault scan (that would reintroduce the per-write cost
+# the id-index fix removed).
+_LINK_REVIEW_NS = ("concepts", "entities")
+
+
+def _wikilink_resolves(t: str) -> bool:
+    wiki = _wiki()
+    if (wiki / f"{t}.md").is_file():
+        return True                                    # literal path (incl. an already-sharded link)
+    parts = t.split("/")
+    if len(parts) >= 2 and parts[-1][:1].isalnum():
+        ns, base = parts[0], parts[-1]
+        b = base[0].lower()
+        if (wiki / ns / b / f"{base}.md").is_file():
+            return True                                # first-letter shard (entities/qilin -> entities/q/qilin)
+        if len(base) > 1 and (wiki / ns / b / base[1].lower() / f"{base}.md").is_file():
+            return True                                # second-letter reshard (oversized shard)
+    return False
+
+
+def _unresolvable_link_flags(p: Path, body: Optional[str]) -> list:
+    """SOFT review flag (never a reject) for a curated-namespace page that INTRODUCES unresolvable
+    wikilinks — a write-time backstop so broken links are attributable, without blocking the organic
+    forward-refs that sources/importers rely on (link-audit 2026-07-09)."""
+    if _namespace(p) not in _LINK_REVIEW_NS or not body:
+        return []
+    bad, seen = [], set()
+    for m in _WIKILINK.finditer(body):
+        t = (m.group(1) or "").strip().strip("/")
+        if t.endswith(".md"):
+            t = t[:-3]
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        if "/" not in t:
+            bad.append(f"[[{t}]] (bare name)")
+        elif not _wikilink_resolves(t):
+            bad.append(f"[[{t}]] (no such page)")
+    if not bad:
+        return []
+    return [f"{len(bad)} unresolvable wikilink(s): " + "; ".join(bad[:5]) + (" …" if len(bad) > 5 else "")]
+
+
+# Degeneration guard: a model in a repetition loop emits a long unpunctuated word-salad. It
+# renders a clean 200, so it slips past every render check and only the periodic content lint
+# catches it — weeks after it lands. Flag it SOFTLY at the enforced write boundary instead,
+# model-agnostic, so ANY lane's degenerate output is attributable at write. Mirrors
+# scripts/cron/content_lint.py's predicate (same threshold); kept in sync by a cross-surface
+# contract test. Precision-tuned on a real multilingual vault: commas terminate and wikilinks
+# are stripped so a long legitimate LIST (MITRE techniques, killed services) is not flagged, and
+# a CJK-latin-fusion signal was DROPPED (it can't tell code-switching from legitimate Chinese CTI).
+# code-switching fuses a latin token to its CJK translation (`known漏洞`). Both render a clean 200,
+# so they slip past every render check and only the periodic content lint catches them — weeks after
+# they land. Flag them SOFTLY at the enforced write boundary instead, model-agnostic, so ANY lane's
+# degenerate output is attributable at write. Mirrors scripts/cron/content_lint.py's predicate (same
+# thresholds); kept in sync by a cross-surface contract test. Precision-tuned: a coherent long
+# paragraph clears it (250 words is well above a verbose run-on, below a 500+-word loop).
+_DEGEN_FENCE = re.compile(r"```.*?```", re.DOTALL)
+_DEGEN_WIKILINK = re.compile(r"\[\[[^\]]*\]\]")
+_DEGEN_STOP = re.compile(r"[.!?;:\n,]")
+_DEGEN_MAX_RUN = 250
+
+
+def _degeneration_flags(body: Optional[str]) -> list:
+    """SOFT review flag (never a reject) for a DEGENERATE generation — a repetition-loop word-salad
+    (comma/wikilink-aware). See the block comment above."""
+    if not body:
+        return []
+    prose = _DEGEN_WIKILINK.sub(" ", _DEGEN_FENCE.sub("\n", body))   # code + wikilink-lists are not prose
+    worst = max((len(seg.split()) for seg in _DEGEN_STOP.split(prose)), default=0)
+    if worst > _DEGEN_MAX_RUN:
+        return [f"degenerate: {worst}-word unpunctuated run (repetition loop)"]
+    return []
 
 
 def _briefing_link_reject(p: Path, body: Optional[str]) -> Optional[str]:
@@ -854,10 +1003,14 @@ def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> st
         _h1 = _H1.search(body or "")
         if _h1:
             fm["name"] = _h1.group(1).strip()
+    isr = _int_shape_reject(p, fm)
+    if isr:
+        return f"rejected: {isr}"
     pol = _policy_reject(p, fm, "create")
     if pol:
         return f"rejected: {pol}"
-    flags = drift + _review_flags(p, fm, prev=None)
+    flags = drift + _review_flags(p, fm, prev=None) + _unresolvable_link_flags(p, body) + \
+        _degeneration_flags(body)
     if flags:
         fm["needs_review"] = True
     content = _compose(fm, body)
@@ -896,6 +1049,9 @@ def _update(path: str, frontmatter_yaml: Union[str, dict, None] = None,
     if ferr:
         return f"rejected: {ferr} — repair the frontmatter before updating"
     cur_fm, cur_body = _read_page(p)
+    tr = _tombstone_refuse(cur_fm, p)   # never resurrect a tombstoned page (invariant-audit M18)
+    if tr:
+        return tr
     new_fm = dict(cur_fm)
     if frontmatter_yaml is not None:
         patch = _coerce_fm(frontmatter_yaml, p)
@@ -920,10 +1076,14 @@ def _update(path: str, frontmatter_yaml: Union[str, dict, None] = None,
         new_fm["version"] = 2
     new_fm["last_updated"] = _now()
     _stamp_maintainer(new_fm, creation=False)   # add this pack as a maintainer (okengine#90 P3)
+    isr = _int_shape_reject(p, new_fm)
+    if isr:
+        return f"rejected: {isr}"  # existing file left untouched
     pol = _policy_reject(p, new_fm, "update", prev=cur_fm)
     if pol:
         return f"rejected: {pol}"  # existing file left untouched
-    flags = drift + _review_flags(p, new_fm, prev=cur_fm)
+    flags = drift + _review_flags(p, new_fm, prev=cur_fm) + \
+        (_unresolvable_link_flags(p, new_body) + _degeneration_flags(new_body) if body is not None else [])
     if flags:
         new_fm["needs_review"] = True
     content = _compose(new_fm, new_body)
@@ -1065,6 +1225,9 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
     if n > 1:
         return f"rejected: old_string matches {n} places — add surrounding context to make it unique"
     cur_fm, _cur_body = _read_page(p)
+    tr = _tombstone_refuse(cur_fm, p)   # invariant-audit M18
+    if tr:
+        return tr
     new_text = text.replace(old_string, new_string, 1)
     m = _FM.match(new_text)
     if not m:
@@ -1082,6 +1245,9 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
     fl = _field_loss(cur_fm, new_fm)
     if fl:
         return f"rejected: {fl}"
+    isr = _int_shape_reject(p, new_fm)
+    if isr:
+        return f"rejected: {isr}"
     pol = _policy_reject(p, new_fm, "update", prev=cur_fm)
     if pol:
         return f"rejected: {pol}"
@@ -1156,6 +1322,9 @@ def _append_section(path: str, heading: str, text: str) -> str:
     if not (text or "").strip():
         return "rejected: text is empty"
     cur_fm, cur_body = _read_page(p)
+    tr = _tombstone_refuse(cur_fm, p)   # invariant-audit M18
+    if tr:
+        return tr
     new_body, where = _insert_into_section(cur_body, heading, text)
     new_fm = dict(cur_fm)
     blr = _briefing_link_reject(p, new_body)   # append is the hot path for growing a briefing's
@@ -1284,13 +1453,21 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
             merged, dec = converge.merge_frontmatter(
                 cur_fm, fm, owner_pack=owner, caller_pack=(pack or None),
                 field_owners=fos, remove=rm)
-            new_body = cur_body if not body else body
+            merged, drift = _normalize_drift(merged, p)   # okengine#46: converge on schema vocab —
+            new_body = cur_body if not body else body     # same guard as _create/_update (invariant-audit)
             _stamp(merged, cur_fm)
             if pack:
                 merged["last_modified_by"] = pack
+            blr = _briefing_link_reject(p, new_body)   # briefings must cite resolvable pages — the same
+            if blr:                                    # guard create/update/patch/append enforce (L3)
+                return f"rejected: {blr}"
             fd = _future_date_reject(merged)   # the boundary every writer crosses (invariant-audit)
             if fd:
                 return f"rejected: {fd}"        # file left untouched
+            isr = _int_shape_reject(p, merged)  # machine-owned int fields (recent_reports/total_mentions):
+            if isr:                             # create/update/patch all reject here; _dedup_on_create
+                return f"rejected: {isr}"       # redirects create_entity INTO converge, so this lane must
+                                                # enforce it too or the guard is bypassed (invariant-audit)
             # Converge is an agent write into an EXISTING page: apply the same
             # write-governance as update_entity, not a bypass (#21). HARD namespace
             # permission gate first (a human-authored namespace refuses the write,
@@ -1300,7 +1477,7 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
                 return f"rejected: {pol}"
             # ...then SOFT review flags (categorical confidence verdict, changed
             # review field) — flag, never block.
-            review = _review_flags(p, merged, prev=cur_fm)
+            review = drift + _review_flags(p, merged, prev=cur_fm) + _unresolvable_link_flags(p, new_body)
             if review:
                 merged["needs_review"] = True
             content = _compose(merged, new_body)

@@ -350,10 +350,14 @@ At deploy, `scripts/cron_pack_split.py` **merges** the engine's
   ```
 - **`crons/domain-crons.json`** — a JSON **array** of full domain-tier defs. Each
   needs a `name` and a `schedule`, plus a `script` and/or a `prompt`. A `script`
-  is resolved from `crons/scripts/`.
+  is resolved from `crons/scripts/`. The `schedule` is a `{"kind": "cron", "expr":
+  "<5-field cron>"}` object — the shape cron-plus (the runtime scheduler) reads;
+  every first-party cron uses it. (A bare `"schedule": "0 13 * * SUN"` string is
+  also tolerated — the deploy normalizes it to the object form — but write the
+  object.)
   ```json
   [
-    {"name": "my-weekly-digest", "schedule": "0 13 * * SUN",
+    {"name": "my-weekly-digest", "schedule": {"kind": "cron", "expr": "0 13 * * SUN"},
      "prompt": "Compile the week into a digest grouped by …"}
   ]
   ```

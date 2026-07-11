@@ -301,7 +301,7 @@ def append_history(today: date, q_rows, pages) -> None:
 
 
 def main() -> int:
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now().date()  # LOCAL ledger day, not UTC (TZ-behind-UTC files tomorrow) — invariant-audit B6.2
     q_rows = (parse_queue_snapshots(QUEUE_SNAPSHOTS.read_text(errors="replace"))
               if QUEUE_SNAPSHOTS.exists() else [])
     pages = total_pages()

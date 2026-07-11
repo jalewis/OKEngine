@@ -240,6 +240,16 @@ def list_fields(schema: dict) -> set:
     return {k for k, v in shapes.items() if v == "list"}
 
 
+def int_fields(schema: dict) -> set:
+    """Field names a schema declares with `int` shape (`field_shapes`) — machine-owned counts
+    (recent_reports, total_mentions). The enforced write path coerces a digit-string and REJECTS
+    anything else, so an agent that semantically misreads the field name (live incident:
+    `recent_reports:` hand-set to a list of source paths) can't poison a numeric-consuming
+    dashboard/sort."""
+    shapes = (schema or {}).get("field_shapes") or {}
+    return {k for k, v in shapes.items() if v == "int"}
+
+
 def compose_schema(root: Path, fragments=None, namespace: str = "") -> tuple[dict, list[str]]:
     """N-way additive schema composition (okengine#90 P3 / #133).
 

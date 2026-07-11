@@ -91,6 +91,19 @@ def test_verify_detects_corruption(tmp_path):
     assert not ok and any("checksum" in why for _, why in probs)
 
 
+def test_create_preserves_mtime(tmp_path):  # invariant-audit MEDIUM (#39)
+    """Restore was dating every file to 1970-01-01 (TarInfo.mtime unset), deranging mtime-keyed
+    engine lanes. Archived entries must carry the source file's real mtime."""
+    import os
+    m = _mod()
+    p = _pack(tmp_path)
+    os.utime(p / "wiki" / "entities" / "a" / "acme.md", (1_780_000_000, 1_780_000_000))
+    arc, _ = m.create(p, tmp_path / "bk", False, "20260101T000000Z")
+    with tarfile.open(arc) as t:
+        info = t.getmember("wiki/entities/a/acme.md")
+    assert info.mtime == 1_780_000_000, info.mtime
+
+
 # --- restore -----------------------------------------------------------------
 
 def test_restore_roundtrip(tmp_path):

@@ -42,10 +42,11 @@ import time
 import datetime
 from collections import Counter
 import subprocess
+import shutil
 import tempfile
 import urllib.request
 import urllib.error
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from pathlib import Path
 from typing import Any
 
@@ -114,6 +115,18 @@ _WIKILINK = re.compile(r"\[\[\s*([^\]|#\n\\]*)(?:#([^\]|\n]+))?(?:\\?\|\s*([^\]\
 _DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 _H1_RE = re.compile(r"^#\s+.*$", re.MULTILINE)
 TODAY = datetime.date.today  # callable; never cached so dates stay live
+
+# Prediction "open" vocabulary — a cross-surface contract. config/base-schema.yaml
+# `tier.namespaces.predictions.open_values: [open, active]` is the source of truth, mirrored by
+# pred_lib.OPEN_VALUES (extensions/okengine.predictions) and read config-driven by tier_lib /
+# build_hot_set / select_daily_brief. The cockpit is a FOURTH consumer: it must count `active`
+# predictions as open too (predictions routinely carry status:active — migrated/drained sets), or
+# the home 'Open predictions' section and due-soon tally silently undercount (invariant-audit M11).
+# Same env override knob pred_lib uses, so a pack with a different vocabulary stays consistent.
+# tests/test_cockpit_panels.py pins this set to pred_lib.OPEN_VALUES.
+_OPEN_STATUS = {s.strip().lower()
+                for s in os.environ.get("OKENGINE_PREDICTION_OPEN_VALUES", "open,active").split(",")
+                if s.strip()}
 
 
 def split_fm(text: str) -> tuple[dict, str]:
@@ -266,6 +279,20 @@ def load_cockpit_config(vault: Path) -> dict:
                     "boxes": [b for b in v["boxes"] if isinstance(b, dict)],
                 }
 
+    # per-type fact-panel field ORDER (okengine — type-aware profile). A pack declares
+    # `profiles: {<type>: [field, field, …]}`; the page overlay then renders that type's fact panel
+    # in this order (declared fields first, the rest in frontmatter order) so an actor/vuln/… page
+    # reads as a curated profile, not raw frontmatter. Domain-agnostic: the engine ships the ordering
+    # mechanism, the pack supplies the field priority.
+    profiles: dict[str, list] = {}
+    rp = raw.get("profiles")
+    if isinstance(rp, dict):
+        for t, order in rp.items():
+            if isinstance(order, list):
+                fields = [str(f).strip() for f in order if str(f).strip()]
+                if fields:
+                    profiles[str(t).strip()] = fields
+
     return {
         "title": title,
         "streams": streams,
@@ -276,6 +303,7 @@ def load_cockpit_config(vault: Path) -> dict:
         "tabs": tabs,
         "dashboards": dashboards,
         "tab_defs": tab_defs,
+        "profiles": profiles,
     }
 
 
@@ -308,6 +336,18 @@ def _wl_display(m) -> str:
 def _delink(s: str) -> str:
     """Render a wikilink as plain display text (this reader has no entity pages)."""
     return _WIKILINK.sub(_wl_display, s)
+
+
+# `[APT41](entities/a/apt41)` — an INTERNAL vault link (the agent's linked-title citations). Not an
+# image (`!` excluded), not external (http/mailto/# excluded).
+_MD_LOCAL_LINK = re.compile(r"(?<!\!)\[([^\]\n]+)\]\((?!https?://|mailto:|#)[^)\n]*\)")
+
+
+def _deref_local_links(s: str) -> str:
+    """Flatten internal markdown links to their text for portable export — `[APT41](entities/a/apt41)`
+    -> `APT41`. External http(s)/mailto links are kept. Vault paths resolve only inside the reader,
+    so an exported md/docx/pdf must not carry them as dead links."""
+    return _MD_LOCAL_LINK.sub(r"\1", s)
 
 
 _EMBED = re.compile(r"!\[\[\s*([^\]\n#|]+?)\s*(?:#[^\]\n|]+)?(?:\|[^\]\n]+)?\s*\]\]")
@@ -420,10 +460,21 @@ def _link_originals(html: str) -> str:
     return _SRC_LINK.sub(_enrich, html)
 
 
+# Agents across lanes "highlight" a wikilink by wrapping it in backticks (`[[x]]`). That makes
+# _linkify inject the <a> INSIDE an inline-code span, so markdown escapes it to visible `<a …>` text
+# in the UI. Strip the backticks around a bare wikilink first — the author meant a link, not code.
+_UNCODE_WIKILINK = re.compile(r"`(\[\[[^`]+?\]\])`")
+
+
+def _uncode_wikilinks(s: str) -> str:
+    return _UNCODE_WIKILINK.sub(r"\1", s)
+
+
 def render_md(body: str) -> str:
     body = _resolve_embeds(body)
     body = re.sub(r"```dataview(js)?\n.*?\n```",
                   "_[Dataview view — open in Obsidian to compute]_", body, flags=re.DOTALL)
+    body = _uncode_wikilinks(body)
     body = _linkify(body)
     return _link_originals(md.markdown(body, extensions=["tables", "fenced_code", "sane_lists", "nl2br"]))
 
@@ -449,8 +500,13 @@ def api_config():
     # so it's auto-appended when that content exists — no per-pack schema authoring needed. A pack
     # that lists "ops" in its own `tabs:` controls its position; otherwise it trails the nav.
     tabs = list(cfg["tabs"])
+    # Ops is the engine-level operational surface, auto-appended when that content exists — inserted
+    # BEFORE `browse` so browse stays at the tail next to Chat (the pack lists browse last).
     if "ops" not in tabs and _ops_available():
-        tabs.append("ops")
+        if "browse" in tabs:
+            tabs.insert(tabs.index("browse"), "ops")
+        else:
+            tabs.append("ops")
     return {"title": cfg["title"], "tabs": tabs,
             "watchlist": cfg["watchlist"] is not None,
             # labels for pack-defined dataset tabs (the frontend builds their panes dynamically)
@@ -463,6 +519,50 @@ def _streams() -> dict:
     return cockpit_config()["streams_by_key"]
 
 
+def _is_reserved_seg(seg: str) -> bool:
+    """A reserved DIRECTORY segment: `_archive`/`_archived`/`.git`-style hidden dirs. A BARE `_` is NOT
+    reserved — it's the engine's reshard SECOND-LETTER bucket for a slug whose 2nd char is non-alnum
+    (entities/x/_/x-force.md; okf_migrate._second), a legitimate canonical location that must stay
+    visible in every enumeration surface (batch-2 re-verify over-drop)."""
+    return len(seg) > 1 and seg.startswith(("_", "."))
+
+
+def _visible_page(p: Path, base: Path) -> bool:
+    """A page under `base` visible at EVERY path depth — no reserved dir segment anywhere and no INDEX
+    leaf. rglob recurses into reserved sub-dirs a non-recursive glob never entered, so a leaf-only
+    check would surface `_archived/`/`_archive/` retired content as live. invariant-audit batch-2."""
+    try:
+        parts = p.relative_to(base).parts
+    except ValueError:
+        return False
+    return not any(_is_reserved_seg(seg) for seg in parts) and not p.name.startswith("INDEX")
+
+
+def _ns_dirs(p: Path) -> frozenset:
+    """The DIRECTORY components of a page's wiki-relative path (filename dropped) — layout-agnostic,
+    so a walk-up sub-domain's nested namespace (wiki/<subdomain>/<ns>/…) is matched, not just parts[0]."""
+    try:
+        return frozenset(p.relative_to(WIKI).parts[:-1])
+    except ValueError:
+        return frozenset()
+
+
+def _reserved_seg(p: Path) -> bool:
+    """True if any DIRECTORY segment of a page's wiki-relative path is a reserved (`_archive/`-style)
+    dir a leaf-only check misses. Safe on ANY enumeration surface (drops only engine-hidden dirs,
+    never a real namespace or the bare-`_` reshard bucket)."""
+    return any(_is_reserved_seg(seg) for seg in _ns_dirs(p))
+
+
+def _hidden_page(p: Path) -> bool:
+    """Hidden from the BROWSE discovery surfaces (browse rail count + /api/dir ledger): a reserved
+    sub-dir OR a schema-excluded namespace nested under a walk-up sub-domain. NOT for dataset tabs /
+    observation aggregation, which read an explicitly-configured dir and must not be second-guessed by
+    the browse `exclude:` set — those use _reserved_seg only. (batch-2 re-verify)"""
+    nsd = _ns_dirs(p)
+    return any(_is_reserved_seg(seg) for seg in nsd) or bool(nsd & _excluded_dirs())
+
+
 def _stream_pages(cfg: dict) -> list[str]:
     """Pages feeding a stream — by frontmatter `type` (okengine-layout-aware), by
     filename `glob`, or (default) every *.md in the stream dir."""
@@ -472,7 +572,7 @@ def _stream_pages(cfg: dict) -> list[str]:
     if cfg.get("type"):
         out = []
         for p in base.rglob("*.md"):
-            if p.name.startswith(("_", ".")) or p.name == "INDEX.md":
+            if not _visible_page(p, base):   # segment-level (drops _archived/ at ANY depth), not leaf-only
                 continue
             try:
                 fm, _ = split_fm(p.read_text(encoding="utf-8", errors="replace"))
@@ -481,7 +581,11 @@ def _stream_pages(cfg: dict) -> list[str]:
             if str(fm.get("type") or "").strip() == cfg["type"]:
                 out.append(str(p))
         return out
-    return glob.glob(str(base / cfg.get("glob", "*.md")))
+    # rglob, NOT glob.glob — the latter is non-recursive, so a PARTITIONED stream dir (dates sharded
+    # into sub-dirs) yields zero pages/dates (invariant-audit M-528). _visible_page excludes reserved
+    # sub-dirs (_archived/…) at ANY depth — a leaf-only check would surface retired archived pages.
+    pattern = cfg.get("glob", "*.md")
+    return [str(p) for p in base.rglob(pattern) if _visible_page(p, base)]
 
 
 def _stream_dates(key: str) -> list[str]:
@@ -543,10 +647,40 @@ def api_doc(stream: str = Query(...), date: str = Query(...)):
     }
 
 
+_MARP = shutil.which("marp")
+# The vault is mounted read-only, so on-demand deck renders cache under a writable dir, keyed by the
+# source .md's mtime (a regenerated deck re-renders; stale renders are pruned).
+_DECK_CACHE = Path(os.environ.get("OKENGINE_DECK_CACHE", "/tmp/okengine-deck-cache"))
+
+
+def _render_deck_pdf(md: Path) -> "Path | None":
+    """Render a marp `.md` deck to PDF on demand. Returns the cached pdf path, or None if marp is
+    unavailable or the render fails (caller then 404s). The weekly-deck cron writes only the `.md`
+    (the pinned gateway has no browser); the cockpit renders the PDF the stream serves."""
+    if not _MARP or not md.is_file():
+        return None
+    try:
+        _DECK_CACHE.mkdir(parents=True, exist_ok=True)
+        out = _DECK_CACHE / f"{md.stem}.{int(md.stat().st_mtime)}.pdf"
+        if out.is_file() and out.stat().st_size > 0:
+            return out
+        for stale in _DECK_CACHE.glob(f"{md.stem}.*.pdf"):   # drop renders of an older md version
+            stale.unlink(missing_ok=True)
+        # marp/puppeteer write intermediate files under HOME/TMPDIR/XDG_*; the container often runs as
+        # a home-less vault uid, so point them all at the writable cache or the render EACCES-fails.
+        env = {**os.environ, "HOME": str(_DECK_CACHE), "TMPDIR": str(_DECK_CACHE),
+               "XDG_CACHE_HOME": str(_DECK_CACHE), "XDG_CONFIG_HOME": str(_DECK_CACHE)}
+        subprocess.run([_MARP, str(md), "--pdf", "--allow-local-files", "-o", str(out)],
+                       check=True, capture_output=True, timeout=120, cwd=str(_DECK_CACHE), env=env)
+        return out if (out.is_file() and out.stat().st_size > 0) else None
+    except Exception:
+        return None
+
+
 @app.get("/api/stream.pdf")
 def api_stream_pdf(stream: str = Query(...), date: str = Query(...)):
-    """Serve a same-stem PDF companion for a pdf-enabled stream's dated page
-    (e.g. a `weekly-deck-<date>.pdf` next to its `.md`). Generic: no fixed paths."""
+    """Serve a pdf-enabled stream's dated deck as PDF: a pre-rendered `<stem>.pdf` next to the `.md`
+    if present, else render the marp `.md` on demand (cached). Generic: no fixed paths."""
     cfg = _streams().get(stream)
     if not cfg or not cfg.get("pdf"):
         raise HTTPException(404, "no pdf for stream")
@@ -557,7 +691,11 @@ def api_stream_pdf(stream: str = Query(...), date: str = Query(...)):
         if _file_date(Path(p).name) == date:
             pdf = Path(p).with_suffix(".pdf").resolve()
             if str(pdf).startswith(str(base)) and pdf.is_file():
-                return FileResponse(pdf, media_type="application/pdf")
+                return FileResponse(pdf, media_type="application/pdf")   # pre-rendered in the vault
+            rendered = _render_deck_pdf(Path(p))                          # else render the marp md
+            if rendered:
+                return FileResponse(rendered, media_type="application/pdf")
+            break
     raise HTTPException(404, "deck pdf not found")
 
 
@@ -682,7 +820,8 @@ def _prediction_files() -> list[str]:
     # and the date-partitioned layouts.
     files: list[str] = []
     for sub in cockpit_config()["predictions_dirs"]:
-        files += glob.glob(str(WIKI / sub / "**" / "*.md"), recursive=True)
+        files += [f for f in glob.glob(str(WIKI / sub / "**" / "*.md"), recursive=True)
+                  if not _reserved_seg(Path(f))]   # skip predictions/_archive/… retired forecasts
     return files
 
 
@@ -720,7 +859,7 @@ def _load_predictions() -> list[dict]:
             if d in ev_dir:
                 ev_dir[d] += 1
         made = _as_date(fm.get("made_on") or fm.get("created"))
-        idle = status == "open" and not ev_entries and made is not None and (today - made).days > 60
+        idle = status in _OPEN_STATUS and not ev_entries and made is not None and (today - made).days > 60
         rows.append({
             "id": Path(p).stem,
             "status": status,
@@ -754,7 +893,7 @@ def api_predictions():
     for r in rows:
         summary[r["status"]] = summary.get(r["status"], 0) + 1
         d = r["days_to_resolve"]
-        if r["status"] == "open" and d is not None and 0 <= d <= 7:
+        if r["status"] in _OPEN_STATUS and d is not None and 0 <= d <= 7:
             due_soon += 1
         if r["idle"]:
             idle += 1
@@ -807,21 +946,21 @@ def _as_date(v: Any) -> "datetime.date | None":
 
 _DIR_CACHE: dict[str, tuple[float, list[dict]]] = {}
 _DIR_TTL = 120.0  # seconds; vault is :ro and refreshed by cron, brief staleness is fine
+_DIR_LOCK = threading.Lock()
+_DIR_REFRESHING: set[str] = set()
 
 
-def _load_dir(sub: str) -> list[dict]:
-    """Parse frontmatter of every page under wiki/<sub> (recursive, like Dataview FROM).
-    Cached for _DIR_TTL to keep entity/concept scans (3k–6k files) off the hot path."""
-    now = time.monotonic()
-    hit = _DIR_CACHE.get(sub)
-    if hit and now - hit[0] < _DIR_TTL:
-        return hit[1]
+def _scan_dir_meta(sub: str) -> list[dict]:
+    """Parse frontmatter of every page under wiki/<sub> (recursive, like Dataview FROM). The raw
+    scan: on a 3k–6k-file namespace this is seconds of syscalls + YAML parses, so it must never run
+    synchronously on a request — _load_dir keeps it behind the cache + a background refresh.
+    (Distinct from the browse-layer _scan_dir below, which returns a lighter list-row shape.)"""
     out: list[dict] = []
     base = WIKI / sub
     if base.is_dir():
         for p in base.rglob("*.md"):
             name = p.name
-            if name.startswith(("_", ".")) or ".bak." in name:
+            if name.startswith(("_", ".")) or ".bak." in name or _reserved_seg(p):
                 continue
             try:
                 fm, _ = split_fm(p.read_text(encoding="utf-8", errors="replace"))
@@ -833,8 +972,67 @@ def _load_dir(sub: str) -> list[dict]:
             # basename resolution papers over it until two shards collide on a stem
             fm["_rel"] = p.relative_to(base).as_posix()[:-3]
             out.append(fm)
-    _DIR_CACHE[sub] = (now, out)
     return out
+
+
+def _refresh_dir_async(sub: str) -> None:
+    """Rescan wiki/<sub> in a daemon thread and swap the cache. In-flight guard so N concurrent
+    requests to a stale dir spawn ONE rescan, not N."""
+    with _DIR_LOCK:
+        if sub in _DIR_REFRESHING:
+            return
+        _DIR_REFRESHING.add(sub)
+
+    def _work():
+        try:
+            rows = _scan_dir_meta(sub)
+            _DIR_CACHE[sub] = (time.monotonic(), rows)
+        finally:
+            with _DIR_LOCK:
+                _DIR_REFRESHING.discard(sub)
+
+    threading.Thread(target=_work, daemon=True).start()
+
+
+def _load_dir(sub: str) -> list[dict]:
+    """Frontmatter of every page under wiki/<sub>, cached, STALE-WHILE-REVALIDATE. A scan of a large
+    namespace (entities/sources are thousands of pages) costs seconds; sorting a top-N table needs
+    every row, so the scan is inherent. Keep it off the hot path: within _DIR_TTL serve the cache;
+    once stale serve the stale copy immediately AND rescan in the background; only a cold miss (no
+    cache at all) scans synchronously — and the startup warmer pre-populates the configured datasets
+    so even the first request is warm. The vault is :ro and cron-refreshed, so bounded staleness is
+    already the contract (previously every request that fell past the TTL blocked on the full scan)."""
+    now = time.monotonic()
+    hit = _DIR_CACHE.get(sub)
+    if hit is not None:
+        if now - hit[0] >= _DIR_TTL:
+            _refresh_dir_async(sub)          # stale: refresh in the background, serve stale now
+        return hit[1]
+    rows = _scan_dir_meta(sub)               # cold miss (first ever load of this dir)
+    _DIR_CACHE[sub] = (now, rows)
+    return rows
+
+
+def _warm_tab_datasets() -> None:
+    """Pre-scan the namespaces the configured tabs/streams read, so the FIRST overview/tab request
+    doesn't eat a cold multi-thousand-file scan (the 'overview slow to load' report)."""
+    subs: set[str] = set()
+    cfg = cockpit_config()
+    for d in (cfg.get("tab_defs") or {}).values():
+        for b in (d.get("boxes") or []):
+            ds = b.get("dataset") or {}
+            if ds.get("dir"):
+                subs.add(str(ds["dir"]))
+            if b.get("dir"):
+                subs.add(str(b["dir"]))
+    for s in cfg.get("streams") or []:
+        if isinstance(s, dict) and s.get("dir"):
+            subs.add(str(s["dir"]))
+    for sub in subs:
+        try:
+            _DIR_CACHE[sub] = (time.monotonic(), _scan_dir_meta(sub))
+        except Exception:
+            pass
 
 
 def _disp(fm: dict) -> str:
@@ -1027,7 +1225,7 @@ def api_home():
     # 3. open predictions (top by nearest resolution)
     pr = api_predictions()
     if pr["total"]:
-        top = sorted([r for r in pr["rows"] if r["status"] == "open"],
+        top = sorted([r for r in pr["rows"] if r["status"] in _OPEN_STATUS],
                      key=lambda r: r["resolves_by"] or "9999")[:8]
         prows = [[f'<a class="wl" data-page="predictions/{_esc(r["id"])}">{_esc(r["subject"] or r["id"])}</a>',
                   _esc(str(r["confidence"] or "—")), _esc(r["resolves_by"] or "—")] for r in top]
@@ -1095,6 +1293,8 @@ def _ds_rows(spec: dict) -> list[dict]:
         rows = [r for r in rows if str(r.get(f)) == str(v)]
     for f in (spec.get("has") or []):        # field-presence filter (e.g. theme pages vs
         rows = [r for r in rows if r.get(f) not in (None, "", [])]   # shift docs in one dir)
+    for f in (spec.get("missing") or []):    # field-ABSENCE filter (mirror of `has`) — e.g. unsourced actors
+        rows = [r for r in rows if r.get(f) in (None, "", [])]
     tp = spec.get("today_prefix")            # e.g. published starts with today's date
     if tp:
         today = datetime.date.today().isoformat()
@@ -1109,13 +1309,26 @@ def _ds_sorted(rows: list[dict], srt: dict) -> list[dict]:
     if srt.get("require"):
         rows = [r for r in rows if r.get(f) not in (None, "", [])]
 
-    def key(r):
+    # TWO buckets — numeric, then everything-else — each honoring the sort direction WITHIN itself.
+    # Two live incidents shaped this:
+    #   1. `reverse=bool(desc)` flipped the buckets too, so ONE page with a malformed value (an
+    #      agent hand-set `recent_reports:` to a list of source paths) took the #1 slot of the
+    #      Most-active table — junk in a NUMERIC sort must rank below every real number.
+    #   2. The first fix sorted the non-numeric bucket ascending unconditionally — which broke every
+    #      DATE-sorted box (ISO dates aren't floatable, so a date box lives entirely in this bucket):
+    #      `sort: {field: created, desc: true}` showed OLDEST gaps first. Direction must apply
+    #      within the bucket; ISO date strings/objects order correctly via str().
+    desc = bool(srt.get("desc"))
+    nums, others = [], []
+    for r in rows:
         v = r.get(f)
         try:
-            return (0, float(v))
+            nums.append((float(v), r))
         except (TypeError, ValueError):
-            return (1, str(v))
-    return sorted(rows, key=key, reverse=bool(srt.get("desc")))
+            others.append((str(v), r))
+    nums.sort(key=lambda t: t[0], reverse=desc)
+    others.sort(key=lambda t: t[0], reverse=desc)
+    return [r for _, r in nums] + [r for _, r in others]
 
 
 def _defang(v: str) -> str:
@@ -1159,6 +1372,12 @@ def _drill_attrs(drill, *, value=None, item=None, page=None):
     return " drill", f' data-drill data-dtab="{_esc(tab)}" data-dbox="{bi}"{sel}'
 
 
+def _gb_values(v) -> list[str]:
+    """The group_by buckets a row contributes: each element of a LIST field (so a page targeting
+    ['government','finance'] counts toward both), or the single scalar. Empties dropped."""
+    return [str(x) for x in v if str(x).strip()] if isinstance(v, list) else ([str(v)] if v not in (None, "") else [])
+
+
 def _ds_pairs(box: dict, rows: list[dict]) -> list:
     """(label, value, unmapped, key) tuples for bars/chips — a group_by count or explicit fields.
     `unmapped` is True only when a `labels:` map is configured but this grouped value is absent
@@ -1167,8 +1386,11 @@ def _ds_pairs(box: dict, rows: list[dict]) -> list:
     if box.get("group_by"):
         labels = {str(k): str(v) for k, v in (box.get("labels") or {}).items()}
         drop = {"", "None", "Unknown", "nan"}
-        cnt = Counter(str(r.get(box["group_by"])) for r in rows
-                      if str(r.get(box["group_by"]) or "") not in drop)
+        cnt: Counter = Counter()
+        for r in rows:                        # list fields explode: each element is its own bucket
+            for s in _gb_values(r.get(box["group_by"])):
+                if s not in drop:
+                    cnt[s] += 1
         return [(labels.get(k, k), v, bool(labels) and k not in labels, k)
                 for k, v in cnt.most_common(int(box.get("limit") or 8))]
     vf = str(box.get("value_field") or "")
@@ -1190,6 +1412,25 @@ def _v_table(box: dict, rows: list[dict]) -> str:
                        [[_ds_cell(r, c) for c in cols] for r in rows])
 
 
+def _link_page_map(box: dict) -> dict:
+    """For a group_by box with `link_page: {dir, by}`, map each bucket value -> the page path
+    (<dir>/<rel>) of the page in <dir> whose <by> field equals the value. Lets an aggregate bar
+    open the entity it NAMES (e.g. an ATT&CK technique id -> its technique page) instead of
+    drilling to the members that share it. {} when not configured; values with no matching page
+    keep the normal group_by drilldown."""
+    lp = box.get("link_page")
+    if not isinstance(lp, dict) or not lp.get("dir"):
+        return {}
+    by = str(lp.get("by") or "id")
+    out: dict = {}
+    for r in _load_dir(str(lp["dir"])):
+        k = r.get(by)
+        if k in (None, ""):
+            continue
+        out.setdefault(str(k), f'{r.get("_sub", "")}/{r.get("_rel") or r.get("_name", "")}'.strip("/"))
+    return out
+
+
 def _v_bars(box: dict, rows: list[dict], drill=None) -> str:
     pairs = _ds_pairs(box, rows)
     if not pairs:
@@ -1197,9 +1438,14 @@ def _v_bars(box: dict, rows: list[dict], drill=None) -> str:
     mx = max(v for _, v, _, _ in pairs) or 1
     tone = box.get("tone") if box.get("tone") in _TONES else "acc"
     grp = bool(box.get("group_by"))
+    lpm = _link_page_map(box) if grp else {}
     out = []
     for l, v, um, key in pairs:
-        dc, da = _drill_attrs(drill, value=key) if grp else _drill_attrs(drill, page=key)
+        if grp:
+            pg = lpm.get(str(key))
+            dc, da = _drill_attrs(drill, page=pg) if pg else _drill_attrs(drill, value=key)
+        else:
+            dc, da = _drill_attrs(drill, page=key)
         out.append(f'<div class="brow{" um" if um else ""}{dc}"{da}>'
                    f'<span class="bl">{_esc(l)}{_UM_FLAG if um else ""}</span>'
                    f'<span class="btrk"><i class="bfill t-{tone}" style="width:{100 * v / mx:.0f}%"></i></span>'
@@ -1212,9 +1458,14 @@ def _v_chips(box: dict, rows: list[dict], drill=None) -> str:
     if not pairs:
         return ""
     grp = bool(box.get("group_by"))
+    lpm = _link_page_map(box) if grp else {}
     out = []
     for l, v, um, key in pairs:
-        dc, da = _drill_attrs(drill, value=key) if grp else _drill_attrs(drill, page=key)
+        if grp:
+            pg = lpm.get(str(key))
+            dc, da = _drill_attrs(drill, page=pg) if pg else _drill_attrs(drill, value=key)
+        else:
+            dc, da = _drill_attrs(drill, page=key)
         out.append(f'<span class="dchip{" um" if um else ""}{dc}"{da}>'
                    f'{_esc(l)}{_UM_FLAG if um else ""} <b>{v:,}</b></span>')
     return '<div class="dchips">' + "".join(out) + "</div>"
@@ -1247,7 +1498,12 @@ def _v_cards(box: dict, rows: list[dict]) -> str:
     df = str(box.get("dir_field") or "direction")
     sf = str(box.get("status_field") or "trend_status")
     series = str(box.get("series_field") or "count_by_year")
-    glyph = {"rising": ("▲", "ok"), "falling": ("▼", "crit")}
+    # Trend vocab varies by generator (up/down/flat/emerging vs rising/falling/steady). Cover both so
+    # a card shows a DIRECTION glyph, not the default → for every value (the glyph map only knew
+    # rising/falling, but theme_trends writes up/down/flat/emerging — so all arrows were →).
+    glyph = {"up": ("▲", "ok"), "rising": ("▲", "ok"),
+             "down": ("▼", "crit"), "falling": ("▼", "crit"),
+             "emerging": ("◆", "acc"), "flat": ("→", "mut"), "steady": ("→", "mut")}
     cards = []
     for r in rows[: int(box.get("limit") or 12)]:
         g, gc = glyph.get(str(r.get(df)), ("→", "mut"))
@@ -1311,11 +1567,15 @@ def _v_doc(box: dict):
     if not pat.endswith(".md"):
         pat += ".md"
     base = WIKI / d
-    cands = sorted((p for p in base.glob(pat) if not p.name.startswith(("INDEX", "_", "."))),
-                   reverse=True) if base.is_dir() else []
+    # rglob so a PARTITIONED doc dir matches; read the winner by its path RELATIVE TO base — a sub-dir
+    # hit passed as a bare basename to safe_read(base, name) 404s the ENTIRE tab (M-1513). Sort by the
+    # filename DATE (then name), NOT the full path: a full-path sort ranks a flat/letter-leading page
+    # above a YYYY/-sharded newer one (batch-2 re-verify). _visible_page drops reserved sub-dirs.
+    cands = sorted((p for p in base.rglob(pat) if _visible_page(p, base)),
+                   key=lambda p: (_file_date(p.name) or "", p.name), reverse=True) if base.is_dir() else []
     if not cands:
         return "", ""
-    fm, body = split_fm(safe_read(base, cands[0].name))
+    fm, body = split_fm(safe_read(base, str(cands[0].relative_to(base))))
     return f'<div class="ddoc">{render_md(body)}</div>', cands[0].stem
 
 
@@ -1394,13 +1654,13 @@ def api_drill(tab: str, box: int, value: str = Query(default=""), item: int = Qu
             rows = [r for r in rows if str(r.get(f)) == str(v)]
         heading = str(it.get("label") or heading)
         if it.get("stat") == "top" and it.get("group_by"):     # drill the WINNING bucket
-            cnt = Counter(str(r.get(it["group_by"])) for r in rows if r.get(it["group_by"]))
+            cnt = Counter(s for r in rows for s in _gb_values(r.get(it["group_by"])))
             top = cnt.most_common(1)[0][0] if cnt else None
-            rows = [r for r in rows if str(r.get(it["group_by"])) == top] if top else []
+            rows = [r for r in rows if top in _gb_values(r.get(it["group_by"]))] if top else []
             heading = f"{heading}: {top}" if top else heading
     elif view in ("bars", "chips") and b.get("group_by"):
         gb = b["group_by"]
-        rows = [r for r in _ds_rows(b.get("dataset") or {}) if str(r.get(gb)) == value]
+        rows = [r for r in _ds_rows(b.get("dataset") or {}) if value in _gb_values(r.get(gb))]
         lbl = {str(k): str(v) for k, v in (b.get("labels") or {}).items()}.get(value, value)
         heading = f"{heading}: {lbl}"
     else:
@@ -1439,10 +1699,14 @@ def api_dashboards():
         base = WIKI / "dashboards"
         extra = []
         if base.is_dir():
-            for p in sorted(base.glob("*.md")):
-                if p.name.startswith(("_", ".")) or p.name == "INDEX.md":
+            # RECURSIVE, matching the default branch below: extensions write nested dashboards
+            # (dashboards/<ns>/*.md); a flat *.md glob left an un-curated nested dashboard out of the
+            # "Other" catch-all entirely, so it was invisible in the grid (invariant-audit M7).
+            for p in sorted(base.rglob("*.md")):
+                if not _visible_page(p, base):   # segment-level: drops dashboards/_archive/… (batch-2 re-verify)
                     continue
-                path = f"dashboards/{p.stem}"
+                rel = p.relative_to(base).with_suffix("").as_posix()
+                path = f"dashboards/{rel}"
                 if path in seen:
                     continue
                 fm = _dmeta(path)
@@ -1458,7 +1722,7 @@ def api_dashboards():
         # RECURSIVE: extensions write nested dashboards (dashboards/<ns>/*.md, e.g. competitive/);
         # a flat *.md glob left them invisible in the grid unless a pack curated them explicitly.
         for p in sorted(base.rglob("*.md")):
-            if p.name.startswith(("_", ".")) or p.name == "INDEX.md" or p.name.startswith("INDEX-"):
+            if not _visible_page(p, base):   # segment-level: drops dashboards/_archive/… (batch-2 re-verify)
                 continue
             try:
                 fm, _ = split_fm(p.read_text(encoding="utf-8", errors="replace"))
@@ -1554,10 +1818,15 @@ def api_ops():
     return {"groups": _ops_groups()}
 
 
-# generic OKF/Obsidian namespaces a page basename might resolve under (resolution
-# fallback only — no domain knowledge).
-_PAGE_DIRS = ("entities", "concepts", "sources", "predictions",
-              "marketing", "dashboards", "operational", "dailies", "briefings", "reports")
+def _content_dirs() -> list:
+    """Top-level content dirs ACTUALLY present under wiki/ — layout-agnostic basename resolution.
+    Replaces a hardcoded 10-namespace tuple that 404'd pack-owned namespaces (detections/actor/cve/…)
+    and walk-up sub-domain roots (invariant-audit M-1758). Fallback only: the direct wiki-relative
+    path is tried first, and rglob under each dir reaches nested (partitioned/walk-up) pages."""
+    try:
+        return [d for d in WIKI.iterdir() if d.is_dir() and not d.name.startswith((".", "_"))]
+    except OSError:
+        return []
 
 
 # ── UI extension panels (okengine#160, ported from the reader) ───────────────
@@ -1636,6 +1905,284 @@ def _provenance(fm: dict, body: str) -> dict:
     return prov if has_signal else {}
 
 
+# ── page overlay: fact panel + multi-source conflict/observation view (ported from the reader) ──
+# The reader treats a clicked page as a TYPED intel object: the surfaced frontmatter is its profile
+# (fact panel), record-keeping is tucked away (record details), and the assembler's multi-source
+# `conflicts:` + `observations/` records show "what each source says". All domain-agnostic — it
+# renders whatever fields/conflicts/observations exist, in frontmatter order.
+_META_PANEL_SKIP = {"title", "name", "type", "version", "raw", "needs_review", "sources"}   # needs_review -> badge/strip; sources -> the graded Evidence section (both drop from the fact panel)
+_META_SECONDARY = {"tlp", "created", "updated", "last_updated", "last_seen", "first_seen",
+                   "assembled_from", "tier", "tlp_caveat",
+                   "maintained_by", "discovered_by", "created_by", "last_modified_by"}
+_REL_RANK = {c: i for i, c in enumerate("FEDCBA")}    # A=5 (highest) … F=0; unknown -> -1
+_SRC_REL_CACHE: tuple[float, dict] = (0.0, {})
+_OBS_INDEX_CACHE: tuple[float, dict] = (0.0, {})
+
+
+def _source_reliability() -> dict:
+    """{source -> Admiralty reliability A–F} from the pack's schema.yaml `source_registry`, so the
+    conflict view can label each claim. Domain-agnostic; cached (vault is :ro)."""
+    global _SRC_REL_CACHE
+    now = time.monotonic()
+    if now - _SRC_REL_CACHE[0] < _DIR_TTL:
+        return _SRC_REL_CACHE[1]
+    out: dict = {}
+    sp = VAULT / "schema.yaml"
+    if sp.is_file():
+        try:
+            reg = (yaml.safe_load(sp.read_text(encoding="utf-8")) or {}).get("source_registry") or {}
+            for k, v in (reg.items() if isinstance(reg, dict) else []):
+                r = str((v or {}).get("reliability") or "").strip()
+                if r:
+                    out[str(k)] = r
+        except Exception:
+            pass
+    _SRC_REL_CACHE = (now, out)
+    return out
+
+
+def _meta_compact_dict(d: dict) -> str:
+    return ", ".join(f"{k}={v}" for k, v in d.items() if v not in (None, "", [], {}))
+
+
+def _val_text(v) -> str:
+    return _meta_compact_dict(v) if isinstance(v, dict) else str(v)
+
+
+def _url_label(url: str) -> str:
+    """Friendly link text for a bare URL — its host minus 'www.' (e.g. attack.mitre.org)."""
+    try:
+        host = urlparse(url).netloc
+    except Exception:
+        host = ""
+    host = host[4:] if host.startswith("www.") else host
+    return host or url
+
+
+def _ref_target(s: str) -> str | None:
+    """If `s` is a wiki-relative path that resolves to a vault page, return its canonical key (no
+    `.md`) for an internal link; else None. Path-shaped only; basename fallback resolves a flat-form
+    ref to a sharded page (entities/foo -> entities/f/foo)."""
+    if not isinstance(s, str):
+        return None
+    key = s.strip()
+    if "/" not in key or "://" in key or " " in key:
+        return None
+    key = key[:-3] if key.endswith(".md") else key
+    if not WIKI.is_dir():
+        return None
+    try:
+        cand = (WIKI / (key + ".md")).resolve()
+        if cand.is_file() and _within(WIKI, cand):
+            return key
+        hits = [p for p in WIKI.rglob(Path(key).name + ".md") if not _skip(p.name)]
+        if len(hits) == 1:
+            return str(hits[0].resolve().relative_to(WIKI.resolve()))[:-3]
+    except OSError:
+        pass
+    return None
+
+
+def _meta_values(v) -> list[dict]:
+    """One frontmatter value -> display chips. http(s) scalars + url/href list items become external
+    links; a value resolving to a vault page becomes an internal page link; dicts compact to k=v."""
+    out: list[dict] = []
+    for el in (v if isinstance(v, list) else [v]):
+        if isinstance(el, dict):
+            url = el.get("url") or el.get("href")
+            txt = (el.get("id") or el.get("value") or el.get("name") or el.get("std")
+                   or (_url_label(url) if url else None) or _meta_compact_dict(el))
+            out.append({"text": str(txt), "url": str(url)} if url else {"text": str(txt)})
+        else:
+            s = str(el)
+            if s.startswith(("http://", "https://")):
+                out.append({"text": _url_label(s), "url": s})
+            else:
+                tgt = _ref_target(s)
+                out.append({"text": s, "page": tgt} if tgt else {"text": s})
+    return out
+
+
+def _meta_panel_items(fm: dict, order: list | None = None) -> dict:
+    """Frontmatter split into `primary` (the page's intel — surfaced) and `secondary`
+    (record-keeping — collapsed). Renders whatever fields exist. When the pack supplies a per-type
+    `order`, that order IS the profile: only its fields are primary (in order); everything else
+    (record-keeping — ids, urls, dates, provenance the pack didn't put in the profile) drops to
+    secondary, so the top reads as a curated analyst card, not a field dump. Without an order, the
+    split falls back to the `_META_SECONDARY` heuristic."""
+    primary: list[dict] = []
+    secondary: list[dict] = []
+    if not isinstance(fm, dict):
+        return {"primary": primary, "secondary": secondary}
+    keys = list(fm.keys())
+    rank = {f: i for i, f in enumerate(order)} if order else {}
+    if order:
+        keys.sort(key=lambda k: rank.get(k, len(order)))   # stable: declared first, rest keep fm order
+    for k in keys:
+        v = fm.get(k)
+        if k in _META_PANEL_SKIP or v is None or v == "" or v == [] or v == {}:
+            continue
+        label = str(k).replace("_", " ").replace("-", " ").strip()
+        item = {"label": label[:1].upper() + label[1:], "values": _meta_values(v)}
+        if order:
+            is_secondary = k not in rank                   # profiled: only declared fields are the profile
+        else:
+            is_secondary = k in _META_SECONDARY            # unprofiled: heuristic record-keeping set
+        (secondary if is_secondary else primary).append(item)
+    return {"primary": primary, "secondary": secondary}
+
+
+def _shape_conflicts(fm: dict) -> list[dict]:
+    """The assembler's `conflicts:` frontmatter -> per-field 'what each source says', each value
+    tagged with its source(s) + Admiralty reliability + rank (for the ≥B filter), headline flagged."""
+    rel = _source_reliability()
+    out: list[dict] = []
+    conflicts = fm.get("conflicts")
+    if not isinstance(conflicts, list):     # `conflicts: 42` -> `for c in 42` TypeError (M28)
+        conflicts = []
+    for c in conflicts:
+        if not isinstance(c, dict):
+            continue
+        headline = c.get("headline")
+        vals: list[dict] = []
+        values = c.get("values")            # guard the container (`values: 42` = non-iterable scalar)
+        if not isinstance(values, list):    # AND each entry below — see reader's copy (invariant-audit M28)
+            values = []
+        for v in values:
+            if not isinstance(v, dict):     # scalar entry -> .get() AttributeError 500s the page
+                continue
+            v_sources = v.get("sources")    # third container: `sources: 42` -> for s in 42 (M28)
+            if not isinstance(v_sources, list):
+                v_sources = []
+            srcs = [{"name": str(s), "reliability": rel.get(str(s), "")} for s in v_sources]
+            rank = max((_REL_RANK.get(str(s["reliability"]).upper()[:1], -1) for s in srcs), default=-1)
+            vals.append({"value": _val_text(v.get("value")), "sources": srcs, "rank": rank,
+                         "is_headline": v.get("value") == headline})
+        out.append({"field": str(c.get("field") or ""), "headline": _val_text(headline), "values": vals})
+    return out
+
+
+def _evidence_sources(fm: dict) -> list[dict]:
+    """A page's cited `sources:` as graded evidence rows: name, internal page (if it resolves),
+    Admiralty reliability (from schema.yaml source_registry), and recency (the source page's date,
+    when it's a page). Turns a bare source list into dated, graded citations. Reliability/date are
+    "" when the deployment doesn't populate a registry or the source is a prose name."""
+    srcs = fm.get("sources")
+    srcs = srcs if isinstance(srcs, list) else ([srcs] if srcs else [])
+    rel = _source_reliability()
+    out: list[dict] = []
+    for s in srcs:
+        name = str(s).strip()
+        if not name:
+            continue
+        page = _ref_target(name)
+        date = ""
+        if page:
+            try:
+                pfm, _ = split_fm(_read_head(WIKI / (page + ".md")))
+                date = str(pfm.get("published") or pfm.get("date") or pfm.get("updated")
+                           or pfm.get("last_updated") or "")[:10]
+            except OSError:
+                pass
+        out.append({"name": name, "page": page, "reliability": rel.get(name, ""), "date": date})
+    return out
+
+
+def _observations_by_canonical() -> dict:
+    """{canonical-slug -> [{source, key}]} over `observations/`, for canonical→source drill-down.
+    Cached for _DIR_TTL (head-read only)."""
+    global _OBS_INDEX_CACHE
+    now = time.monotonic()
+    if now - _OBS_INDEX_CACHE[0] < _DIR_TTL:
+        return _OBS_INDEX_CACHE[1]
+    idx: dict = {}
+    base = WIKI / "observations"
+    if base.is_dir():
+        for p in base.rglob("*.md"):
+            if _skip(p.name) or _reserved_seg(p):   # skip _archive/ retired observations (batch-2 re-verify)
+                continue
+            fm, _ = split_fm(_read_head(p))
+            canon = str(fm.get("canonical") or "").strip().lower()
+            if canon:
+                key = str(p.resolve().relative_to(WIKI.resolve()))[:-3]
+                idx.setdefault(canon, []).append({"source": str(fm.get("source") or ""), "key": key})
+    _OBS_INDEX_CACHE = (now, idx)
+    return idx
+
+
+# ── page quality/status badges (okengine — generic page health) ─────────────────────────────────
+# A problem-only badge row atop the overlay, computed from data already present. Nothing
+# domain-specific: which fields a type REQUIRES comes from schema.yaml; the rest are envelope
+# signals (sources/grounding/review/conflicts/recency/size). A clean page gets no row.
+_STALE_DAYS = max(0, int(os.environ.get("OKENGINE_COCKPIT_STALE_DAYS", "90")))   # 0 disables the stale badge
+_THIN_CHARS = 240
+_TYPE_REQ_CACHE: tuple[float, dict] = (0.0, {})
+
+
+def _type_required_fields() -> dict:
+    """{type -> [required field names]} from schema.yaml `types`, so a page missing a field its type
+    requires can be flagged. 'type' itself is always present -> dropped. Cached (vault :ro)."""
+    global _TYPE_REQ_CACHE
+    now = time.monotonic()
+    if now - _TYPE_REQ_CACHE[0] < _DIR_TTL:
+        return _TYPE_REQ_CACHE[1]
+    out: dict = {}
+    sp = VAULT / "schema.yaml"
+    if sp.is_file():
+        try:
+            types = (yaml.safe_load(sp.read_text(encoding="utf-8")) or {}).get("types") or {}
+            for k, v in (types.items() if isinstance(types, dict) else []):
+                req = (v or {}).get("required") if isinstance(v, dict) else None
+                if isinstance(req, list):
+                    out[str(k)] = [str(f) for f in req if str(f) != "type"]
+        except Exception:
+            pass
+    _TYPE_REQ_CACHE = (now, out)
+    return out
+
+
+def _quality_badges(fm: dict, body: str, ptype: str, prov: dict, conflicts: list) -> list[dict]:
+    """Generic page-health badges from data already present — only PROBLEM signals surface (a clean
+    page gets no row). level: bad (red) | warn (amber). Each carries a `title` tooltip."""
+    b: list[dict] = []
+    prov = prov or {}
+    # required fields the schema declares for this type
+    missing = [f for f in _type_required_fields().get(ptype or "", []) if fm.get(f) in (None, "", [], {})]
+    if missing:
+        b.append({"label": f"missing {', '.join(missing[:3])}", "level": "bad",
+                  "title": f"required field(s) absent for type '{ptype}': {', '.join(missing)}"})
+    # sourcing / grounding (an empty prov dict means no sources — the badge is correct)
+    nsrc = prov.get("sources", 0)
+    if not nsrc:
+        b.append({"label": "no sources", "level": "bad", "title": "no sources cited"})
+    elif not prov.get("source_pages"):
+        b.append({"label": "ungrounded", "level": "warn",
+                  "title": f"{nsrc} prose source(s) — none link to a source page"})
+    g = prov.get("grounding")
+    if g and g.get("unsupported"):
+        n = g["unsupported"]
+        b.append({"label": f"{n} unsupported claim{'s' if n != 1 else ''}", "level": "bad",
+                  "title": "the Grounding check flagged unsupported claims"})
+    if fm.get("needs_review"):
+        b.append({"label": "needs review", "level": "warn", "title": "flagged for human review"})
+    if conflicts:
+        n = len(conflicts)
+        b.append({"label": f"{n} conflicting field{'s' if n != 1 else ''}", "level": "warn",
+                  "title": "sources disagree on one or more fields"})
+    if _STALE_DAYS:
+        d = _as_date(fm.get("updated") or fm.get("last_updated") or fm.get("last_seen"))
+        if d is not None:
+            age = (TODAY() - d).days
+            if age > _STALE_DAYS:
+                b.append({"label": f"stale {age}d", "level": "warn",
+                          "title": f"last updated {age} days ago (> {_STALE_DAYS}d)"})
+    prose = _strip_md(body or "").strip()
+    nfields = sum(1 for k, v in fm.items() if k not in _META_PANEL_SKIP and v not in (None, "", [], {}))
+    if len(prose) < _THIN_CHARS and nfields < 4:
+        b.append({"label": "thin", "level": "warn", "title": f"sparse page (<{_THIN_CHARS} chars, few fields)"})
+    return b
+
+
 @app.get("/api/page")
 def api_page(path: str = Query(...)):
     """Render any wiki page (entity/source/concept/...) for click-through navigation."""
@@ -1644,8 +2191,7 @@ def api_page(path: str = Query(...)):
     cand = WIKI / (path + ".md")
     if not cand.is_file():
         name = Path(path).name + ".md"
-        hits = [h for d in _PAGE_DIRS if (WIKI / d).is_dir()
-                for h in (WIKI / d).rglob(name)]
+        hits = [h for d in _content_dirs() for h in d.rglob(name)]
         if len(hits) > 1:
             raise HTTPException(409, "ambiguous page basename; use the full wiki-relative path")
         cand = hits[0] if hits else None
@@ -1658,9 +2204,24 @@ def api_page(path: str = Query(...)):
         raise HTTPException(403, "blocked")
     fm, body = split_fm(cp.read_text(encoding="utf-8", errors="replace"))
     title = fm.get("title") or fm.get("name") or Path(path).name
-    return {"path": path, "title": str(title), "type": str(fm.get("type") or ""),
+    ptype = str(fm.get("type") or "")
+    profiles = cockpit_config().get("profiles", {})
+    m = _meta_panel_items(fm, profiles.get(ptype))
+    slug = cp.stem.lower()
+    prov = _provenance(fm, body)
+    conflicts = _shape_conflicts(fm)
+    return {"path": path, "title": str(title), "type": ptype,
             "rel": str(cp.relative_to(WIKI.resolve())), "html": render_md(body),
-            "panel": _panel_for(fm, body), "provenance": _provenance(fm, body)}
+            # a type the pack gives a `profiles:` order to splits its fields into a primary fact
+            # panel (`meta`) vs secondary Record details (`meta_aux`). The body always leads the
+            # page; the fact panel follows it (see openPage in static/app.js).
+            "profiled": ptype in profiles,
+            "panel": _panel_for(fm, body), "provenance": prov,
+            "meta": m["primary"], "meta_aux": m["secondary"],
+            "conflicts": conflicts, "needs_review": bool(fm.get("needs_review")),
+            "observations": _observations_by_canonical().get(slug, []),
+            "citations": _evidence_sources(fm),
+            "quality": _quality_badges(fm, body, ptype, prov, conflicts)}
 
 
 @app.get("/api/rollup")
@@ -1688,7 +2249,9 @@ def _clean_markdown(raw: str, title: str | None = None) -> str:
     fm, body = split_fm(raw)
     body = _resolve_embeds(body)
     body = re.sub(r"```dataview(js)?\n.*?\n```", "", body, flags=re.DOTALL)
+    body = _uncode_wikilinks(body)
     body = _delink(body)
+    body = _deref_local_links(body)
     t = str(title or fm.get("title") or fm.get("name") or "").strip()
     if t and not body.lstrip().startswith("# "):
         body = f"# {t}\n\n{body}"
@@ -1709,8 +2272,7 @@ def _resolve_source(stream: str | None, date: str | None, path: str | None):
         cand = WIKI / (path + ".md")
         if not cand.is_file():
             name = Path(path).name + ".md"
-            hits = [h for d in _PAGE_DIRS if (WIKI / d).is_dir()
-                    for h in (WIKI / d).rglob(name)]
+            hits = [h for d in _content_dirs() for h in d.rglob(name)]
             if len(hits) > 1:
                 raise HTTPException(409, "ambiguous page basename; use the full wiki-relative path")
             cand = hits[0] if hits else None
@@ -1725,16 +2287,41 @@ def _resolve_source(stream: str | None, date: str | None, path: str | None):
     raise HTTPException(400, "need stream+date or path")
 
 
-def _pandoc(clean_md: str, fmt: str) -> bytes:
+# Print stylesheet for the weasyprint PDF path. Pandoc ships no CSS, so a wide markdown table or a
+# long unbreakable token (URL, hash, IOC) runs off the right edge of the page. Constrain everything
+# to the page box: real margins, fixed-layout full-width tables, and word-breaking in every cell.
+_PDF_CSS = (
+    "@page{size:A4;margin:1.8cm 1.7cm}"
+    "html{font-family:'DejaVu Serif',serif;font-size:10.5pt;line-height:1.42}"
+    "body{max-width:100%}"
+    "h1{font-size:18pt;margin:0 0 .3em}h2{font-size:13.5pt;margin:1.1em 0 .3em}"
+    "h3{font-size:11.5pt;margin:.9em 0 .2em}"
+    "p,li{overflow-wrap:break-word;word-wrap:break-word}"
+    "pre,code{white-space:pre-wrap;word-break:break-word;font-size:9pt}"
+    "pre{background:#f5f5f5;padding:6px 8px;border-radius:4px}"
+    "table{width:100%;table-layout:fixed;border-collapse:collapse;font-size:8.6pt;margin:.6em 0}"
+    "th,td{border:1px solid #bbb;padding:3px 5px;vertical-align:top;"
+    "overflow-wrap:break-word;word-break:break-word}"
+    "th{background:#f0f0f0;text-align:left}"
+    "img{max-width:100%}a{color:inherit;text-decoration:none}"
+)
+
+
+def _pandoc(clean_md: str, fmt: str, title: str | None = None) -> bytes:
     with tempfile.TemporaryDirectory() as td:
         src = Path(td) / "in.md"
         out = Path(td) / f"out.{fmt}"
         src.write_text(clean_md, encoding="utf-8")
         cmd = ["pandoc", str(src), "-f", "markdown+pipe_tables", "-o", str(out)]
+        # a non-empty title keeps standalone docx/pdf out of pandoc's "Defaulting to 'in'" fallback
+        cmd += ["--metadata", f"title={(title or '').strip() or 'OKEngine report'}"]
         if fmt == "docx":
             cmd += ["--standalone"]
         if fmt == "pdf":
             cmd += ["--pdf-engine=weasyprint"]
+            hdr = Path(td) / "style.html"
+            hdr.write_text(f"<style>{_PDF_CSS}</style>", encoding="utf-8")
+            cmd += ["--standalone", "-H", str(hdr)]
         try:
             # cwd must be writable: pandoc/weasyprint create temp files in CWD,
             # and /app is root-owned (we run as the vault uid).
@@ -1760,9 +2347,84 @@ def api_download(fmt: str, stream: str | None = None, date: str | None = None,
         raise HTTPException(400, "fmt must be md|docx|pdf")
     raw, base, title = _resolve_source(stream, date, path)
     clean = _clean_markdown(raw, title)
-    data = clean.encode("utf-8") if fmt == "md" else _pandoc(clean, fmt)
+    data = clean.encode("utf-8") if fmt == "md" else _pandoc(clean, fmt, title)
     fname = f"{base}.{fmt}"
     return Response(content=data, media_type=_DL_MIME[fmt],
+                    headers={"Content-Disposition": f"attachment; filename=\"{quote(fname)}\""})
+
+
+# A leading progress-narration line ("Checking the vault…", "Pulling the pages now", "Good leads").
+# The contract asks the agent to keep these out of a report, but local models still emit them; we
+# strip them from the EXPORTED report (they're fine as live feedback in the chat).
+_NARRATION = re.compile(
+    r"^\s*(checking|pulling|retrieving|searching|assessing|reviewing|looking|gathering|fetching|"
+    r"scanning|querying|good\b|i (now|have|'ll|'ve)|let me|now (pulling|checking|retrieving|"
+    r"searching))\b", re.I)
+
+
+def _strip_report_preamble(md: str) -> str:
+    """Drop a leading block of progress-narration IFF it's clearly delimited by a `---` / heading —
+    conservative so real content is never removed."""
+    lines = md.split("\n")
+    n = len(lines)
+    i = 0
+    while i < n and not lines[i].strip():
+        i += 1
+    start = i
+    while i < n:
+        s = lines[i].strip()
+        if not s:
+            i += 1
+            continue
+        if _NARRATION.match(s) or s.endswith("now") or s.endswith("now."):
+            i += 1
+            continue
+        break
+    if i == start:                                   # no leading narration
+        return md
+    j = i
+    while j < n and not lines[j].strip():
+        j += 1
+    if j < n:
+        b = lines[j].strip()
+        if b in ("---", "***", "___"):               # narration → thematic break → report
+            return "\n".join(lines[j + 1:]).lstrip("\n")
+        if b.startswith(("#", "**")):                # narration → title/heading → report
+            return "\n".join(lines[j:]).lstrip("\n")
+    return md                                        # not clearly delimited — leave it untouched
+
+
+def _clean_chat_markdown(md: str, title: str | None = None) -> str:
+    """Portable markdown from a chat report: leading progress-narration stripped, internal vault
+    links flattened to text (they resolve only in-app), wikilinks flattened, an optional title as H1."""
+    body = _strip_report_preamble(_deref_local_links(_delink(md.strip())))
+    t = str(title or "").strip()
+    if t and not body.lstrip().startswith("# "):
+        body = f"# {t}\n\n{body}"
+    return body.strip() + "\n"
+
+
+@app.post("/api/chat_export")
+async def api_chat_export(request: Request, fmt: str = Query(...)):
+    """Export a chat report (the assistant markdown the browser POSTs) as md/docx/pdf through the
+    same clean+pandoc pipeline as page downloads. Internal vault links are flattened to text so the
+    file carries no dead paths — the citations only resolve inside the reader."""
+    if fmt not in _DL_MIME:
+        raise HTTPException(400, "fmt must be md|docx|pdf")
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(400, "bad json")
+    content = str((data or {}).get("content") or "").strip()
+    if not content:
+        raise HTTPException(400, "no content")
+    if len(content) > 200_000:
+        raise HTTPException(413, "content too large")
+    title = str((data or {}).get("title") or "").strip()[:200] or None
+    clean = _clean_chat_markdown(content, title)
+    blob = clean.encode("utf-8") if fmt == "md" else _pandoc(clean, fmt, title)
+    fname = f"report-{datetime.date.today().isoformat()}.{fmt}"
+    return Response(content=blob, media_type=_DL_MIME[fmt],
                     headers={"Content-Disposition": f"attachment; filename=\"{quote(fname)}\""})
 
 
@@ -1779,8 +2441,11 @@ def api_search(q: str = Query(...), limit: int = 40):
     q = q.strip()
     if len(q) < 2:
         return {"q": q, "results": []}
+    # `!_?*` (underscore + ≥1 char), NOT `!_*` — the latter also prunes the bare-`_` reshard bucket
+    # (entities/x/_/x-force.md), making a resharded entity browsable-but-unfindable. Mirrors
+    # _is_reserved_seg's bare-`_` exemption so search agrees with browse (batch-2 gate).
     cmd = ["rg", "-i", "-F", "-m1", "--no-heading", "-n", "--no-messages",
-           "--max-columns", "240", "-g", "*.md", "-g", "!*.bak.*", "-g", "!_*",
+           "--max-columns", "240", "-g", "*.md", "-g", "!*.bak.*", "-g", "!_?*",
            "--", q, str(WIKI)]
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=12, text=True)
@@ -1913,8 +2578,14 @@ def _skip_backlink_src(key: str) -> bool:
         name += ".md"
     if _bl_skip_name(name) or name in _RESERVED_BL_NAMES:
         return True
-    ns = key.split("/")[0] if "/" in key else ""
-    return bool(ns) and ns in (_excluded_dirs() | _SURFACED_DERIVED | _backlink_drop_dirs())
+    parts = key.split("/")
+    # reserved sub-dir (_archive/…) at ANY depth, AND an excluded/surfaced/drop namespace at any depth
+    # (walk-up sub-domain nests them) — a leaf + top-level-only check let archived/excluded pages
+    # contribute "what links here" edges that browse + search hide (batch-2 completeness re-verify).
+    if any(_is_reserved_seg(seg) for seg in parts[:-1]):
+        return True
+    drop = _excluded_dirs() | _SURFACED_DERIVED | _backlink_drop_dirs()
+    return any(seg in drop for seg in parts[:-1])
 
 
 def _backlink_title(src: str) -> str:
@@ -2065,9 +2736,13 @@ def _load_backlinks(blocking: bool = True) -> dict:
 
 @app.on_event("startup")
 def _prewarm_backlinks() -> None:
-    """Build the backlink graph in the background at startup so the first
-    user request doesn't block on the build."""
+    """Build the backlink graph AND pre-scan the tab datasets in the background at startup so the
+    first user request doesn't block on the build or a cold multi-thousand-file namespace scan."""
     threading.Thread(target=_load_backlinks, daemon=True).start()
+    threading.Thread(target=_warm_tab_datasets, daemon=True).start()
+
+
+_BL_GROUP_CAP = 12   # items shown per Related-rail type group (the rest collapse to "+N more")
 
 
 @app.get("/api/backlinks")
@@ -2076,8 +2751,19 @@ def api_backlinks(path: str = Query(...), limit: int = 100):
     wiki-relative key without .md (e.g. 'concepts/<name>')."""
     key = path[:-3] if path.endswith(".md") else path
     refs = _load_backlinks(blocking=False).get(key, [])   # never block the UI on the IWE build
-    return {"path": key, "count": len(refs),
-            "backlinks": refs[:max(1, min(limit, 500))]}
+    # Typed "Related" rail: group referrers by their namespace (the first path segment == the OKF
+    # type bucket — predictions/, findings/, entities/, dashboards/, …). Counts are over ALL
+    # referrers; items are capped per group. Ordered most-connected first — generic, no domain
+    # priority baked into the engine. (sources/ is already dropped from the graph upstream.)
+    groups: dict[str, list] = {}
+    for r in refs:
+        rk = str(r.get("key") or "")
+        ns = rk.split("/", 1)[0] if "/" in rk else "(root)"
+        groups.setdefault(ns, []).append(r)
+    grouped = [{"ns": ns, "label": _humanize(ns), "count": len(items), "items": items[:_BL_GROUP_CAP]}
+               for ns, items in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))]
+    return {"path": key, "count": len(refs), "groups": grouped,
+            "backlinks": refs[:max(1, min(limit, 500))]}   # flat list kept for back-compat
 
 
 # ── generic browse (namespaces → pages, ported from okengine-reader) ─────────
@@ -2240,7 +2926,7 @@ def _scan_dir(sub: str) -> list[dict]:
     out: list[dict] = []
     if base.is_dir() and _within(WIKI, base):
         for p in base.rglob("*.md"):
-            if _skip(p.name):
+            if _skip(p.name) or _hidden_page(p):   # reserved sub-dirs + walk-up excluded (batch-2 re-verify)
                 continue
             out.append(_page_meta(p.resolve()))
     out.sort(key=lambda r: (r["title"].lower(), r["path"]))
@@ -2297,7 +2983,7 @@ def api_tree():
         for d in sorted(WIKI.iterdir()):
             if not d.is_dir() or _skip(d.name) or d.name in excluded:
                 continue
-            mds = [p for p in d.rglob("*.md") if not _skip(p.name)]
+            mds = [p for p in d.rglob("*.md") if not _skip(p.name) and not _hidden_page(p)]
             if mds:
                 dirs.append({"dir": d.name, "count": len(mds), "derived": _dir_is_derived(mds)})
     label, ns = _rail_top_section()
@@ -2430,13 +3116,17 @@ _AGENT_SYSTEM = os.environ.get("OKENGINE_AGENT_SYSTEM") or (
     "You are the OKEngine vault agent. This OKF knowledge vault is your long-term memory and "
     "the FIRST place you look for anything. Open EVERY reply with a one-line acknowledgement "
     "of what you're about to do (e.g. \"Checking the vault for Scattered Spider…\") before you "
-    "call any tools, so the user gets immediate feedback. Then:\n"
+    "call any tools, so the user gets immediate feedback. Keep it to that ONE line — do not narrate "
+    "each search round (\"good leads\", \"pulling the pages now\", \"good data\"). Then:\n"
     "1. SEARCH THE VAULT FIRST — use your tools (search, then get_page / retrieve_context / "
     "find_references) and build your answer from those pages. Search is lexical, so it matches "
     "words not meanings: if the first query is thin, RETRY with synonyms and related terms "
     "before concluding the vault lacks it (e.g. health → medical / clinical / hospital / "
-    "patient; actor → group / intrusion-set / threat-actor; ransomware → extortion). Cite each "
-    "page you used inline as `path` (e.g. `entities/s/scattered-spider`).\n"
+    "patient; actor → group / intrusion-set / threat-actor; ransomware → extortion). Prefer the "
+    "most RECENT pages — the vault is fed continuously, so current-year material exists; lead with "
+    "it and don't lean on old advisories when fresher reporting is present. Cite each page you use "
+    "as a linked title — `[Page Title](path)`, e.g. `[Scattered Spider](entities/s/scattered-spider)` "
+    "— never a bare file path.\n"
     "2. If the vault already covers it, answer ONLY from the vault — do not add outside or "
     "prior knowledge.\n"
     "3. If the vault is missing or thin on the topic, RESEARCH IT WITH YOUR WEB TOOLS — you "
@@ -2449,7 +3139,23 @@ _AGENT_SYSTEM = os.environ.get("OKENGINE_AGENT_SYSTEM") or (
     "every external fact you rely on gets captured so the next query finds it here.\n"
     "4. Never fabricate — and never claim you lack external access: you HAVE web search, so use "
     "it before giving up. Only call a fact unverifiable after a web search has actually failed "
-    "to confirm it."
+    "to confirm it.\n"
+    "5. Speak as the vault's own analyst, never as software. Do NOT name or describe the machinery "
+    "behind you: never mention Hermes, your model or model provider, or the tools/functions you use "
+    "(search, web research, retrieve_context, write tools, and the like), and do not sign a reply "
+    "or report off as any \"agent\". Referring to THE VAULT and citing your sources is expected — "
+    "describe WHAT you found and WHERE (linked page titles, web sources), never the plumbing that "
+    "fetched it.\n"
+    "6. Be specific and disciplined. Surface the concrete detail the pages hold — dates, CVEs, "
+    "IOCs, named techniques/TTPs — not generic advice; state the time window your assessment covers "
+    "and say so plainly if the freshest evidence is old. Stay within the question's scope: if you "
+    "raise an adjacent but DISTINCT threat (different actor class or motivation), label it as "
+    "context, don't blend it into the main assessment.\n"
+    "7. Only when asked for a REPORT, BRIEFING, or DECK (not a quick question): make it a "
+    "SELF-CONTAINED document that BEGINS at its title / executive summary — your search-and-pull "
+    "narration must NOT appear anywhere in it. Structure it: a short impact-framed executive "
+    "summary, comparison TABLES where you contrast actors/options, and a specific "
+    "detection/mitigation section drawn from the vault. Keep ordinary questions concise."
 )
 
 

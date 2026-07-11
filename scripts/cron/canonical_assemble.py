@@ -57,10 +57,20 @@ def _as_list(v) -> list:
     return list(v) if isinstance(v, list) else [v]
 
 
+def _json_default(o):
+    """Deterministic fallback for values yaml.safe_load produces that json can't serialize: a bare
+    ISO date -> datetime.date, a !!set -> set. Sets are SORTED (not str(set), whose order is
+    PYTHONHASHSEED-dependent) so the dedup key is stable across runs (invariant-audit completeness /
+    B6.1 lesson). Without this, a dict field carrying a date crashed the whole assembly run."""
+    if isinstance(o, (set, frozenset)):
+        return sorted(map(str, o))
+    return str(o)
+
+
 def _key(v) -> str:
     """Stable dedup/identity key for a value (scalars and dict items alike)."""
     if isinstance(v, dict):
-        return json.dumps(v, sort_keys=True, ensure_ascii=False)
+        return json.dumps(v, sort_keys=True, ensure_ascii=False, default=_json_default)
     return str(v).strip().lower()
 
 

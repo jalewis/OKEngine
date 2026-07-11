@@ -51,7 +51,26 @@ def _d(v) -> str:
     return str(v or "")[:10]
 
 
+def _open_prediction_values() -> set:
+    """Statuses that count a prediction OPEN — read from the schema's
+    tier.namespaces.predictions.open_values (the single config-driven contract tier_lib and
+    build_hot_set already consume), not a bare literal that silently forks (invariant-audit L1).
+    Defaults to {open, active}."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import schema_lib
+        nsc = (((schema_lib.merged_schema(VAULT, "predictions").get("tier") or {})
+                .get("namespaces") or {}).get("predictions") or {})
+        ov = nsc.get("open_values")
+        if ov:
+            return {str(v).lower() for v in ov}
+    except Exception:
+        pass
+    return {"open", "active"}
+
+
 def main() -> int:
+    open_vals = _open_prediction_values()
     if not WIKI.is_dir() or not any(WIKI.rglob("*.md")):
         print("# empty vault — nothing to brief (fresh install)")
         print(json.dumps({"wakeAgent": False}))
@@ -103,7 +122,7 @@ def main() -> int:
             if p.name.startswith(("_", "INDEX")):
                 continue
             fm = _fm(p)
-            if str(fm.get("status") or "open") in ("open", "active"):
+            if str(fm.get("status") or "open").lower() in open_vals:
                 rb = _d(fm.get("resolves_by"))
                 if rb and rb <= due_by:
                     due.append((rb, p.relative_to(WIKI).as_posix()[:-3],

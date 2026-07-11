@@ -16,7 +16,7 @@ OKEngine is pre-1.0. Security fixes target the latest `0.x` release and `main`.
 
 | Version | Supported |
 |---|---|
-| `0.3.x` / `main` | ✅ |
+| `0.11.x` / `main` | ✅ |
 | older | ❌ |
 
 ## Security model (what to keep in mind)

@@ -134,8 +134,16 @@ fi
 # --- reader extension panels (okengine#160) -> <pack>/.okengine/reader-panels.json ---
 # Type-bound panel bindings for the reader (it reads them from the vault it mounts). Host-side
 # (a vault file, not a /opt/data script). Self-declared panels (e.g. viz's map) don't need this.
-python3 "$REPO_ROOT/scripts/framework.py" extensions stage-panels "$PACK_DIR" || \
-    echo "  (reader-panels staging skipped)"
+# stage-panels writes `{}` and exits 0 even with ZERO panels, so a non-zero exit is ALWAYS a real
+# error — a broken extension config or a panel-TYPE COLLISION (collect_reader_panels fails loud when
+# two enabled extensions bind the same page type). Do NOT swallow it as "skipped": that shipped the
+# deploy green with an ambiguous/broken reader panel map. Fail the deploy, like the stage-plan above
+# (invariant-audit B6.4).
+if ! python3 "$REPO_ROOT/scripts/framework.py" extensions stage-panels "$PACK_DIR"; then
+    echo "ERROR: reader-panels staging failed — broken extension config or a panel-type collision" \
+         "(see the FAIL lines above)." >&2
+    exit 1
+fi
 
 # --- domain data -> /opt/data/config/ ---
 # Domain data tables consumed at runtime (cron-plus mounts only /opt/data/, so these must sit

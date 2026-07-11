@@ -71,6 +71,167 @@ def _log_text(root: Path) -> str:
     return log.read_text(encoding="utf-8") if log.exists() else ""
 
 
+# ── degeneration guard (soft flag at the enforced write boundary) ─────────────
+
+def test_degeneration_flags_word_salad():
+    m = _load()
+    salad = " ".join(f"term{i}" for i in range(400))       # 400-word unpunctuated run (repetition loop)
+    flags = m._degeneration_flags("# X\n\n" + salad + ".\n")
+    assert any("unpunctuated run" in f for f in flags), flags
+
+
+def test_degeneration_flags_legitimate_content_clean():
+    m = _load()
+    assert m._degeneration_flags("# X\n\nA coherent page. It has sentences. They end.\n") == []
+    # a long comma-separated LIST (MITRE techniques / killed services) is legitimate, not filler
+    assert m._degeneration_flags("Applies to: " + ", ".join(f"Svc {i}" for i in range(300)) + ".\n") == []
+    # a long wikilink list is not prose
+    assert m._degeneration_flags(" ".join(f"[[t/x-{i}|X{i}]]" for i in range(300)) + "\n") == []
+    # Chinese CTI content is NOT degeneration — the dropped CJK-fusion signal used to flag it
+    assert m._degeneration_flags("Aliases: XY助手, 熊猫Stealer. 东南亚新APT组织持续活跃。\n") == []
+    assert m._degeneration_flags(None) == [] and m._degeneration_flags("") == []
+
+
+def test_degeneration_guard_agrees_with_content_lint():
+    """Cross-surface contract: the write-path guard and scripts/cron/content_lint.py must agree on the
+    same samples, or a fix to one silently drifts from the other (the multi-surface-contract rule)."""
+    m = _load()
+    cl_spec = importlib.util.spec_from_file_location("content_lint", REPO / "scripts" / "cron" / "content_lint.py")
+    cl = importlib.util.module_from_spec(cl_spec)
+    cl_spec.loader.exec_module(cl)
+    salad = " ".join(f"t{i}" for i in range(400))
+    biglist = ", ".join(f"Svc {i}" for i in range(300))
+    for body in (salad, biglist, "Clean prose. It ends.", "Aliases: XY助手, 熊猫Stealer."):
+        guard = bool(m._degeneration_flags(body))
+        lint = bool(cl.lint_text("x", body))
+        assert guard == lint, f"guard/lint disagree on {body[:40]!r}: guard={guard} lint={lint}"
+
+
+def test_create_degenerate_page_is_flagged_needs_review(vault):
+    m, root = vault
+    salad = " ".join(f"term{i}" for i in range(400))
+    res = m._create("concepts/x/degen", {"type": "concept", "name": "Degen"}, "# Degen\n\n" + salad + ".\n")
+    assert "review" in res.lower()
+    page = (root / "wiki" / "concepts" / "x" / "degen.md").read_text(encoding="utf-8")
+    assert "needs_review: true" in page
+
+
+# ── _safe path normalization — dotted slugs must not be truncated ─────────────────────────────────
+
+def test_dotted_slug_not_truncated(vault):
+    """_safe forces the .md extension. It must APPEND, not with_suffix(), which strips everything
+    after the LAST dot: 'sources/2026/07/openssl-3.0.7-advisory' would misfile to '...openssl-3.0.md',
+    colliding distinct dotted prefixes onto one file and dead-linking every wikilink (invariant-audit
+    M16)."""
+    m, root = vault
+    fm = {"type": "source", "source_kind": "advisory", "publisher": "OpenSSL", "published": "2026-06-01"}
+    res = m._create("sources/2026/07/openssl-3.0.7-advisory", fm, "# Advisory\n\nBody.\n")
+    assert res.startswith("created"), res
+    good = root / "wiki" / "sources" / "2026" / "07" / "openssl-3.0.7-advisory.md"
+    bad = root / "wiki" / "sources" / "2026" / "07" / "openssl-3.0.md"
+    assert good.is_file(), "dotted slug must keep its full stem + .md"
+    assert not bad.exists(), "must NOT truncate at the last dot"
+
+
+# ── engine-generated root dashboards are write-refused (paired with the validator exemption) ───────
+
+def test_engine_dashboards_health_bundle_refused(vault):
+    """schema_validator exempts HEALTH.md/BUNDLE.md from conformance (876fceb); if the write path does
+    NOT also refuse them the two guards compose into ZERO protection — an agent overwrites the
+    engine-generated dashboard with fabricated content and nothing objects (invariant-audit M17)."""
+    m, root = vault
+    for name in ("HEALTH", "BUNDLE"):
+        assert m._create(name, "type: dashboard\ntitle: X", "# fabricated").startswith("refused:")
+        assert m._update(name, {"type": "dashboard", "title": "Y"}, None).startswith("refused:")
+
+
+def test_write_refusal_covers_validator_conformance_exemption(vault):
+    """The true cross-surface contract (M17): EVERY basename the validator exempts from conformance
+    (schema_validator._OKF_RESERVED_DEFAULT ∪ _is_generated_structural) MUST be write-refused, or the
+    two guards compose into zero protection — an agent forges a conformance-invisible page. The
+    round-2 re-verify showed the narrow health/bundle fix left the INDEX-<nonp> and dotfile families
+    exposed, and that a test iterating only _OKF_RESERVED_DEFAULT never bound them. Assert the
+    implication over a battery spanning every exempt family (the write path MAY refuse a superset)."""
+    m, _root = vault
+    sv_spec = importlib.util.spec_from_file_location("schema_validator", REPO / "tools" / "schema_validator.py")
+    sv = importlib.util.module_from_spec(sv_spec)
+    sv_spec.loader.exec_module(sv)
+
+    def validator_exempt(bn):
+        return bn.lower() in sv._OKF_RESERVED_DEFAULT or sv._is_generated_structural(bn)
+
+    def write_refused(bn):
+        return m._reserved_refuse(Path("wiki") / bn) is not None
+
+    exempt = ["HEALTH.md", "BUNDLE.md", "HOT.md", "index.md", "INDEX.md", "INDEX-p02.md",
+              "INDEX-glossary.md", "INDEX-summary.md", "_review-queue.md", ".backlinks.md",
+              "log.md", "AGENTS.md", "README.md"]
+    for bn in exempt:
+        assert validator_exempt(bn), f"test battery wrong: {bn} should be validator-exempt"
+        assert write_refused(bn), (
+            f"{bn} is conformance-EXEMPT but NOT write-refused — the two guards compose to zero "
+            f"protection (an agent forges a page nothing conformance-checks)")
+    # and a clearly-normal knowledge page is NOT refused (no runaway over-refusal)
+    for bn in ("apt-29.md", "openssl-advisory.md", "coverage-gap.md"):
+        assert not write_refused(bn), f"{bn} is a normal page and must remain writable"
+
+
+# ── tombstone invariant: no lane may resurrect a tombstoned page ─────────────────────────────────
+
+def test_tombstoned_page_not_resurrected_by_update_patch_append(vault):
+    """The never-resurrect guard lived ONLY on the converge lane (id-based); update/patch/append
+    operate by PATH on the retained tombstone file, so they could silently un-tombstone it
+    (invariant-audit M18). All three must refuse; tombstone_entity is the only lane that touches a
+    tombstone."""
+    m, root = vault
+    rel = "entities/g/ghost"                        # canonical shard form (create/tombstone/update all agree)
+    m._create(rel, {"type": "entity", "name": "Ghost"}, "# Ghost\n\nBody line.\n")
+    assert m._tombstone(rel, "merged into successor").startswith("tombstoned")
+    page = root / "wiki" / "entities" / "g" / "ghost.md"
+    before = page.read_text(encoding="utf-8")
+    assert m._update(rel, {"type": "entity", "name": "Ghost", "status": "active"}, None).startswith("refused")
+    assert "tombstoned" in m._patch(rel, "Body line.", "Alive again.")
+    assert m._append_section(rel, "Notes", "- resurrected").startswith("refused")
+    assert page.read_text(encoding="utf-8") == before, "tombstoned page must be untouched by all three"
+
+
+# ── int-shaped fields (machine-owned counts) — the recent_reports live incident ──────────────────
+
+def test_create_rejects_list_in_int_field(vault):
+    """An agent misreading `recent_reports` as \"list the recent reports\" hand-wrote a list of
+    source paths; the malformed value then TOPPED the cockpit's Most-active sort. The write path
+    must reject it, naming the field, before anything lands."""
+    m, root = vault
+    res = m._create("entities/b/badcount",
+                    {"type": "entity", "name": "BadCount",
+                     "recent_reports": ["sources/2026/07/some-report"]},
+                    "# BadCount\n\nBody.\n")
+    assert res.startswith("rejected:") and "recent_reports" in res, res
+    assert not (root / "wiki" / "entities" / "b" / "badcount.md").exists()
+
+
+def test_create_coerces_digit_string_count(vault):
+    """`recent_reports: \"15\"` is unambiguous intent — coerce, don't churn the lane."""
+    m, root = vault
+    res = m._create("entities/g/goodcount",
+                    {"type": "entity", "name": "GoodCount", "recent_reports": "15"},
+                    "# GoodCount\n\nBody.\n")
+    assert res.startswith("created"), res
+    page = (root / "wiki" / "entities" / "g" / "goodcount.md").read_text(encoding="utf-8")
+    assert "recent_reports: 15" in page
+
+
+def test_update_rejects_garbage_int_field_and_leaves_file(vault):
+    m, root = vault
+    m._create("entities/o/okactor", {"type": "entity", "name": "OkActor", "total_mentions": 7},
+              "# OkActor\n\nBody.\n")
+    before = (root / "wiki" / "entities" / "o" / "okactor.md").read_text(encoding="utf-8")
+    res = m._update("entities/o/okactor", {"type": "entity", "name": "OkActor",
+                                           "total_mentions": "about a dozen"}, None)
+    assert res.startswith("rejected:") and "total_mentions" in res, res
+    assert (root / "wiki" / "entities" / "o" / "okactor.md").read_text(encoding="utf-8") == before
+
+
 _DRIFT_SCHEMA = """\
 okf:
   required: [type]

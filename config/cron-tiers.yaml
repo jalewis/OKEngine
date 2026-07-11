@@ -29,6 +29,7 @@ engine:
   - reshard-oversized
   - build-index-tree
   - backlinks-refresh            # no_agent precompute of wiki/.backlinks.json for the UIs (okengine#168)
+  - id-index-refresh             # no_agent precompute of the id->path index so the MCP write path loads it (not a 64k-page live scan)
   - index-rebuild-daily
   - build-hot-set
   - tier-refresh
@@ -48,6 +49,8 @@ engine:
   - lint-watcher
   - schema-drift-lint
   - conformance-audit
+  - content-lint                 # no_agent degeneration monitor (word-salad / CJK-fusion) -> wiki/operational/content-lint.md
+  - render-lint                  # no_agent render-surface monitor (crawls the reader) -> wiki/operational/render-lint.md
   - deployment-validate
   - fleet-health
   - grounding-audit

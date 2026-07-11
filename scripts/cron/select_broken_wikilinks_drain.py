@@ -236,11 +236,11 @@ def main() -> int:
         n_sources = len(sources)
         total_refs = sum(c for _, c in sources)
         hint = classify_hint(target, by_basename)
-        print(f"{i}. `[[{target}]]`  inbound: {n_sources} sources, {total_refs} refs total")
+        print(f"{i}. `{target}`  inbound: {n_sources} sources, {total_refs} refs total")
         print(f"   hint: {hint}")
         sug = suggest_repair(target, by_basename, stem_tokens, tokidx)
         if sug:
-            print(f"   repair candidate: `[[{sug[0]}]]` ({sug[1]:.0f}% lexical match) "
+            print(f"   repair candidate: `{sug[0]}` ({sug[1]:.0f}% lexical match) "
                   f"— if the inbound context matches, rewrite the link to this; else create a stub")
         # Show top 3 inbound sources for context
         top = sorted(sources, key=lambda x: -x[1])[:3]
