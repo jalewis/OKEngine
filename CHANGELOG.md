@@ -14,6 +14,32 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
 > **About panel** (reader/cockpit deployment purpose + composition from live state); and now **pack
 > bundles** (v0.10.0). If you are jumping from v0.3.5, read v0.4.0 onward.
 
+## v0.11.4
+
+Patch: the fixes + install-experience work accumulated after the v0.11.3 tag, re-aligning the
+version with what actually ships (the public tag had been re-pointed across three snapshot
+publishes; this names that content).
+
+- **fix(cockpit):** `sort.then:` secondary key for dataset tables — coarse-date ties (50–70 actors
+  on one annual-report date) rank by activity instead of glob order (!423).
+- **fix(cockpit):** exported chat reports strip the agent's progress-narration ("Checking the
+  vault…", "Found the page…", "Based on the vault…") — live chat keeps it, md/docx/pdf don't (!424).
+- **fix(install-domain):** a cockpit-bearing guest onto a host with no `cockpit:` block SEEDS the
+  block instead of asserting — un-crashes every coinstall of a cockpit guest onto a bare scaffold
+  host (5 deploy-matrix cells) (!426).
+- **fix(deploy):** an .env with no pinned HERMES_UID made deploy.sh die instantly and silently
+  (`set -euo pipefail` + no-match `$(grep …)`, 5th instance of the class) — the documented
+  from-scratch flow was broken for exactly its target users. Guarded, plus a class-gate test
+  scanning every set -e script (!430).
+- **docs:** INSTALL.md is a paste-able five-step quickstart ending in a POPULATED system (feeds
+  activation — packs ship inert; model key before deploy; `deploy.sh --kickstart`; the reader/
+  cockpit URLs + LAN exposure); release-checklist gains the cross-repo library pack-pin re-stamp
+  step (!425, !427–!429).
+
+**Invariant-audit waiver (checklist 2b):** scoped waiver for this patch — every code fix above
+shipped through its own adversarial re-verify (2c pattern) this cycle and the deploy fix was
+caught/validated by a live clean-host kickstart install; no new cross-surface features landed.
+
 ## v0.11.3
 
 Invariant-audit **medium batches 4–8** — cron/lane robustness, the upgrade roll-forward gate,

@@ -12,7 +12,7 @@
 # (schema.yaml + persona + feeds + crons + content). See INSTALL.md and
 # docs/deploy-a-new-domain.md.
 version: 1
-engine_release: v0.11.3  # invariant-audit medium batches 4-8: cron/lane robustness, exhaustive roll-forward gate, install/build/verify hygiene, scaffold cleanup; see CHANGELOG.md
+engine_release: v0.11.4  # cockpit sort tie-break + export narration strip, install-domain cockpit seeding, deploy.sh silent-death guard, paste-able INSTALL; see CHANGELOG.md
 
 runtime:
   # Hermes is a PINNED DEPENDENCY, not vendored into this repo. You clone Hermes
