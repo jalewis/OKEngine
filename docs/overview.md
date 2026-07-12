@@ -14,7 +14,7 @@ wiki, an investor wiki, a legal wiki, a research wiki, or a product-intelligence
 wiki.
 
 ```
-a live deployment today = OKEngine @ a pinned Hermes + one domain pack
+a live deployment today = OKEngine @ a pinned Hermes + one pack **or bundle**
 ```
 
 The catalyst was Karpathy's LLM-wiki idea: an agent should accumulate knowledge in
@@ -105,7 +105,7 @@ automatically. See [`design/composable-okpacks.md`](design/composable-okpacks.md
 In practice:
 
 - **Framework = Runtime + Engine.**
-- **Deployment today = Framework + one pack.**
+- **Deployment today = Framework + one pack _or bundle_.** A bundle composes several ownership-disjoint packs into one vault; `install-domain` co-installs compatible domains.
 - **Swap the pack, change the brain.**
 
 The boundary is versioned in [`engine-manifest.yaml`](../engine-manifest.yaml) and

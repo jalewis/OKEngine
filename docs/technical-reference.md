@@ -54,7 +54,7 @@ per query.)
 The one-line factoring of a live system:
 
 ```
-a live deployment  =  OKEngine @ a pinned Hermes-Agent  +  ONE domain pack
+a live deployment  =  OKEngine @ a pinned Hermes-Agent  +  ONE pack or bundle
 ```
 
 - **OKEngine** (this repo) is the reusable, domain-agnostic layer: write

@@ -18,7 +18,7 @@ decomposition is three layers:
 | **Engine** | OKEngine's domain-agnostic value-add: LLM-wiki governance/maintenance, OKF-compatible validation, KB-maintenance machinery (`engine` + `engine-template` crons), retrieval/graph integration, deploy tooling | Ships with the framework; same for every deployment. |
 | **Domain pack** | Everything domain-specific: the vault (schema + content + persona), feeds, domain data files, `domain` crons + `engine-template` prompts, secrets | One per deployment; the reference pack is **okpack-cti** (separate repo). |
 
-The framework = **Runtime + Engine**. A deployment = framework + **one domain pack**.
+The framework = **Runtime + Engine**. A deployment = framework + **one pack definition OR bundle** (a bundle composes several ownership-disjoint packs into one vault; `install-domain` can co-install compatible domains).
 
 ## 2. File/dir → layer mapping
 

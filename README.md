@@ -20,7 +20,7 @@ the wiki useful over time. Swap the domain pack and the same engine can maintain
 wiki, an investor wiki, a legal wiki, a research wiki, or a product-intelligence wiki.
 
 ```
-a live deployment today = OKEngine @ a pinned Hermes + one domain pack
+a live deployment today = OKEngine @ a pinned Hermes + one pack **or bundle**
 ```
 
 The catalyst was Andrej Karpathy's

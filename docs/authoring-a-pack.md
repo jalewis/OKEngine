@@ -27,7 +27,7 @@ elsewhere:
   the write-governance contract. Read this if you want to know exactly what
   "conformant" means.
 
-> **What a pack is.** `a live deployment = OKEngine @ a pinned Hermes + ONE pack`.
+> **What a pack is.** `a live deployment = OKEngine @ a pinned Hermes + ONE pack or bundle`.
 > The engine ships zero domain knowledge; everything domain-specific — types,
 > persona, feeds, crons, content — lives in the pack. Swapping the pack changes
 > the brain with no engine code change.

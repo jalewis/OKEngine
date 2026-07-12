@@ -1,7 +1,7 @@
 # OKEngine roadmap
 
 OKEngine is an **engine for swappable-topic LLM wikis** — the catalyst is Karpathy's
-LLM-maintained-wiki pattern. A live deployment is OKEngine @ a pinned Hermes + one domain pack;
+LLM-maintained-wiki pattern. A live deployment is OKEngine @ a pinned Hermes + one pack or bundle;
 **security is the first concrete domain profile**. Pages are portable via **OKF** (Open
 Knowledge Format), a small interoperability floor — not the origin or center.
 

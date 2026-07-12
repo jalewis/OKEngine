@@ -1,6 +1,6 @@
 # Design note (RFC): composable okpacks
 
-**Status:** RFC — architecture discussion, no implementation yet.
+**Status:** **Shipped** — multipack composition is live (this began as an RFC; see [design/README.md](README.md) for the authoritative status index).
 **Scope:** how multiple okpacks combine to build one compounding vault.
 **Relationship to current code:** the engine is domain-agnostic (it reads
 types/namespaces/aliases from `schema.yaml`, hardcodes no domain). That is a

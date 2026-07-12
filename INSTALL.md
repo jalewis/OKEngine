@@ -1,7 +1,7 @@
 # Installing OKEngine on Hermes
 
 OKEngine = **a pinned Hermes** + **8 carried patches** + an **overlay** (new
-files) + **plugins** + **config**, then **one domain pack**. This is the procedure
+files) + **plugins** + **config**, then **one pack or bundle**. This is the procedure
 to take a stock Hermes install and bring it up to OKEngine — i.e. the exact
 stock→OKEngine delta.
 
@@ -68,7 +68,7 @@ adds N to each. **okpack-cti's recipe sets offset 200**, so the block above land
 |---|---|---|---|
 | **Reader** | `http://localhost:9400` | `:9200` | browse/search the wiki, page detail + backlinks, agent Chat |
 | **Cockpit** | `http://localhost:9401` | `:9201` | the function-oriented dashboard: briefings, watchlists, data tabs |
-| MCP (read) | `:8930` | `:8730` | the agent's query API — not a browser UI (401 without a token is healthy) |
+| MCP (read) | *(no host port)* | *(bridge-only)* | the agent's query API — reached by the gateway at `okengine-mcp:8730` by service name; NOT published to the host by default (the skeleton compose host mapping is commented out). Publish it only for an external MCP client — then a token is required and `401` without one is healthy. |
 
 Both UIs bind to `OKENGINE_BIND` (default `127.0.0.1` — this machine only). To reach them from
 another machine on your LAN, set `OKENGINE_BIND=0.0.0.0` in `.env` **and** set the real passwords

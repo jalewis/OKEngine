@@ -1,5 +1,7 @@
 # Composable okpacks — v1 implementation plan
 
+**Status:** **Shipped** — this v1 composition plan was delivered. See [design/README.md](README.md) for the status index.
+
 > **Status (okengine#90, 2026-06):** the schema slices are **implemented** — P1 (stamped-once `id`),
 > P2 (engine-owned core: `schema_lib._merge_base_pack` merges the core types/namespaces/tiering +
 > cross-cutting optionals under every pack; packs own only their domain), and the P3 N-way fold
