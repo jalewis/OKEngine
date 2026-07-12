@@ -60,3 +60,23 @@ def test_malformed_morning_fails_loud():
     assert cj.expand_brief_jobs(jobs, 7) == 1
     assert jobs[0]["schedule"]["expr"] == "30 7 * * *"
     assert jobs[1]["schedule"]["expr"] == "0 9 * * *"
+
+
+def test_page_quality_enrich_off_the_morning_stagger():  # invariant-audit #54
+    """The @morning stagger reserves :00/:15/:30/:45 at BRIEF_HOUR (default 7) so slow-local-model
+    agent lanes don't contend. page-quality-enrich (an agent lane) was pinned to `0 7 * * *` —
+    byte-identical to @morning:0 (positioning) and concept-backfill's minute-0. It must sit clear."""
+    import json
+    d = json.loads((REPO / "config" / "engine-crons.json").read_text())
+    def _expr(j):
+        s = j.get("schedule")
+        return s.get("expr") if isinstance(s, dict) else s
+    pqe = next(j for j in d if j.get("name") == "page-quality-enrich")
+    pqe_expr = _expr(pqe)
+    assert pqe_expr != "0 7 * * *", "page-quality-enrich collides with the @morning:0 slot"
+    # not on ANY morning-stagger slot (minute 0/15/30/45 at BRIEF_HOUR default 7)
+    assert pqe_expr not in {f"{mm} 7 * * *" for mm in (0, 15, 30, 45)}, \
+        f"page-quality-enrich sits on a @morning stagger slot ({pqe_expr})"
+    # and its expr isn't shared by any OTHER enabled engine lane (no new collision from the move)
+    others = [_expr(j) for j in d if j.get("enabled", True) and j.get("name") != "page-quality-enrich"]
+    assert pqe_expr not in others, f"page-quality-enrich expr {pqe_expr} collides with another lane"

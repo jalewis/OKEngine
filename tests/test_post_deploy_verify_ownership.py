@@ -34,10 +34,10 @@ case "$args" in
   *write_server.py*)                exit 0 ;;      # write_server present
   *.pdv_wtest*)                     exit "${FAKE_QMD_WTEST_RC:-0}" ;;   # writability probe
   *qmd\ status*)  echo "${FAKE_NDOCS:-42}"; exit 0 ;;   # already post-pipeline (grep runs in sh -c)
-  *HERMES_UID*)                     echo "${FAKE_WANT_UID:-1003}"; exit 0 ;;
+  *HERMES_UID*)                     [ -n "${FAKE_UID_EMPTY:-}" ] && exit 1; echo "${FAKE_WANT_UID:-1003}"; exit 0 ;;
   *python3*jobs.json*|*jobs.json*python3*) echo "${FAKE_NJOBS:-5}"; exit 0 ;;
-  *stat\ -c*jobs.json*)             echo "${FAKE_JOB_UID:-1003}"; exit 0 ;;
-  *stat\ -c*cron-plus*)             echo "${FAKE_DIR_UID:-1003}"; exit 0 ;;
+  *stat\ -c*jobs.json*)             [ -n "${FAKE_UID_EMPTY:-}" ] && exit 1; echo "${FAKE_JOB_UID:-1003}"; exit 0 ;;
+  *stat\ -c*cron-plus*)             [ -n "${FAKE_UID_EMPTY:-}" ] && exit 1; echo "${FAKE_DIR_UID:-1003}"; exit 0 ;;
   *.tick.lock*)                     exit 0 ;;
   *cron-plus*)                      exit 0 ;;       # config.yaml grep for cron-plus plugin
   *) exit 0 ;;
@@ -104,3 +104,14 @@ def test_empty_but_writable_qmd_is_a_still_building_warn(tmp_path):
 def test_populated_qmd_index_passes(tmp_path):
     _, out = _run(tmp_path, FAKE_NDOCS=137)
     assert "qmd index ready (137 files indexed)" in out, out
+
+
+# --- #48: ownership gate must not report a vacuous PASS when the gateway is not exec-able ---------
+def test_unexecable_gateway_warns_not_vacuous_pass(tmp_path):  # invariant-audit #48
+    """When `docker compose exec` fails (gateway crash-looping/stopped — the very uid-desync 5c
+    hunts), the uid probes come back EMPTY. The gate must WARN 'cannot verify ... undetectable', NOT
+    print a green PASS with uid '?', which violates the repo's 'missing key = WARN, never a vacuous
+    pass' rule in the one gate reachable when the fleet stalls."""
+    _, out = _run(tmp_path, FAKE_UID_EMPTY=1)
+    assert "cannot verify runtime ownership" in out and "not a pass" in out, out
+    assert "owned by the gateway uid (?)" not in out, "still reports a vacuous PASS with uid '?'"

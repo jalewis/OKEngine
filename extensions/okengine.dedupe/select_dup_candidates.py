@@ -53,7 +53,10 @@ def scan(entities: Path, vault: Path) -> dict:
         slug = p.relative_to(vault / "wiki").as_posix()[:-3]
         name = str(fm.get("title") or p.stem)
         aliases = fm.get("aliases") or []
-        if isinstance(aliases, str):
+        # The write path only coerces a scalar STRING -> list; a non-string scalar (`aliases: 8220`
+        # -> YAML int, a bool, a date) lands as a bare scalar and `{_norm(a) for a in 8220}` raised
+        # TypeError, killing the whole dedupe wake-gate (invariant-audit #28). Wrap any non-list scalar.
+        if not isinstance(aliases, list):
             aliases = [aliases]
         pages[slug] = {"name": name, "norm": _norm(name),
                        "aliases": {_norm(a) for a in aliases if _norm(a)}}

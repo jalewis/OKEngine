@@ -122,6 +122,19 @@ def check_schema(pack: Path, r: Report) -> None:
     for block in ("partitioning", "hot_set"):
         (r.ok if isinstance(sch.get(block), dict) else r.warn)(
             f"schema.{block}", "" if isinstance(sch.get(block), dict) else "absent (engine defaults apply)")
+    # Each partitioned namespace's `strategy` must be one okf_migrate KNOWS — a typo (`by_date`) or
+    # invented value silently degraded to flat in _new_key while every 'is this partitioned?' matcher
+    # tests `strategy != "flat"` and treated it as partitioned, forking canonicals (invariant-audit
+    # #25). Gate it at validate — the earliest gate — so it never reaches the drain.
+    _VALID_STRATEGIES = {"flat", "by-letter", "by-date", "by-type"}
+    part_ns = ((sch.get("partitioning") or {}).get("namespaces") or {}) if isinstance(sch, dict) else {}
+    if isinstance(part_ns, dict):
+        for ns, cfg in part_ns.items():
+            strat = (cfg or {}).get("strategy", "flat") if isinstance(cfg, dict) else "flat"
+            if strat not in _VALID_STRATEGIES:
+                r.fail(f"partitioning.{ns}.strategy",
+                       f"unknown strategy {strat!r} — valid: {sorted(_VALID_STRATEGIES)} "
+                       f"(an unknown value silently degrades to flat while drains treat it as partitioned)")
     for block in ("permissions", "review", "tier"):
         if isinstance(sch.get(block), dict):
             r.info(f"schema.{block}", "declared (G2/G3/G4 policy)")
@@ -999,6 +1012,31 @@ def check_extension_requirements(pack: Path, r: Report) -> None:
             r.ok(f"schema owner ext:{ext_id}", "enabled")
 
 
+def check_enabled_extensions_resolve(pack: Path, r: Report) -> None:
+    """Every id in <pack>/.okengine/extensions.yaml `enabled:` must still be DISCOVERED — an enabled
+    id that no longer resolves (e.g. an engine upgrade renamed a tier-1 extension the operator had
+    enabled) otherwise slips past `framework validate` and first hard-stops at deploy.sh step 5, AFTER
+    step 4 already recreated every container (with --no-crons, never at all). check_extension_requirements
+    only covers ids the pack DECLARES via requires:/schema-owner, so an enabled-only id was unguarded
+    at the fail-fast gate (invariant-audit #39). This mirrors framework_extensions._cmd_validate."""
+    if not (pack / ".okengine" / "extensions.yaml").is_file():
+        return                                  # nothing enabled -> nothing to resolve
+    disc = _discovery_mod()
+    try:
+        discovered, disc_errors = disc.discover(pack)
+        enabled, en_errors = disc.load_enabled_state(pack)
+        _, res_errors = disc.resolve_enabled(list(enabled), discovered)
+    except Exception as e:                       # discovery faults are reported elsewhere; don't crash
+        r.warn("enabled extensions", f"could not resolve enabled set: {e}")
+        return
+    problems = list(en_errors) + list(res_errors)
+    if problems:
+        for p in problems:
+            r.fail("enabled extension", p if not p.startswith("FAIL") else p[5:].strip())
+    elif enabled:
+        r.ok("enabled extensions", f"{len(enabled)} enabled, all discovered")
+
+
 def check_tokens(pack: Path, r: Report) -> None:
     """Unrendered scaffold placeholders ({{UPPER_SNAKE}}) mean a config/variable
     framework_init never filled — a guaranteed-broken deploy. Hard FAIL on any
@@ -1035,6 +1073,7 @@ def validate(pack: Path, probe: bool = False) -> Report:
     check_engine_version(pack, r)
     check_pack_meta(pack, r)
     check_extension_requirements(pack, r)
+    check_enabled_extensions_resolve(pack, r)
     check_feeds(pack, r, probe)
     check_crons(pack, r)
     check_model_profiles(pack, r)

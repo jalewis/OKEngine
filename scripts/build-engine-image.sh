@@ -26,6 +26,11 @@ RELEASE="${RELEASE:-$(awk -F': *' '/^engine_release:/{print $2; exit}' "$ENGINE_
 [ -n "$PIN" ]     || { echo "ERROR: could not read runtime.pinned_tag from $ENGINE_DIR/engine-manifest.yaml — refusing to build against a guessed pin" >&2; exit 1; }
 [ -n "$RELEASE" ] || { echo "ERROR: could not read engine_release from $ENGINE_DIR/engine-manifest.yaml — refusing to bake an 'unknown' version" >&2; exit 1; }
 ENG_SHA="$(git -C "$ENGINE_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# The engine overlay COPYs the WORKING TREE (below), so a dirty tree bakes uncommitted edits. Reflect
+# that in the provenance label ("X-dirty") so deploy.sh's staleness gate never trusts a dirty-built
+# image as clean-commit-X on a later clean checkout (invariant-audit #9 label poisoning). Mirrors the
+# "X-dirty" sha deploy.sh computes, so a dirty build + clean re-deploy at X correctly rebuilds.
+[ -n "$(git -C "$ENGINE_DIR" status --porcelain 2>/dev/null)" ] && ENG_SHA="${ENG_SHA}-dirty"
 HERMES_REPO="${HERMES_REPO:-https://github.com/NousResearch/hermes-agent.git}"
 IMAGE="${OKENGINE_IMAGE:-hermes-agent}"
 # Default tag tracks the engine release from the manifest (okengine#101) — never a hardcoded

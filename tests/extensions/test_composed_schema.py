@@ -93,3 +93,46 @@ def test_write_path_enforces_extension_type_via_composed_artifact(tmp_path, monk
     # with claim present it passes
     good = "---\ntype: forecast\nid: forecast:p1\nclaim: X beats Y\n---\n# p1\n"
     assert not sv.schema_reject_reason(str(page), good)
+
+
+def test_live_recompose_agrees_with_artifact_via_recorded_fragments(tmp_path):
+    """okengine#195: the deploy-side composer (extension_compose) and the in-gateway recompose
+    (schema_lib.compose_schema with NO explicit fragments — deployment_validate/conformance_audit's
+    call shape) must AGREE when a schema-bearing extension is enabled. Pre-fix, the live recompose
+    silently omitted every enabled extension's schema: the staleness WARN fired forever on okcti
+    (lacuna) and no redeploy could clear it. The artifact now records its fragment INPUTS
+    (_fragments) and compose_schema auto-loads them."""
+    comp = _load("extension_compose", COMP)
+    schema_lib = _load("schema_lib", REPO / "scripts" / "cron" / "schema_lib.py")
+    disc = _load("extension_discovery", DISC)
+    pack = _pack_with_schema_ext(tmp_path)
+
+    disc.set_enabled(pack, "demo.pred", True)
+    assert comp.write_composed_schema(pack) == []
+    artifact = yaml.safe_load((pack / ".okengine" / "composed-schema.yaml").read_text())
+    assert artifact.get("_fragments"), "artifact must record its fragment inputs"
+
+    live, errors = schema_lib.compose_schema(pack)          # fragments=None -> auto-load recorded
+    assert errors == [], errors
+    # the extension's contributions are present in the LIVE recompose...
+    assert "forecast" in live["types"], "live recompose omitted the extension type (the #195 bug)"
+    assert "forecasts" in live["partitioning"]["namespaces"]
+    assert live["owners"]["types"]["forecast"] == "ext:demo.pred"
+    # ...and the two compositions agree on every governance key the staleness check compares
+    for key in ("types", "enums", "partitioning", "permissions", "owners", "review"):
+        assert live.get(key) == artifact.get(key), f"composers disagree on {key!r}"
+
+
+def test_recompose_without_artifact_or_fragments_is_base_pack_only(tmp_path):
+    """No artifact (or a pre-#195 artifact without _fragments) -> the exact old behavior."""
+    schema_lib = _load("schema_lib", REPO / "scripts" / "cron" / "schema_lib.py")
+    pack = _pack_with_schema_ext(tmp_path)                  # extension present but NOT enabled/composed
+    live, errors = schema_lib.compose_schema(pack)
+    assert errors == []
+    assert "forecast" not in live["types"]                  # nothing auto-enables
+    # a hand-planted artifact with garbage _fragments must not crash or leak
+    art = pack / ".okengine" / "composed-schema.yaml"
+    art.parent.mkdir(parents=True, exist_ok=True)
+    art.write_text("_fragments: 'not a list'\n", encoding="utf-8")
+    live2, errors2 = schema_lib.compose_schema(pack)
+    assert errors2 == [] and "forecast" not in live2["types"]

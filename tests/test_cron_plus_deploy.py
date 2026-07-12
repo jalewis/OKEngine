@@ -257,3 +257,63 @@ def test_deploy_installs_cron_plus_before_compose():  # #20 integration
     # an unambiguous anchor, unlike "docker compose up" which is also in the header;
     # count-agnostic so a step renumber doesn't break it)
     assert t.index("install-cron-plus.sh") < t.index("[4/")
+
+
+# ── invariant-audit v0.11.5 batch-3 (deploy/staging pipeline) ─────────────────────────────────
+
+def test_jobs_deploy_seeds_jitter_rng_for_stability():  # invariant-audit #47
+    """ENGINE @jitter sentinels are re-expanded on every deploy; the RNG must be SEEDED from the
+    pack identity so a redeploy doesn't silently reshuffle (skip/double-run) each jittered lane."""
+    t = (S / "deploy-cron-plus-jobs.sh").read_text()
+    assert "random.Random(_seed)" in t and "hashlib.sha256(pack_dir" in t, \
+        "deploy must seed cron_jitter.expand_jobs deterministically from the pack, not use an unseeded RNG"
+
+
+def test_jobs_deploy_validates_scripts_before_overwriting_live_store():  # invariant-audit #50
+    """The missing-staged-script guard must run against the DEPLOY copy BEFORE the live jobs.json is
+    overwritten — the old check ran after the write and exited without restoring the snapshot, so the
+    invalid store was already live and being scheduled."""
+    t = (S / "deploy-cron-plus-jobs.sh").read_text()
+    # the guard reads the deploy temp via stdin, and it sits before the cat-into-DEST_IN write
+    assert "json.load(sys.stdin)" in t and 'cat > ' in t
+    assert t.index("MISSING_SCRIPTS=") < t.index('cat >'), \
+        "the staged-script guard must precede the live jobs.json overwrite"
+
+
+def test_jobs_deploy_always_regenerates_and_guards_pack_provenance():  # invariant-audit #12
+    """Always regenerate for THIS pack (never deploy a stale/wrong-pack leftover), and refuse an
+    artifact whose domain lanes carry another pack's provenance marker. The stale comment about a
+    'committed cron-plus-jobs.json' DR path (the file is gitignored, never committed) must be gone."""
+    t = (S / "deploy-cron-plus-jobs.sh").read_text()
+    # regen no longer gated on `-d $PACK_DIR/crons` (engine-only packs regen too)
+    assert '[ -d "$PACK_DIR/crons" ]' not in t, "regen must not skip packs lacking a crons/ dir"
+    assert "FOREIGN-PACK" in t and "TARGET_PACK" in t, "missing the pack-provenance guard"
+    assert "deploying committed cron-plus-jobs.json as-is" not in t, "stale 'committed file' fallback still present"
+
+
+def test_cron_scripts_deploy_reconciles_stale_fossils():  # invariant-audit #46
+    """Staging via tar only adds/overwrites; a script deleted/renamed in source lingers staged and
+    importable forever (check_crons still finds the fossil and passes). The deploy must reconcile the
+    flat script set — remove top-level *.py not in the engine+pack source."""
+    t = (S / "deploy-cron-scripts.sh").read_text()
+    assert "reconcile" in t and "os.unlink(p)" in t and "ALLOW=" in t, \
+        "deploy-cron-scripts must remove flat staged fossils no longer in source"
+
+
+def test_deploy_rebuilds_on_dirty_engine_tree():  # invariant-audit #9
+    """The image bakes the working tree but the staleness gate compares HEAD shas — a dirty tree at
+    HEAD X against an image built at X must REBUILD (else the uncommitted fix never ships), and a
+    dirty build must stamp a '-dirty' label so a later clean checkout at X doesn't trust it."""
+    dp = (S / "deploy.sh").read_text()
+    assert "ENGINE_DIRTY" in dp and "status --porcelain" in dp and "-dirty" in dp, \
+        "deploy.sh staleness gate must be dirty-aware"
+    bi = (S / "build-engine-image.sh").read_text()
+    assert 'ENG_SHA="${ENG_SHA}-dirty"' in bi, "build must stamp a -dirty provenance label on a dirty tree"
+
+
+def test_deploy_force_recreates_gateway_on_config_change():  # invariant-audit #10
+    """config.yaml is read once at gateway start and is bind-mounted, so `up -d` never reloads it.
+    deploy.sh must force-recreate the gateway when config.yaml is newer than the running container."""
+    dp = (S / "deploy.sh").read_text()
+    assert "force-recreate" in dp and "config.yaml" in dp and "StartedAt" in dp, \
+        "deploy.sh must force-recreate the gateway on a config.yaml change newer than the container"

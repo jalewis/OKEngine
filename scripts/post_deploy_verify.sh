@@ -205,13 +205,21 @@ got_uid="$(dcx "$GW" stat -c '%u' /opt/data/cron-plus 2>/dev/null | tr -d '[:spa
 # well-owned dir; stat the FILE too, matching deployment_validate.check_runtime_ownership. Empty =>
 # absent (already FAILed by the jobs.json check above), so skip.
 job_uid="$(dcx "$GW" stat -c '%u' /opt/data/cron-plus/jobs.json 2>/dev/null | tr -d '[:space:]')"
-if [ -n "$want_uid" ] && [ -n "$got_uid" ] && [ "$got_uid" != "$want_uid" ]; then
+# Distinguish EMPTY probes (exec failed — gateway crash-looping/stopped, exactly the uid-desync 5c
+# hunts) from a real match: an empty want_uid/got_uid means nothing was measured, so reporting PASS
+# is a vacuous green that violates the repo's 'missing key = WARN undetectable, never a vacuous pass'
+# rule (M22) in the one gate that is the designated peer for the in-lane checks a dead ticker can't
+# run (invariant-audit #48).
+if [ -z "$want_uid" ] || [ -z "$got_uid" ]; then
+    wn "cannot verify runtime ownership — the gateway is not exec-able (crash-looping/stopped?), so the uid could not be read; UNDETECTABLE here, not a pass" \
+       "docker compose ps $GW; docker compose logs $GW  (this is the failure mode 5c exists to catch)"
+elif [ "$got_uid" != "$want_uid" ]; then
     bad "runtime /opt/data/cron-plus owned by uid $got_uid but the gateway runs as $want_uid" \
         "the scheduler dies on .tick.lock; pin HERMES_UID=$got_uid in .env + recreate, or chown .hermes-data to $want_uid"
-elif [ -n "$want_uid" ] && [ -n "$job_uid" ] && [ "$job_uid" != "$want_uid" ]; then
+elif [ -n "$job_uid" ] && [ "$job_uid" != "$want_uid" ]; then
     bad "runtime /opt/data/cron-plus/jobs.json owned by uid $job_uid but the gateway runs as $want_uid" \
         "the scheduler can't READ it (root:0600 poison) and the WHOLE fleet stalls (okengine#193); chown jobs.json to $want_uid, or re-run deploy-cron-plus-jobs.sh with HERMES_UID=$want_uid"
-else ok "runtime dir + jobs.json owned by the gateway uid (${got_uid:-?})"; fi
+else ok "runtime dir + jobs.json owned by the gateway uid ($got_uid)"; fi
 
 # 5b. NB: backlinks-refresh no longer needs an iwe binary (okengine#179 — it builds the graph
 # with an in-process link-scanner), so there is no gateway iwe dependency to verify here anymore.

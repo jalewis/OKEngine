@@ -5,9 +5,14 @@
 #   # fixed uid + chown the tree only for a portable/shared vault. The :-10000 below is just a
 #   # bare-compose fallback when neither deploy.sh nor an exported HERMES_UID is in play.
 #   bash $ENGINE_DIR/scripts/build-engine-image.sh  # builds the gateway image (hermes-agent)
-#   ENGINE_DIR=$ENGINE_DIR docker compose up -d      # builds reader+mcp, runs all three
+#   bash $ENGINE_DIR/scripts/ensure-runtime.sh $(pwd) # seeds config + a REAL MCP token — WITHOUT this
+#                                                     # the mcp container FAILS CLOSED on the shipped
+#                                                     # default token and crash-loops (okengine#208)
+#   ENGINE_DIR=$ENGINE_DIR docker compose up -d --build   # --build REBUILDS reader/mcp/cockpit on an
+#                                                        # engine update (plain up -d only builds when ABSENT — invariant-audit #45)
 #   CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-scripts.sh
 #   CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-plus-jobs.sh
+# (or just `bash $ENGINE_DIR/scripts/deploy.sh` — it runs exactly this sequence, plus verify)
 # Only the reader publishes a host port (offset by {{PORT_OFFSET}} to avoid collisions with other
 # packs); the gateway is on the per-pack bridge (no host port) and reaches okengine-mcp by service
 # name, and okengine-mcp needs no host port for the engine itself (okengine#138).
@@ -143,6 +148,10 @@ services:
       # (an EMPTY value would disable, not default — keep the fallbacks).
       - OKENGINE_MCP_INDEX_POLL_SECONDS=${OKENGINE_MCP_INDEX_POLL_SECONDS:-30}
       - OKENGINE_MCP_INDEX_MIN_UPDATE_SECONDS=${OKENGINE_MCP_INDEX_MIN_UPDATE_SECONDS:-60}
+      # Full-reindex cadence (hours; server.py reads it, docs/kb-tooling.md documents it, 0 disables).
+      # Must be listed here or the documented `OKENGINE_MCP_INDEX_REFRESH_HOURS=0` .env override never
+      # reaches the container (explicit environment: list, no env_file on this service) — invariant-audit #35.
+      - OKENGINE_MCP_INDEX_REFRESH_HOURS=${OKENGINE_MCP_INDEX_REFRESH_HOURS:-6}
     volumes:
       - ./:/opt/vault:ro
       - ./.hermes-data/qmd:/opt/data/qmd

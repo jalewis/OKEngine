@@ -111,6 +111,28 @@ def _caller() -> dict:
     return c if c is not None else {"kind": "admin", "write_scopes": None, "ext_id": None}
 
 
+def _apply_extension_provenance(fm: dict, *, creating: bool,
+                                existing_ext_id: Optional[str] = None) -> None:
+    """Stamp/preserve `extension_id` server-side and STRIP any caller-supplied value.
+
+    `extension_id` is SERVER-DERIVED provenance (okengine#132/#133): the key disable/orphan/purge
+    read, and `extensions purge --yes` HARD-deletes by it — the ONE non-tombstone delete in a
+    tombstone-only contract. A client must never set or change it, or (invariant-audit) a scoped
+    token forges another extension's id onto a curated page and a later `purge` unlink()s a page
+    that extension never wrote, or an extension orphan-proofs its own pages so its purge misses them.
+    The create-path stamp alone (only in _create, only for extension callers) left update/patch/
+    converge/admin-create wide open. So: strip the incoming value unconditionally at EVERY write, then
+    derive it from the scoped token on CREATE, or preserve the immutable create-time stamp on a
+    mutation. Stdio/admin writes get no stamp."""
+    fm.pop("extension_id", None)                    # never client-settable — kill any forge
+    if creating:
+        _c = _caller()
+        if _c.get("kind") == "extension" and _c.get("ext_id"):
+            fm["extension_id"] = _c["ext_id"]        # server-derived from the scoped token
+    elif existing_ext_id:
+        fm["extension_id"] = existing_ext_id         # provenance is set once, never re-stamped
+
+
 def _authorize_write(path: str) -> bool:
     """May the current caller write this wiki-relative path? Admin (stdio gateway) =
     always; an extension = only within its declared write scopes."""
@@ -144,10 +166,11 @@ def _normalize_entity_shard(rel: str) -> str:
     back to one level — that refuses/duplicates writes on a mature vault (okengine invariant-audit).
     Choose one- vs two-level by what's actually on disk. Other namespaces are left untouched."""
     parts = rel.split("/")
-    # only the entities/ first-char-shard scheme (single-char intermediate segments); multi-char
-    # segments are some other layout and are left alone.
-    if not (len(parts) >= 3 and parts[0] == "entities"
-            and all(len(seg) == 1 for seg in parts[1:-1])):
+    # entities/ shard scheme: the FLAT form `entities/<slug>` (2 parts, the most common wrong shape —
+    # okengine invariant-audit) OR an already-sharded form with single-char intermediate segments.
+    # A multi-char intermediate segment is some other layout and is left alone.
+    if not (parts[0] == "entities"
+            and (len(parts) == 2 or (len(parts) >= 3 and all(len(seg) == 1 for seg in parts[1:-1])))):
         return rel
     stem = parts[-1][:-3] if parts[-1].endswith(".md") else parts[-1]
     if not stem:
@@ -543,11 +566,22 @@ def _namespace(p: Path) -> str:
     return parts[i]
 
 
+_PERM_KEYS = ("create", "update", "delete")
+
+
 def _ns_perm(policy: dict, ns: str) -> dict:
     perms = (policy or {}).get("permissions") or {}
     base = dict(perms.get("default") or {})
     nscfg = (perms.get("namespaces") or {}).get(ns) or {}
-    base.update({k: v for k, v in nscfg.items() if k in ("create", "update", "delete")})
+    # A typo'd permission key (e.g. `creat: false`) was SILENTLY DROPPED by the allowlist, so the
+    # namespace fell back to the (usually open) default — a human-authored `findings` ns could go
+    # agent-writable with no error (invariant-audit LOW #58). FAIL CLOSED on an unknown key so the
+    # typo is caught at the gate instead of quietly opening the namespace.
+    unknown = [k for k in nscfg if k not in _PERM_KEYS]
+    if unknown:
+        raise ValueError(f"namespace '{ns}' permissions has unknown key(s) {unknown} "
+                         f"(valid: {list(_PERM_KEYS)}) — a typo would silently default the namespace open")
+    base.update({k: v for k, v in nscfg.items() if k in _PERM_KEYS})
     return base
 
 
@@ -989,10 +1023,8 @@ def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> st
     _stamp_maintainer(fm, creation=True)   # composition provenance (okengine#90 P3)
     # Provenance (okengine#132/#133): stamp the owning extension id when a networked
     # extension caller writes — the key disable/orphan/purge reads. Server-side, derived
-    # from the scoped token, so a client can't spoof it. Stdio/admin writes get no stamp.
-    _c = _caller()
-    if _c.get("kind") == "extension" and _c.get("ext_id"):
-        fm["extension_id"] = _c["ext_id"]
+    # from the scoped token, so a client can't spoof it (strips any supplied value first).
+    _apply_extension_provenance(fm, creating=True)
     # Ensure every page carries a human `name`. The ingest agent (esp. source ingest:
     # select_raw_batch -> agent -> okengine-write) puts the article title in the body's
     # `# H1` but doesn't always set a `name`/`title` field, leaving the page nameless in
@@ -1063,6 +1095,8 @@ def _update(path: str, frontmatter_yaml: Union[str, dict, None] = None,
         if fdr:
             return f"rejected: {fdr}"
         new_fm.update(patch)
+    # extension_id is server-derived: strip any client forge, keep the create-time stamp (M14).
+    _apply_extension_provenance(new_fm, creating=False, existing_ext_id=cur_fm.get("extension_id"))
     new_fm, drift = _normalize_drift(new_fm, p)    # converge on schema vocab (okengine#46)
     new_body = cur_body if body is None else body
     if body is not None:                           # only when this update REWRITES the body
@@ -1109,6 +1143,9 @@ def _tombstone(path: str, reason: str, superseded_by: Optional[str] = None) -> s
         return _rr
     if not p.is_file():
         return f"refused: {_rel(p)} does not exist — nothing to tombstone"
+    ferr = _frontmatter_error(p)        # invariant-audit M18: malformed YAML -> refuse, don't wipe it
+    if ferr:
+        return f"refused: {ferr} — fix the page's frontmatter before tombstoning (would silently wipe it)"
     cur_fm, cur_body = _read_page(p)
     # a tombstone IS an update — it must clear the same namespace permission
     # matrix as every other mutation (found via okengine#166: an agent-read-only
@@ -1242,9 +1279,15 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
     # do (#196 — a schema-declared list field authored as a scalar becomes a list; bare [[wikilink]]
     # values are stripped), so an edit can't land a malformed shape that poisons a downstream lane.
     new_fm = _coerce_fm(new_fm, p)
-    fl = _field_loss(cur_fm, new_fm)
+    fl = _field_loss(cur_fm, new_fm)   # compare in the pre-normalized space (cur_fm is un-normalized)
     if fl:
         return f"rejected: {fl}"
+    # patch is a full write chokepoint — converge on the schema vocabulary (okengine#46) exactly like
+    # create/update/converge, or an aliased field/value introduced by a surgical edit lands raw and
+    # forks the vault silently (invariant-audit). After field-loss so a rename isn't seen as a drop.
+    new_fm, drift = _normalize_drift(new_fm, p)
+    # extension_id is server-derived: strip any patched-in forge, keep the create-time stamp (M14).
+    _apply_extension_provenance(new_fm, creating=False, existing_ext_id=cur_fm.get("extension_id"))
     isr = _int_shape_reject(p, new_fm)
     if isr:
         return f"rejected: {isr}"
@@ -1261,7 +1304,11 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
     fd = _future_date_reject(new_fm)   # the boundary every writer crosses (invariant-audit)
     if fd:
         return f"rejected: {fd}"        # file left untouched
-    flags = _review_flags(p, new_fm, prev=cur_fm)
+    # Same review gate as create/update: drift (aliased field/value), degenerate body, and dead
+    # wikilinks must be attributable at THIS write, not only via a nightly report-only lint that
+    # carries no write attribution (invariant-audit — patch bypassed all three).
+    flags = drift + _review_flags(p, new_fm, prev=cur_fm) + \
+        _unresolvable_link_flags(p, body) + _degeneration_flags(body)
     if flags:
         new_fm["needs_review"] = True
     content = _compose(new_fm, body)
@@ -1321,8 +1368,11 @@ def _append_section(path: str, heading: str, text: str) -> str:
         return f"refused: {_rel(p)} does not exist — use create_entity"
     if not (text or "").strip():
         return "rejected: text is empty"
+    ferr = _frontmatter_error(p)        # invariant-audit M18: malformed YAML -> refuse, don't wipe it
+    if ferr:
+        return f"refused: {ferr} — fix the page's frontmatter before appending (would silently wipe it)"
     cur_fm, cur_body = _read_page(p)
-    tr = _tombstone_refuse(cur_fm, p)   # invariant-audit M18
+    tr = _tombstone_refuse(cur_fm, p)   # tombstone-guard (a separate concern)
     if tr:
         return tr
     new_body, where = _insert_into_section(cur_body, heading, text)
@@ -1337,7 +1387,11 @@ def _append_section(path: str, heading: str, text: str) -> str:
     fd = _future_date_reject(new_fm)   # the boundary every writer crosses (invariant-audit)
     if fd:
         return f"rejected: {fd}"        # file left untouched
-    flags = _review_flags(p, new_fm, prev=cur_fm)
+    # append is the documented hot path for growing a briefing's `## Recent activity`, so the
+    # SAME degenerate-content + dead-link review gate create/update apply must fire here on the
+    # newly-appended text — else a degenerate run lands unflagged (invariant-audit).
+    flags = _review_flags(p, new_fm, prev=cur_fm) + \
+        _unresolvable_link_flags(p, text) + _degeneration_flags(text)
     if flags:
         new_fm["needs_review"] = True
     content = _compose(new_fm, new_body)
@@ -1446,6 +1500,13 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
                 return _wa
         if p.is_file():
             cur_fm, cur_body = _read_page(p)
+            # invariant-audit M14: the registry tombstone check above reads the id-index, which is
+            # up to 6h stale (rebuilt on a cron). A page hand-tombstoned on disk (status: tombstoned)
+            # since the last index rebuild would slip past it and be RESURRECTED by this merge. Trust
+            # the on-disk status too.
+            if str(cur_fm.get("status") or "").strip().lower() == "tombstoned":
+                return (f"refused: {_rel(p)} is tombstoned on disk (status: tombstoned) — "
+                        "write to its successor, never resurrect a tombstoned page")
             ftype = str(cur_fm.get("type") or fm.get("type") or "").strip()
             owner = schema_lib.type_owner(schema, ftype)
             fos = schema_lib.field_owners(schema, ftype)
@@ -1454,6 +1515,9 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
                 cur_fm, fm, owner_pack=owner, caller_pack=(pack or None),
                 field_owners=fos, remove=rm)
             merged, drift = _normalize_drift(merged, p)   # okengine#46: converge on schema vocab —
+            # extension_id is server-derived: converge.merge treats it as a _SERVER_KEY, but strip any
+            # residual forge and re-assert the on-disk stamp so it can never be reassigned (M14).
+            _apply_extension_provenance(merged, creating=False, existing_ext_id=cur_fm.get("extension_id"))
             new_body = cur_body if not body else body     # same guard as _create/_update (invariant-audit)
             _stamp(merged, cur_fm)
             if pack:
@@ -1477,7 +1541,8 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
                 return f"rejected: {pol}"
             # ...then SOFT review flags (categorical confidence verdict, changed
             # review field) — flag, never block.
-            review = drift + _review_flags(p, merged, prev=cur_fm) + _unresolvable_link_flags(p, new_body)
+            review = drift + _review_flags(p, merged, prev=cur_fm) + _unresolvable_link_flags(p, new_body) + \
+                (_degeneration_flags(new_body) if body else [])   # degenerate body attributable at write (M15)
             if review:
                 merged["needs_review"] = True
             content = _compose(merged, new_body)

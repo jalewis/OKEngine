@@ -17,6 +17,7 @@ from the config are UNTIERED (tier_of -> None): the filter leaves them in.
 from __future__ import annotations
 
 import re
+import sys
 from datetime import date
 from pathlib import Path
 from typing import Optional
@@ -30,6 +31,11 @@ _FM_RE = re.compile(r"\A---[ \t]*\n(.*?\n)---", re.S)
 _DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 
 # Fallback if the pack schema.yaml has no `tier:` block.
+# MUST mirror config/base-schema.yaml's `tier:` block — it is only the schema_lib-UNAVAILABLE
+# fallback (load_cfg composes the real one). It used to list extra open_values (proposed/pending) and
+# only 4 namespaces, disagreeing with the base⊕pack composer everyone else consumes (pred_lib /
+# select_daily_brief / the write path / the cockpit): a `proposed` prediction read OPEN here but not
+# there (invariant-audit #51). Keep it byte-for-byte aligned with base-schema.
 _DEFAULT_TIER = {
     "hot_days": 30,
     "warm_days": 365,
@@ -38,8 +44,10 @@ _DEFAULT_TIER = {
         "entities": {"date_field": "updated"},
         "concepts": {"date_field": "updated"},
         "predictions": {"date_field": "resolves_by", "status_field": "status",
-                        "open_values": ["open", "active", "proposed", "pending"],
-                        "open_floor": "hot"},
+                        "open_values": ["open", "active"], "open_floor": "hot"},
+        "findings": {"date_field": "updated"},
+        "briefings": {"date_field": "published"},
+        "trends": {"date_field": "updated"},
     },
 }
 
@@ -47,7 +55,19 @@ _TIERS = ("hot", "warm", "cold")
 
 
 def load_cfg(vault: Path) -> dict:
-    """Read the `tier:` block from <vault>/schema.yaml, else the engine default."""
+    """The COMPOSED `tier:` block (engine base-schema ⊕ pack schema.yaml), read through the SAME
+    composer select_daily_brief / pred_lib.OPEN_VALUES / the write path / the cockpit consume
+    (schema_lib.merged_schema) — so a pack that OMITS `tier:` inherits the engine-core tier instead of
+    a divergent hardcoded default (a page 'open'/tiered here but not there, invariant-audit #51). Falls
+    back to reading the raw pack `tier:` (then _DEFAULT_TIER) only if schema_lib is unavailable."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import schema_lib
+        tier = (schema_lib.merged_schema(Path(vault)) or {}).get("tier")
+        if isinstance(tier, dict) and tier:
+            return tier
+    except Exception:
+        pass
     if yaml is not None:
         sp = Path(vault) / "schema.yaml"
         if sp.is_file():

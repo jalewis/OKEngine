@@ -42,3 +42,4 @@ operations:
   scope-classify:
     schedule: {kind: cron, expr: "25 5 * * *"}   # the middle, right after prescore
     entrypoint: scope_classify.py
+    cost_bearing: true                           # scope_classify calls llm_lib (paid) — budget_guard pauses it (#36)

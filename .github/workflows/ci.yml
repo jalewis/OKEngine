@@ -31,8 +31,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -r requirements-dev.txt
-      # The MCP server tests self-skip without `mcp`; install it for full coverage.
-      - run: pip install -r okengine-mcp/requirements.txt || echo "mcp deps unavailable — those tests will skip"
+      # The MCP server tests self-skip without `mcp`. HARD-fail the install (no `|| echo`) and VERIFY
+      # the import, so a broken mcp pin (a new python leg, a yanked wheel, a resolver conflict) can't
+      # make the 5 mcp-gated modules — incl. the Bearer-token 401 boundary — SILENTLY skip on a green
+      # build (invariant-audit #23).
+      - run: pip install -r okengine-mcp/requirements.txt
+      - run: python -c "import mcp"
       - name: pytest
         run: python -m pytest
 
@@ -74,6 +78,8 @@ jobs:
         run: pip-audit -r okengine-mcp/requirements.txt
       - name: pip-audit reader runtime (gating)
         run: pip-audit -r okengine-reader/requirements.txt
+      - name: pip-audit cockpit runtime (gating)
+        run: pip-audit -r okengine-cockpit/requirements.txt
       - name: bandit (python security lint, high-severity — informational baseline)
         run: bandit -q -ll -r scripts tools okengine-mcp okengine-reader -x tests
         continue-on-error: true

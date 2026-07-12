@@ -165,6 +165,22 @@ def test_regen_reproduces_jobs(tmp_path):
     assert m.JOBS.read_text() == first
 
 
+def test_regen_tolerates_pack_without_crons_dir(tmp_path):  # invariant-audit #12
+    """A pack with ONLY engine crons has no crons/ dir. regen must still run (empty domain set) so
+    the deploy always regenerates THIS pack's set instead of skipping regen and shipping a stale
+    leftover — which, on a multi-pack host, could be a DIFFERENT pack's job set."""
+    m = _mod()
+    m.ENGINE_CRONS_FILE = tmp_path / "engine-crons.json"
+    m.PACK_DIR = tmp_path / "engineonly-pack"          # deliberately NO crons/ subdir
+    m.JOBS = tmp_path / "cron-plus-jobs.json"
+    m.PACK_DIR.mkdir()
+    (m.PACK_DIR / "pack.yaml").write_text("name: engineonly-pack\n")
+    m.ENGINE_CRONS_FILE.write_text(m._dump_list([{"name": "eng-a", "schedule": {"expr": "0 7 * * *"}}]))
+    merged = m.regen()                                  # must NOT raise FileNotFoundError
+    assert m.JOBS.is_file()
+    assert "eng-a" in {j["name"] for j in merged}
+
+
 def test_dump_from_live_round_trips_through_sources(tmp_path):
     m = _mod()
     jobs = _seed_slice2(m, tmp_path)
@@ -382,3 +398,22 @@ def test_merge_packs_rejects_domain_name_shadowing_engine_lane():  # batch-3 re-
     packs = [{"name": "acme", "domain": [{"name": "reshelve", "enabled": True}]}]   # shadows the engine lane
     _, errors = m.merge_packs(engine, packs, tier_of={"reshelve": "engine"})
     assert any("shadows" in e and "reshelve" in e for e in errors), errors
+
+
+def test_pack_marked_dotted_name_routes_to_domain_not_extensions(tmp_path):  # invariant-audit #24
+    """A pack domain cron whose name contains '.'/':' carries a `pack:` provenance marker and must
+    route to DOMAIN, not the EXTENSIONS partition (which dump_from_live silently erases — it writes
+    only engine/domain/prompts)."""
+    m = _mod()
+    tier_of = {"plain-feed": "domain"}
+    jobs = [
+        {"name": "acme.fetch", "pack": "okpack-x", "schedule": {"expr": "0 6 * * *"}},
+        {"name": "okpack-x:feed-fetch", "pack": "okpack-x", "schedule": {"expr": "0 7 * * *"}},
+        {"name": "plain-feed", "pack": "okpack-x", "schedule": {"expr": "0 8 * * *"}},
+        {"name": "some.extension:op", "extension": "okengine.viz", "schedule": {"expr": "0 9 * * *"}},
+    ]
+    parts = m.split(jobs, tier_of)
+    domain_names = {j["name"] for j in parts[m.DOMAIN_CRONS]}
+    ext_names = {j["name"] for j in parts[m.EXTENSIONS]}
+    assert domain_names == {"acme.fetch", "okpack-x:feed-fetch", "plain-feed"}
+    assert ext_names == {"some.extension:op"}      # only the real extension-marked job

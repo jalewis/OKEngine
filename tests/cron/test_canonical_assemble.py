@@ -305,3 +305,14 @@ def test_key_serializes_date_and_set_dict_fields_deterministically():  # invaria
     assert out["refs"] == [{"url": "https://example.com", "seen": d}]   # identical dicts deduped to one
     # a set inside a dict field keys deterministically regardless of insertion order
     assert m._key({"tags": {"b", "a"}}) == m._key({"tags": {"a", "b"}})
+
+
+def test_non_int_version_does_not_crash_assembler(tmp_path):  # invariant-audit #30
+    """An agent authored a semver `version: 3.0.14` (str) on the existing page — the write path
+    accepts it (version is not int-shaped). The assembler must not ValueError on int(version)."""
+    m = _load("canonical_assemble")
+    p = _canon(tmp_path, "openssl", "type: entity\nname: OpenSSL\nversion: 3.0.14\n", "Agent notes.\n")
+    m.write_canonical(tmp_path, "openssl", "entity", {"category": "library"}, [],
+                      ["nvd"], POLICY, "2026-06-21")
+    fm, _ = m.read_fm(p)
+    assert isinstance(fm["version"], int) and fm["version"] == 1   # reset from non-int, then bumped

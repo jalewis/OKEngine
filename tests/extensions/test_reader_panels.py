@@ -74,3 +74,11 @@ def test_deploy_does_not_swallow_reader_panels_staging_failure():  # invariant-a
     # the failure fails the deploy (exit 1 in the block right after the invocation)
     after = sh.split("extensions stage-panels", 1)[1][:400]
     assert "exit 1" in after, "stage-panels failure no longer fails the deploy"
+
+
+def test_timeline_binding_rejected_no_renderer():  # invariant-audit #26
+    """`timeline` has no renderer on any surface — a reader_panels binding for it validated GREEN then
+    produced panel:null on every bound page. It must be rejected at the manifest gate now."""
+    e, _ = MAN.validate_manifest(_base(reader_panels=[{"type": "event", "kind": "timeline", "fields": ["date"]}]))
+    assert any("kind" in x and "timeline" not in x.split("one of")[-1] for x in e), e
+    assert "timeline" not in MAN._PANEL_KINDS

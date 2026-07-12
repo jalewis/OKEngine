@@ -177,7 +177,17 @@ def check_schema():
     if art.is_file() and composed and not any(l == "FAIL" and c == "schema" for l, c, _ in F):
         on_disk = _yaml(art) or {}
         keys = ("types", "enums", "partitioning", "permissions", "owners", "review")
-        if any(_artifact_missing_pack_governance(composed.get(k), on_disk.get(k)) for k in keys):
+        # Compare against a base⊕pack-ONLY recompose (fragments=[]), NOT `composed` above (fragments=
+        # None), which since okengine#195 auto-loads the artifact's OWN recorded _fragments — making
+        # the staleness test circular (it compared the artifact to a recompose seeded from itself,
+        # invariant-audit #62). base⊕pack-only is exactly what _artifact_missing_pack_governance's
+        # subset test expects; extension-fragment currency is a deploy-time gate (deploy.sh step 1b,
+        # which the in-gateway validator can't reproduce — the extension composer isn't staged here).
+        try:
+            live_bp, _bp_err = schema_lib.compose_schema(VAULT, fragments=[])
+        except Exception:
+            live_bp = composed
+        if any(_artifact_missing_pack_governance(live_bp.get(k), on_disk.get(k)) for k in keys):
             add("WARN", "schema", "composed-schema.yaml is STALE — it is missing or disagrees with a "
                 "live base+pack recompose of schema.yaml, and the enforced write path uses the on-disk "
                 "copy, so recent schema.yaml edits are not applied. Regenerate it: re-run the deploy "
@@ -201,6 +211,39 @@ def check_crons():
     if not jf.is_file():
         add("FAIL", "crons", "deployed jobs.json missing — dead scheduler?")
         return
+    # okengine#197: a root `docker exec` that rewrites the store re-owns it root:root — the
+    # uid-service scheduler then silently stops firing EVERYTHING (44-min live all-lane outage).
+    # Two red signals, at the earliest gate: (a) the store/pidfiles owned by someone other than
+    # the uid running this validator (the service uid — deployment-validate runs as the gateway
+    # service), (b) the scheduler's own .scheduler-stalled sentinel (cron-plus drops it when it
+    # cannot load the store; a successful load clears it).
+    me = os.geteuid()
+    try:
+        st = jf.stat()
+        if st.st_uid != me:
+            add("FAIL", "crons", f"jobs.json owned by uid {st.st_uid}, scheduler runs as uid {me} "
+                                 f"— a root `docker exec` write poisoned it; every lane will "
+                                 f"silently stop. chown it back (fix-vault-ownership / "
+                                 f"`chown {me} {jf}`)")
+    except OSError:
+        pass
+    pid_dir = DATA / "cron-plus" / "pids"
+    if pid_dir.is_dir():
+        bad = [p.name for p in pid_dir.glob("*.pid") if p.stat().st_uid != me]  # glob-ok: runtime pids/ is a flat dir, not a sharded content namespace
+        if bad:
+            add("WARN", "crons", f"{len(bad)} pidfile(s) owned by another uid ({', '.join(bad[:5])}"
+                                 f"{'…' if len(bad) > 5 else ''}) — root `docker exec` residue; "
+                                 f"the scheduler may fail to clear them")
+    sent = DATA / "cron-plus" / ".scheduler-stalled"
+    if sent.is_file():
+        detail = ""
+        try:
+            detail = json.loads(sent.read_text()).get("error", "")
+        except Exception:
+            pass
+        why = detail or "unreadable job store"
+        add("FAIL", "crons", f"scheduler STALLED sentinel present ({why}) — cron-plus cannot "
+                             f"load jobs.json; NO lanes are firing")
     try:
         jobs = json.loads(jf.read_text()).get("jobs", [])
     except Exception as e:
@@ -271,7 +314,9 @@ def check_timezone():
             f"TZ is unset (schedules interpret as UTC) but {len(daily)} fixed-hour daily "
             f"lane(s) are enabled ({listed}) — these fire in UTC, not the operator's local "
             "morning. If local-morning briefs were intended, set TZ (+ OKENGINE_BRIEF_HOUR) in "
-            ".env and recreate the gateway.")
+            ".env and recreate the gateway, THEN null the stale next_run_at in "
+            ".hermes-data/cron-plus/jobs.json (cron-plus only self-heals NULL next_run_at; a "
+            "populated one computed under the OLD tz is honored as-is until it lapses).")
         return
     if _cron_plus_tz_aware() is False:
         add("FAIL", "timezone",
@@ -279,7 +324,9 @@ def check_timezone():
             f"handling) — the {len(daily)} daily lane(s) ({listed}) run in UTC, ignoring TZ "
             "(07:00 local fires 07:00 UTC). The plugin pin is stale: bump engine-manifest "
             "cron-plus pinned_sha to the TZ-aware commit, remove .hermes-data/plugins/cron-plus, "
-            "re-run ensure-runtime, and recreate the gateway.")
+            "re-run ensure-runtime, recreate the gateway, THEN null the stale next_run_at in "
+            ".hermes-data/cron-plus/jobs.json (it persists across the recreate under the old tz; "
+            "cron-plus only recomputes a NULL next_run_at).")
 
 
 def check_partition_dups():
@@ -388,14 +435,19 @@ def check_ownership():
             continue
         for p in d.rglob("*"):
             try:
-                if p.is_file() and p.stat().st_uid != me:
-                    strays.append(f"{p.relative_to(VAULT)} (uid {p.stat().st_uid})")
+                # Flag stray DIRECTORIES too, not just files (invariant-audit #8): a root-owned dir
+                # (from a bare root `docker exec`) is unwritable by the lane uid, so the atomic-write
+                # pattern (write tmp + os.replace) can't create new pages in it — yet the file-only
+                # detection/repair pair converged 'green' with the dir still root-owned.
+                if (p.is_file() or p.is_dir()) and p.stat().st_uid != me:
+                    kind = "dir" if p.is_dir() else "file"
+                    strays.append(f"{p.relative_to(VAULT)} ({kind}, uid {p.stat().st_uid})")
             except OSError:
                 strays.append(f"{p.relative_to(VAULT)} (unstattable)")
             if len(strays) > 25:
                 break
     if strays:
-        add("FAIL", "ownership", f"{len(strays)}{'+' if len(strays) > 25 else ''} file(s) not "
+        add("FAIL", "ownership", f"{len(strays)}{'+' if len(strays) > 25 else ''} path(s) not "
                                  f"owned by the lane uid ({me}) — lanes cannot maintain them: "
                                  + "; ".join(strays[:5])
                                  + (" …" if len(strays) > 5 else ""))
@@ -554,10 +606,24 @@ def check_write_path_libs():
             f"schema (undetectable, not a pass).")
 
 
+def check_provenance_env():
+    """invariant-audit M14/#750: composition provenance (maintained_by / discovered_by) is stamped
+    by the enforced write path ONLY when the gateway carries OKENGINE_PACK (deployment-pinned, never
+    client-supplied). A pack whose compose predates the OKENGINE_PACK env (pre-2026-06-26 skeleton)
+    silently stops stamping it on every write — undetectable until you ask 'which pack wrote this'.
+    This validator runs IN the gateway, so its own env reflects what the write path sees."""
+    if not os.environ.get("OKENGINE_PACK", "").strip():
+        add("WARN", "provenance", "OKENGINE_PACK is not set in the gateway env — the write path "
+            "stamps no composition provenance (maintained_by/discovered_by). Add "
+            "`OKENGINE_PACK=<pack>` to the gateway service in docker-compose.yml and recreate it "
+            "(regenerate from the current skeleton, or copy the line).")
+
+
 def main() -> int:
     for c in (check_pins, check_schema, check_subdomains, check_crons,
               check_timezone, check_partition_dups, check_rules, check_extensions,
-              check_ownership, check_runtime_ownership, check_auth, check_write_path_libs):
+              check_ownership, check_runtime_ownership, check_auth, check_write_path_libs,
+              check_provenance_env):
         try:
             c()
         except Exception as e:

@@ -209,3 +209,23 @@ def test_messaging_brief_prompt_never_instructs_silent():
         "prompt still directs a silent skip on no-change days (breaks the daily floor)"
     # ...and the explicit prohibition must be present
     assert "NEVER respond `[SILENT]`" in prompt
+
+
+def test_messaging_synthesis_detects_same_day_upstream_delta(tmp_path):  # invariant-audit #18
+    """An upstream artifact written LATER the same day as the last brief (the routine @morning stagger)
+    compared equal-DATE and was never detected. mtime has intra-day granularity, so 'newer than the
+    last brief' is expressible: with today's brief present (daily floor satisfied), a newer same-day
+    content-peg must still WAKE via the delta path."""
+    import os
+    import datetime
+    today = datetime.date.today().isoformat()
+    a = _anchor(tmp_path)
+    brief = tmp_path / f"wiki/briefings/messaging-brief-{today}.md"
+    _write(brief, f"---\ntype: marketing-brief\npublished: '{today}'\nupdated: '{today}'\n---\n# brief\n")
+    peg = tmp_path / f"wiki/briefings/content-pegs-{today}.md"
+    _write(peg, f"---\ntype: marketing-pulse\npublished: '{today}'\nupdated: '{today}'\n---\n# pegs\n")
+    os.utime(brief, (1000, 1000))          # the brief
+    os.utime(peg, (2000, 2000))            # the peg, written AFTER it (same DATE, later mtime)
+    out = _run("select_messaging_synthesis.py", {
+        "WIKI_PATH": str(tmp_path), "PRODUCT_ANCHOR_PATH": str(a)})
+    assert json.loads(out.strip().splitlines()[-1]) == {"wakeAgent": True}, out

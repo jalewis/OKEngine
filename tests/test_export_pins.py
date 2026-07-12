@@ -40,3 +40,33 @@ def test_weasyprint_at_or_above_cve_floor():
         tup = tuple(int(x) for x in re.findall(r"\d+", ver)[:2])
         assert tup >= _MIN_WEASYPRINT, (
             f"{k}: weasyprint {ver} is below the CVE-2025-68616 floor {_MIN_WEASYPRINT} (okengine#95)")
+
+
+def test_reader_cockpit_share_every_common_dependency_pin():
+    """okengine#95-class (invariant audit HIGH #2): the cockpit is the reader's twin — it imports
+    fastapi + markdown too — but its pins lagged the reader's CVE fix (fastapi 0.115.6/starlette
+    0.41.x, markdown 3.7) for releases because NOTHING compared their FULL pin sets (only weasyprint/
+    pydyf were guarded) and CI pip-audit never scanned the cockpit. Every package pinned in BOTH must
+    pin the SAME version — a CVE bump to one is now forced onto the other."""
+    def pins(text):
+        return dict(re.findall(r"^([A-Za-z0-9_.\[\]-]+)==([0-9][\w.]*)", text, re.M))
+    rd = pins(REQS["reader"].read_text(encoding="utf-8"))
+    ck = pins(REQS["cockpit"].read_text(encoding="utf-8"))
+    common = set(rd) & set(ck)
+    assert common, "reader/cockpit share no pinned deps — parser broke, not a real pass"
+    drift = {p: (rd[p], ck[p]) for p in common if rd[p] != ck[p]}
+    assert not drift, (f"reader/cockpit common-dependency pins diverge (reader, cockpit): {drift} — "
+                       "sync them; a CVE fix to one twin must reach the other")
+
+
+def test_cve_sensitive_deps_are_audited_in_ci_and_makefile():
+    """The lag hid because the cockpit is a separate image/venv that no audit surface scanned.
+    Every requirements file that ships in an image must be pip-audited in BOTH CI and the Makefile
+    audit target — a new image whose deps aren't scanned fails HERE."""
+    must = ("okengine-reader/requirements.txt", "okengine-cockpit/requirements.txt",
+            "okengine-mcp/requirements.txt")
+    ci = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    mk = (REPO / "Makefile").read_text(encoding="utf-8")
+    for req in must:
+        assert req in ci, f"CI pip-audit does not scan {req} — a shipped image's deps are unaudited"
+        assert req in mk, f"Makefile audit target does not scan {req}"

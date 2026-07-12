@@ -125,3 +125,22 @@ def test_heartbeat_gauge_emitted_even_when_monitor_dead(tmp_path, monkeypatch): 
     ts = int(mt.group(1))
     assert before - 5 <= ts <= time.time() + 5, f"heartbeat timestamp {ts} not fresh"
     assert "okengine_health_overall 2" in prom              # emitted alongside the RED dead-monitor verdict
+
+
+def test_heartbeat_pings_external_dead_mans_switch(tmp_path, monkeypatch):  # invariant-audit #11
+    """The detect->notify chain runs INSIDE the scheduler, so a webhook-only deployment can't detect
+    the scheduler's OWN death. health_export must ping OKENGINE_HEARTBEAT_URL every run so an EXTERNAL
+    dead-man's switch alerts when the ping stops."""
+    import urllib.request
+    dd = tmp_path / "wiki" / "dashboards"
+    dd.mkdir(parents=True)
+    _dash(dd, "fleet-health", "- 🟢 ok: **51**  ·  🔴 errored: **0**  ·  🔴 off-model: **0**")
+    hits = []
+
+    class _Resp:
+        def read(self): return b""
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda req, timeout=8: hits.append(getattr(req, "full_url", str(req))) or _Resp())
+    monkeypatch.setenv("OKENGINE_HEARTBEAT_URL", "http://dms.example/ping")
+    _run(tmp_path, monkeypatch)
+    assert any("dms.example" in str(h) for h in hits), hits

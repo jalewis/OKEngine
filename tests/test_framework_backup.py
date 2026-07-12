@@ -137,13 +137,43 @@ def test_restore_refuses_nonempty_target(tmp_path):
 # --- prune -------------------------------------------------------------------
 
 def test_prune_keeps_newest_n(tmp_path):
+    import os, time
     m = _mod()
     d = tmp_path / "bk"; d.mkdir()
-    for ts in ["20260101", "20260102", "20260103", "20260104"]:
-        (d / f"p-{ts}T000000Z.tar.gz").write_text("x")
-    assert m.prune_backups(d, keep=2) == 2
+    for i, ts in enumerate(["20260101", "20260102", "20260103", "20260104"]):
+        p = d / f"p-{ts}T000000Z.tar.gz"; p.write_text("x")
+        os.utime(p, (time.time() + i, time.time() + i))   # mtime order == intended age order
+    assert m.prune_backups(d, keep=2, pack_name="p") == 2
     assert sorted(f.name for f in d.glob("*.tar.gz")) == \
         ["p-20260103T000000Z.tar.gz", "p-20260104T000000Z.tar.gz"]
+
+
+def test_prune_is_pack_scoped_on_a_shared_dest(tmp_path):
+    """invariant-audit HIGH #3: two packs sharing one dest — pruning one must NEVER touch the
+    other's archives (name-sort put every zeta-* above every alpha-* and deleted alpha's history)."""
+    import os, time
+    m = _mod()
+    d = tmp_path / "shared"; d.mkdir()
+    for i in range(4):
+        for name in ("alpha", "zeta"):
+            p = d / f"{name}-2026010{i}T000000Z.tar.gz"; p.write_text("x")
+            os.utime(p, (time.time() + i, time.time() + i))
+    removed = m.prune_backups(d, keep=2, pack_name="zeta")
+    assert removed == 2
+    assert len(list(d.glob("alpha-*.tar.gz"))) == 4, "alpha's DR history must be untouched"
+    assert len(list(d.glob("zeta-*.tar.gz"))) == 2
+
+
+def test_prune_refuses_keep_zero(tmp_path):
+    """`--keep 0` used to silently unlink every archive in the dest — a delete-all footgun."""
+    m = _mod()
+    d = tmp_path / "bk"; d.mkdir()
+    (d / "p-20260101T000000Z.tar.gz").write_text("x")
+    import pytest
+    with pytest.raises(ValueError):
+        m.prune_backups(d, keep=0, pack_name="p")
+    assert m.main(["prune", str(_pack(tmp_path)), "--dest", str(d), "--keep", "0"]) == 2  # CLI -> exit 2
+    assert len(list(d.glob("*.tar.gz"))) == 1                                             # nothing deleted
 
 
 # --- CLI integration ---------------------------------------------------------
@@ -153,7 +183,7 @@ def test_main_create_list_verify(tmp_path, capsys):
     assert m.main(["create", str(p), "--dest", str(tmp_path / "bk")]) == 0
     assert m.main(["list", str(p), "--dest", str(tmp_path / "bk")]) == 0
     out = capsys.readouterr().out
-    assert "1 backup(s)" in out
+    import re as _re; assert _re.search(r"1 .*backup\(s\) in", out), out
     arc = next((tmp_path / "bk").glob("*.tar.gz"))
     assert m.main(["verify", str(arc)]) == 0
 
@@ -220,3 +250,56 @@ def test_skeleton_gitignore_excludes_okengine_secrets_keeps_enable_state():
         assert secret in patterns, f"scaffold .gitignore must exclude {secret}"
     for tracked in (".okengine/extensions.yaml", ".okengine/model-profiles.yaml"):
         assert tracked not in patterns, f"scaffold .gitignore must NOT exclude the committed {tracked}"
+
+
+# --- invariant-audit v0.11.5 batch-4 ---------------------------------------------------------
+
+def test_sqlite_captured_consistently_and_sidecars_skipped(tmp_path):  # invariant-audit #33/#34
+    """A live SQLite index (qmd) must be captured via the online-backup API — a consistent snapshot
+    even under concurrent writes — and its transient -wal/-shm sidecars excluded (folded into the
+    snapshot). A plain file copy caught torn pages / a db+wal pair that never coexisted, so verify()
+    rejected the archive or restore yielded a corrupt index."""
+    import sqlite3
+    m = _mod()
+    p = _pack(tmp_path)
+    qdir = p / ".hermes-data" / "qmd" / "cache" / "qmd"
+    qdir.mkdir(parents=True)
+    db = qdir / "index.sqlite"
+    con = sqlite3.connect(str(db))
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("CREATE TABLE t(x)")
+    con.executemany("INSERT INTO t VALUES(?)", [(i,) for i in range(50)])
+    con.commit()
+    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")   # fold WAL into the main db
+    con.close()
+    # a leftover transient -wal sidecar must be excluded from the archive (folded into the snapshot)
+    (qdir / "index.sqlite-wal").write_bytes(b"")
+    files = {r.as_posix() for r in m.iter_files(p, include_secrets=False)}
+    assert ".hermes-data/qmd/cache/qmd/index.sqlite" in files
+    assert ".hermes-data/qmd/cache/qmd/index.sqlite-wal" not in files      # sidecar excluded
+    arc, man = m.create(p, tmp_path / "bk", False, "20260101T000000Z")
+    ok, _man, problems = m.verify(arc)
+    assert ok, problems                                                     # internally consistent
+    # the archived sqlite is a valid, queryable db (WAL folded in)
+    out = tmp_path / "restored"
+    m.restore(arc, out, force=False)
+    rcon = sqlite3.connect(str(out / ".hermes-data" / "qmd" / "cache" / "qmd" / "index.sqlite"))
+    assert rcon.execute("SELECT count(*) FROM t").fetchone()[0] == 50
+    rcon.close()
+
+
+def test_symlinks_excluded_are_warned(tmp_path, capsys):  # invariant-audit #60
+    """Symlinked files/dirs are dropped from the archive; the create CLI must WARN so a restore is
+    not silently missing content (verify passes only on what WAS captured)."""
+    import os
+    m = _mod()
+    p = _pack(tmp_path)
+    target = tmp_path / "external.md"
+    target.write_text("# shared\n")
+    os.symlink(target, p / "wiki" / "shared.md")
+    syms = {r.as_posix() for r in m.skipped_symlinks(p, include_secrets=False)}
+    assert "wiki/shared.md" in syms
+    rc = m.main(["create", str(p), "--dest", str(tmp_path / "bk")])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "symlink" in err.lower() and "wiki/shared.md" in err

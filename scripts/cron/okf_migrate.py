@@ -107,7 +107,12 @@ def _new_key(namespace: str, slug: str, fm: dict, pcfg: dict, canonical: set) ->
         if t in set(pcfg.get("sharded_types") or []):
             return f"{namespace}/{t}/{_letter(slug)}/{slug}"
         return f"{namespace}/{t}/{slug}"
-    return None
+    # An UNRECOGNIZED strategy (a typo like `by_date`, or an invented `by-year`) silently degraded to
+    # flat here while every 'is this partitioned?' matcher tests `strategy != "flat"` and treats it as
+    # partitioned — so the drain reshelved by one rule and the flat fallback wrote by another, forking
+    # canonicals (invariant-audit #25). Fail LOUD; framework_validate gates it before deploy.
+    raise ValueError(f"unknown partition strategy {strat!r} for namespace {namespace!r} "
+                     f"(valid: flat, by-letter, by-date, by-type)")
 
 
 # ── public helpers for no_agent importers (okengine#54) ──────────────────────

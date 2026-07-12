@@ -36,11 +36,15 @@
 
 ## The cron fleet, by cost
 
-34 scheduled jobs. **18 are free `no_agent` scripts** (feed-fetch, reshelve, index/
-hot-set/tier builders, YAML/schema/frontmatter repair drains, health refreshers) —
-they never call the LLM. **16 invoke the agent**, and **15 of those are wake-gated**
-(a cheap script decides each tick whether there's work; the agent fires only if so).
-Only the **daily brief** fires unconditionally (once/day).
+Counts below are the ENGINE-ONLY baseline (`config/engine-crons.json` at engine v0.11.x) — NOT an
+engine invariant: a composed deployment ADDS pack + extension jobs, so a live fleet is larger (e.g.
+the okcti bundle runs ~90+). Re-derive per deployment from its `cron-plus-jobs.json`; treat this as
+the engine floor, not the total.
+
+**53 engine jobs. 34 are free `no_agent` scripts** (feed-fetch, reshelve, index/hot-set/tier
+builders, YAML/schema/frontmatter repair drains, health refreshers) — they never call the LLM.
+**19 invoke the agent**, and most are wake-gated (a cheap script decides each tick whether there's
+work; the agent fires only if so). Only the **daily brief** fires unconditionally (once/day).
 
 So the schedule frequency is an **upper bound on gate checks**, not on LLM calls.
 `raw-backfill` ticks every 5 min but only wakes the agent when raw items are waiting,

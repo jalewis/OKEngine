@@ -39,6 +39,15 @@ common_optional:
   - sensitivity      # generic confidentiality marker (alt to tlp)
   - source_kind      # what kind of source (paper / post / release / …)
   - publisher        # source publisher / outlet
+  # Ingest provenance (okengine#194) — stamped by feed/API ingest lanes and CARRIED verbatim by the
+  # raw->wiki compile (select_raw_batch PROVENANCE_KEYS, cross-checked by test_select_raw_batch).
+  # Without these the compile agent treated them as unknown fields and dropped them, so a vault
+  # could not be filtered/attributed by ingest source.
+  - source_feed      # which feed/API the item arrived from
+  - source_channel   # ingest channel kind (feed / api / manual / …)
+  - matched_query    # the watch/search query that surfaced the item
+  - watch_lane       # which ingest lane pulled it
+  - quality_score    # ingest-time quality/relevance score (scheme is the ingester's)
   - reliability      # source-channel reliability (the grading SCHEME is a pack enum)
   - credibility      # claim credibility (scheme is a pack enum)
   - severity         # finding / issue severity

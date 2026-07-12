@@ -59,7 +59,18 @@ def main() -> int:
 
     product = anchor.get("product_name", "the product")
     prior = _latest("messaging-brief-*.md")
-    prior_updated = (prior[1].get("updated") or prior[1].get("published")) if prior else None
+    # Compare file MTIMEs, not the date-only `updated` frontmatter: prior_updated is the extension's
+    # OWN brief, which the daily floor regenerates every day, so an upstream artifact written LATER
+    # the same day (the routine @morning:0 battle-card vs @morning:15 brief stagger) compares
+    # equal-date under `str(updated) > str(prior_updated)` and was NEVER detected as a delta — that
+    # day or ever (invariant-audit #18). mtime has intra-day granularity, so 'newer than the last
+    # brief' is expressible.
+    def _mtime(path) -> float:
+        try:
+            return os.path.getmtime(str(path))
+        except OSError:
+            return 0.0
+    prior_mtime = _mtime(prior[0]) if prior else None
 
     inputs = {
         "content-pegs": _latest("content-pegs-*.md"),
@@ -72,13 +83,10 @@ def main() -> int:
         if hit is None:
             continue
         p, fm, _ = hit
-        updated = fm.get("updated") or fm.get("published")
-        if prior_updated is None or (updated and str(updated) > str(prior_updated)):
+        if prior_mtime is None or _mtime(p) > prior_mtime:
             deltas.append((name, p))
     for bc in battle_cards:
-        fm, _ = _split(Path(bc))
-        updated = fm.get("updated") or fm.get("published")
-        if prior_updated is None or (updated and str(updated) > str(prior_updated)):
+        if prior_mtime is None or _mtime(bc) > prior_mtime:
             deltas.append((f"battle-card:{Path(bc).stem}", Path(bc)))
 
     from datetime import date
@@ -116,7 +124,7 @@ def main() -> int:
     out_path = f"briefings/messaging-brief-{today}"
     print("=== messaging-synthesis wake-gate ===")
     print(f"  product: {product}  |  {len(deltas)} delta(s) since the last brief "
-          f"({'none — first brief' if prior is None else prior_updated})"
+          f"({'none — first brief' if prior is None else Path(prior[0]).name})"
           + ("  [STEADY-STATE: no material change since the last brief — reaffirm current "
              "messaging from the anchor + prior brief; do NOT invent news]" if steady else ""))
     print(f"  write via mcp_okengine_write_create_entity to: {out_path}")

@@ -161,6 +161,12 @@ def _is_extension_job(j: dict, tier_of: dict[str, str]) -> bool:
     (`<id>` / `<id>:<op>` — chars engine/pack cron names never use)."""
     if j.get("extension"):
         return True
+    if j.get("pack"):
+        # A pack-provenance-marked job (okengine#143) is a DOMAIN cron, never an extension — even if
+        # its name contains '.'/':'. Without this, a pack cron like `acme.fetch` (pack: okpack-x)
+        # was routed to the EXTENSIONS partition and then silently ERASED by dump_from_live, which
+        # only writes engine/domain/prompts (invariant-audit #24).
+        return False
     name = j.get("name", "")
     return tier_of.get(name) is None and ("." in name or ":" in name)
 
@@ -390,11 +396,15 @@ def regen() -> list[dict]:
     """Generate config/cron-plus-jobs.json from the engine half + the domain pack +
     any enabled extensions (#113). Fail-loud before writing on a composition error."""
     engine = json.loads(ENGINE_CRONS_FILE.read_text())
-    domain = json.loads((PACK_DIR / "crons" / DOMAIN_CRONS).read_text())
+    # A pack with ONLY engine crons has no crons/ dir; tolerate its absence (empty domain set) so
+    # regen can run for EVERY pack. Otherwise the deploy skipped regen for such packs and shipped a
+    # stale leftover — possibly another pack's job set on a multi-pack host (invariant-audit #12).
+    _dc, _dp = PACK_DIR / "crons" / DOMAIN_CRONS, PACK_DIR / "crons" / DOMAIN_PROMPTS
+    domain = json.loads(_dc.read_text()) if _dc.is_file() else []
     pname = _pack_name(PACK_DIR)
     for j in domain:                          # provenance marker (okengine#143) so split/dump
         j.setdefault("pack", pname)           # can route a pack's own crons back to domain
-    prompts = json.loads((PACK_DIR / "crons" / DOMAIN_PROMPTS).read_text())
+    prompts = json.loads(_dp.read_text()) if _dp.is_file() else []
     merged = merge(engine, domain, prompts, tier_of=_tier_map(TIERS))
     ext_jobs, ext_errors = _extension_pass(PACK_DIR, merged)
     if ext_errors:

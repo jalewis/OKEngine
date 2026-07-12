@@ -825,12 +825,27 @@ def _chat_enabled() -> bool:
     return bool(_AGENT_API and _AGENT_KEY)
 
 
+def _budget_tripped() -> bool:
+    """True while budget_guard has tripped the model-token budget. The guard's only actuator was
+    cron-plus pause; chat relayed to the gateway api_server unbounded (chat sessions DO count against
+    the budget). The guard now drops a marker into the SHARED vault (the reader mounts it, not the
+    gateway /opt/data), so /api/chat honors the same trip that pauses the crons (invariant-audit #37)."""
+    try:
+        return (VAULT / ".okengine" / "budget-paused").exists()
+    except OSError:
+        return False
+
+
 @app.post("/api/chat")
 async def api_chat(request: Request):
     """Relay an OpenAI-style chat turn to the Hermes agent and stream its SSE back. The
     upstream key is held server-side; the client only ever sees the token stream."""
     if not _chat_enabled():
         raise HTTPException(503, "agent chat not configured")
+    if _budget_tripped():
+        raise HTTPException(503, "agent chat paused — the deployment is over its model-token budget "
+                                 "(budget-guard). It resumes when usage ages back under budget, or "
+                                 "after `framework budget --resume`.")
     if not _RATE.allow(_client_ip(request)):
         raise HTTPException(429, "rate limit exceeded — slow down")
     try:

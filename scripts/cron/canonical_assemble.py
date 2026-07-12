@@ -326,7 +326,14 @@ def write_canonical(vault: Path, slug: str, type_: str, fused: dict, conflicts: 
             return path.read_text(encoding="utf-8", errors="replace"), False
 
     out["last_updated"] = today
-    out["version"] = int(existing_fm.get("version") or 0) + 1
+    # `version` is not int-shaped in base-schema, so the write path accepts a str — an agent authoring
+    # `version: 3.0.14` on a software/product entity (natural in a CTI/market vault) made int() raise
+    # ValueError and killed the whole assemble lane (invariant-audit #30). Treat a non-int version as 0.
+    try:
+        _prev_ver = int(existing_fm.get("version") or 0)
+    except (TypeError, ValueError):
+        _prev_ver = 0
+    out["version"] = _prev_ver + 1
     new_text = "---\n" + _dump_fm(out) + "\n---\n" + page_body
     if not dry_run:
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -23,15 +23,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 # Server-managed keys the merge never treats as a pack-authored conflict — the
-# write path stamps/owns these regardless of caller.
+# write path stamps/owns these regardless of caller. `extension_id` is included so a
+# converge merge never takes a caller-supplied value for it — it is server-derived
+# provenance the write path re-applies from the scoped token / on-disk stamp
+# (invariant-audit: forgeable extension_id → mis-attributed purge deletion).
 _SERVER_KEYS = {"id", "version", "updated", "last_modified_by",
-                "maintained_by", "discovered_by", "created", "created_by"}
+                "maintained_by", "discovered_by", "created", "created_by", "extension_id"}
 
 # The subset of server keys that are PROVENANCE — set once at create and never re-stamped by the
 # write path. A converge merge must PRESERVE these (never take an incoming value), or a caller forges
 # them (invariant-audit M19). The other server keys (id/version/updated/last_modified_by) ARE
 # re-stamped after the merge, so passing them through here is harmless and back-compatible.
-_PROVENANCE_KEYS = {"created", "created_by", "discovered_by"}
+_PROVENANCE_KEYS = {"created", "created_by", "discovered_by", "extension_id"}
 
 
 @dataclass

@@ -66,6 +66,7 @@ operations:
   concept-enrich:
     schedule: {kind: cron, expr: "50 4 * * *"}      # daily, BEFORE the 05:20 map so fresh fields land on it
     entrypoint: enrich_concepts.py                  # no_agent drain: llm_lib classify -> frontmatter fill (#172)
+    cost_bearing: true                              # calls llm_lib (paid) — budget_guard must pause it (#36)
   panel-svg-refresh:
     schedule: {kind: cron, expr: "45 5 * * *"}      # after the agent dashboard lanes: data -> embedded chart
     entrypoint: render_panel_svgs.py                # no_agent: SVG into any dashboards page with panel: data# No reader_panels type-binding: the generated map page SELF-DECLARES `panel: {kind:

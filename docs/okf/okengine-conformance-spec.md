@@ -1,6 +1,6 @@
 # OKEngine OKF Conformance Profile — v0.1
 
-**Status:** normative (engine release `v0.2.0`). This is a *profile*, not a fork of
+**Status:** normative for the engine v0.11.x series (profile v0.1, stable across the range). This is a *profile*, not a fork of
 the format.
 
 ## 0. Scope & relationship to OKF
@@ -225,6 +225,7 @@ The reference implementation's tests pin these clauses (where practical):
 
 ## 13. Versioning
 
-This profile is versioned independently of the engine; `v0.1` corresponds to engine
-`v0.2.0`. Breaking changes to a normative clause bump the profile's minor version.
+This profile is versioned independently of the engine; profile `v0.1` is stable across the engine
+v0.11.x series (and back to v0.2.0 — the normative clauses have not broken). Breaking changes to a
+normative clause bump the profile's minor version.
 The base OKF version this profile targets is OKF **v0.1**.

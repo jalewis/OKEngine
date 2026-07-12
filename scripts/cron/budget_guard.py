@@ -96,7 +96,11 @@ def cost_bearing_ids(jobs: list, self_name: str = SELF_NAME) -> list[tuple[str, 
     was actually running when it tripped."""
     out = []
     for j in jobs or []:
-        if j.get("no_agent"):
+        # no_agent lanes were assumed free, but a no_agent script can call llm_lib DIRECTLY (paid) —
+        # concept-enrich / scope-classify. Such a lane marks `cost_bearing: true`, so it is paused with
+        # the agent lanes when over budget instead of burning paid tokens unpausably (invariant-audit
+        # #36). A plain no_agent maintenance script (reshelve/backlinks — zero tokens) keeps running.
+        if j.get("no_agent") and not j.get("cost_bearing"):
             continue
         if not j.get("enabled", True):
             continue                       # already disabled (operator maintenance) — don't touch
@@ -124,6 +128,28 @@ def decide(*, over_budget: bool, currently_paused: bool, resume_policy: str) -> 
 # ── effectful helpers ────────────────────────────────────────────────────────
 def _state_path() -> Path:
     return Path(_hermes_home()) / "budget-guard-state.json"
+
+
+def _vault_pause_marker() -> Path:
+    return Path(os.environ.get("WIKI_PATH") or "/opt/vault") / ".okengine" / "budget-paused"
+
+
+def _set_pause_marker(active: bool, info: dict | None = None) -> None:
+    """Signal the budget trip to OTHER surfaces via the SHARED VAULT. The guard's only actuator was
+    cron-plus pause, but the reader chat endpoint relays browser turns to the gateway api_server with
+    no budget consultation — chat spend continued unbounded after a trip (invariant-audit #37). The
+    reader mounts the vault (not the gateway /opt/data where budget-guard-state.json lives), so a
+    marker here is the cross-surface signal: the reader chat endpoint refuses to relay while it
+    exists. Best-effort — never crash the guard tick."""
+    try:
+        mp = _vault_pause_marker()
+        if active:
+            mp.parent.mkdir(parents=True, exist_ok=True)
+            mp.write_text(json.dumps(info or {"paused": True}), encoding="utf-8")
+        elif mp.exists():
+            mp.unlink()
+    except OSError:
+        pass
 
 
 def _load_state() -> dict:
@@ -219,6 +245,7 @@ def resume(reason: str = "manual") -> int:
         # every paused cron came back — safe to clear the tripped state
         _save_state({"paused": False, "resumed_at": time.time(),
                      "note": f"{reason}-resume", "resumed_count": len(resumed)})
+        _set_pause_marker(False)         # lift the reader-chat gate too (#37)
         print(f"budget-guard: ✅ resumed {len(resumed)} cron(s) ({reason}).", file=sys.stderr)
     else:
         # some resume calls FAILED (cron-plus down / jobs.json lock / uid-desynced write). Do NOT
@@ -353,6 +380,7 @@ def main(argv: list[str] | None = None) -> int:
                  "tripped_at": now, "window": win_name,
                  "usage_tokens": tokens, "reason": f"over budget ({usage_str} >= {budget_str})"}
         _save_state(state)
+        _set_pause_marker(True, {"tripped_at": now, "window": win_name})   # gate reader chat too (#37)
         if fully:
             print(f"budget-guard: ⛔ BUDGET TRIPPED — paused {len(paused)} cost-bearing cron(s): "
                   f"{', '.join(n for _, n in paused)}. Free maintenance crons keep running. "

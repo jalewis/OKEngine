@@ -71,9 +71,11 @@ and `chown` the tree to match:
 export HERMES_UID=10000 HERMES_GID=10000 && sudo chown -R 10000:10000 <pack>
 ```
 
-1. **Get the engine** at a pinned release:
+1. **Get the engine** at a pinned release (the current series is **v0.11.x** — never a
+   hardcoded old tag; select the latest release, or the specific one you're targeting):
    ```bash
-   git clone <engine-repo> && cd <engine-repo> && git checkout v0.2.0
+   git clone <engine-repo> && cd <engine-repo>
+   git checkout "$(git tag -l 'v*' | sort -V | tail -1)"   # latest release tag
    ```
 2. **Scaffold the pack** — one command generates the skeleton (schema + persona
    + feeds + crons + wiki + `.env.example` + a starting `docker-compose.yml`,
@@ -143,7 +145,7 @@ export HERMES_UID=10000 HERMES_GID=10000 && sudo chown -R 10000:10000 <pack>
    # Only for a portable/shared vault: export a fixed uid AND `sudo chown -R <uid> <pack>`.
    bash <engine-checkout>/scripts/build-engine-image.sh    # -> hermes-agent:latest (once)
    bash <engine-checkout>/scripts/ensure-runtime.sh        # seed .hermes-data/config.yaml + install the PINNED cron-plus scheduler plugin (REQUIRED — without it nothing schedules) — MUST precede compose
-   ENGINE_DIR=<engine-checkout> docker compose up -d        # builds reader+mcp, runs all three
+   ENGINE_DIR=<engine-checkout> docker compose up -d --build   # --build rebuilds reader/mcp/cockpit on an engine update (plain up -d only builds when ABSENT — #45)
    CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-scripts.sh       # engine + pack scripts -> /opt/data/scripts; pack data/feeds -> /opt/data/config
    CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-plus-jobs.sh     # regenerated jobs.json -> live (self-heals next_run_at in ~60s)
    ```

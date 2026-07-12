@@ -160,3 +160,12 @@ def test_dedup_partition_collisions_collapses_to_canonical(tmp_path):
     assert "full incident writeup" in body       # longest body kept
     note = (root / "wiki" / "notes" / "n.md").read_text()
     assert "[[security-incidents/2014/07/inc-x]]" in note   # link rewritten to canonical
+
+
+def test_unknown_partition_strategy_raises(tmp_path):  # invariant-audit #25
+    """An unrecognized strategy (typo `by_date`, invented `by-year`) silently degraded to flat while
+    every 'is partitioned?' matcher treated it as partitioned — forking canonicals. Fail loud."""
+    m = _mod()
+    with pytest.raises(ValueError):
+        m._new_key("sources", "x", {"type": "source", "published": "2026-06-01"},
+                   {"strategy": "by_date", "date_field": "published"}, set())

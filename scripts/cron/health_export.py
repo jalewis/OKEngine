@@ -10,8 +10,15 @@ Closes the detect→notify loop. The operator dashboard SHOWS health; this EXPOR
     alerts.md and POSTs ALERT_WEBHOOK (Slack-compatible {text}) if set, so a no-Prometheus
     deployment still gets notified.
 
+  - HEARTBEAT: pings OKENGINE_HEARTBEAT_URL every run (a healthchecks.io-style dead-man's switch), so
+    an EXTERNAL service detects the SCHEDULER's OWN death — which no in-scheduler lane can (if the
+    ticker dies, this lane never runs, and its silence otherwise reads as healthy). Essential for a
+    no-Prometheus, webhook-only deployment; the Prometheus path already exposes an equivalent
+    `okengine_health_export_heartbeat_seconds` metric to alert on.
+
 Deterministic (no_agent). Reads the health dashboards (graceful if a number is absent).
-Env: WIKI_PATH (/opt/vault) · METRICS_DIR (/opt/data/metrics) · ALERT_WEBHOOK (optional)
+Env: WIKI_PATH (/opt/vault) · METRICS_DIR (/opt/data/metrics) · ALERT_WEBHOOK (optional) ·
+     OKENGINE_HEARTBEAT_URL (optional external dead-man's switch)
 """
 from __future__ import annotations
 
@@ -171,6 +178,19 @@ def main() -> int:
     else:
         print("  health-state NOT advanced (webhook undelivered) — will retry the alert next run",
               file=sys.stderr)
+    # EXTERNAL dead-man's switch (invariant-audit #11): the whole detect->notify chain runs INSIDE the
+    # cron-plus scheduler, so if the SCHEDULER itself dies (CRON_PLUS_DISABLED, plugin removed, ticker
+    # wedged) health_export never runs and its silence reads as healthy — a no-Prometheus, webhook-only
+    # deployment has nothing watching the watcher. Ping OKENGINE_HEARTBEAT_URL on every run (a
+    # healthchecks.io-style dead-man's switch); the EXTERNAL service alerts when the ping STOPS,
+    # catching the scheduler's own death that no in-scheduler lane can. Best-effort, never fatal.
+    hb_url = os.environ.get("OKENGINE_HEARTBEAT_URL", "").strip()
+    if hb_url:
+        try:
+            import urllib.request
+            urllib.request.urlopen(urllib.request.Request(hb_url), timeout=8)
+        except Exception as e:                       # noqa: BLE001 — a dead-man's ping must never fail the lane
+            print(f"  heartbeat ping failed: {e}", file=sys.stderr)
     states = {0: "🟢", 1: "🟡", 2: "🔴"}
     print(f"health-export: overall {states[overall]} -> {MDIR / 'okengine.prom'} "
           f"({sum(1 for _, _, v in metrics if v is not None)} metrics); "

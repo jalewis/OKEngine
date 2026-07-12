@@ -250,6 +250,30 @@ def int_fields(schema: dict) -> set:
     return {k for k, v in shapes.items() if v == "int"}
 
 
+def _recorded_fragments(root: Path) -> list:
+    """The (owner, fragment) inputs the deploy-side composer recorded into the artifact's
+    ``_fragments`` (okengine#195). Only the INPUT list is trusted — the composition itself is
+    always re-derived live from base⊕pack⊕these, so a hand-edited artifact body can't leak in.
+    Absent artifact / pre-#195 artifact (no _fragments) / malformed shape -> [] (base⊕pack only,
+    the exact pre-#195 behavior)."""
+    art = Path(root) / ".okengine" / "composed-schema.yaml"
+    if not art.is_file():
+        return []
+    try:
+        doc = fast_load(art.read_text(encoding="utf-8"))
+    except Exception:                       # unreadable/unparseable artifact -> base⊕pack only
+        return []
+    raw = doc.get("_fragments") if isinstance(doc, dict) else None
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw:
+        if isinstance(item, (list, tuple)) and len(item) == 2 \
+                and isinstance(item[0], str) and isinstance(item[1], dict):
+            out.append((item[0], item[1]))
+    return out
+
+
 def compose_schema(root: Path, fragments=None, namespace: str = "") -> tuple[dict, list[str]]:
     """N-way additive schema composition (okengine#90 P3 / #133).
 
@@ -264,8 +288,18 @@ def compose_schema(root: Path, fragments=None, namespace: str = "") -> tuple[dic
 
     Owner tokens: ``engine`` (base globals), ``pack`` (pack-declared types/namespaces),
     ``ext:<id>`` (an extension's owned/extended ids).
+
+    ``fragments=None`` (the in-gateway callers: deployment_validate, conformance_audit) auto-loads
+    the fragment INPUTS recorded in ``.okengine/composed-schema.yaml`` ``_fragments`` (okengine#195)
+    — the deploy-side composer records them at enable/deploy time precisely so a live recompose
+    here reproduces the SAME composition instead of silently omitting every enabled extension's
+    schema (the un-clearable "composed-schema STALE" false positive, and lacuna-class pages
+    reading as unknown types to conformance). Pass an explicit list (possibly empty) to compose
+    exact inputs — the deploy-side composer does.
     """
     import copy
+    if fragments is None:
+        fragments = _recorded_fragments(root)
     composed = copy.deepcopy(_merge_base_pack(root, namespace))   # base⊕pack only — never the artifact
     errors: list[str] = []
 

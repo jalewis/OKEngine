@@ -216,14 +216,14 @@ The implementation splits cleanly into two layers:
 
 | Layer | What it is | Domain-specific? |
 |---|---|---|
-| **Engine** | The runtime (a pinned Hermes-Agent, v0.17.0, consumed as a dependency — not forked), the `cron-plus` scheduler, LLM-wiki governance/maintenance machinery, OKF-compatible validation, retrieval + graph tooling, and deploy tooling | No — fully domain-agnostic |
+| **Engine** | The runtime (a pinned Hermes-Agent — the exact pin is in `engine-manifest.yaml`, consumed as a dependency, not forked), the `cron-plus` scheduler, LLM-wiki governance/maintenance machinery, OKF-compatible validation, retrieval + graph tooling, and deploy tooling | No — fully domain-agnostic |
 | **Domain pack** | Per deployment: `schema.yaml`, the content `wiki/`, the persona `CLAUDE.md`, feeds, data, cron job definitions + prompts, and `.env` | Yes — this *is* the domain |
 
 The boundary is explicit and versioned:
 
 - `engine-manifest.yaml` enumerates exactly which files constitute the engine layer.
 - `cron-tiers.yaml` classifies every scheduled job as **engine** (domain-agnostic maintenance), **engine-template** (engine logic, per-pack prompt), or **domain** (pack-owned).
-- The engine is versioned (`v0.2.0`); a domain pack pins `engine.version`.
+- The engine is versioned (see `engine-manifest.yaml` `engine_release`); a domain pack pins `engine.version`.
 - `framework_init` scaffolds a fresh domain pack against the current engine.
 
 This is the mechanism that makes the pattern *deployable* rather than a one-off: a quickstart (`docs/deploy-a-new-domain.md`) walks the same engine into a new domain by authoring only the pack.
@@ -232,8 +232,8 @@ This is the mechanism that makes the pattern *deployable* rather than a one-off:
 
 | Pattern concept (this briefing) | Reference implementation |
 |---|---|
-| Autonomous agent loop | pinned Hermes-Agent (v0.17.0, consumed as a dependency) running observe→reason→act with tool use |
-| Runs continuously, not on demand | `cron-plus` scheduler — ~98 scheduled jobs maintain the wiki |
+| Autonomous agent loop | pinned Hermes-Agent (the pin is in `engine-manifest.yaml`, consumed as a dependency) running observe→reason→act with tool use |
+| Runs continuously, not on demand | `cron-plus` scheduler — dozens of scheduled jobs maintain the wiki (a composed reference deployment measured ~90+; the engine-only floor is ~53 — see `config/engine-crons.json`) |
 | Three Karpathy layers | immutable `raw/` → agent-maintained `wiki/` → `schema.yaml` + persona `CLAUDE.md` |
 | The schema/contract (Layer 3) | `schema.yaml` — read by the engine, never hardcoded |
 | OKF "only `type` is mandatory" | `schema.yaml` `types` declares page types + required fields; engine enforces OKF's `type` floor |
@@ -263,7 +263,7 @@ OKF conformance is enforced, not assumed:
 
 - **Subprocess-per-job** — true parallel execution, isolation per job.
 - **`no_agent` flag** — pure-script jobs skip the LLM entirely: the script *is* the job (no prompt, no tool loop, no token spend).
-- **Wake-gate pattern** — a cheap script decides whether to wake the agent. The script gates; the agent only does expensive reasoning when there's actually work. This is how ~98 jobs run cheaply: most ticks are script-only.
+- **Wake-gate pattern** — a cheap script decides whether to wake the agent. The script gates; the agent only does expensive reasoning when there's actually work. This is how a fleet of dozens of jobs runs cheaply: most ticks are script-only.
 
 ### Filing and self-healing
 
@@ -282,7 +282,7 @@ OKF conformance is enforced, not assumed:
 The implementation is built to be re-deployed into new domains, not just operated as one:
 
 - `framework_init` scaffolds a new domain pack.
-- The engine is versioned (`v0.2.0`); packs pin `engine.version`.
+- The engine is versioned (see `engine-manifest.yaml`); packs pin `engine.version`.
 - Quickstart: `docs/deploy-a-new-domain.md`.
 - **The reference pack** is **okpack-cti** (a security-focused LLM-wiki pack, maintained in its own repo). A production deployment further proves the same engine spans multiple domains by hosting a root domain plus a related sub-domain in one vault.
 

@@ -54,6 +54,43 @@ def test_deploy_recomposes_schema_artifact():  # invariant-audit #12
         "deploy.sh no longer recomposes the schema artifact — schema.yaml edits won't reach the write path"
 
 
+def test_deploy_recompose_error_is_fatal():  # invariant-audit HIGH #4
+    """A recompose ERROR must ABORT the deploy, not WARN-and-continue. write_composed_schema writes
+    NOTHING on error and leaves the stale artifact, which the enforced write path keeps using
+    unconditionally — a broken/renamed extension fragment would silently freeze the governing
+    schema forever. deploy.sh's 1b step must exit non-zero on errors (no 'non-fatal' escape)."""
+    dp = SCRIPT.read_text()
+    b1 = dp[dp.index("1b."):dp.index("[2/6]")]
+    assert "non-fatal" not in b1, "recompose step still treats errors as non-fatal"
+    assert "sys.exit(1 if errs else 0)" in b1 and "exit 1" in b1, \
+        "recompose step must exit non-zero on a fragment error, not just print a warning"
+
+
+def test_write_composed_schema_errors_on_a_broken_fragment(tmp_path):
+    """The behaviour deploy.sh now gates on: a missing/unparseable enabled fragment yields errors
+    and leaves the artifact untouched (write-nothing-on-error)."""
+    import importlib.util, sys, yaml
+    def _load(n):
+        s = importlib.util.spec_from_file_location(n, REPO / "scripts" / f"{n}.py")
+        m = importlib.util.module_from_spec(s); sys.modules[n] = m; s.loader.exec_module(m); return m
+    comp = _load("extension_compose"); disc = _load("extension_discovery")
+    pack = tmp_path / "pack"; (pack / "wiki").mkdir(parents=True)
+    (pack / "schema.yaml").write_text(yaml.safe_dump(
+        {"apply_under": ["wiki/"], "partitioning": {"namespaces": {"entities": {}}},
+         "types": {"entity": {"required": ["type"]}}}))
+    d = pack / "extensions" / "demo.pred"; (d / "schema").mkdir(parents=True)
+    (d / "extension.yaml").write_text(yaml.safe_dump({
+        "id": "demo.pred", "kind": "operation", "version": "0.1.0", "trust": "in-gateway",
+        "requires": {"engine": ">=0.3.0"}, "capabilities": {"read": ["wiki/**"], "write": ["x/**"]},
+        "schema": ["schema/missing.yaml"],   # <-- fragment file does NOT exist
+        "operation": {"schedule": {"kind": "cron", "expr": "0 4 * * *"},
+                      "entrypoint": {"script": "run.py"}}}))
+    disc.set_enabled(pack, "demo.pred", True)
+    errs = comp.write_composed_schema(pack)
+    assert errs, "a missing enabled fragment must produce errors"
+    assert not (pack / ".okengine" / "composed-schema.yaml").is_file(), "must write nothing on error"
+
+
 def test_deploy_rebuilds_sibling_images():  # invariant-audit #8/#23
     """deploy.sh step 4 must `up -d --build`. Plain `up -d` builds an image only when ABSENT, so
     the reader/mcp/cockpit images (the only services with a compose build:) freeze after the first
@@ -97,7 +134,11 @@ def test_default_uid_is_invoking_user_not_fixed_10000():
     assert "HERMES_UID:-10000" not in dp, "deploy.sh must not default HERMES_UID to a fixed 10000"
     assert ":-1003" not in dp, "deploy.sh must not hardcode an operator-specific uid"
     er = (REPO / "scripts" / "ensure-runtime.sh").read_text()
-    assert "HERMES_UID:-$(id -u)" in er, "ensure-runtime.sh should default to the invoking uid too"
+    # invariant-audit HIGH #1: ensure-runtime now resolves the uid via the SHARED resolver (env >
+    # .env pin > tree owner) — the way compose/deploy do — instead of a bare $(id -u) that ignored
+    # the .env pin, and it pins the result into .env so bare compose uses the same uid.
+    assert "resolve_hermes_uid" in er, "ensure-runtime.sh must use the shared uid resolver"
+    assert "HERMES_UID:-10000" not in er and ":-1003" not in er, "no fixed/operator uid default"
 
 
 def test_skip_validate_proceeds_past_gate(tmp_path):

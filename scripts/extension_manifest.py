@@ -45,13 +45,20 @@ _TOP_KEYS = {"id", "kind", "scope", "version", "name", "description",
 # Built-in reader panel KINDS the reader ships (okengine#160). An extension BINDS one to a page
 # type declaratively — it ships no renderer code, so there's no third-party-JS surface in the
 # reader (sidesteps the #124 sandbox concern for this path). New kinds are added to the reader.
-_PANEL_KINDS = {"fields", "two-axis", "timeline"}
+# The binding allowlist must match what a renderer actually implements. `fields` + `two-axis` render
+# (static/app.js panelHtml), but `timeline` has NO renderer on any surface — allowing it validated a
+# binding GREEN that then produced `panel: null` on every bound page (invariant-audit #26). Dropped.
+# Add a kind back only when a renderer for it ships.
+_PANEL_KINDS = {"fields", "two-axis"}
 _REQUIRED_TOP = ("id", "kind", "version", "requires", "trust", "capabilities")
 # §6: unknown keys under these blocks FAIL (vs unknown descriptive top-level = WARN).
 _REQUIRES_KEYS = {"engine", "schema_refs", "extensions"}
 _CAP_KEYS = {"read", "write", "network", "secrets", "delivery"}
 _OPERATION_KEYS = {"schedule", "entrypoint", "timeout", "prompt", "prompt_file",
-                   "toolsets", "tier", "model", "after"}
+                   "toolsets", "tier", "model", "after", "cost_bearing"}
+# cost_bearing: a no_agent op that STILL spends model budget (a deterministic script calling
+# llm_lib directly, e.g. concept-enrich / scope-classify). budget_guard pauses it when over budget —
+# without the marker it looked "free" and burned paid tokens unpausably (invariant-audit #36).
 
 
 class ManifestError(Exception):

@@ -1,6 +1,7 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-markdown==3.7
+fastapi==0.138.0          # pulls starlette 1.3.x (clears the 0.41.3 CVEs — okengine#95). Keep in sync with okengine-reader.
+uvicorn[standard]==0.49.0
+markdown==3.10.2          # PYSEC-2026-89 fixed in 3.8.1 (okengine#95). Keep in sync with okengine-reader.
+nh3==0.3.5
 PyYAML==6.0.2
 weasyprint==69.0          # CVE-2025-68616 fixed in 68.0 (okengine#95); pandoc --pdf-engine. Keep in sync with okengine-reader.
 pydyf==0.12.1             # paired with weasyprint 69 (62.3 needed pydyf 0.10; 69 uses the 0.12 API). Unpinned => pip grabs 0.12 => 'super has no transform' crash on 62.3.

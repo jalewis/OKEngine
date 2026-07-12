@@ -69,6 +69,24 @@ def _open_prediction_values() -> set:
     return {"open", "active"}
 
 
+def _knowledge_namespaces():
+    """The vault's declared knowledge namespaces (the COMPOSED schema on a multipack vault) minus
+    excluded/derived dirs — NOT a hardcoded ('entities','concepts'), which silently skipped every
+    pack namespace on a composed vault (okcti: threat-actors, cves, detections, …), leaving the brief's
+    movement section empty for pack content (invariant-audit #27). Mirrors page_quality_audit. Falls
+    back to the pair when the schema declares no knowledge namespaces."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import schema_lib
+        ms = schema_lib.merged_schema(VAULT)
+        nss = schema_lib.knowledge_namespaces(ms) - schema_lib.excluded_dirs(ms)
+        if nss:
+            return tuple(sorted(nss))
+    except Exception:
+        pass
+    return ("entities", "concepts")
+
+
 def main() -> int:
     open_vals = _open_prediction_values()
     if not WIKI.is_dir() or not any(WIKI.rglob("*.md")):
@@ -95,9 +113,9 @@ def main() -> int:
                                  str(fm.get("title") or p.stem)[:90]))
     srcs.sort(reverse=True)
 
-    # 2. entity/concept movement
+    # 2. knowledge-namespace movement
     moved = []
-    for ns in ("entities", "concepts"):
+    for ns in _knowledge_namespaces():
         d = WIKI / ns
         if not d.is_dir():
             continue

@@ -242,6 +242,8 @@ def _synthesize_one(ext_id: str, m: dict, trust, op_name: str | None, op: dict,
     model = op.get("model")             # per-operation model override: the cron scheduler
     if isinstance(model, str) and model.strip():   # honors job["model"] over the config default,
         job["model"] = model.strip()    # so a low-stakes lane can run on a free/cheap model.
+    if op.get("cost_bearing"):          # a no_agent op that still spends via llm_lib — budget_guard
+        job["cost_bearing"] = True      # must be able to pause it despite no_agent (invariant-audit #36)
     after = op.get("after")             # okengine#129: hard cross-job dependency(ies)
     if isinstance(after, list):
         deps = [a.strip() for a in after if isinstance(a, str) and a.strip()]
@@ -587,6 +589,11 @@ def write_composed_schema(pack_dir) -> list[str]:
     artifact.parent.mkdir(parents=True, exist_ok=True)
     composed = dict(composed)
     composed["_generated"] = "framework extensions (okengine#133) — do not edit"
+    # Record the fragment INPUTS so a live recompose can reproduce this composition exactly
+    # (okengine#195): schema_lib.compose_schema auto-loads these when the caller passes no
+    # fragments — the in-gateway validator/conformance recompose then agrees with this artifact
+    # instead of silently omitting every enabled extension's schema.
+    composed["_fragments"] = [[owner, frag] for owner, frag in frags]
     artifact.write_text(yaml.safe_dump(composed, sort_keys=False, allow_unicode=True),
                         encoding="utf-8")
     return []

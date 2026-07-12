@@ -75,3 +75,20 @@ def test_prediction_bearing_coverage(tmp_path, monkeypatch):
         "---\ntype: prediction\nstatus: confirmed\nbasis:\n- '[[sources/uncited]]'\n---\n# p\n")
     _, dash = _run(tmp_path, monkeypatch)
     assert "Sources cited in `basis:` by an OPEN prediction: **1** of 2" in dash
+
+
+def test_list_shaped_publisher_does_not_crash(tmp_path, monkeypatch):  # invariant-audit #29
+    """The write path can store a LIST for an unquoted `publisher: [[wiki]]` value; a list key is
+    unhashable and used to kill the whole lane. _collect must stringify these fields so the render
+    degrades to one bucket instead of crashing."""
+    m = _load("source_portfolio_watch", "scripts/cron/source_portfolio_watch.py")
+    assert m._s(["entities/p/recorded-future"]) == "entities/p/recorded-future"
+    assert m._s(None) == "(unset)" and m._s([]) == "(unset)"
+    # a source page with a list-shaped publisher must not crash the run
+    s = tmp_path / "wiki" / "sources"
+    s.mkdir(parents=True)
+    (s / "x.md").write_text(
+        "---\ntype: source\nsignal_class: current-market-signal\nsource_kind: article\n"
+        "publisher:\n  - entities/p/recorded-future\nreliability: A\ningested: 2026-06-30\n---\n# s\n")
+    wake, dash = _run(tmp_path, monkeypatch)
+    assert "recorded-future" in dash

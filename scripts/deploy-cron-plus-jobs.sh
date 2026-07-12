@@ -36,20 +36,45 @@ HERMES_UID="$(resolve_hermes_uid "$PACK_DIR")"
 # the `hermes` user so ownership is correct (#18).
 DEST_IN="/opt/data/cron-plus/jobs.json"
 
-# Two-repo split (slice 2): cron-plus-jobs.json is GENERATED from the engine half
-# (config/engine-crons.json) + the domain pack ($PACK_DIR/crons/). If both sources
-# are present, regenerate first so the deploy reflects them. If the pack is absent
-# (e.g. disaster recovery from the engine repo alone), fall back to the committed
-# cron-plus-jobs.json as-is.
-if [ -f "$REPO_ROOT/config/engine-crons.json" ] && [ -d "$PACK_DIR/crons" ]; then
+# Two-repo split (slice 2): cron-plus-jobs.json is a per-pack GENERATED artifact (gitignored, never
+# committed) produced from the engine half (config/engine-crons.json) + the domain pack
+# ($PACK_DIR/crons/, optional — regen tolerates its absence for an engine-only pack). ALWAYS
+# regenerate for THIS pack so the deploy never ships a stale leftover from the last regen — which,
+# on a multi-pack host, could be a DIFFERENT pack's job set (invariant-audit #12). The old guard
+# skipped regen when a pack lacked crons/ and deployed whatever was lying around.
+if [ -f "$REPO_ROOT/config/engine-crons.json" ]; then
     CRON_PACK_DIR="$PACK_DIR" python3 "$REPO_ROOT/scripts/cron_pack_split.py" regen
 else
-    echo "  (pack not found at $PACK_DIR — deploying committed cron-plus-jobs.json as-is)"
+    # No engine-crons.json = a broken/partial engine checkout, NOT a valid DR source. The artifact is
+    # gitignored, so any $SRC present is a stale leftover — refuse rather than deploy it blind.
+    echo "ERROR: $REPO_ROOT/config/engine-crons.json missing — cannot regenerate the cron fleet." >&2
+    echo "       (cron-plus-jobs.json is a generated artifact, never committed; a leftover copy is" >&2
+    echo "        a stale/wrong-pack snapshot and will NOT be deployed.)  Restore the engine checkout." >&2
+    exit 1
 fi
 
 if [ ! -f "$SRC" ]; then
     echo "ERROR: $SRC not found.  Are you running from the repo root?" >&2
     exit 1
+fi
+
+# The regenerated artifact must belong to THIS pack: every domain lane carries a `pack:` provenance
+# marker (cron_pack_split), and none may name another pack — a mismatch means a wrong-pack artifact
+# slipped through (invariant-audit #12). Cheap earliest-gate check before touching the live store.
+TARGET_PACK="$(grep -oE '^name:[[:space:]]*[A-Za-z0-9._-]+' "$PACK_DIR/pack.yaml" 2>/dev/null | head -1 | awk '{print $2}' || true)"
+if [ -n "$TARGET_PACK" ]; then
+    FOREIGN="$(python3 -c '
+import json, sys
+target = sys.argv[2]
+print("\n".join(sorted({j.get("pack") for j in json.load(open(sys.argv[1]))["jobs"]
+                        if j.get("pack") and j.get("pack") != target})))
+' "$SRC" "$TARGET_PACK")"
+    if [ -n "$FOREIGN" ]; then
+        echo "ERROR: cron-plus-jobs.json carries domain lane(s) for OTHER pack(s):" >&2
+        echo "$FOREIGN" | sed 's/^/  FOREIGN-PACK  /' >&2
+        echo "  target pack is '$TARGET_PACK' — a stale/wrong-pack artifact. Regenerate for this pack." >&2
+        exit 1
+    fi
 fi
 
 # Expand any @jitter:* sentinels into concrete schedules for the DEPLOY copy. Engine crons
@@ -69,12 +94,20 @@ trap 'rm -f "$DEPLOY_JOBS"' EXIT
 BRIEF_HOUR="$(grep -oE '^OKENGINE_BRIEF_HOUR=[0-9]+' "$PACK_DIR/.env" 2>/dev/null | cut -d= -f2 || true)"
 BRIEF_HOUR="${BRIEF_HOUR:-7}"
 PYTHONPATH="$REPO_ROOT/scripts" python3 - "$SRC" "$DEPLOY_JOBS" "$PACK_DIR" "$BRIEF_HOUR" <<'PY'
-import sys, json, cron_jitter, model_profiles
+import sys, json, hashlib, random, cron_jitter, model_profiles
 src, out, pack_dir, brief_hour = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 d = json.load(open(src, encoding="utf-8"))
 jobs = d.get("jobs", [])
 bn = cron_jitter.expand_brief_jobs(jobs, brief_hour)
-n = cron_jitter.expand_jobs(jobs)
+# ENGINE crons ship @jitter sentinels and are re-expanded on EVERY deploy; with an unseeded
+# random.Random() each redeploy re-rolls every jittered lane's minute, and because the deploy strips
+# runtime fields (next_run_at recomputed from the new expr) a lane can silently skip or double-run
+# that cycle (invariant-audit #47). Seed the RNG from the pack identity so re-expansion is STABLE
+# across redeploys of the same install (idempotent) yet still differs between installs (the per-
+# install spread @jitter exists to provide). Job order is fixed by the source file, so each lane
+# keeps the same minute deploy-to-deploy.
+_seed = int(hashlib.sha256(pack_dir.encode("utf-8")).hexdigest(), 16) % (2**32)
+n = cron_jitter.expand_jobs(jobs, random.Random(_seed))
 try:
     profiles = model_profiles.load_profiles(pack_dir)
 except (ValueError, OSError) as e:
@@ -121,6 +154,29 @@ if ! docker exec "$CONTAINER" sh -c "test -f /opt/data/plugins/cron-plus/runner.
     exit 1
 fi
 
+# PRE-WRITE guard (okengine#162, invariant-audit #50): every deployed lane's `script` must be STAGED
+# in the gateway, or the lane fails SILENTLY (cron-plus runs the agent with no wake-gate and writes
+# nothing — how an enabled extension whose scripts were never deploy-cron-scripts'd goes dark).
+# Validate the DEPLOY copy against /opt/data/scripts BEFORE overwriting the live store, so a broken
+# set is rejected with the live jobs.json untouched (the old check ran AFTER the write and exited
+# without restoring the snapshot — the invalid store was already live and being scheduled).
+MISSING_SCRIPTS="$(docker exec -i -u "$HERMES_UID" "$CONTAINER" python3 -c '
+import json, os, sys
+for j in json.load(sys.stdin)["jobs"]:
+    s = (j.get("script") or "").strip()
+    if not s:
+        continue
+    p = s if s.startswith("/") else "/opt/data/scripts/" + s
+    if not os.path.isfile(p):
+        print((j.get("name") or "?") + " -> " + p)
+' < "$DEPLOY_JOBS")"
+if [ -n "$MISSING_SCRIPTS" ]; then
+    echo "ERROR: lane(s) reference scripts NOT staged in the gateway (live jobs.json UNCHANGED):" >&2
+    echo "$MISSING_SCRIPTS" | sed 's/^/  MISSING  /' >&2
+    echo "  fix: CRON_PACK_DIR='$PACK_DIR' bash '$REPO_ROOT/scripts/deploy-cron-scripts.sh', then re-run." >&2
+    exit 1
+fi
+
 # Create the runtime dir, snapshot any existing jobs.json, then stream the new one
 # in as `hermes` (so the cron-plus subprocess, also hermes, can read it).
 docker exec -u "$HERMES_UID" "$CONTAINER" mkdir -p /opt/data/cron-plus
@@ -130,30 +186,7 @@ docker exec -i -u "$HERMES_UID" "$CONTAINER" sh -c "cat > '$DEST_IN' && chmod 60
 echo "  deployed: $CONTAINER:$DEST_IN"
 
 JOB_COUNT=$(python3 -c "import json; print(len(json.load(open('$SRC'))['jobs']))")
-echo "  jobs: $JOB_COUNT"
-
-# --- guard (okengine#162): every deployed lane's `script` must be STAGED. A lane pointing at an
-#     unstaged script fails SILENTLY — cron-plus runs the agent with no wake-gate and writes nothing
-#     (how an enabled extension whose scripts were never deploy-cron-scripts'd goes dark). Fail-loud
-#     so a half-deployed stack cannot ship green. ---
-MISSING_SCRIPTS="$(docker exec -i -u "$HERMES_UID" "$CONTAINER" python3 - "$DEST_IN" <<'PY'
-import json, os, sys
-for j in json.load(open(sys.argv[1]))["jobs"]:
-    s = (j.get("script") or "").strip()
-    if not s:
-        continue
-    p = s if s.startswith("/") else "/opt/data/scripts/" + s
-    if not os.path.isfile(p):
-        print((j.get("name") or "?") + " -> " + p)
-PY
-)"
-if [ -n "$MISSING_SCRIPTS" ]; then
-    echo "ERROR: deployed lane(s) reference scripts that are NOT staged in the gateway:" >&2
-    echo "$MISSING_SCRIPTS" | sed 's/^/  MISSING  /' >&2
-    echo "  fix: CRON_PACK_DIR='$PACK_DIR' bash '$REPO_ROOT/scripts/deploy-cron-scripts.sh'" >&2
-    exit 1
-fi
-echo "  all $JOB_COUNT lane scripts staged"
+echo "  jobs: $JOB_COUNT (all lane scripts staged — validated pre-write)"
 
 echo ""
 echo "Done. cron-plus self-heals null next_run_at on the next tick (~60s)."

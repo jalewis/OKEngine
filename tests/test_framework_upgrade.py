@@ -618,3 +618,54 @@ def test_conformance_regressions_diff_is_before_after(tmp_path, monkeypatch):  #
     out = m._conformance_regressions(before, after)
     assert any("reg.md" in x for x in out)
     assert not any("stale.md" in x for x in out), f"pre-existing failure leaked into regressions: {out}"
+
+
+# --- invariant-audit v0.11.5 batch-4 -----------------------------------------
+
+def test_snapshot_refuses_when_disk_full(tmp_path, monkeypatch):  # invariant-audit #31
+    """snapshot() copies the whole source onto the vault's own filesystem; without a space check an
+    ENOSPC mid-copy left a partial, manifest-less snapshot AND filled the disk. Refuse up front."""
+    import collections
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    (pack / "big.md").write_text("x" * 1000)
+    D = collections.namedtuple("D", "total used free")
+    monkeypatch.setattr(m.shutil, "disk_usage", lambda p: D(0, 0, 10))   # ~no free space
+    with pytest.raises(OSError):
+        m.snapshot(pack, "s1")
+    assert not (pack / m.SNAPSHOTS_REL / "s1").exists()                  # no partial snapshot left
+
+
+def test_snapshot_cleans_partial_on_copy_failure(tmp_path, monkeypatch):  # invariant-audit #31
+    """A copy failure (ENOSPC / Ctrl-C) mid-snapshot must remove the partial dir so nothing mistakes
+    a manifest-less husk for a valid restore point or skews prune retention."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    (pack / "a.md").write_text("a")
+    (pack / "b.md").write_text("b")
+    real = m.shutil.copy2
+    state = {"n": 0}
+    def boom(src, dst):
+        state["n"] += 1
+        if state["n"] >= 2:
+            raise OSError("ENOSPC")
+        return real(src, dst)
+    monkeypatch.setattr(m.shutil, "copy2", boom)
+    with pytest.raises(OSError):
+        m.snapshot(pack, "s2")
+    assert not (pack / m.SNAPSHOTS_REL / "s2").exists()                  # partial removed
+
+
+def test_rollback_quarantines_added_files_never_deletes(tmp_path):  # invariant-audit #32
+    """The added/modified capture is non-atomic at vault scale, so a page a concurrent lane/MCP wrote
+    during the window can be misclassified as migration-added. Rollback must QUARANTINE such files
+    (move them under .okengine/rolled-back/<snap>/), never unlink — a rollback must not be lossy."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    snap = m.snapshot(pack, "s1")
+    (pack / "wiki").mkdir(exist_ok=True)
+    (pack / "wiki" / "live.md").write_text("concurrent content")        # a live write, not in snapshot
+    m.restore(pack, snap, added={Path("wiki/live.md")}, modified=set())
+    assert not (pack / "wiki" / "live.md").exists()                     # removed from its place
+    q = pack / ".okengine" / "rolled-back" / "s1" / "wiki" / "live.md"
+    assert q.read_text() == "concurrent content"                        # preserved, not destroyed

@@ -253,7 +253,14 @@ def _cmd_enable(args) -> int:
             "the risk for code you trust.")
 
     # 4. dry-run composition with the target added — fail-before-runtime (no write on error).
-    want_ids = set(enabled) | {args.id}
+    # Compose against the EFFECTIVE set (explicit opt-ins ∪ core default-ons), NOT just the explicit
+    # opt-ins: write_composed_schema/resolve_for_pack and the whole deploy use the effective set, so a
+    # dry-run over the narrower explicit set could pass while the real composition (with a core
+    # extension's schema fragment) conflicts — the fail-before-runtime guarantee validating a
+    # different composition than ships (invariant-audit #63).
+    eff_enabled, eff_err = disc.effective_enabled(pack, extensions)
+    fails += eff_err
+    want_ids = set(eff_enabled) | {args.id}
     resolved, res_err = disc.resolve_enabled(want_ids, extensions)
     fails += res_err
     _, comp_err, comp_warn = comp.compose(resolved)
@@ -417,7 +424,19 @@ def _cmd_disable(args) -> int:
             print(f"FAIL: {e}", file=sys.stderr)
         return 1
     _tokens().revoke(pack, args.id)            # revoke the scoped MCP token (okengine#132)
-    _composer().write_composed_schema(pack)    # regenerate composed schema without it (#133)
+    serr = _composer().write_composed_schema(pack)    # regenerate composed schema without it (#133)
+    if serr:
+        # write_composed_schema writes NOTHING on error, so the artifact still carries the
+        # just-disabled extension's owned types/namespaces — reporting clean success here would leave
+        # the enforced write path governed by a stale schema (invariant-audit #38). The canonical
+        # trigger is ANOTHER enabled extension left unresolvable by an engine/pack update; surface it.
+        for e in serr:
+            print(f"FAIL: composed-schema regen: {e}", file=sys.stderr)
+        print(f"disabled: {args.id} in state, but the composed schema was NOT regenerated (it still "
+              f"reflects the old enabled set). Resolve the errors above and re-run "
+              f"`framework extensions disable`/`enable` (or fix the offending extension), then "
+              f"redeploy.", file=sys.stderr)
+        return 1
     print(f"disabled: {args.id}")
     print("redeploy to apply — its cron job drops from the generated fleet. Pages it "
           "wrote are PRESERVED (orphaned); use `extensions purge` (#127) to remove them.")

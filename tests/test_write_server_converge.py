@@ -44,8 +44,9 @@ def _load(wiki_path: Path, schema: str = SCHEMA):
 
 
 def _read_id(m, rel):
-    import yaml
-    fm, _ = m._read_page(Path(os.environ["WIKI_PATH"]) / "wiki" / rel)
+    # Resolve through _safe so an entity rel lands at the same sharded canonical the write
+    # path normalized it to (entities/<slug> -> entities/<l>/<slug>.md); non-entity paths pass through.
+    fm, _ = m._read_page(m._safe(rel))
     return fm
 
 

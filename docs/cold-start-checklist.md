@@ -34,7 +34,7 @@ cd my-brain && bash ../okengine/scripts/deploy.sh            # build (once) + up
   entries from `feeds/feeds.opml.example` into `feeds/feeds.opml` and redeploy the
   crons. With empty feeds the deployment is nearly free.
 - **The agent works cold.** On a fresh deploy the ingest lane connects the read +
-  enforced-write MCP servers (21 tools), calls your model, and writes schema-
+  enforced-write MCP servers (~20 tools; see the MCP server for the exact set), calls your model, and writes schema-
   conformant pages (`type`, required fields, the `raw:` dedupe key, structured
   wikilinks). Verified end-to-end.
 

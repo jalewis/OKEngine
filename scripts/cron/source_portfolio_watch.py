@@ -71,6 +71,17 @@ def _parse_fm(text: str) -> dict | None:
         return None
 
 
+def _s(val) -> str:
+    """Stringify a frontmatter value that will be used as a hashable dict/Counter key. The write path
+    can store a LIST (an unquoted `publisher: [[wiki]]` mangles to a YAML list); a list key is
+    unhashable and crashed the whole lane (invariant-audit #29). Empty/None -> '(unset)'."""
+    if val is None or val == "" or val == []:
+        return "(unset)"
+    if isinstance(val, (list, tuple)):
+        return ", ".join(str(x) for x in val) or "(unset)"
+    return str(val)
+
+
 def _date(val) -> date | None:
     if isinstance(val, datetime):
         return val.date()
@@ -123,12 +134,17 @@ def _collect() -> list[dict]:
                 continue
             if not fm:
                 continue
+            # Coerce to str: these become dict/Counter KEYS in render(), but none is int/str-shaped in
+            # base-schema, and the write path can store a LIST for an unquoted `publisher: [[wiki]]`
+            # value — a list key raises TypeError('unhashable') and kills the whole lane
+            # (invariant-audit #29). _s stringifies any non-string (list -> joined) so a mangled field
+            # degrades to one bucket instead of crashing.
             out.append({
                 "stem": p.stem,
-                "signal_class": fm.get("signal_class") or "(unset)",
-                "source_kind": fm.get("source_kind") or "(unset)",
-                "publisher": fm.get("publisher") or "(unset)",
-                "reliability": str(fm.get("reliability") or "(unset)"),
+                "signal_class": _s(fm.get("signal_class")),
+                "source_kind": _s(fm.get("source_kind")),
+                "publisher": _s(fm.get("publisher")),
+                "reliability": _s(fm.get("reliability")),
                 "ingested": _date(fm.get("ingested") or fm.get("created")),
             })
     return out

@@ -28,24 +28,36 @@ This roadmap ties planned work to issues and priority. It supersedes the earlier
   dep/security scan (#54), docker build smoke (#55), coverage (#56), limited type-check (#57),
   dependency pinning (#58) — shipped as runnable `make` targets plus GitHub CI jobs.
 
-## Near-term (what's next — #79)
-The P0 gate and the first hardening tranche are shipped (above). The next tranche:
-1. **Operator dashboard** — cron health, ingest freshness, queue/budget, schema drift, review
-   queue, broken links, index freshness (#60).
-2. **Human review workflow** — lifecycle for `needs_review` (open/assigned/resolved/dismissed,
-   comments, audit) + reader UI (#69).
-3. **Backup & restore** — snapshot vault + runtime state, restore to a new deployment, verify
-   integrity, prune (#65).
-4. **Pack upgrade workflow** — guided diff/merge/validate for `framework pull --update` (#61).
+## ✅ Shipped since this roadmap was drafted (as of engine v0.11.x)
+Several items listed below as "near-term/later" have SINCE SHIPPED — cross-referenced with the
+code, not this list (invariant-audit / okengine#209 — a roadmap must not present delivered
+capabilities as future work):
+- **Operator dashboard** (`operator_dashboard.py`, the cockpit) — #60.
+- **Human review workflow** (`framework review`, `review_queue.py`) — #69.
+- **Backup & restore** (`framework backup` create/verify/restore/prune) — #65.
+- **Pack upgrade workflow** (`framework upgrade` + versioned `migrations/` + rollback gates) — #61/#66.
+- **Multi-pack composition preview** (`framework compose-preview`) — #72.
+- **Structured observability** (`health_export.py` — Prometheus textfile + webhook + heartbeat) — #64.
+- **Extension/plugin system** — 17 shipped tier-1 extensions + full enable/disable/compose lifecycle — #63.
+
+The lists below are the ORIGINAL #79 plan, kept for provenance; treat the shipped items above as done
+and rebuild the forward plan from the current open issues.
+
+## Near-term (original #79 plan — see ✅ Shipped above for what has since landed)
+1. **Operator dashboard** (SHIPPED) — cron health, ingest freshness, queue/budget, schema drift,
+   review queue, broken links, index freshness (#60).
+2. **Human review workflow** (SHIPPED) — lifecycle for `needs_review` + reader UI (#69).
+3. **Backup & restore** (SHIPPED) — snapshot vault + runtime state, restore, verify, prune (#65).
+4. **Pack upgrade workflow** (SHIPPED) — guided diff/merge/validate for `framework pull --update` (#61).
 5. **Search/index management UI** — surfaces the qmd/index state the verifier now checks (#68).
 
-## Platform & product (later)
+## Platform & product (later — several SHIPPED, see ✅ above)
 Search/index management UI (#68), content-provenance UI (#70), multi-pack composition preview
-(#72), versioned migration framework (#66), security hardening profile (#78), RBAC (#71),
-structured observability (#64), formal plugin/extension API (#63); import connectors beyond RSS
-(#76), static export/publishing with a portable OKF projection (#77), pack catalog UX (#62),
-one-command local sandbox (#73), golden conformance fixtures (#75), performance benchmarks
-(#74).
+(SHIPPED, #72), versioned migration framework (SHIPPED, #66), security hardening profile (#78),
+RBAC (#71), structured observability (SHIPPED, #64), formal plugin/extension API (SHIPPED, #63);
+import connectors beyond RSS (#76), static export/publishing with a portable OKF projection (#77),
+pack catalog UX (#62), one-command local sandbox (#73), golden conformance fixtures (#75),
+performance benchmarks (#74).
 
 ## Consolidation notes
 - **Overlaps to fold, not duplicate:** #60 / #64 / #68 are one *operator-visibility* cluster

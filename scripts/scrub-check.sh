@@ -12,16 +12,28 @@ set -uo pipefail   # NOT -e: a clean `git grep` returns 1 and must not abort the
 
 cd "$(git rev-parse --show-toplevel)" || { echo "scrub: not in a git repo" >&2; exit 2; }
 
-GLOBS=('*.py' '*.md' '*.yaml' '*.yml' '*.json' '*.sh' '*.toml')
+# Scan the WHOLE tracked tree (git grep skips binaries by default), matching the publish-time scrub
+# which greps the entire staged snapshot — the old 7-glob subset never scanned tracked files that SHIP
+# in the public snapshot (static/*.js|html|css, Dockerfiles, patches/*.patch, requirements*.txt,
+# .env.example, feeds.opml, Makefile, LICENSE), so a hardcoded private URL in app.js passed the gate
+# and only tripped at release (invariant-audit #55). EXCLUDE the paths publish-snapshot.sh also
+# excludes: the publish scrubber + its test (they legitimately CONTAIN the patterns), plus the
+# INTERNAL-only docs that never ship (they reference the dev remote / internal issues by design) —
+# keep this list in sync with publish-snapshot.sh's EXCLUDE array (invariant-audit #55/#56).
+EXCL=(
+  ':!scripts/publish-snapshot.sh' ':!tests/test_publish_snapshot.py'
+  ':!docs/release-checklist.md' ':!CLAUDE.md' ':!scripts/audit'
+  ':!docs/testing-and-audit.md' ':!docs/hermes-upgrades'
+  ':!docs/design/sec-threat-hunting-prd.md' ':!docs/design/sec-threat-hunting-technical-spec.md'
+)
 found=0
 
 # git grep: exit 0 (prints matches) when a leak IS present, exit 1 when clean. So a taken if-branch
-# == a leak. `|| true` keeps the no-match exit 1 from tripping anything.
-if git grep -inE "192\.168\." -- "${GLOBS[@]}"; then found=1; fi
+# == a leak.
+if git grep -inE "192\.168\." -- "${EXCL[@]}"; then found=1; fi
 
 if [ -f .scrub-patterns ]; then
-  if git grep -inE -f .scrub-patterns -- "${GLOBS[@]}" \
-        ':!scripts/publish-snapshot.sh' ':!tests/test_publish_snapshot.py'; then
+  if git grep -inE -f .scrub-patterns -- "${EXCL[@]}"; then
     found=1
   fi
 fi

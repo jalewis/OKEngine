@@ -36,7 +36,7 @@ RAG embeds document chunks and retrieves semantically similar fragments at query
 
 The vault therefore uses **lexical + hybrid search over the markdown itself** (see §7), not a vector store as the primary retrieval path.
 
-> **Reference implementation.** The engine is a pinned Hermes-Agent (v0.17.0, consumed as a dependency — not forked) + the `cron-plus` scheduler + LLM-wiki governance/maintenance machinery with an OKF-compatible validation floor, driving a fleet of autonomous cron jobs. The three-layer stack is literal: `raw/` (immutable, gitignored, durable storage) → `wiki/` (agent-maintained) → `schema.yaml` + the vault's persona `CLAUDE.md`. No RAG; search is qmd-hybrid + IWE + ripgrep (§7).
+> **Reference implementation.** The engine is a pinned Hermes-Agent (the exact pin is in `engine-manifest.yaml`, consumed as a dependency, not forked) + the `cron-plus` scheduler + LLM-wiki governance/maintenance machinery with an OKF-compatible validation floor, driving a fleet of autonomous cron jobs. The three-layer stack is literal: `raw/` (immutable, gitignored, durable storage) → `wiki/` (agent-maintained) → `schema.yaml` + the vault's persona `CLAUDE.md`. No RAG; search is qmd-hybrid + IWE + ripgrep (§7).
 
 ---
 
@@ -370,7 +370,7 @@ engine @ vX.Y.Z   +   <your pack>   →   a live second brain
 
 **Scaffolding.** A new pack is bootstrapped, then the engine version is pinned.
 
-> **Reference implementation.** The engine/pack boundary is declared in `engine-manifest.yaml` (the pinned Hermes-Agent stays at the repo root for clean upstream tracking, so the manifest *is* the logical boundary). Cron classification lives in `config/cron-tiers.yaml` (engine / engine-template / domain). The branded `framework` CLI scaffolds a new pack — `python scripts/framework.py init` (which calls `framework_init.py`) — with `framework validate` (`scripts/framework_validate.py`) as the pre-deploy pack check; the engine is versioned (`v0.2.0`) and a pack pins `engine.version`. Operator quickstart: `docs/deploy-a-new-domain.md`. The reference pack is **okpack-cti** (a security-focused LLM-wiki pack, maintained in its own repo).
+> **Reference implementation.** The engine/pack boundary is declared in `engine-manifest.yaml` (the pinned Hermes-Agent stays at the repo root for clean upstream tracking, so the manifest *is* the logical boundary). Cron classification lives in `config/cron-tiers.yaml` (engine / engine-template / domain). The branded `framework` CLI scaffolds a new pack — `python scripts/framework.py init` (which calls `framework_init.py`) — with `framework validate` (`scripts/framework_validate.py`) as the pre-deploy pack check; the engine is versioned (see `engine-manifest.yaml` `engine_release`) and a pack pins `engine.version`. Operator quickstart: `docs/deploy-a-new-domain.md`. The reference pack is **okpack-cti** (a security-focused LLM-wiki pack, maintained in its own repo).
 
 ### Scheduler mechanics (cron-plus)
 

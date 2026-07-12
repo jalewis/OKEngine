@@ -64,8 +64,11 @@ def test_predictions_open_floor_hot_regardless_of_date():
 
 def test_untiered_namespace_returns_none():
     assert t("dashboards/wardley/map") is None
-    assert t("briefings/2026/06/x") is None
-    assert t("research/sources/2026/06/x") is None   # a sub-domain untiered in this pack
+    assert t("operational/metrics") is None          # operational is not a tiered namespace
+    assert t("research/notes/x") is None             # a sub-domain namespace untiered in this pack
+    # briefings/findings/trends ARE tiered in the engine core (base-schema, 7 namespaces) — the
+    # _DEFAULT_TIER fallback now mirrors it, so they are no longer spuriously untiered (invariant-audit #51)
+    assert t("briefings/2026/06/x", {"published": "2026-06-10"}) == "hot"
 
 
 def test_tier_of_file_reads_frontmatter(tmp_path):
@@ -76,3 +79,20 @@ def test_tier_of_file_reads_frontmatter(tmp_path):
     assert TL.tier_of_file(p, wiki, CFG, TODAY) == "hot"
     p.write_text("---\ntype: entity\nname: Acme\nupdated: 2023-01-01\n---\n# Acme\n")
     assert TL.tier_of_file(p, wiki, CFG, TODAY) == "cold"
+
+
+def test_load_cfg_uses_the_shared_merged_schema_composer(tmp_path):
+    """invariant-audit #51: load_cfg must read the COMPOSED tier (base-schema ⊕ pack) via
+    schema_lib.merged_schema — the same composer select_daily_brief / pred_lib / the write path use —
+    so a pack that omits `tier:` inherits the engine core instead of a divergent hardcoded default."""
+    import os
+    import sys as _sys
+    _sys.path.insert(0, str(REPO / "scripts" / "cron"))
+    os.environ["OKENGINE_BASE_SCHEMA"] = str(REPO / "config" / "base-schema.yaml")
+    import schema_lib
+    (tmp_path / "schema.yaml").write_text(
+        "tier:\n  namespaces:\n    predictions:\n      open_values: [open, active, custom]\n")
+    cfg = TL.load_cfg(tmp_path)
+    composed = schema_lib.merged_schema(tmp_path).get("tier")
+    assert cfg == composed                                        # identical to the shared composer
+    assert "custom" in cfg["namespaces"]["predictions"]["open_values"]   # pack value composed on core

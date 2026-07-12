@@ -615,3 +615,39 @@ def test_bundle_malformed_recipe_is_a_fail(tmp_path):
     r = v.validate(pack)
     assert any(s == "FAIL" and c == "bundle recipe" for s, c, d in r.rows), r.rows
     assert v.main([str(pack), "--quiet"]) == 1
+
+
+def test_enabled_but_undiscovered_extension_fails_validate(tmp_path):  # invariant-audit #39
+    """An enabled id in .okengine/extensions.yaml that no longer resolves (e.g. an engine upgrade
+    renamed a tier-1 extension the operator had enabled) must FAIL `framework validate` — the deploy's
+    step-1 fail-fast gate — not first hard-stop at deploy step 5 AFTER every container was recreated.
+    check_extension_requirements only covered ids the pack DECLARES; enabled-only ids were unguarded."""
+    import yaml as _yaml
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    okd = pack / ".okengine"
+    okd.mkdir(exist_ok=True)
+    (okd / "extensions.yaml").write_text(
+        _yaml.safe_dump({"enabled": {"acme.ghost": {}}}), encoding="utf-8")
+    v = _load("framework_validate", VAL)
+    r = v.validate(pack)
+    fails = [(c, d) for s, c, d in r.rows if s == "FAIL"
+             and ("ghost" in d.lower() or "extension" in c.lower())]
+    assert fails, f"an enabled-but-undiscovered extension must FAIL validate; rows={r.rows}"
+    assert v.main([str(pack), "--quiet"]) == 1
+
+
+def test_unknown_partition_strategy_fails_validate(tmp_path):  # invariant-audit #25
+    """A partitioned namespace's `strategy` must be one okf_migrate knows — a typo (`by_date`) or
+    invented value silently degraded to flat while drains treated it as partitioned. Gate at validate."""
+    import yaml as _yaml
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    sp = pack / "schema.yaml"
+    sch = _yaml.safe_load(sp.read_text())
+    sch.setdefault("partitioning", {}).setdefault("namespaces", {})["sources"] = {
+        "strategy": "by_date", "date_field": "published"}     # underscore typo
+    sp.write_text(_yaml.safe_dump(sch))
+    v = _load("framework_validate", VAL)
+    rows = v.validate(pack).rows
+    assert any(s == "FAIL" and "strategy" in c and "by_date" in d for s, c, d in rows), rows

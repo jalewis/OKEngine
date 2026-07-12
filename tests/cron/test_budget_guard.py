@@ -435,3 +435,29 @@ def test_reconcile_repauses_cron_added_mid_trip(tmp_path, monkeypatch):
     assert "new-lane" in repaused                          # the mid-trip cron got re-paused
     assert ("pause", "new") in calls
     assert "new" in state["paused_ids"] and "old" in state["paused_ids"]   # folded in for resume
+
+
+def test_cost_bearing_no_agent_lane_is_paused():  # invariant-audit #36
+    """A no_agent lane that spends via llm_lib (marked cost_bearing) must be paused with the agent
+    lanes when over budget; a truly-free no_agent maintenance script keeps running."""
+    m = _load()
+    jobs = [
+        {"id": "a", "name": "reshelve", "no_agent": True},                    # free -> keep running
+        {"id": "b", "name": "enrich", "no_agent": True, "cost_bearing": True},  # paid no_agent -> pause
+        {"id": "c", "name": "ingest", "no_agent": False},                     # agent -> pause
+    ]
+    ids = {i for i, _ in m.cost_bearing_ids(jobs, self_name="budget-guard")}
+    assert ids == {"b", "c"}, ids
+
+
+def test_pause_marker_written_and_cleared_in_vault(tmp_path, monkeypatch):  # invariant-audit #37
+    """budget_guard signals a trip to OTHER surfaces via a marker in the SHARED vault (the reader
+    mounts it, not the gateway /opt/data) so /api/chat can honor the same trip. It appears on set and
+    is removed on clear."""
+    m = _load()
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    marker = tmp_path / ".okengine" / "budget-paused"
+    m._set_pause_marker(True, {"tripped_at": 123})
+    assert marker.is_file()
+    m._set_pause_marker(False)
+    assert not marker.exists()

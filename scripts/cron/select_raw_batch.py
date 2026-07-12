@@ -176,6 +176,13 @@ def path_tier(rel_path: str) -> int:
     return 1
 
 
+# Ingest-provenance frontmatter the compile agent must CARRY from the raw page onto the compiled
+# source page (okengine#194 — it rewrote frontmatter to the schema and silently dropped these, so
+# a vault could not be filtered/attributed by ingest source). Kept in ONE place; the base schema
+# lists the same keys under common_optional (cross-checked by tests/cron/test_select_raw_batch.py).
+PROVENANCE_KEYS = ("source_feed", "source_channel", "matched_query", "watch_lane", "quality_score")
+
+
 def main() -> int:
     if not VAULT.exists():
         print(f"ERROR: vault not found at {VAULT}", file=sys.stderr)
@@ -333,6 +340,11 @@ def main() -> int:
 
     print("## Files to ingest this batch (in order)\n")
     print("Process each in the order listed below. Each source page MUST set `raw:` to the relative path shown — that's the dedupe key.\n")
+    print("CARRY the raw page's ingest-provenance frontmatter onto the source page VERBATIM when "
+          f"present — {', '.join(f'`{k}`' for k in PROVENANCE_KEYS)}, plus any other *_score/*_id "
+          "provenance keys the raw page carries. Copy what exists; never invent values. These keys "
+          "are schema-legal on every type (base common_optional) — dropping them loses the vault's "
+          "ability to attribute/filter by ingest source (okengine#194).\n")
     print("If a raw file DUPLICATES a story that already has a source page (different slug), do NOT "
           "create a second page — instead APPEND this raw path to that existing source's `raw:` list "
           "(via `mcp_okengine_write_update_entity`). That records it as processed so it stops being "

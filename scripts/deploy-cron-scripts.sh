@@ -102,6 +102,31 @@ else
     echo "  (pack scripts not found at $PACK_SCRIPTS — engine-only deploy)"
 fi
 
+# --- reconcile: drop FLAT cron-script fossils no longer in source (invariant-audit #46). ---
+# tar extraction only ADDS/overwrites, never removes, so a script deleted or RENAMED in scripts/cron/
+# (e.g. moved into an extension, exactly d8657f7's select_prediction_candidates.py) lingers staged and
+# importable forever: check_crons still finds the fossil and passes green, so an unregenerated lane
+# silently keeps executing DELETED code. Remove any TOP-LEVEL *.py in /opt/data/scripts that isn't in
+# the current engine+pack source set. Namespaced extension subdirs are untouched (they reconcile via
+# their own stage plan below); the engine owns the flat *.py namespace here.
+ALLOW="$( { find "$SRC_DIR" -maxdepth 1 -name '*.py' -printf '%f\n'; \
+            if [ -d "$PACK_SCRIPTS" ]; then find "$PACK_SCRIPTS" -maxdepth 1 -name '*.py' -printf '%f\n'; fi; } | sort -u )"
+REMOVED="$(printf '%s\n' "$ALLOW" | docker exec -i -u "$HERMES_UID" "$CONTAINER" python3 -c '
+import os, sys
+allow = {l.strip() for l in sys.stdin if l.strip()}
+d = "/opt/data/scripts"
+out = []
+for name in sorted(os.listdir(d)):
+    p = os.path.join(d, name)
+    if name.endswith(".py") and os.path.isfile(p) and name not in allow:
+        os.unlink(p); out.append(name)
+print("\n".join(out))
+')"
+if [ -n "$REMOVED" ]; then
+    echo "  reconciled: removed stale staged script(s) no longer in source:"
+    printf '%s\n' "$REMOVED" | sed 's/^/    - /'
+fi
+
 # --- enabled extension scripts -> /opt/data/scripts/<id>/ (okengine#128) ---
 # Each enabled in-gateway operation extension stages its *.py into a NAMESPACED
 # subdir; the synthesized cron job's `script:` is /opt/data/scripts/<id>/<file>

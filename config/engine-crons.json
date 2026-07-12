@@ -253,7 +253,7 @@
     "enabled": true,
     "schedule": {
       "kind": "cron",
-      "expr": "0 7 * * *"
+      "expr": "30 8 * * *"
     },
     "workdir": "/opt/vault",
     "script": "select_page_quality_enrich.py",

@@ -253,6 +253,33 @@ def _apply_port_offset(dest: Path, offset: int) -> None:
     print(f"  ports: reader {rport}, mcp {mport} (offset {offset})")
 
 
+def _warn_busy_host_ports(dest: Path) -> None:
+    """Bind-check the pack's published host ports at pull time. reader AND cockpit publish container
+    9200 on SEQUENTIAL host ports (base+offset, base+offset+1), so two packs whose offsets differ by
+    exactly 1 share a host port — nothing enforces spacing and `docker compose up` only discovers it
+    by dying half-up (invariant-audit #64). A cheap bind test surfaces the clash before deploy."""
+    compose = dest / "docker-compose.yml"
+    if not compose.is_file():
+        return
+    import socket
+    text = compose.read_text(encoding="utf-8")
+    ports = sorted({int(m) for m in re.findall(r":(\d+):(?:9200|8730)\b", text)})
+    busy = []
+    for p in ports:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.1", p))
+        except OSError:
+            busy.append(p)
+        finally:
+            s.close()
+    if busy:
+        print(f"  ⚠ host port(s) already in use: {', '.join(map(str, busy))} — another stack holds "
+              f"them (reader+cockpit publish container 9200 on adjacent host ports, so offsets "
+              f"differing by 1 collide). Pick a --port-offset spaced ≥10 from other packs, or free "
+              f"the port(s) before `docker compose up`.")
+
+
 def _pack_meta_mod():
     """Load the sibling pack_meta module by path (no package assumptions)."""
     import importlib.util
@@ -371,6 +398,45 @@ def _resolve_member(name: str, bundle_spec: dict, catalog: dict | None) -> dict:
         f"  Add '{name}' to the catalog, or pull the bundle via okpacks-library:<bundle>.")
 
 
+_BUNDLE_IDENT_KEYS = ("name", "description", "mission")
+
+
+def _bundle_identity(dest: Path) -> dict:
+    """The thin bundle dir's display identity (single-line pack.yaml scalars), captured BEFORE
+    the host fetch clobbers pack.yaml (okengine#183)."""
+    out = {}
+    try:
+        txt = (dest / "pack.yaml").read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for k in _BUNDLE_IDENT_KEYS:
+        m = re.search(rf"^{k}:\s*(.+?)\s*$", txt, re.M)
+        if m:
+            out[k] = m.group(1)
+    return out
+
+
+def _apply_bundle_identity(dest: Path, ident: dict) -> None:
+    """Re-stamp the BUNDLE's identity onto the composed pack.yaml — the host fetch overwrote it,
+    so the reader/cockpit About panel described the vault as the HOST pack (okengine#183: okcti
+    showed "threat-actor tracking" instead of the composed CTI vault). Surgical line edits so the
+    host pack.yaml's comments/structure survive; owns/requires/ports stay the host's (they ARE the
+    composed vault's contract — only the display identity belongs to the bundle)."""
+    py = dest / "pack.yaml"
+    try:
+        txt = py.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for k in _BUNDLE_IDENT_KEYS:
+        if k not in ident:
+            continue
+        if re.search(rf"^{k}:", txt, re.M):
+            txt = re.sub(rf"^{k}:.*$", f"{k}: {ident[k]}", txt, count=1, flags=re.M)
+        else:
+            txt = re.sub(r"^(name:.*)$", rf"\1\n{k}: {ident[k]}", txt, count=1, flags=re.M)
+    py.write_text(txt, encoding="utf-8")
+
+
 def _expand_bundle(meta: dict, bundle_spec: dict, dest: Path, catalog: dict | None) -> None:
     """okengine#181: a `kind: bundle` pack is a RECIPE, not a vault. Turn `dest` into the
     composed vault in place — fetch the recipe's `host` pack over the thin bundle dir (it
@@ -380,6 +446,7 @@ def _expand_bundle(meta: dict, bundle_spec: dict, dest: Path, catalog: dict | No
     if errs:
         raise SystemExit("ERROR: malformed bundle recipe in pack.yaml:\n  " + "\n  ".join(errs))
     host, compose = meta["bundle_host"], meta["bundle_compose"]
+    ident = _bundle_identity(dest)               # capture before the host fetch clobbers pack.yaml
     print(f"  ⧉ bundle: host {host} + {len(compose)} composed pack(s): {', '.join(compose)}")
     print(f"    ↓ host {host}")
     fetch(_resolve_member(host, bundle_spec, catalog), dest, force=True)
@@ -394,6 +461,9 @@ def _expand_bundle(meta: dict, bundle_spec: dict, dest: Path, catalog: dict | No
                 raise SystemExit(
                     f"ERROR: install-domain of bundle member '{member}' failed (exit {rc}) — "
                     f"the recipe does not compose cleanly onto {host}.")
+    if ident:
+        _apply_bundle_identity(dest, ident)      # About describes the BUNDLE, not the host (#183)
+        print(f"    ✎ identity: {ident.get('name', host)} (bundle) re-stamped onto the composed pack.yaml")
     print(f"  ✓ bundle composed into {dest} (host {host} + {len(compose)} pack(s))")
 
 
@@ -483,7 +553,28 @@ def main(argv: list[str]) -> int:
             up = clone / spec["subdir"] if spec["subdir"] else clone
             if not up.is_dir():
                 raise SystemExit(f"ERROR: subdir '{spec['subdir']}' not found in {spec['giturl']}")
+            # invariant-audit HIGH #41: a `kind: bundle` upstream is a RECIPE, not a vault — an
+            # in-place file copy of the thin bundle dir does NOT re-run install-domain, so the
+            # composed layer (guest types/crons/schema) is silently left stale. Refuse it.
+            up_meta = _load_meta_safe(up)
+            if up_meta and up_meta.get("kind") == "bundle":
+                raise SystemExit(
+                    f"ERROR: '{spec['name']}' is a kind: bundle — `--update` can't recompose it "
+                    f"in place (it would copy only the recipe skin, leaving the composed guests "
+                    f"stale). Re-pull it fresh into a new dir, or update the member packs "
+                    f"individually.")
             s = _update_in_place(up, dest)
+            # invariant-audit HIGH #5: the update corridor writes NEW upstream files with zero
+            # collision analysis and bypasses all 7 coinstall preflight checks. On a COMPOSED vault
+            # (install-domain'd guests, marked in CLAUDE.md) a new file can collide with a guest's
+            # namespace/cron-id/port. We can't reliably re-run preflight here (the guest additions
+            # aren't in the upstream), so make the gap LOUD instead of silent.
+            _cm = dest / "CLAUDE.md"
+            _composed = _cm.is_file() and "## Installed domain:" in _cm.read_text(encoding="utf-8", errors="replace")
+            if _composed and s["added"]:
+                print(f"  ⚠ {len(s['added'])} new file(s) landed on a COMPOSED vault WITHOUT coinstall "
+                      f"preflight (cron-id / port / namespace collisions with install-domain'd guests "
+                      f"are NOT checked here). Re-validate before deploy and review the new files.")
         print(f"  + {len(s['added'])} new · ~ {len(s['changed'])} changed (.upstream written) · "
               f"= {s['unchanged']} unchanged")
         if s["added"]:
@@ -519,6 +610,7 @@ def main(argv: list[str]) -> int:
         cli_offset = bundle_offset
     offset, src = _resolve_offset(cli_offset, dest)
     _apply_port_offset(dest, offset)
+    _warn_busy_host_ports(dest)
     if offset and src == "pack.yaml":
         print(f"    (offset {offset} is the pack's declared default — override with --port-offset)")
     elif offset and is_bundle and cli_offset == bundle_offset and args.port_offset is None:

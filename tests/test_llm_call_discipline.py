@@ -37,3 +37,21 @@ def test_no_raw_model_calls_outside_llm_lib():
         "Raw model-endpoint call(s) outside llm_lib — use scripts/cron/llm_lib.py "
         "(reasoning-off policy baked in; see docs/common-issues.md):\n  "
         + "\n  ".join(offenders))
+
+
+def test_vendored_llm_lib_copies_are_byte_identical():  # invariant-audit #52
+    """The reasoning-off/truncation policy lives in THREE vendored llm_lib.py copies, and this gate
+    exempts them by FILENAME — so a policy fix to one and not the others (or a stale copy) passes CI
+    silently. Pin them byte-identical: a divergence is caught here, at the exact seam the by-name
+    allowlist leaves open."""
+    copies = [
+        REPO / "scripts" / "cron" / "llm_lib.py",
+        REPO / "extensions" / "okengine.relevance-gate" / "llm_lib.py",
+        REPO / "extensions" / "okengine.viz" / "llm_lib.py",
+    ]
+    present = [p for p in copies if p.is_file()]
+    assert len(present) >= 2, f"expected multiple vendored llm_lib.py copies, found {present}"
+    blobs = {p.read_bytes() for p in present}
+    assert len(blobs) == 1, (
+        "vendored llm_lib.py copies have DIVERGED — a policy fix landed in one but not the others:\n  "
+        + "\n  ".join(f"{p} ({len(p.read_bytes())} bytes)" for p in present))

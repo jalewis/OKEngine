@@ -415,7 +415,9 @@ def test_update_invalid_rejected_original_untouched(vault):
 
 def test_update_malformed_existing_frontmatter_refused(vault):
     m, root = vault
-    p = root / "wiki" / "entities" / "bad.md"
+    # existing pages live at the sharded canonical (entities/<l>/<slug>.md); _update
+    # normalizes the flat arg to the same shard, so plant the fixture there too.
+    p = root / "wiki" / "entities" / "b" / "bad.md"
     p.parent.mkdir(parents=True)
     p.write_text("---\ntype: entity\nname: [unterminated\n---\nbody")
     before = p.read_text()
@@ -1090,7 +1092,7 @@ def test_tombstone_marks_registry_so_converge_cannot_resurrect_in_process(vault)
     assert "tombstoned" in m._tombstone("entities/acme.md", "merged away")
     out = m._converge("entities/acme.md", "type: entity\nname: Acme Reborn\nid: authority:acme\n")
     assert "tombstoned" in out and "resurrect" in out, out          # refused, not resurrected
-    assert "status: tombstoned" in (root / "wiki" / "entities" / "acme.md").read_text()
+    assert "status: tombstoned" in (root / "wiki" / "entities" / "a" / "acme.md").read_text()
 
 
 def test_schema_reserved_files_refuses_all_write_tools(tmp_path, monkeypatch):
@@ -1125,8 +1127,11 @@ def test_future_date_rejected_on_converge_patch_append(vault):
     # patch injecting a future `published`
     pt = m._patch("entities/x.md", "name: X", "name: X\npublished: 2099-01-01")
     assert "future" in pt.lower() and "reject" in pt.lower(), pt
-    # append to a page that already carries a future date (planted directly, bypassing the guard)
-    (root / "wiki" / "entities" / "y.md").write_text(
+    # append to a page that already carries a future date (planted directly, bypassing the guard).
+    # Plant at the sharded canonical so _append_section's normalized lookup finds it.
+    yp = root / "wiki" / "entities" / "y" / "y.md"
+    yp.parent.mkdir(parents=True, exist_ok=True)
+    yp.write_text(
         "---\ntype: entity\nname: Y\npublished: 2099-01-01\n---\nbody\n", encoding="utf-8")
     ap = m._append_section("entities/y.md", "H", "note")
     assert "future" in ap.lower() and "reject" in ap.lower(), ap
@@ -1246,3 +1251,147 @@ def test_okf_always_covers_base_common_optional(drift_vault):
     base = yaml.safe_load((REPO / "config" / "base-schema.yaml").read_text(encoding="utf-8"))
     missing = set(base.get("common_optional") or []) - m._okf_always()
     assert not missing, f"_okf_always() omits base common_optional field(s): {sorted(missing)}"
+
+
+# ── invariant-audit v0.11.5 batch-2 (write-path contract) ─────────────────────────────────────
+
+def test_flat_entity_path_normalizes_to_shard(vault):
+    """M17: the flat `entities/<slug>` (2-part) form is the MOST COMMON wrong shape — it fell
+    through _normalize_entity_shard untouched and created an unsharded duplicate canonical."""
+    m, root = vault
+    assert m._normalize_entity_shard("entities/qilin") == "entities/q/qilin.md"
+    assert m._normalize_entity_shard("entities/qilin.md") == "entities/q/qilin.md"
+    # a create at the flat path lands at the sharded canonical, not entities/qilin.md
+    m._create("entities/qilin", "type: entity\nname: Qilin", "body")
+    assert (root / "wiki" / "entities" / "q" / "qilin.md").is_file()
+    assert not (root / "wiki" / "entities" / "qilin.md").exists()
+
+
+def test_unknown_permission_key_fails_closed(vault):
+    """L58: a typo'd namespace permission key (`creat: false`) was silently dropped and the
+    namespace defaulted OPEN — a human-authored ns could go agent-writable with no error."""
+    m, root = vault
+    import pytest
+    (root / "schema.yaml").write_text(_SCHEMA.replace(
+        "    findings:\n      create: false\n      update: false",
+        "    findings:\n      creat: false\n      update: false"), encoding="utf-8")
+    with pytest.raises(ValueError):
+        m._ns_perm(m.governing_policy(str(root / "wiki" / "findings" / "x.md")), "findings")
+
+
+def test_tombstone_refuses_malformed_frontmatter_instead_of_wiping(vault):
+    """M18: a page with malformed YAML frontmatter parsed to {} and the tombstone/append silently
+    WIPED it. Now refused, page untouched."""
+    m, root = vault
+    p = root / "wiki" / "entities" / "a" / "acme.md"
+    p.parent.mkdir(parents=True)
+    p.write_text("---\ntype: entity\nname: Acme\n\tbad: tab\n---\nbody\n", encoding="utf-8")  # tab -> invalid YAML
+    before = p.read_text()
+    out = m._tombstone("entities/a/acme", "dup")
+    assert out.startswith("refused") and "frontmatter" in out
+    assert p.read_text() == before                       # untouched
+    out2 = m._append_section("entities/a/acme", "Notes", "x")
+    assert out2.startswith("refused")
+    assert p.read_text() == before
+
+
+def test_converge_refuses_on_disk_tombstone(vault):
+    """M14: a page hand-tombstoned on disk since the last (6h) id-index rebuild slipped past the
+    registry check and got resurrected by converge. The on-disk status is now trusted."""
+    m, root = vault
+    m._create("entities/a/akira", "type: entity\nname: Akira\nid: akira", "body")
+    p = root / "wiki" / "entities" / "a" / "akira.md"
+    txt = p.read_text().replace("name: Akira", "name: Akira\nstatus: tombstoned")
+    p.write_text(txt, encoding="utf-8")
+    out = m._converge("entities/a/akira", "type: entity\nname: Akira\nid: akira", "resurrected")
+    assert "tombstoned" in out and out.startswith("refused")
+    assert "resurrected" not in p.read_text()
+
+
+def test_patch_converges_drift_and_flags_degeneration(drift_vault):
+    """M15: patch_entity bypassed drift normalization AND the review flags. A surgical edit that
+    introduces an aliased field (country->suspected_origin) / value (CN->China) landed RAW — the
+    identical change via update converged — and a degenerate body arrived with no needs_review."""
+    import yaml
+    m, root = drift_vault
+    m._create("entities/a/apt-z", "type: intrusion-set\nname: APT-Z\nmotivation: espionage", "seed")
+    p = root / "wiki" / "entities" / "a" / "apt-z.md"
+    out = m._patch("entities/a/apt-z", "name: APT-Z", "name: APT-Z\ncountry: CN")
+    assert out.startswith("patched"), out
+    fm = yaml.safe_load(p.read_text().split("---")[1])
+    assert fm.get("suspected_origin") == "China" and "country" not in fm   # converged, not raw
+    # a degenerate body introduced by patch is now flagged for review (was silent before)
+    salad = " ".join(f"z{i}" for i in range(400))
+    out2 = m._patch("entities/a/apt-z", "seed", salad + ".")
+    assert out2.startswith("patched"), out2
+    assert "needs_review: true" in p.read_text()
+
+
+def test_append_flags_degenerate_content(vault):
+    """M15: append_to_section is the documented hot path for a briefing's `## Recent activity`,
+    yet it skipped the degeneration flag entirely — a word-salad append landed unattributed."""
+    m, root = vault
+    m._create("entities/b/brief", "type: entity\nname: Brief", "# Brief\n\nClean prose. It ends.\n")
+    p = root / "wiki" / "entities" / "b" / "brief.md"
+    salad = " ".join(f"term{i}" for i in range(400))
+    out = m._append_section("entities/b/brief", "Recent activity", salad + ".")
+    assert out.startswith("appended"), out
+    assert "needs_review: true" in p.read_text()
+
+
+def test_extension_id_is_not_client_forgeable(vault):
+    """M14: extension_id is SERVER-DERIVED provenance that `extensions purge --yes` HARD-deletes by —
+    the one non-tombstone delete. It was stamped only on create-by-extension, so update/patch/converge
+    (and admin create) let ANY caller set or reassign it: forge another extension's id onto a curated
+    page and purge unlink()s a page it never wrote. Every write must strip a supplied value and keep
+    the immutable create-time stamp."""
+    import yaml
+    m, root = vault
+
+    def as_ext(ext_id):
+        m._caller_var.set({"kind": "extension", "ext_id": ext_id, "write_scopes": ["entities/**"]})
+
+    def fm_of(rel):
+        return yaml.safe_load((root / "wiki" / rel).read_text().split("---")[1])
+
+    try:
+        # create by ext-a stamps ext-a; a client-supplied extension_id in the same call is ignored
+        as_ext("ext-a")
+        m._create("entities/x/xr", "type: entity\nname: Xr\nextension_id: ext-evil", "b")
+        assert fm_of("entities/x/xr.md")["extension_id"] == "ext-a"
+        # a DIFFERENT extension updating cannot reassign it (forge attempt via frontmatter)
+        as_ext("ext-b")
+        m._update("entities/x/xr", "extension_id: ext-b")
+        assert fm_of("entities/x/xr.md")["extension_id"] == "ext-a"    # immutable, preserved
+        # patch cannot reassign it either
+        m._patch("entities/x/xr", "name: Xr", "name: Xr\nextension_id: ext-c")
+        assert fm_of("entities/x/xr.md")["extension_id"] == "ext-a"
+        # converge cannot reassign it
+        m._converge("entities/x/xr", "type: entity\nname: Xr\nid: authority:xr\nextension_id: ext-d", "b2")
+        assert fm_of("entities/x/xr.md")["extension_id"] == "ext-a"
+    finally:
+        m._caller_var.set(None)
+
+    # an ADMIN (stdio) create supplying extension_id gets no stamp — it is not forgeable into existence
+    m._create("entities/y/yr", "type: entity\nname: Yr\nextension_id: ext-x", "b")
+    assert "extension_id" not in fm_of("entities/y/yr.md")
+
+
+def test_update_entity_wrapper_passes_body_and_frontmatter_through(vault):
+    """M22: the @mcp.tool() wrappers carry real falsy-mapping logic (update_entity maps
+    frontmatter_yaml='' -> None and passes body='' -> clear / None -> keep), but the okengine#52
+    regression pins m._update, not the wrapper — so a 'normalize falsy' cleanup to the wrapper (body
+    or None) could reintroduce #52 with the suite green. Exercise the wrapper itself."""
+    m, root = vault
+    if m.mcp is None:
+        pytest.skip("mcp not installed — wrapper not defined")
+    m.create_entity("entities/f/foo", "type: entity\nname: Foo", "original body text")
+    p = root / "wiki" / "entities" / "f" / "foo.md"
+    m.update_entity("entities/f/foo")                        # body omitted (None) -> keep
+    assert "original body text" in p.read_text()
+    m.update_entity("entities/f/foo", frontmatter_yaml="")   # "" -> None -> keep fm, no reject
+    assert "original body text" in p.read_text()
+    out = m.update_entity("entities/f/foo", body="")         # "" -> CLEAR body (the #52 contract)
+    assert out.startswith("updated"), out
+    assert "original body text" not in p.read_text()
+    assert p.read_text().split("---", 2)[2].strip() == ""

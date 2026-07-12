@@ -14,6 +14,67 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
 > **About panel** (reader/cockpit deployment purpose + composition from live state); and now **pack
 > bundles** (v0.10.0). If you are jumping from v0.3.5, read v0.4.0 onward.
 
+## v0.11.5
+
+Correctness patch — the seven-issue backlog triaged after v0.11.4, in three fix waves. Every fix:
+root cause + a validation at the earliest gate + a red-proven regression test.
+
+- **fix(mcp #198):** `_run` starts helpers in their own process group and `killpg`s the tree on
+  timeout — the orphaned-`iwe` leak (internal timeouts were cosmetic; grandchildren piled up) is
+  red-proven dead.
+- **fix(mcp #199):** `graph_stats` serves from the `wiki/.backlinks.json` artifact (meta + hubs +
+  no-inbound count); live whole-graph IWE rebuilds remain only as the no-artifact fallback.
+- **fix(pull #183):** a composed bundle keeps the BUNDLE's About identity (name/description/
+  mission re-stamped after the host fetch; owns/ports stay the host's).
+- **fix(schema #195):** the composed-schema artifact records its fragment INPUTS (`_fragments`)
+  and `schema_lib.compose_schema` auto-loads them — the deploy-side and in-gateway composers of
+  one contract now agree (kills the un-clearable "composed-schema STALE" false positive;
+  conformance now sees extension-owned types).
+- **fix(ingest #194):** the raw→wiki compile CARRIES ingest provenance (`source_feed` & co.) as a
+  two-surface contract keyed off one constant (wake prompt + base `common_optional`,
+  cross-checked in CI). Fleet data repaired: 5,156 source pages re-attached to their provenance.
+- **fix(crons #197):** cron-plus (pin `6b230dc`→`ee6d9f1`) gains ownership-preserving writes (a
+  root `docker exec` can no longer silently kill every lane) + a loud `.scheduler-stalled`
+  sentinel; `deployment_validate` FAILs foreign-owned stores and the sentinel.
+- **fix(skeleton #208):** the documented bare-compose sequence seeds the MCP token
+  (ensure-runtime) before `up` — live-confirmed up-in-1s with a token, crash-loop control intact.
+
+Deploy surfaces: gateway image (schema_lib — a baked write-path lib; watch the drift check) and
+MCP image (server.py) both rebuild; cron-plus plugin updates to the new pin per deployment.
+
+### Invariant-audit remediation (all 65 confirmed findings + doc audit okengine#209)
+
+The pre-release invariant audit (checklist step 2b) surfaced **65 confirmed cross-surface findings**
+(5 high · 36 medium · 24 low) — non-obvious traps where a value/invariant must agree across surfaces
+and nothing enforced it. **All 65 were fixed in this release** (no deferral, no waiver), each with the
+standing pattern: root cause + a validation at the earliest gate + a red-proven regression test.
+Issue **okengine#209**'s documentation-drift audit was folded in. By subsystem:
+
+- **Write path** (`okengine-mcp/write_server.py`): `extension_id` provenance made unforgeable across
+  update/patch/converge; converge refuses an on-disk-tombstoned page; patch/append/converge now run
+  the same drift + degeneration + dead-link review gate as create/update; flat `entities/<slug>`
+  paths normalize to the shard canonical; malformed-YAML frontmatter is refused (not wiped);
+  namespace permission keys fail closed; the `@mcp.tool` wrappers gained coverage.
+- **Deploy/staging**: dirty-tree image staleness; config.yaml force-recreate; always-regenerate crons
+  (never a stale/wrong-pack artifact) + pack-provenance guard; deterministic jitter seed; validate the
+  staged-script set before overwriting the live store; reconcile staged fossils; no vacuous ownership PASS.
+- **Framework CLI**: consistent SQLite backups (online-backup API) + symlink warnings; upgrade snapshot
+  disk-check + partial cleanup; rollback quarantines instead of deleting; yaml-free manifest pin read;
+  enabled-extension resolve gate; disable/enable compose the effective set + fail loud; port-collision
+  preflight.
+- **Cron scripts**: dir-ownership + fossil detection; offpeak/okf/tier silent-degradation guards; list/
+  semver crash guards; schema-driven namespaces; `budget_guard` pauses `cost_bearing` no_agent lanes;
+  `cron_pack_split` routes pack-marked dotted names to domain.
+- **Extensions + reader/cockpit**: mtime-based delta detection; non-string alias tolerance; unimplemented
+  panel kind dropped; reader chat honors the budget trip (shared-vault marker); cockpit `today_prefix`
+  in UTC; MCP index-refresh env forwarded; manual bring-up docs use `--build`.
+- **Constants/pins**: `new-pack.sh`/`apply.sh` read the pin from the manifest; patch-count + pyproject
+  version bound by test; `page-quality-enrich` moved off the morning stagger; `health_export` gained an
+  external dead-man's-switch heartbeat.
+- **CI/publish/scrub gates**: mcp install hard-fails + verifies import; the pre-commit scrub scans the
+  whole tracked tree; publish/CI test parity; Makefile target guards the excluded script; the three
+  vendored `llm_lib.py` copies are pinned byte-identical.
+
 ## v0.11.4
 
 Patch: the fixes + install-experience work accumulated after the v0.11.3 tag, re-aligning the

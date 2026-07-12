@@ -42,31 +42,59 @@ def _engine_meta():
     return m
 
 
+def _manifest_scalar(key: str) -> str | None:
+    """Read a `key: value` scalar from engine-manifest.yaml WITHOUT PyYAML. engine_meta._load()
+    returns {} when PyYAML is missing, which used to drop these to a HARDCODED literal that rotted
+    two Hermes bumps behind the real pin (invariant-audit #44). Parsing the manifest directly keeps a
+    yaml-less scaffold honest. First match wins. `pinned_tag`/`engine_release` are unique here."""
+    try:
+        for line in (ENGINE_ROOT / "engine-manifest.yaml").read_text(encoding="utf-8").splitlines():
+            m = re.match(rf"\s*{re.escape(key)}:\s*(\S+)", line)
+            if m:
+                return m.group(1).strip()
+    except OSError:
+        pass
+    return None
+
+
 def engine_version() -> str:
-    # The engine manifest is authoritative — this is the SAME value
-    # `framework validate` requires a pack to pin, so a fresh scaffold always
-    # matches the engine it was scaffolded from. Fall back to the git tag only if
-    # the manifest can't be read.
+    # The engine manifest is authoritative — this is the SAME value `framework validate` requires a
+    # pack to pin, so a fresh scaffold always matches the engine it was scaffolded from. Fall back to
+    # a yaml-free manifest read (still authoritative), then the git tag; never a rotting literal.
     try:
         v = _engine_meta().engine_release()
         if v:
             return v
     except Exception:
         pass
+    v = _manifest_scalar("engine_release")
+    if v:
+        return v
     try:
         out = subprocess.run(["git", "-C", str(ENGINE_ROOT), "describe", "--tags",
                               "--match", "v*", "--abbrev=0"],
                              capture_output=True, text=True, timeout=10)
-        return (out.stdout or "").strip() or "v0.3.3"
+        v = (out.stdout or "").strip()
+        if v:
+            return v
     except Exception:
-        return "v0.3.3"
+        pass
+    raise SystemExit("ERROR: cannot determine engine_release (manifest unreadable, no git tag) — "
+                     "refusing to stamp a guessed engine version")
 
 
 def hermes_pin() -> str:
     try:
-        return _engine_meta().hermes_pin() or "v2026.6.19"
+        v = _engine_meta().hermes_pin()
+        if v:
+            return v
     except Exception:
-        return "v2026.6.19"
+        pass
+    v = _manifest_scalar("pinned_tag")          # yaml-free fallback — no rotting literal (#44)
+    if v:
+        return v
+    raise SystemExit("ERROR: cannot read the Hermes pin (pinned_tag) from engine-manifest.yaml — "
+                     "refusing to stamp a guessed pin")
 
 
 def _tokens(dest: Path, domain: str, offset: int) -> dict[str, str]:
@@ -181,7 +209,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--interactive", action="store_true", help="prompt for inputs")
     ap.add_argument("--no-compose", action="store_true", help="drop docker-compose.yml")
     ap.add_argument("--port-offset", type=int, default=0,
-                    help="add to reader(9200)/mcp(8730) ports to avoid host collisions")
+                    help="add to reader(9200)/cockpit(offset+1)/mcp(8730) host ports to avoid "
+                         "collisions; SPACE offsets >=10 between packs — cockpit takes offset+1, so "
+                         "offsets differing by 1 collide (#64)")
     args = ap.parse_args(argv)
 
     # Interactive when asked, or when no dest given and we have a TTY.

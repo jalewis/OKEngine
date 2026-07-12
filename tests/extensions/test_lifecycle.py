@@ -190,3 +190,31 @@ def test_cli_stage_plan_prints_id_and_dir(tmp_path, capsys):
     ext_id, _, ext_dir = out.partition("\t")
     assert ext_id == "demo.alpha"
     assert ext_dir.endswith("/extensions/demo.alpha")
+
+
+# --- invariant-audit v0.11.5 batch-4 -----------------------------------------
+
+def test_disable_fails_loud_when_recompose_errors(tmp_path, capsys):  # invariant-audit #38
+    """`extensions disable` must NOT report clean success when write_composed_schema errors — the
+    artifact is left untouched (still governing with the old set), so the enforced write path runs on
+    a stale schema. The canonical trigger is ANOTHER enabled extension left undiscovered by an update."""
+    disc, cli = _disc(), _cli()
+    pack = tmp_path / "pack"
+    _write_ext(pack, "demo.alpha")
+    disc.set_enabled(pack, "demo.alpha", True)
+    disc.set_enabled(pack, "demo.ghost", True)          # enabled but never discovered -> recompose errors
+    rc = cli.main(["disable", str(pack), "demo.alpha"])
+    assert rc == 1, "disable must fail loud when the composed-schema regen errors"
+    err = capsys.readouterr().err
+    assert "demo.ghost" in err and "composed-schema" in err.lower()
+
+
+def test_enable_dry_run_uses_effective_set_not_just_explicit():  # invariant-audit #63
+    """The enable dry-run must compose over the EFFECTIVE set (explicit opt-ins ∪ core default-ons),
+    the same set write_composed_schema/deploy use — else fail-before-runtime validates a different
+    composition than ships. Structural guard (a core schema-bringing extension is not constructible
+    today without modifying the engine)."""
+    src = CLI_PATH.read_text()
+    body = src[src.index("def _cmd_enable"):src.index("def _cmd_disable")]
+    assert "effective_enabled" in body, \
+        "enable dry-run must build want_ids from effective_enabled, not just load_enabled_state"

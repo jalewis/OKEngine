@@ -73,3 +73,35 @@ def test_all_companion_exts_are_covered():
     src = SCRIPT.read_text()
     for ext in COMPANION_EXTS:
         assert f'"{ext}"' in src, f"{ext} missing from select_raw_batch"
+
+
+def test_provenance_carry_contract_prompt_and_base_schema_agree(tmp_path):
+    """okengine#194: the compile agent silently dropped ingest-provenance frontmatter
+    (source_feed & co.) because nothing told it to carry them AND the base schema didn't
+    know them (unknown-field flags discourage extras). Multi-surface contract: the wake
+    prompt must instruct the carry using PROVENANCE_KEYS, and every one of those keys must
+    be schema-legal in the base's common_optional — a key added to one surface but not the
+    other fails HERE, not on a live vault."""
+    import importlib.util
+    import yaml
+
+    spec = importlib.util.spec_from_file_location("select_raw_batch", SCRIPT)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    keys = m.PROVENANCE_KEYS
+    assert keys, "PROVENANCE_KEYS must be non-empty"
+
+    # surface 1: the emitted prompt carries the instruction + every key by name
+    (tmp_path / "wiki" / "sources").mkdir(parents=True)
+    raw = tmp_path / "raw" / "2026"
+    raw.mkdir(parents=True)
+    (raw / "a.txt").write_text("content")
+    out = _run(tmp_path)
+    assert "CARRY the raw page's ingest-provenance" in out
+    for k in keys:
+        assert f"`{k}`" in out, f"prompt does not name provenance key {k!r}"
+
+    # surface 2: the base schema lists the SAME keys (schema-legal on every type)
+    base = yaml.safe_load((REPO / "config" / "base-schema.yaml").read_text())
+    missing = [k for k in keys if k not in (base.get("common_optional") or [])]
+    assert not missing, f"base-schema common_optional is missing provenance key(s): {missing}"

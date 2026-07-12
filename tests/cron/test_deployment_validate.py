@@ -909,3 +909,145 @@ def test_staged_but_not_folded_warns_even_for_a_core_extension(tmp_path):  # inv
     assert any(lvl == "WARN" and "okengine.contradictions" in msg and "NO lane" in msg
                for lvl, _, msg in m.F), list(m.F)
     assert not any(lvl == "FAIL" for lvl, _, _ in m.F), "staged-but-not-folded is a WARN, not a FAIL"
+
+
+import json as _json197  # noqa: E402  (this file predates the json need; local alias avoids clashes)
+
+# --- okengine#197: cron store ownership + stall sentinel -------------------------------------
+
+def _run_cron_check(tmp_path, monkeypatch, *, owner_uid=None, sentinel=None):
+    vault = tmp_path / "vault"
+    data = tmp_path / "data"
+    (vault / "wiki").mkdir(parents=True)
+    cp = data / "cron-plus"
+    cp.mkdir(parents=True)
+    (cp / "jobs.json").write_text(_json197.dumps({"jobs": [{"id": "a1", "name": "j1"}]}))
+    if sentinel is not None:
+        (cp / ".scheduler-stalled").write_text(_json197.dumps(sentinel))
+    monkeypatch.setenv("WIKI_PATH", str(vault))
+    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["deployment_validate"] = m
+    spec.loader.exec_module(m)
+    m.F.clear()
+    m.VAULT, m.DATA = vault, data
+    if owner_uid is not None:                 # simulate a foreign-owned store without needing root
+        real_stat = type(cp / "jobs.json").stat
+
+        class _St:
+            def __init__(self, st): self._st, self.st_uid = st, owner_uid
+            def __getattr__(self, k): return getattr(self._st, k)
+        monkeypatch.setattr(type(cp / "jobs.json"), "stat",
+                            lambda self, **kw: _St(real_stat(self, **kw)))
+    m.check_crons()
+    return list(m.F)
+
+
+def test_cron_store_foreign_owner_fails(tmp_path, monkeypatch):
+    """okengine#197: jobs.json owned by root (a docker-exec write) silently kills every lane —
+    the validator must go RED, not rely on an operator noticing frozen last_run_at."""
+    f = _run_cron_check(tmp_path, monkeypatch, owner_uid=0)
+    assert any(l == "FAIL" and "owned by uid 0" in msg for l, c, msg in f), f
+
+
+def test_cron_store_own_uid_passes(tmp_path, monkeypatch):
+    f = _run_cron_check(tmp_path, monkeypatch)
+    assert not any(l == "FAIL" and "owned by uid" in msg for l, c, msg in f), f
+
+
+def test_scheduler_stalled_sentinel_fails(tmp_path, monkeypatch):
+    """The cron-plus .scheduler-stalled sentinel (dropped when the store is unreadable) must be
+    a FAIL with the recorded cause — silence never reads as healthy."""
+    f = _run_cron_check(tmp_path, monkeypatch,
+                        sentinel={"error": "Permission denied: jobs.json", "at": "2026-07-08T01:00:00Z"})
+    assert any(l == "FAIL" and "STALLED" in msg and "Permission denied" in msg for l, c, msg in f), f
+
+
+def _run_provenance_check(monkeypatch, pack):
+    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["deployment_validate"] = m
+    spec.loader.exec_module(m)
+    m.F.clear()
+    if pack is None:
+        monkeypatch.delenv("OKENGINE_PACK", raising=False)
+    else:
+        monkeypatch.setenv("OKENGINE_PACK", pack)
+    m.check_provenance_env()
+    return list(m.F)
+
+
+def test_provenance_env_unset_warns(monkeypatch):
+    """invariant-audit M14/#750: no OKENGINE_PACK in the gateway env -> the write path stamps no
+    composition provenance. Undetectable at runtime, so the in-gateway validator must WARN."""
+    f = _run_provenance_check(monkeypatch, None)
+    assert any(l == "WARN" and c == "provenance" and "OKENGINE_PACK" in msg for l, c, msg in f), f
+
+
+def test_provenance_env_set_is_clean(monkeypatch):
+    f = _run_provenance_check(monkeypatch, "okpack-example")
+    assert not any(c == "provenance" for l, c, msg in f), f
+
+
+# --- invariant-audit v0.11.5 batch-5 (cron scripts) --------------------------------------------
+
+def _load_dv5(tmp_path, vault):
+    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["deployment_validate"] = m
+    spec.loader.exec_module(m)
+    m.F.clear()
+    m.VAULT = vault
+    return m
+
+
+def test_check_ownership_flags_stray_directory(tmp_path, monkeypatch):  # invariant-audit #8
+    """A root-owned DIRECTORY (from a bare root docker exec) is unwritable by the lane uid — the
+    atomic-write pattern can't create pages in it — but the old file-only check skipped dirs and went
+    green. check_ownership must flag stray dirs too."""
+    vault = tmp_path / "vault"
+    (vault / "wiki" / "notes" / "sub").mkdir(parents=True)          # a nested dir
+    (vault / "wiki" / "notes" / "page.md").write_text("p")         # a file
+    m = _load_dv5(tmp_path, vault)
+    monkeypatch.setattr(m.os, "geteuid", lambda: m.os.getuid() + 99999)  # every path reads as foreign
+    m.check_ownership()
+    f = list(m.F)
+    assert any(l == "FAIL" and c == "ownership" and "dir" in msg for l, c, msg in f), f
+
+
+def test_check_rules_flags_duplicate_rule_ids(tmp_path):  # invariant-audit #21 (was untested)
+    vault = tmp_path / "vault"
+    (vault / "config").mkdir(parents=True)
+    (vault / "config" / "rules.yaml").write_text(
+        "rules:\n  - {id: r1}\n  - {id: r1}\n  - {id: r2}\n")
+    m = _load_dv5(tmp_path, vault)
+    m.check_rules()
+    assert any(l == "FAIL" and c == "rules" and "r1" in msg for l, c, msg in m.F), list(m.F)
+
+
+def test_check_subdomains_warns_on_typeless_subdomain(tmp_path):  # invariant-audit #21 (was untested)
+    vault = tmp_path / "vault"
+    sub = vault / "wiki" / "research"
+    sub.mkdir(parents=True)
+    (sub / "schema.yaml").write_text("types: {}\n")
+    m = _load_dv5(tmp_path, vault)
+    m.check_subdomains()
+    assert any(l == "WARN" and c == "sub-domains" and "no types" in msg for l, c, msg in m.F), list(m.F)
+
+
+def test_tz_remediation_mentions_nulling_next_run_at(tmp_path, monkeypatch):  # invariant-audit #53
+    """The TZ remediation must tell the operator to null the stale next_run_at — jobs.json persists it
+    across the recreate under the OLD tz, and cron-plus only self-heals a NULL next_run_at."""
+    f = _run_tz_check(tmp_path, monkeypatch, [_daily("daily-brief")], tz=None)
+    assert any(lvl == "WARN" and "next_run_at" in msg for lvl, _, msg in f), f
+    f2 = _run_tz_check(tmp_path, monkeypatch, [_daily("daily-brief")], tz="America/New_York",
+                       plugin_tz_aware=False)
+    assert any(lvl == "FAIL" and "next_run_at" in msg for lvl, _, msg in f2), f2
+
+
+def test_schema_staleness_compares_base_pack_only_not_recorded_fragments():  # invariant-audit #62
+    """The staleness check must recompose base⊕pack (fragments=[]), NOT fragments=None — the latter
+    auto-loads the artifact's OWN recorded _fragments, making the comparison circular. Source guard."""
+    src = MOD.read_text()
+    body = src[src.index("def check_schema"):src.index("def check_subdomains")]
+    assert "fragments=[]" in body, "staleness compare must use a base⊕pack recompose (fragments=[])"

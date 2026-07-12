@@ -98,10 +98,18 @@ fi
 #     regenerated it — so a plain schema.yaml edit was silently ignored on the write path until the
 #     next extension toggle (okengine#178). write_composed_schema regenerates it from the CURRENT
 #     schema.yaml + enabled extensions, or REMOVES a stale artifact when no schema-extensions remain
-#     (a no-op when a pack has neither). Non-fatal.
-"$PYTHON" -c "import sys, pathlib; sys.path.insert(0, '$ENGINE_DIR/scripts'); import extension_compose as c; errs = c.write_composed_schema(pathlib.Path('$PACK')); [print('    WARN: recompose:', e) for e in (errs or [])]" \
-    && echo "    schema artifact recomposed from current schema.yaml + extensions" \
-    || echo "    WARN: composed-schema recompose failed (non-fatal)" >&2
+#     (a no-op when a pack has neither). FATAL on error (invariant-audit HIGH #4): on ANY recompose
+#     error write_composed_schema writes NOTHING and leaves the STALE artifact, which the enforced
+#     write path then keeps using UNCONDITIONALLY — so a broken/renamed extension fragment silently
+#     freezes the governing schema and every future schema.yaml edit is ignored on the write path.
+#     A WARN here (the old behavior) let that ship green. Fail the deploy so it's fixed, not frozen.
+if ! "$PYTHON" -c "import sys, pathlib; sys.path.insert(0, '$ENGINE_DIR/scripts'); import extension_compose as c; errs = c.write_composed_schema(pathlib.Path('$PACK')); [print('    ERROR: recompose:', e, file=sys.stderr) for e in (errs or [])]; sys.exit(1 if errs else 0)"; then
+    echo "==> [1b/6] FAILED: composed-schema recompose errored — the enforced write path is frozen on" >&2
+    echo "    the stale .okengine/composed-schema.yaml (a broken/renamed extension schema fragment)." >&2
+    echo "    Fix the fragment (or disable the extension) and re-run; deploy ABORTED." >&2
+    exit 1
+fi
+echo "    schema artifact recomposed from current schema.yaml + extensions"
 
 # 2. seed the runtime dir + ensure it's writable by HERMES_UID BEFORE compose binds it,
 #    and install the cron-plus scheduler plugin into the runtime (the seeded config
@@ -112,6 +120,17 @@ bash "$ENGINE_DIR/scripts/install-cron-plus.sh" "$PACK"
 
 # 3. gateway image — build if missing OR stale (label != current checkout), or forced.
 cur_sha="$(git -C "$ENGINE_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# build-engine-image.sh bakes the WORKING TREE (COPYs the tree, not HEAD), yet the staleness gate
+# below compares HEAD short-shas — so an UNCOMMITTED edit at HEAD X against an image built at X reads
+# "up to date" and the fix never ships, and a dirty --rebuild stamps a clean-X label that later reads
+# as verified on any clean checkout at X (invariant-audit #9). Fold the dirty state into the compared
+# sha: a dirty tree becomes "X-dirty", which can never equal a clean image label (so the gate always
+# rebuilds) and matches the "-dirty" provenance label a dirty build stamps.
+if [ -n "$(git -C "$ENGINE_DIR" status --porcelain 2>/dev/null)" ]; then
+    ENGINE_DIRTY=1; cur_sha="${cur_sha}-dirty"
+else
+    ENGINE_DIRTY=0
+fi
 img_sha="$(docker image inspect -f '{{ index .Config.Labels "org.okengine.git_sha" }}' hermes-agent:latest 2>/dev/null || echo)"
 if [ "$SKIP_BUILD" = 0 ]; then
     if [ "$REBUILD" = 1 ]; then
@@ -119,6 +138,9 @@ if [ "$SKIP_BUILD" = 0 ]; then
         bash "$ENGINE_DIR/scripts/build-engine-image.sh"
     elif ! docker image inspect hermes-agent:latest >/dev/null 2>&1; then
         echo "==> [3/6] build gateway image (none present)"
+        bash "$ENGINE_DIR/scripts/build-engine-image.sh"
+    elif [ "$ENGINE_DIRTY" = 1 ]; then
+        echo "==> [3/6] engine tree has UNCOMMITTED changes — rebuilding so the image bakes current source (a HEAD-sha match would otherwise run stale code)"
         bash "$ENGINE_DIR/scripts/build-engine-image.sh"
     elif [ "$img_sha" != "$cur_sha" ]; then
         echo "==> [3/6] gateway image is STALE (image sha='${img_sha:-none/unlabeled}' != engine sha '$cur_sha') — rebuilding"
@@ -143,6 +165,25 @@ fi
 #    touches it (okengine#178). --build uses the layer cache, so an unchanged image is a fast no-op.
 echo "==> [4/6] docker compose up -d --build"
 ( cd "$PACK" && ENGINE_DIR="$ENGINE_DIR" docker compose up -d --build )
+
+# 4b. config.yaml is read ONCE at gateway start and lives on a BIND MOUNT, so a content edit is
+#     invisible to `docker compose up` (compose recreates on compose/env-var changes, never on a
+#     bind-mounted file's content) — the old config keeps running until an unrelated recreate weeks
+#     later, when the change appears spontaneously (invariant-audit #10). ensure-runtime (step 2)
+#     re-seds config.yaml on every run, so this is the common case. Force-recreate the gateway when
+#     config.yaml is newer than the running container's start time — the cheap discriminator. A fresh
+#     deploy just started the container (StartedAt > mtime), so this is a no-op there.
+CFG_FILE="$PACK/.hermes-data/config.yaml"
+if [ -f "$CFG_FILE" ]; then
+    gw_cid="$(cd "$PACK" && docker compose ps -q gateway 2>/dev/null | head -1)"
+    gw_started="$(docker inspect "$gw_cid" --format '{{.State.StartedAt}}' 2>/dev/null || echo)"
+    gw_epoch=0; [ -n "$gw_started" ] && gw_epoch="$(date -d "$gw_started" +%s 2>/dev/null || echo 0)"
+    cfg_epoch="$(stat -c %Y "$CFG_FILE" 2>/dev/null || echo 0)"
+    if [ "$gw_epoch" -gt 0 ] 2>/dev/null && [ "$cfg_epoch" -gt "$gw_epoch" ] 2>/dev/null; then
+        echo "==> [4b/6] config.yaml is newer than the running gateway ($(( cfg_epoch - gw_epoch ))s) — force-recreating so the new config actually loads"
+        ( cd "$PACK" && ENGINE_DIR="$ENGINE_DIR" docker compose up -d --force-recreate --no-deps gateway )
+    fi
+fi
 
 # 5. deploy cron scripts + jobs.
 if [ "$NO_CRONS" = 0 ]; then

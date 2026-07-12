@@ -50,6 +50,21 @@ def test_expand_jobs_assigns_random_minute_per_job():
         assert not m.is_sentinel(j["schedule"]["expr"])         # fully expanded
 
 
+def test_expand_jobs_is_stable_under_a_fixed_seed():  # invariant-audit #47
+    """The deploy re-expands ENGINE @jitter sentinels on EVERY run; deploy-cron-plus-jobs.sh now
+    seeds the RNG from the pack identity so the minute is STABLE across redeploys (no silent
+    skip/double-run). Lock the property the deploy relies on: identical jobs + identical seed ->
+    identical expansion; a different seed generally differs (per-install spread preserved)."""
+    m = _load()
+    def _run(seed):
+        jobs = [{"name": "a", "schedule": {"kind": "cron", "expr": "@jitter:daily"}},
+                {"name": "b", "schedule": {"kind": "cron", "expr": "@jitter:6h"}}]
+        m.expand_jobs(jobs, random.Random(seed))
+        return [j["schedule"]["expr"] for j in jobs]
+    assert _run(4242) == _run(4242)                    # deterministic per seed -> redeploy-stable
+    assert any(_run(s) != _run(0) for s in range(1, 12))   # some other install seed -> different spread
+
+
 def test_expand_jobs_never_picks_minute_zero():
     """okengine#103: the jittered minute must never be 0 — a :00 schedule is the herd-prone
     case the jitter exists to avoid, and the validator rejects it. Sweep many seeds."""

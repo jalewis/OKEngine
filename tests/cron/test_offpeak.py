@@ -35,3 +35,16 @@ def test_wraparound_window_defers_overnight():  # invariant-audit #24
     assert offpeak.in_defer_window(10, "20-6") is False  # daytime off-peak
     # a mixed spec (wrap + normal part) still works
     assert offpeak.in_defer_window(13, "22-2,12-14") is True
+
+
+def test_malformed_spec_warns_and_never_defers(monkeypatch, capsys):  # invariant-audit #19
+    """A non-empty but unparseable spec (wrong separator / HH:MM / en-dash) used to silently return
+    False for every hour — bulk drains ran at full peak price, the opposite of intent. Now it WARNs
+    and still doesn't defer (fail loud, not silent)."""
+    monkeypatch.setenv("CRON_DEFER_UTC_HOURS", "01:00-04:00;06:00-10:00")   # HH:MM + ';' separator
+    for h in range(24):
+        assert offpeak.offpeak_defer(datetime(2026, 7, 1, h, tzinfo=timezone.utc)) is False
+    assert "no valid" in capsys.readouterr().err
+    # a VALID spec still parses and defers (no spurious warning)
+    monkeypatch.setenv("CRON_DEFER_UTC_HOURS", "1-4,6-10")
+    assert offpeak.offpeak_defer(datetime(2026, 7, 1, 2, tzinfo=timezone.utc)) is True

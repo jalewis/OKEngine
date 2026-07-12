@@ -80,10 +80,12 @@ def test_budget_runs_when_state_dir_exists(tmp_path, monkeypatch):
 
 def test_build_image_rejects_dirty_reused_checkout():
     sh = (REPO / "scripts" / "build-engine-image.sh").read_text()
-    # after the pin-sha verification there must be a working-tree cleanliness gate
-    assert "status --porcelain" in sh, "no working-tree cleanliness check — a dirty HERMES_SRC bakes edits"
+    # after the pin-sha verification there must be a working-tree cleanliness gate on the reused
+    # HERMES_SRC ($WORK). NB: build-engine-image.sh also runs a porcelain check on $ENGINE_DIR (for
+    # the -dirty provenance label, invariant-audit #9), so anchor on the $WORK-specific one here.
+    assert '"$WORK" status --porcelain' in sh, "no HERMES_SRC cleanliness check — a dirty $WORK bakes edits"
     assert "UNCOMMITTED" in sh, "dirty-tree branch has no explicit refusal"
     # the cleanliness check sits inside the pinned-sha block (integrity), after the sha compare
     idx_sha = sh.index("expected pinned commit")
-    idx_clean = sh.index("status --porcelain")
+    idx_clean = sh.index('"$WORK" status --porcelain')
     assert idx_clean > idx_sha, "cleanliness check should follow the sha verification"

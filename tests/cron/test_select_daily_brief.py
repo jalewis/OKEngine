@@ -37,3 +37,15 @@ def test_open_values_defaults_when_no_schema(tmp_path):
     (tmp_path / "wiki").mkdir(parents=True)
     m = _load(tmp_path)
     assert m._open_prediction_values() == {"open", "active"}               # safe fallback
+
+
+def test_movement_uses_composed_knowledge_namespaces(tmp_path):  # invariant-audit #27
+    """The brief's movement section must iterate the vault's DECLARED knowledge namespaces (composed
+    schema), not a hardcoded ('entities','concepts') that silently skipped every pack namespace on a
+    composed vault (okcti: threat-actors, cves, detections, …)."""
+    (tmp_path / "wiki").mkdir(parents=True)
+    (tmp_path / "schema.yaml").write_text(
+        "partitioning:\n  namespaces:\n    actors: {strategy: by-letter}\n    cves: {strategy: by-date}\n")
+    m = _load(tmp_path)
+    nss = set(m._knowledge_namespaces())
+    assert "actors" in nss and "cves" in nss, nss     # pack namespaces included, not the bare pair

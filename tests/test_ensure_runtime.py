@@ -198,3 +198,34 @@ def test_template_api_server_toolset_is_locked():
     assert api == ["okengine", "okengine-write"], api
     forbidden = {"terminal", "code_execution", "coding", "file", "computer_use", "web", "shell"}
     assert not (set(api) & forbidden), f"chat toolset leaked a dangerous tool: {set(api) & forbidden}"
+
+
+def test_pins_hermes_uid_into_env_for_bare_compose(tmp_path):
+    """invariant-audit HIGH #1: ensure-runtime seeded the runtime but never pinned HERMES_UID into
+    .env, so a bare `docker compose up` (the documented step-by-step path) interpolated
+    ${HERMES_UID:-10000} and ran the gateway as a DIFFERENT uid than the tree — a silently dead
+    scheduler. It must pin the resolved uid:gid into .env (like deploy.sh) so compose uses the same."""
+    (tmp_path / "wiki").mkdir()
+    (tmp_path / ".env").write_text("OKENGINE_MCP_TOKEN=okengine-local\n")
+    # NO HERMES_UID in the env -> the resolver must fall to the tree owner (this uid) and pin it
+    e = dict(os.environ, OKENGINE_CRON_PLUS_SKIP="1")
+    e.pop("HERMES_UID", None); e.pop("HERMES_GID", None)
+    r = subprocess.run(["bash", str(SCRIPT), str(tmp_path)], capture_output=True, text=True,
+                       timeout=30, env=e)
+    assert r.returncode == 0, r.stderr
+    env_txt = (tmp_path / ".env").read_text()
+    assert f"HERMES_UID={SELF_UID}" in env_txt, f"HERMES_UID not pinned:\n{env_txt}"
+    assert f"HERMES_GID={SELF_GID}" in env_txt
+
+
+def test_existing_uid_pin_is_not_clobbered(tmp_path):
+    """A deliberate operator pin (portable/shared vault) must survive — pin only when absent."""
+    (tmp_path / "wiki").mkdir()
+    # pin our OWN uid (so the writability gate passes) — the point is no DUPLICATE line is appended
+    (tmp_path / ".env").write_text(f"HERMES_UID={SELF_UID}\nHERMES_GID={SELF_GID}\nOKENGINE_MCP_TOKEN=x\n")
+    e = dict(os.environ, OKENGINE_CRON_PLUS_SKIP="1", HERMES_UID=SELF_UID, HERMES_GID=SELF_GID)
+    r = subprocess.run(["bash", str(SCRIPT), str(tmp_path)], capture_output=True, text=True,
+                       timeout=30, env=e)
+    assert r.returncode == 0, r.stderr
+    assert (tmp_path / ".env").read_text().count("HERMES_UID=") == 1
+    assert (tmp_path / ".env").read_text().count("HERMES_GID=") == 1

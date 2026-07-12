@@ -43,7 +43,8 @@ SNAPSHOTS_REL = Path(".okengine") / "snapshots"
 # Runtime/generated/VCS trees the snapshot+rollback scope skips — migrations transform the pack
 # SOURCE (schema, crons, wiki, configs, .okengine state), not these.
 SNAPSHOT_EXCLUDES = {".git", ".hermes-data", "data", "tmp", "logs",
-                     "node_modules", ".venv", "__pycache__"}
+                     "node_modules", ".venv", "__pycache__",
+                     "rolled-back"}   # quarantine of files a rollback set aside (#32) — never re-scoped
 
 
 def _engine_meta():
@@ -335,14 +336,39 @@ def snapshot(pack: Path, snap_id: str, meta_obj: Optional[dict] = None) -> Path:
     Returns the snapshot dir. Cheap-ish: a file copy of the source, not the runtime."""
     snap_dir = pack / SNAPSHOTS_REL / snap_id
     tree = snap_dir / "tree"
-    tree.mkdir(parents=True, exist_ok=True)
     snapshots_abs = (pack / SNAPSHOTS_REL).resolve()
-    for rel in _scope_files(pack, snapshots_abs):
-        dst = tree / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(pack / rel, dst)
-    (snap_dir / "manifest.json").write_text(
-        json.dumps(meta_obj or {}, indent=2) + "\n", encoding="utf-8")
+    scoped = list(_scope_files(pack, snapshots_abs))
+    # Disk-space precheck: the snapshot copies the whole source (wiki can be 11k–64k pages) onto the
+    # SAME filesystem the live vault writes to. Without a check, an ENOSPC mid-copy left a partial,
+    # manifest-less snapshot behind AND filled the disk (invariant-audit #31). Refuse up front.
+    need = 0
+    for rel in scoped:
+        try:
+            need += (pack / rel).stat().st_size
+        except OSError:
+            pass
+    try:
+        free = shutil.disk_usage(pack).free
+    except OSError:
+        free = None
+    if free is not None and need > free * 0.95:          # keep a little headroom
+        raise OSError(f"insufficient disk space for the pre-upgrade snapshot: need ~{need} bytes, "
+                      f"{free} free on {pack}'s filesystem. Free space, or re-run with --no-snapshot.")
+    tree.mkdir(parents=True, exist_ok=True)
+    try:
+        for rel in scoped:
+            dst = tree / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(pack / rel, dst)
+        # manifest.json is written LAST — its presence marks a COMPLETE snapshot.
+        (snap_dir / "manifest.json").write_text(
+            json.dumps(meta_obj or {}, indent=2) + "\n", encoding="utf-8")
+    except BaseException:
+        # ENOSPC or an operator Ctrl-C mid-copy (minutes on a real vault) leaves a partial,
+        # manifest-less snapshot that nothing cleaned, marked invalid, or excluded from prune
+        # retention (invariant-audit #31). Remove it so it can't be mistaken for a restore point.
+        shutil.rmtree(snap_dir, ignore_errors=True)
+        raise
     return snap_dir
 
 
@@ -382,9 +408,10 @@ def changed_since_snapshot(pack: Path, snap_dir: Path) -> set:
 
 def restore(pack: Path, snap_dir: Path, added: Optional[set] = None,
             modified: Optional[set] = None) -> int:
-    """Roll the pack source back to a snapshot: delete files the migration added, then restore
-    the snapshotted files it changed (reverting modifications and recreating deletions). Returns
-    #changes.
+    """Roll the pack source back to a snapshot: QUARANTINE files the migration added (move them under
+    .okengine/rolled-back/<snap_id>/ — never delete, so a misclassified concurrent write survives),
+    then restore the snapshotted files it changed (reverting modifications and recreating deletions).
+    Returns #changes.
 
     `added` is the migration's added-set captured right after apply (see added_since_snapshot):
     when given, ONLY those files are removed, so live-vault writes made after the capture point
@@ -403,12 +430,20 @@ def restore(pack: Path, snap_dir: Path, added: Optional[set] = None,
     snap_set = set(_scope_files(tree, (tree / SNAPSHOTS_REL).resolve()))
     if added is None:
         added = {rel for rel in _scope_files(pack, snapshots_abs) if rel not in snap_set}
+    # QUARANTINE (never unlink) the `added` set. The added/modified capture is a non-atomic walk at
+    # real vault scale, so a page a concurrent lane/MCP writes during the apply→validate window can be
+    # misclassified as migration-added; deleting it would destroy live content (invariant-audit #32).
+    # Move such files aside under .okengine/rolled-back/<snap_id>/ so a rollback is NEVER lossy — the
+    # operator can recover a false positive; SNAPSHOT_EXCLUDES keeps the quarantine out of every scope.
+    quarantine = pack / ".okengine" / "rolled-back" / snap_dir.name
     n = 0
-    for rel in added:                                         # migration-added -> remove
-        if rel not in snap_set:                               # never delete a file the snapshot restores
+    for rel in added:                                         # migration-added -> set aside
+        if rel not in snap_set:                               # never touch a file the snapshot restores
             f = pack / rel
             if f.exists():
-                f.unlink()
+                q = quarantine / rel
+                q.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(f), str(q))
                 n += 1
     for rel in snap_set:                                      # restore content (+ recreate deleted)
         dst = pack / rel
@@ -519,6 +554,8 @@ def main(argv: list) -> int:
             shutil.rmtree(snap, ignore_errors=True)
             print(f"\n  ✗ migration FAILED mid-apply: {e}")
             print(f"  ↩ ROLLED BACK to the pre-upgrade source ({n} files restored) — pack unchanged.")
+            print(f"    (any migration-added files were quarantined under .okengine/rolled-back/, "
+                  f"not deleted — recover from there if a concurrent write was caught up.)")
         else:
             print(f"\n  ✗ migration FAILED mid-apply: {e}; --no-snapshot was set, so NO automatic "
                   "rollback. Restore the pack manually.")
@@ -556,6 +593,8 @@ def main(argv: list) -> int:
             n = restore(pack, snap, added=added, modified=modified)
             shutil.rmtree(snap, ignore_errors=True)   # the failed attempt's snapshot is spent
             print(f"  ↩ ROLLED BACK to the pre-upgrade source ({n} files restored) — pack unchanged.")
+            print(f"    (migration-added files were quarantined under .okengine/rolled-back/, not "
+                  f"deleted — recover from there if a concurrent write was caught up.)")
         else:
             print("  ✗ vault no longer validates, and --no-snapshot was set: NO automatic "
                   "rollback. Restore the pack manually.")

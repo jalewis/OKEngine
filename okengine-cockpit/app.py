@@ -1297,7 +1297,11 @@ def _ds_rows(spec: dict) -> list[dict]:
         rows = [r for r in rows if r.get(f) in (None, "", [])]
     tp = spec.get("today_prefix")            # e.g. published starts with today's date
     if tp:
-        today = datetime.date.today().isoformat()
+        # UTC, not the container's LOCAL date: the fields this filters (published/created) are
+        # normalized to a full UTC ISO timestamp by the engine's feed pipeline / write path, so a
+        # LOCAL-date prefix drops rows for the hours between UTC midnight and local midnight on a
+        # non-UTC deployment (okcti TZ=America/New_York — invariant-audit #61).
+        today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
         rows = [r for r in rows if str(r.get(tp) or "").startswith(today)]
     return rows
 

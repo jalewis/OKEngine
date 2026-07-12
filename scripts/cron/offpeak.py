@@ -17,7 +17,29 @@ since the check is in UTC regardless of the deployment's CRON_TZ).
 from __future__ import annotations
 
 import os
+import sys
 from datetime import datetime, timezone
+
+
+def _spec_has_valid_window(spec: str) -> bool:
+    """True if `spec` contains at least ONE parseable hour value/range. A non-empty spec that parses
+    to ZERO valid parts (wrong separator like ';', an HH:MM value, an en-dash) would make
+    in_defer_window return False for every hour — silently NEVER deferring, the opposite of intent
+    (invariant-audit #19, same silent-never-defers class as the #178 wraparound)."""
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            if "-" in part:
+                a, b = (int(x) for x in part.split("-", 1))
+                if 0 <= a <= 23 and 0 <= b <= 24:
+                    return True
+            elif 0 <= int(part) <= 23:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def in_defer_window(hour: int, spec: str) -> bool:
@@ -49,6 +71,13 @@ def offpeak_defer(now: datetime | None = None) -> bool:
     `now` overridable for tests. Empty/unset env -> always False."""
     spec = os.environ.get("CRON_DEFER_UTC_HOURS", "").strip()
     if not spec:
+        return False
+    if not _spec_has_valid_window(spec):
+        # A non-empty but unparseable spec would silently never defer (bulk drains run at full peak
+        # price — the opposite of intent). Fail LOUD rather than silent (invariant-audit #19).
+        sys.stderr.write(
+            f"offpeak: CRON_DEFER_UTC_HOURS={spec!r} has no valid UTC-hour window "
+            f"(expected e.g. '1-4,6-10', hours 0-23, comma-separated) — NOT deferring; fix the spec.\n")
         return False
     h = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).hour
     return in_defer_window(h, spec)

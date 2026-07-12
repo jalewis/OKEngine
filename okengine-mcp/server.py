@@ -37,6 +37,7 @@ import hmac
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -72,14 +73,27 @@ mcp = FastMCP("okengine",
 
 
 def _run(args: list[str], extra_env: dict | None = None, timeout: int = 90) -> str:
+    """Run a helper script with a timeout that actually bounds wall-clock (okengine#198).
+
+    subprocess.run(timeout=) only kills the DIRECT child; a spawned grandchild (kb_graph's `iwe`)
+    survives holding the stdout pipe, and the post-kill communicate() blocks until IT exits — so
+    the internal timeout was cosmetic and the client hung to its own 300s ceiling. Start the child
+    in its OWN process group (start_new_session) and killpg the whole tree on timeout."""
     env = {**os.environ, **(extra_env or {})}
+    proc = subprocess.Popen([PYBIN, *args], cwd=str(VAULT), env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
     try:
-        r = subprocess.run([PYBIN, *args], cwd=str(VAULT), env=env,
-                           capture_output=True, text=True, timeout=timeout)
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)     # the whole group: python + any iwe grandchild
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        proc.communicate()                           # reap; pipes close now the group is dead
         return "(query timed out)"
-    out = (r.stdout or "").strip()
-    return out or (r.stderr or "(no output)").strip()
+    out = (stdout or "").strip()
+    return out or (stderr or "(no output)").strip()
 
 
 def _safe(path: str) -> Path | None:
@@ -155,7 +169,7 @@ def get_page(path: str) -> str:
 # (cyber-market, recurring). Read the artifact instead (O(dict lookup)); fall back to live IWE only
 # when the artifact is absent/stale (small vault without the cron, or a missed refresh).
 _BL_ARTIFACT_MAX_AGE = max(3600, int(os.environ.get("OKENGINE_BACKLINKS_MAX_AGE", "172800")))
-_BL_CACHE: dict = {"map": None, "mtime": None}
+_BL_CACHE: dict = {"map": None, "mtime": None, "doc": None}
 _WL_RE = re.compile(r"\[\[([^\]|#\n]+?)(?:[#|][^\]]*)?\]\]")
 
 
@@ -173,13 +187,20 @@ def _artifact_backlinks() -> dict | None:
     if _BL_CACHE["mtime"] == st.st_mtime and _BL_CACHE["map"] is not None:
         return _BL_CACHE["map"]
     try:
-        m = json.loads(p.read_text(encoding="utf-8")).get("backlinks")
+        doc = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, ValueError):
         return None
+    m = doc.get("backlinks") if isinstance(doc, dict) else None
     if not isinstance(m, dict):
         return None
-    _BL_CACHE["map"], _BL_CACHE["mtime"] = m, st.st_mtime
+    _BL_CACHE["map"], _BL_CACHE["doc"], _BL_CACHE["mtime"] = m, doc, st.st_mtime
     return m
+
+
+def _artifact_doc() -> dict | None:
+    """The FULL backlinks artifact (meta: pages/targets/edges/built_at + the map), same cache and
+    freshness rules as _artifact_backlinks. graph_stats reads the meta (okengine#199)."""
+    return _BL_CACHE["doc"] if _artifact_backlinks() is not None else None
 
 
 def _resolve_key(target: str, bl: dict) -> str | None:
@@ -266,9 +287,29 @@ def retrieve_context(path: str) -> str:
 
 @mcp.tool()
 def graph_stats() -> str:
-    """Knowledge-graph health/shape via IWE: orphans (pages nothing links to),
-    most-referenced pages, and the link hierarchy over the whole vault. Use to
-    find under-connected pages or the corpus's hubs. No arguments."""
+    """Knowledge-graph health/shape: page/edge totals, pages with no inbound link,
+    and the most-referenced pages (the corpus's hubs). Use to find under-connected
+    pages or the hubs. No arguments.
+
+    Served from the precomputed wiki/.backlinks.json artifact (okengine#199 — a live
+    whole-graph IWE rebuild per call times out on large vaults); falls back to live
+    IWE only when the artifact is absent/stale."""
+    doc = _artifact_doc()
+    if doc is not None:
+        bl = doc.get("backlinks") or {}
+        pages, targets, edges = doc.get("pages"), doc.get("targets"), doc.get("edges")
+        if isinstance(pages, int) and isinstance(targets, int) and isinstance(edges, int):
+            built = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(doc["built_at"])) \
+                if isinstance(doc.get("built_at"), (int, float)) else "unknown"
+            hubs = sorted(bl.items(), key=lambda kv: len(kv[1]), reverse=True)[:15]
+            excl = ", ".join(doc.get("excluded_namespaces") or []) or "none"
+            lines = [f"Knowledge-graph stats (from the backlinks artifact, built {built}):",
+                     f"  pages: {pages}  ·  link targets: {targets}  ·  edges: {edges}",
+                     f"  pages with no inbound link: {pages - targets} "
+                     f"(namespaces excluded from the graph: {excl})",
+                     "", "Most-referenced pages (inbound links):"]
+            lines += [f"  {len(v):>5}  {k}" for k, v in hubs]
+            return "\n".join(lines)[:8000]
     return _run([str(SCRIPTS / "kb_graph.py"), "stats"])[:8000]
 
 

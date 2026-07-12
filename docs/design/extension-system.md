@@ -268,6 +268,7 @@ extension with several lanes (#multi-op). Per-operation keys:
 | `timeout` | seconds; bounds a runaway op. |
 | `tier` | optional kickstart-stage hint (#129) — slot the job into that stage's order instead of guessing a clock time. |
 | `model` | optional per-operation model id. The cron scheduler honors `job["model"]` over the deployment's `config.yaml` default — so a low-stakes lane (e.g. glossary) can run on a small/free model while reasoning lanes use a stronger one. Pick by task profile, not brand — see [docs/model-selection.md](../model-selection.md). Omit to inherit the default. |
+| `cost_bearing` | `true` on a **`no_agent`** op that still SPENDS model budget — a deterministic script that calls `llm_lib` directly (e.g. `concept-enrich`, `scope-classify`). `budget_guard` pauses it with the agent lanes when over budget; without the marker a no_agent lane looks free and burns paid tokens unpausably. Omit for a truly free maintenance script (zero model calls). |
 
 **`core`** (boolean, engine-tier only): `true` makes the extension **default-ON** (active
 unless explicitly disabled), for operations that are effectively part of the house baseline

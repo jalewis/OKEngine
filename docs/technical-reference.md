@@ -6,9 +6,12 @@ end-to-end by someone technical who has never seen the codebase. Everything here
 is domain-agnostic and shareable; deployment-specific details (hostnames, brands,
 private packs) are deliberately absent, per the engine's own scrub rule.*
 
-*Current as of engine **v0.9.1** on Hermes-Agent **v0.18.0** (upstream tag
-`v2026.7.7.2`), July 2026. Pointers into the repo are given throughout; where this
-document and the code disagree, the code wins.*
+*Engine pin as of this revision: **v0.11.5** on Hermes-Agent **v0.18.2** (upstream tag
+`v2026.7.7.2`), July 2026 — see `engine-manifest.yaml` for the authoritative current values.
+The prose was last reviewed end-to-end at v0.9.1; the v0.10–v0.11 subsystem changes (bundle/
+composition, install-domain, extension lifecycle, re-verification, deployment hardening) are
+tracked in `CHANGELOG.md` and may lead this document. Pointers into the repo are given
+throughout; where this document and the code disagree, the code wins.*
 
 ---
 

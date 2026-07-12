@@ -8,9 +8,13 @@
 # Idempotent: already-applied patches are skipped. Exits non-zero on drift.
 set -euo pipefail
 
-PIN="v2026.7.7.2"   # Hermes v0.18.2 — the version these patches are cut against
 HERMES="${1:-${HERMES_DIR:-$PWD}}"
 PATCHDIR="$(cd "$(dirname "$0")" && pwd)"
+# Read the Hermes pin from engine-manifest.yaml (the single source of truth), NOT a hardcoded literal
+# that silently drifts from the manifest on a bump — the exact class the cron-plus pin already binds
+# by test (invariant-audit #6). The advisory check below just reports the pin these patches target.
+PIN="$(grep -E '^[[:space:]]*pinned_tag:' "$PATCHDIR/../engine-manifest.yaml" 2>/dev/null | awk '{print $2}' | head -1)"
+PIN="${PIN:-unknown}"
 
 cd "$HERMES"
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {

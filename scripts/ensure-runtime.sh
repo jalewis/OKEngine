@@ -36,7 +36,18 @@ PACK="$(cd "${PACK_ARG:-${CRON_PACK_DIR:-$PWD}}" && pwd)"
 TMPL="$ENGINE_DIR/config/config.yaml.template"
 RT="$PACK/.hermes-data"
 CFG="$RT/config.yaml"
-HUID="${HERMES_UID:-$(id -u)}"; HGID="${HERMES_GID:-$(id -g)}"
+# okengine#197/#185 + invariant-audit HIGH: resolve the uid the way compose/deploy do (shared
+# resolver: env > .env pin > tree owner), NOT a bare $(id -u) that ignores the .env pin — and PIN it
+# into .env so a bare `docker compose up` interpolates the SAME uid. Without this, the documented
+# step-by-step bring-up seeded the runtime as one uid while compose ran the gateway as ${...:-10000},
+# deploying a silently-dead scheduler the writability gate below (checking the wrong uid) couldn't see.
+# shellcheck source=lib/hermes_uid.sh
+. "$ENGINE_DIR/scripts/lib/hermes_uid.sh"
+HUID="$(resolve_hermes_uid "$PACK")"; HGID="$(resolve_hermes_gid "$PACK")"
+ENVF="$PACK/.env"
+[ -f "$ENVF" ] || : > "$ENVF"
+grep -qE '^[[:space:]]*HERMES_UID[[:space:]]*=' "$ENVF" || printf 'HERMES_UID=%s\n' "$HUID" >> "$ENVF"
+grep -qE '^[[:space:]]*HERMES_GID[[:space:]]*=' "$ENVF" || printf 'HERMES_GID=%s\n' "$HGID" >> "$ENVF"
 
 mkdir -p "$RT/qmd" "$RT/logs"
 [ -f "$RT/.gitkeep" ] || : > "$RT/.gitkeep"

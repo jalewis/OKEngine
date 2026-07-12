@@ -30,3 +30,16 @@ def test_vault_mount_is_under_write_safe_root():
     assert wiki == root or wiki.startswith(root.rstrip("/") + "/"), (
         f"WIKI_PATH={wiki} is outside HERMES_WRITE_SAFE_ROOT={root} — the agent's "
         "file-tool writes to the vault will be silently denied (okengine#140)")
+
+
+def test_bare_compose_sequence_seeds_the_mcp_token_before_up():
+    """okengine#208: the skeleton's documented bare-compose sequence went build -> `up -d`, but the
+    shipped default OKENGINE_MCP_TOKEN makes the mcp container FAIL CLOSED on its 0.0.0.0 container
+    bind (#50) and crash-loop — only ensure-runtime (a real generated token) saves that path, and it
+    was only run by deploy.sh. The header must document ensure-runtime BEFORE compose up."""
+    text = (REPO / "templates" / "pack" / "skeleton" / "docker-compose.yml").read_text()
+    header = text.split("services:")[0]
+    assert "ensure-runtime.sh" in header, "bare-compose sequence must seed the runtime/token"
+    assert header.index("build-engine-image.sh") < header.index("ensure-runtime.sh") \
+        < header.index("docker compose up"), "ensure-runtime must sit between build and up"
+    assert "crash-loops (okengine#208)" in header      # the WHY travels with the sequence

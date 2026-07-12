@@ -53,3 +53,16 @@ def test_wakegate_true_with_candidates(tmp_path, monkeypatch, capsys):
     _ent(wiki, "g/gpt-5", title="GPT-5"); _ent(wiki, "g/gpt5-dup", title="GPT 5")
     monkeypatch.setattr(m, "ENTITIES", wiki / "entities"); monkeypatch.setattr(m, "VAULT", tmp_path)
     assert m.main() == 0 and '"wakeAgent": true' in capsys.readouterr().out
+
+
+def test_scan_tolerates_non_string_scalar_aliases(tmp_path):  # invariant-audit #28
+    """The write path only coerces a scalar STRING aliases -> list; a bare int/bool/date lands as a
+    scalar and `{_norm(a) for a in 8220}` raised TypeError, killing the whole dedupe wake-gate."""
+    m = _mod()
+    wiki = tmp_path / "wiki"
+    p = wiki / "entities" / "n" / "numeric.md"
+    p.parent.mkdir(parents=True)
+    p.write_text("---\ntype: entity\nname: Numeric\naliases: 8220\n---\nbody\n")   # bare YAML int
+    pages = m.scan(wiki / "entities", tmp_path)                                    # must not raise
+    assert "entities/n/numeric" in pages
+    assert pages["entities/n/numeric"]["aliases"] == {"8220"}

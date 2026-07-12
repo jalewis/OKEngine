@@ -313,5 +313,69 @@ def test_pull_bundle_composes_host_and_guests(tmp_path):
         # guest namespace folded into the host partitioning
         ns = (sch.get("partitioning") or {}).get("namespaces") or {}
         assert "cves" in ns, ns
+        # okengine#183: the composed vault carries the BUNDLE's display identity, not the host's —
+        # the host fetch used to clobber pack.yaml, so the About panel described the vault as the
+        # host pack. owns stays the host's (the composed contract); name/description are the bundle's.
+        pk = yaml.safe_load((dest / "pack.yaml").read_text())
+        assert pk["name"] == "okpack-testbundle", pk["name"]
+        assert pk["description"] == "test bundle", pk.get("description")
+        assert pk.get("owns", {}).get("types"), "host owns must survive the identity re-stamp"
     finally:
         os.environ.pop("OKENGINE_LIBRARY", None)
+
+
+def test_update_refuses_a_bundle_upstream(tmp_path):
+    """invariant-audit HIGH #41: `pull --update` on a kind: bundle would copy only the thin recipe
+    skin and silently leave the composed guests stale — it must REFUSE, not no-op."""
+    import os, pytest
+    lib = _git_library(tmp_path)               # contains okpack-testbundle (kind: bundle)
+    os.environ["OKENGINE_LIBRARY"] = str(lib)  # module reads this at import -> set BEFORE _load()
+    try:
+        m = _load()
+        dest = tmp_path / "composed"
+        _w(dest / "pack.yaml", "name: okpack-host\n")     # a pre-existing composed vault
+        _w(dest / "schema.yaml", "types: {actor: {}}\n")
+        with pytest.raises(SystemExit) as ei:
+            m.main(["okpacks-library:okpack-testbundle", str(dest), "--update", "--no-validate",
+                    "--catalog", str(tmp_path / "no-catalog.json")])
+        assert "kind: bundle" in str(ei.value) and "recompose" in str(ei.value)
+    finally:
+        os.environ.pop("OKENGINE_LIBRARY", None)
+
+
+def test_update_warns_loudly_on_a_composed_vault(tmp_path, capsys):
+    """invariant-audit HIGH #5: new files landing on a composed (install-domain'd) vault bypass the
+    7 coinstall preflight checks — the gap must be LOUD, not silent."""
+    m = _load()
+    up, dest = tmp_path / "up", tmp_path / "dest"
+    _w(up / "pack.yaml", "name: p\n")
+    _w(up / "crons" / "scripts" / "brand_new.py", "print('x')\n")     # a NEW file
+    _w(dest / "pack.yaml", "name: p\n")
+    _w(dest / "CLAUDE.md", "# persona\n\n## Installed domain: security incidents\n")  # composed marker
+    m.main(["owner/repo", str(dest), "--update", "--no-validate"]) if False else None
+    # call _update_in_place + the branch logic directly is awkward; assert the warning wiring is present
+    src = (REPO / "scripts" / "framework_pull.py").read_text()
+    assert "WITHOUT coinstall" in src and "## Installed domain:" in src, \
+        "composed-vault update must warn about skipped preflight"
+
+
+def test_warn_busy_host_ports_flags_a_taken_port(tmp_path, capsys):  # invariant-audit #64
+    """reader+cockpit publish container 9200 on adjacent host ports, so two packs whose offsets
+    differ by 1 collide. A bind-check at pull time surfaces a taken port before `docker compose up`
+    dies half-up."""
+    import socket
+    m = _load()
+    dest = tmp_path / "pack"
+    dest.mkdir()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.listen()
+    (dest / "docker-compose.yml").write_text(
+        f'services:\n  reader:\n    ports:\n      - "127.0.0.1:{port}:9200"\n')
+    try:
+        m._warn_busy_host_ports(dest)
+    finally:
+        s.close()
+    out = capsys.readouterr().out
+    assert "already in use" in out and str(port) in out

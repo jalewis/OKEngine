@@ -36,6 +36,8 @@ audit:  ## supply-chain CVE scan + python security lint (okengine#54)
 	python -m pip_audit -r requirements-dev.txt
 	python -m pip_audit -r okengine-mcp/requirements.txt
 	python -m pip_audit -r okengine-reader/requirements.txt
+	python -m pip_audit -r okengine-cockpit/requirements.txt
+	python -m pip_audit -r okengine-reader/requirements.txt
 	python -m bandit -q -ll -r scripts tools okengine-mcp okengine-reader -x tests
 
 coverage:  ## run tests with a coverage report (okengine#56)
@@ -70,6 +72,10 @@ content-lint:  ## scan a vault's SOURCE for degenerate generations (word-salad, 
 	python scripts/cron/content_lint.py --vault $${VAULT:-.} $${WIKI:+--wiki $$WIKI}
 
 publish-snapshot:  ## stage a gated, no-history public GitHub snapshot (never pushes; okengine#94)
-	bash scripts/publish-snapshot.sh
+	@if [ -f scripts/publish-snapshot.sh ]; then \
+	  bash scripts/publish-snapshot.sh; \
+	else \
+	  echo "publish-snapshot is a SOURCE-REPO-only target — its script is excluded from public snapshots (invariant-audit #59). Run it from the source repo."; \
+	fi
 
 check: scrub lint test scaffold-check  ## everything CI runs (fast gate; audit/coverage/typecheck are separate)

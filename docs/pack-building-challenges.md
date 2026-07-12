@@ -1,7 +1,7 @@
 # Pack-building challenges — what actually goes wrong
 
-Field notes from building and auditing five packs (okpack-cti, okpack-ai-research, okpack-example,
-okpack-competitive, okpack-cyber-market) plus porting a production system's lane fleet. This is the
+Field notes from building and auditing the public example packs (okpack-cti, okpack-ai-research,
+okpack-example, okpack-competitive) plus porting a private production pack's lane fleet. This is the
 *why-packs-rot* companion to [`authoring-a-pack.md`](authoring-a-pack.md) (the how-to) and
 [`common-issues.md`](common-issues.md) (symptom→fix). Every item below was found in a real pack.
 
@@ -10,7 +10,7 @@ okpack-competitive, okpack-cyber-market) plus porting a production system's lane
 Packs start as copies (of `okpack-example`, of a sibling, of an origin system) and the copy carries
 things that must not travel:
 
-- **Sibling-domain vocabulary.** A cyber-market pack shipped ingest prompts telling the agent to
+- **Sibling-domain vocabulary.** A market-intelligence pack shipped ingest prompts telling the agent to
   "cross-link model↔lab↔researcher↔technique↔benchmark" — okpack-ai-research's nouns, actively
   misdirecting classification. The engine has a domain-leak grep; packs need the inverse — check
   your prompts for the *donor pack's* nouns.

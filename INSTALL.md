@@ -1,6 +1,6 @@
 # Installing OKEngine on Hermes
 
-OKEngine = **a pinned Hermes** + **6 carried patches** + an **overlay** (new
+OKEngine = **a pinned Hermes** + **8 carried patches** + an **overlay** (new
 files) + **plugins** + **config**, then **one domain pack**. This is the procedure
 to take a stock Hermes install and bring it up to OKEngine — i.e. the exact
 stock→OKEngine delta.
@@ -126,7 +126,7 @@ git clone https://github.com/NousResearch/hermes-agent.git hermes
 cd hermes && git checkout v2026.7.7.2         # == Hermes v0.18.2
 ```
 
-## 2. Apply the carried patches (6 core-file patches)
+## 2. Apply the carried patches (8 core-file patches)
 ```bash
 <OKEngine>/patches/apply.sh "$PWD"           # idempotent; fails loudly on drift
 ```
@@ -156,7 +156,7 @@ Copy the overlay paths from the OKEngine repo onto the Hermes tree. The
   # <pack>/.hermes-data/plugins/cron-plus (= /opt/data/plugins/cron-plus in the gateway), pinned.
   # Manual form (or for a HOST-run hermes, at ~/.hermes/plugins/cron-plus instead):
   git clone https://github.com/jalewis/hermes-cron-plus <pack>/.hermes-data/plugins/cron-plus
-  git -C <pack>/.hermes-data/plugins/cron-plus checkout 6b230dc89171b0e21e89b7856e7a1a57628ca83c
+  git -C <pack>/.hermes-data/plugins/cron-plus checkout ee6d9f18fd2269b7f323e200ae7138fdb2e676a6
   # `cron-plus` under plugins.enabled in config.yaml (the seeded template already lists it)
   ```
 - **model-provider plugins** ship in the overlay (`plugins/model-providers/custom` — the local-Ollama `reasoning_effort:none` lever; `openrouter`).
@@ -209,7 +209,7 @@ Or step by step (exactly what `deploy.sh` runs in order):
 ```bash
 bash $ENGINE_DIR/scripts/ensure-runtime.sh "$(pwd)"                    # seed .hermes-data/config.yaml + cron-plus + MCP token
 bash $ENGINE_DIR/scripts/build-engine-image.sh                        # build hermes-agent — once per engine version
-ENGINE_DIR=$ENGINE_DIR docker compose up -d                           # builds okengine-reader + okengine-mcp, runs gateway + both
+ENGINE_DIR=$ENGINE_DIR docker compose up -d --build                   # --build rebuilds reader/mcp/cockpit on an engine update (plain up -d only builds when ABSENT — #45)
 CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-scripts.sh   # engine + pack scripts/data -> /opt/data
 CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-plus-jobs.sh # cron defs -> live (self-heals next_run_at)
 ```
