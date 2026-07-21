@@ -100,6 +100,12 @@ jobs:
   coverage:
     name: test coverage report (okengine#56)
     runs-on: ubuntu-latest
+    # REPORT-ONLY (no threshold gate yet) — must NOT gate the pipeline. pytest-cov can raise an
+    # INTERNALERROR at teardown ("Can't combine statement coverage data with branch data", from a
+    # subprocess writing statement-only data while branch=true) AFTER every test passes; that is a
+    # coverage-tooling hiccup, not a code/test failure, and a report-only job failing the whole CI
+    # is the opposite of its stated intent. continue-on-error keeps the report without gating.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
