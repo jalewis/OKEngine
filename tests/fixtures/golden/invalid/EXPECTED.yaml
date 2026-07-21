@@ -1,0 +1,8 @@
+# Each invalid fixture -> a substring that MUST appear in schema_reject_reason's output.
+# The four cover DISTINCT reachable rejection paths in tools/schema_validator.py:
+#   okf floor / per-type required / closed enum / malformed YAML.
+# Adding an invalid case = add its expected-reason substring here (the acknowledgement).
+missing-okf-id.md: "missing required field(s): id"
+prediction-missing-required.md: "type 'prediction' is missing"
+bad-enum-tlp.md: "not in enum"
+malformed-frontmatter.md: "not valid YAML"

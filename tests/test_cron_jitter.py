@@ -127,6 +127,27 @@ def test_validator_jitter_bases_match_expander():  # anti-drift guard
         assert f'"{base}"' in vtext, f"validate.py no longer accepts the expander base '{base}'"
 
 
+def test_skeleton_validator_accepts_bare_string_schedule(tmp_path):
+    """The standalone pack gate must accept the same schedule shapes as framework validate."""
+    crons = tmp_path / "crons"
+    crons.mkdir()
+    (crons / "domain-crons.json").write_text(json.dumps([
+        {"name": "string", "enabled": True, "schedule": "17 5 * * *"},
+        {"name": "sentinel", "enabled": True, "schedule": "@jitter:daily"},
+    ]))
+    spec = importlib.util.spec_from_file_location(
+        "skeleton_validate", REPO / "templates" / "pack" / "skeleton" / "validate.py"
+    )
+    validator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(validator)
+    validator.ROOT = tmp_path
+    validator.fails.clear()
+
+    validator.check_crons_jittered()
+
+    assert validator.fails == []
+
+
 def test_expand_jobs_handles_all_three_schedule_shapes():
     """invariant-audit #2: framework validate accepts a dict schedule, a BARE STRING schedule, and a
     top-level `expr`. The expander must handle all three — before the fix a string schedule raised

@@ -20,6 +20,14 @@ def test_md_content_wraps_long_tokens():
     assert "overflow-wrap:" in CSS
 
 
+def test_full_width_document_panel_uses_its_allocated_width():
+    """A span-12 application overview must not retain the compact card's 66ch measure."""
+    compact = re.search(r"\.ddoc\{[^}]*\}", CSS)
+    full = re.search(r"\.dbox\.s12 \.ddoc\{[^}]*\}", CSS)
+    assert compact and "max-width:66ch" in compact.group(0)
+    assert full and "max-width:none" in full.group(0)
+
+
 def test_dashboard_card_title_scales_with_font_control():
     m = re.search(r"\.dash-card \.dash-t\{[^}]*\}", CSS)
     assert m and "rem" in m.group(0) and "13px" not in m.group(0)
@@ -43,6 +51,11 @@ def test_predictions_subject_cleaned():
     assert "function subjCell" in JS and "subjCell(p.subject)" in JS
 
 
+def test_toolbar_prefers_compact_configured_title():
+    JS = (pathlib.Path(__file__).resolve().parents[1] / "okengine-cockpit/static/app.js").read_text()
+    assert 'cfg.short_title || cfg.title || "cockpit"' in JS
+
+
 def test_num_cells_never_wrap():
     """Operator report: date cells (Resolves by / Updated / Anchored) in .ledger tables broke
     mid-token (2026-09-30) when a long first column squeezed the table. `.num` cells (right-aligned
@@ -50,3 +63,10 @@ def test_num_cells_never_wrap():
     column is last; a ledger with the date last needs this."""
     m = re.search(r"td\.num,th\.num\{[^}]*\}", CSS)
     assert m and "white-space:nowrap" in m.group(0), "date/number cells must not wrap"
+
+
+def test_adversarial_assessments_have_explicit_record_boundaries():
+    marker = re.search(r"\.ddoc \.assessment-review-separator\{[^}]*\}", CSS)
+    heading = re.search(r"\.ddoc \.assessment-review-separator\+h2\{[^}]*\}", CSS)
+    assert marker and "margin:34px" in marker.group(0)
+    assert heading and "border-left:5px" in heading.group(0) and "background:" in heading.group(0)

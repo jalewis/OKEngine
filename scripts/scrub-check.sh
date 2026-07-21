@@ -25,6 +25,7 @@ EXCL=(
   ':!docs/release-checklist.md' ':!CLAUDE.md' ':!scripts/audit'
   ':!docs/testing-and-audit.md' ':!docs/hermes-upgrades'
   ':!docs/design/sec-threat-hunting-prd.md' ':!docs/design/sec-threat-hunting-technical-spec.md'
+  ':!.gitlab-ci.yml'   # legitimately names the internal group runner (org-abbrev pattern); publish-excluded, never ships
 )
 found=0
 

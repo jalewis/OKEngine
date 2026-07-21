@@ -26,7 +26,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scope_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
-LOOKBACK = int(os.environ.get("SCOPE_LOOKBACK_DAYS", "7"))
+LOOKBACK = int(os.environ.get(
+    "SCOPE_LOOKBACK_DAYS",
+    os.environ.get("OKENGINE_RELEVANCE_GATE_SCOPE_LOOKBACK_DAYS", "7"),
+))
 
 
 def _recent(fm: dict, cutoff: date | None) -> bool:

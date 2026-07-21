@@ -60,13 +60,22 @@ def test_id_required_after_promotion_should_tier_empty(tmp_path):
     assert m.schema_reject_reason(str(pg.resolve()), pg.read_text()) is None
 
 
-def test_strict_types_is_engine_owned_pack_value_ignored(tmp_path):
-    """#23: strict_types is engine-owned. A pack setting strict_types: true does
-    NOT cause unknown-type rejection — the engine base (default false) governs."""
+def test_pack_can_opt_into_strict_types(tmp_path):
+    """#245: a pack can reject values outside its composed taxonomy."""
     m = _load()  # real base ships strict_types: false
     w = _vault(tmp_path, "strict_types: true\ntypes:\n  entity: {required: [type]}\n")
     pg = w / "entities" / "a.md"
     pg.write_text("---\ntype: wildcat\nid: 'x:wildcat'\n---\nx\n")   # unknown type (+id so strict_types is isolated)
+    r = m.schema_reject_reason(str(pg.resolve()), pg.read_text())
+    assert r and "unknown type" in r
+
+
+def test_strict_types_accepts_declared_alias(tmp_path):
+    m = _load()
+    w = _vault(tmp_path, ("strict_types: true\ntype_aliases: {wildcat: entity}\n"
+                          "types:\n  entity: {required: [type]}\n"))
+    pg = w / "entities" / "a.md"
+    pg.write_text("---\ntype: wildcat\nid: 'x:wildcat'\n---\nx\n")
     assert m.schema_reject_reason(str(pg.resolve()), pg.read_text()) is None
 
 
@@ -185,4 +194,32 @@ field_enums:
     r = m.schema_reject_reason(str(pg.resolve()), pg.read_text())
     assert r and "source_kind='feed'" in r
     pg.write_text("---\ntype: source\nsource_kind: news\nid: 'source:item'\n---\nx\n")
+    assert m.schema_reject_reason(str(pg.resolve()), pg.read_text()) is None
+
+
+def test_tombstoned_is_a_reserved_universal_status(tmp_path):
+    """okengine#249: the tombstone convention sets `status: tombstoned`, but a pack may
+    enum-bind `status` per type (okcti actor_status). Tombstoning a `type: actor` page must
+    NOT be a conformance violation — while a LIVE actor with a bogus status still fails."""
+    m = _load()
+    w = _vault(tmp_path, """\
+types:
+  actor: {required: [type]}
+enums:
+  actor_status: [active, dormant, defunct, unknown]
+field_enums:
+  status: {by_type: {actor: actor_status}}
+""")
+    pg = w / "entities" / "a.md"
+    # tombstoned actor passes BOTH gates despite `tombstoned` not being in actor_status
+    pg.write_text("---\ntype: actor\nid: 'actor:a'\nstatus: tombstoned\n---\nx\n")
+    p, c = str(pg.resolve()), pg.read_text()
+    assert m.schema_reject_reason(p, c) is None
+    assert m.conformance_reject_reason(p, c) is None
+    # a LIVE actor with a bogus status still HARD-fails (the enum still enforces real values)
+    pg.write_text("---\ntype: actor\nid: 'actor:a'\nstatus: zombie\n---\nx\n")
+    r = m.schema_reject_reason(str(pg.resolve()), pg.read_text())
+    assert r and "status='zombie'" in r
+    # and a valid live status still passes
+    pg.write_text("---\ntype: actor\nid: 'actor:a'\nstatus: active\n---\nx\n")
     assert m.schema_reject_reason(str(pg.resolve()), pg.read_text()) is None

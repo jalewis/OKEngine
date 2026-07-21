@@ -1,0 +1,39 @@
+# okengine.reevaluation — CHE core: dependency-aware reevaluation mechanics (okengine#234/#235).
+#
+# The piece that makes continuous reassessment DEPENDENCY-AWARE rather than a relabeled
+# document refresh (drafts/che-evaluation.md §3/§6): a materialized proposition → cited-evidence
+# edge index (this extension's no_agent lane), which the dependency-aware selector (#235) walks —
+# "sources THIS proposition cites changed" replaces "any recent source exists".
+#
+# DESIGN GUARDRAIL (§3, the go/no-go line): this is a SCHEDULED SWEEP, never event-driven.
+# No event substrate, no trigger dispatcher, no second store — a cron rebuilds a derived
+# artifact wholesale, exactly the .backlinks.json pattern. The artifact is a machine sidecar
+# (wiki/.reevaluation-edges.json), NOT canonical content — no governed-write involvement.
+#
+# Domain-agnostic by construction: which types count as propositions, which statuses are open,
+# and which frontmatter fields carry evidence refs are all CONFIG (a pack/deployment extends the
+# defaults) — okcti's diagnostic class (#236) plugs in with zero engine change.
+id: okengine.reevaluation
+kind: operation
+version: 0.1.0
+name: Reevaluation
+description: >-
+  Dependency edges from open propositions to the evidence pages they cite, rebuilt on a
+  schedule into a derived sidecar — the substrate for dependency-aware reevaluation
+  ("sources this proposition cites changed", not "any recent source exists").
+trust: in-gateway
+requires:
+  engine: ">=0.6.0"
+capabilities:
+  read: [wiki/**]
+  write: []          # writes only the derived dot-sidecar wiki/.reevaluation-edges.json
+                     # (machine artifact, .backlinks.json class — not vault content)
+config:
+  # Composer/runtime contract: OKENGINE_REEVALUATION_<KEY>.
+  # Which `type:` values are propositions (comma-separated). okcti's diagnostic class adds here.
+  proposition_types: {type: string, default: "prediction"}
+  # Which `status:` values count as open/reevaluable.
+  open_statuses: {type: string, default: "open,active"}
+  # Frontmatter fields whose refs are evidence/dependency edges (evidence[].source and body
+  # wikilinks are always scanned in addition).
+  ref_fields: {type: string, default: "subject,sources,basis"}

@@ -1,0 +1,13 @@
+# CI/dind overlay for the smoke stack (okengine#282). Layered on top of docker-compose.smoke.yml only
+# when smoke-e2e.sh runs with SMOKE_CI=1. In docker-in-docker the stack runs inside the dind daemon, so
+# its published ports live on the dind container's interfaces — the job reaches them at the `docker`
+# service hostname, and they must bind 0.0.0.0 there (the base file binds 127.0.0.1, correct for local
+# runs but unreachable across the job<->dind container boundary). Same ports, just not loopback-pinned.
+name: okengine-smoke
+services:
+  reader:
+    ports: !override ["9880:9200"]
+  okengine-mcp:
+    ports: !override ["8880:8730"]
+  cockpit:
+    ports: !override ["9881:9200"]

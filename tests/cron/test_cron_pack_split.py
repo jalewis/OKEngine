@@ -286,6 +286,24 @@ def test_bare_string_schedule_normalized_to_dict():
     assert out2["jobs"][0]["schedule"] == {"kind": "cron", "expr": "0 9 * * *"}
 
 
+def test_top_level_expr_schedule_normalized_to_dict():
+    """HIGH #5: framework_validate._cron_expr blesses a TOP-LEVEL {expr} shape (no schedule key), so a
+    pack cron authored that way validates GREEN — but it must NOT deploy schedule-less, or cron-plus
+    computes next_run None, next_run_at stays null, and the job silently never fires. The deploy
+    chokepoint must lift the top-level expr into {kind:cron, expr:...}."""
+    import json
+    m = _mod()
+    out = json.loads(m._dump_jobs([{"name": "z", "expr": "0 13 * * *", "prompt": "x", "enabled": True}]))
+    job = out["jobs"][0]
+    assert job["schedule"] == {"kind": "cron", "expr": "0 13 * * *"}, "top-level expr must be lifted"
+    # and it must match what the validator resolves as the usable expr (no divergence)
+    import importlib.util
+    fv = importlib.util.spec_from_file_location("framework_validate", REPO / "scripts" / "framework_validate.py")
+    fvm = importlib.util.module_from_spec(fv); fv.loader.exec_module(fvm)
+    assert fvm._cron_expr({"name": "z", "expr": "0 13 * * *"}) == "0 13 * * *"   # validator accepts it
+    assert fvm._cron_expr(job) == "0 13 * * *"                                    # deployed shape still resolves
+
+
 def test_validate_unique_ids_flags_collisions():  # invariant-audit M37
     """cron-plus keys by id (minted from name); a dup id/name means one job runs the other's def and
     the twin never fires. The single-pack merge + extension pass had no gate, and _by_name/

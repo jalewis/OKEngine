@@ -29,6 +29,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 
 DEFAULT_TIMEOUT = 120
 DEFAULT_RETRIES = 2
@@ -50,6 +51,9 @@ def _resolve(base_url: str | None, model: str | None) -> tuple[str, str]:
     if not url or not mdl:
         raise LLMError("llm_lib: no endpoint/model — pass base_url+model or set "
                        "OKENGINE_LLM_BASE_URL + OKENGINE_LLM_MODEL")
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise LLMError("llm_lib: endpoint must be an http(s) URL with a host")
     return url, mdl
 
 
@@ -99,7 +103,7 @@ def chat(prompt_or_messages, *, model: str | None = None, base_url: str | None =
     last: Exception | None = None
     for attempt in range(retries + 1):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:  # nosec B310
                 return parse_content(json.load(r))
         except LLMError:
             raise                       # a parsed-but-unusable answer won't improve on retry

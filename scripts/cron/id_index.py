@@ -29,6 +29,12 @@ from pathlib import Path
 
 import yaml
 
+try:                                            # id_lib is a sibling baked write-path lib
+    import id_lib
+except ImportError:                             # standalone import (cron/tests): add our own dir
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import id_lib
+
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 INDEX_PATH = Path(os.environ.get("HERMES_DATA", "/opt/data")) / "state" / "id-index.json"
 
@@ -61,6 +67,11 @@ class IdIndex:
         self.aliases: dict[str, str] = {}      # alias id -> rel path
         self.tombstoned: set[str] = set()
         self._collisions: dict[str, list[str]] = {}   # id -> [rel paths] (>1 live)
+        # Normalized name/alias -> rel paths, for write_server._dedup_on_create's name<->alias match
+        # (okengine#324). Unlike by_id these index LIVE entity pages EVEN WITHOUT an id (the dedup must
+        # catch their duplicates too). Populated by _add_identity for entities/ pages only.
+        self.name_to_rels: dict[str, list[str]] = {}
+        self.alias_to_rels: dict[str, list[str]] = {}
 
     def resolve(self, page_id: str) -> str | None:
         """The wiki-relative path for `page_id`, consulting `aliases:`. None if unknown."""
@@ -96,23 +107,53 @@ class IdIndex:
         for a in aliases:
             self.aliases.setdefault(str(a), rel)
 
+    def _add_identity(self, rel: str, fm: dict) -> None:
+        """Record a LIVE entity page's normalized primary-name + aliases (okengine#324). Caller has
+        already excluded tombstoned pages. Matches _dedup_on_create's key derivation exactly: primary
+        name = name|title|stem; aliases coerced from a scalar the same way (okengine#196)."""
+        stem = rel.rsplit("/", 1)[-1]
+        if stem.endswith(".md"):
+            stem = stem[:-3]
+        name = id_lib.normalize_key(str(fm.get("name") or fm.get("title") or stem))
+        if name:
+            bucket = self.name_to_rels.setdefault(name, [])
+            if rel not in bucket:
+                bucket.append(rel)
+        aliases = fm.get("aliases") or []
+        if isinstance(aliases, str):
+            aliases = [a.strip() for a in aliases.split(",") if a.strip()]
+        elif not isinstance(aliases, list):
+            aliases = []
+        for a in aliases:
+            na = id_lib.normalize_key(str(a))
+            if na:
+                bucket = self.alias_to_rels.setdefault(na, [])
+                if rel not in bucket:
+                    bucket.append(rel)
+
     def to_dict(self) -> dict:
         return {
-            "norm_version": 1,
+            "norm_version": 2,                  # v2 adds name_to_rels/alias_to_rels (okengine#324)
             "by_id": self.by_id,
             "aliases": self.aliases,
             "tombstoned": sorted(self.tombstoned),
             "collisions": self._collisions,
+            "name_to_rels": self.name_to_rels,
+            "alias_to_rels": self.alias_to_rels,
         }
 
 
 def from_dict(d: dict) -> IdIndex:
-    """Reconstruct an IdIndex from a persisted `to_dict()` payload."""
+    """Reconstruct an IdIndex from a persisted `to_dict()` payload. A pre-v2 artifact has no
+    name_to_rels/alias_to_rels — they default empty, and write_server._dedup_on_create FALLS BACK to
+    a live scan until the refresh cron rewrites a v2 artifact (okengine#324), so dedup is never blind."""
     idx = IdIndex()
     idx.by_id = dict(d.get("by_id") or {})
     idx.aliases = dict(d.get("aliases") or {})
     idx.tombstoned = set(d.get("tombstoned") or [])
     idx._collisions = dict(d.get("collisions") or {})
+    idx.name_to_rels = {k: list(v) for k, v in (d.get("name_to_rels") or {}).items()}
+    idx.alias_to_rels = {k: list(v) for k, v in (d.get("alias_to_rels") or {}).items()}
     return idx
 
 
@@ -143,12 +184,17 @@ def _scan(vault: Path) -> IdIndex:
             fm = _frontmatter(p.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             continue
-        pid = fm.get("id")
-        if not isinstance(pid, str) or not pid.strip():
-            continue
         try:
             rel = p.resolve().relative_to(base).as_posix()
         except (ValueError, OSError):
+            continue
+        # Name/alias identity for entities/ dedup (okengine#324) — indexed for LIVE entity pages even
+        # WITHOUT an id (the dedup must catch their duplicates), so this runs BEFORE the id skip below.
+        if rel.split("/", 1)[0] == "entities" and \
+                str(fm.get("status") or "").strip().lower() != "tombstoned":
+            idx._add_identity(rel, fm)
+        pid = fm.get("id")
+        if not isinstance(pid, str) or not pid.strip():
             continue
         idx._add(pid.strip(), rel, fm)
     return idx
@@ -165,6 +211,7 @@ def _refresh_into(idx: IdIndex, vault: Path, key: str) -> None:
                 fresh.by_id.setdefault(pid, rel)
             idx.by_id, idx.aliases = fresh.by_id, fresh.aliases
             idx.tombstoned, idx._collisions = fresh.tombstoned, fresh._collisions
+            idx.name_to_rels, idx.alias_to_rels = fresh.name_to_rels, fresh.alias_to_rels
         try:
             write_index(fresh)
         except OSError:

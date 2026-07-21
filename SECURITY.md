@@ -37,5 +37,20 @@ deployment is configured:
   file-tool write-guard is the backstop.
 - **A public reader deployment** must mount only public content and should disable
   or rate-limit expensive endpoints (export/graph rebuild).
+- **UI editing.** The reader's Chat can *write back* to the vault (via the `okengine-write`
+  MCP in the api_server toolset). On an externally-exposed deployment set **`OKENGINE_EDITING=0`**
+  to make it read-only — `ensure-runtime` drops `okengine-write` from the api_server toolset on the
+  next gateway recreate, so chat still answers from the vault but cannot edit it. Default is on for
+  back-compat; the reader shows a read-only indicator when off.
+- **Hardened profile (one switch).** Rather than discover and set each flag above,
+  set `OKENGINE_HARDENED=1` to assert "this deployment must be safe to expose." It
+  is **fail-closed**: the daily in-gateway `deployment_validate` lane FAILs (marking
+  itself ERRORED in fleet health) on any unsafe setting and names it — a missing or
+  default `OKENGINE_MCP_TOKEN`, a private reader with neither `OKENGINE_READER_PASSWORD`
+  nor an explicit `OKENGINE_TRUST=public`, rate limiting disabled
+  (`OKENGINE_READER_RATE=0`), exports left on for a public reader, or **UI editing left on**
+  (requires `OKENGINE_EDITING=0`). The profile
+  never mints secrets or flips values silently — the operator supplies them, so what
+  changed is always visible.
 
 When reporting, please note the deployment mode (local vs exposed) you tested.

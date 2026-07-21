@@ -22,7 +22,9 @@ else the pack dir name minus its `okpack-` prefix) — never an ad-hoc name.
 
 Dry-run by default (prints the exact plan); `--apply` writes. Idempotent: every merge is
 key-based (type name / rule id / job name / prompt key / xmlUrl / persona marker), so a
-re-run applies nothing. Runs `coinstall_preflight` first and refuses on FAIL.
+re-run applies nothing. `--refresh` replaces changed runtime artifacts only when the pack's
+ownership manifest proves they belong to that co-installed domain. Runs `coinstall_preflight`
+first and refuses on FAIL.
 
 The write-path probes (invalid page under the subtree must REJECT; host pages untouched)
 need a LIVE gateway and are printed as the post-install checklist, not run here — along
@@ -30,7 +32,7 @@ with the deploy commands that make the cron/feed merges take effect.
 
 Usage:
   framework install-domain <deployment-dir> <pack-dir>
-      [--under wiki/<slug>] [--shape subtree|taxonomy] [--apply]
+      [--under wiki/<slug>] [--shape subtree|taxonomy] [--refresh] [--apply]
 """
 from __future__ import annotations
 
@@ -38,8 +40,10 @@ import argparse
 import importlib.util
 import json
 import re
+import shutil
 import sys
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -47,6 +51,17 @@ import yaml
 _HERE = Path(__file__).resolve().parent
 
 PERSONA_MARKER = "## Installed domain:"
+MAX_OPML_BYTES = 10 * 1024 * 1024
+
+
+def _safe_xml(data: bytes | str) -> ET.Element:
+    raw = data.encode("utf-8") if isinstance(data, str) else data
+    if len(raw) > MAX_OPML_BYTES:
+        raise ET.ParseError("OPML exceeds 10 MiB safety limit")
+    upper = raw[:4096].upper()
+    if b"<!DOCTYPE" in upper or b"<!ENTITY" in upper:
+        raise ET.ParseError("DTD/entity declarations are not permitted")
+    return ET.fromstring(raw)  # nosec B314
 
 
 def _load_mod(filename: str):
@@ -80,6 +95,8 @@ def _dump_entry(key: str, val, indent: int) -> str:
     pad = " " * indent
     flow = yaml.safe_dump(val, default_flow_style=True, sort_keys=False,
                           width=10**6).strip()
+    if flow.endswith("\n..."):
+        flow = flow[:-4]
     return f"{pad}{key}: {flow}\n"
 
 
@@ -302,6 +319,238 @@ def merge_type_aliases(host: Path, pack: Path, plan: Plan) -> None:
     plan.step(f"merge {len(add)} type_alias(es) into schema.yaml: {sorted(add)}", _do)
 
 
+def merge_coverage_fields(host: Path, pack: Path, plan: Plan) -> None:
+    """Fold a guest's `coverage_fields` (the field-population ratios corpus_audit tracks, okengine
+    #264) into the host schema so the type OWNER's coverage declarations TRAVEL into a composed /
+    bundle vault. Without this a member (okpack-vuln: cve.cvss_base) declares coverage the composed
+    schema silently drops — the metric only ever appears in the member's STANDALONE deploy, and a
+    bundle like okpack-cti shows UNDETECTABLE despite owning the enriched type. Additive + deduped
+    by (type, field); a host entry for the same pair wins."""
+    additions = _yaml(pack / "subdomain" / "host-schema-additions.yaml").get("coverage_fields") or []
+    additions = [a for a in additions if isinstance(a, dict) and a.get("type") and a.get("field")]
+    if not additions:
+        return
+    hschema = host / "schema.yaml"
+    have = {(str(e.get("type")), str(e.get("field")))
+            for e in (_yaml(hschema).get("coverage_fields") or []) if isinstance(e, dict)}
+    add = [a for a in additions if (str(a["type"]), str(a["field"])) not in have]
+    if not add:
+        return
+    text = hschema.read_text(encoding="utf-8")
+    # host declares coverage_fields INLINE (`coverage_fields: [...]`) — a list can't be block-inserted
+    # into; leave it for a human rather than append a second key YAML would silently de-dup. (Packs
+    # write block style, so this is belt-and-braces.)
+    if re.search(r"^coverage_fields:[ \t]*\S", text, re.M) and \
+            not re.search(r"^coverage_fields:[ \t]*(#.*)?$", text, re.M):
+        plan.warn("host declares coverage_fields inline — skipping guest merge (add by hand)")
+        return
+
+    def _do(add=add):
+        t = hschema.read_text(encoding="utf-8")
+
+        def _entry(a):
+            body = f"type: {a['type']}, field: {a['field']}"
+            if a.get("min") is not None:
+                body += f", min: {a['min']}"
+            return f"  - {{{body}}}\n"
+        block = ("  # --- co-installed coverage_fields (okpack: "
+                 f"{pack_name(pack)}, framework install-domain) ---\n"
+                 + "".join(_entry(a) for a in add))
+        new_t = _insert_under(t, r"^coverage_fields:[ \t]*(#.*)?$", block)
+        if new_t is None:                       # no coverage_fields yet — add a fresh top-level block
+            new_t = t.rstrip("\n") + "\ncoverage_fields:\n" + block
+        got = {(str(e.get("type")), str(e.get("field")))
+               for e in (yaml.safe_load(new_t).get("coverage_fields") or []) if isinstance(e, dict)}
+        assert {(str(a["type"]), str(a["field"])) for a in add} <= got, \
+            "coverage_fields merge failed to parse back"
+        hschema.write_text(new_t, encoding="utf-8")
+    plan.step(f"merge {len(add)} coverage_field(s) into schema.yaml: "
+              f"{[(a['type'], a['field']) for a in add]}", _do)
+
+
+def merge_enums(host: Path, pack: Path, plan: Plan) -> None:
+    """Fold a guest's `enums` (vocabularies) + `field_enums` (field->rule) from host-schema-additions
+    into the host schema, so a type OWNER's vocabulary TRAVELS into a composed/bundle vault and
+    corpus_audit's enum-drift metric can actually SEE the guest's fields. Without this a member
+    (okpack-vuln: cve.severity, okpack-incidents: incident.incident_type, okpack-indicators:
+    indicator.indicator_type) declares an enum the composed schema silently drops — the A-class vocab
+    drift on those fields reads UNDETECTABLE in the bundle deploy though the drift is real
+    (okengine#259 rec 12). Additive + deduped by key; a host entry for the same key WINS (never
+    overwritten — the host's contract is authoritative). Mirrors merge_coverage_fields."""
+    add = _yaml(pack / "subdomain" / "host-schema-additions.yaml")
+    g_enums = add.get("enums") if isinstance(add.get("enums"), dict) else {}
+    g_fe = add.get("field_enums") if isinstance(add.get("field_enums"), dict) else {}
+    if not g_enums and not g_fe:
+        return
+    hschema = host / "schema.yaml"
+    hy = _yaml(hschema)
+    h_enums = hy.get("enums") if isinstance(hy.get("enums"), dict) else {}
+    h_fe = hy.get("field_enums") if isinstance(hy.get("field_enums"), dict) else {}
+    new_enums = {k: v for k, v in g_enums.items() if k not in h_enums}
+    new_fe = {k: v for k, v in g_fe.items() if k not in h_fe}
+    merged_fe = {}
+    for key, guest in g_fe.items():
+        current = h_fe.get(key)
+        if key not in h_fe or not isinstance(current, dict) or not isinstance(guest, dict):
+            continue
+        current_by_type = current.get("by_type")
+        guest_by_type = guest.get("by_type")
+        if not isinstance(current_by_type, dict) or not isinstance(guest_by_type, dict):
+            continue
+        missing = {name: value for name, value in guest_by_type.items()
+                   if name not in current_by_type}
+        if missing:
+            value = dict(current)
+            value["by_type"] = {**current_by_type, **missing}
+            merged_fe[key] = value
+    if not new_enums and not new_fe and not merged_fe:
+        return
+
+    text = hschema.read_text(encoding="utf-8")
+    # a host that declares either block INLINE (`enums: {...}`) can't be block-inserted into without
+    # YAML silently de-duping a second same-named key — leave it for a human (mirror coverage_fields).
+    for key in ("enums", "field_enums"):
+        if re.search(rf"^{key}:[ \t]*\S", text, re.M) and \
+                not re.search(rf"^{key}:[ \t]*(#.*)?$", text, re.M):
+            plan.warn(f"host declares {key} inline — skipping guest merge (add by hand)")
+            return
+
+    def _render(d: dict) -> str:
+        return "".join(
+            f"  {k}: {yaml.safe_dump(v, default_flow_style=True, allow_unicode=True).strip()}\n"
+            for k, v in d.items())
+
+    def _do():
+        t = hschema.read_text(encoding="utf-8")
+        pn = pack_name(pack)
+        for key, block_d in (("enums", new_enums), ("field_enums", new_fe)):
+            if not block_d:
+                continue
+            block = (f"  # --- co-installed {key} (okpack: {pn}, framework install-domain) ---\n"
+                     + _render(block_d))
+            nt = _insert_under(t, rf"^{key}:[ \t]*(#.*)?$", block)
+            if nt is None:                       # no such block yet — add a fresh top-level one
+                nt = t.rstrip("\n") + f"\n{key}:\n" + block
+            t = nt
+        # Existing field contracts frequently use an inline `status: {by_type: ...}`. Replace
+        # exactly that entry with a merged value so guest-owned type cases travel without dumping
+        # or reformatting the operator's full schema. Existing host type cases always win.
+        for field, value in merged_fe.items():
+            section = re.search(r"^field_enums:[ \t]*(?:#.*)?$", t, re.M)
+            assert section is not None, "field_enums section vanished during merge"
+            start = re.search(rf"^  {re.escape(str(field))}:.*$", t[section.end():], re.M)
+            assert start is not None, f"field_enums.{field} entry vanished during merge"
+            absolute_start = section.end() + start.start()
+            line_end = t.find("\n", absolute_start)
+            line_end = len(t) if line_end < 0 else line_end + 1
+            first_line = t[absolute_start:line_end]
+            if first_line.rstrip().endswith(":"):
+                rest = t[line_end:]
+                next_entry = re.search(r"^(?:  \S|\S)", rest, re.M)
+                absolute_end = line_end + (next_entry.start() if next_entry else len(rest))
+            else:
+                absolute_end = line_end
+            t = t[:absolute_start] + _dump_entry(str(field), value, 2) + t[absolute_end:]
+        parsed = yaml.safe_load(t)
+        got_e = parsed.get("enums") or {}
+        got_fe = parsed.get("field_enums") or {}
+        assert set(new_enums) <= set(got_e) and set(new_fe) <= set(got_fe), \
+            "enums merge failed to parse back"
+        for field, value in merged_fe.items():
+            assert got_fe.get(field) == value, f"field_enums.{field} nested merge failed"
+        hschema.write_text(t, encoding="utf-8")
+    plan.step(f"merge {len(new_enums)} enum(s) + {len(new_fe)} field_enum(s) + "
+              f"{len(merged_fe)} by-type extension(s) into schema.yaml: "
+              f"{sorted(list(new_enums) + list(new_fe) + list(merged_fe))}", _do)
+
+
+def merge_field_contracts(host: Path, pack: Path, plan: Plan) -> None:
+    """Carry additive field-shape and list-item contracts into a taxonomy host.
+
+    Type required fields alone are not sufficient: dropping `facets: list` or its item contract
+    silently weakens the same pack when co-installed. Host values win on an existing key; new keys
+    are inserted surgically under the existing top-level mapping.
+    """
+    additions = _yaml(pack / "subdomain" / "host-schema-additions.yaml")
+    hschema = host / "schema.yaml"
+    # Compare against the effective schema when extensions are enabled. A common contract may be
+    # extension-owned even though it is absent from schema.yaml; inserting it into the root would
+    # make the next extension composition fail as a duplicate declaration.
+    composed = host / ".okengine" / "composed-schema.yaml"
+    host_schema = _yaml(composed) if composed.is_file() else _yaml(hschema)
+    pending = {}
+    for section in ("field_shapes", "field_items"):
+        guest = additions.get(section) if isinstance(additions.get(section), dict) else {}
+        current = host_schema.get(section) if isinstance(host_schema.get(section), dict) else {}
+        pending[section] = {key: value for key, value in guest.items() if key not in current}
+        for key in set(guest) & set(current):
+            if guest[key] != current[key]:
+                plan.warn(f"{section}.{key} already differs in host — host wins; verify compatibility")
+    if not any(pending.values()):
+        return
+
+    def _do():
+        text = hschema.read_text(encoding="utf-8")
+        for section, values in pending.items():
+            if not values:
+                continue
+            block = (f"  # --- co-installed {section} (okpack: {pack_name(pack)}, "
+                     "framework install-domain) ---\n" +
+                     "".join(_dump_entry(str(key), value, 2) for key, value in sorted(values.items())))
+            updated = _insert_under(text, rf"^{section}:[ \t]*(#.*)?$", block)
+            if updated is None:
+                updated = text.rstrip("\n") + f"\n{section}:\n" + block
+            text = updated
+        parsed = yaml.safe_load(text)
+        for section, values in pending.items():
+            assert set(values) <= set(parsed.get(section) or {}), f"{section} merge failed"
+        hschema.write_text(text, encoding="utf-8")
+
+    count = sum(len(values) for values in pending.values())
+    plan.step(f"merge {count} field shape/item contract(s)", _do)
+
+
+def merge_list_contracts(host: Path, pack: Path, plan: Plan) -> None:
+    """Union additive top-level enforcement lists without reformatting the host schema."""
+    additions = _yaml(pack / "subdomain" / "host-schema-additions.yaml")
+    hschema = host / "schema.yaml"
+    current = _yaml(hschema)
+    pending: dict[str, list] = {}
+    for key in ("protected_fields", "depth_critical_types"):
+        guest = additions.get(key) if isinstance(additions.get(key), list) else []
+        host_values = current.get(key) if isinstance(current.get(key), list) else []
+        merged = [*host_values, *(value for value in guest if value not in host_values)]
+        if merged != host_values:
+            pending[key] = merged
+    if not pending:
+        return
+
+    def _do():
+        text = hschema.read_text(encoding="utf-8")
+        for key, values in pending.items():
+            document = yaml.compose(text)
+            value_node = None
+            if isinstance(document, yaml.MappingNode):
+                for key_node, candidate in document.value:
+                    if key_node.value == key:
+                        value_node = candidate
+                        break
+            rendered = yaml.safe_dump(values, default_flow_style=True, sort_keys=False,
+                                      width=10**6).strip()
+            if rendered.endswith("\n..."):
+                rendered = rendered[:-4]
+            if value_node is None:
+                text = text.rstrip("\n") + f"\n{key}: {rendered}\n"
+            else:
+                text = text[:value_node.start_mark.index] + rendered + text[value_node.end_mark.index:]
+        parsed = yaml.safe_load(text)
+        for key, values in pending.items():
+            assert parsed.get(key) == values, f"{key} merge failed"
+        hschema.write_text(text, encoding="utf-8")
+
+    plan.step(f"merge {len(pending)} additive enforcement list contract(s): {sorted(pending)}", _do)
+
+
 def merge_namespaces(host: Path, pack: Path, plan: Plan) -> None:
     """Taxonomy shape: the pack's OWNED namespaces (pack.yaml owns.namespaces) must
     land in the host schema, or every page written into them is refused by the
@@ -398,12 +647,12 @@ def merge_feeds(host: Path, pack: Path, plan: Plan) -> None:
                            dst.write_bytes(src.read_bytes())))
         return
     try:
-        stree, dtree = ET.parse(src), ET.parse(dst)
-    except ET.ParseError as e:
+        sroot, droot = _safe_xml(src.read_bytes()), _safe_xml(dst.read_bytes())
+    except (OSError, ET.ParseError) as e:
         plan.fail(f"feeds OPML unparseable: {e}")
         return
-    have = {o.get("xmlUrl") for o in dtree.getroot().iter("outline") if o.get("xmlUrl")}
-    new = [o for o in stree.getroot().iter("outline")
+    have = {o.get("xmlUrl") for o in droot.iter("outline") if o.get("xmlUrl")}
+    new = [o for o in sroot.iter("outline")
            if o.get("xmlUrl") and o.get("xmlUrl") not in have]
     if not new:
         return
@@ -420,28 +669,36 @@ def merge_feeds(host: Path, pack: Path, plan: Plan) -> None:
             f'type="rss" xmlUrl="{esc(o.get("xmlUrl"))}"/>\n' for o in new)
         lines = f"    <!-- co-installed feeds ({pack_name(pack)}, framework install-domain) -->\n" + lines
         new_t = t.replace("</body>", lines + "  </body>", 1)
-        got = {o.get("xmlUrl") for o in ET.fromstring(new_t).iter("outline")}
+        got = {o.get("xmlUrl") for o in _safe_xml(new_t).iter("outline")}
         assert {o.get("xmlUrl") for o in new} <= got, "feed merge failed to parse back"
         dst.write_text(new_t, encoding="utf-8")
     plan.step(f"merge {len(new)} feed(s) into feeds/feeds.opml (deduped by xmlUrl)", _do)
 
 
-def merge_crons(host: Path, pack: Path, plan: Plan) -> None:
+def merge_crons(host: Path, pack: Path, plan: Plan, *, refresh: bool = False,
+                owned: set[str] | None = None) -> None:
     pname = pack_name(pack)
     src = pack / "crons" / "domain-crons.json"
     if src.is_file():
         dst = host / "crons" / "domain-crons.json"
         cur = json.loads(dst.read_text(encoding="utf-8")) if dst.is_file() else []
         cur_jobs = cur["jobs"] if isinstance(cur, dict) else cur
-        have = {j.get("name") for j in cur_jobs}
-        add, unprefixed = [], []
+        by_name = {j.get("name"): (i, j) for i, j in enumerate(cur_jobs)}
+        owned = owned or set()
+        add, update, stale, unprefixed = [], [], [], []
         for j in json.loads(src.read_text(encoding="utf-8")):
-            if j.get("name") in have:
-                continue
             if not str(j.get("name", "")).startswith(f"{pname}-"):
                 unprefixed.append(j.get("name"))
                 continue
-            add.append(j)
+            name = j.get("name")
+            if name not in by_name:
+                add.append(j)
+            elif ({k: v for k, v in by_name[name][1].items() if k != "enabled"} !=
+                  {k: v for k, v in j.items() if k != "enabled"}):
+                if refresh and name in owned:
+                    update.append((by_name[name][0], j))
+                else:
+                    stale.append(name)
         if unprefixed:
             plan.warn(f"cron job(s) skipped — co-installed domain jobs must be "
                       f"'{pname}-' prefixed: {unprefixed}")
@@ -451,6 +708,21 @@ def merge_crons(host: Path, pack: Path, plan: Plan) -> None:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 dst.write_text(json.dumps(cur, indent=2) + "\n", encoding="utf-8")
             plan.step(f"append {len(add)} domain cron job(s): {[j['name'] for j in add]}", _do)
+        if stale:
+            plan.fail(f"installed cron job(s) differ from {pname}: {stale} — "
+                      "run install-domain --refresh --apply to accept the pack update")
+        if update:
+            def _update(update=update, cur=cur, cur_jobs=cur_jobs, dst=dst):
+                for index, job in update:
+                    merged = dict(job)
+                    # Preserve the deployment operator's explicit on/off decision. Pack updates
+                    # own the job contract, but never get to silently activate a disabled lane.
+                    if "enabled" in cur_jobs[index]:
+                        merged["enabled"] = cur_jobs[index]["enabled"]
+                    cur_jobs[index] = merged
+                dst.write_text(json.dumps(cur, indent=2) + "\n", encoding="utf-8")
+            plan.step(f"refresh {len(update)} owned domain cron job(s): "
+                      f"{[j['name'] for _, j in update]}", _update)
     src = pack / "crons" / "engine-template-prompts.json"
     if src.is_file():
         # Engine-template prompts NEVER auto-merge in a co-install. Shared engine
@@ -472,7 +744,9 @@ def merge_crons(host: Path, pack: Path, plan: Plan) -> None:
                       "domain job)")
 
 
-def merge_lane_scripts(host: Path, pack: Path, plan: Plan) -> None:
+def merge_lane_scripts(host: Path, pack: Path, plan: Plan, *, refresh: bool = False,
+                       owned: set[str] | None = None, shared: set[str] | None = None,
+                       scope: set[str] | None = None) -> None:
     """Copy the pack's lane scripts (crons/scripts/*.py) into the host's staging dir —
     a merged domain job references its script by name, and deploy-cron-scripts stages
     from the HOST deployment only (first real install shipped a job whose script was
@@ -483,22 +757,38 @@ def merge_lane_scripts(host: Path, pack: Path, plan: Plan) -> None:
     if not src.is_dir():
         return
     dst = host / "crons" / "scripts"
-    copy, clash = [], []
+    owned = owned or set()
+    shared = shared or set()
+    copy, replace, preserve, clash = [], [], [], []
     for f in sorted(src.glob("*.py")):  # glob-ok: pack crons/scripts/ is a flat dir, not a sharded content namespace
+        if scope is not None and f.name not in scope:
+            continue
         d = dst / f.name
         if not d.is_file():
             copy.append(f.name)
         elif d.read_bytes() != f.read_bytes():
-            clash.append(f.name)
+            if refresh and f.name in owned:
+                replace.append(f.name)
+            elif refresh and f.name in shared:
+                preserve.append(f.name)
+            else:
+                clash.append(f.name)
+    if preserve:
+        plan.warn(f"shared support script(s) differ and remain host-controlled: {preserve}")
     for n in clash:
-        plan.fail(f"lane script name collision: crons/scripts/{n} exists in the host "
-                  "with DIFFERENT content — rename the pack's script (prefix convention)")
-    if copy:
-        def _do(copy=copy):
+        plan.fail(f"lane script crons/scripts/{n} differs from the installed pack; "
+                  "use --refresh only for a pack that owns this artifact, or rename a true collision")
+    if copy or replace:
+        def _do(copy=copy, replace=replace):
             dst.mkdir(parents=True, exist_ok=True)
-            for n in copy:
+            for n in copy + replace:
                 (dst / n).write_bytes((src / n).read_bytes())
-        plan.step(f"copy {len(copy)} lane script(s) into crons/scripts/: {copy}", _do)
+        desc = []
+        if copy:
+            desc.append(f"copy {len(copy)} new: {copy}")
+        if replace:
+            desc.append(f"refresh {len(replace)} owned: {replace}")
+        plan.step("; ".join(desc) + " in crons/scripts/", _do)
 
 
 def _persona_provenance(pack: Path) -> str:
@@ -566,7 +856,37 @@ def install_subtree(host: Path, pack: Path, slug: str, plan: Plan) -> None:
     append_persona(host, pack, slug, plan)
 
 
-def merge_cockpit(host: Path, pack: Path, plan: Plan) -> None:
+def _mapping_value(node, key: str):
+    """Return a composed-YAML mapping value without round-tripping the document."""
+    if not isinstance(node, yaml.MappingNode):
+        return None
+    for k, value in node.value:
+        if k.value == key:
+            return value
+    return None
+
+
+def _replace_cockpit_boxes(text: str, tab: str, boxes: list[dict]) -> str:
+    """Replace one tab's boxes node while leaving the rest of the commented schema intact."""
+    root = yaml.compose(text)
+    cockpit = _mapping_value(root, "cockpit")
+    tab_defs = _mapping_value(cockpit, "tab_defs")
+    tab_node = _mapping_value(tab_defs, tab)
+    boxes_node = _mapping_value(tab_node, "boxes")
+    assert boxes_node is not None, f"cockpit tab {tab!r} has no boxes list"
+    replacement = yaml.safe_dump(boxes, default_flow_style=True, sort_keys=False,
+                                 width=10**6).strip()
+    if replacement.endswith("\n..."):
+        replacement = replacement[:-4]
+    # A block sequence's end mark is the first character of the following mapping key. Replacing
+    # it with a one-line flow sequence therefore has to restore the line boundary. A flow sequence
+    # embedded in an inline mapping must not gain one (that would split `{..., boxes: []}`).
+    if not boxes_node.flow_style:
+        replacement += "\n"
+    return text[:boxes_node.start_mark.index] + replacement + text[boxes_node.end_mark.index:]
+
+
+def merge_cockpit(host: Path, pack: Path, plan: Plan, *, refresh: bool = False) -> None:
     """Taxonomy shape: fold a guest's cockpit `tab_defs` + `tabs` (from host-schema-additions.yaml)
     into the host's `cockpit:` block, so a composed vault surfaces the guest domain's tab (a
     Vulnerabilities pack contributes its Vulnerabilities tab). Host wins on a tab it already declares.
@@ -575,7 +895,10 @@ def merge_cockpit(host: Path, pack: Path, plan: Plan) -> None:
     add_ck = _yaml(pack / "subdomain" / "host-schema-additions.yaml").get("cockpit") or {}
     add_defs = add_ck.get("tab_defs") if isinstance(add_ck.get("tab_defs"), dict) else {}
     add_names = [str(t).strip() for t in (add_ck.get("tabs") or []) if str(t).strip()]
-    if not add_defs and not add_names:
+    contributions = (add_ck.get("tab_contributions")
+                     if isinstance(add_ck.get("tab_contributions"), dict) else {})
+    aliases = add_ck.get("tab_aliases") if isinstance(add_ck.get("tab_aliases"), dict) else {}
+    if not add_defs and not add_names and not contributions and not aliases:
         return
     hschema = host / "schema.yaml"
     hcock = _yaml(hschema).get("cockpit") or {}
@@ -625,17 +948,131 @@ def merge_cockpit(host: Path, pack: Path, plan: Plan) -> None:
                                encoding="utf-8")
         plan.step(f"add {len(missing)} tab(s) to the cockpit nav: {missing}", _do_tabs)
 
+    # A guest may extend a host-owned workspace without creating another top-level tab. Stable,
+    # pack-prefixed contribution IDs and box IDs make ownership explicit and refresh deterministic.
+    pname = pack_name(pack)
+    prospective_defs = set(htabdefs) | set(add_defs)
+    desired_by_target: dict[str, list[dict]] = {}
+    contribution_ids = set()
+    for cid, declaration in contributions.items():
+        cid = str(cid).strip()
+        if not cid.startswith(pname + "."):
+            plan.fail(f"cockpit contribution {cid!r} must be prefixed with {pname!r}")
+            continue
+        if not isinstance(declaration, dict):
+            plan.fail(f"cockpit contribution {cid!r} must be a mapping")
+            continue
+        target = str(declaration.get("target") or "").strip()
+        boxes = declaration.get("boxes")
+        if target not in prospective_defs:
+            plan.fail(f"cockpit contribution {cid!r} targets missing tab {target!r}")
+            continue
+        if not isinstance(boxes, list) or not boxes:
+            plan.fail(f"cockpit contribution {cid!r} must declare at least one box")
+            continue
+        normalized = []
+        for box in boxes:
+            bid = str(box.get("id") or "").strip() if isinstance(box, dict) else ""
+            if not bid or not bid.startswith(pname + "."):
+                plan.fail(f"every box in cockpit contribution {cid!r} needs a stable, "
+                          f"{pname!r}-prefixed id")
+                continue
+            normalized.append({**box, "id": bid, "contribution": cid})
+        if len(normalized) == len(boxes):
+            desired_by_target.setdefault(target, []).extend(normalized)
+            contribution_ids.add(cid)
 
-def install_taxonomy(host: Path, pack: Path, slug: str, plan: Plan) -> None:
+    if desired_by_target:
+        def _do_contributions():
+            path = host / "schema.yaml"
+            text = path.read_text(encoding="utf-8")
+            parsed = yaml.safe_load(text) or {}
+            defs = ((parsed.get("cockpit") or {}).get("tab_defs") or {})
+            for target, desired in desired_by_target.items():
+                current = list((defs.get(target) or {}).get("boxes") or [])
+                owned = [b for b in current if b.get("contribution") in contribution_ids]
+                foreign = [b for b in current if b.get("contribution") not in contribution_ids]
+                foreign_ids = {str(b.get("id")) for b in foreign if b.get("id")}
+                collisions = sorted(foreign_ids & {str(b["id"]) for b in desired})
+                assert not collisions, f"cockpit box id collision on {target}: {collisions}"
+                if owned == desired:
+                    continue
+                assert not owned or refresh, (f"cockpit contribution on {target!r} changed; "
+                                              "rerun install-domain with --refresh")
+                merged = foreign + desired
+                text = _replace_cockpit_boxes(text, target, merged)
+                reparsed = yaml.safe_load(text) or {}
+                actual = ((((reparsed.get("cockpit") or {}).get("tab_defs") or {})
+                           .get(target) or {}).get("boxes") or [])
+                assert actual == merged, (f"cockpit contribution merge for {target!r} did not "
+                                          "parse back exactly; schema was not written")
+                defs[target]["boxes"] = merged
+            path.write_text(text, encoding="utf-8")
+        plan.step(f"merge cockpit contribution(s) into {sorted(desired_by_target)}",
+                  _do_contributions)
+
+    if aliases:
+        invalid = {str(k): str(v) for k, v in aliases.items()
+                   if str(v) not in prospective_defs}
+        for alias, target in invalid.items():
+            plan.fail(f"cockpit tab alias {alias!r} targets missing tab {target!r}")
+        valid = {str(k).strip(): str(v).strip() for k, v in aliases.items()
+                 if str(v) in prospective_defs}
+        existing_aliases = hcock.get("tab_aliases") or {}
+        conflicts = {k: (existing_aliases[k], v) for k, v in valid.items()
+                     if k in existing_aliases and existing_aliases[k] != v}
+        for alias, values in conflicts.items():
+            plan.fail(f"cockpit tab alias {alias!r} conflicts: {values[0]!r} vs {values[1]!r}")
+        new_aliases = {k: v for k, v in valid.items() if k not in existing_aliases}
+        if new_aliases:
+            def _do_aliases():
+                text = hschema.read_text(encoding="utf-8")
+                block = "".join(_dump_entry(k, v, 4) for k, v in new_aliases.items())
+                if re.search(r"^  tab_aliases:\s*$", text, re.M):
+                    updated = _insert_under(text, r"^  tab_aliases:\s*$", block)
+                else:
+                    updated = _insert_under(text, r"^cockpit:\s*(#.*)?$", "  tab_aliases:\n" + block)
+                assert updated is not None
+                hschema.write_text(updated, encoding="utf-8")
+            plan.step(f"merge cockpit tab alias(es): {sorted(new_aliases)}", _do_aliases)
+
+
+def install_taxonomy(host: Path, pack: Path, slug: str, plan: Plan, *, refresh: bool = False,
+                     manifest: dict | None = None, source_manifest: dict | None = None) -> None:
+    manifest = manifest or {}
+    source_manifest = source_manifest or {}
+    if refresh:
+        # Refresh is deliberately a runtime-only corridor. Schema, cockpit, feeds, rules, and
+        # persona are additive composition contracts and need a fresh bundle composition—not a
+        # cron update that might partially rewrite the write boundary.
+        merge_crons(host, pack, plan, refresh=True,
+                    owned=set((manifest.get("cron_jobs") or {}).keys()))
+        merge_lane_scripts(host, pack, plan, refresh=True,
+                           owned=set((manifest.get("lane_scripts") or {}).keys()),
+                           shared=set((source_manifest.get("shared_support_scripts") or {}).keys()),
+                           scope=(set((source_manifest.get("lane_scripts") or {}).keys()) |
+                                  set((source_manifest.get("shared_support_scripts") or {}).keys())))
+        merge_cockpit(host, pack, plan, refresh=True)
+        return
     added = merge_types(host, pack, plan)
     merge_type_aliases(host, pack, plan)
+    merge_coverage_fields(host, pack, plan)
+    merge_enums(host, pack, plan)
+    merge_field_contracts(host, pack, plan)
+    merge_list_contracts(host, pack, plan)
     merge_namespaces(host, pack, plan)
     merge_rules(host, pack, added, plan)
     merge_feeds(host, pack, plan)
-    merge_crons(host, pack, plan)
-    merge_lane_scripts(host, pack, plan)
-    merge_cockpit(host, pack, plan)
-    append_persona(host, pack, slug, plan)
+    merge_crons(host, pack, plan, refresh=refresh,
+                owned=set((manifest.get("cron_jobs") or {}).keys()))
+    merge_lane_scripts(host, pack, plan, refresh=refresh,
+                       owned=set((manifest.get("lane_scripts") or {}).keys()),
+                       shared=set((source_manifest.get("shared_support_scripts") or {}).keys()),
+                       scope=(set((source_manifest.get("lane_scripts") or {}).keys()) |
+                              set((source_manifest.get("shared_support_scripts") or {}).keys())))
+    merge_cockpit(host, pack, plan, refresh=refresh)
+    if not refresh:
+        append_persona(host, pack, slug, plan)
 
 
 def _checklist(shape: str, slug: str) -> str:
@@ -657,6 +1094,39 @@ def _checklist(shape: str, slug: str) -> str:
         "fills independently")
 
 
+def _legacy_runtime_ownership(host: Path, pack: Path) -> dict:
+    """Conservatively adopt a pre-manifest install for an explicit first --refresh.
+
+    A matching pack-prefixed job name proves the domain was previously installed. Only scripts
+    directly referenced by those jobs are adopted; an unrelated same-named helper remains a hard
+    collision instead of being overwritten merely because --refresh was supplied.
+    """
+    pname = pack_name(pack)
+    try:
+        incoming_raw = json.loads((pack / "crons" / "domain-crons.json").read_text())
+        incoming = incoming_raw.get("jobs", []) if isinstance(incoming_raw, dict) else incoming_raw
+    except (OSError, json.JSONDecodeError):
+        incoming = []
+    try:
+        host_raw = json.loads((host / "crons" / "domain-crons.json").read_text())
+        host_jobs = host_raw.get("jobs", []) if isinstance(host_raw, dict) else host_raw
+    except (OSError, json.JSONDecodeError):
+        host_jobs = []
+    present = {str(row.get("name")) for row in host_jobs if isinstance(row, dict)}
+    owned_jobs, owned_scripts = {}, {}
+    for row in incoming:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "")
+        if name in present and name.startswith(f"{pname}-"):
+            owned_jobs[name] = "legacy-adopted"
+            if row.get("script"):
+                owned_scripts[Path(str(row["script"])).name] = "legacy-adopted"
+    source = _load_mod("composed_pack_state.py").source_manifest(pack, detect_shape(pack, None) or "taxonomy")
+    return {"cron_jobs": owned_jobs, "lane_scripts": owned_scripts,
+            "shared_support_scripts": source.get("shared_support_scripts") or {}}
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(
         prog="framework install-domain",
@@ -668,6 +1138,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--shape", choices=["subtree", "taxonomy"],
                     help="required only when the pack ships both co-install forms")
     ap.add_argument("--apply", action="store_true", help="write (default: print the plan)")
+    ap.add_argument("--refresh", action="store_true",
+                    help="replace changed cron jobs/scripts owned by this installed pack")
     ns = ap.parse_args(argv)
 
     host, pack = Path(ns.deployment).resolve(), Path(ns.pack).resolve()
@@ -701,19 +1173,52 @@ def main(argv: list[str]) -> int:
               file=sys.stderr)
         return 1
 
+    state = _load_mod("composed_pack_state.py")
+    pname = pack_name(pack)
+    prior_manifest = state.load(host, pname)
+    incoming_manifest = state.source_manifest(pack, shape)
+    ownership = prior_manifest or (_legacy_runtime_ownership(host, pack) if ns.refresh else {})
     plan = Plan(ns.apply)
     if shape == "subtree":
         install_subtree(host, pack, slug, plan)
     else:
-        install_taxonomy(host, pack, slug, plan)
+        install_taxonomy(host, pack, slug, plan, refresh=ns.refresh, manifest=ownership,
+                         source_manifest=incoming_manifest)
+    # A pack-version migration is one logical update with the install-domain edits planned above.
+    # Snapshot BEFORE those edits, otherwise the migration runner's own pre-migration snapshot can
+    # only roll back to an already-partially-updated deployment.
+    fu = _load_mod("framework_upgrade.py")
+    incoming_ver = str(incoming_manifest.get("pack_version") or "") or None
+    installed_ver = (fu.installed_pack_version(
+        host, pname, fallback=str(prior_manifest.get("pack_version") or "") or None)
+        if prior_manifest else None)
+    update_snapshot = None
+    if ns.apply and prior_manifest and incoming_ver and installed_ver != incoming_ver:
+        snap_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-install-domain"
+        update_snapshot = fu.snapshot(
+            host, snap_id, {"operation": "install-domain", "pack": pname,
+                            "from": installed_ver, "to": incoming_ver})
+        print(f"  transaction snapshot: .okengine/snapshots/{snap_id} (before domain update)")
     rc = plan.run()
+    if rc == 0 and ns.apply:
+        manifest = incoming_manifest
+        # Never bless a new source snapshot unless its changed owned runtime artifacts were
+        # actually refreshed. A normal re-run may diagnose staleness but must preserve the last
+        # known-good hashes so validation continues to detect it.
+        runtime_changed = prior_manifest and any(
+            manifest.get(key) != prior_manifest.get(key) for key in ("lane_scripts", "cron_jobs"))
+        if not runtime_changed or ns.refresh or not prior_manifest:
+            if state.write(host, manifest):
+                print(f"  recorded ownership manifest: {state.manifest_path(host, pname)}")
     if rc == 0 and plan.steps and ns.apply and shape == "taxonomy":
         # The taxonomy merge edited the host root schema.yaml — but the RUNTIME write path PREFERS
         # <host>/.okengine/composed-schema.yaml (base ⊕ pack ⊕ extensions) whenever an enabled
         # extension made that artifact exist, and it still predates the merge. Left stale, every
         # okengine-write into the newly co-installed namespace/type is silently rejected ("namespace
         # not declared", okengine#115) until the next full deploy. Regenerate it now so the write path
-        # sees the merge immediately; write_composed_schema self-heals the no-extension case too
+        # sees the merge immediately. This also applies to --refresh: Cockpit reads the effective
+        # artifact, so leaving it stale would hide refreshed tab contributions/aliases even though
+        # root schema.yaml is correct. write_composed_schema self-heals the no-extension case too
         # (no fragments → it removes any stale artifact so schema.yaml governs).
         compose = _load_mod("extension_compose.py")
         errs = compose.write_composed_schema(host)
@@ -725,6 +1230,32 @@ def main(argv: list[str]) -> int:
                 print(f"  - {e}", file=sys.stderr)
             return 1
         print("  regenerated .okengine/composed-schema.yaml — runtime write path now sees the merge")
+    # okengine#312: re-installing an EXISTING member is a pack update — run the guest's
+    # pack-version migrations (pack/migrations/m_*.py, span (installed, incoming]) against the
+    # composed host vault through the engine's upgrade runner: dry-run preview in plan mode,
+    # snapshot + roll-forward gate + auto-rollback under --apply. A NEW member just gets its
+    # version baselined so a future refresh can compute the span.
+    if rc == 0:
+        if prior_manifest:
+            try:
+                changelog = (pack / "CHANGELOG.md").read_text(encoding="utf-8")
+            except OSError:
+                changelog = None
+            if fu.run_pack_migrations(host, pname, installed_ver, incoming_ver,
+                                      apply=ns.apply, migrations_dir=pack / "migrations",
+                                      changelog_text=changelog, record=ns.apply,
+                                      apply_hint="--apply") != 0:
+                if update_snapshot is not None:
+                    added = fu.added_since_snapshot(host, update_snapshot)
+                    modified = fu.changed_since_snapshot(host, update_snapshot)
+                    n = fu.restore(host, update_snapshot, added=added, modified=modified)
+                    shutil.rmtree(update_snapshot, ignore_errors=True)
+                    print(f"  ↩ domain update transaction ROLLED BACK ({n} files restored)")
+                return 1
+        elif ns.apply and incoming_ver and incoming_ver != "0.0.0":
+            fu.record_pack_version(host, pname, incoming_ver)
+    if update_snapshot is not None:
+        shutil.rmtree(update_snapshot, ignore_errors=True)
     if rc == 0 and plan.steps:
         print("\nnext steps:\n" + _checklist(shape, slug))
     return rc

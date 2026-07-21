@@ -43,3 +43,37 @@ def test_bare_compose_sequence_seeds_the_mcp_token_before_up():
     assert header.index("build-engine-image.sh") < header.index("ensure-runtime.sh") \
         < header.index("docker compose up"), "ensure-runtime must sit between build and up"
     assert "crash-loops (okengine#208)" in header      # the WHY travels with the sequence
+
+
+def test_review_writer_is_explicit_bridge_only_and_cockpit_stays_read_only():
+    text = COMPOSE.read_text(encoding="utf-8")
+    review = text.split("  okengine-review-write:", 1)[1].split("  okengine-cockpit:", 1)[0]
+    cockpit = text.split("  okengine-cockpit:", 1)[1]
+    assert 'profiles: ["review"]' in review
+    assert "OKENGINE_WRITE_REVIEW_ONLY=1" in review
+    assert "OKENGINE_WRITE_TOKEN=${OKENGINE_REVIEW_TOKEN:-}" in review
+    assert "ports:" not in review, "review writer must not publish a host port"
+    assert 'volumes: ["./:/opt/vault"]' in review
+    assert 'volumes: ["./:/vault:ro"]' in cockpit
+    for key in ("OKENGINE_REVIEW_API", "OKENGINE_REVIEW_TOKEN", "OKENGINE_REVIEWER_NAME",
+                "OKENGINE_REVIEW_TRUSTED_NETWORK"):
+        assert key in cockpit
+
+
+def test_operation_runner_is_allowlisted_bridge_only_and_cockpit_stays_read_only():
+    text = COMPOSE.read_text(encoding="utf-8")
+    runner = text.split("  okengine-operation-runner:", 1)[1].split("  okengine-cockpit:", 1)[0]
+    cockpit = text.split("  okengine-cockpit:", 1)[1]
+    assert 'profiles: ["review"]' in runner
+    assert "OKENGINE_OPERATION_TOKEN=${OKENGINE_REVIEW_TOKEN:-}" in runner
+    assert "OKENGINE_OPERATION_ALLOW=${OKENGINE_OPERATION_ALLOW:-}" in runner
+    assert "ports:" not in runner, "operation runner must not publish a host port"
+    assert 'volumes: ["./:/opt/vault"]' in runner
+    assert "OKENGINE_OPERATION_API=http://okengine-operation-runner:8732" in cockpit
+    assert "OKENGINE_OPERATION_TOKEN=${OKENGINE_REVIEW_TOKEN:-}" in cockpit
+    assert 'volumes: ["./:/vault:ro"]' in cockpit
+
+
+def test_operation_runner_image_contains_engine_extension_tools():
+    dockerfile = (REPO / "okengine-operations" / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY extensions/ /engine/extensions/" in dockerfile

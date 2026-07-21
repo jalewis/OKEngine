@@ -68,6 +68,15 @@ def test_scopes_from_manifest():
     assert tok.scopes_from_manifest({}) == ([], [])
 
 
+def test_write_capability_from_manifest():
+    tok = _tokens()
+    policy = {"rule_id": "ext-demo-fields", "operations": ["update"],
+              "paths": ["dashboards/**"], "types": ["dashboard"],
+              "update_fields": ["status"], "protected_fields": ["id"], "body": "deny"}
+    manifest = {"capabilities": {"write": ["dashboards/**"], "write_policy": policy}}
+    assert tok.write_capability_from_manifest(manifest) == policy
+
+
 def test_mint_writes_hashed_store_and_plaintext_secret(tmp_path):
     tok = _tokens()
     plaintext = tok.mint(tmp_path, "demo.alpha", ["wiki/**"], ["dashboards/**"])
@@ -78,6 +87,7 @@ def test_mint_writes_hashed_store_and_plaintext_secret(tmp_path):
     assert plaintext not in json.dumps(store)
     assert rec["read_scopes"] == ["wiki/**"] and rec["write_scopes"] == ["dashboards/**"]
     assert rec["status"] == "active"
+    assert rec["write_capability"] == {}
     # plaintext lives only in the 0600 secrets file
     sec_path = tmp_path / ".okengine" / "extension-secrets.json"
     assert json.loads(sec_path.read_text())["demo.alpha"] == plaintext
@@ -94,6 +104,41 @@ def test_revoke_removes_from_store_and_secrets(tmp_path):
     assert ids == {"demo.beta"}
     sec = json.loads((tmp_path / ".okengine" / "extension-secrets.json").read_text())
     assert "demo.alpha" not in sec and "demo.beta" in sec
+
+
+def test_reconcile_updates_scopes_without_rotating_valid_token(tmp_path):
+    tok = _tokens()
+    plaintext = tok.mint(tmp_path, "demo.alpha", ["wiki/**"], ["dashboards/**"])
+
+    result = tok.reconcile(tmp_path, "demo.alpha", ["wiki/news/**"], ["predictions/**"])
+
+    assert result == {"token": plaintext, "changed": True, "rotated": False}
+    store = json.loads((tmp_path / ".okengine" / "extension-tokens.json").read_text())
+    rec = next(r for r in store["tokens"] if r["ext_id"] == "demo.alpha")
+    assert rec["token_sha256"] == tok._sha256(plaintext)
+    assert rec["read_scopes"] == ["wiki/news/**"]
+    assert rec["write_scopes"] == ["predictions/**"]
+    secrets = json.loads((tmp_path / ".okengine" / "extension-secrets.json").read_text())
+    assert secrets["demo.alpha"] == plaintext
+
+    unchanged = tok.reconcile(tmp_path, "demo.alpha", ["wiki/news/**"], ["predictions/**"])
+    assert unchanged == {"token": plaintext, "changed": False, "rotated": False}
+
+
+def test_reconcile_rotates_inconsistent_credential(tmp_path):
+    tok = _tokens()
+    old = tok.mint(tmp_path, "demo.alpha", ["wiki/**"], ["dashboards/**"])
+    secrets_path = tmp_path / ".okengine" / "extension-secrets.json"
+    secrets_path.write_text(json.dumps({"demo.alpha": "wrong-plaintext"}))
+
+    result = tok.reconcile(tmp_path, "demo.alpha", ["wiki/**"], ["predictions/**"])
+
+    assert result["changed"] is True and result["rotated"] is True
+    assert result["token"] not in (old, "wrong-plaintext")
+    store = json.loads((tmp_path / ".okengine" / "extension-tokens.json").read_text())
+    rec = next(r for r in store["tokens"] if r["ext_id"] == "demo.alpha")
+    assert rec["token_sha256"] == tok._sha256(result["token"])
+    assert rec["write_scopes"] == ["predictions/**"]
 
 
 # --- THE cross-module contract: mint host-side, resolve container-side ----

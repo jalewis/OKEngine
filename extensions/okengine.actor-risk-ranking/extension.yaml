@@ -39,11 +39,12 @@ config:
     default: "config/actor-risk-targets.yaml"
     description: >-
       Vault-relative path to the operator's target definitions. Absent -> the lane
-      no-ops LOUDLY (never guess a boundary). Override via ACTOR_RISK_TARGETS.
+      no-ops LOUDLY (never guess a boundary). Env:
+      OKENGINE_ACTOR_RISK_RANKING_TARGETS_FILE.
   artifact_max_age_hours:
     type: string
     default: "48"
     description: >-
       Reject a wiki/.backlinks.json older than this (two missed daily refreshes) —
       the run SKIPS loudly rather than ranking on a stale graph. Override via
-      ACTOR_RISK_ARTIFACT_MAX_AGE_HOURS.
+      OKENGINE_ACTOR_RISK_RANKING_ARTIFACT_MAX_AGE_HOURS.

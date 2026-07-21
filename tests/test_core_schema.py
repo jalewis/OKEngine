@@ -52,6 +52,8 @@ def test_core_ships_cross_cutting_optionals_and_tlp_standard():
     for f in ("tlp", "source_kind", "publisher", "reliability", "credibility", "severity"):
         assert f in base["common_optional"], f
     assert base["enums"]["tlp"] == ["CLEAR", "GREEN", "AMBER", "AMBER+STRICT", "RED"]   # standard, baked
+    assert {"review_method", "review_policy", "authority", "authority_source_url",
+            "authority_verified_fields"} <= set(base["common_optional"])
 
 
 def test_pack_extends_base_enum_by_union(tmp_path):

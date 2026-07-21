@@ -45,6 +45,26 @@ def apply(pack: pathlib.Path, dry_run: bool) -> list[str]:
   runtime/VCS trees (`.git`, `.hermes-data`, `data`, `logs`, …) are excluded, so migrations should
   only transform source.
 
+## Pack-VERSION migrations on update (okengine#312)
+
+The phases above key on the **engine** release. Packs additionally ship their own migrations —
+`<pack>/migrations/m_*.py`, the **same module contract**, but with `FROM`/`TO` keyed on **pack**
+versions (`pack.yaml version:`, okpacks-library `VERSIONING.md`). They run through the same
+snapshot / dry-run / roll-forward machinery when a deployed pack is updated:
+
+- `framework pull <pack> --update` computes the span `(installed, incoming]`, surfaces each
+  CHANGELOG section's `Migration impact:` line, and **previews** pending migrations (dry-run).
+  `--apply-migrations` performs them: snapshot → apply → record → validation gate → automatic
+  rollback on any failure.
+- `framework install-domain` over an **existing member** does the same for the guest's
+  migrations against the composed host vault (preview in plan mode, full run under `--apply`).
+- State lives in `<pack>/.okengine/migrations-state.json`: `pack_versions.<name>` records the
+  installed version (a dry-run **floors** it, so `framework reconcile` accepting
+  `pack.yaml.upstream` can't erase a pending span); applied ids join the shared `applied` set.
+- An installed pack with **no recorded/parseable version** (a pre-versioning deploy) is
+  baselined at the incoming version and nothing runs — apply older CHANGELOG steps manually
+  once; the span machinery takes over from there.
+
 ## Authoring notes
 
 - Keep `apply()` **idempotent and side-effect-free in dry-run**. The framework calls it with

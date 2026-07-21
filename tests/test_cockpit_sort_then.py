@@ -64,3 +64,16 @@ def test_then_missing_secondary_sinks_within_tie(monkeypatch, tmp_path):
     out = [r["title"] for r in m._ds_sorted(
         rows, {"field": "last_seen", "desc": True, "then": "recent_reports"})]
     assert out == ["has", "missing"], out
+
+
+def test_then_breaks_batch_tie_by_rfc3339_timestamp(monkeypatch, tmp_path):
+    m = _mod(monkeypatch, tmp_path)
+    rows = [
+        {"title": "older", "last_updated": "2026-07-17T16:07:39Z",
+         "as_of": "2026-07-16T04:54:19Z"},
+        {"title": "newer", "last_updated": "2026-07-17T16:07:39Z",
+         "as_of": "2026-07-17T05:08:40Z"},
+    ]
+    out = [r["title"] for r in m._ds_sorted(
+        rows, {"field": "last_updated", "desc": True, "then": "as_of"})]
+    assert out == ["newer", "older"], out

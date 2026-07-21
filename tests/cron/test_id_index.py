@@ -103,11 +103,17 @@ def test_build_fast_path_loads_artifact_not_scan(tmp_path, monkeypatch):
 
 def test_write_index_persists(tmp_path):
     m = _load()
-    _page(tmp_path, "entities/a/acme.md", "type: vendor\nid: 'entities:acme'")
+    _page(tmp_path, "entities/a/acme.md", "type: vendor\nname: Acme\nid: 'entities:acme'\naliases: [ACME Corp]")
     idx = m.build(tmp_path, force=True)
     out = tmp_path / "id-index.json"
     m.write_index(idx, out)
     import json
     data = json.loads(out.read_text())
     assert data["by_id"]["entities:acme"] == "entities/a/acme.md"
-    assert data["norm_version"] == 1
+    assert data["norm_version"] == 2                              # v2 adds identity maps (okengine#324)
+    # name/alias identity maps are serialized + normalized (okengine#324)
+    assert data["name_to_rels"]["acme"] == ["entities/a/acme.md"]
+    assert data["alias_to_rels"]["acme-corp"] == ["entities/a/acme.md"]
+    # and a v2 payload round-trips through from_dict
+    idx2 = m.from_dict(data)
+    assert idx2.name_to_rels == idx.name_to_rels and idx2.alias_to_rels == idx.alias_to_rels

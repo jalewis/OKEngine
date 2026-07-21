@@ -180,6 +180,7 @@ a.wl:hover{border-bottom-style:solid}
 .chat-log{flex:1;min-height:0;overflow:auto;padding:18px 2px;display:flex;flex-direction:column;gap:12px}
 .chat-hint{color:var(--dim);font-size:0.929rem;line-height:1.7;max-width:62ch;margin:auto;text-align:center}
 .chat-hint code{background:var(--panel);padding:1px 5px;border-radius:4px;font:0.857rem var(--mono)}
+.chat-readonly{color:var(--dim);font-size:0.857rem;text-align:center;padding:6px 10px;margin:0 auto 4px;border:1px solid var(--border);border-radius:6px;background:var(--panel);max-width:62ch}
 .chat-msg{max-width:88%;padding:9px 13px;border-radius:10px;line-height:1.55;word-wrap:break-word;overflow-wrap:anywhere}
 .chat-user{align-self:flex-end;background:var(--panel);border:1px solid var(--border)}
 .chat-assistant{align-self:flex-start;background:var(--panel2);border:1px solid var(--border)}

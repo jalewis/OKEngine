@@ -12,7 +12,7 @@ the vault's dated content to `wiki/dashboards/timeline.md`.
   `framework extensions disable <pack> okengine.timeline`.
 
 Config: `max_entries` (default 300) caps the rows. Reads `WIKI_PATH` (vault root) and
-`OKENGINE_CONFIG_MAX_ENTRIES`.
+`OKENGINE_TIMELINE_MAX_ENTRIES`.
 
 Companion reference extensions: `okengine.contradictions` (deterministic dashboard, core),
 `okengine.glossary` (agent, owns a schema type), `okengine.predictions` (multi-op agent lanes).

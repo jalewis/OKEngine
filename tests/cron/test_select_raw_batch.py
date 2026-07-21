@@ -101,6 +101,14 @@ def test_provenance_carry_contract_prompt_and_base_schema_agree(tmp_path):
     for k in keys:
         assert f"`{k}`" in out, f"prompt does not name provenance key {k!r}"
 
+    # Source semantics are not interchangeable: repositories and discovery
+    # mechanisms must not be promoted into the article publisher (#278).
+    assert "`publisher` is the organization/site" in out
+    assert "`source_feed` is the repository or feed" in out
+    assert "Never put a retrieval repository/feed" in out
+    assert "never write placeholder strings such as `undefined`" in out
+    assert "do not substitute" in out
+
     # surface 2: the base schema lists the SAME keys (schema-legal on every type)
     base = yaml.safe_load((REPO / "config" / "base-schema.yaml").read_text())
     missing = [k for k in keys if k not in (base.get("common_optional") or [])]

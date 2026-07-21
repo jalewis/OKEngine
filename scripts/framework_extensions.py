@@ -58,12 +58,27 @@ def _cmd_list(args) -> int:
     pack = Path(args.pack).expanduser()
     extensions, errors = disc.discover(pack)
     enabled, en_errors = disc.load_enabled_state(pack)
-    errors = errors + en_errors
+    effective, eff_errors = disc.effective_enabled(pack, extensions)
+    errors = errors + en_errors + eff_errors
+
+    def row(e):
+        explicit = e["id"] in enabled
+        core = disc.is_core(e)
+        active = e["id"] in effective
+        if explicit:
+            state = "enabled (explicit)"
+        elif core and active:
+            state = "enabled (core default)"
+        elif core:
+            state = "disabled (core opt-out)"
+        else:
+            state = "present"
+        return {"id": e["id"], "tier": e["tier"], "dir": e["dir"],
+                "kind": e["manifest"].get("kind"), "enabled": active,
+                "explicitly_enabled": explicit, "core": core, "state": state}
 
     if args.json:
-        rows = [{"id": e["id"], "tier": e["tier"], "dir": e["dir"],
-                 "kind": e["manifest"].get("kind"),
-                 "enabled": e["id"] in enabled} for e in extensions]
+        rows = [row(e) for e in extensions]
         print(json.dumps({"extensions": rows, "errors": errors}, indent=2))
         return 1 if errors else 0
 
@@ -73,7 +88,7 @@ def _cmd_list(args) -> int:
     else:
         print(f"{'ID':<32} {'TIER':<9} {'KIND':<12} {'STATE'}")
         for e in sorted(extensions, key=lambda r: (r["id"], r["tier"])):
-            state = "enabled" if e["id"] in enabled else "present"
+            state = row(e)["state"]
             print(f"{e['id']:<32} {e['tier']:<9} "
                   f"{str(e['manifest'].get('kind','')):<12} {state}")
     for msg in errors:
@@ -143,7 +158,7 @@ def _cmd_validate(args) -> int:
         if not fails:
             print(f"OK: {len(extensions)} extension(s) discovered, "
                   f"{len(enabled)} enabled, no conflicts")
-    return 1 if fails else 0
+    return 1 if fails or (args.strict_warnings and warns) else 0
 
 
 def _cmd_stage_panels(args) -> int:
@@ -283,20 +298,26 @@ def _cmd_enable(args) -> int:
     # the next enable.
     _seed_about(pack, target)
 
+    # Re-read manifest capabilities on EVERY enable invocation. Extension upgrades can change
+    # scopes after the token's first mint; leaving the old record in place either over-authorizes
+    # a narrowed extension or makes a newly declared operation fail. Preserve a valid token so an
+    # already-running sidecar is not disrupted; rotate only if its credential record is incomplete.
+    tok = _tokens()
+    read_scopes, write_scopes = tok.scopes_from_manifest(target["manifest"])
+    write_capability = tok.write_capability_from_manifest(target["manifest"])
     if args.id in enabled:
-        print(f"already enabled: {args.id}")
+        rec = tok.reconcile(pack, args.id, read_scopes, write_scopes, write_capability)
+        action = "token rotated" if rec["rotated"] else (
+            "token scopes reconciled" if rec["changed"] else "token scopes current")
+        print(f"already enabled: {args.id} ({action})")
         return 0
     errs = disc.set_enabled(pack, args.id, True)
     if errs:
         for e in errs:
             print(f"FAIL: {e}", file=sys.stderr)
         return 1
-    # Mint a scoped MCP token from the manifest capabilities (okengine#132). The
-    # store (sha256 + scopes) is what the MCP servers enforce; the plaintext goes to
-    # the gitignored secrets file for a sidecar's env injection (okengine#135).
-    tok = _tokens()
-    read_scopes, write_scopes = tok.scopes_from_manifest(target["manifest"])
-    tok.mint(pack, args.id, read_scopes, write_scopes)
+    # Mint the first token, or repair a partial credential left by an interrupted earlier enable.
+    tok.reconcile(pack, args.id, read_scopes, write_scopes, write_capability)
     serr = comp.write_composed_schema(pack)        # regenerate composed-schema.yaml (#133)
     for e in serr:
         print(f"WARN: composed-schema regen: {e}", file=sys.stderr)
@@ -461,6 +482,8 @@ def main(argv: list[str]) -> int:
     p_val = sub.add_parser("validate", help="validate discovery + enabled-state")
     p_val.add_argument("pack")
     p_val.add_argument("--quiet", action="store_true")
+    p_val.add_argument("--strict-warnings", action="store_true",
+                       help="treat manifest warnings as failures (release/conformance gate)")
     p_val.set_defaults(func=_cmd_validate)
 
     p_en = sub.add_parser("enable", help="enable an extension (validates, then writes state)")

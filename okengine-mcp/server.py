@@ -486,17 +486,21 @@ def _qmd(args: list[str], timeout: int = 1800) -> tuple[int, str]:
         return 124, "qmd timed out"
 
 
-def _refresh_index() -> None:
-    """Ensure the wiki collection is registered, then incrementally refresh the index."""
+def _refresh_index() -> bool:
+    """Ensure the wiki collection is registered, then incrementally refresh the index. Returns
+    whether the refresh SUCCEEDED — the caller must not mark the index current on a failure, or a
+    failed `qmd update` silently reads as 'up to date' and search stays stale (invariant-audit).
+    qmd-absent (rc 127) returns True: a permanent condition, not a transient failure to retry-spin on."""
     rc, out = _qmd(["collection", "list"], timeout=60)
     if rc == 127:
         print("okengine-mcp: qmd not found — skipping index maintenance", file=sys.stderr, flush=True)
-        return
+        return True
     if "qmd://wiki" not in out:                       # not registered yet (e.g. fresh deploy)
         arc, _ = _qmd(["collection", "add", str(WIKI)])
         print(f"okengine-mcp: registered qmd 'wiki' collection (rc={arc})", file=sys.stderr, flush=True)
     rc, _ = _qmd(["update"])
     print(f"okengine-mcp: qmd index refresh rc={rc}", file=sys.stderr, flush=True)
+    return rc == 0
 
 
 _INDEX_POLL_SECONDS = float(os.environ.get("OKENGINE_MCP_INDEX_POLL_SECONDS", "30") or 0)
@@ -550,11 +554,14 @@ def _index_maintainer_step(state: dict) -> None:
         # change would read as "already indexed" and never trigger the incremental branch until the
         # next full refresh hours later (invariant-audit M9). Capturing first keeps it pending.
         seen_before = _vault_max_mtime()
-        _refresh_index()                          # registers collection + full incremental
+        ok = _refresh_index()                     # registers collection + full incremental
         done = time.monotonic()
-        state["last_full"] = now
-        state["last_seen"] = seen_before
+        state["last_full"] = now                  # advance the periodic clock (no tight retry loop)
         state["cooldown_until"] = done + _index_update_cooldown(done - now)
+        if ok:
+            state["last_seen"] = seen_before      # mark the index current ONLY if the refresh worked;
+        # on failure last_seen is unchanged, so the incremental branch keeps trying to catch the
+        # pending changes rather than silently treating a failed full refresh as up-to-date (audit).
         return
     cur = _vault_max_mtime()
     # a page changed since the last index AND the cooldown has passed; skipped
@@ -564,8 +571,10 @@ def _index_maintainer_step(state: dict) -> None:
         done = time.monotonic()
         print(f"okengine-mcp: qmd index update on vault change rc={rc} ({done - now:.1f}s)",
               file=sys.stderr, flush=True)
-        state["last_seen"] = cur
         state["cooldown_until"] = done + _index_update_cooldown(done - now)
+        if rc == 0:
+            state["last_seen"] = cur              # mark indexed ONLY on success; a failed update
+        # leaves last_seen so the change is retried next poll, not silently lost (invariant-audit).
 
 
 def _index_maintainer() -> None:

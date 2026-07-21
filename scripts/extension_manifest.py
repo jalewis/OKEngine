@@ -53,7 +53,7 @@ _PANEL_KINDS = {"fields", "two-axis"}
 _REQUIRED_TOP = ("id", "kind", "version", "requires", "trust", "capabilities")
 # §6: unknown keys under these blocks FAIL (vs unknown descriptive top-level = WARN).
 _REQUIRES_KEYS = {"engine", "schema_refs", "extensions"}
-_CAP_KEYS = {"read", "write", "network", "secrets", "delivery"}
+_CAP_KEYS = {"read", "write", "write_policy", "network", "secrets", "delivery"}
 _OPERATION_KEYS = {"schedule", "entrypoint", "timeout", "prompt", "prompt_file",
                    "toolsets", "tier", "model", "after", "cost_bearing"}
 # cost_bearing: a no_agent op that STILL spends model budget (a deterministic script calling
@@ -207,6 +207,30 @@ def validate_manifest(manifest: dict) -> tuple[list[str], list[str]]:
         else:
             for k in set(caps) - _CAP_KEYS:
                 errors.append(f"unknown key under capabilities: {k}")
+            wp = caps.get("write_policy")
+            if wp is not None:
+                if not isinstance(wp, dict):
+                    errors.append("capabilities.write_policy must be a mapping")
+                else:
+                    allowed = {"rule_id", "operations", "paths", "types", "update_fields",
+                               "protected_fields", "body"}
+                    unknown = sorted(set(wp) - allowed)
+                    if unknown:
+                        errors.append(f"capabilities.write_policy has unknown keys: {unknown}")
+                    for key in ("operations", "paths", "types", "update_fields", "protected_fields"):
+                        if key in wp and not (isinstance(wp[key], list) and
+                                              all(isinstance(v, str) and v for v in wp[key])):
+                            errors.append(f"capabilities.write_policy.{key} must be a string list")
+                    if not isinstance(wp.get("rule_id"), str) or not wp.get("rule_id", "").strip():
+                        errors.append("capabilities.write_policy.rule_id is required")
+                    known_operations = {"create", "update", "patch", "append", "tombstone",
+                                        "converge", "flag", "review", "import"}
+                    unknown_operations = sorted(set(wp.get("operations") or []) - known_operations)
+                    if unknown_operations:
+                        errors.append("capabilities.write_policy.operations has unknown values: "
+                                      f"{unknown_operations}")
+                    if wp.get("body", "deny") not in {"allow", "append-only", "deny"}:
+                        errors.append("capabilities.write_policy.body must be allow, append-only, or deny")
 
     # core: default-ON marker (okengine#142). Only honored for the engine tier (a
     # pack/operator extension can't force itself on) — enforced at resolve time.

@@ -63,6 +63,34 @@ else
     echo "  cloned to $DEST"
 fi
 
+# Apply OKEngine's small dependency-boundary capabilities in a fixed order.
+# Fail loudly when a future pin changes their context; silently losing runtime
+# configuration or `after:` enforcement would be worse than stopping deploy.
+apply_carried_patch() {
+    local patch="$1" label="$2"
+    if [ ! -f "$patch" ]; then
+        echo "ERROR: required cron-plus patch not found: $patch" >&2
+        exit 1
+    fi
+    if gitd apply --check "$patch" >/dev/null 2>&1; then
+        gitd apply "$patch"
+        echo "  applied $label"
+    elif gitd apply --reverse --check "$patch" >/dev/null 2>&1; then
+        echo "  $label already applied"
+    else
+        echo "ERROR: $patch does not apply to cron-plus pin ${SHA:0:12}" >&2
+        echo "       refresh the carried patch when updating dependencies.cron-plus.pinned_sha" >&2
+        exit 1
+    fi
+}
+
+apply_carried_patch "$ENGINE_DIR/patches/cron-plus/job-env.patch" \
+    "OKEngine per-job environment support"
+apply_carried_patch "$ENGINE_DIR/patches/cron-plus/after-ordering.patch" \
+    "OKEngine after: runtime ordering"
+cp "$ENGINE_DIR/patches/cron-plus/after_ordering.py" "$DEST/after_ordering.py"
+echo "  installed OKEngine after: policy overlay"
+
 # Sanity: the CLI the cron helpers invoke must be present.
 if [ ! -f "$DEST/cli.py" ]; then
     echo "  ⚠ $DEST/cli.py not found — the pinned cron-plus layout may have changed" >&2

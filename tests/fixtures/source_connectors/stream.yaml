@@ -1,0 +1,20 @@
+connector_version: 1
+id: fixture.stream
+name: Fixture bounded stream
+mode: stream
+trust: {permission: licensed, data_sensitivity: restricted, source_authority: Fixture Stream}
+permissions: {network: true, allowed_hosts: [stream.example], allow_private_network: false, write_raw: true}
+auth: {type: api-key, secret_refs: {key: FIXTURE_STREAM_KEY}}
+inputs: {required: []}
+request:
+  url: https://stream.example/events
+  method: GET
+  headers: {X-Api-Key: "${secret.key}"}
+response: {format: jsonl, records_path: "", stable_id_path: event_id, revision_path: sequence}
+pagination: {type: none, max_pages: 1}
+checkpoint: {path: fixture.stream.json}
+conditional_requests: {enabled: false}
+rate_limit: {max_requests: 1, per_seconds: 5}
+archive: {enabled: true, raw_responses: true, path: fixture.stream, retention_days: 7}
+license: {name: Restricted stream, redistribution: restricted, max_retention_days: 7}
+health: {path: fixture.stream.json}

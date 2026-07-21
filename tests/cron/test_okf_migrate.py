@@ -122,9 +122,34 @@ def test_canonical_key_and_find_page_agree_with_the_drain(tmp_path):
     assert m.find_page(root, "cves", "CVE-1999-9999") is None
 
 
+def test_write_key_respects_reshard_contract_without_forking_existing_pages(tmp_path):
+    """okengine#243: once a namespace declares a reshard, new direct-writer pages go straight to
+    that deeper bucket. A lone pre-reshard page is still updated in place until the migration moves
+    it, while an already-resharded page wins over a stale base-bucket duplicate."""
+    m = _mod()
+    root = tmp_path
+    (root / "schema.yaml").write_text(
+        "partitioning:\n  namespaces:\n"
+        "    entities: {strategy: by-letter, reshard_by: second-letter}\n"
+        "types:\n  vulnerability: {}\n")
+    fm = {"type": "vulnerability"}
+
+    assert m.canonical_key(root, "entities", "cve-2026-1", fm) == "entities/c/cve-2026-1"
+    assert m.write_key(root, "entities", "cve-2026-1", fm) == "entities/c/v/cve-2026-1"
+
+    base = root / "wiki" / "entities" / "c"
+    base.mkdir(parents=True)
+    (base / "cve-2026-1.md").write_text("---\ntype: vulnerability\n---\nold\n")
+    assert m.write_key(root, "entities", "cve-2026-1", fm) == "entities/c/cve-2026-1"
+
+    (base / "v").mkdir()
+    (base / "v" / "cve-2026-1.md").write_text("---\ntype: vulnerability\n---\ncanonical\n")
+    assert m.write_key(root, "entities", "cve-2026-1", fm) == "entities/c/v/cve-2026-1"
+
+
 def test_dedup_partition_collisions_collapses_to_canonical(tmp_path):
     """okengine#54 cleanup: same-slug copies at a flat root AND a wrong-shaped shard collapse onto
-    the ONE canonical path (chosen by canonical_key — same fn the importer uses), frontmatter is
+    the ONE canonical path (chosen by write_key — same contract the importer uses), frontmatter is
     union-merged, losers deleted, and [[links]] to a dropped path are rewritten."""
     sys.path.insert(0, str(REPO / "scripts" / "cron"))
     import dedup_partition_collisions as dd

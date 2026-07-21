@@ -1,0 +1,5 @@
+schema_version: 1
+id: fixture-cycle-a
+version: 0.1.0
+name: Cycle A
+extends: {profile: fixture-cycle-b, version: ">=0.1.0"}

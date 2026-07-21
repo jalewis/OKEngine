@@ -1,0 +1,4 @@
+{
+  "schedule": {"kind": "cron", "expr": "5 */6 * * *"},
+  "entrypoint": "edge_index.py"
+}

@@ -27,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tier_lib  # noqa: E402
+import tz_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
@@ -81,8 +82,8 @@ def main() -> int:
         print(f"ERROR: wiki not found at {WIKI}", file=sys.stderr)
         return 1
     cfg = tier_lib.load_cfg(VAULT)
-    today = datetime.now(timezone.utc).date()
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    today = tz_lib.deployment_today()                                  # okengine#301: deployment TZ
+    now = tz_lib.deployment_now().strftime("%Y-%m-%d %H:%M %Z")        # %Z = the deployment zone, not "UTC"
 
     nss = cfg.get("namespaces") or {}
     dist = {ns: _count_namespace(ns, nscfg, cfg, today) for ns, nscfg in nss.items()}

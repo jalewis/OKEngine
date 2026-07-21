@@ -1,0 +1,27 @@
+id: assessment:actor-candidate:country-link
+type: assessment
+subject: entities/a/actor-candidate
+question: Is this actor linked to Iran?
+claim: The actor may be operationally linked to Iran; state sponsorship is unassessed.
+status: active
+as_of: 2026-07-16
+confidence: 0.42
+confidence_band: moderate
+proposed_confidence_change: 0.20
+consequence: high
+alternatives:
+  - A non-Iranian actor planted locale artifacts as a false flag.
+  - A shared builder introduced the metadata.
+adversarial_evidence:
+  - observation: Persian locale metadata was authentically recovered from the malware sample.
+    source: sources/2026/07/vendor-forensics
+    observation_confidence: high
+    diagnosticity: low
+    manipulation_susceptibility: high
+    source_independence: primary-direct
+    evidence_lineage: sample-7f31
+    claim_role: observation
+    deception_possible: true
+    deception_hypothesis: The operator planted locale metadata to steer attribution toward Iran.
+    collection_context: The bytes are authentic, but the malware author controlled their creation.
+    alternatives: [genuine developer residue, planted false flag, shared build environment]

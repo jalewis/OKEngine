@@ -68,3 +68,47 @@ def test_explicit_unauthenticated_optout():
     assert warning and "NO authentication" in warning
     # on loopback the opt-out is silent
     assert s._resolve_http_auth({"OKENGINE_MCP_ALLOW_UNAUTHENTICATED": "1"}, "127.0.0.1")[1] is None
+
+
+# ── write_server networked-transport auth: the ENFORCED write path must fail closed on the public
+#    default token off-loopback, mirroring the read server (invariant-audit CRITICAL) ──────────────
+
+WS = REPO / "okengine-mcp" / "write_server.py"
+
+
+def _load_write():
+    spec = importlib.util.spec_from_file_location("okengine_write_server", WS)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["okengine_write_server"] = m
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_write_auth_empty_token_refuses():
+    w = _load_write()
+    with pytest.raises(SystemExit):
+        w._resolve_write_auth({}, "0.0.0.0")
+
+
+def test_write_auth_default_token_exposed_fails_closed():
+    """The seeded compose default (OKENGINE_MCP_TOKEN=okengine-local) bound off-loopback must be
+    REFUSED — the read server guards this; write_server used to only check non-empty, so it served
+    unauthenticated full write access on the network (invariant-audit CRITICAL)."""
+    w = _load_write()
+    with pytest.raises(SystemExit):
+        w._resolve_write_auth({"OKENGINE_MCP_TOKEN": w.DEFAULT_LOCAL_TOKEN}, "0.0.0.0")
+
+
+def test_write_auth_default_token_loopback_ok():
+    w = _load_write()
+    assert w._resolve_write_auth({"OKENGINE_MCP_TOKEN": w.DEFAULT_LOCAL_TOKEN}, "127.0.0.1") \
+        == w.DEFAULT_LOCAL_TOKEN                     # loopback default is painless, like the read server
+
+
+def test_write_auth_secret_exposed_ok_and_default_optin():
+    w = _load_write()
+    assert w._resolve_write_auth({"OKENGINE_WRITE_TOKEN": "s3cret"}, "0.0.0.0") == "s3cret"
+    # explicit opt-in serves the default off-loopback (parity with OKENGINE_MCP_ALLOW_DEFAULT_TOKEN)
+    assert w._resolve_write_auth(
+        {"OKENGINE_MCP_TOKEN": w.DEFAULT_LOCAL_TOKEN, "OKENGINE_WRITE_ALLOW_DEFAULT_TOKEN": "1"},
+        "0.0.0.0") == w.DEFAULT_LOCAL_TOKEN

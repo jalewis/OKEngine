@@ -26,10 +26,12 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 
-def normalize(s: str) -> str:
+def normalize(s) -> str:
     """Match key: lowercase alphanumerics only, so 'APT 28' == 'APT28'. Mirrors the
-    importers' ``norm()`` so the index and the queries agree."""
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+    importers' ``norm()`` so the index and the queries agree. Coerces non-string scalars to
+    str first — an importer that wrote a numeric alias (e.g. apt35 `aliases: [10768]`,
+    okengine#348) must not crash the whole resolve/canonical-assemble lane on one bad record."""
+    return re.sub(r"[^a-z0-9]", "", str(s if s is not None else "").lower())
 
 
 @dataclass

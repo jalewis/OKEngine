@@ -217,7 +217,8 @@ def main(argv=None) -> int:
     ap.add_argument("--live-all", action="store_true", help="live-test every catalog pack")
     ap.add_argument("--port-base", type=int, default=750,
                     help="live port offsets start here (per-pack +10)")
-    ap.add_argument("--workdir", default="/tmp", help="live scratch parent dir")
+    # Only a parent: tempfile creates private randomized children beneath it.
+    ap.add_argument("--workdir", default=tempfile.gettempdir(), help="live scratch parent dir")
     a = ap.parse_args(argv)
 
     library = Path(a.library).resolve()

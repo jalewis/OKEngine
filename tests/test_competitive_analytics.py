@@ -29,7 +29,8 @@ def _run(script: str, env: dict) -> str:
 def test_manifest_shape():
     m = yaml.safe_load((EXT / "extension.yaml").read_text())
     assert m["id"] == "okengine.competitive-analytics"
-    assert m["trust"] == "in-gateway" and m.get("tier") == "analyze"
+    assert m["trust"] == "in-gateway"
+    assert "tier" not in m  # unsupported manifest keys must not survive as ignored decoration
     assert set(m["operations"]) == {"competitor-quadrants", "sector-battle-cards", "acquirer-signals", "discover-competitors"}
     assert "watchlist_path" in m["config"]
     assert any("dashboards/" in w for w in m["capabilities"]["write"])

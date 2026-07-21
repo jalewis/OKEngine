@@ -50,7 +50,76 @@ def test_calibration_brier(tmp_path, monkeypatch):
     dash = (tmp_path / "wiki" / "dashboards" / "calibration.md").read_text()
     assert "resolved & scored: **2**" in dash
     # Brier = ((.25)^2 + (.75)^2)/2 = (0.0625+0.5625)/2 = 0.3125
-    assert "Brier: **0.312**" in dash or "Brier: **0.313**" in dash
+    assert "Brier: **0.3125**" in dash
+
+
+def test_calibration_portfolio_watch_bias_and_history(tmp_path, monkeypatch):
+    pr = tmp_path / "wiki" / "predictions"
+    pr.mkdir(parents=True)
+
+    def write(slug, fields):
+        (pr / f"{slug}.md").write_text(
+            "---\n" + yaml.safe_dump({"type": "prediction", **fields}, sort_keys=False) +
+            "---\n# prediction\n", encoding="utf-8")
+
+    write("stale-near-due", {
+        "status": "open", "subject": "[[entities/acme]]", "confidence": 0.6,
+        "made_on": "2026-01-01", "resolves_by": "2026-08-01", "horizon": "long",
+        "basis": ["[[sources/reinforcing-source]]"],
+        "evidence": [{"date": "2026-02-01", "direction": "reinforces"}],
+    })
+    write("recent-hit", {
+        "status": "confirmed", "subject": "[[entities/acme]]", "confidence": 0.8,
+        "made_on": "2026-01-01", "resolves_by": "2026-07-01", "updated": "2026-07-10",
+        "horizon": "medium", "basis": ["[[sources/reinforcing-source]]"],
+        "evidence": [{"date": "2026-06-01", "direction": "reinforces"}],
+    })
+    write("recent-miss", {
+        "status": "refuted", "subject": "[[entities/beta]]", "confidence": 0.8,
+        "made_on": "2026-01-01", "resolves_by": "2026-07-01", "updated": "2026-07-11",
+        "horizon": "medium", "basis": ["[[sources/contrary-source]]"],
+        "evidence": [{"date": "2026-06-02", "direction": "contradicts"},
+                     {"date": "2026-06-03", "direction": "bespoke-drift"}],
+    })
+
+    src = tmp_path / "wiki" / "sources"
+    src.mkdir(parents=True)
+    (src / "reinforcing-source.md").write_text(
+        "---\ntype: source\nsignal_class: leading\n---\n# source\n", encoding="utf-8")
+    (src / "contrary-source.md").write_text(
+        "---\ntype: source\nsignal_class: lagging\n---\n# source\n", encoding="utf-8")
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "competitive-watchlist.yaml").write_text(
+        "segments:\n  market:\n    competitors: [acme, missing-co]\n", encoding="utf-8")
+
+    state = tmp_path / "data"
+    history_path = state / "state" / "okengine.predictions" / "calibration-history.jsonl"
+    history_path.parent.mkdir(parents=True)
+    history_path.write_text(
+        '{"date":"2026-07-14","resolved":1,"brier":0.3}\n', encoding="utf-8")
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("HERMES_DATA", str(state))
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-07-15")
+
+    cal = _load("calibration_refresh")
+    assert cal.main() == 0
+    first = (tmp_path / "wiki" / "dashboards" / "calibration.md").read_text()
+    assert "## Near-due unresolved (1)" in first
+    assert "## Recent resolutions (2 in 30d)" in first
+    assert "## High-confidence misses (1)" in first
+    assert "2 positive / 1 negative" in first
+    assert "unknown/unmapped: **1**" in first and "`bespoke-drift`×1" in first
+    assert "### Calibration by horizon" in first
+    assert "### Calibration by dominant basis signal class" in first
+    assert "Watchlist gaps: **1 / 2**" in first and "[[entities/missing-co]]" in first
+    assert "Window delta:" in first
+
+    # Daily history and the dashboard are idempotent for a fixed effective date.
+    assert cal.main() == 0
+    assert (tmp_path / "wiki" / "dashboards" / "calibration.md").read_text() == first
+    history = [_json.loads(line) for line in history_path.read_text().splitlines()]
+    assert [row["date"] for row in history] == ["2026-07-14", "2026-07-15"]
 
 
 def test_date_audit_flags(tmp_path, monkeypatch):
@@ -224,3 +293,97 @@ def test_output_outcome_gate(tmp_path, monkeypatch):
     b = tmp_path / "wiki" / "briefings"; b.mkdir(parents=True)
     (b / "2026-06-28.md").write_text("---\ntype: dashboard\ntitle: brief\n---\n# brief\n")
     assert _run("select_output_outcome", tmp_path, monkeypatch) is True
+
+
+def test_numeric_base_rate_families_and_output_outcome_joins(tmp_path, monkeypatch):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("HERMES_DATA", str(tmp_path / "data"))
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-07-15")
+    predictions = tmp_path / "wiki" / "predictions"
+    sources = tmp_path / "wiki" / "sources"
+    briefings = tmp_path / "wiki" / "briefings"
+    predictions.mkdir(parents=True)
+    sources.mkdir(parents=True)
+    briefings.mkdir(parents=True)
+
+    def write_prediction(slug, status, subject, basis, horizon, made_on="2026-07-02"):
+        data = {"type": "prediction", "status": status, "subject": f"[[entities/{subject}]]",
+                "basis": [f"[[sources/{basis}]]"], "horizon": horizon,
+                "confidence": 0.7, "made_on": made_on, "resolves_by": "2026-07-14"}
+        (predictions / f"{slug}.md").write_text(
+            "---\n" + yaml.safe_dump(data, sort_keys=False) + "---\n# prediction\n")
+
+    for slug, signal_class in (("s1", "leading"), ("s2", "lagging"), ("s3", "leading")):
+        (sources / f"{slug}.md").write_text(
+            f"---\ntype: source\nsignal_class: {signal_class}\npublisher: Pub\n---\n# source\n")
+    write_prediction("p0", "confirmed", "acme", "s1", "short")
+    write_prediction("p1", "confirmed", "acme", "s1", "short")
+    write_prediction("p2", "refuted", "beta", "s2", "medium")
+    write_prediction("p3", "confirmed", "gamma", "s3", "long")
+    write_prediction("p4", "confirmed", "acme", "s1", "short")
+
+    event_rows = [
+        {"event_id": "events/e1", "event_type": "capital", "entity": "acme",
+         "date": "2026-07-10", "source": "sources/s1", "publisher": "P1",
+         "scores": {"materiality": .8, "signal_strength": .9, "watchlist_relevance": 1}},
+        {"event_id": "events/e2", "event_type": "capital", "entity": "beta",
+         "date": "2026-07-09", "source": "sources/s2", "publisher": "P1",
+         "scores": {"materiality": .4, "signal_strength": .5, "watchlist_relevance": 0}},
+        {"event_id": "events/e3", "event_type": "launch", "entity": "gamma",
+         "date": "2026-07-08", "source": "sources/s3", "publisher": "P2",
+         "scores": {"materiality": .6, "signal_strength": .7, "watchlist_relevance": 0}},
+        {"event_id": "events/e4", "event_type": "launch", "entity": "uncovered",
+         "date": "2026-07-07", "source": "sources/s4", "publisher": "P2",
+         "scores": {"materiality": .2, "signal_strength": .3, "watchlist_relevance": 0}},
+        {"event_id": "sources/s1", "event_type": "source-evidence", "entity": "",
+         "date": "2026-07-10", "source": "sources/s1", "publisher": "Pub",
+         "score_scope": "source",
+         "scores": {"materiality": .9, "signal_strength": .9, "watchlist_relevance": 0}},
+    ]
+    event_path = tmp_path / "data" / "state" / "okengine.events" / "event-scores.jsonl"
+    event_path.parent.mkdir(parents=True)
+    event_path.write_text("".join(_json.dumps(row) + "\n" for row in event_rows))
+    (briefings / "2026-07-01-watch.md").write_text(
+        "---\ntype: briefing\ndate: 2026-07-01\n---\n"
+        "Watch [[sources/s1]] and [[entities/acme]].\n")
+
+    metrics = _load("numeric_metrics")
+    rows, state_path, dashboard_path = metrics.compute_base_rates(tmp_path)
+    lookup = {(row["rate_kind"], row["class_label"]): row for row in rows}
+    assert lookup[("event-frequency", "capital")]["n_observations"] == 2
+    assert ("event-frequency", "source-evidence") not in lookup
+    assert lookup[("event-frequency", "capital")]["materiality_p50"] == .6
+    assert lookup[("event-coverage", "launch")]["value"] == .5
+    assert lookup[("entity-frequency", "entities/acme")]["on_watchlist"] is True
+    overall = lookup[("outcome-rate", "(all-resolved)")]
+    assert overall["value"] == .8 and overall["n_observations"] == 5
+    assert overall["small_n"] is False
+    assert lookup[("outcome-rate", "horizon=short")]["small_n"] is True
+    assert ("outcome-rate", "basis-signal-class=leading") in lookup
+    assert ("outcome-rate", "basis-event-type=capital") in lookup
+    assert lookup[("publisher-mix", "P1")]["sole_basis_fraction"] == 1.0
+    assert state_path.is_file() and "## C. Event coverage" in dashboard_path.read_text()
+
+    outcome_rows, outcome_state, outcome_dash = metrics.compute_output_outcomes(tmp_path)
+    outcomes = {row["metric_label"]: row for row in outcome_rows}
+    assert outcomes["briefing_source_to_prediction_basis_yield"]["value"] == 1.0
+    assert outcomes["briefing_entity_subsequent_material_event_yield"]["value"] == 1.0
+    assert outcomes["high_materiality_event_briefing_coverage_miss_rate"]["value"] == .5
+    assert outcome_state.is_file() and "50.0%" in outcome_dash.read_text()
+
+    first_rates, first_outcomes = state_path.read_text(), outcome_state.read_text()
+    metrics.compute_base_rates(tmp_path)
+    metrics.compute_output_outcomes(tmp_path)
+    assert state_path.read_text() == first_rates
+    assert outcome_state.read_text() == first_outcomes
+
+
+def test_numeric_base_rates_family_d_without_event_sidecar(tmp_path, monkeypatch):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("HERMES_DATA", str(tmp_path / "data"))
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-07-15")
+    _pred(tmp_path / "wiki" / "predictions", "hit", "confirmed", "high", "2026-07-01")
+    rows, _, dashboard = _load("numeric_metrics").compute_base_rates(tmp_path)
+    assert any(row["rate_kind"] == "outcome-rate" for row in rows)
+    assert not any(row["rate_kind"] == "event-frequency" for row in rows)
+    assert "families A–C and E are empty" in dashboard.read_text()

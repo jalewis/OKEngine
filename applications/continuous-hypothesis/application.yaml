@@ -1,0 +1,66 @@
+schema_version: 1
+id: continuous-hypothesis
+version: 1.0.0
+name: Continuous Hypothesis Engine
+description: >-
+  A closed epistemic loop in which changed evidence selects affected propositions,
+  reassessment preserves belief-change provenance, consequential changes cross a
+  review boundary, and resolved outcomes improve later judgment.
+
+requires:
+  engine: ">=0.11.0"
+  extensions:
+    okengine.reevaluation: ">=0.1.0"
+    okengine.assessments: ">=0.1.0"
+  optional_extensions:
+    okengine.predictions: ">=0.3.0"
+    okengine.completeness: ">=0.1.0"
+    okengine.events: ">=0.1.0"
+
+binding_contract:
+  minimum_proposition_classes: 1
+  required_fields:
+    - type
+    - namespace
+    - status_field
+    - open_values
+    - resolved_values
+    - confidence_field
+    - evidence_field
+    - resolution_field
+    - review_field
+  required_operations: [reassess, resolve, measure]
+
+operating_loop:
+  - {id: register, capability: proposition-registration, after: []}
+  - {id: assess, capability: assessment-state, after: [register]}
+  - {id: index-dependencies, capability: epistemic-dependency-index, after: [assess]}
+  - {id: select-affected, capability: caused-reassessment, after: [index-dependencies]}
+  - {id: reassess, capability: belief-change-provenance, after: [select-affected]}
+  - {id: review, capability: governed-human-review, after: [reassess]}
+  - {id: resolve, capability: resolution, after: [review]}
+  - {id: learn, capability: portfolio-learning, after: [resolve]}
+
+required_surfaces:
+  - dependency_explanation
+  - assessment_review
+  - portfolio_learning
+
+required_queues:
+  - affected_reassessment
+  - assessment_review
+
+required_success_measures:
+  - caused_reassessment_precision
+  - review_queue_age
+  - resolution_yield
+  - calibration_or_outcome_quality
+
+policy:
+  scheduled_reevaluation_only: true
+  preserve_prior_assessment: true
+  require_typed_evidence_direction: true
+  require_refutation_or_resolution_criteria: true
+  require_human_review_for_high_consequence_moves: true
+  abstain_when_evidence_is_insufficient: true
+  adversarial_balance_required: true

@@ -5,15 +5,15 @@
 name: okpack-smoke
 trust: public
 owns:
-  types: [actor, malware, prediction, incident, lacuna]
-  namespaces: [entities, predictions, security-incidents, dashboards, briefings, lacuna]
+  types: [actor, malware, prediction, incident, lacuna, threat-procedure, detection-requirement, detection-strategy, detection-analytic, deployment-snapshot, validation-result, coverage-assessment, defensive-outcome]
+  namespaces: [entities, predictions, security-incidents, dashboards, briefings, lacuna, procedures, detection-requirements, detection-strategies, detection-analytics, deployment-snapshots, validation-results, coverage-assessments, defensive-outcomes]
 
 # The cockpit's only domain input. Drives the profile fact-panel ordering, the deck PDF stream,
 # the predictions tab, and a curated dashboards grid (so an un-curated NESTED dashboard must land
 # in the "Other" catch-all — the M7 regression).
 cockpit:
   title: "OKEngine smoke vault"
-  tabs: [overview, adversaries, sorted, predictions, dashboards, browse]
+  tabs: [overview, adversaries, sorted, predictions, tid, dashboards, browse]
   # The `sorted` tab pins the box-engine SORT contract — both live incidents:
   #   - a DATE-sorted box (desc) must show newest first (ISO dates aren't floatable, so the whole
   #     box lives in the non-numeric sort bucket; direction must apply within it — Knowledge-gaps
@@ -21,6 +21,15 @@ cockpit:
   #   - a NUMERIC-sorted box must rank a malformed value (a list where a count belongs) BELOW every
   #     real number, never at the top (Most-active regression 2026-07-10).
   tab_defs:
+    tid:
+      label: Detection
+      boxes:
+        - {title: "Threat-to-defense trace", span: 12, view: tid-trace, empty: "No procedures imported."}
+        - {title: "Actor defensive posture", span: 12, view: tid-actor-posture, empty: "No actor posture yet."}
+        - {title: "Coverage facets", span: 12, view: tid-facet-matrix, empty: "No coverage assessments yet."}
+        - {title: "Detection dossier", span: 12, view: tid-detection-dossier}
+        - {title: "Validation queue", span: 12, view: tid-validation-queue}
+        - {title: "Gap workbench", span: 12, view: tid-gap-workbench}
     sorted:
       label: Sorted
       boxes:

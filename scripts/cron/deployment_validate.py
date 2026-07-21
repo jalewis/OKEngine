@@ -14,7 +14,10 @@ Checks (deterministic, against the deployed/staged state the gateway actually ru
   4. cron fleet      deployed jobs.json parses; script refs exist; no duplicate ids/names
   5. rules files     config/*rules*.yaml parse; rule ids unique
   6. extensions      .okengine/extensions.yaml parses; enabled extensions have staged scripts
-  7. auth posture    trust: private + non-loopback bind -> password must be set
+  7. auth posture    trust: private + non-loopback bind -> password must be set; the Agent Chat
+                     (api_server) toolset lockdown; and, when OKENGINE_HARDENED=1, the full
+                     fail-closed safe profile (real MCP token, reader auth-or-public, rate limits
+                     on, exports off if public) — okengine#78
 
 Writes wiki/operational/deployment-validation.md. EXITS 1 when any FAIL exists — the lane
 shows ERRORED in fleet health, which is the attention mechanism (a failed validation that
@@ -32,6 +35,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+
+# Sibling cron lib (staged into DATA/scripts alongside this script; scripts/cron/ in the repo).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hardening_lib import hardened_posture_violations, is_hardened, is_editing  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 DATA = Path(os.environ.get("OKENGINE_DATA", "/opt/data"))
@@ -142,6 +149,15 @@ def _artifact_missing_pack_governance(live, disk) -> bool:
     return live != disk
 
 
+def _schema_documents_equal(fresh, disk) -> bool:
+    """Compare governing schema content, ignoring generated provenance only."""
+    if not isinstance(fresh, dict) or not isinstance(disk, dict):
+        return False
+    clean_fresh = {k: v for k, v in fresh.items() if not str(k).startswith("_")}
+    clean_disk = {k: v for k, v in disk.items() if not str(k).startswith("_")}
+    return clean_fresh == clean_disk
+
+
 def check_schema():
     sys.path.insert(0, str(DATA / "scripts"))
     try:
@@ -164,34 +180,43 @@ def check_schema():
     for ns in ((root.get("partitioning") or {}).get("namespaces") or {}):
         if not (VAULT / "wiki" / ns).is_dir():
             add("WARN", "schema", f"partitioned namespace wiki/{ns}/ does not exist")
-    # STALENESS (#12): the enforced write path prefers the on-disk .okengine/composed-schema.yaml
-    # UNCONDITIONALLY when present, but ONLY `framework extensions enable/disable` regenerates it —
-    # no deploy/upgrade/edit does. So a schema.yaml edit not paired with an extension toggle is
-    # silently IGNORED on the write path (the frozen artifact wins). The live `composed` above is
-    # base⊕pack ONLY (schema_lib.compose_schema takes no extension fragments here, and the extension
-    # composer isn't staged in the gateway). The ARTIFACT is base⊕pack⊕extensions — so compare as a
-    # SUBSET, never equality: it's stale only if MISSING/DISAGREEING on current base⊕pack governance;
-    # its extra extension-owned entries are legitimate. (Equality here false-flagged every deployment
-    # with a schema-bringing extension — lacuna/frontier/… — enabled.)
+    # STALENESS: prefer a fresh FULL runtime composition (engine + pack + enabled
+    # extension source fragments) and compare it exactly with the enforced artifact.
+    # deploy-cron-scripts stages the composer and engine extension tier into
+    # /opt/data for this check. This catches additions, removals and changed enums
+    # without trusting the artifact's own recorded _fragments as source-of-truth.
     art = VAULT / ".okengine" / "composed-schema.yaml"
     if art.is_file() and composed and not any(l == "FAIL" and c == "schema" for l, c, _ in F):
         on_disk = _yaml(art) or {}
-        keys = ("types", "enums", "partitioning", "permissions", "owners", "review")
-        # Compare against a base⊕pack-ONLY recompose (fragments=[]), NOT `composed` above (fragments=
-        # None), which since okengine#195 auto-loads the artifact's OWN recorded _fragments — making
-        # the staleness test circular (it compared the artifact to a recompose seeded from itself,
-        # invariant-audit #62). base⊕pack-only is exactly what _artifact_missing_pack_governance's
-        # subset test expects; extension-fragment currency is a deploy-time gate (deploy.sh step 1b,
-        # which the in-gateway validator can't reproduce — the extension composer isn't staged here).
         try:
-            live_bp, _bp_err = schema_lib.compose_schema(VAULT, fragments=[])
-        except Exception:
-            live_bp = composed
-        if any(_artifact_missing_pack_governance(live_bp.get(k), on_disk.get(k)) for k in keys):
-            add("WARN", "schema", "composed-schema.yaml is STALE — it is missing or disagrees with a "
-                "live base+pack recompose of schema.yaml, and the enforced write path uses the on-disk "
-                "copy, so recent schema.yaml edits are not applied. Regenerate it: re-run the deploy "
-                "(it recomposes an existing artifact) or any `framework extensions enable/disable`.")
+            import extension_compose
+        except (ImportError, FileNotFoundError):
+            fresh, full_errors = None, []
+        else:
+            try:
+                fresh, full_errors = extension_compose.composed_schema(VAULT)
+            except Exception as exc:
+                add("FAIL", "schema", f"fresh full runtime composition crashed: {exc}")
+                fresh, full_errors = {}, []
+        if fresh is not None:
+            for error in full_errors or []:
+                add("FAIL", "schema", f"full runtime composition: {error}")
+            if not full_errors and not _schema_documents_equal(fresh, on_disk):
+                add("FAIL", "schema", "composed-schema.yaml DIVERGES from a fresh full composition "
+                    "of engine + schema.yaml + enabled extension source fragments. The write path "
+                    "and UI use the artifact; redeploy to regenerate it before accepting writes.")
+        else:
+            # Upgrade-safe fallback for a pre-#277 runtime that has not staged the
+            # composer yet. It can detect pack additions/changes but not fragment
+            # removals; therefore WARN rather than claiming full validation.
+            try:
+                live_bp, _bp_err = schema_lib.compose_schema(VAULT, fragments=[])
+            except Exception:
+                live_bp = composed
+            keys = ("types", "enums", "field_enums", "partitioning", "permissions", "review")
+            if any(_artifact_missing_pack_governance(live_bp.get(k), on_disk.get(k)) for k in keys):
+                add("WARN", "schema", "composed-schema.yaml is STALE against base+pack governance; "
+                    "runtime full-composition validation is unavailable until the next deploy.")
 
 
 def check_subdomains():
@@ -362,6 +387,17 @@ def check_partition_dups():
             # skip generated per-dir artifacts (INDEX, paginated INDEX-p02/03, _* scaffolding) —
             # the same stem legitimately recurs in every shard dir; matches okf_migrate's skip.
             if slug.startswith("_") or slug.startswith("INDEX") or slug in ("index", "log", "README"):
+                continue
+            # A tombstoned page is intentionally superseded (e.g. a same-story dedup loser left at
+            # its old shard path with superseded_by) — it inflates no count (the counting lanes skip
+            # it) and is not a live occupant of the slug. Only LIVE copies at 2+ paths are a #54 dup.
+            try:
+                head = p.read_text(encoding="utf-8", errors="replace")[:4096]
+            except OSError:
+                continue
+            fm_end = head.find("\n---", 3)
+            fm_head = head[:fm_end] if fm_end != -1 else head
+            if re.search(r"(?im)^status:\s*[\"']?tombstoned\b", fm_head):
                 continue
             seen.setdefault(slug, []).append(p.relative_to(wiki).as_posix())
         dups = {s: paths for s, paths in seen.items() if len(paths) > 1}
@@ -540,6 +576,26 @@ def check_auth():
                 add("FAIL", "auth", f"Agent Chat (api_server) toolset has non-allowlisted member(s) "
                     f"{sorted(bad)} — a composite/alias can expand to terminal/code_execution/file. "
                     f"Restrict platform_toolsets.api_server to {sorted(_API_SERVER_SAFE_TS)}.")
+            # okengine#257: the OKENGINE_EDITING switch must AGREE with the live toolset. Editing off is
+            # enforced by DROPPING okengine-write here (ensure-runtime). If the flag says off but the
+            # write MCP is still present, the switch never took (config not reconciled / gateway not
+            # recreated) — UI editing (reader Chat write-back) is still exposed.
+            if isinstance(ts, list) and not is_editing(os.environ) and \
+                    "okengine-write" in {str(x).strip() for x in ts}:
+                add("FAIL", "auth", "OKENGINE_EDITING is off but okengine-write is STILL in the "
+                    "api_server toolset — UI editing (reader Chat write-back) is still exposed. Re-run "
+                    "ensure-runtime and recreate the gateway so the switch applies (okengine#257).")
+
+    # OKENGINE_HARDENED (okengine#78): a single opt-in profile. When set, the deployment ASSERTS it
+    # must be safe to expose, so every unsafe setting is a FAIL (fail-closed — the profile never mints
+    # secrets or flips values silently). hardened_posture_violations is the shared source of truth.
+    if is_hardened(os.environ):
+        viols = hardened_posture_violations(os.environ)
+        for msg in viols:
+            add("FAIL", "hardening", msg)
+        if not viols:
+            add("INFO", "hardening", "OKENGINE_HARDENED posture satisfied "
+                "(real MCP token, reader auth-or-public, rate limits on, exports safe).")
 
 
 # The libs the enforced okengine-write MCP (write_server.py) imports from the BAKED scripts/cron tree
@@ -552,7 +608,7 @@ def check_auth():
 #   — it's image-only like scope.py (a change needs an image rebuild, caught by the version stamp, not
 #   this drift check). Listing it here made check_write_path_libs hit the both-absent branch and never
 #   actually compare it, and the M23 pin enshrined the wrong bucket (invariant-audit round-2 re-verify).
-_WRITE_PATH_LIBS = ("schema_lib.py", "id_lib.py", "id_index.py")
+_WRITE_PATH_LIBS = ("schema_lib.py", "id_lib.py", "id_index.py", "okf_migrate.py")
 
 
 def check_write_path_libs():

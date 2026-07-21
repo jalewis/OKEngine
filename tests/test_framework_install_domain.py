@@ -107,10 +107,22 @@ def _taxonomy_pack(tmp_path) -> Path:
     (p / "subdomain" / "host-schema-additions.yaml").write_text(yaml.safe_dump({
         "types": {"intrusion-set": {"required": ["type", "id"]},
                   "vendor": {"required": ["type", "id", "name"]}},
+        # the guest contributes field-coverage rows so a composed vault tracks them (okengine#264):
+        # one with a min floor, one without — both must travel through install-domain.
+        "coverage_fields": [{"type": "intrusion-set", "field": "score", "min": 0.8},
+                            {"type": "vendor", "field": "name"}],
+        # the guest contributes its field vocabularies so corpus_audit's enum-drift metric can see
+        # them in the composed vault (okengine#259 rec 12) — one plain enum, one by_type-scoped.
+        "enums": {"severity": ["critical", "high", "medium", "low"],
+                  "tax_kind": ["alpha", "beta"]},
+        "field_enums": {"severity": {"enum": "severity", "extensible": True},
+                        "tax_kind": {"by_type": {"intrusion-set": "tax_kind"}}},
         # the guest contributes its cockpit tab so a composed vault surfaces it (okengine#<n>)
         "cockpit": {"tabs": ["taxtab"], "tab_defs": {
             "taxtab": {"label": "Tax", "boxes": [
-                {"title": "Events", "view": "table", "dataset": {"dir": "tax-events", "type": "intrusion-set"}}]}}},
+                {"title": "Events", "view": "table",
+                 "dataset": {"dir": "tax-events", "type": "intrusion-set"},
+                 "empty": "No tax events yet."}]}}},
     }))
     (p / "subdomain" / "PERSONA.md").write_text("curation rules for tax\n")
     (p / "crons" / "domain-crons.json").write_text(json.dumps([
@@ -198,6 +210,100 @@ def test_taxonomy_apply(tmp_path):
     assert "okpack-tax" in (h / "CLAUDE.md").read_text()
 
 
+def test_taxonomy_merges_guest_coverage_fields(tmp_path):
+    """okengine#264: a guest's `coverage_fields` (field-population ratios corpus_audit tracks) must
+    fold into the composed host schema — else a bundle member's coverage declaration (okpack-vuln:
+    cve.cvss_base) is silently dropped and the composed vault shows UNDETECTABLE despite owning the
+    enriched type. Both the min-floored and floor-less rows must travel; the merge is idempotent."""
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    cov = yaml.safe_load((h / "schema.yaml").read_text()).get("coverage_fields") or []
+    pairs = {(c["type"], c["field"]): c.get("min") for c in cov if isinstance(c, dict)}
+    assert pairs.get(("intrusion-set", "score")) == 0.8       # min floor carried through
+    assert ("vendor", "name") in pairs and pairs[("vendor", "name")] is None  # floor-less carried
+    # idempotent: a second apply must not duplicate the rows
+    mod.main([str(h), str(p), "--apply"])
+    cov2 = yaml.safe_load((h / "schema.yaml").read_text()).get("coverage_fields") or []
+    assert len([c for c in cov2 if isinstance(c, dict) and c.get("field") == "score"]) == 1
+
+
+def test_taxonomy_merges_guest_enums(tmp_path):
+    """okengine#259 rec 12: a guest's `enums` + `field_enums` (its field vocabularies) must fold into
+    the composed host schema — else corpus_audit's enum-drift metric reports UNDETECTABLE for the
+    guest's fields in the bundle deploy though the A-class vocab drift is real. Both a plain `enum:`
+    rule and a `by_type:`-scoped rule travel; a host key WINS; the merge is idempotent."""
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    # host already owns `severity` with a NARROWER vocabulary — host must win, guest is skipped.
+    hs = (h / "schema.yaml").read_text() + \
+        "enums:\n  severity: [crit, hi]\nfield_enums:\n  severity: {enum: severity}\n"
+    (h / "schema.yaml").write_text(hs)
+
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    schema = yaml.safe_load((h / "schema.yaml").read_text())
+    # host-owned `severity` preserved (guest's 4-value list did NOT overwrite it)
+    assert schema["enums"]["severity"] == ["crit", "hi"]
+    # guest-unique vocabulary + rules travelled
+    assert schema["enums"]["tax_kind"] == ["alpha", "beta"]
+    assert schema["field_enums"]["tax_kind"] == {"by_type": {"intrusion-set": "tax_kind"}}
+    # idempotent: a second apply doesn't duplicate the key or corrupt the block
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    schema2 = yaml.safe_load((h / "schema.yaml").read_text())
+    assert schema2["enums"]["tax_kind"] == ["alpha", "beta"]
+    assert schema2["field_enums"]["severity"] == {"enum": "severity"}   # still the host's rule
+
+
+def test_taxonomy_extends_inline_by_type_and_carries_field_item_contracts(tmp_path):
+    """A co-installed type must not lose status enum dispatch or nested-list validation merely
+    because the host already owns the common `status` field and declares it inline."""
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    host = (h / "schema.yaml").read_text() + (
+        "enums:\n  host_status: [active]\n"
+        "field_enums:\n  status: {by_type: {vendor: host_status}}\n"
+        "field_shapes:\n  aliases: list\n"
+        "field_items:\n  aliases: {_item: {shape: str}}\n"
+        "protected_fields: [aliases]\n"
+        "depth_critical_types: [vendor]\n"
+    )
+    (h / "schema.yaml").write_text(host)
+    additions_path = p / "subdomain" / "host-schema-additions.yaml"
+    additions = yaml.safe_load(additions_path.read_text())
+    additions["enums"]["tax_status"] = ["candidate", "accepted"]
+    additions["field_enums"]["status"] = {"by_type": {"intrusion-set": "tax_status"}}
+    additions["field_shapes"] = {"signals": "list", "aliases": "list"}
+    additions["field_items"] = {"signals": {"_item": {"shape": "dict", "required": ["id"]}}}
+    additions["protected_fields"] = ["signals", "aliases"]
+    additions["depth_critical_types"] = ["intrusion-set"]
+    additions_path.write_text(yaml.safe_dump(additions, sort_keys=False))
+
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    schema = yaml.safe_load((h / "schema.yaml").read_text())
+    self_status = schema["field_enums"]["status"]["by_type"]
+    assert self_status == {"vendor": "host_status", "intrusion-set": "tax_status"}
+    assert schema["field_shapes"]["aliases"] == "list"       # identical host value wins
+    assert schema["field_shapes"]["signals"] == "list"
+    assert schema["field_items"]["signals"]["_item"]["required"] == ["id"]
+    assert schema["protected_fields"] == ["aliases", "signals"]
+    assert schema["depth_critical_types"] == ["vendor", "intrusion-set"]
+    assert mod.main([str(h), str(p), "--apply"]) == 0          # idempotent
+
+
+def test_taxonomy_does_not_redeclare_extension_owned_field_contract(tmp_path):
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    additions_path = p / "subdomain" / "host-schema-additions.yaml"
+    additions = yaml.safe_load(additions_path.read_text())
+    additions["field_shapes"] = {"alternatives": "list", "signals": "list"}
+    additions_path.write_text(yaml.safe_dump(additions, sort_keys=False))
+    composed = yaml.safe_load((h / "schema.yaml").read_text())
+    composed["field_shapes"] = {"alternatives": "list"}
+    (h / ".okengine").mkdir()
+    (h / ".okengine" / "composed-schema.yaml").write_text(
+        yaml.safe_dump(composed, sort_keys=False))
+
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    root = yaml.safe_load((h / "schema.yaml").read_text())
+    assert root["field_shapes"] == {"signals": "list"}
+
+
 def test_taxonomy_merges_guest_cockpit_tab(tmp_path):
     """A guest's cockpit tab_def + tab name fold into the host's cockpit block, so a composed vault
     surfaces the guest domain's tab (the canonical home a hand-added tab lacked). Host wins on a tab
@@ -213,6 +319,181 @@ def test_taxonomy_merges_guest_cockpit_tab(tmp_path):
     assert mod.main([str(h), str(p), "--apply"]) == 0
     ck2 = yaml.safe_load((h / "schema.yaml").read_text())["cockpit"]
     assert ck2["tabs"].count("taxtab") == 1
+
+
+def test_merged_guest_tab_is_consumed_by_cockpit_api(tmp_path):
+    """Bind install-domain's producer to the cockpit consumer: the merged schema must make the
+    guest key a real /api/tab/<key> response, not merely leave parseable but unused YAML."""
+    pytest.importorskip("fastapi")
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+
+    app_path = REPO / "okengine-cockpit" / "app.py"
+    spec = importlib.util.spec_from_file_location("cockpit_app_issue186", app_path)
+    cockpit = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cockpit)
+    cockpit.VAULT = h
+    cockpit.WIKI = h / "wiki"
+    cockpit._CFG_CACHE = (float("-inf"), None)
+
+    response = cockpit.api_tab("taxtab")
+    assert response["key"] == "taxtab"
+    assert response["label"] == "Tax"
+    assert response["boxes"][0]["title"] == "Events"
+
+
+def test_pack_contributes_sections_to_existing_tab_without_adding_navigation(tmp_path):
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    additions_path = p / "subdomain" / "host-schema-additions.yaml"
+    additions = yaml.safe_load(additions_path.read_text())
+    additions["cockpit"] = {
+        "tab_contributions": {
+            "okpack-tax.coverage": {
+                "target": "overview",
+                "boxes": [{
+                    "id": "okpack-tax.coverage-summary",
+                    "section": "Threat coverage",
+                    "title": "Coverage summary",
+                    "view": "application-help",
+                    "summary": "How this workspace works",
+                }],
+            },
+        },
+        "tab_aliases": {"legacy-tax": "overview"},
+    }
+    additions_path.write_text(yaml.safe_dump(additions, sort_keys=False))
+
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    schema = yaml.safe_load((h / "schema.yaml").read_text())
+    cockpit = schema["cockpit"]
+    assert cockpit["tabs"] == ["overview", "browse"]
+    contributed = cockpit["tab_defs"]["overview"]["boxes"][0]
+    assert contributed["id"] == "okpack-tax.coverage-summary"
+    assert contributed["contribution"] == "okpack-tax.coverage"
+    assert contributed["section"] == "Threat coverage"
+    assert cockpit["tab_aliases"] == {"legacy-tax": "overview"}
+
+    # Replay is exactly idempotent; an alias resolves to the canonical tab and retains route identity.
+    before = (h / "schema.yaml").read_text()
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    assert (h / "schema.yaml").read_text() == before
+
+    app_path = REPO / "okengine-cockpit" / "app.py"
+    spec = importlib.util.spec_from_file_location("cockpit_app_issue315", app_path)
+    cockpit_app = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cockpit_app)
+    cockpit_app.VAULT = h
+    cockpit_app.WIKI = h / "wiki"
+    cockpit_app._CFG_CACHE = (float("-inf"), None)
+    response = cockpit_app.api_tab("legacy-tax")
+    assert response["key"] == "legacy-tax"
+    assert response["canonical_key"] == "overview"
+    assert response["boxes"][0]["section"] == "Threat coverage"
+    assert "<details" in response["boxes"][0]["html"]
+
+
+def test_pack_cockpit_contribution_refresh_replaces_only_owned_boxes(tmp_path):
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    additions_path = p / "subdomain" / "host-schema-additions.yaml"
+    additions = yaml.safe_load(additions_path.read_text())
+    additions["cockpit"] = {"tab_contributions": {"okpack-tax.coverage": {
+        "target": "overview",
+        "boxes": [{"id": "okpack-tax.coverage-summary", "title": "First", "view": "table"}],
+    }}}
+    additions_path.write_text(yaml.safe_dump(additions, sort_keys=False))
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+
+    additions["cockpit"]["tab_contributions"]["okpack-tax.coverage"]["boxes"][0]["title"] = "Updated"
+    additions_path.write_text(yaml.safe_dump(additions, sort_keys=False))
+    # Simulate the effective artifact Cockpit prefers when extensions are enabled. Refresh must
+    # never leave this older presentation contract in front of the newly updated root schema.
+    stale_artifact = h / ".okengine" / "composed-schema.yaml"
+    stale_artifact.write_text(yaml.safe_dump({"cockpit": {"tabs": ["legacy"]}}))
+    assert mod.main([str(h), str(p), "--refresh", "--apply"]) == 0
+    boxes = yaml.safe_load((h / "schema.yaml").read_text())["cockpit"]["tab_defs"]["overview"]["boxes"]
+    assert [b["title"] for b in boxes] == ["Updated"]
+    assert not stale_artifact.exists(), "extensionless compose removes the stale effective artifact"
+
+
+def test_pack_cockpit_contribution_preserves_block_tab_boundary(tmp_path):
+    """Live schemas use block tab definitions; the following key must not join a flow box list."""
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    schema = yaml.safe_load((h / "schema.yaml").read_text())
+    schema["cockpit"]["tab_defs"]["after"] = {"label": "After", "boxes": []}
+    (h / "schema.yaml").write_text(yaml.safe_dump(schema, sort_keys=False))
+    additions_path = p / "subdomain" / "host-schema-additions.yaml"
+    additions = yaml.safe_load(additions_path.read_text())
+    additions["cockpit"] = {"tab_contributions": {"okpack-tax.coverage": {
+        "target": "overview",
+        "boxes": [{"id": "okpack-tax.coverage-summary", "title": "Coverage", "view": "table"}],
+    }}}
+    additions_path.write_text(yaml.safe_dump(additions, sort_keys=False))
+
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    parsed = yaml.safe_load((h / "schema.yaml").read_text())
+    assert parsed["cockpit"]["tab_defs"]["overview"]["boxes"][0]["title"] == "Coverage"
+    assert parsed["cockpit"]["tab_defs"]["after"]["label"] == "After"
+
+
+def test_failed_pack_migration_rolls_back_install_domain_edits_too(tmp_path):
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    pack_manifest = p / "pack.yaml"
+    pack_manifest.write_text(pack_manifest.read_text() + "version: 0.1.0\n")
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    schema_before = (h / "schema.yaml").read_bytes()
+    ownership_path = h / ".okengine" / "installed-domains" / "okpack-tax.json"
+    ownership_before = ownership_path.read_bytes()
+
+    pack_manifest.write_text(pack_manifest.read_text().replace("0.1.0", "0.2.0"))
+    additions_path = p / "subdomain" / "host-schema-additions.yaml"
+    additions = yaml.safe_load(additions_path.read_text())
+    additions["cockpit"] = {"tab_contributions": {"okpack-tax.coverage": {
+        "target": "overview",
+        "boxes": [{"id": "okpack-tax.coverage-summary", "title": "Coverage", "view": "table"}],
+    }}}
+    additions_path.write_text(yaml.safe_dump(additions, sort_keys=False))
+    (p / "migrations").mkdir()
+    (p / "migrations" / "m_0_1_0_0_2_0_fail.py").write_text(
+        'ID="fail-update"\nFROM="0.1.0"\nTO="0.2.0"\nDESCRIPTION="fail"\n'
+        'def apply(pack, dry_run):\n    raise RuntimeError("expected failure")\n')
+    (p / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## 0.2.0 — 2026-07-19\n- Migration impact: test failure.\n")
+
+    assert mod.main([str(h), str(p), "--refresh", "--apply"]) == 1
+    assert (h / "schema.yaml").read_bytes() == schema_before
+    assert ownership_path.read_bytes() == ownership_before
+
+
+def test_pack_cockpit_contribution_requires_owned_stable_ids(tmp_path, capsys):
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    additions_path = p / "subdomain" / "host-schema-additions.yaml"
+    additions = yaml.safe_load(additions_path.read_text())
+    additions["cockpit"] = {"tab_contributions": {"coverage": {
+        "target": "overview", "boxes": [{"title": "No stable id", "view": "table"}],
+    }}}
+    additions_path.write_text(yaml.safe_dump(additions, sort_keys=False))
+    assert mod.main([str(h), str(p), "--apply"]) == 1
+    assert "must be prefixed" in capsys.readouterr().out
+
+
+def test_taxonomy_cockpit_tab_collision_is_host_wins_with_notice(tmp_path, capsys):
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    schema = yaml.safe_load((h / "schema.yaml").read_text())
+    schema["cockpit"]["tabs"].insert(-1, "taxtab")
+    schema["cockpit"]["tab_defs"]["taxtab"] = {
+        "label": "Host Tax",
+        "boxes": [{"title": "Host-owned", "view": "table",
+                   "dataset": {"dir": "entities", "type": "entity"}}],
+    }
+    (h / "schema.yaml").write_text(yaml.safe_dump(schema, sort_keys=False))
+
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+
+    merged = yaml.safe_load((h / "schema.yaml").read_text())["cockpit"]
+    assert merged["tab_defs"]["taxtab"]["label"] == "Host Tax"
+    assert merged["tab_defs"]["taxtab"]["boxes"][0]["title"] == "Host-owned"
+    assert merged["tabs"].count("taxtab") == 1
+    assert "host already declares (host wins)" in capsys.readouterr().out
 
 
 def test_taxonomy_seeds_cockpit_on_a_bare_host(tmp_path):
@@ -259,6 +540,120 @@ def test_taxonomy_idempotent(tmp_path):
     assert mod.main([str(h), str(p), "--apply"]) == 0
     for f, txt in snap.items():
         assert (h / f).read_text() == txt, f
+
+
+def test_taxonomy_refresh_updates_owned_runtime_assets_and_records_manifest(tmp_path, capsys):
+    """#270: a merged guest update must have a safe path into the composed deployment."""
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    state = _sibling("composed_pack_state")
+    manifest_path = state.manifest_path(h, "okpack-tax")
+    assert manifest_path.is_file()
+    before_manifest = json.loads(manifest_path.read_text())
+    assert "okpack_tax_feed_fetch.py" in before_manifest["lane_scripts"]
+    assert "okpack-tax-feed-fetch" in before_manifest["cron_jobs"]
+    host_jobs = json.loads((h / "crons" / "domain-crons.json").read_text())
+    next(j for j in host_jobs if j["name"] == "okpack-tax-feed-fetch")["enabled"] = False
+    (h / "crons" / "domain-crons.json").write_text(json.dumps(host_jobs))
+    assert state.installed_drift(h, before_manifest) == []  # operator enablement is not drift
+
+    # Simulate the next pack release changing both its lane and its scheduled definition.
+    (p / "crons" / "scripts" / "okpack_tax_feed_fetch.py").write_text("# tax lane v2\n")
+    jobs = json.loads((p / "crons" / "domain-crons.json").read_text())
+    jobs[0]["schedule"] = {"kind": "cron", "expr": "17 */2 * * *"}
+    (p / "crons" / "domain-crons.json").write_text(json.dumps(jobs))
+
+    # A normal re-install diagnoses the stale copy and cannot silently bless/overwrite it.
+    assert mod.main([str(h), str(p), "--apply"]) == 1
+    out = capsys.readouterr().out
+    assert "--refresh" in out
+    assert (h / "crons" / "scripts" / "okpack_tax_feed_fetch.py").read_text() == "# tax lane\n"
+    assert json.loads(manifest_path.read_text()) == before_manifest
+
+    # Explicit refresh replaces only manifest-owned assets and advances their accepted hashes.
+    assert mod.main([str(h), str(p), "--refresh", "--apply"]) == 0
+    assert (h / "crons" / "scripts" / "okpack_tax_feed_fetch.py").read_text() == "# tax lane v2\n"
+    installed = json.loads((h / "crons" / "domain-crons.json").read_text())
+    refreshed = next(j for j in installed if j["name"] == "okpack-tax-feed-fetch")
+    assert refreshed["schedule"]["expr"] == "17 */2 * * *"
+    assert refreshed["enabled"] is False                    # refresh cannot activate a lane
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest != before_manifest
+    assert state.installed_drift(h, manifest) == []
+    capsys.readouterr()
+    assert mod.main([str(h), str(p), "--refresh", "--apply"]) == 0
+    assert "refresh 1 owned domain cron" not in capsys.readouterr().out
+
+
+def test_taxonomy_refresh_adopts_only_provable_legacy_assets(tmp_path):
+    """A pre-#270 deployment can refresh its job script, but --refresh is not a force flag."""
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    state = _sibling("composed_pack_state")
+    state.manifest_path(h, "okpack-tax").unlink()       # legacy deployment: no ownership manifest
+    (p / "crons" / "scripts" / "okpack_tax_feed_fetch.py").write_text("# adopted v2\n")
+    assert mod.main([str(h), str(p), "--refresh", "--apply"]) == 0
+    assert (h / "crons" / "scripts" / "okpack_tax_feed_fetch.py").read_text() == "# adopted v2\n"
+
+    # An unreferenced same-name file has no ownership proof and remains fail-closed.
+    (p / "crons" / "scripts" / "foreign_helper.py").write_text("# guest\n")
+    (h / "crons" / "scripts" / "foreign_helper.py").write_text("# host\n")
+    jobs = json.loads((p / "crons" / "domain-crons.json").read_text())
+    jobs.append({"id": "dd", "name": "okpack-tax-foreign", "script": "foreign_helper.py"})
+    (p / "crons" / "domain-crons.json").write_text(json.dumps(jobs))
+    state.manifest_path(h, "okpack-tax").unlink()
+    assert mod.main([str(h), str(p), "--refresh", "--apply"]) == 1
+    assert (h / "crons" / "scripts" / "foreign_helper.py").read_text() == "# host\n"
+
+
+def test_taxonomy_refresh_preserves_shared_support_module(tmp_path, capsys):
+    """A flat helper imported by a lane is host-controlled; refreshing one pack cannot regress it."""
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    entry = p / "crons" / "scripts" / "okpack_tax_feed_fetch.py"
+    entry.write_text("from _shared_writer import write\n")
+    (p / "crons" / "scripts" / "_shared_writer.py").write_text("write = 'v1'\n")
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    state = _sibling("composed_pack_state")
+    manifest = json.loads(state.manifest_path(h, "okpack-tax").read_text())
+    assert "okpack_tax_feed_fetch.py" in manifest["lane_scripts"]
+    assert "_shared_writer.py" in manifest["shared_support_scripts"]
+    assert "_shared_writer.py" not in manifest["lane_scripts"]
+
+    # The host helper has moved ahead independently. A pack entrypoint update may land, but the
+    # helper remains untouched and the operator gets a visible warning.
+    (h / "crons" / "scripts" / "_shared_writer.py").write_text("write = 'host-v2'\n")
+    entry.write_text("from _shared_writer import write\n# entry v2\n")
+    assert mod.main([str(h), str(p), "--refresh", "--apply"]) == 0
+    assert (h / "crons" / "scripts" / "_shared_writer.py").read_text() == "write = 'host-v2'\n"
+    assert "entry v2" in (h / "crons" / "scripts" / "okpack_tax_feed_fetch.py").read_text()
+    assert "remain host-controlled" in capsys.readouterr().out
+
+
+def test_taxonomy_refresh_does_not_touch_schema_cockpit_or_persona(tmp_path):
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    before = {name: (h / name).read_bytes() for name in ("schema.yaml", "CLAUDE.md", "feeds/feeds.opml")}
+    additions = yaml.safe_load((p / "subdomain" / "host-schema-additions.yaml").read_text())
+    additions["types"]["new-in-release"] = {"required": ["type", "id"]}
+    (p / "subdomain" / "host-schema-additions.yaml").write_text(yaml.safe_dump(additions))
+    (p / "crons" / "scripts" / "okpack_tax_feed_fetch.py").write_text("# runtime v2\n")
+
+    assert mod.main([str(h), str(p), "--refresh", "--apply"]) == 0
+    assert "runtime v2" in (h / "crons" / "scripts" / "okpack_tax_feed_fetch.py").read_text()
+    assert {name: (h / name).read_bytes() for name in before} == before
+    assert "new-in-release" not in yaml.safe_load((h / "schema.yaml").read_text())["types"]
+
+
+def test_composed_manifest_drift_is_reported_by_framework_validate(tmp_path):
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    (h / "crons" / "scripts" / "okpack_tax_feed_fetch.py").write_text("# hand edit\n")
+    validator = _sibling("framework_validate")
+    report = validator.validate(h)
+    drift = [(sev, detail) for sev, check, detail in report.rows
+             if check == "composed pack drift"]
+    assert any(sev == "WARN" and "modified crons/scripts/okpack_tax_feed_fetch.py" in detail
+               for sev, detail in drift)
 
 
 def test_taxonomy_idempotent_with_friendly_persona_marker(tmp_path):

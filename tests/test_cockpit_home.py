@@ -185,3 +185,66 @@ def test_reshard_bucket_page_stays_visible(tmp_path, monkeypatch):
     assert tree.get("entities") == 2, "the _ reshard bucket page must be counted, not over-dropped"
     assert any("x-force" in r["path"] for r in m._scan_dir("entities")), "resharded x-force missing from ledger"
     assert len(m._scan_dir_meta("entities")) == 2, "reshard bucket page missing from dataset scan"
+
+
+def test_home_gaps_ranked_by_maturity_with_signal_columns(tmp_path, monkeypatch):
+    """The Knowledge-gaps table surfaces each gap's maturity (density / confidence / testable) and
+    ranks most-grounded first, so a well-supported gap outranks a thin one without opening the page."""
+    (tmp_path / "schema.yaml").write_text("cockpit:\n  tabs: [home]\n", encoding="utf-8")
+    _mk(tmp_path, "lacuna/thin.md",
+        "type: lacuna\nname: thin gap\ncreated: '2026-07-06'\nsurround_density: 12 links\nconfidence: low\n")
+    _mk(tmp_path, "lacuna/grounded.md",
+        "type: lacuna\nname: grounded gap\ncreated: '2026-07-05'\n"
+        "surround_density: 340 links · sources 300\nconfidence: high\n"
+        "prediction_candidate: predictions/grounded-2028\n")
+    m = _load(tmp_path, monkeypatch)
+    sec = next(s for s in m.api_home()["sections"] if s["group"] == "Knowledge gaps")
+    html = sec["html"]
+    for col in ("Density", "Confidence", "Testable"):
+        assert col in html, col
+    assert "340" in html and "high" in html and "✓" in html          # the grounded gap's signals
+    assert html.index("grounded gap") < html.index("thin gap")       # most-grounded first
+
+
+def test_browse_groups_omit_empty_kind(tmp_path, monkeypatch):
+    """okengine#259 Browse cleanup: the cockpit /api/groups drops a declared display_group with 0
+    matching pages (the observed 'Report vendors 0'), matching /api/tree hiding empty namespaces."""
+    (tmp_path / "schema.yaml").write_text(
+        "display_groups:\n"
+        "  Threat actors: [actor]\n"
+        "  Report vendors: [report-vendor]\n", encoding="utf-8")
+    _mk(tmp_path, "entities/a/apt42.md", "type: actor\n")
+    m = _load(tmp_path, monkeypatch)
+    assert [g["label"] for g in m.api_groups()["groups"]] == ["Threat actors"]
+
+
+def test_box_provenance_affordance(tmp_path, monkeypatch):
+    """okengine#259 Rec 11: a panel tagged `provenance:` (a corpus/coverage measure, not a threat
+    measure) surfaces a structured provenance badge {label, note} on the box so the UI can mark it
+    distinct — a 'coverage ▼' dip must not read as the threat declining. String shorthand + dict
+    both work; an untagged panel carries no provenance key."""
+    (tmp_path / "schema.yaml").write_text(
+        "cockpit:\n  tabs: [t]\n  tab_defs:\n    t:\n      label: T\n      boxes:\n"
+        "        - title: Theme trends\n          view: bars\n          dataset: {dir: trends, type: trend}\n"
+        "          group_by: direction\n"
+        "          provenance: {label: coverage, note: \"Reporting volume, not threat level.\"}\n"
+        "        - title: Actor movement\n          view: bars\n          dataset: {dir: entities, type: actor}\n"
+        "          group_by: origin\n", encoding="utf-8")
+    _mk(tmp_path, "trends/x.md", "type: trend\ndirection: up\n")
+    _mk(tmp_path, "entities/a/apt.md", "type: actor\norigin: China\n")
+    m = _load(tmp_path, monkeypatch)
+    by = {b["title"]: b for b in m.api_tab("t")["boxes"]}
+    assert by["Theme trends"]["provenance"] == {"label": "coverage", "note": "Reporting volume, not threat level."}
+    assert "provenance" not in by["Actor movement"]          # untagged panel unaffected
+
+
+def test_box_provenance_string_shorthand(tmp_path, monkeypatch):
+    """`provenance: coverage` shorthand expands to {label: coverage, note: ''}."""
+    (tmp_path / "schema.yaml").write_text(
+        "cockpit:\n  tabs: [t]\n  tab_defs:\n    t:\n      label: T\n      boxes:\n"
+        "        - title: Publisher activity\n          view: bars\n          dataset: {dir: sources, type: source}\n"
+        "          group_by: publisher\n          provenance: coverage\n", encoding="utf-8")
+    _mk(tmp_path, "sources/s.md", "type: source\npublisher: Acme\n")
+    m = _load(tmp_path, monkeypatch)
+    box = {b["title"]: b for b in m.api_tab("t")["boxes"]}["Publisher activity"]
+    assert box["provenance"] == {"label": "coverage", "note": ""}

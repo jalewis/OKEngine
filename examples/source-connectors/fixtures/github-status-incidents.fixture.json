@@ -1,0 +1,10 @@
+{
+  "fixture_version": 1,
+  "pages": [{
+    "headers": {"etag": "github-status-v1"},
+    "body": {"page": {"id": "kctbh9vrtdwd"}, "incidents": [
+      {"id": "inc-001", "name": "Actions workflow delays", "status": "resolved", "impact": "minor", "updated_at": "2026-07-18T10:00:00Z"},
+      {"id": "inc-002", "name": "API requests degraded", "status": "monitoring", "impact": "major", "updated_at": "2026-07-18T11:00:00Z"}
+    ]}
+  }]
+}

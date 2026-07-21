@@ -32,6 +32,9 @@ from pathlib import Path
 
 import yaml
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # scripts/cron, for sibling libs
+import tz_lib  # noqa: E402
+
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
 _FM_RE = re.compile(r"\A---[ \t]*\n(.*?\n)---", re.S)
@@ -195,7 +198,7 @@ def main() -> int:
     cap = int(cfg.get("cap", 300))
     today = datetime.now(timezone.utc).date()
     cutoff = today - timedelta(days=days)
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now = tz_lib.deployment_now().strftime("%Y-%m-%d %H:%M %Z")  # okengine#301: deployment zone, not "UTC"
 
     def rel(p: Path) -> str:
         return p.relative_to(WIKI).as_posix()[:-3]

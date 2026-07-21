@@ -1,0 +1,11 @@
+{
+  "fixture_version": 1,
+  "pages": [{
+    "status": 200,
+    "headers": {"ETag": "bundle-v1"},
+    "body": {"objects": [
+      {"id": "object-1", "modified": "2026-07-18T12:00:00Z", "name": "One"},
+      {"id": "object-2", "modified": "2026-07-18T12:01:00Z", "name": "Two"}
+    ]}
+  }]
+}

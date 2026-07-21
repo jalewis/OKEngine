@@ -20,10 +20,40 @@ bash tests/e2e/smoke/smoke-e2e.sh --keep         # leave the stack up (9880 read
 bash tests/e2e/smoke/smoke-e2e.sh --no-build     # reuse existing images
 ```
 
+## Use it as the contributor sandbox
+
+The same frozen, dependency-light stack is the one-command local sandbox:
+
+```bash
+make sandbox-start   # build, verify, then leave the stack running
+make sandbox-stop    # stop it and remove the disposable qmd index
+make sandbox-reset   # clean reset, rebuild, verify, and leave it running
+```
+
+After `sandbox-start`:
+
+- reader: http://127.0.0.1:9880
+- cockpit: http://127.0.0.1:9881
+- read MCP: `http://127.0.0.1:8880/mcp`, token `okengine-local`
+
+The fixture vault is intentionally read-only and tracked in Git, so every start uses known sample
+content and `sandbox-reset` cannot destroy contributor data. The qmd index is the only persistent
+sandbox state and is disposable. This is a surface-development/evaluation sandbox, not a miniature
+production agent: it deliberately omits Hermes, models, feeds, credentials, delivery, and cron.
+Use a scaffolded domain pack when testing write paths or scheduled agent behavior.
+
 The venv needs **`pytest`**, and for the rendered-DOM layer **`playwright`** plus a system Chrome
 (`channel="chrome"` — no browser download). Without playwright the DOM layer **skips** and the
 HTTP/content layer still gates. It's a pre-release step (`docs/release-checklist.md` §2) and runs
 on demand; it is intentionally *not* in the every-push `make check`.
+
+For a release, use `SMOKE_REQUIRE_DOM=1 make smoke-e2e`; missing Playwright/Chrome is then a hard
+failure. The harness tears down through an `EXIT` trap. If the host or terminal dies first, recover
+before retrying:
+
+```bash
+docker compose -f tests/e2e/smoke/docker-compose.smoke.yml down -v --remove-orphans
+```
 
 ## Layout
 

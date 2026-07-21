@@ -65,13 +65,14 @@ schema; packs add domain fields on top.
 vault root's. A sub-tree **MAY** carry its own `schema.yaml` (a nested sub-domain).
 
 3.2 The engine merges an **engine-owned base schema UNDER** every pack schema. The
-base owns the global toggles **and the universal OKF core**; a pack **MUST NOT**
-override the toggles, and declares only its **domain** `types`/namespaces (+ any
+base owns the universal requirements **and the universal OKF core**. A pack declares
+its **domain** `types`/namespaces (+ any
 domain `partitioning`/`tier`/`permissions` and extra keys):
 - `okf.required` — the merged requirement is the **union** of base and pack; `type`
   is always present and the floor never loosens.
 - `okf.should` — base-owned advisory tier (currently `[id]`).
-- `strict_types` — **engine-owned**; a pack-level value is ignored.
+- `strict_types` — open (`false`) by default. A pack **MAY** opt into `true`; the
+  setting is monotonic, so a pack cannot loosen a stricter base/composed host.
 - the **OKF core** (okengine#90) — engine-owned DEFAULTS merged under the pack: the
   core `types` (`source`/`concept`/`prediction`/`finding`/`dashboard`/`briefing`/
   `trend`), the core `partitioning.namespaces` + `tier`, and the cross-cutting
@@ -87,10 +88,11 @@ back to the pack's own `okf`, never crash a write).
 4.1 A page is **type-conformant** when its `type` satisfies the governing schema:
 the type's declared `required` fields are all present.
 
-4.2 `strict_types` (engine-owned, default `false`): when `false`, a page whose
+4.2 `strict_types` (default `false`): when `false`, a page whose
 `type` is **not** in the schema's `types` is allowed if it satisfies `okf.required`
-(open/extensible). When `true`, an unknown `type` is **rejected**. Because it is
-engine-owned, this decision is uniform across all packs composed into one vault.
+(open/extensible). When `true`, an unknown `type` is **rejected** against the full
+composed type map. A declared `type_aliases` value is accepted as its target and
+write boundaries store the canonical target, preventing new taxonomy fragments.
 
 ## 5. Identifiers (`id`)
 
@@ -210,7 +212,7 @@ The reference implementation's tests pin these clauses (where practical):
 | Clause | Test(s) |
 |---|---|
 | §2.1/§3.2 base-floor `okf.required` union | `tests/test_schema_validator_base.py` |
-| §3.2/§4.2 `strict_types` engine-owned | `tests/test_schema_validator_base.py`, `tests/cron/test_schema_lib_base.py` |
+| §3.2/§4.2 pack-opt-in `strict_types` | `tests/test_schema_validator_base.py`, `tests/cron/test_schema_lib_base.py` |
 | §2.2 `okf.should` WARN tier (`id`) | `tests/test_schema_validator_base.py` |
 | §5.2 id form / normalization | `tests/cron/test_id_lib.py` |
 | §5.1/§5.4 id index, convergence, collisions | `tests/cron/test_id_index.py`, `tests/test_converge.py` |

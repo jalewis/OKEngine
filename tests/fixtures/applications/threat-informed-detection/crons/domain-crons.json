@@ -1,0 +1,15 @@
+[
+  {"name": "coverage-reassess", "script": "noop.py", "no_agent": true},
+  {"name": "coverage-resolve", "script": "noop.py", "no_agent": true},
+  {"name": "coverage-measure", "script": "noop.py", "no_agent": true},
+  {"name": "import-threat-procedures", "script": "noop.py", "no_agent": true},
+  {"name": "refresh-detection-requirements", "script": "noop.py", "no_agent": true},
+  {"name": "import-environment-inventory", "script": "noop.py", "no_agent": true},
+  {"name": "import-telemetry-inventory", "script": "noop.py", "no_agent": true},
+  {"name": "refresh-detection-strategies", "script": "noop.py", "no_agent": true},
+  {"name": "import-detection-analytics", "script": "noop.py", "no_agent": true},
+  {"name": "import-deployment-inventory", "script": "noop.py", "no_agent": true},
+  {"name": "import-validation-tests", "script": "noop.py", "no_agent": true},
+  {"name": "import-validation-results", "script": "noop.py", "no_agent": true},
+  {"name": "evaluate-coverage", "script": "noop.py", "no_agent": true}
+]

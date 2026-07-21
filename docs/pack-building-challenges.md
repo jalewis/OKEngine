@@ -108,7 +108,7 @@ config files that cannot merge, and entity taxonomies redeclared instead of mark
 host-reusable. None of it breaks standalone — all of it breaks the walk-up co-install
 that is the point of building packs (deployment-topology model A). The fix is three
 hygiene rules + shipping a `subdomain/` install form; see `authoring-a-pack.md` §8.
-Found the hard way: every pack built before okpack-doctrine failed at least one rule.
+Found the hard way: every pack built before these hygiene rules existed failed at least one.
 
 ## 10. A checker nobody tests is a placebo
 

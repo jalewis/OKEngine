@@ -1,0 +1,8 @@
+{
+  "fixture_version": 1,
+  "pages": [
+    {"headers": {"ETag": "poll-v2"}, "body": {"changes": [{"id": "a", "revision": 1}], "next_cursor": "c1"}},
+    {"body": {"changes": [{"id": "b", "revision": 2, "deleted": true}], "next_cursor": "c2"}},
+    {"body": {"changes": [], "next_cursor": "c2"}}
+  ]
+}

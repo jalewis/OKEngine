@@ -31,6 +31,12 @@ ALL domain judgment lives in the pack's rules file (config/completeness-rules.ya
       - id: assumption-freshness
         when: {type: assumption}
         expect: freshness                       # date field older than max_age_days -> gap
+      - id: prediction-needs-refutation-criteria
+        when: {type: prediction}
+        expect: section                         # body H2 containing `section` w/ >=min_chars content
+        section: What would refute this        # gradeability gate, okengine#214
+        min_chars: 20
+        severity: medium
         field: last_reviewed
         max_age_days: 90
         severity: medium
@@ -58,8 +64,14 @@ import yaml
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
-RULES_FILE = os.environ.get("COMPLETENESS_RULES", "config/completeness-rules.yaml")
-MAX_PER_RULE = int(os.environ.get("COMPLETENESS_MAX_PER_RULE", "200"))
+RULES_FILE = os.environ.get(
+    "COMPLETENESS_RULES",
+    os.environ.get("OKENGINE_COMPLETENESS_RULES_FILE", "config/completeness-rules.yaml"),
+)
+MAX_PER_RULE = int(os.environ.get(
+    "COMPLETENESS_MAX_PER_RULE",
+    os.environ.get("OKENGINE_COMPLETENESS_MAX_GAPS_PER_RULE", "200"),
+))
 GAPS = WIKI / "gaps"
 _FM = re.compile(r"\A---[ \t]*\n(.*?\n)---", re.S)
 _LINK = re.compile(r"\[\[\s*([A-Za-z0-9._/-]+?)\s*(?:[|#\]])")
@@ -96,7 +108,7 @@ def load_rules() -> list[dict] | None:
     ok = []
     for r in rules:
         if not (isinstance(r, dict) and r.get("id") and isinstance(r.get("when"), dict)
-                and r.get("expect") in ("field", "link", "companion", "freshness")):
+                and r.get("expect") in ("field", "link", "companion", "freshness", "section")):
             print(f"completeness-audit: skipping malformed rule: {r!r:.120}")
             continue
         r.setdefault("severity", "medium")
@@ -155,6 +167,22 @@ def _unmet(rule: dict, rel: str, slug: str, fm: dict, body: str,
             hit = any(t.strip("/") in tset or t.rsplit("/", 1)[-1] in tstems for t in targets)
             return None if hit else f"no wikilink to a `type: {spec['type']}` page"
         return None
+    if kind == "section":
+        # gradeability gate (okengine#214): a resolvable proposition must carry a substantive
+        # body section (e.g. "What would refute this") — 31% of cyber-market's expired
+        # predictions were ungradeable because nothing machine-checkable required criteria.
+        want = str(rule.get("section") or "").strip().lower()
+        min_chars = int(rule.get("min_chars") or 20)
+        if not want:
+            return None
+        for m in re.finditer(r"^##\s+(.+)$", body, re.M):
+            if want in m.group(1).strip().lower():
+                nxt = re.search(r"^##\s", body[m.end():], re.M)
+                content = body[m.end(): m.end() + nxt.start()] if nxt else body[m.end():]
+                filled = len(re.sub(r"\s", "", content))
+                return None if filled >= min_chars else \
+                    f"section `## {m.group(1).strip()}` is present but empty/thin (<{min_chars} chars)"
+        return f"body section matching `## …{rule.get('section')}…` is missing"
     if kind == "freshness":
         f = rule.get("field") or "updated"
         max_age = int(rule.get("max_age_days") or 90)

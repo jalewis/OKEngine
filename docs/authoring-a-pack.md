@@ -319,6 +319,15 @@ Both are domain-agnostic and run on the host over the `raw/` tree. **Per-publish
 extraction (site-specific selectors, format adapters like SEC filings) is *pack*
 work — supply it in `crons/scripts/`, not the engine.
 
+**Structured and on-demand sources.** For JSON/JSONL APIs, prefer a declarative
+manifest under `connectors/` before writing a pack script. The generic connector
+runtime covers Bundle, Query, Enrichment, and bounded Stream/Poll modes, including
+secret references, cursors, pagination, conditional requests, revision/deletion
+mapping, archival policy, and health output. See
+[`source-connectors.md`](source-connectors.md) for the manifest schema, fixture
+contract, cron invocation, and trust rules. `framework validate` checks every
+manifest before deployment.
+
 ---
 
 ## 5. Crons — domain jobs + engine-template prompts
@@ -425,10 +434,13 @@ that passes is structurally complete and deployable.
 - Empty/absent feeds or unreachable feed URLs (a pack ships **inert** by design),
   a missing `.env.example` or no model-provider key documented.
 - `pack.yaml` absent (recommended for composition), or owning no types/namespaces.
-- Optional/engine-supplied schema blocks absent (`partitioning`, `hot_set`), a
-  pack-level `strict_types` (engine-owned — ignored), or a `type_aliases` /
+- Optional/engine-supplied schema blocks absent (`partitioning`, `hot_set`), or a `type_aliases` /
   `classify_hints` / `operational_types` reference to a type not in this pack's
   `types:` (it may be owned by a pack you `requires:` — resolved at deploy).
+
+Set `strict_types: true` when the pack's composed taxonomy is complete. Unknown
+types then fail at the write boundary; `type_aliases` are accepted and stored as
+their canonical target. The default remains open for exploratory packs.
 
 Run it after every change; it's offline except `--probe-feeds`.
 
@@ -512,8 +524,8 @@ Three hygiene rules do that:
 
 - **Domain-subtree pack** — the pack's content is its own knowledge domain: a subtree
   with its own `schema.yaml` (owned types only), persona section, and id-keyed config
-  merges. **Naming standard: the subtree is the pack's domain slug** (okpack-doctrine →
-  `wiki/doctrine/`) — one word across the pack name, the domain dir, validators, and
+  merges. **Naming standard: the subtree is the pack's domain slug** (okpack-fintech →
+  `wiki/fintech/`) — one word across the pack name, the domain dir, validators, and
   reports; ad-hoc install names proved confusing in the first real install. Reference:
   `okpack-example/subdomain/` (public teaching copy of BOTH forms) — first real
   subtree install: a knowledge-state pack.
@@ -531,7 +543,7 @@ types ⊆ standalone types; drift between the two forms is a bug.
 The install itself is automated (okengine#173):
 
 ```
-framework install-domain <deployment> <pack> [--under wiki/<slug>] [--shape ...] [--apply]
+framework install-domain <deployment> <pack> [--under wiki/<slug>] [--shape ...] [--refresh] [--apply]
 ```
 
 It detects the shape from `subdomain/`, runs `coinstall_preflight` on what actually LANDS

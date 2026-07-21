@@ -111,6 +111,17 @@ def build_report(data_dir: str = "/opt/data", window_h: float = 24.0) -> tuple[s
     enabled = [j for j in jobs if j.get("enabled", True)]
     n_ext = sum(1 for j in enabled if j.get("extension"))
     ticking = os.path.isfile(os.path.join(data_dir, "cron-plus", ".tick.lock"))
+    # .tick.lock presence is NOT liveness: tick() refreshes it BEFORE load_jobs(), so a scheduler
+    # that ticks but can't load the store keeps a fresh lock while firing NO lanes. cron-plus drops
+    # .scheduler-stalled for exactly that (#197); its only other reader is a cron LANE the stalled
+    # scheduler never runs, so surface it HERE too (invariant-audit HIGH #2).
+    stalled = ""
+    sent = os.path.join(data_dir, "cron-plus", ".scheduler-stalled")
+    if os.path.isfile(sent):
+        try:
+            stalled = json.load(open(sent, encoding="utf-8")).get("error") or "unreadable job store"
+        except (OSError, ValueError, AttributeError):
+            stalled = "unreadable job store"
 
     logs = sorted(_recent_logs(data_dir, window_h), key=os.path.getmtime)
     latest: dict[str, tuple[str, float]] = {}     # job -> (outcome, mtime) of its newest run
@@ -159,6 +170,9 @@ def build_report(data_dir: str = "/opt/data", window_h: float = 24.0) -> tuple[s
     L.append("=" * 60)
     L.append(f"Fleet: {len(jobs)} jobs ({len(enabled)} enabled, {n_ext} extension)  ·  "
              f"cron-plus ticking {'✓' if ticking else '✗ — scheduler not running!'}")
+    if stalled:
+        L.append(f"  ✗ SCHEDULER STALLED — ticking but cannot load jobs.json ({stalled}); "
+                 f"NO lanes are firing until the store is repaired and $GW restarted")
     L.append(f"Last {int(window_h)}h: {len(latest)} lanes ran  ·  "
              f"{counts['ok']} ok  ·  {counts['silent']} silent(no-agent)  ·  "
              f"{counts['incomplete']} incomplete")
@@ -193,10 +207,10 @@ def build_report(data_dir: str = "/opt/data", window_h: float = 24.0) -> tuple[s
 
     crit = sum(signals_total[k] for k in CRITICAL)
     L.append("=" * 60)
-    verdict = "ATTENTION" if (crit or incomplete or not ticking) else "healthy"
+    verdict = "ATTENTION" if (crit or incomplete or not ticking or stalled) else "healthy"
     L.append(f"{verdict}: {crit} critical signal(s), {len(incomplete)} incomplete, "
-             f"{len(overdue)} overdue.")
-    return "\n".join(L), (1 if crit else 0)
+             f"{len(overdue)} overdue{', SCHEDULER STALLED' if stalled else ''}.")
+    return "\n".join(L), (1 if (crit or stalled) else 0)
 
 
 def main(argv: list[str]) -> int:

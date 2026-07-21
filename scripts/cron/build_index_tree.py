@@ -31,6 +31,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import schema_lib  # noqa: E402
+import tz_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
@@ -168,7 +169,7 @@ def main() -> int:
     if not WIKI.is_dir():
         print(f"ERROR: wiki not found at {WIKI}", file=sys.stderr)
         return 1
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now = tz_lib.deployment_now().strftime("%Y-%m-%d %H:%M %Z")  # okengine#301: deployment zone, not "UTC"
     namespaces = _discover_namespaces(WIKI)   # domain-agnostic: picks up sub-domains too
     counts = {}
     for ns in namespaces:

@@ -26,6 +26,16 @@ COMPOSE="docker compose -f $HERE/docker-compose.smoke.yml"
 PY="${SMOKE_PYTHON:-python3}"
 REQUIRE_DOM="${SMOKE_REQUIRE_DOM:-0}"
 
+# CI/dind mode (SMOKE_CI=1, used by the okengine#282 e2e job): the stack runs inside the dind daemon, so
+# its published ports live on the dind container's interfaces — reachable from this job at the `docker`
+# service hostname, not 127.0.0.1, and they must bind 0.0.0.0 there. Layer the CI compose overlay and
+# retarget the probe/test URLs at the dind host. Local runs (SMOKE_CI unset) keep the loopback binding.
+HOSTADDR=127.0.0.1
+if [ "${SMOKE_CI:-0}" = 1 ]; then
+  COMPOSE="$COMPOSE -f $HERE/docker-compose.smoke.ci.yml"
+  HOSTADDR="${SMOKE_HOST:-docker}"
+fi
+
 # Release-mode preflight: fail BEFORE building the stack if the DOM layer can't run at all.
 if [ "$REQUIRE_DOM" = 1 ]; then
   "$PY" -c 'import playwright.sync_api' 2>/dev/null || {
@@ -35,9 +45,9 @@ if [ "$REQUIRE_DOM" = 1 ]; then
     exit 3
   }
 fi
-export SMOKE_READER_URL="http://127.0.0.1:9880"
-export SMOKE_COCKPIT_URL="http://127.0.0.1:9881"
-export SMOKE_MCP_URL="http://127.0.0.1:8880"
+export SMOKE_READER_URL="http://$HOSTADDR:9880"
+export SMOKE_COCKPIT_URL="http://$HOSTADDR:9881"
+export SMOKE_MCP_URL="http://$HOSTADDR:8880"
 export SMOKE_MCP_TOKEN="okengine-local"          # must match OKENGINE_MCP_TOKEN in docker-compose.smoke.yml
 
 KEEP=0; BUILD=1

@@ -35,6 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import schema_lib  # noqa: E402
+import tz_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 OP_DIR = VAULT / "wiki" / "operational"
@@ -200,7 +201,7 @@ def render(today: date, q_rows, pages) -> str:
     fm_errors = lkv.get("fm-parse-errors", 0)
     fm_valid_pct = 100.0 * (pages - fm_errors) / pages if pages else 0.0
 
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    ts = tz_lib.deployment_now().strftime("%Y-%m-%d %H:%M %Z")  # okengine#301: deployment zone, not "UTC"
     L: list[str] = []
     L.append("---")
     L.append("type: dashboard")

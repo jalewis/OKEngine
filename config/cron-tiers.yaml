@@ -44,6 +44,8 @@ engine:
   - page-quality-audit
   - wiki-health-audit
   - source-portfolio-refresh     # no_agent corpus-composition dashboard (complements source-staleness)
+  - corpus-audit                # no_agent vocabulary-drift + dead-field standing detector
+  - classify-new-sources        # no_agent signal_class producer (okengine#221) — fixes D6 dead field
   # contradictions-refresh migrated to the okengine.contradictions extension (okengine#131 §11)
   # --- conformance / lint / repair ---
   - lint-watcher
@@ -52,9 +54,13 @@ engine:
   - content-lint                 # no_agent degeneration monitor (word-salad / CJK-fusion) -> wiki/operational/content-lint.md
   - render-lint                  # no_agent render-surface monitor (crawls the reader) -> wiki/operational/render-lint.md
   - deployment-validate
+  - policy-audit                # no_agent verification of the composed runtime policy artifact
   - fleet-health
+  - collection-health             # no_agent configured-source freshness/yield ledger projection (#274)
   - grounding-audit
+  - review-autoverify          # deterministic evidence-graded needs_review clearing (#313)
   - review-queue
+  - review-drain                 # bounded local-evidence drain for substantive needs_review pages
   - operator-dashboard
   - health-export
   - relink-prose-sources

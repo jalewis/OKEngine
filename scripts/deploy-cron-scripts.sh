@@ -36,6 +36,8 @@ PACK_DIR="${CRON_PACK_DIR:-/path/to/pack}"
 HERMES_UID="$(resolve_hermes_uid "$PACK_DIR")"
 PACK_SCRIPTS="$PACK_DIR/crons/scripts"
 PACK_DATA="$PACK_DIR/data"
+PACK_CONNECTORS="$PACK_DIR/connectors"
+RUNTIME_COMPOSE_HELPERS=(extension_compose.py extension_discovery.py extension_manifest.py)
 
 if [ ! -d "$SRC_DIR" ]; then
     echo "ERROR: $SRC_DIR not found.  Are you running from the repo root?" >&2
@@ -82,6 +84,32 @@ else
     echo "  $ecount engine cron script(s) deployed to $CONTAINER:/opt/data/scripts/"
 fi
 
+# --- runtime schema-composition helpers + engine extension inputs (#277) ---
+# deployment_validate runs inside the gateway. To reproduce the deploy-side
+# composition there, it needs both the composer modules and the engine-tier
+# extension manifests/schema fragments. The staged layout deliberately mirrors
+# the repository layout expected by extension_discovery:
+#   /opt/data/scripts/extension_discovery.py -> /opt/data/extensions/<id>/
+for helper in "${RUNTIME_COMPOSE_HELPERS[@]}"; do
+    if [ ! -f "$REPO_ROOT/scripts/$helper" ]; then
+        echo "ERROR: runtime schema-composition helper missing: scripts/$helper" >&2
+        exit 1
+    fi
+done
+( cd "$REPO_ROOT/scripts" && tar -cf - "${RUNTIME_COMPOSE_HELPERS[@]}" ) \
+    | docker exec -i -u "$HERMES_UID" "$CONTAINER" tar -xf - -C /opt/data/scripts/
+
+# Reconcile the whole generated engine-extension tier so removed/renamed
+# extensions cannot linger discoverable in the runtime.
+docker exec -u "$HERMES_UID" "$CONTAINER" sh -c \
+    'rm -rf /opt/data/extensions && mkdir -p /opt/data/extensions'
+if find "$REPO_ROOT/extensions" -mindepth 2 -maxdepth 2 -name extension.yaml -print -quit \
+        | grep -q .; then
+    ( cd "$REPO_ROOT" && tar --exclude='__pycache__' --exclude='*.pyc' -cf - extensions ) \
+        | docker exec -i -u "$HERMES_UID" "$CONTAINER" tar -xf - -C /opt/data/
+fi
+echo "  runtime schema composer + engine extension inputs deployed"
+
 # --- engine base-schema -> /opt/data/config/ (okengine#90) ---
 # The core (types/namespaces/optionals) lives in config/base-schema.yaml; the staged schema_lib
 # resolves it at ../config relative to /opt/data/scripts (== /opt/data/config). Without it, cron
@@ -110,6 +138,7 @@ fi
 # the current engine+pack source set. Namespaced extension subdirs are untouched (they reconcile via
 # their own stage plan below); the engine owns the flat *.py namespace here.
 ALLOW="$( { find "$SRC_DIR" -maxdepth 1 -name '*.py' -printf '%f\n'; \
+            printf '%s\n' "${RUNTIME_COMPOSE_HELPERS[@]}"; \
             if [ -d "$PACK_SCRIPTS" ]; then find "$PACK_SCRIPTS" -maxdepth 1 -name '*.py' -printf '%f\n'; fi; } | sort -u )"
 REMOVED="$(printf '%s\n' "$ALLOW" | docker exec -i -u "$HERMES_UID" "$CONTAINER" python3 -c '
 import os, sys
@@ -206,6 +235,25 @@ if [ -d "$PACK_FEEDS" ]; then
         ( cd "$PACK_FEEDS" && tar -cf - ./*.opml ) \
             | docker exec -i -u "$HERMES_UID" "$CONTAINER" tar -xf - -C /opt/data/config/
         echo "  $ocount pack feed list(s) deployed to $CONTAINER:/opt/data/config/"
+    fi
+fi
+
+# --- declarative source connectors -> /opt/data/config/connectors/ (okengine#273) ---
+# framework validate has already enforced the connector contract. Stage manifests only;
+# authoring fixtures remain in the source tree and cannot accidentally become live inputs.
+if [ -d "$PACK_CONNECTORS" ]; then
+    mapfile -t connector_files < <(
+        find "$PACK_CONNECTORS" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) \
+            -printf '%f\n' | sort
+    )
+    if [ "${#connector_files[@]}" -gt 0 ]; then
+        docker exec -u "$HERMES_UID" "$CONTAINER" mkdir -p /opt/data/config/connectors
+        ( cd "$PACK_CONNECTORS" && tar -cf - "${connector_files[@]}" ) \
+            | docker exec -i -u "$HERMES_UID" "$CONTAINER" \
+                tar -xf - -C /opt/data/config/connectors/
+        echo "  ${#connector_files[@]} source connector manifest(s) deployed to /opt/data/config/connectors/"
+    else
+        echo "  (no source connector manifests found under $PACK_CONNECTORS)"
     fi
 fi
 

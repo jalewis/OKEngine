@@ -53,7 +53,7 @@ mkdir -p "$RT/qmd" "$RT/logs"
 [ -f "$RT/.gitkeep" ] || : > "$RT/.gitkeep"
 
 if [ -f "$CFG" ]; then
-    echo "ok: $CFG already present (left untouched)"
+    echo "ok: $CFG already present (operator values preserved)"
 elif [ -f "$TMPL" ]; then
     cp "$TMPL" "$CFG"
     echo "seeded: $CFG  <- $TMPL"
@@ -62,6 +62,211 @@ else
     echo "ERROR: engine config template not found: $TMPL" >&2
     exit 1
 fi
+
+# Reconcile engine-managed security defaults introduced after a deployment's first seed. Operator
+# values remain authoritative: an existing api_server toolset is never overwritten (and the runtime
+# validator rejects unsafe values). We only add the formerly-absent lockdown to old configs, preserving
+# their comments, formatting, model choices, and secrets instead of YAML round-tripping the whole file.
+CFG="$CFG" python3 - <<'PY'
+import os
+import re
+from pathlib import Path
+
+path = Path(os.environ["CFG"])
+text = path.read_text(encoding="utf-8")
+lines = text.splitlines(keepends=True)
+top = next((i for i, line in enumerate(lines)
+            if re.match(r"^platform_toolsets\s*:", line)), None)
+block = (
+    "platform_toolsets:\n"
+    "  api_server:\n"
+    "    - okengine\n"
+    "    - okengine-write\n"
+)
+changed = False
+if top is None:
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += "\n# Engine-managed network-agent safety baseline (reconciled by ensure-runtime).\n" + block
+    changed = True
+elif re.match(r"^platform_toolsets:\s*(?:#.*)?(?:\r?\n)?$", lines[top]):
+    end = len(lines)
+    for i in range(top + 1, len(lines)):
+        line = lines[i]
+        if line.strip() and not line.lstrip().startswith("#") and not line.startswith((" ", "\t")):
+            end = i
+            break
+    if not any(re.match(r"^[ \t]+api_server\s*:", line)
+               for line in lines[top + 1:end]):
+        insertion = (
+            "  # Engine-managed network-agent safety baseline (reconciled by ensure-runtime).\n"
+            "  api_server:\n"
+            "    - okengine\n"
+            "    - okengine-write\n"
+        )
+        lines.insert(end, insertion)
+        text = "".join(lines)
+        changed = True
+else:
+    print(f"warn: {path} uses an inline/non-mapping platform_toolsets value; "
+          "left operator config unchanged (deployment validation will enforce safety)")
+if changed:
+    path.write_text(text, encoding="utf-8")
+    print(f"reconciled: {path} (added missing platform_toolsets.api_server safety baseline)")
+PY
+
+# Reconcile the dedicated source-quality writer into older seeded configs. Its
+# process environment is the server-verifiable job identity; a prompt/job_id
+# argument cannot impersonate it. Insert only when absent and preserve all
+# operator-owned model, delivery, and secret configuration verbatim.
+CFG="$CFG" python3 - <<'PY'
+import os
+import re
+from pathlib import Path
+
+path = Path(os.environ["CFG"])
+lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+
+def top_level(name):
+    return next((i for i, line in enumerate(lines)
+                 if re.match(rf"^{re.escape(name)}\s*:\s*(?:#.*)?$", line.rstrip("\n"))), None)
+
+def section_end(start):
+    return next((i for i in range(start + 1, len(lines))
+                 if lines[i].strip() and not lines[i].startswith((" ", "\t", "#"))), len(lines))
+
+mcp_start = top_level("mcp_servers")
+if mcp_start is None:
+    # A malformed/minimal operator config is left byte-for-byte unchanged; the
+    # existing deployment validator reports its missing required MCP block.
+    raise SystemExit(0)
+mcp_end = section_end(mcp_start)
+key = "  okengine-write-source-quality:"
+if any(line.rstrip() == key for line in lines[mcp_start + 1:mcp_end]):
+    raise SystemExit(0)
+
+# Repair the short-lived legacy bug that placed this engine-managed entry under
+# the following top-level section (commonly `web:`). The reserved key is safe to
+# move; no operator-owned fields live beneath it.
+misplaced = next((i for i, line in enumerate(lines)
+                  if line.rstrip() == key and not (mcp_start < i < mcp_end)), None)
+if misplaced is not None:
+    remove_start = misplaced
+    if misplaced and "Engine-managed server-bound identity" in lines[misplaced - 1]:
+        remove_start -= 1
+    remove_end = next((i for i in range(misplaced + 1, len(lines))
+                       if lines[i].strip() and len(lines[i]) - len(lines[i].lstrip()) <= 2),
+                      len(lines))
+    del lines[remove_start:remove_end]
+    mcp_start = top_level("mcp_servers")
+    mcp_end = section_end(mcp_start)
+
+block = (
+    "  # Engine-managed server-bound identity for source-quality-backfill.\n"
+    "  okengine-write-source-quality:\n"
+    "    command: /opt/hermes/.venv/bin/python\n"
+    "    args:\n"
+    "    - /opt/hermes/okengine-mcp/write_server.py\n"
+    "    env:\n"
+    "      OKENGINE_WRITE_ACTOR: cron:source-quality-backfill\n\n"
+)
+lines.insert(mcp_end, block)
+path.write_text("".join(lines), encoding="utf-8")
+print(f"reconciled: {path} (added server-bound source-quality writer)")
+PY
+
+# Reconcile every additional cron capability from the deploy-materialized policy into a dedicated
+# writer process. This turns policy identity into runtime identity without asking packs to commit
+# their secret-bearing .hermes-data/config.yaml. Existing operator entries are never rewritten.
+CFG="$CFG" PACK="$PACK" python3 - <<'PY'
+import json
+import os
+import re
+from pathlib import Path
+
+cfg = Path(os.environ["CFG"])
+policy_path = Path(os.environ["PACK"]) / ".okengine" / "effective-policy.json"
+if not policy_path.is_file():
+    raise SystemExit(0)
+try:
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    raise SystemExit("ERROR: cannot read deploy-materialized effective policy")
+
+lines = cfg.read_text(encoding="utf-8").splitlines(keepends=True)
+mcp_start = next((i for i, line in enumerate(lines)
+                  if re.match(r"^mcp_servers\s*:\s*(?:#.*)?$", line.rstrip("\n"))), None)
+if mcp_start is None:
+    raise SystemExit(0)
+mcp_end = next((i for i in range(mcp_start + 1, len(lines))
+                if lines[i].strip() and not lines[i].startswith((" ", "\t", "#"))), len(lines))
+existing = {match.group(1) for line in lines[mcp_start + 1:mcp_end]
+            if (match := re.match(r"^  ([A-Za-z0-9_.-]+):\s*(?:#.*)?$", line.rstrip("\n")))}
+blocks = []
+for actor in sorted((policy.get("capabilities") or {})):
+    if not actor.startswith("cron:"):
+        continue
+    name = "okengine-write-" + re.sub(r"[^a-z0-9]+", "-", actor[5:].lower()).strip("-")
+    if name in existing:
+        continue
+    blocks.append(
+        f"  # Engine-managed server-bound identity for {actor}.\n"
+        f"  {name}:\n"
+        "    command: /opt/hermes/.venv/bin/python\n"
+        "    args:\n"
+        "    - /opt/hermes/okengine-mcp/write_server.py\n"
+        "    env:\n"
+        f"      OKENGINE_WRITE_ACTOR: {actor}\n\n"
+    )
+if blocks:
+    lines.insert(mcp_end, "".join(blocks))
+    cfg.write_text("".join(lines), encoding="utf-8")
+    print(f"reconciled: {cfg} (added {len(blocks)} policy-bound cron writer(s))")
+PY
+
+# okengine#257: OKENGINE_EDITING is the UI-editing switch. The reader Chat writes back to the vault
+# via the okengine-write MCP in the api_server toolset, so editing OFF must DROP okengine-write
+# (read-only chat: wiki Q&A still works). Unlike the baseline above (which never overwrites), this is
+# an AUTHORITATIVE security control — it manages exactly the okengine-write line to match the flag.
+# Default ON for back-compat (unset -> editing on). Takes effect on the next gateway recreate.
+CFG="$CFG" OKENGINE_EDITING="${OKENGINE_EDITING:-}" python3 - <<'PY'
+import os, re
+from pathlib import Path
+path = Path(os.environ["CFG"])
+editing = str(os.environ.get("OKENGINE_EDITING") or "").strip().lower() not in ("0", "false", "no", "off")
+lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+pt = next((i for i, l in enumerate(lines) if re.match(r"^platform_toolsets\s*:", l)), None)
+if pt is not None:
+    end = len(lines)
+    for i in range(pt + 1, len(lines)):
+        if lines[i].strip() and not lines[i].lstrip().startswith("#") and not lines[i].startswith((" ", "\t")):
+            end = i; break
+    api = next((i for i in range(pt + 1, end) if re.match(r"^[ \t]+api_server\s*:", lines[i])), None)
+    if api is not None:
+        api_ind = len(lines[api]) - len(lines[api].lstrip())
+        lend = end
+        for i in range(api + 1, end):
+            l = lines[i]
+            if not l.strip() or l.lstrip().startswith("#"):
+                continue
+            ind = len(l) - len(l.lstrip())
+            if not l.lstrip().startswith("-") and ind <= api_ind:
+                lend = i; break
+        write_idx = next((i for i in range(api + 1, lend)
+                          if re.match(r"^[ \t]*-\s*okengine-write\s*$", lines[i])), None)
+        ok_idx = next((i for i in range(api + 1, lend)
+                       if re.match(r"^[ \t]*-\s*okengine\s*$", lines[i])), None)
+        if not editing and write_idx is not None:
+            del lines[write_idx]
+            path.write_text("".join(lines), encoding="utf-8")
+            print(f"okengine#257: OKENGINE_EDITING=0 -> dropped okengine-write from the api_server "
+                  f"toolset in {path} (UI chat is now READ-ONLY)")
+        elif editing and write_idx is None and ok_idx is not None:
+            lines.insert(ok_idx + 1, re.sub(r"okengine\s*$", "okengine-write\n", lines[ok_idx]))
+            path.write_text("".join(lines), encoding="utf-8")
+            print(f"okengine#257: OKENGINE_EDITING on -> ensured okengine-write in the api_server "
+                  f"toolset in {path} (UI chat can edit)")
+PY
 
 # --- runtime version marker: stamp the ACTUAL engine/Hermes being deployed ---
 # The reader's About reads this so it reports what's RUNNING, not the pack's DECLARED
@@ -183,37 +388,15 @@ fi
 CP_DIR="$RT/plugins/cron-plus"
 if [ "${OKENGINE_CRON_PLUS_SKIP:-0}" = "1" ]; then
     echo "  cron-plus: install skipped (OKENGINE_CRON_PLUS_SKIP=1 — host-run hermes keeps the plugin at ~/.hermes/plugins; tests run hermetic)"
-elif [ ! -f "$CP_DIR/runner.py" ]; then
-    MANIFEST="${ENGINE_DIR:-$(cd "$(dirname "$0")/.." && pwd)}/engine-manifest.yaml"
-    # awk block-scan, not grep -A<N>: the manifest's multi-line role: text once pushed
-    # upstream:/pinned_sha: outside a fixed -A window — and the failed grep inside $()
-    # killed the whole script under set -euo pipefail BEFORE the fail-loud branch could
-    # fire (a silent death that shipped a dead scheduler). Parse robustly + verify.
-    CP_URL="$(awk '/^  cron-plus:/{f=1;next} f&&/^  [a-z]/{exit} f&&/upstream:/{print $2; exit}' "$MANIFEST" || true)"
-    CP_SHA="$(awk '/^  cron-plus:/{f=1;next} f&&/^  [a-z]/{exit} f&&/pinned_sha:/{print $2; exit}' "$MANIFEST" || true)"
-    if [ -z "$CP_URL" ] || [ -z "$CP_SHA" ]; then
-        echo "ERROR: could not parse cron-plus upstream/pinned_sha from $MANIFEST — the" >&2
-        echo "       scheduler cannot be installed; refusing to continue silently." >&2
-        exit 1
-    fi
-    mkdir -p "$RT/plugins"
-    if git clone -q "$CP_URL" "$CP_DIR" 2>/dev/null && git -C "$CP_DIR" checkout -q "$CP_SHA" 2>/dev/null; then
-        echo "  cron-plus: installed at plugins/cron-plus @ ${CP_SHA:0:12} (the scheduler the cron fleet runs on)"
-    else
-        rm -rf "$CP_DIR"
-        cat >&2 <<CPMSG
-ERROR: cron-plus (the REQUIRED cron scheduler) is not installed and could not be cloned from
-       $CP_URL @ $CP_SHA
-       Without it NOTHING schedules — the gateway starts but every cron lane is dead.
-       Install it manually, then re-run:
-         git clone $CP_URL "$CP_DIR"
-         git -C "$CP_DIR" checkout $CP_SHA
-       (or copy plugins/cron-plus from a working deployment's .hermes-data/)
-CPMSG
-        exit 1
-    fi
 else
-    echo "  cron-plus: present at plugins/cron-plus"
+    # DELEGATE to install-cron-plus.sh — the single source of truth for the cron-plus install. It
+    # clones/re-pins to the manifest SHA AND applies the carried patches (job-env + after-ordering +
+    # the after_ordering.py overlay). This block used to clone-and-checkout ONLY, and its "present"
+    # branch never re-pinned or re-patched — so a deploy that reached cron-plus through ensure-runtime
+    # (rather than deploy.sh's separate install-cron-plus.sh call) ran an UNPATCHED scheduler, and
+    # extension crons (which need per-job `env` for scoped MCP tokens #132/#210 and `after:` freshness
+    # ordering #129) silently broke (invariant-audit HIGH #6). One installer, always patched.
+    bash "$ENGINE_DIR/scripts/install-cron-plus.sh" "$PACK"
 fi
 
 # --- SOUL.md write-lock vs config migration (Hermes v0.18.0 upgrade path) ---

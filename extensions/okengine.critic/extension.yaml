@@ -29,6 +29,6 @@ config:
   # PACK INPUT (schema.yaml): critic_flagship — a path or glob naming the flagship deliverable(s),
   # e.g. "briefings/**" or "dashboards/strategy.md". No flagship declared -> the lane no-ops.
   # The hard-flag thresholds (the cost lever) are tunable via env on the gate:
-  stale_days:  {type: integer, default: 14}    # CRITIC_STALE_DAYS
-  min_words:   {type: integer, default: 200}   # CRITIC_MIN_WORDS
-  min_sources: {type: integer, default: 3}     # CRITIC_MIN_SOURCES
+  stale_days:  {type: integer, default: 14}    # OKENGINE_CRITIC_STALE_DAYS
+  min_words:   {type: integer, default: 200}   # OKENGINE_CRITIC_MIN_WORDS
+  min_sources: {type: integer, default: 3}     # OKENGINE_CRITIC_MIN_SOURCES

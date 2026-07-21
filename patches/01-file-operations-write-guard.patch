@@ -1,8 +1,8 @@
 diff --git a/tools/file_operations.py b/tools/file_operations.py
-index 78bdd8d..753c781 100644
+index 78bdd8d..b09a515 100644
 --- a/tools/file_operations.py
 +++ b/tools/file_operations.py
-@@ -73,6 +73,107 @@ def _strip_terminal_fence_leaks(text: str) -> str:
+@@ -73,6 +73,136 @@ def _strip_terminal_fence_leaks(text: str) -> str:
      return "".join(cleaned_lines)
  
  
@@ -107,10 +107,39 @@ index 78bdd8d..753c781 100644
 +    return None
 +
 +
++def _creation_reject(path: str) -> Optional[str]:
++    """Refusal 4 (M12 family): the file tool must not CREATE a new `.md` page under the vault —
++    creation is the enforced okengine-write MCP's job (partition-aware canonical sharding +
++    schema validation). A file-tool create is how flat okengine#54 duplicates are born (okcti
++    2026-07-13: a cron agent wrote concepts/<slug>.md flat beside the canonical
++    concepts/d/<slug>.md). Editing an EXISTING page stays allowed — the repair lanes patch
++    broken frontmatter in place, which the validating write path would refuse. Fail-open on
++    any uncertainty, mirroring _reserved_file_reject."""
++    import os
++    if not path.lower().endswith(".md"):
++        return None
++    wiki = os.environ.get("WIKI_PATH")
++    if not wiki:
++        return None
++    try:
++        ap = os.path.realpath(path)
++        roots = [os.path.realpath(os.path.join(wiki, "wiki")), os.path.realpath(wiki)]
++        if not any(ap == r or ap.startswith(r + os.sep) for r in roots):
++            return None
++        if not os.path.exists(ap):
++            return (f"'{path}' does not exist — creating a NEW vault page via the file tool is "
++                    "disabled: it bypasses partition sharding and schema validation and duplicates "
++                    "pages (okengine#54). Create the page through the okengine-write MCP "
++                    "(create_entity); the file tool may only edit pages that already exist.")
++    except Exception:
++        return None
++    return None
++
++
  def _detect_line_ending(sample: str) -> Optional[str]:
      """Return the dominant line ending in ``sample`` or None if undetermined.
  
-@@ -1251,6 +1352,9 @@ class ShellFileOperations(FileOperations):
+@@ -1251,6 +1381,9 @@ class ShellFileOperations(FileOperations):
          path = self._expand_path(path)
          if _is_write_denied(path):
              return WriteResult(error=f"Delete denied: {path} is a protected path")
@@ -120,7 +149,7 @@ index 78bdd8d..753c781 100644
  
          # We can't shell out to ``rm`` here — it doesn't exist on Windows
          # ``cmd.exe`` or PowerShell, so this code path is what's left when
-@@ -1297,6 +1401,13 @@ class ShellFileOperations(FileOperations):
+@@ -1297,6 +1430,16 @@ class ShellFileOperations(FileOperations):
          for p in (src, dst):
              if _is_write_denied(p):
                  return WriteResult(error=f"Move denied: {p} is a protected path")
@@ -131,10 +160,13 @@ index 78bdd8d..753c781 100644
 +            _rf = _reserved_file_reject(p)           # the bare dir (which isn't .md and would slip it).
 +            if _rf:
 +                return WriteResult(error=f"Move denied: {_rf}")
++        _cr = _creation_reject(_eff_dst)             # a Move that lands a NEW page in the vault is the
++        if _cr:                                      # same create-bypass as write() — refuse (okengine#54)
++            return WriteResult(error=f"Move denied: {_cr}")
          result = self._exec(
              f"mv {self._escape_shell_arg(src)} {self._escape_shell_arg(dst)}"
          )
-@@ -1337,6 +1448,22 @@ class ShellFileOperations(FileOperations):
+@@ -1337,6 +1480,28 @@ class ShellFileOperations(FileOperations):
          if _is_write_denied(path):
              return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
  
@@ -154,10 +186,16 @@ index 78bdd8d..753c781 100644
 +        if _rf:
 +            return WriteResult(error=f"Write rejected: {_rf}")
 +
++        # Refusal 4: a brand-new vault page must be born through okengine-write (sharding +
++        # schema); the file tool only edits pages that already exist (okengine#54).
++        _cr = _creation_reject(path)
++        if _cr:
++            return WriteResult(error=f"Write rejected: {_cr}")
++
          # Capture pre-write content.  Two consumers want it:
          #
          #   1. The lint-delta layer (for in-process linters like ast.parse
-@@ -1483,6 +1610,17 @@ class ShellFileOperations(FileOperations):
+@@ -1483,6 +1648,17 @@ class ShellFileOperations(FileOperations):
          if _is_write_denied(path):
              return PatchResult(error=f"Write denied: '{path}' is a protected system/credential file.")
  

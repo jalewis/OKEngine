@@ -14,11 +14,30 @@
 #   3. the runtime tree owner                              (stat .hermes-data, else the pack dir)
 #   4. last-resort 10000 + a LOUD warning                  (old behaviour, but no longer silent)
 
-_okengine_env_file_val() {   # $1=pack_dir  $2=VAR  -> stdout the pinned value, or non-zero
+_okengine_env_file_val() {   # $1=pack_dir  $2=VAR  -> stdout dotenv value, or non-zero
     [ -f "$1/.env" ] || return 1
-    local v
-    v="$(sed -n "s/^$2=//p" "$1/.env" | head -1 | tr -d '[:space:]')"
-    [ -n "$v" ] && printf '%s' "$v"
+    python3 - "$1/.env" "$2" <<'PY'
+import re
+import shlex
+import sys
+from pathlib import Path
+
+path, key = Path(sys.argv[1]), sys.argv[2]
+rx = re.compile(rf"^\s*(?:export\s+)?{re.escape(key)}\s*=\s*(.*?)\s*$")
+for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    match = rx.match(line)
+    if not match:
+        continue
+    try:
+        parts = shlex.split(match.group(1), comments=True, posix=True)
+    except ValueError:
+        sys.exit(1)
+    if parts:
+        print(" ".join(parts), end="")
+        sys.exit(0)
+    sys.exit(1)
+sys.exit(1)
+PY
 }
 
 _okengine_tree_owner() {     # $1=pack_dir  $2=stat_fmt (%u|%g)  -> non-root owner of the runtime tree

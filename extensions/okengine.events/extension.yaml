@@ -14,8 +14,8 @@ kind: operation
 version: 0.1.0
 name: Events
 description: >-
-  Compiles the pack's dated event-typed pages into a scored, append-only event ledger dashboard.
-  Deterministic (no LLM); event types + weights are pack config, so it runs on any domain.
+  Compiles pack-declared event pages into a ledger, an eight-score-vector sidecar, typed-event
+  partitions, and ranked dashboards. Deterministic; all vocabulary and weights are pack config.
 trust: in-gateway
 requires:
   engine: ">=0.6.0"               # #63 cron drop-in collector
@@ -26,6 +26,12 @@ config:
   # PACK INPUTS (read from schema.yaml, not extension code — the domain coupling lives in the pack):
   #   event_types:         [<type>, ...]   page types that are events (e.g. deal, incident)
   #   event_date_field:    <field>          frontmatter field with the event date (default: date)
-  #   event_score_weights: {<type>: <n>}    per-type weight (default 1)
+  #   event_score_weights: {<type>: <n>}    per-type materiality weight (default 1)
+  #   event_scoring:                        optional scoring vocabulary/weights
+  #     source_kind_weights: {<kind>: <0..1>}
+  #     publisher_field: publisher
+  #     evidence_phrases: [<literal phrase>, ...]
+  #     watchlist_tier_weights: {<tier>: <0..1>}
+  #     typed_extractors: {<type>: funding|m-and-a|product-launch|buyer-signal|regulatory}
   # A pack declaring no event_types -> the lane no-ops (generic).
   max_events: {type: integer, default: 500}

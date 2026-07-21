@@ -56,7 +56,7 @@ Search/index management UI (#68), content-provenance UI (#70), multi-pack compos
 (SHIPPED, #72), versioned migration framework (SHIPPED, #66), security hardening profile (#78),
 RBAC (#71), structured observability (SHIPPED, #64), formal plugin/extension API (SHIPPED, #63);
 import connectors beyond RSS (#76), static export/publishing with a portable OKF projection (#77),
-pack catalog UX (#62), one-command local sandbox (#73), golden conformance fixtures (#75),
+pack catalog UX (#62), one-command local sandbox (SHIPPED, #73), golden conformance fixtures (#75),
 performance benchmarks (#74).
 
 ## Consolidation notes

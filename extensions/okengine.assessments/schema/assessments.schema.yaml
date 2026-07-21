@@ -1,0 +1,67 @@
+# Reusable assessment substrate. Domain packs supply question taxonomies and rubrics;
+# this fragment owns only the generic ledger and adversarial-evidence contract.
+owns:
+  namespaces: [assessments]
+  types:
+    assessment:
+      required: [type, subject, question, claim, status, as_of, confidence,
+                 confidence_band, proposed_confidence_change, consequence,
+                 alternatives, adversarial_evidence]
+      optional: [assessment_kind, confidence_rationale, assumptions,
+                 would_increase_confidence, would_decrease_confidence,
+                 needs_review, reviewed_by, reviewed_on, review_method, review_policy,
+                 assessed_value, assessed_label, epistemic_status, sources]
+
+field_shapes:
+  alternatives: list
+  assumptions: list
+  would_increase_confidence: list
+  would_decrease_confidence: list
+  adversarial_evidence: list
+
+enums:
+  evidence_kind: [observed, expected-absence]
+  observation_confidence: [low, medium, high]
+  diagnosticity: [none, low, medium, high]
+  manipulation_susceptibility: [low, medium, high]
+  source_independence: [primary-direct, independent-origin, shared-lineage, unknown]
+  evidence_claim_role: [observation, actor-statement, third-party-claim]
+  absence_status: [not-observed, searched-not-found, collection-gap]
+  evidence_coverage: [unknown, poor, partial, substantial, near-complete]
+  detection_probability: [unknown, low, medium, high]
+  epistemic_status: [reported, assessed, confirmed, disputed, inconclusive, unknown]
+
+field_enums:
+  epistemic_status: {enum: epistemic_status}
+
+field_items:
+  adversarial_evidence:
+    _item:
+      shape: dict
+      required: [observation, source, observation_confidence, diagnosticity,
+                 manipulation_susceptibility, source_independence, evidence_lineage,
+                 claim_role, deception_possible, collection_context, alternatives]
+    observation: {shape: str}
+    source: {shape: str}
+    evidence_kind: {enum: evidence_kind}
+    observation_confidence: {enum: observation_confidence}
+    diagnosticity: {enum: diagnosticity}
+    manipulation_susceptibility: {enum: manipulation_susceptibility}
+    source_independence: {enum: source_independence}
+    evidence_lineage: {shape: str}
+    claim_role: {enum: evidence_claim_role}
+    deception_possible: {shape: bool}
+    deception_hypothesis: {shape: str}
+    collection_context: {shape: str}
+    alternatives: {shape: list}
+    expected_observation: {shape: str}
+    expected_under: {shape: dict}
+    search_scope: {shape: str}
+    opportunity_population: {shape: str}
+    absence_status: {enum: absence_status}
+    coverage: {enum: evidence_coverage}
+    detection_probability: {enum: detection_probability}
+    collection_bias: {shape: list}
+    collection_requirement: {shape: str}
+    would_strengthen: {shape: list}
+    would_weaken: {shape: list}

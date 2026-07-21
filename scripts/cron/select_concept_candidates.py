@@ -19,6 +19,9 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import okf_migrate  # noqa: E402  — same physical-path contract as the MCP writer
+
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 N = int(os.environ.get("CONCEPT_BACKFILL_BATCH_SIZE", "10"))
 MIN_INBOUND_TO_FIRE = int(os.environ.get("CONCEPT_BACKFILL_MIN_INBOUND", "3"))
@@ -70,6 +73,17 @@ def scan_wikilinks() -> dict[str, list[Path]]:
     return {k: sorted(v) for k, v in refs.items()}
 
 
+def canonical_concept_key(reference: str) -> str:
+    """Physical key for a missing logical concept reference.
+
+    References may be bare (``concepts/foo``) or already carry the first-letter
+    shard (``concepts/f/foo``).  The page identity is the final slug in either
+    form; ``write_key`` then applies the live schema and any active reshard.
+    """
+    slug = reference.strip("/").split("/")[-1]
+    return okf_migrate.write_key(VAULT, "concepts", slug, {"type": "concept"})
+
+
 def main() -> int:
     existing = list_existing_concepts()
     refs = scan_wikilinks()
@@ -99,12 +113,17 @@ def main() -> int:
     print(f"  batch: {len(chosen)} of {len(missing)}")
     print()
     print("=== batch ===")
-    print(f"For each missing concept below, create `wiki/concepts/<slug>.md` with frontmatter and a body synthesized from the citing sources. Per the vault CLAUDE.md, a concept page describes a category, pattern, policy, or trend — NOT a specific organization or named actor (those are entities).\n")
+    print("For each missing concept below, create it through "
+          "`mcp_okengine_write_create_entity` using the displayed canonical key, "
+          "with frontmatter and a body synthesized from the citing sources. Per "
+          "the vault CLAUDE.md, a concept page describes a category, pattern, "
+          "policy, or trend — NOT a specific organization or named actor (those "
+          "are entities). Do not use direct file-write tools for wiki pages.\n")
 
     for i, (slug, paths) in enumerate(chosen, 1):
         print(f"## {i}. `concepts/{slug}` ({len(paths)} inbound refs)")
         print()
-        print(f"  expected file: `wiki/concepts/{slug}.md`")
+        print(f"  canonical write key: `{canonical_concept_key(slug)}`")
         print(f"  citing pages (showing up to {MAX_CITING_SOURCES}):")
         for citing in paths[:MAX_CITING_SOURCES]:
             rel = citing.relative_to(VAULT).as_posix()

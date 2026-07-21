@@ -1,0 +1,41 @@
+# Reference identity-authority connector (okengine#314): the Research Organization Registry.
+# mode: enrichment — keyed per-entity lookup; the enrich: block tells authority_enrich.py how to
+# stamp `authority_ids.ror` onto matching vault pages (exact normalized-name match only; ambiguity
+# and duplicates go to human review, never auto-merged). Copy into a pack's connectors/ and adjust
+# targets.types to the pack's schema before scheduling.
+connector_version: 1
+id: reference.ror-organizations
+name: ROR research-organization identity
+mode: enrichment
+trust: {permission: public, data_sensitivity: clear, source_authority: Research Organization Registry}
+permissions: {network: true, allowed_hosts: [api.ror.org], allow_private_network: false, write_raw: false}
+auth: {type: none, secret_refs: {}}
+inputs: {required: [entity_name]}
+request:
+  url: https://api.ror.org/v2/organizations
+  method: GET
+  headers: {}
+  query: {query: "${input.entity_name}"}
+  timeout_seconds: 30
+  max_bytes: 5242880
+response: {format: json, records_path: items, stable_id_path: id, revision_path: id, deleted_path: deleted}
+pagination: {type: none, max_pages: 1}
+checkpoint: {path: reference.ror-organizations.json}
+conditional_requests: {enabled: false}
+rate_limit: {max_requests: 30, per_seconds: 60}
+archive: {enabled: false, raw_responses: false, path: "", retention_days: 0}
+license:
+  name: CC0 (ROR data)
+  url: https://ror.org/about
+  redistribution: allowed
+  max_retention_days: 0
+health: {path: reference.ror-organizations.json}
+enrich:
+  authority: ror
+  id_path: id
+  match:
+    query_input: entity_name
+    page_field: name
+    candidate_paths: [name, names.value]
+  targets:
+    types: [lab, organization, publisher]

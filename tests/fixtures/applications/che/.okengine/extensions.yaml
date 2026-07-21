@@ -1,0 +1,6 @@
+enabled:
+  okengine.assessments: {}
+  okengine.reevaluation:
+    config:
+      proposition_types: forecast,diagnostic
+

@@ -60,6 +60,31 @@ def test_excluded_dirs_surfaces_dashboards_hides_operational(tmp_path):
     assert m._excluded_dirs() == frozenset({"operational"})   # dashboards surfaced, operational hidden
 
 
+def test_recent_reporting_groups_duplicate_refs_and_skips_stale(tmp_path):
+    wiki = tmp_path / "wiki"
+    for rel, url, title in (
+        ("sources/2026/07/a", "https://example.com/story?id=1", "Story copy A"),
+        ("sources/2026/07/15/b", "https://www.example.com/story?utm=x", "Story copy B"),
+        ("sources/2026/07/c", "https://other.example/report", "Independent report"),
+    ):
+        path = wiki / f"{rel}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"---\ntype: source\ntitle: {title}\nurl: {url}\npublisher: Test\n---\nbody\n"
+        )
+    m = _load(tmp_path)
+    grouped = m._recent_reporting({
+        "recent_news_refs": [
+            "sources/2026/07/a",
+            "sources/2026/07/15/b",
+            "sources/2026/07/c",
+            "sources/2026/07/missing",
+        ]
+    })
+    assert [item["count"] for item in grouped] == [2, 1]
+    assert grouped[0]["sources"][0]["path"] == "sources/2026/07/a"
+
+
 def test_browse_rail_surfaces_dashboards_hides_operational(tmp_path):
     m = _load(_build_vault(tmp_path))
     tree = m.api_tree()["dirs"]
@@ -191,15 +216,17 @@ def test_about_api_reports_vault_and_versions(tmp_path, monkeypatch):
     assert "chat_enabled" in resp
 
 
-def test_about_api_tolerates_missing_files(tmp_path):
+def test_about_api_tolerates_missing_files(tmp_path, monkeypatch):
     """A definition checkout without pack.yaml/engine.version -> empty strings, no crash.
     Pins the FULL empty-state shape incl. the v0.9.1 About-panel fields (description/
-    mission/installed_domains/sub_domains/extensions) — the old 5-key assertion rotted
-    unnoticed because this file self-skips wherever flask isn't installed."""
+    mission/installed_domains/sub_domains/extensions) and the okengine#301 `tz` field —
+    the old 5-key assertion rotted unnoticed because this file self-skips wherever flask
+    isn't installed."""
+    monkeypatch.delenv("TZ", raising=False)   # tz defaults to UTC when the deployment sets no zone
     (tmp_path / "wiki").mkdir()
     m = _load(tmp_path)
     assert m._about_info() == {"vault": "", "vault_version": "", "engine_version": "",
-                              "hermes_pin": "", "project_url": "",
+                              "hermes_pin": "", "project_url": "", "tz": "UTC",
                               "description": "", "mission": "",
                               "installed_domains": [], "sub_domains": [], "extensions": []}
 
@@ -232,6 +259,19 @@ def test_no_display_groups_is_empty(tmp_path):
     _mk(tmp_path / "wiki" / "sources" / "s.md")
     m = _load(tmp_path)
     assert m.api_groups()["groups"] == []
+
+
+def test_display_groups_omits_empty_kind(tmp_path):
+    """okengine#259 Browse cleanup: a declared display_group with 0 matching pages is omitted from
+    /api/groups (no dead '… 0' row, e.g. the observed 'Report vendors 0') — matching how the browse
+    tree hides empty namespaces. A populated group beside it is unaffected."""
+    (tmp_path / "schema.yaml").write_text(
+        "display_groups:\n"
+        "  Threat actors: [intrusion-set]\n"
+        "  Report vendors: [report-vendor]\n")          # declared, but that type was never ingested
+    _mk(tmp_path / "wiki" / "entities" / "a" / "apt42.md", "intrusion-set")
+    m = _load(tmp_path)
+    assert [g["label"] for g in m.api_groups()["groups"]] == ["Threat actors"]
 
 
 def test_rail_top_section_pins_output_namespaces(tmp_path):
@@ -370,6 +410,20 @@ def test_page_meta_updated_prefers_last_updated_timestamp(tmp_path):
     app = _load(tmp_path)
     meta = app._page_meta(w / "briefings" / "b.md")
     assert meta["updated"] == "2026-06-28 14:30:00"      # last_updated, with time, not the created date
+    assert meta["revision"] and ":" in meta["revision"]   # filesystem edit identity, not display metadata
+
+
+def test_page_revision_inventory_is_minimal_recursive_and_sorted(tmp_path):
+    w = tmp_path / "wiki"
+    (w / "entities" / "b").mkdir(parents=True)
+    (w / "entities" / "b" / "two.md").write_text("# Two\n")
+    (w / "entities" / "one.md").write_text("# One\n")
+    (w / "_private.md").write_text("# hidden\n")
+    (tmp_path / "schema.yaml").write_text("okf: {required: [type]}\n")
+    app = _load(tmp_path)
+    pages = app.api_page_revisions()["pages"]
+    assert [row["path"] for row in pages] == ["entities/b/two", "entities/one"]
+    assert all(set(row) == {"path", "revision"} and ":" in row["revision"] for row in pages)
 
 
 # --- reader extension panels (okengine#160 P2): self-declared + type-bound resolution ---

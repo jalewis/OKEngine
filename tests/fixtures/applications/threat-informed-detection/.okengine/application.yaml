@@ -1,0 +1,122 @@
+profile: threat-informed-detection
+profile_version: 0.1.0
+bindings:
+  propositions:
+    - type: coverage-assessment
+      namespace: coverage-assessments
+      status_field: status
+      open_values: [active, disputed]
+      resolved_values: [resolved, withdrawn]
+      confidence_field: confidence
+      evidence_field: evidence
+      resolution_field: resolution
+      review_field: needs_review
+      operations:
+        reassess: coverage-reassess
+        resolve: coverage-resolve
+        measure: coverage-measure
+  roles:
+    threat_procedure:
+      - type: threat-procedure
+        namespace: procedures
+        behavior_field: behavior
+        evidence_field: sources
+        as_of_field: as_of
+        operations: {ingest: import-threat-procedures}
+    detection_requirement:
+      - type: detection-requirement
+        namespace: detection-requirements
+        procedure_field: procedure_ref
+        environment_field: environment_ref
+        telemetry_refs_field: telemetry_refs
+        status_field: status
+        operations: {refresh: refresh-detection-requirements}
+    environment_snapshot:
+      - type: environment-snapshot
+        namespace: environment-snapshots
+        scope_field: scope
+        telemetry_refs_field: telemetry_refs
+        observed_at_field: observed_at
+        operations: {inventory: import-environment-inventory}
+    telemetry_source:
+      - type: telemetry-source
+        namespace: telemetry
+        platform_field: platform
+        scope_field: scope
+        observed_at_field: observed_at
+        status_field: status
+        operations: {inventory: import-telemetry-inventory}
+    detection_strategy:
+      - type: detection-strategy
+        namespace: detection-strategies
+        requirement_field: requirement_ref
+        hypothesis_field: hypothesis
+        status_field: status
+        operations: {refresh: refresh-detection-strategies}
+    detection_analytic:
+      - type: detection-analytic
+        namespace: detection-analytics
+        strategy_field: strategy_ref
+        revision_field: revision
+        status_field: status
+        operations: {inventory: import-detection-analytics}
+    deployment_snapshot:
+      - type: deployment-snapshot
+        namespace: deployment-snapshots
+        analytic_field: analytic_ref
+        revision_field: revision
+        scope_field: scope
+        observed_at_field: observed_at
+        operations: {inventory: import-deployment-inventory}
+    validation_test:
+      - type: validation-test
+        namespace: validation-tests
+        procedure_field: procedure_ref
+        analytic_field: analytic_ref
+        status_field: status
+        operations: {import: import-validation-tests}
+    validation_result:
+      - type: validation-result
+        namespace: validation-results
+        analytic_field: analytic_ref
+        revision_field: revision
+        environment_field: environment_ref
+        result_field: result
+        executed_at_field: executed_at
+        operations: {import: import-validation-results}
+    coverage_assessment:
+      - type: coverage-assessment
+        namespace: coverage-assessments
+        procedure_field: procedure_ref
+        environment_field: environment_ref
+        facets_field: facets
+        as_of_field: as_of
+        status_field: status
+        operations: {evaluate: evaluate-coverage}
+surfaces:
+  dependency_explanation: dashboards/reevaluation-impact
+  assessment_review: dashboards/assessment-review
+  portfolio_learning: dashboards/epistemic-learning
+  threat_to_defense_trace: dashboards/threat-to-defense-trace
+  actor_defensive_posture: dashboards/actor-defensive-posture
+  coverage_facets: dashboards/coverage-facets
+  detection_dossier: dashboards/detection-dossier
+  validation_queue: dashboards/validation-queue
+  gap_workbench: dashboards/gap-workbench
+queues:
+  affected_reassessment: coverage-reassess
+  assessment_review: dashboards/assessment-review
+  unassessed_procedures: procedures
+  telemetry_gaps: telemetry
+  unvalidated_analytics: validation-results
+  stale_coverage: coverage-assessments
+success_measures:
+  caused_reassessment_precision: dashboards/reevaluation-impact
+  review_queue_age: dashboards/assessment-review
+  resolution_yield: dashboards/epistemic-learning
+  calibration_or_outcome_quality: dashboards/epistemic-learning
+  procedure_to_requirement_latency: dashboards/threat-to-defense-trace
+  telemetry_qualification_rate: dashboards/coverage-facets
+  current_validation_rate: dashboards/validation-queue
+  dependency_caused_downgrades: dashboards/reevaluation-impact
+  validated_gap_closure_time: dashboards/gap-workbench

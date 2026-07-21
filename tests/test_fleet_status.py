@@ -42,15 +42,37 @@ def test_scan_signals_counts_the_silent_failures():
 
 # --- build_report -----------------------------------------------------------
 
-def _seed(tmp_path, *, ticking=True, jobs=None, logs=None):
+def _seed(tmp_path, *, ticking=True, jobs=None, logs=None, stalled=None):
     cp = tmp_path / "cron-plus"; cp.mkdir(parents=True)
     (cp / "jobs.json").write_text(json.dumps({"jobs": jobs or []}), encoding="utf-8")
     if ticking:
         (cp / ".tick.lock").write_text("")
+    if stalled is not None:
+        (cp / ".scheduler-stalled").write_text(json.dumps({"error": stalled}), encoding="utf-8")
     ld = tmp_path / "logs" / "cron-plus"; ld.mkdir(parents=True)
     for name, text in (logs or {}).items():
         (ld / name).write_text(text, encoding="utf-8")
     return tmp_path
+
+
+def test_stall_sentinel_flagged_even_when_tick_lock_is_fresh(tmp_path):
+    """HIGH #2: tick() refreshes .tick.lock BEFORE load_jobs(), so a ticking-but-not-loading
+    scheduler keeps a FRESH lock while firing no lanes. The .scheduler-stalled sentinel is the
+    machine alarm for that, but its only other reader is a cron LANE the stalled scheduler never
+    runs. fleet_status must surface it and exit non-zero — even with a fresh .tick.lock present."""
+    m = _mod()
+    _seed(tmp_path, ticking=True,             # lock present + fresh (would otherwise read healthy)
+          jobs=[{"name": "feed-fetch", "enabled": True, "next_run_at": "2099-01-01T00:00:00+00:00"}],
+          logs={"feed-fetch-20260101-000000.log": "Job 'feed-fetch' completed successfully\n"},
+          stalled="jobs.json: unexpected end of JSON")
+    report, code = m.build_report(str(tmp_path))
+    assert code == 1, "a stalled scheduler must fail the fleet status"
+    assert "SCHEDULER STALLED" in report
+    assert "unexpected end of JSON" in report
+    # and with NO sentinel the same fixture is healthy (proves the sentinel is what flips it)
+    (tmp_path / "cron-plus" / ".scheduler-stalled").unlink()
+    report2, code2 = m.build_report(str(tmp_path))
+    assert code2 == 0 and "SCHEDULER STALLED" not in report2
 
 
 def test_report_clean_fleet_exits_zero(tmp_path):

@@ -1,0 +1,20 @@
+connector_version: 1
+id: fixture.query
+name: Fixture query
+mode: query
+trust: {permission: public, data_sensitivity: clear, source_authority: Fixture Search}
+permissions: {network: true, allowed_hosts: [query.example], allow_private_network: false, write_raw: false}
+auth: {type: none, secret_refs: {}}
+inputs: {required: [term]}
+request:
+  url: https://query.example/search
+  method: GET
+  query: {q: "${input.term}"}
+response: {format: json, records_path: results, stable_id_path: id}
+pagination: {type: none, max_pages: 1}
+checkpoint: {path: fixture.query.json}
+conditional_requests: {enabled: false}
+rate_limit: {max_requests: 5, per_seconds: 60}
+archive: {enabled: false, raw_responses: false, path: "", retention_days: 0}
+license: {name: Query-only, redistribution: prohibited, max_retention_days: 0}
+health: {path: fixture.query.json}

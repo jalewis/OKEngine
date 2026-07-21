@@ -21,6 +21,11 @@ modules, makes no gateway/dashboard calls, reads `<vault>/schema.yaml` directly
 (only `yaml`), and serves only from a **read-only** mount of the vault — so it
 keeps working even if the rest of the stack is down.
 
+Human review is the one optional operator workflow, and it preserves that boundary: Cockpit proxies
+version-locked assignment/decision requests to a separate bridge-only governed writer while its own
+vault mount stays read-only. It is disabled unless Basic auth, reviewer identity, review API, and
+review token are all configured. See [human review](../docs/human-review.md).
+
 ## What it does
 
 - **Briefings** — a rail of dated streams; click a date to render the page
@@ -45,8 +50,10 @@ All keys are optional. Add this block to the pack's `schema.yaml`:
 
 ```yaml
 cockpit:
-  # Display title (topbar + browser tab). Default: titleized vault dir name.
+  # Full display title for the browser tab. Default: titleized vault dir name.
   title: "Acme Intelligence"
+  # Optional compact toolbar brand; defaults to title.
+  short_title: "Acme"
 
   # The STREAM rail. Each stream selects dated pages by frontmatter `type`
   # (the okengine-normalized way) OR by filename `glob`; with neither, every

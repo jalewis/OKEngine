@@ -17,19 +17,42 @@ Schema keys consumed (all optional except `types`):
 
 The engine also ships a BASE schema (config/base-schema.yaml) merged under every
 pack schema via `merged_schema()`: the universal field set + the engine-owned
-global toggles (`okf.required`/`okf.should`, `strict_types`). Packs declare only
+  global requirements (`okf.required`/`okf.should`). Packs declare only
 their domain types on top; the base is not pack-settable under composition.
 """
 from __future__ import annotations
 
 import os
+import importlib.util
+import sys
+from glob import glob
 from pathlib import Path
 from typing import Iterable
 
+
+def _add_packaged_dependencies() -> None:
+    """Let system-python cron calls reuse the gateway's packaged pure-Python dependencies."""
+    if importlib.util.find_spec("yaml") is not None:
+        return
+    configured = os.environ.get("OKENGINE_PACKAGED_SITE_PACKAGES")
+    candidates = ([configured] if configured else []) + sorted(
+        glob("/opt/hermes/.venv/lib/python*/site-packages"))
+    for candidate in candidates:
+        if candidate and candidate not in sys.path:
+            sys.path.insert(0, candidate)
+        if importlib.util.find_spec("yaml") is not None:
+            return
+
+
+_add_packaged_dependencies()
 import yaml
 
-_SCHEMA_CACHE: dict[str, dict] = {}
-_BASE_CACHE: dict[str, dict] = {}
+# All three are (mtime, data) caches — invalidated when the file changes on disk, so the enforced
+# write path (a long-running process) picks up a hand-edited schema without a restart. Before the
+# audit fix _SCHEMA_CACHE/_BASE_CACHE were plain path->data and cached FOREVER, so write_server
+# validated every write against the pre-edit schema for the life of the gateway (invariant-audit HIGH).
+_SCHEMA_CACHE: dict[str, tuple[float, dict]] = {}
+_BASE_CACHE: dict[str, tuple[float, dict]] = {}
 _COMPOSED_CACHE: dict[str, tuple[float, dict]] = {}
 
 # config/base-schema.yaml ships with the engine. It is resolved from one of two
@@ -53,7 +76,8 @@ except Exception:                                       # pragma: no cover
 def fast_load(text):
     """yaml.safe_load via libyaml when available. Returns the parsed object (dict/None/...)."""
     import yaml
-    return yaml.load(text, _FAST_LOADER)
+    # _FAST_LOADER is CSafeLoader or SafeLoader, never a constructor-capable loader.
+    return yaml.load(text, _FAST_LOADER)  # nosec B506
 
 def _default_base() -> Path:
     for c in _BASE_CANDIDATES:
@@ -62,19 +86,35 @@ def _default_base() -> Path:
     return _BASE_CANDIDATES[0]
 
 
+def _yaml_mtime_cached(p: Path, cache: dict) -> dict:
+    """Parse the YAML mapping at `p`, cached by path but INVALIDATED on mtime change — so a
+    long-running process re-reads a hand-edited file without a restart (the _COMPOSED_CACHE contract,
+    extended to base/governing schema; invariant-audit HIGH). Missing/unparseable -> {}."""
+    k = str(p)
+    try:
+        mt = p.stat().st_mtime
+    except OSError:
+        return {}
+    hit = cache.get(k)
+    if hit and hit[0] == mt:
+        return hit[1]
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except Exception:
+        data = {}
+    data = data if isinstance(data, dict) else {}
+    cache[k] = (mt, data)
+    return data
+
+
 def base_schema() -> dict:
     """The engine-owned base schema (config/base-schema.yaml): the universal core
     (types/namespaces/tiering) + cross-cutting optional fields + the global toggles
     (okf.required/should, strict_types). Returns {} if absent. Resolution: the
-    OKENGINE_BASE_SCHEMA override, else the first existing repo/staged candidate."""
+    OKENGINE_BASE_SCHEMA override, else the first existing repo/staged candidate.
+    mtime-cached (re-reads a hand-edited base-schema without a restart)."""
     p = Path(os.environ.get("OKENGINE_BASE_SCHEMA") or _default_base())
-    k = str(p)
-    if k not in _BASE_CACHE:
-        try:
-            _BASE_CACHE[k] = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        except Exception:
-            _BASE_CACHE[k] = {}
-    return _BASE_CACHE[k]
+    return _yaml_mtime_cached(p, _BASE_CACHE)
 
 
 def _composed_artifact_at(dir_: Path) -> dict | None:
@@ -147,7 +187,7 @@ def merged_schema(root: Path, namespace: str = "") -> dict:
 def _merge_base_pack(root: Path, namespace: str = "") -> dict:
     """The governing pack schema merged UNDER the engine base schema. The base owns the
     global toggles (`okf.required` is the union with `[type]` always present; `okf.should`
-    and `strict_types` are engine-owned); the pack owns `types`/`partitioning`/`tier`/
+    are engine-owned); the pack owns `types`/`partitioning`/`tier`/
     `permissions` and any extra keys, which pass through unchanged."""
     base = base_schema()
     pack = governing_schema(root, namespace)
@@ -159,12 +199,12 @@ def _merge_base_pack(root: Path, namespace: str = "") -> dict:
     if b_okf.get("should"):
         okf["should"] = list(b_okf["should"])
     out["okf"] = okf
-    # strict_types is ENGINE-OWNED: the base is authoritative and a pack-level
-    # value is ignored. Under composition a pack must not be able to loosen or
-    # tighten the global type taxonomy (one pack's `strict_types: true` would
-    # reject another pack's valid types). `framework validate` WARNs a pack that
-    # sets it. Default False keeps the format open/extensible (OKF passes extras).
-    out["strict_types"] = base.get("strict_types", False)
+    # A pack may opt into a closed taxonomy, but may never loosen a stricter base
+    # or composed host. Composition has already merged every guest type into the
+    # governing `types` map, so the monotonic OR closes the *composed* taxonomy,
+    # not one pack's private view of it. Default False preserves open OKF packs.
+    out["strict_types"] = bool(base.get("strict_types", False) or
+                               pack.get("strict_types", False))
     common = set(base.get("common_optional") or []) | set(pack.get("common_optional") or [])
     if common:
         out["common_optional"] = sorted(common)
@@ -215,6 +255,13 @@ def _merge_base_pack(root: Path, namespace: str = "") -> dict:
     b_fs, p_fs = base.get("field_shapes") or {}, pack.get("field_shapes") or {}
     if b_fs or p_fs:
         out["field_shapes"] = {**b_fs, **p_fs}
+    # Field ITEM contracts (okengine#211): per-key rules for LIST-OF-DICT fields (e.g. the
+    # predictions `evidence:` records), merged like field_shapes — pack wins on a field key.
+    # The enforced write path validates each item's declared keys (enum membership / shape),
+    # so an agent-authored record can't drift the vocabulary a consumer buckets on (D1 class).
+    b_fi, p_fi = base.get("field_items") or {}, pack.get("field_items") or {}
+    if b_fi or p_fi:
+        out["field_items"] = {**b_fi, **p_fi}
     # Conformance rules (okengine#158): engine FLOOR (base) ⊕ pack additions, additive + deduped by
     # `id` (pack can't drop an engine rule; a same-id pack rule overrides the floor copy). So the
     # audit + write-guard see one merged rule set, not the raw pack's.
@@ -248,6 +295,62 @@ def int_fields(schema: dict) -> set:
     dashboard/sort."""
     shapes = (schema or {}).get("field_shapes") or {}
     return {k for k, v in shapes.items() if v == "int"}
+
+
+def item_rules(schema: dict) -> dict:
+    """Normalized ITEM contracts for list-of-dict fields (`field_items`, okengine#211):
+
+        {field: {key: rule, "_item": {"shape": "dict", "required": set}}}
+
+    Grammar (per field, per item key):
+        field_items:
+          evidence:
+            _item: {shape: dict, required: [direction, source]}
+            direction: {enum: [reinforces, contradicts, partial, neutral]}   # inline values
+            # or        {enum: direction}         # a NAME resolved through schema `enums:`
+            confidence_before: {shape: number}
+            date: {shape: date}
+            source: {shape: str}
+
+    Supported shapes are number, date, str, bool, list, and dict. ``_item`` is
+    optional; without it legacy scalar items and absent keys retain the original
+    permissive behavior. With ``shape: dict``, every item must be a mapping and
+    every key listed under ``required`` must be present and non-empty.
+
+    `enum:` accepts an inline list OR a string naming an entry in the schema's `enums:`
+    vocabulary map (same indirection as field_enums — one declaration, every consumer derives).
+    Malformed rules are skipped, not fatal: the write path must never crash on a schema typo."""
+    enums = (schema or {}).get("enums") or {}
+    out: dict = {}
+    for field, keyrules in ((schema or {}).get("field_items") or {}).items():
+        if not isinstance(keyrules, dict):
+            continue
+        norm: dict = {}
+        item_spec = keyrules.get("_item")
+        if isinstance(item_spec, dict) and item_spec.get("shape") == "dict":
+            required = item_spec.get("required") or []
+            if isinstance(required, list) and all(isinstance(k, str) and k for k in required):
+                norm["_item"] = {"shape": "dict", "required": set(required)}
+        for key, rule in keyrules.items():
+            if key == "_item":
+                continue
+            if not isinstance(rule, dict):
+                continue
+            allowed = None
+            ev = rule.get("enum")
+            if isinstance(ev, list):
+                allowed = {str(v) for v in ev}
+            elif isinstance(ev, str):
+                named = enums.get(ev)
+                if isinstance(named, list):
+                    allowed = {str(v) for v in named}
+            shape = rule.get("shape")
+            if allowed is None and shape not in ("number", "date", "str", "bool", "list", "dict"):
+                continue                                  # nothing enforceable — skip
+            norm[key] = {"enum": allowed, "shape": shape if allowed is None else None}
+        if norm:
+            out[field] = norm
+    return out
 
 
 def _recorded_fragments(root: Path) -> list:
@@ -314,11 +417,18 @@ def compose_schema(root: Path, fragments=None, namespace: str = "") -> tuple[dic
     _base = base_schema()
     _core_types = set(_base.get("types") or {})
     _core_ns = set((_base.get("partitioning") or {}).get("namespaces") or {})
-    owners = {"namespaces": {}, "types": {}, "fields": {}, "enum_values": {}}
+    owners = {"namespaces": {}, "types": {}, "fields": {}, "enum_values": {},
+              "enums": {}, "field_enums": {}, "field_shapes": {}}
     for ns in composed["partitioning"]["namespaces"]:
         owners["namespaces"][ns] = "engine" if ns in _core_ns else "pack"
     for t in composed["types"]:
         owners["types"][t] = "engine" if t in _core_types else "pack"
+    for name in composed.get("enums") or {}:
+        owners["enums"][name] = "engine" if name in (_base.get("enums") or {}) else "pack"
+    for name in composed.get("field_enums") or {}:
+        owners["field_enums"][name] = "engine" if name in (_base.get("field_enums") or {}) else "pack"
+    for name in composed.get("field_shapes") or {}:
+        owners["field_shapes"][name] = "engine" if name in (_base.get("field_shapes") or {}) else "pack"
 
     for owner, frag in (fragments or []):
         if not isinstance(frag, dict):
@@ -341,6 +451,24 @@ def compose_schema(root: Path, fragments=None, namespace: str = "") -> tuple[dic
                 continue
             composed["types"][tname] = copy.deepcopy(tdef) if isinstance(tdef, dict) else {}
             owners["types"][tname] = owner
+        # --- Own: new vocabularies and cross-cutting field contracts ---
+        for ename, values in (frag.get("enums") or {}).items():
+            if ename in owners["enums"]:
+                errors.append(f"{owner}: enum '{ename}' already owned by {owners['enums'][ename]}")
+                continue
+            if not isinstance(values, list):
+                errors.append(f"{owner}: enum '{ename}' must be a list")
+                continue
+            composed.setdefault("enums", {})[ename] = copy.deepcopy(values)
+            owners["enums"][ename] = owner
+        for section in ("field_enums", "field_shapes"):
+            for fname, rule in (frag.get(section) or {}).items():
+                if fname in owners[section]:
+                    errors.append(f"{owner}: {section} '{fname}' already declared by "
+                                  f"{owners[section][fname]}")
+                    continue
+                composed.setdefault(section, {})[fname] = copy.deepcopy(rule)
+                owners[section][fname] = owner
         # --- Extend: additive optional fields / enum values on an existing type|enum ---
         for tname, ext_def in (frag.get("extends") or {}).items():
             if not isinstance(ext_def, dict):
@@ -378,6 +506,21 @@ def compose_schema(root: Path, fragments=None, namespace: str = "") -> tuple[dic
                 target.setdefault("fields", {})[fname] = copy.deepcopy(fdef) \
                     if isinstance(fdef, dict) else {}
                 owners["fields"][fkey] = owner
+        # --- field_items: an ITEM contract for a list-of-dict field (okengine#211) ---
+        # Additive per FIELD key with no shadowing: one owner per field, a duplicate claim is a
+        # hard conflict (same philosophy as owns — a second declaration silently replacing the
+        # first is exactly the multi-surface drift this feature exists to prevent).
+        for fname, keyrules in (frag.get("field_items") or {}).items():
+            fi_owners = owners.setdefault("field_items", {})
+            if fname in fi_owners or fname in (composed.get("field_items") or {}):
+                errors.append(f"{owner}: field_items '{fname}' already declared by "
+                              f"{fi_owners.get(fname, 'base/pack')} (one owner per field)")
+                continue
+            if not isinstance(keyrules, dict):
+                errors.append(f"{owner}: field_items.{fname} must be a mapping of item-key rules")
+                continue
+            composed.setdefault("field_items", {})[fname] = copy.deepcopy(keyrules)
+            fi_owners[fname] = owner
 
     # Second pass: Reuse — every {type: ref, to: X} must resolve to a composed type.
     known = set(composed["types"])
@@ -410,18 +553,12 @@ def _is_extensible_enum(schema: dict, enum_name: str) -> bool:
 def governing_schema(root: Path, namespace: str = "") -> dict:
     """The schema.yaml governing wiki/<namespace>/ — walk UP from the namespace dir
     (a sub-domain's own schema.yaml, else the vault root's). `namespace=""` resolves
-    the vault-root schema. Returns {} if none found. Cached by path."""
+    the vault-root schema. Returns {} if none found. mtime-cached (re-reads on edit)."""
     cur = (root / "wiki" / namespace) if namespace else (root / "wiki")
     while True:
         sp = cur / "schema.yaml"
         if sp.is_file():
-            k = str(sp)
-            if k not in _SCHEMA_CACHE:
-                try:
-                    _SCHEMA_CACHE[k] = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}
-                except Exception:
-                    _SCHEMA_CACHE[k] = {}
-            return _SCHEMA_CACHE[k]
+            return _yaml_mtime_cached(sp, _SCHEMA_CACHE)   # mtime-invalidated (audit HIGH)
         if cur == root or cur.parent == cur:
             return {}
         cur = cur.parent
@@ -439,6 +576,12 @@ def type_aliases(schema: dict) -> dict[str, str]:
     """Pack-supplied {alias -> canonical} type remap. Default {} (no remapping)."""
     aliases = schema.get("type_aliases")
     return {str(k): str(v) for k, v in aliases.items()} if isinstance(aliases, dict) else {}
+
+
+def canonical_type(schema: dict, value: object) -> str:
+    """Resolve a pack-declared type alias to its canonical taxonomy value."""
+    typ = str(value or "").strip()
+    return type_aliases(schema).get(typ, typ)
 
 
 def reference_policy(schema: dict) -> dict:
@@ -538,6 +681,27 @@ def knowledge_namespaces(schema: dict) -> set[str]:
     `partitioning.namespaces` keys). Empty set if undeclared."""
     ns = (schema.get("partitioning") or {}).get("namespaces")
     return set(ns.keys()) if isinstance(ns, dict) else set()
+
+
+# Engine-core types (base-schema) whose canonical home namespace is the conventional plural
+# (source -> sources, …). Domain types (cve -> cves, incident -> security-incidents) don't follow a
+# derivable rule, so a schema declares those via `type_namespaces` (below).
+_CORE_TYPE_HOME = {"source": "sources", "concept": "concepts", "prediction": "predictions",
+                   "finding": "findings", "briefing": "briefings", "trend": "trends",
+                   "dashboard": "dashboards"}
+
+
+def type_home_namespace(schema: dict, typ: str) -> "str | None":
+    """The namespace where pages of ``typ`` canonically live, or None if not determinable. A schema's
+    optional ``type_namespaces: {type: namespace}`` map WINS (the declarative source of truth for
+    domain types); else the engine-core convention (source -> sources, …). Used by the write path to
+    reject a page CREATED in the wrong namespace — a `type: source` under `concepts/`, where both are
+    declared but source belongs in `sources/` (okengine#276). None (no rule) => the guard is a no-op
+    for that type, never a vacuous reject."""
+    tn = schema.get("type_namespaces")
+    if isinstance(tn, dict) and typ in tn and tn[typ]:
+        return str(tn[typ])
+    return _CORE_TYPE_HOME.get(typ)
 
 
 def excluded_dirs(schema: dict) -> set[str]:

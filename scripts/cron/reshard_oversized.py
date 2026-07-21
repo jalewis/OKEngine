@@ -90,7 +90,12 @@ def _oversized(glob_pat: str, max_n: int):
             continue
         files = [f for f in d.glob("*.md")  # glob-ok: d is a resolved shard-leaf dir
                  if f.name != "INDEX.md" and not f.name.startswith("_")]
-        if len(files) > max_n:
+        # Once a bucket has been split, every direct content file in that bucket is residual
+        # non-canonical state even when the direct count has fallen below the original threshold.
+        # Sweeping those stragglers prevents a fixed importer/migration from leaving a permanently
+        # mixed one-level/two-level layout (#243).
+        already_split = any(p.is_dir() for p in d.iterdir())
+        if len(files) > max_n or (files and already_split):
             yield d, files
 
 
@@ -116,6 +121,11 @@ def _apply(namespace: str, reshard_by: str, max_n: int, apply: bool) -> int:
     if not apply:
         return 0
     pat, repl = okf_migrate.make_rewriter(mp, namespace)
+    # Bare (non-wikilink) references — e.g. an assessment's `subject: entities/a/foo` frontmatter
+    # scalar — go stale too when the target moves deeper; the wikilink rewriter never touches them
+    # (#336). Rewrite both, and no longer skip files whose ONLY reference is
+    # bare (the old `[[namespace/` gate dropped exactly the assessment records that broke).
+    bpat, brepl = okf_migrate.make_path_rewriter(mp)
     rew = 0
     for p in WIKI.rglob("*.md"):
         if "/.git/" in p.as_posix():
@@ -124,9 +134,10 @@ def _apply(namespace: str, reshard_by: str, max_n: int, apply: bool) -> int:
             c = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if f"[[{namespace}/" not in c:
+        if f"{namespace}/" not in c:
             continue
-        nc, k = pat.subn(repl, c)
+        nc, _ = pat.subn(repl, c)
+        nc, _ = bpat.subn(brepl, nc)
         if nc != c:
             try:
                 p.write_text(nc, encoding="utf-8")

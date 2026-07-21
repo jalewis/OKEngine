@@ -24,6 +24,16 @@ def _resolve(pack_dir, fn="resolve_hermes_uid", env=None):
     return r.stdout.strip()
 
 
+def _env_file_val(pack_dir, key):
+    r = subprocess.run(
+        ["bash", "-c", f'. "{LIB}"; _okengine_env_file_val "$1" "$2"', "bash",
+         str(pack_dir), key],
+        capture_output=True,
+        text=True,
+    )
+    return r
+
+
 def test_lib_exists_and_sources_clean():
     assert LIB.is_file(), "scripts/lib/hermes_uid.sh missing"
     r = subprocess.run(["bash", "-n", str(LIB)], capture_output=True, text=True)
@@ -40,6 +50,25 @@ def test_pack_env_pin_used_over_default(tmp_path):
     (tmp_path / ".env").write_text("SOMETHING=x\nHERMES_UID=1003\nHERMES_GID=1003\n")
     assert _resolve(tmp_path) == "1003"
     assert _resolve(tmp_path, fn="resolve_hermes_gid") == "1003"
+
+
+def test_env_parser_accepts_export_quotes_whitespace_and_comments(tmp_path):
+    (tmp_path / ".env").write_text(
+        " export HERMES_UID = '1003' # pack owner\n"
+        'OKENGINE_BRIEF_HOUR = "09" # local morning\n'
+    )
+    uid = _env_file_val(tmp_path, "HERMES_UID")
+    hour = _env_file_val(tmp_path, "OKENGINE_BRIEF_HOUR")
+    assert uid.returncode == 0 and uid.stdout == "1003"
+    assert hour.returncode == 0 and hour.stdout == "09"
+
+
+def test_env_parser_rejects_empty_or_malformed_values(tmp_path):
+    (tmp_path / ".env").write_text("HERMES_UID='unterminated\n")
+    malformed = _env_file_val(tmp_path, "HERMES_UID")
+    missing = _env_file_val(tmp_path, "HERMES_GID")
+    assert malformed.returncode != 0
+    assert missing.returncode != 0
 
 
 def test_tree_owner_used_when_no_env_pin(tmp_path):
@@ -65,3 +94,10 @@ def test_both_deploy_scripts_use_the_resolver():
         assert "resolve_hermes_uid" in t, f"{name} must call resolve_hermes_uid"
         assert 'HERMES_UID="${HERMES_UID:-10000}"' not in t, \
             f"{name} must not keep the silent 10000 default"
+
+
+def test_cron_jobs_deploy_uses_dotenv_parser_for_brief_hour():
+    text = (REPO / "scripts" / "deploy-cron-plus-jobs.sh").read_text()
+    assert '_okengine_env_file_val "$PACK_DIR" OKENGINE_BRIEF_HOUR' in text
+    assert "OKENGINE_BRIEF_HOUR must be" in text
+    assert "grep -oE '^OKENGINE_BRIEF_HOUR=" not in text

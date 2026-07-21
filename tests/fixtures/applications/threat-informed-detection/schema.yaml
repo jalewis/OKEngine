@@ -1,0 +1,49 @@
+okf:
+  required: [type]
+types:
+  threat-procedure:
+    required: [type, behavior, sources, as_of]
+  detection-requirement:
+    required: [type, procedure_ref, environment_ref, telemetry_refs, status]
+  environment-snapshot:
+    required: [type, scope, telemetry_refs, observed_at]
+  telemetry-source:
+    required: [type, platform, scope, observed_at, status]
+  detection-strategy:
+    required: [type, requirement_ref, hypothesis, status]
+  detection-analytic:
+    required: [type, strategy_ref, revision, status]
+  deployment-snapshot:
+    required: [type, analytic_ref, revision, scope, observed_at]
+  validation-test:
+    required: [type, procedure_ref, analytic_ref, status]
+  validation-result:
+    required: [type, analytic_ref, revision, environment_ref, result, executed_at]
+  coverage-assessment:
+    required:
+      - type
+      - procedure_ref
+      - environment_ref
+      - facets
+      - as_of
+      - status
+      - confidence
+      - evidence
+      - resolution
+      - needs_review
+partitioning:
+  namespaces:
+    procedures: {strategy: flat}
+    detection-requirements: {strategy: flat}
+    environment-snapshots: {strategy: flat}
+    telemetry: {strategy: flat}
+    detection-strategies: {strategy: flat}
+    detection-analytics: {strategy: flat}
+    deployment-snapshots: {strategy: flat}
+    validation-tests: {strategy: flat}
+    validation-results: {strategy: flat}
+    coverage-assessments: {strategy: flat}
+field_shapes:
+  telemetry_refs: list
+  evidence: list
+  facets: list

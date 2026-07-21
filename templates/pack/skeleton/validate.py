@@ -164,7 +164,9 @@ def check_crons_jittered() -> None:
     for item in crons:
         if item.get("enabled") is not True:
             continue
-        expr = ((item.get("schedule") or {}).get("expr") or "").strip()
+        schedule = item.get("schedule")
+        expr = (schedule if isinstance(schedule, str)
+                else (schedule or {}).get("expr") or "").strip()
         name = item.get("name")
         if expr.startswith("@jitter:"):
             # Only the SUPPORTED bases expand (engine cron_jitter._SENTINEL_RE — keep this set in

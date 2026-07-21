@@ -58,8 +58,8 @@ ENGINE_CRONS_FILE = REPO / "config" / ENGINE_CRONS
 PACK_DIR = Path(os.environ.get("CRON_PACK_DIR", "/path/to/pack"))
 
 # Runtime fields stripped when capturing from the live scheduler state.
-RUNTIME_FIELDS = {"next_run_at", "last_run_at", "last_run_success",
-                  "last_error", "last_delivery_error"}
+RUNTIME_FIELDS = {"next_run_at", "last_run_at", "last_run_success", "last_completed_at",
+                  "last_error", "last_delivery_error", "after_claim", "after_consumed"}
 # A runtime PAUSE (budget-guard cost cap, or a manual `cron-plus pause`) is stored IN jobs.json as
 # {enabled: false, paused_at: ...}. `paused_at` is the marker that distinguishes a pause from an
 # intentional source-level `enabled: false` (a ship-disabled placeholder).
@@ -97,14 +97,21 @@ def _by_name(jobs: list[dict]) -> list[dict]:
 
 def _normalize_schedule(job: dict) -> dict:
     """cron-plus requires `schedule` to be a DICT ({kind:cron, expr:...}); the pack-authoring docs
-    also show a BARE STRING ("0 13 * * SUN"). Normalize the string shape into the dict HERE — the
-    single chokepoint that writes the deployed jobs.json — so a documented bare-string schedule can't
-    reach cron-plus verbatim and crash every tick with 'str has no attribute get', stalling the whole
-    fleet (invariant-audit HIGH #1)."""
+    AND framework_validate._cron_expr also accept a BARE STRING ("0 13 * * SUN") and a TOP-LEVEL
+    `expr` (no schedule key). Normalize BOTH looser shapes into the dict HERE — the single chokepoint
+    that writes the deployed jobs.json — so a job that VALIDATES GREEN can't deploy in a shape
+    cron-plus silently never fires:
+      - bare string → 'str has no attribute get' crashes every tick, stalling the fleet (audit #1);
+      - top-level {expr} → deploys with NO schedule key, so compute_next_run returns None,
+        next_run_at stays null, and Phase 2 skips the job every tick forever, no error logged
+        (audit HIGH #5)."""
     s = job.get("schedule")
     if isinstance(s, str) and s.strip():
         job = dict(job)
         job["schedule"] = {"kind": "cron", "expr": s.strip()}
+    elif s is None and isinstance(job.get("expr"), str) and job["expr"].strip():
+        job = dict(job)
+        job["schedule"] = {"kind": "cron", "expr": job["expr"].strip()}
     return job
 
 
@@ -118,7 +125,10 @@ def _ensure_id(job: dict) -> dict:
     single deploy chokepoint — no id-less job can reach the deployed jobs.json."""
     if not str(job.get("id") or "").strip():
         job = dict(job)
-        job["id"] = hashlib.sha1(str(job.get("name") or "").encode("utf-8")).hexdigest()[:12]
+        # Stable non-security identifier; collision resistance is not an auth boundary.
+        job["id"] = hashlib.sha1(
+            str(job.get("name") or "").encode("utf-8"), usedforsecurity=False
+        ).hexdigest()[:12]
     return job
 
 

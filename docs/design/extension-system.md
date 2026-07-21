@@ -270,6 +270,20 @@ extension with several lanes (#multi-op). Per-operation keys:
 | `model` | optional per-operation model id. The cron scheduler honors `job["model"]` over the deployment's `config.yaml` default — so a low-stakes lane (e.g. glossary) can run on a small/free model while reasoning lanes use a stronger one. Pick by task profile, not brand — see [docs/model-selection.md](../model-selection.md). Omit to inherit the default. |
 | `cost_bearing` | `true` on a **`no_agent`** op that still SPENDS model budget — a deterministic script that calls `llm_lib` directly (e.g. `concept-enrich`, `scope-classify`). `budget_guard` pauses it with the agent lanes when over budget; without the marker a no_agent lane looks free and burns paid tokens unpausably. Omit for a truly free maintenance script (zero model calls). |
 
+**Config environment contract.** For an in-gateway extension, the composer turns
+each `config:` value into job-local environment using
+`OKENGINE_<EXTENSION_NAMESPACE>_<KEY>`. The reserved `okengine.` prefix is omitted
+(`okengine.frontier-watch.config.batch_size` becomes
+`OKENGINE_FRONTIER_WATCH_BATCH_SIZE`); punctuation becomes `_`. The cron runner
+applies the mapping only inside that job's subprocess, before its wake-gate or
+agent runs, so concurrent extensions cannot contaminate each other's environment.
+An already-set deployment env value wins over the composed value, preserving an
+explicit operator override.
+Every declared key must have a corresponding runtime read; the fleet contract test
+rejects half-real configuration. Existing legacy names may remain as deprecated
+operator overrides during migration, but new code uses only the canonical name.
+Sidecars retain their isolated `OKENGINE_CONFIG_<KEY>` container contract.
+
 **`core`** (boolean, engine-tier only): `true` makes the extension **default-ON** (active
 unless explicitly disabled), for operations that are effectively part of the house baseline
 (#142). A pack can require an extension via `pack.yaml` `requires: [ext:<id>@>=ver]`;

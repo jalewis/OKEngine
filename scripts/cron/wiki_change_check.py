@@ -10,6 +10,7 @@ State: $HERMES_HOME/scripts/lint-state.json — last-seen baseline mtime.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -46,7 +47,30 @@ def save_state(state: dict) -> None:
     os.replace(tmp, STATE_PATH)
 
 
-def main() -> int:
+def commit_baseline(candidate: float) -> int:
+    """Advance only after the lint agent completed its report/log/index writes."""
+    state = load_state()
+    pending = float(state.get("pending_baseline_mtime", 0.0))
+    if not pending or abs(pending - candidate) > 0.000001:
+        print("wiki-change-check: baseline commit refused — candidate is not the current pending scan",
+              file=sys.stderr)
+        return 1
+    state["last_baseline_mtime"] = pending
+    state["last_run_at"] = datetime.now(timezone.utc).isoformat()
+    state.pop("pending_baseline_mtime", None)
+    state.pop("pending_started_at", None)
+    save_state(state)
+    print(f"wiki-change-check: committed successful lint baseline {pending}")
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--commit-baseline", type=float)
+    args, _ = ap.parse_known_args(argv)
+    if args.commit_baseline is not None:
+        return commit_baseline(args.commit_baseline)
+
     wiki_dir = VAULT / "wiki"
     if not wiki_dir.exists():
         print(f"# wiki-change-check: `{wiki_dir}` does not exist")
@@ -89,11 +113,18 @@ def main() -> int:
         print(f"- ... and {len(changed) - SAMPLE} more")
     print()
 
-    state["last_baseline_mtime"] = max_mtime
-    state["last_run_at"] = now_iso
+    # A pre-run script cannot know whether the following agent succeeds. Record a CANDIDATE only;
+    # the agent commits it after the lint report/log/index writes complete. If the agent fails, the
+    # durable baseline stays put and the same change set is offered again next week.
+    state["pending_baseline_mtime"] = max_mtime
+    state["pending_started_at"] = now_iso
     save_state(state)
+    print("## Success acknowledgement required\n")
+    print("After the lint report, log append, and index update ALL succeed, run this exact command:")
+    print(f"`python3 /opt/data/scripts/wiki_change_check.py --commit-baseline {max_mtime}`")
+    print("Do not run it after a partial or failed lint; leaving it pending makes the changes retry.\n")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

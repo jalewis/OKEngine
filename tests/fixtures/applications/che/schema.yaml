@@ -1,0 +1,12 @@
+okf:
+  required: [type]
+types:
+  forecast:
+    required: [type, status, confidence, evidence, outcome, needs_review]
+  diagnostic:
+    required: [type, status, confidence_band, evidence, resolution, needs_review]
+partitioning:
+  namespaces:
+    forecasts: {strategy: flat}
+    diagnostics: {strategy: flat}
+

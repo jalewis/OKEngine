@@ -32,7 +32,10 @@ import scope_lib  # noqa: E402
 import llm_lib    # noqa: E402  (vendored — reasoning-off default, truncation raises)
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
-BATCH = int(os.environ.get("SCOPE_CLASSIFY_BATCH", "12"))   # cron-plus kills no_agent scripts at ~120s; ~6s/model call
+BATCH = int(os.environ.get(
+    "SCOPE_CLASSIFY_BATCH",
+    os.environ.get("OKENGINE_RELEVANCE_GATE_SCOPE_CLASSIFY_BATCH", "12"),
+))
 
 
 def main() -> int:

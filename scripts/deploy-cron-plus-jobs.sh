@@ -91,8 +91,15 @@ trap 'rm -f "$DEPLOY_JOBS"' EXIT
 # (OKENGINE_BRIEF_HOUR in .env, gateway-local TZ). Brief lanes ship `@morning[:MM]`
 # sentinels; they expand to this hour at deploy so every deployment picks its own
 # morning without forking any schedule (okengine#177). Default 7.
-BRIEF_HOUR="$(grep -oE '^OKENGINE_BRIEF_HOUR=[0-9]+' "$PACK_DIR/.env" 2>/dev/null | cut -d= -f2 || true)"
+BRIEF_HOUR="$(_okengine_env_file_val "$PACK_DIR" OKENGINE_BRIEF_HOUR || true)"
 BRIEF_HOUR="${BRIEF_HOUR:-7}"
+case "$BRIEF_HOUR" in
+    *[!0-9]*|"") echo "ERROR: OKENGINE_BRIEF_HOUR must be an integer from 0 to 23 (got '$BRIEF_HOUR')" >&2; exit 1 ;;
+esac
+if [ "$BRIEF_HOUR" -gt 23 ]; then
+    echo "ERROR: OKENGINE_BRIEF_HOUR must be from 0 to 23 (got '$BRIEF_HOUR')" >&2
+    exit 1
+fi
 PYTHONPATH="$REPO_ROOT/scripts" python3 - "$SRC" "$DEPLOY_JOBS" "$PACK_DIR" "$BRIEF_HOUR" <<'PY'
 import sys, json, hashlib, random, cron_jitter, model_profiles
 src, out, pack_dir, brief_hour = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])

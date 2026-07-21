@@ -30,6 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import okf_migrate  # noqa: E402  — shared shard-aware page locator (find_page / canonical_key)
+import entity_resolve  # noqa: E402 — conservative cross-source identity resolver
 
 _FM = re.compile(r"\A---[ \t]*\n(.*?\n)---[ \t]*\n?(.*)\Z", re.S)
 # A>...>F, higher rank = more reliable; unknown reliability sorts below F.
@@ -213,6 +214,64 @@ def collect_observations(vault: Path, reliability: dict) -> dict:
     return out
 
 
+def _canonical_index(vault: Path) -> entity_resolve.CanonicalIndex:
+    """Build a resolver index over active canonical entity pages."""
+    records = []
+    root = vault / "wiki" / "entities"
+    if not root.is_dir():
+        return entity_resolve.build_index(records)
+    for p in sorted(root.rglob("*.md")):
+        if p.name.startswith(("_", ".", "INDEX")):
+            continue
+        fm, _ = read_fm(p)
+        if str(fm.get("status") or "").strip().lower() == "tombstoned":
+            continue
+        aliases = fm.get("aliases") or []
+        if isinstance(aliases, str):
+            aliases = [a.strip() for a in aliases.split(",") if a.strip()]
+        elif not isinstance(aliases, list):
+            aliases = []
+        records.append((p.stem, str(fm.get("name") or fm.get("title") or p.stem), aliases))
+    return entity_resolve.build_index(records)
+
+
+def resolve_observation_groups(vault: Path, groups: dict[str, list[dict]]) -> tuple[dict, list[dict]]:
+    """Route source-native slugs to known canonicals only on strong identity evidence.
+
+    Exact primary-name and multi-identifier matches converge. A lone shared alias stays separate
+    and is reported as ambiguous, preserving the resolver's #39 over-merge protection.
+    """
+    idx = _canonical_index(vault)
+    routed: dict[str, list[dict]] = {}
+    decisions: list[dict] = []
+    for proposed, obs in sorted(groups.items()):
+        existing = okf_migrate.find_page(vault, "entities", proposed)
+        target, evidence, ambiguous = proposed, ("existing-slug" if existing else "none"), None
+        if not existing:
+            ranked = sorted(obs, key=lambda o: (_rank(o.get("reliability")),
+                                                str(o.get("observed") or "")), reverse=True)
+            name = ""
+            aliases: list[str] = []
+            for o in ranked:
+                fields = o.get("fields") or {}
+                if not name and (fields.get("name") or fields.get("title")):
+                    name = str(fields.get("name") or fields.get("title"))
+                vals = fields.get("aliases") or []
+                vals = vals if isinstance(vals, list) else [vals]
+                aliases.extend(str(v) for v in vals if str(v).strip())
+            if name:
+                resolution = entity_resolve.resolve(idx, name, aliases)
+                evidence = resolution.evidence
+                if resolution.merged and resolution.slug:
+                    target = resolution.slug
+                elif resolution.ambiguous:
+                    ambiguous = resolution.ambiguous.candidate
+        routed.setdefault(target, []).extend(obs)
+        decisions.append({"proposed": proposed, "target": target, "evidence": evidence,
+                          "ambiguous": ambiguous})
+    return routed, decisions
+
+
 def _canonical_type(obs: list[dict]) -> str:
     """The entity type for the canonical — the type the most reliable observation asserts."""
     best = max((o for o in obs if o.get("type")),
@@ -268,7 +327,7 @@ def write_canonical(vault: Path, slug: str, type_: str, fused: dict, conflicts: 
     # char — wrong for an uppercase, digit, or symbol slug (canonical shards lowercase, map digits to
     # `0-9` and symbols to `_`), so the assembler read/wrote a different shard than reshelve files to.
     existing = okf_migrate.find_page(vault, "entities", slug)
-    path = existing if existing else vault / "wiki" / f"{okf_migrate.canonical_key(vault, 'entities', slug, fused)}.md"
+    path = existing if existing else vault / "wiki" / f"{okf_migrate.write_key(vault, 'entities', slug, fused)}.md"
     existing_fm, body = (read_fm(path) if path.exists() else ({}, ""))
     union_f = policy.get("union", set())
 
@@ -352,9 +411,10 @@ def main(argv: list[str] | None = None) -> int:
     policy, reliability = merge_policy(schema), source_reliability(schema)
 
     today = date.today().isoformat()
-    groups = collect_observations(vault, reliability)
+    raw_groups = collect_observations(vault, reliability)
     if args.only:
-        groups = {k: v for k, v in groups.items() if k == args.only.strip().lower()}
+        raw_groups = {k: v for k, v in raw_groups.items() if k == args.only.strip().lower()}
+    groups, resolutions = resolve_observation_groups(vault, raw_groups)
     counts = {"entities": 0, "written": 0, "skipped": 0, "conflicts": 0, "observations": 0, "multi": 0}
     for slug, obs in sorted(groups.items()):
         counts["entities"] += 1
@@ -375,6 +435,12 @@ def main(argv: list[str] | None = None) -> int:
             al = result["fields"].get("aliases", [])
             print(f"  · {slug}: {srcs} -> aliases {len(al)}"
                   f"{', CONFLICTS ' + str([c['field'] for c in result['conflicts']]) if result['conflicts'] else ''}")
+    for decision in resolutions:
+        if decision["target"] != decision["proposed"]:
+            print(f"  ↪ {decision['proposed']} -> {decision['target']} ({decision['evidence']})")
+        elif decision.get("ambiguous"):
+            print(f"  ? {decision['proposed']}: lone-alias match to "
+                  f"{decision['ambiguous']} left separate")
     verb = "would assemble" if args.dry_run else "assembled"
     print(f"canonical-assemble: {verb} {counts['written']} canonical(s) "
           f"({counts['skipped']} unchanged, skipped) from "

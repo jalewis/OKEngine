@@ -110,7 +110,14 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Content-quality lint over the vault source")
     ap.add_argument("--vault", default="", help="vault root (contains wiki/)")
     ap.add_argument("--wiki", default="", help="wiki dir directly (overrides --vault/WIKI_PATH)")
-    ap.add_argument("--max-offenders", type=int, default=0)
+    ap.add_argument("--max-offenders", type=int, default=-1,
+                    help="exit non-zero only when MORE than this many pages are degenerate. -1 "
+                         "(default) = AUTO: max(10, 0.5%% of scanned pages). A report-only monitor "
+                         "must not RED the whole fleet-health over the routine handful of degenerate "
+                         "feed-ingests a large vault always carries — it should flag a degradation "
+                         "SPIKE. The full list is always in wiki/operational/content-lint.md "
+                         "regardless of the exit code. Env CONTENT_LINT_MAX_OFFENDERS overrides; an "
+                         "explicit non-negative value wins over auto.")
     ap.add_argument("--write-vault", default="", help="vault root; writes wiki/operational/content-lint.md")
     ap.add_argument("--now", default="")
     ap.add_argument("--json", action="store_true")
@@ -158,7 +165,21 @@ def main(argv=None) -> int:
             print(f"  {pg}: {', '.join(offenders[pg])}")
         if len(offenders) > 20:
             print(f"  … +{len(offenders) - 20:,} more")
-    return 1 if len(offenders) > a.max_offenders else 0
+    # Effective alarm threshold: an env/explicit value wins; else AUTO-scale to the vault. The old
+    # default 0 (alarm on ANY degenerate page) perpetually reddened fleet-health on a large ingesting
+    # vault — a report-only quality monitor should signal a SPIKE, not the routine noise.
+    env_max = os.environ.get("CONTENT_LINT_MAX_OFFENDERS", "").strip()
+    if env_max:
+        threshold = int(env_max)
+    elif a.max_offenders >= 0:
+        threshold = a.max_offenders
+    else:
+        threshold = max(10, -(-total * 5 // 1000))   # ceil(0.5% of scanned pages), floor 10
+    over = len(offenders) > threshold
+    if not a.json:
+        print(f"content-lint: {len(offenders):,} degenerate / threshold {threshold:,} "
+              f"({'OVER — content-degradation alarm' if over else 'within tolerance'})")
+    return 1 if over else 0
 
 
 if __name__ == "__main__":

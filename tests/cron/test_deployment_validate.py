@@ -298,15 +298,27 @@ def _run_schema_check(tmp_path, vault_schema, artifact):
     return list(m.F)
 
 
-def test_stale_composed_schema_artifact_warns(tmp_path):  # invariant-audit #12
-    """The write path prefers the on-disk composed-schema.yaml unconditionally, but only extension
-    enable/disable regenerated it — so a schema.yaml edit was silently ignored. check_schema must
-    WARN when the artifact drifts from a live recompose."""
+def test_stale_composed_schema_artifact_fails(tmp_path):  # invariant-audit #12
+    """A governing artifact that differs from fresh source composition blocks validation."""
     schema = "types:\n  entity: {required: [type, name]}\npartitioning: {namespaces: {entities: {}}}\n"
     stale = "types:\n  STALE_ONLY_TYPE: {}\npartitioning: {namespaces: {}}\n"
     f = _run_schema_check(tmp_path, schema, stale)
-    assert any(lvl == "WARN" and "STALE" in msg and "composed-schema" in msg
+    assert any(lvl == "FAIL" and "DIVERGES" in msg and "composed-schema" in msg
                for lvl, _, msg in f), f
+
+
+def test_schema_document_comparison_is_exact_and_ignores_generated_metadata(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["deployment_validate"] = m
+    spec.loader.exec_module(m)
+    fresh = {"types": {"source": {}}, "field_enums": {"status": {"enum": "status"}}}
+    same = {**fresh, "_generated": "test", "_fragments": [["ext:x", {}]]}
+    assert m._schema_documents_equal(fresh, same)
+    changed = {**same, "field_enums": {"status": {"enum": "other"}}}
+    assert not m._schema_documents_equal(fresh, changed)
+    removed = {"types": {"source": {}}, "_generated": "test"}
+    assert not m._schema_documents_equal(fresh, removed)
 
 
 def test_in_sync_composed_schema_artifact_is_clean(tmp_path):
@@ -382,6 +394,38 @@ def test_partition_no_dups_passes(tmp_path, monkeypatch):
         "cves/2026/06/CVE-2026-48558": "cve",
     })
     assert [x for x in f if x[1] == "partition-dups"] == []
+
+
+def test_partition_tombstoned_copy_not_a_dup(tmp_path, monkeypatch):
+    """A tombstoned page (e.g. a same-story dedup loser left at its old shard path with
+    superseded_by) is intentionally superseded — it inflates no count and must NOT be flagged
+    as a #54 live duplicate. Only >=2 LIVE copies of a slug are a dup."""
+    vault = tmp_path / "vault"
+    (vault / "wiki").mkdir(parents=True)
+    (vault / "schema.yaml").write_text(_CVE_SCHEMA)
+    # same slug at two shard paths, but one is tombstoned -> exactly one LIVE -> not a dup
+    (vault / "wiki" / "cves" / "2026" / "07").mkdir(parents=True)
+    (vault / "wiki" / "cves" / "2026" / "07" / "CVE-2026-45659.md").write_text(
+        "---\ntype: cve\n---\n# live\n")
+    (vault / "wiki" / "cves" / "2026").mkdir(parents=True, exist_ok=True)
+    (vault / "wiki" / "cves" / "2026" / "CVE-2026-45659.md").write_text(
+        "---\ntype: cve\nstatus: tombstoned\nsuperseded_by: cves/2026/07/CVE-2026-45659\n---\n# dead\n")
+    monkeypatch.setenv("WIKI_PATH", str(vault))
+    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["deployment_validate"] = m
+    spec.loader.exec_module(m)
+    m.F.clear()
+    m.VAULT = vault
+    m.check_partition_dups()
+    assert [x for x in m.F if x[1] == "partition-dups"] == []
+    # sanity: two LIVE copies of the same slug still FAIL
+    (vault / "wiki" / "cves" / "2026" / "CVE-2026-45659.md").write_text("---\ntype: cve\n---\n# live2\n")
+    m.F.clear()
+    m.check_partition_dups()
+    assert [x for x in m.F if x[1] == "partition-dups"], "two LIVE copies must still FAIL"
+
+
 def test_stale_stamp_selfheals_against_running_engine(tmp_path, monkeypatch):
     """okengine#192: an image roll without a re-stamp leaves the runtime stamp behind the RUNNING
     engine, so About reports the wrong version. check_pins compares the stamp to the baked

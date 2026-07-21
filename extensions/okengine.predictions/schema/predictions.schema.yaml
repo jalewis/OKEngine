@@ -1,0 +1,25 @@
+# okengine.predictions schema fragment — THE single source of the evidence-record item
+# contract (okengine#217; mechanism okengine#211).
+#
+# Every other surface DERIVES from the composed result of this file — none may carry its
+# own copy of the vocabulary:
+#   - the WRITE PATH enforces it (write_server._item_shape_reject) — the boundary every
+#     writer crosses; out-of-enum / wrong-shape evidence records REJECT;
+#   - the regrade DIGEST renders its vocabulary line from the composed schema
+#     (select_regrade_batch.py) — prompt text is instruction, never the source;
+#   - the COCKPIT buckets the reinforces/contradicts tally by it (app.py), keeping only a
+#     legacy-synonym map for pre-backfill history (okengine#219).
+#
+# Change the vocabulary HERE and every surface follows. The cross-surface contract test
+# (tests/extensions/test_direction_single_source.py, okengine#218) pins the derivations so
+# they can never drift; tests/test_field_items.py pins the enforcement mechanism.
+#
+# NOTE: this extension still reuses the pack's `prediction` TYPE (no owns/extends here) —
+# the fragment governs only the shape of the shared `evidence:` record convention.
+field_items:
+  evidence:
+    direction: {enum: [reinforces, contradicts, partial, neutral]}
+    confidence_before: {shape: number}
+    confidence_after: {shape: number}
+    date: {shape: date}
+    source: {shape: str}

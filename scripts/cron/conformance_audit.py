@@ -54,6 +54,27 @@ def _skip(p: Path) -> bool:
     return n.startswith(("_", ".")) or n == "INDEX.md" or n.startswith("INDEX-") or ".bak." in n
 
 
+def _check_nonempty_fields(fm: dict, fields: list[str]) -> list[tuple[str, list[str]]]:
+    """Return (field, [defect]) for each named field that is missing or empty.
+    Presence semantics mirror the validator's `_present`: None, blank scalar,
+    and empty list all count as empty (the capture lane writes `published:`
+    with no value for dateless feed items — that must surface here)."""
+    out = []
+    for f in fields:
+        if f not in fm:
+            out.append((f, ["(missing)"]))
+            continue
+        v = fm[f]
+        empty = (
+            v is None
+            or (isinstance(v, str) and not v.strip())
+            or (isinstance(v, list) and not [e for e in v if e is not None and str(e).strip()])
+        )
+        if empty:
+            out.append((f, ["(empty)"]))
+    return out
+
+
 def _check_ref_fields(fm: dict, fields: list[str]) -> list[tuple[str, list[str]]]:
     """Return (field, [prose entries]) for each named list-field carrying a non-page-ref entry."""
     out = []
@@ -90,9 +111,15 @@ def main() -> int:
                 continue
             rel = p.relative_to(WIKI).as_posix()[:-3]
             for r in rules:
-                if r["kind"] != "ref_fields":
-                    continue  # P1: only ref_fields implemented
-                hits = _check_ref_fields(fm, r.get("fields") or [])
+                if r["kind"] == "ref_fields":
+                    hits = _check_ref_fields(fm, r.get("fields") or [])
+                elif r["kind"] == "nonempty_fields":
+                    # optional per-rule type scope (e.g. only `source` pages)
+                    if r.get("type") and str(fm.get("type") or "") != str(r["type"]):
+                        continue
+                    hits = _check_nonempty_fields(fm, r.get("fields") or [])
+                else:
+                    continue  # unknown kinds are forward-compatible no-ops
                 if hits:
                     acc = findings[r["id"]]
                     acc["pages"] += 1

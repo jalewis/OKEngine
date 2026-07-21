@@ -1,0 +1,5 @@
+enabled:
+  okengine.assessments: {}
+  okengine.reevaluation:
+    config:
+      proposition_types: coverage-assessment

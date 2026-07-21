@@ -54,6 +54,11 @@ def page():
 def _open(page, path):
     page.evaluate(f"openPage({path!r})")
     page.wait_for_selector("#ov-content", state="visible", timeout=10000)
+    # Quarantine is intentionally fail-closed. Browser assertions that inspect the draft body
+    # must exercise the analyst's explicit disclosure action first.
+    disclosure = page.locator("#ov-content details.quarantined-content > summary")
+    if disclosure.count():
+        disclosure.click()
 
 
 def test_actor_body_leads_fact_panel(page):
@@ -90,3 +95,49 @@ def test_no_raw_markup_visible_on_actor_page(page):
     assert "[[entities/" not in txt, "a wikilink is shown as literal [[…]] in the rendered page"
     # the genuine inline-code span is intentionally literal and MUST survive verbatim
     assert "LITERAL_CODE_KEPT_x7" in txt, "genuine inline-code span was altered/dropped"
+
+
+def _open_tid(page):
+    page.locator('#tabs button[data-tab="tid"]').click()
+    page.wait_for_selector(".tid-trace-record", timeout=10000)
+
+
+def test_tid_surfaces_render_validated_incomplete_and_superseded_cases(page):
+    """The three TID projections must preserve epistemic and lifecycle distinctions in the
+    assembled browser DOM: a validated chain, an incomplete chain, and assessment history."""
+    _open_tid(page)
+    trace_text = page.locator(".tid-trace").inner_text()
+    posture_text = page.locator(".tid-table-wrap").first.inner_text()
+    matrix_text = page.locator(".tid-facet-matrix").inner_text()
+    assert "Voice phishing" in trace_text and "Validated" in trace_text
+    assert "Unassessed procedure" in trace_text and "Not assessed" in trace_text
+    assert "apt-smoke" in posture_text and "2" in posture_text
+    assert "active · 2026-07-19 13:30:00+00:00" in matrix_text
+    assert "superseded · 2026-07-18 13:30:00+00:00" in matrix_text
+    assert "Unknown" in matrix_text
+
+
+def test_tid_trace_stacks_on_narrow_viewport(page):
+    _open_tid(page)
+    page.set_viewport_size({"width": 700, "height": 900})
+    direction = page.locator(".tid-trace-chain").first.evaluate(
+        "el => getComputedStyle(el).flexDirection"
+    )
+    widths = page.locator(".tid-node-value").evaluate_all(
+        "els => els.map(el => [el.getBoundingClientRect().width, el.parentElement.getBoundingClientRect().width])"
+    )
+    assert direction == "column"
+    assert all(cell >= parent * 0.95 for cell, parent in widths)
+
+
+def test_tid_dossier_queue_and_all_gap_lifecycle_states(page):
+    _open_tid(page)
+    dossier = page.locator(".tid-dossiers").inner_text()
+    queue = page.locator(".tid-validation-queue").inner_text()
+    workbench = page.locator(".tid-gap-workbench").inner_text()
+    assert "rules/voice.yml" in dossier and "Synthetic identity only" in dossier
+    assert "analytic revision changed" in queue and "validation stale" in queue
+    assert "review pending" in queue
+    for state in ("Proposed", "Approved", "Rejected", "Deferred", "Accepted Risk", "Completed", "Validated"):
+        assert state in workbench
+    assert "expired" in workbench and "analyst@example.test" in workbench

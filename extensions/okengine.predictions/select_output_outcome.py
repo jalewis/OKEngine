@@ -9,6 +9,7 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pred_lib as P  # noqa: E402
+from numeric_metrics import compute_output_outcomes  # noqa: E402
 
 MIN_OUTCOMES = int(os.environ.get("OUTCOME_EVAL_MIN", "3"))
 RECENT_DAYS = int(os.environ.get("OUTCOME_EVAL_RECENT_DAYS", "30"))
@@ -17,6 +18,7 @@ RECENT_DAYS = int(os.environ.get("OUTCOME_EVAL_RECENT_DAYS", "30"))
 
 def main() -> int:
     v = P.vault()
+    metrics, state_path, dashboard_path = compute_output_outcomes(v)
     cutoff = P.days_ago_iso(RECENT_DAYS)
     resolved = []
     for p, fm in P.predictions(v):
@@ -27,12 +29,18 @@ def main() -> int:
     briefs = [p for p in P.iter_pages(v, "briefings")]
     print("=== output-outcome-eval wake-gate ===")
     print(f"  vault: {v}\n  briefings: {len(briefs)}  ·  predictions resolved since {cutoff}: {len(resolved)}")
+    print(f"  deterministic metrics: {len(metrics)} rows -> {state_path}")
+    print(f"  dashboard: {dashboard_path}")
+    for metric in metrics:
+        print(f"  {metric['metric_label']}: {metric['value']:.1%} "
+              f"(N={metric['n_observations']}, small_n={metric['small_n']})")
     if len(resolved) < MIN_OUTCOMES or not briefs:
         print(f"  → SKIP: need >={MIN_OUTCOMES} recent outcomes AND briefings")
         print(json.dumps({"wakeAgent": False}))
         return 0
     print(f"  batch: {len(resolved)} recent outcome(s)\n")
-    print("Assess whether recent briefings' notable calls HELD UP against these resolved outcomes "
+    print("Interpret the deterministic joins in `dashboards/output-outcome-metrics`, then assess "
+          "whether recent briefings' notable calls HELD UP against these resolved outcomes "
           "(accuracy, not prose quality). Write `dashboards/output-outcome-eval` with hits/misses + "
           "patterns; cite the brief + the resolved prediction. Be specific and fair.\n=== recently resolved ===")
     for p, fm in resolved:

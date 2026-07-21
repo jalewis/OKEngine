@@ -12,7 +12,7 @@
 # (schema.yaml + persona + feeds + crons + content). See INSTALL.md and
 # docs/deploy-a-new-domain.md.
 version: 1
-engine_release: v0.11.5  # correctness patch: MCP graph hardening, composed-schema agreement, ingest provenance, cron-store ownership guard, bare-compose token seeding; see CHANGELOG.md
+engine_release: v0.13.0  # MINOR: write-path fabricated-source guard, reshard bare-ref rewriter + dangling-ref detector, entity-resolve alias coercion, assessments evidence/qualification (#343-349), private-pack publish hardening; see CHANGELOG.md
 
 runtime:
   # Hermes is a PINNED DEPENDENCY, not vendored into this repo. You clone Hermes
@@ -38,6 +38,7 @@ dependencies:
 engine_layer:
   okf_contract:
     - tools/schema_validator.py          # OKF conformance contract (validator + write-guard hook; prefers .okengine/composed-schema.yaml, okengine#133)
+    - tools/policy_plane.py              # canonical policy composition, capabilities, audit findings, coverage, and runtime digest (#283)
     - config/base-schema.yaml            # engine-owned universal layer merged under every pack schema
     # schema_lib.compose_schema (scripts/cron/) is the N-way fold (okengine#90 P3 / #133)
   cron_machinery:
@@ -45,6 +46,7 @@ engine_layer:
     - config/engine-crons.json           # the engine half of the cron fleet (source)
     - scripts/cron_pack_split.py         # split/merge/regen/dump generator
     - scripts/cron/                      # engine + engine-template scripts + shared libs (schema_lib, okf_migrate, kb_*, tier_*)
+    - config/source-connector.schema.yaml # declarative Bundle/Query/Enrichment/Stream/Poll contract
   ops_tooling:
     - scripts/deploy.sh                  # one-command pack bring-up: validate -> seed -> build -> compose up -> crons -> verify
     - scripts/post_deploy_verify.sh      # live end-to-end post-deploy checks (reader/MCP/write-path/cron-plus/qmd)
@@ -97,6 +99,7 @@ engine_layer:
     - docs/engine-domain-boundary.md
     - docs/sharded-scan-discipline.md    # rglob-vs-glob convention for sharded namespaces
     - docs/ingest-extraction.md          # stage-1 extraction pipeline + host-cron vs cron-plus rationale
+    - docs/source-connectors.md          # pack connector contract, fixtures, trust, archival, and runtime
     - docs/kb-tooling.md
     - docs/okf-alignment.md
     - docs/okf/                          # the OKF pattern guides (1-4) + deployment-topology

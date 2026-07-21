@@ -33,6 +33,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import schema_lib  # noqa: E402
+import tz_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 INDEX = VAULT / "wiki" / "index.md"
@@ -203,7 +204,7 @@ def render_index() -> str:
     out.append("# Wiki Index")
     out.append("")
     out.append("> Content catalog. Every page listed; a `sources` namespace shows the most recent.")
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now = tz_lib.deployment_now().strftime("%Y-%m-%d %H:%M %Z")  # okengine#301: deployment zone, not "UTC"
     summary = " | ".join(f"{ns.capitalize()}: {counts[ns]}" for ns in namespaces)
     out.append(f"> Generated: {now}" + (f" | {summary}" if summary else ""))
     out.append(f"> Rebuilt by `scripts/cron/rebuild_index.py` — re-run anytime; safe to overwrite.")

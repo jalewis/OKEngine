@@ -50,10 +50,15 @@ def _corrupt_archive(tmp_path):
 
 def test_iter_files_excludes_runtime_secrets_vcs(tmp_path):
     m = _mod()
-    files = {r.as_posix() for r in m.iter_files(_pack(tmp_path), include_secrets=False)}
+    pack = _pack(tmp_path)
+    (pack / ".hermes-data/cron-plus/jobs.json.bak.lacuna-daily").write_text("old\n")
+    (pack / ".hermes-data/cron-plus/jobs.json.pre-lint-crons").write_text("old\n")
+    files = {r.as_posix() for r in m.iter_files(pack, include_secrets=False)}
     assert "wiki/entities/a/acme.md" in files            # vault: kept
     assert ".hermes-data/config.yaml" in files           # runtime config: kept
     assert ".hermes-data/cron-plus/jobs.json" in files   # cron state: kept
+    assert ".hermes-data/cron-plus/jobs.json.bak.lacuna-daily" not in files
+    assert ".hermes-data/cron-plus/jobs.json.pre-lint-crons" not in files
     assert ".git/HEAD" not in files                      # VCS: skipped
     assert ".hermes-data/logs/big.log" not in files      # heavy logs: skipped
     assert ".env" not in files                           # secret: skipped
@@ -286,6 +291,28 @@ def test_sqlite_captured_consistently_and_sidecars_skipped(tmp_path):  # invaria
     rcon = sqlite3.connect(str(out / ".hermes-data" / "qmd" / "cache" / "qmd" / "index.sqlite"))
     assert rcon.execute("SELECT count(*) FROM t").fetchone()[0] == 50
     rcon.close()
+
+
+def test_qmd_model_cache_excluded_but_index_and_config_kept(tmp_path):
+    """Downloaded GGUF/cache payload is rebuildable; the SQLite index and small config are state."""
+    m = _mod()
+    p = _pack(tmp_path)
+    cache = p / ".hermes-data" / "qmd" / "cache" / "qmd"
+    cache.mkdir(parents=True)
+    (cache / "index.sqlite").write_bytes(b"sqlite placeholder")
+    (cache / "models" / "query-expansion.gguf").parent.mkdir()
+    (cache / "models" / "query-expansion.gguf").write_bytes(b"large model")
+    (cache / "downloads.json").write_text("{}\n")
+    config = p / ".hermes-data" / "qmd" / "config" / "collections.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text("collections: []\n")
+
+    files = {r.as_posix() for r in m.iter_files(p, include_secrets=False)}
+
+    assert ".hermes-data/qmd/cache/qmd/index.sqlite" in files
+    assert ".hermes-data/qmd/config/collections.yaml" in files
+    assert ".hermes-data/qmd/cache/qmd/models/query-expansion.gguf" not in files
+    assert ".hermes-data/qmd/cache/qmd/downloads.json" not in files
 
 
 def test_symlinks_excluded_are_warned(tmp_path, capsys):  # invariant-audit #60

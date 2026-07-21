@@ -112,6 +112,7 @@ def test_full_refresh_captures_last_seen_before_refresh(monkeypatch):  # invaria
 
     def fake_refresh():
         mtime["v"] = 200.0             # a page is written mid-refresh -> mtime advances past the index
+        return True                    # refresh SUCCEEDED (the contract is now bool; audit)
 
     monkeypatch.setattr(s, "_refresh_index", fake_refresh)
     s._index_maintainer_step(state)
@@ -137,3 +138,30 @@ def test_first_write_after_idle_indexes_on_next_poll(monkeypatch):
     mtime["v"] = clock.now
     s._index_maintainer_step(state)
     assert len(updates) == 1                         # indexed immediately on this poll
+
+
+def test_failed_incremental_update_does_not_mark_indexed(monkeypatch):
+    """invariant-audit: a `qmd update` that FAILS (rc!=0) must NOT advance last_seen — otherwise the
+    change reads as 'already indexed' and search stays stale until the next full refresh hours away."""
+    s, clock, state, updates, mtime = _rig(monkeypatch)
+    mtime["v"] = 500.0                                   # a page changed (cur=500 > last_seen=0)
+    monkeypatch.setattr(s, "_qmd", lambda args, timeout=1800: (1, "boom"))   # qmd FAILS
+    s._index_maintainer_step(state)                     # incremental branch runs, update fails
+    assert state["last_seen"] == 0.0, "a FAILED update wrongly marked the change indexed"
+    # a later SUCCESSFUL update advances it
+    monkeypatch.setattr(s, "_qmd", lambda args, timeout=1800: (0, ""))
+    clock.now = state["cooldown_until"] + 1
+    s._index_maintainer_step(state)
+    assert state["last_seen"] == 500.0, "a successful update must advance last_seen"
+
+
+def test_failed_full_refresh_leaves_seen_pending(monkeypatch):
+    """A failed FULL refresh must advance the periodic clock (no tight loop) but NOT mark the index
+    current — so the incremental branch keeps trying to catch the pending changes."""
+    s, clock, state, updates, mtime = _rig(monkeypatch)
+    state["last_full"] = 0.0                             # force the full-refresh branch
+    mtime["v"] = 100.0
+    monkeypatch.setattr(s, "_refresh_index", lambda: False)   # full refresh FAILS
+    s._index_maintainer_step(state)
+    assert state["last_full"] == clock.now, "periodic clock must advance (avoid tight retry loop)"
+    assert state["last_seen"] == 0.0, "a failed full refresh must NOT mark the index current"

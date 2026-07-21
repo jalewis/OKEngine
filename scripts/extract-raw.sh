@@ -27,10 +27,14 @@ RAW="${1:-${WIKI_PATH:-/opt/vault}/raw}"
 PY="${EXTRACT_PYTHON:-python3}"
 ts() { date -u +%FT%TZ; }
 
-# Single-flight: the first full pass over a large corpus can be long; never overlap.
-exec 9>"${TMPDIR:-/tmp}/okengine-extract-raw.lock"
+# Single-flight PER RAW ROOT: the first full pass over a large corpus can be long; never overlap
+# against the SAME corpus. A single global /tmp lock made unrelated vaults and concurrent pytest
+# processes block one another (okengine#204). cksum is POSIX and keeps the filename short.
+LOCK_KEY="$(printf '%s' "$RAW" | cksum | awk '{print $1}')"
+LOCK_FILE="${EXTRACT_LOCK_FILE:-${TMPDIR:-/tmp}/okengine-extract-raw-${LOCK_KEY}.lock}"
+exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
-    echo "$(ts) skip: previous extract-raw still running"
+    echo "$(ts) skip: previous extract-raw still running for raw=$RAW"
     exit 0
 fi
 

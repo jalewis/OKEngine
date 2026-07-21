@@ -1,8 +1,7 @@
 # OKEngine base schema — the engine-owned universal layer merged UNDER every
 # pack's schema.yaml (see scripts/cron/schema_lib.merged_schema). Packs declare
-# only their domain types on top; the universal fields and the global toggles
-# (okf.required / okf.should, strict_types) live here and are NOT pack-settable
-# under composition. Engine-owned — do not edit per deployment.
+# only their domain types on top; universal requirements live here. Packs may
+# opt into strict_types, but cannot loosen a stricter base/composed host.
 version: 1
 
 okf:
@@ -10,7 +9,7 @@ okf:
                           # after the P1 id backfill stamped every page (RFC composable-okpacks §5a)
   should:   []            # WARN tier — empty now that `id` is required
 
-strict_types: false       # engine-owned; packs cannot loosen/tighten under composition
+strict_types: false       # open by default; a pack may monotonically opt into true
 
 # Universal fields every page MAY carry. Informational only — undeclared extras
 # always pass through (the format is open/extensible); this list documents the
@@ -27,6 +26,18 @@ common_optional:
   - version
   - created_by
   - last_modified_by
+  - needs_review
+  - review_state
+  - review_id
+  - reviewed_by
+  - reviewed_on
+  - reviewed_at
+  - reviewed_version
+  - review_method
+  - review_policy
+  - authority
+  - authority_source_url
+  - authority_verified_fields
   - confidence
   - tags
   - aliases          # alternate/legacy ids — the id resolver consults these
@@ -74,12 +85,32 @@ field_enums:
 #           with the field named, so an agent that misreads the field name semantically (live
 #           incident: `recent_reports:` hand-set to a LIST of source paths, which then topped the
 #           cockpit's Most-active sort) gets an actionable error instead of poisoning dashboards.
+# Field ITEM contracts (okengine#211) — per-key rules for LIST-OF-DICT fields, enforced at the
+# write path like field_shapes. Grammar (declare under `field_items:` here, in a pack schema, or
+# in an extension schema fragment — one owner per field, duplicates are a compose FAIL):
+#   field_items:
+#     evidence:
+#       _item: {shape: dict, required: [direction, source]} # optional strict object contract
+#       direction: {enum: [reinforces, contradicts, partial, neutral]}  # inline, or a NAME into `enums:`
+#       confidence_before: {shape: number}    # numeric-string coerces; anything else rejects
+#       date: {shape: date}                   # ISO YYYY-MM-DD (bare YAML dates pass)
+#       source: {shape: str}
+#       deception_possible: {shape: bool}
+#       alternatives: {shape: list}
+#       context: {shape: dict}
+# Out-of-enum / wrong-shape item values REJECT the write with the exact location named — the
+# vocabulary a consumer buckets on is enforced at the boundary, never in prompts or synonym maps.
+# `_item` is opt-in: legacy item contracts remain permissive about scalar items and missing keys;
+# strict contracts can require every item be an object with specified non-empty keys.
+# The `evidence` declaration itself ships with the predictions extension (okengine#217).
+
 # Packs EXTEND this for their domain fields (a pack key wins on conflict), same as `field_enums`.
 field_shapes:
   aliases:       list   # alternate names/ids (id resolver + normalize-bare-name-links consume as list)
   tags:          list
   maintained_by: list   # provenance: packs that maintain the page (composition)
   discovered_by: list   # provenance: where the knowledge was first attributed
+  authority_verified_fields: list
   sources:       list   # primary citations — the ref_fields rule + grounding/staleness graph read
                         # these as a list; a scalar `sources: a, b` must split, not land as one blob
                         # (okengine#196's coercion forgot the very field it was for — invariant-audit)
@@ -140,6 +171,11 @@ tier:
 # A pack EXTENDS `rules` with its own (composed, additive). Rule kinds:
 #   ref_fields  — entries of the named frontmatter LIST fields must be page-paths (contain '/' or
 #                 end .md), not prose; a prose entry links nothing (no backlink / graph edge).
+#   nonempty_fields — the named frontmatter fields must be present AND non-empty (scalar
+#                 non-blank, list with >=1 entry) on pages of the rule's `type`. The capture
+#                 lane (feed_fetch raw landing) admits-with-flags BY DESIGN and bypasses the
+#                 write guard, so schema-required fields can land blank (e.g. `published:` on
+#                 a dateless feed item); this rule is the audit flag for that lane.
 # severity: fix (retroactively remediable) | forward-only (can't fabricate the past, informational).
 conformance:
   rules:
@@ -148,3 +184,9 @@ conformance:
       fields: [sources]
       severity: fix
       remediation: "relink-prose-sources (deterministic, unique slug match) + entity-backfill (LLM) for the rest; ambiguous prose left flagged"
+    - id: source-metadata-complete
+      kind: nonempty_fields
+      type: source
+      fields: [published]
+      severity: fix
+      remediation: "enrich_raw_years / date recovery from url+body where derivable; the rest are operator triage — a source page with no published date breaks by-date sharding and staleness math"

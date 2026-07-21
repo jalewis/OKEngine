@@ -1,0 +1,12 @@
+{
+  "connector_id": "reference.ror-organizations",
+  "cursor": "",
+  "deletions": 0,
+  "mode": "enrichment",
+  "new_revisions": 0,
+  "not_modified": false,
+  "observed_at": "2026-07-19T15:42:03Z",
+  "ok": true,
+  "records": 2,
+  "requests": 1
+}

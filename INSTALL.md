@@ -74,6 +74,14 @@ Both UIs bind to `OKENGINE_BIND` (default `127.0.0.1` — this machine only). To
 another machine on your LAN, set `OKENGINE_BIND=0.0.0.0` in `.env` **and** set the real passwords
 there, then `docker compose up -d` again (deliberate choice — see the `.env.example` comments).
 
+To make a network-exposed deployment safe without hunting through the individual flags, set
+`OKENGINE_HARDENED=1` in `.env`. It is a **fail-closed** profile: the daily in-gateway
+`deployment_validate` lane FAILs (and shows ERRORED in fleet health) until every unsafe setting is
+fixed — a real `OKENGINE_MCP_TOKEN`, reader auth (`OKENGINE_READER_PASSWORD`) or an explicit
+`OKENGINE_TRUST=public`, rate limiting on, exports off for a public reader, and **UI editing off**
+(`OKENGINE_EDITING=0` — the reader Chat can otherwise write back to the vault). It never mints
+secrets for you; it tells you exactly what to set. See [`SECURITY.md`](SECURITY.md).
+
 > **First deploy?** [`docs/cold-start-checklist.md`](docs/cold-start-checklist.md) lists the rough edges a from-scratch deploy hits and how to clear them.
 
 > **Where is `docker-compose.yml`?** Not in this engine repo — the engine is an *overlay*, not a
@@ -154,9 +162,12 @@ Copy the overlay paths from the OKEngine repo onto the Hermes tree. The
   ```bash
   # containerized deployment (the normal case): ensure-runtime.sh installs it automatically at
   # <pack>/.hermes-data/plugins/cron-plus (= /opt/data/plugins/cron-plus in the gateway), pinned.
-  # Manual form (or for a HOST-run hermes, at ~/.hermes/plugins/cron-plus instead):
-  git clone https://github.com/jalewis/hermes-cron-plus <pack>/.hermes-data/plugins/cron-plus
-  git -C <pack>/.hermes-data/plugins/cron-plus checkout ee6d9f18fd2269b7f323e200ae7138fdb2e676a6
+  # Manual/explicit form — ALWAYS use install-cron-plus.sh, never a bare clone: it pins to the
+  # manifest SHA AND applies the carried patches (job-env + after-ordering) that extension crons
+  # REQUIRE (per-job env for scoped MCP tokens; after: freshness ordering). A bare clone+checkout
+  # gives an UNPATCHED scheduler and silently-broken extension lanes.
+  bash $ENGINE_DIR/scripts/install-cron-plus.sh <pack>
+  # (for a HOST-run hermes, install into ~/.hermes/plugins/cron-plus and apply patches/cron-plus/*)
   # `cron-plus` under plugins.enabled in config.yaml (the seeded template already lists it)
   ```
 - **model-provider plugins** ship in the overlay (`plugins/model-providers/custom` — the local-Ollama `reasoning_effort:none` lever; `openrouter`).

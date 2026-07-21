@@ -1,0 +1,19 @@
+{
+  "fixture_version": 1,
+  "pages": [{
+    "headers": {"etag": "sec-submissions-v1"},
+    "body": {
+      "cik": "0000320193",
+      "entityType": "operating",
+      "name": "Example Public Company",
+      "tickers": ["EXMPL"],
+      "exchanges": ["Nasdaq"],
+      "filings": {"recent": {
+        "accessionNumber": ["0000320193-26-000001"],
+        "filingDate": ["2026-07-18"],
+        "form": ["8-K"],
+        "primaryDocument": ["example-8k.htm"]
+      }}
+    }
+  }]
+}

@@ -28,6 +28,12 @@ WIKI = Path(os.environ.get("WIKI_PATH", "/opt/vault")) / "wiki"
 MIN_DENSITY = int(os.environ.get("OKENGINE_LACUNA_MIN_DENSITY", "8"))      # config.min_density
 REANALYZE_DAYS = int(os.environ.get("OKENGINE_LACUNA_REANALYZE_DAYS", "90"))  # config.reanalyze_days
 BATCH = int(os.environ.get("OKENGINE_LACUNA_BATCH_SIZE", "3"))            # config.batch_size
+# OPERATOR TOPIC OVERRIDE (config.focus): pin lacuna to ONE concept field this run, bypassing the
+# density rank + the reanalyze rotation. Accepts a bare slug, a `concepts/<shard>/<slug>` path, or a
+# `[[concepts/…]]` wikilink (all fold to the slug). UNSET (default) keeps the autonomous behavior:
+# the densest unanalyzed field, everything considered. A focused field still needs a real concept
+# page + at least one referencing page; below min_density it maps with an extrapolation WARNING.
+FOCUS = os.environ.get("OKENGINE_LACUNA_FOCUS", "").strip()
 
 # Match `[[concepts/<slug>]]` AND sharded `[[concepts/<shard>/.../<slug>]]` (vaults shard a large
 # namespace by leading char, e.g. concepts/s/supply-chain-compromise), capturing the final slug so
@@ -179,6 +185,37 @@ def main() -> int:
           f"{sum(1 for s, p in refs.items() if len(p) >= MIN_DENSITY and _has_concept_page(s))}")
     print(f"  excluded (analyzed since {_cutoff()}): {len(recently)}")
     print(f"  eligible fields: {len(cands)}")
+
+    # FOCUS override: map an operator-pinned field, bypassing the density rank + rotation. Unset
+    # leaves the autonomous "densest unanalyzed field" path below untouched (everything considered).
+    if FOCUS:
+        focus = _slug_of(FOCUS)
+        density = len(refs.get(focus, ()))
+        print(f"\n  FOCUS: concepts/{focus} (operator override — bypasses density rank + "
+              f"{REANALYZE_DAYS}d rotation)")
+        if not focus or not _has_concept_page(focus):
+            print(f"  → SKIP: no concept page for '{focus or FOCUS}' — create the field anchor "
+                  f"(concepts/**/{focus or '<slug>'}.md) first; lacuna maps a NAMED field, not a "
+                  "dangling link.")
+            print(json.dumps({"wakeAgent": False}))
+            return 0
+        if density == 0:
+            print(f"  → SKIP: '{focus}' has a page but NO referencing pages — the field is empty. "
+                  f"Tag pages with [[concepts/{focus}]] to build it, then re-run.")
+            print(json.dumps({"wakeAgent": False}))
+            return 0
+        if density < MIN_DENSITY:
+            print(f"  ⚠ density {density} < min_density {MIN_DENSITY}: thinly sampled — step 6 will be "
+                  "EXTRAPOLATION, not inference. Proceeding because FOCUS is set.")
+        print(f"  field density: {density} referencing pages\n")
+        print("=== field to analyze (FOCUS) ===")
+        print("Run the 6-step lacuna procedure over THIS field. Record its density as "
+              "`surround_density`. DEFER only if you genuinely cannot name a force keeping a cell empty.\n")
+        print(f"## concept: {focus}  ({density} referencing pages)")
+        print(f"  field anchor: `[[concepts/{focus}]]`  ·  "
+              f"surround_density: `{_density_str(by_ns.get(focus, Counter()))}`\n")
+        print(json.dumps({"wakeAgent": True}))
+        return 0
 
     if not cands:
         print("  → SKIP: no dense, unanalyzed field to map")

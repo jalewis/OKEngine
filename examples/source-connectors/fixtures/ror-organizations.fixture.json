@@ -1,0 +1,28 @@
+{
+ "fixture_version": 1,
+ "pages": [
+  {
+   "headers": {},
+   "body": {
+    "number_of_results": 2,
+    "items": [
+     {
+      "id": "https://ror.org/00q4vv597",
+      "status": "active",
+      "names": [
+       {"value": "HKUST", "types": ["acronym"]},
+       {"value": "Hong Kong University of Science and Technology", "types": ["ror_display", "label"]}
+      ]
+     },
+     {
+      "id": "https://ror.org/05qghxh33",
+      "status": "active",
+      "names": [
+       {"value": "Example Research Lab", "types": ["ror_display", "label"]}
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}

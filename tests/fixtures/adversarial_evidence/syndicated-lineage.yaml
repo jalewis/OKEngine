@@ -1,0 +1,32 @@
+id: assessment:actor-candidate:targeting
+type: assessment
+subject: entities/a/actor-candidate
+question: Is the actor expanding into energy-sector targeting?
+claim: Reporting suggests energy-sector interest, but corroboration is unresolved.
+status: active
+as_of: 2026-07-16
+confidence: 0.40
+confidence_band: moderate
+proposed_confidence_change: 0.12
+consequence: medium
+alternatives:
+  - All reports repeat one vendor's victim list.
+adversarial_evidence:
+  - &origin
+    observation: Vendor Alpha reported an energy-sector victim.
+    source: sources/2026/07/vendor-alpha
+    observation_confidence: medium
+    diagnosticity: medium
+    manipulation_susceptibility: medium
+    source_independence: primary-direct
+    evidence_lineage: vendor-alpha-victim-list
+    claim_role: third-party-claim
+    deception_possible: false
+    collection_context: Original public report; underlying telemetry unavailable.
+    alternatives: [misclassification, opportunistic compromise]
+  - <<: *origin
+    source: sources/2026/07/news-beta
+    source_independence: shared-lineage
+  - <<: *origin
+    source: sources/2026/07/aggregator-gamma
+    source_independence: shared-lineage

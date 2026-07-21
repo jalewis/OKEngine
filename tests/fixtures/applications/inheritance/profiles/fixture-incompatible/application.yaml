@@ -1,0 +1,5 @@
+schema_version: 1
+id: fixture-incompatible
+version: 0.1.0
+name: Incompatible child
+extends: {profile: fixture-parent, version: ">=2.0.0"}

@@ -74,6 +74,16 @@ def test_enable_generates_composed_schema_then_disable_removes(tmp_path):
     assert not artifact.is_file()
 
 
+def test_composer_loads_schema_lib_from_flat_gateway_staging(tmp_path):
+    """deploy-cron-scripts flattens scripts/cron into /opt/data/scripts."""
+    comp = _load("extension_compose", COMP)
+    staged = tmp_path / "scripts"
+    staged.mkdir()
+    (staged / "schema_lib.py").write_text("LAYOUT = 'flat-staged'\n", encoding="utf-8")
+    comp._HERE = staged
+    assert comp._schema_lib().LAYOUT == "flat-staged"
+
+
 def test_write_path_enforces_extension_type_via_composed_artifact(tmp_path, monkeypatch):
     comp = _load("extension_compose", COMP)
     disc = _load("extension_discovery", DISC)

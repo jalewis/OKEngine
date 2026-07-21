@@ -1,0 +1,112 @@
+schema_version: 1
+
+rules:
+  - id: engine-authenticated-writer
+    owner: engine
+    description: Every non-administrative writer must resolve to a server-bound capability.
+    severity: reject
+    applies_to: {operation: write}
+    enforcement: [write, ci, deploy]
+    evaluator: field-capability
+    remediation: Use an authenticated administrative caller or a declared least-privilege actor capability.
+    override: forbidden
+    verified_by: [write, ci, deploy]
+
+  - id: source-quality-fields-only
+    owner: engine
+    description: Source-quality scoring may update only reliability and credibility on source pages.
+    severity: reject
+    applies_to:
+      actor: cron:source-quality-backfill
+      operation: update
+      namespace: sources
+      type: source
+    enforcement: [write, audit, ci, cockpit]
+    evaluator: field-capability
+    remediation: Use a two-field frontmatter patch containing reliability and credibility and no body mutation.
+    override: forbidden
+    verified_by: [write, audit, ci, cockpit]
+
+  - id: engine-strict-type-namespace
+    owner: engine
+    description: A knowledge page type must be declared and created in its canonical namespace.
+    severity: reject
+    applies_to: {operation: [create, update, import]}
+    enforcement: [write, importer, audit, ci]
+    evaluator: strict-type-namespace
+    remediation: Use a schema-declared canonical type and its configured home namespace.
+    override: forbidden
+    verified_by: [write, importer, audit, ci]
+
+  - id: engine-source-metadata-complete
+    owner: engine
+    description: Source records retain publisher and publication metadata when the capture provides it.
+    severity: review
+    applies_to: {namespace: sources, type: source}
+    enforcement: [write, audit, ci, cockpit]
+    evaluator: source-metadata-completeness
+    remediation: Recover publisher and publication time from the locally captured source and preserve provenance.
+    override: tighten-only
+    verified_by: [write, audit, ci, cockpit]
+
+  - id: engine-importer-envelope
+    owner: engine
+    description: Importers emit stable identity, revision, provenance, observation time, and payload.
+    severity: reject
+    applies_to: {operation: import}
+    enforcement: [importer, ci]
+    evaluator: importer-envelope
+    remediation: Populate the complete normalized connector envelope before committing output.
+    override: forbidden
+    verified_by: [importer, ci]
+
+  - id: engine-page-quality-review
+    owner: engine
+    description: Structurally incomplete knowledge pages are surfaced through the shared finding contract.
+    severity: review
+    applies_to: {operation: audit}
+    enforcement: [audit, cockpit]
+    evaluator: page-quality-finding
+    remediation: Repair or classify the page, then rerun the scheduled policy audit.
+    override: waivable
+    verified_by: [audit, cockpit]
+
+  - id: engine-policy-digest
+    owner: engine
+    description: Deployed effective policy must match the composed source policy digest.
+    severity: reject
+    applies_to: {operation: deploy}
+    enforcement: [ci, deploy, cockpit]
+    evaluator: policy-digest
+    remediation: Recompose policy and redeploy the runtime artifact from the merged engine and pack revisions.
+    override: forbidden
+    verified_by: [ci, deploy, cockpit]
+
+capabilities:
+  cron:source-quality-backfill:
+    rule_id: source-quality-fields-only
+    operations: [update]
+    paths: [sources/**]
+    types: [source]
+    update_fields: [reliability, credibility]
+    protected_fields:
+      - type
+      - id
+      - publisher
+      - published
+      - published_at
+      - url
+      - raw_capture
+      - status
+      - lifecycle
+      - tlp
+      - confidence
+      - maintained_by
+      - discovered_by
+      - extension_id
+      - created
+      - last_updated
+      - version
+    body: deny
+
+waivers: []

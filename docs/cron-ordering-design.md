@@ -1,7 +1,7 @@
 # Cross-lane cron ordering (#129)
 
-> **Status:** Phase 1 implemented (the `after:` contract + a deploy-time validation gate). Phase 2
-> (runtime enforcement) is designed below and deferred.
+> **Status:** Implemented. Phase 1 defines and validates the `after:` graph; Phase 2 enforces
+> successful-completion freshness atomically at the cron-plus claim boundary.
 
 ## Problem
 
@@ -35,7 +35,7 @@ overruns, the downstream runs on stale data and nothing notices.
 This makes `after:` *mean something* — a declared dependency that's verified before it can ship —
 without touching the Hermes scheduler. It does **not** yet change *when* jobs run.
 
-## Phase 2 — runtime enforcement *(deferred; design)*
+## Phase 2 — runtime enforcement *(implemented)*
 
 Two ways to make the order actually hold at runtime, in increasing fidelity:
 
@@ -43,17 +43,16 @@ Two ways to make the order actually hold at runtime, in increasing fidelity:
    topo order, the deploy assigns staggered `expr` times within a shared run window so a lane's
    `after:` deps fire earlier in the same cycle. Cheap and deterministic; still clock-based (a
    gross overrun spills to the next cycle — acceptable for daily fleets, the next run reconciles).
-2. **Wake-gate freshness (run-time, OKEngine-native — recommended).** A lane with `after: [A]`
-   only wakes when **A produced fresh output since this lane last ran**. OKEngine already gates
-   execution via the wake-gate protocol (`{"wakeAgent": bool}`); this extends it: each lane
-   stamps a "last produced" marker, and a shared `after_gate(deps)` helper checks the upstream
-   markers (or the scheduler's `last_run_at`) before waking. True dependency — robust to slips and
-   overruns — at the cost of eventual (next-tick) rather than immediate downstream runs.
+2. **Successful-completion freshness (run-time, implemented).** A due lane with `after: [A]` is
+   held at the scheduler's atomic claim boundary until **A completed successfully with output the
+   downstream has not already consumed**. Held jobs remain due and retry on the next scheduler
+   tick. Claiming an upstream clears its prior success value, closing the start-vs-completion race;
+   failed upstream or downstream runs do not consume freshness. Multiple dependencies are an
+   all-of gate. Runtime markers are scheduler state and are stripped from source artifacts.
 
-Recommended path: ship Phase 1 (done), adopt **(2)** when the first real `after:` chain lands
-(frontier-watch `board→alert` once those lanes are built), with **(1)** as an interim if a
-same-cycle guarantee is needed sooner. A full DAG-executing scheduler (a Hermes patch) is **not**
-recommended — it's heavier than either and couples the engine to scheduler internals.
+This is deliberately eventual (next scheduler tick), not an immediate DAG dispatch. It is robust
+to slips, overruns, failures, and different lane cadences without coupling OKEngine to a full DAG
+executor. The deployment still validates missing targets and cycles before this runtime boundary.
 
 ## Relationship to #109 (kickstart ordering)
 

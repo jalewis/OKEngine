@@ -15,14 +15,18 @@ no judgment), e.g.:
 It also fixes case-only drift (e.g. "Alpha" -> "alpha") against the pack's
 declared canonical type set. It deliberately does NOT invent remaps for
 heterogeneous values that need per-page classification — those that are not in
-the pack's alias map are left for the classify-drain cron.
+the pack's alias map are left for the classify-drain cron. A reviewed one-time
+migration may supply ``--map <yaml>``. It may be a flat old->canonical map, or
+contain ``types:`` plus page-specific ``paths:`` maps. Those entries are explicit
+migration data, not engine taxonomy.
 
 The engine ships ZERO domain taxonomy: both the canonical type set and the
 alias map are read at runtime from the governing schema.yaml. If the pack
 declared no `types:`, the case-only normalization is skipped (any type is
 accepted); if it declared no `type_aliases:`, nothing is remapped.
 
-Rewrites ONLY the `type:` line; everything else (frontmatter and body) stays
+Scans every authored page under ``wiki/`` (not only entities), resolving the
+governing schema per page. Rewrites ONLY the `type:` line; everything else stays
 byte-identical. Gated: writes only if the result still parses as a mapping with
 a `type:` and the body is unchanged. Idempotent. Pass --dry-run to report
 without writing.
@@ -44,10 +48,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import schema_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
-ENTITIES_DIR = VAULT / "wiki" / "entities"
+WIKI_DIR = VAULT / "wiki"
 
 _FM_RE = re.compile(r"\A(---[ \t]*\n)(.*?\n)(---[ \t]*\n)(.*)\Z", re.S)
-_TYPE_LINE_RE = re.compile(r"^type:[ \t]*(.+?)[ \t]*$", re.M)
+_TYPE_BLOCK_RE = re.compile(r"^type:[ \t]*[^\n]*(?:\n[ \t]+[^\n]*)*", re.M)
 
 
 def split_fm_body(text: str):
@@ -65,12 +69,25 @@ def target_type(cur_type: str, canonical: set[str], aliases: dict[str, str]) -> 
       - `canonical` (schema `types:` keys) — for case-only normalization. Empty
         set => skip the case check (accept any type, no built-in taxonomy)."""
     low = cur_type.lower()
-    if low in aliases:
-        return aliases[low]
+    ci_aliases = {str(k).casefold(): str(v) for k, v in aliases.items()}
+    if low.casefold() in ci_aliases:
+        return ci_aliases[low.casefold()]
     # Case-only normalization, only when the pack declared a canonical type set.
     if canonical and low in canonical and cur_type != low:
         return low
     return None
+
+
+def current_type(text: str) -> str:
+    parts = split_fm_body(text)
+    if parts is None:
+        return ""
+    try:
+        frontmatter = yaml.safe_load(parts[1]) or {}
+    except yaml.YAMLError:
+        return ""
+    value = frontmatter.get("type") if isinstance(frontmatter, dict) else None
+    return str(value) if value is not None else ""
 
 
 def remap(text: str, canonical: set[str], aliases: dict[str, str]) -> tuple[str | None, str, str]:
@@ -79,10 +96,16 @@ def remap(text: str, canonical: set[str], aliases: dict[str, str]) -> tuple[str 
     if parts is None:
         return None, "", ""
     opening, fm_body, closing, body = parts
-    m = _TYPE_LINE_RE.search(fm_body)
+    m = _TYPE_BLOCK_RE.search(fm_body)
     if not m:
         return None, "", ""
-    cur_type = m.group(1).strip().strip('"').strip("'")
+    try:
+        parsed = yaml.safe_load(fm_body) or {}
+    except yaml.YAMLError:
+        return None, "", ""
+    if not isinstance(parsed, dict) or parsed.get("type") is None:
+        return None, "", ""
+    cur_type = str(parsed["type"])
     new_type = target_type(cur_type, canonical, aliases)
     if not new_type or new_type == cur_type:
         return None, cur_type, ""
@@ -104,18 +127,40 @@ def remap(text: str, canonical: set[str], aliases: dict[str, str]) -> tuple[str 
 
 def main() -> int:
     dry = "--dry-run" in sys.argv[1:]
-    if not ENTITIES_DIR.is_dir():
-        print(f"No entities dir at {ENTITIES_DIR}")
-        print(json.dumps({"wakeAgent": False}))
-        return 0
-
-    schema = schema_lib.governing_schema(VAULT)
-    canonical = schema_lib.canonical_types(schema)
-    aliases = schema_lib.type_aliases(schema)
-    if not aliases and not canonical:
-        # No declared taxonomy or alias map: nothing the engine can safely remap.
-        print("=== schema-type-drain ===")
-        print("  no schema types/aliases declared — nothing to drain")
+    map_path = None
+    for i, arg in enumerate(sys.argv[1:]):
+        if arg == "--map" and i + 2 <= len(sys.argv[1:]):
+            map_path = Path(sys.argv[1:][i + 1])
+    map_path = map_path or (Path(os.environ["OKENGINE_TYPE_MAP"])
+                            if os.environ.get("OKENGINE_TYPE_MAP") else None)
+    explicit: dict[str, str] = {}
+    path_explicit: dict[str, str] = {}
+    if map_path:
+        try:
+            loaded = yaml.safe_load(map_path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            print(f"ERROR: cannot load type map {map_path}: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(loaded, dict):
+            print(f"ERROR: type map {map_path} must be a mapping", file=sys.stderr)
+            return 2
+        structured = "types" in loaded or "paths" in loaded
+        if structured:
+            if set(loaded) - {"types", "paths"}:
+                print(f"ERROR: structured type map {map_path} only accepts types/paths", file=sys.stderr)
+                return 2
+            explicit = loaded.get("types") or {}
+            path_explicit = loaded.get("paths") or {}
+        else:
+            explicit = loaded
+        for label, mapping in (("types", explicit), ("paths", path_explicit)):
+            if not isinstance(mapping, dict) or not all(
+                    isinstance(k, str) and isinstance(v, str) for k, v in mapping.items()):
+                print(f"ERROR: type map {map_path} {label} must be a string:string mapping",
+                      file=sys.stderr)
+                return 2
+    if not WIKI_DIR.is_dir():
+        print(f"No wiki dir at {WIKI_DIR}")
         print(json.dumps({"wakeAgent": False}))
         return 0
 
@@ -123,15 +168,26 @@ def main() -> int:
     perm_skips = 0
     by_map: dict[str, int] = {}
     print(f"=== schema-type-drain{' (DRY RUN)' if dry else ''} ===")
-    for p in sorted(ENTITIES_DIR.rglob("*.md")):
+    schemas: dict[Path, tuple[set[str], dict[str, str]]] = {}
+    for p in sorted(WIKI_DIR.rglob("*.md")):
         name = p.name
-        if name.startswith("_") or ".bak" in name or "_archive" in str(p):
+        if (name.startswith(("_", ".")) or name.lower() in {"bundle.md", "hot.md", "health.md"}
+                or name.upper().startswith("INDEX") or ".bak" in name or "_archive" in str(p)):
             continue
         try:
             text = p.read_text(errors="replace")
         except OSError:
             continue
-        new_text, old_t, new_t = remap(text, canonical, aliases)
+        ns = p.parent.relative_to(WIKI_DIR).as_posix()
+        govdir = schema_lib._governing_dir(VAULT, ns)
+        if govdir not in schemas:
+            schema = schema_lib.merged_schema(VAULT, ns)
+            schemas[govdir] = (schema_lib.canonical_types(schema), schema_lib.type_aliases(schema))
+        canonical, aliases = schemas[govdir]
+        rel = p.relative_to(WIKI_DIR).as_posix()
+        old_type = current_type(text)
+        page_map = {old_type: path_explicit[rel]} if old_type and rel in path_explicit else {}
+        new_text, old_t, new_t = remap(text, canonical, {**aliases, **explicit, **page_map})
         if new_text is None:
             continue
         key = f"{old_t} -> {new_t}"

@@ -35,6 +35,18 @@ def scopes_from_manifest(manifest: dict) -> tuple[list, list]:
     return read, write
 
 
+def write_capability_from_manifest(manifest: dict) -> dict:
+    """Return the optional field/body capability bound into the token record.
+
+    Path scopes remain in capabilities.write for compatibility.  The richer
+    contract is separately named so existing list-shaped manifests do not change
+    meaning during the incremental migration.
+    """
+    caps = manifest.get("capabilities") or {}
+    value = caps.get("write_policy") or {}
+    return dict(value) if isinstance(value, dict) else {}
+
+
 def _load(path: Path) -> dict:
     if not path.is_file():
         return {}
@@ -54,7 +66,8 @@ def _write_private(path: Path, data: dict) -> None:
         pass
 
 
-def mint(pack_dir, ext_id: str, read_scopes, write_scopes) -> str:
+def mint(pack_dir, ext_id: str, read_scopes, write_scopes,
+         write_capability: dict | None = None) -> str:
     """Mint (or rotate) a token for ext_id. Persists the SHA-256 + scopes to the store
     and the plaintext to the secrets file. Returns the plaintext (emitted once)."""
     pack = Path(pack_dir)
@@ -69,6 +82,7 @@ def mint(pack_dir, ext_id: str, read_scopes, write_scopes) -> str:
         "token_sha256": _sha256(token),
         "read_scopes": list(read_scopes or []),
         "write_scopes": list(write_scopes or []),
+        "write_capability": dict(write_capability or {}),
         "status": "active",
     })
     store["tokens"] = sorted(tokens, key=lambda r: r["ext_id"])
@@ -78,6 +92,50 @@ def mint(pack_dir, ext_id: str, read_scopes, write_scopes) -> str:
     sec[ext_id] = token
     _write_private(secrets_path, sec)
     return token
+
+
+def reconcile(pack_dir, ext_id: str, read_scopes, write_scopes,
+              write_capability: dict | None = None) -> dict:
+    """Make an enabled extension's stored scopes match its current manifest.
+
+    Preserve a valid active token so a manifest-only capability change does not break an already
+    deployed sidecar. Rotate only when either half of the credential is absent/inconsistent; in
+    that case retaining the old hash or plaintext would leave an unusable authorization record.
+    Returns ``{"token", "changed", "rotated"}``.
+    """
+    pack = Path(pack_dir)
+    store_path = pack.joinpath(*STORE_REL)
+    secrets_path = pack.joinpath(*SECRETS_REL)
+    store = _load(store_path)
+    sec = _load(secrets_path)
+    records = [r for r in store.get("tokens", [])
+               if isinstance(r, dict) and r.get("ext_id") == ext_id]
+    plaintext = sec.get(ext_id)
+    current = records[-1] if records else None
+    valid = (
+        isinstance(plaintext, str)
+        and bool(plaintext)
+        and current is not None
+        and current.get("status") == "active"
+        and current.get("token_sha256") == _sha256(plaintext)
+    )
+    if not valid:
+        token = mint(pack, ext_id, read_scopes, write_scopes, write_capability)
+        return {"token": token, "changed": True, "rotated": True}
+
+    desired = dict(current)
+    desired["read_scopes"] = list(read_scopes or [])
+    desired["write_scopes"] = list(write_scopes or [])
+    desired["write_capability"] = dict(write_capability or {})
+    desired["status"] = "active"
+    others = [r for r in store.get("tokens", [])
+              if not isinstance(r, dict) or r.get("ext_id") != ext_id]
+    changed = len(records) != 1 or desired != current
+    if changed:
+        store["tokens"] = sorted(others + [desired],
+                                 key=lambda r: str(r.get("ext_id") or ""))
+        _write_private(store_path, store)
+    return {"token": plaintext, "changed": changed, "rotated": False}
 
 
 def revoke(pack_dir, ext_id: str) -> None:

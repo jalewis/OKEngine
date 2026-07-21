@@ -115,7 +115,10 @@ def main() -> int:
 
     existing_entities = []
     for e in sorted((entities_dir).rglob("*.md")) if entities_dir.exists() else []:
-        text = e.read_text(errors="replace")
+        try:
+            text = e.read_text(errors="replace")
+        except OSError:
+            continue  # page moved/deleted by a concurrent lane mid-scan
         fm = parse_frontmatter(text)
         existing_entities.append({
             "filename": e.name,
@@ -125,9 +128,15 @@ def main() -> int:
             "title": first_h1(text) or e.stem,
         })
 
+    def _mtime(p):
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0  # vanished mid-scan; sorts last and the read guard below skips it
+
     sources = sorted(
         sources_dir.rglob("*.md"),
-        key=lambda p: -p.stat().st_mtime,
+        key=lambda p: -_mtime(p),
     )[:RECENT_SOURCES_N]
 
     print(f"# Entity-backfill digest — {datetime.now(timezone.utc).isoformat()}\n")
@@ -160,7 +169,10 @@ def main() -> int:
     print("## Recent source pages to scan for entity candidates\n")
     print("Read each, look for organizations/products/actors/notable items that recur across multiple sources and meet the vault CLAUDE.md trajectory rule (worth tracking over time).\n")
     for s in sources:
-        text = s.read_text(errors="replace")
+        try:
+            text = s.read_text(errors="replace")
+        except OSError:
+            continue  # page moved/deleted by a concurrent lane mid-scan
         fm = parse_frontmatter(text)
         title = first_h1(text) or s.stem
         publisher = fm.get("publisher") or ""

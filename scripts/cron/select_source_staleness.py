@@ -34,6 +34,7 @@ from source_decay import (  # type: ignore[import]
     STALE_THRESHOLD, compute_for, HALF_LIVES, DEFAULT_HALF_LIFE,
 )
 import schema_lib  # noqa: E402
+import tz_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 _SCHEMA = schema_lib.governing_schema(VAULT)
@@ -424,7 +425,7 @@ def render_dashboard(scores: dict[str, SourceScore], anchors: list[Anchor], toda
 
 
 def main() -> int:
-    today = datetime.now(timezone.utc).date()
+    today = tz_lib.deployment_today()   # okengine#301: staleness ages compare against deployment-TZ content dates
     print("=== select-source-staleness ===")
     print(f"  vault: {VAULT}")
     print(f"  stale threshold: {STALE_THRESHOLD}")

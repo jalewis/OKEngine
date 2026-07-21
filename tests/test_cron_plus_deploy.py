@@ -74,24 +74,35 @@ def test_install_cron_plus_targets_runtime_and_reads_pin():  # #20
     t = (S / "install-cron-plus.sh").read_text()
     assert ".hermes-data/plugins/cron-plus" in t
     assert "pinned_sha" in t and "dependencies.cron-plus" not in t.split("\n")[0]  # reads the manifest pin
+    assert "cron-plus/job-env.patch" in t and "cron-plus/after-ordering.patch" in t
+    assert "after_ordering.py" in t and "apply --reverse --check" in t
+    assert (REPO / "patches" / "cron-plus" / "job-env.patch").is_file()
+    assert (REPO / "patches" / "cron-plus" / "after-ordering.patch").is_file()
+    assert (REPO / "patches" / "cron-plus" / "after_ordering.py").is_file()
     r = subprocess.run(["bash", "-n", str(S / "install-cron-plus.sh")], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
 
 
-def test_cron_plus_pin_agrees_across_manifest_and_docs():  # #177 follow-up
-    """The cron-plus commit pin lives in THREE places that must agree — the manifest (what
-    ensure-runtime clones), INSTALL.md (the manual clone), and docs/supply-chain.md (the SBOM
-    row). A bump in one without the others reintroduces exactly the stale-pin regression this
-    guards: the manifest pointed one commit BEFORE TZ-aware scheduling, so fresh installs cloned
-    a UTC-naive scheduler that silently ignored TZ. Verify all three cite the same SHA."""
+def test_cron_plus_pin_agrees_across_manifest_and_docs():  # #177 follow-up; #6 (H6)
+    """The cron-plus pin must not DRIFT across the places that cite it. The manifest is the single
+    source of truth (what install-cron-plus.sh clones + patches). INSTALL.md must NOT hardcode the
+    SHA — it delegates to install-cron-plus.sh, so it cannot drift by construction (invariant-audit
+    HIGH #6; the old bare `git clone <sha>` in INSTALL.md was both a drift surface AND shipped an
+    UNPATCHED scheduler). docs/supply-chain.md (the SBOM row) legitimately cites the SHA and must
+    agree with the manifest. The regression this guards: the manifest once pointed one commit BEFORE
+    TZ-aware scheduling, so fresh installs cloned a UTC-naive scheduler that silently ignored TZ."""
     import re
     man = (REPO / "engine-manifest.yaml").read_text()
     m = re.search(r"cron-plus:.*?pinned_sha:\s*([0-9a-f]{40})", man, re.DOTALL)
     assert m, "engine-manifest.yaml: cron-plus pinned_sha (40-hex) not found"
     sha = m.group(1)
     install = (REPO / "INSTALL.md").read_text()
-    assert sha in install, \
-        f"INSTALL.md does not cite the manifest cron-plus pin {sha[:12]} — the clone command drifted"
+    # INSTALL.md delegates, never hardcodes — so it can't drift from the manifest.
+    assert "install-cron-plus.sh" in install, \
+        "INSTALL.md must install cron-plus via install-cron-plus.sh (pins + patches from the manifest)"
+    assert sha not in install, (
+        f"INSTALL.md hardcodes the cron-plus pin {sha[:12]} — remove it and delegate to "
+        f"install-cron-plus.sh; a hardcoded SHA in docs is a drift surface (invariant-audit #6)")
     sc = (REPO / "docs" / "supply-chain.md").read_text()
     # supply-chain.md abbreviates as `<first8>…<last5>`; accept either the full or that form
     assert sha in sc or (sha[:8] in sc and sha[-5:] in sc), \
@@ -167,17 +178,39 @@ def test_install_cron_plus_force_recovers_a_dirty_managed_clone(tmp_path):  # in
         return subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(cwd), capture_output=True, text=True).stdout.strip()
 
     up = tmp_path / "upstream"; up.mkdir(); git("init", "-q", cwd=up)
-    (up / "cli.py").write_text("# cli\n"); (up / "jobs.py").write_text("OLD\n")
+    (up / "cli.py").write_text("# cli\n")
+    (up / "jobs.py").write_text("OLD\n")
     git("add", "-A", cwd=up); git("commit", "-qm", "A", cwd=up)
     old = rev(up)
     (up / "jobs.py").write_text("NEW-PINNED\n")
     git("add", "-A", cwd=up); git("commit", "-qm", "B", cwd=up)
     new = rev(up)
 
-    eng = tmp_path / "fake-engine"; (eng / "scripts").mkdir(parents=True)
+    eng = tmp_path / "fake-engine"
+    (eng / "scripts").mkdir(parents=True)
+    (eng / "patches" / "cron-plus").mkdir(parents=True)
     (eng / "engine-manifest.yaml").write_text(
         f"dependencies:\n  cron-plus:\n    upstream: file://{up}\n    pinned_sha: {new}\n")
     shutil.copy(S / "install-cron-plus.sh", eng / "scripts" / "install-cron-plus.sh")
+    # This test exercises the installer's carried-patch lifecycle independently
+    # of the real dependency's runner.py context.
+    (eng / "patches" / "cron-plus" / "job-env.patch").write_text(
+        "diff --git a/jobs.py b/jobs.py\n"
+        "--- a/jobs.py\n"
+        "+++ b/jobs.py\n"
+        "@@ -1 +1,2 @@\n"
+        " NEW-PINNED\n"
+        "+JOB-ENV-PATCHED\n"
+    )
+    (eng / "patches" / "cron-plus" / "after-ordering.patch").write_text(
+        "diff --git a/cli.py b/cli.py\n"
+        "--- a/cli.py\n"
+        "+++ b/cli.py\n"
+        "@@ -1 +1,2 @@\n"
+        " # cli\n"
+        "+AFTER-ORDERING-PATCHED\n"
+    )
+    (eng / "patches" / "cron-plus" / "after_ordering.py").write_text("# policy overlay\n")
 
     pack = tmp_path / "pack"; dest = pack / ".hermes-data" / "plugins" / "cron-plus"
     dest.parent.mkdir(parents=True)
@@ -188,8 +221,16 @@ def test_install_cron_plus_force_recovers_a_dirty_managed_clone(tmp_path):  # in
                        capture_output=True, text=True, env=genv)
     assert r.returncode == 0, f"aborted on a dirty managed clone:\n{r.stderr}"   # the bug
     assert rev(dest) == new, "did not recover to the pin"
-    assert (dest / "jobs.py").read_text() == "NEW-PINNED\n", "local edit not discarded"
+    assert (dest / "jobs.py").read_text() == "NEW-PINNED\nJOB-ENV-PATCHED\n", \
+        "local edit was not discarded and replaced by the carried patch"
+    assert (dest / "cli.py").read_text() == "# cli\nAFTER-ORDERING-PATCHED\n"
+    assert (dest / "after_ordering.py").read_text() == "# policy overlay\n"
     assert "discarding LOCAL" in r.stderr, "must surface the discarded change, not silently drop it"
+
+    again = subprocess.run(["bash", str(eng / "scripts" / "install-cron-plus.sh"), str(pack)],
+                           capture_output=True, text=True, env=genv)
+    assert again.returncode == 0, again.stderr
+    assert "already applied" in again.stdout
 
 
 def test_cron_plus_logs_reads_container_not_host_hermes():  # invariant-audit #15
@@ -298,6 +339,18 @@ def test_cron_scripts_deploy_reconciles_stale_fossils():  # invariant-audit #46
     t = (S / "deploy-cron-scripts.sh").read_text()
     assert "reconcile" in t and "os.unlink(p)" in t and "ALLOW=" in t, \
         "deploy-cron-scripts must remove flat staged fossils no longer in source"
+
+
+def test_cron_scripts_stage_runtime_schema_composer_and_engine_extensions():
+    """The in-gateway validator must be able to freshly compose engine + pack +
+    enabled extensions; recorded artifact fragments are not a source-of-truth."""
+    t = (S / "deploy-cron-scripts.sh").read_text()
+    for helper in ("extension_compose.py", "extension_discovery.py", "extension_manifest.py"):
+        assert helper in t
+    assert "/opt/data/extensions" in t
+    assert "rm -rf /opt/data/extensions" in t, "stale engine extensions must be reconciled"
+    assert "RUNTIME_COMPOSE_HELPERS" in t and 'printf \'%s\\n\'' in t, \
+        "runtime helpers must be retained by flat-script fossil reconciliation"
 
 
 def test_deploy_rebuilds_on_dirty_engine_tree():  # invariant-audit #9

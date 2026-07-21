@@ -114,6 +114,157 @@ def test_regrade_skips_with_no_recent_sources(tmp_path, monkeypatch):
     assert wake is True
 
 
+def _edges(root: Path, edges: dict):
+    (root / "wiki" / ".reevaluation-edges.json").write_text(json.dumps({"edges": edges}))
+
+
+def _state(root: Path, **values):
+    (root / "wiki" / ".prediction-regrade-watermark.json").write_text(json.dumps(values))
+
+
+def test_regrade_dependency_maps_only_changed_cited_source(tmp_path, monkeypatch):
+    _vault(tmp_path, monkeypatch)
+    import os
+    import time
+    now = time.time_ns()
+    os.utime(tmp_path / "wiki" / "sources" / "s-old.md", ns=(now - 100_000, now - 100_000))
+    os.utime(tmp_path / "wiki" / "sources" / "s-new.md", ns=(now, now))
+    _edges(tmp_path, {
+        "sources/s-new": [{"page": "predictions/p-akira"}],
+        "sources/s-old": [{"page": "predictions/p-overdue"}],
+    })
+    _state(tmp_path, watermark_ns=now - 50_000, last_fallback_ns=now)
+    wake, out = _run(_load("select_regrade_batch"))
+    assert wake is True
+    assert "dependency-matched prediction(s)" in out
+    assert "Akira X" in out and "APT42 Y" not in out
+    assert "sources/s-new.md" in out and "sources/s-old.md" not in out
+
+
+def test_regrade_watermark_advances_and_no_change_skips(tmp_path, monkeypatch):
+    _vault(tmp_path, monkeypatch)
+    _edges(tmp_path, {"sources/s-new": [{"page": "predictions/p-akira"}]})
+    _state(tmp_path, watermark_ns=0, last_fallback_ns=__import__("time").time_ns())
+    mod = _load("select_regrade_batch")
+    wake, _ = _run(mod)
+    first = json.loads((tmp_path / "wiki" / ".prediction-regrade-watermark.json").read_text())
+    assert wake is True and first["watermark_ns"] > 0
+    wake, out = _run(mod)
+    second = json.loads((tmp_path / "wiki" / ".prediction-regrade-watermark.json").read_text())
+    assert wake is False and "no cited source changed" in out
+    assert second["watermark_ns"] >= first["watermark_ns"]
+
+
+def test_regrade_edge_less_prediction_gets_reduced_frequency_fallback(tmp_path, monkeypatch):
+    _vault(tmp_path, monkeypatch)
+    # p-akira is indexed; p-overdue has no edge and must remain reachable.
+    _edges(tmp_path, {"sources/s-old": [{"page": "predictions/p-akira"}]})
+    _state(tmp_path, watermark_ns=__import__("time").time_ns(), last_fallback_ns=0)
+    wake, out = _run(_load("select_regrade_batch"))
+    assert wake is True and "fallback=used" in out
+    assert "APT42 Y" in out and "fresh" in out
+
+
+def test_regrade_invalid_edge_artifact_preserves_legacy_path(tmp_path, monkeypatch):
+    _vault(tmp_path, monkeypatch)
+    (tmp_path / "wiki" / ".reevaluation-edges.json").write_text("not-json")
+    wake, out = _run(_load("select_regrade_batch"))
+    assert wake is True and "legacy batch" in out
+
+
+def test_regrade_cap_carries_overflow_without_losing_source_change(tmp_path, monkeypatch):
+    _vault(tmp_path, monkeypatch)
+    # Add a third open prediction, with more evidence than the existing two so #216's
+    # starved-first ordering deliberately defers it when MAX_PRED=2.
+    _mk(tmp_path, "predictions", "p-served",
+        "type: prediction\nstatus: open\nconfidence: 0.6\nsubject: entities/x\n"
+        "title: already served\nevidence:\n"
+        "- {date: 2026-06-01, direction: neutral, confidence_before: 0.6, "
+        "confidence_after: 0.6, source: sources/s-old}\n")
+    _edges(tmp_path, {
+        "sources/s-new": [
+            {"page": "predictions/p-akira"},
+            {"page": "predictions/p-overdue"},
+            {"page": "predictions/p-served"},
+        ],
+    })
+    _state(tmp_path, watermark_ns=0, last_fallback_ns=__import__("time").time_ns())
+    monkeypatch.setenv("PREDICTION_REGRADE_MAX_PRED", "2")
+    mod = _load("select_regrade_batch")
+
+    wake, first_out = _run(mod)
+    first = json.loads((tmp_path / "wiki" / ".prediction-regrade-watermark.json").read_text())
+    assert wake is True and "2 dependency-matched" in first_out
+    assert "already served" not in first_out
+    assert first["pending"] == {"predictions/p-served": ["sources/s-new"]}
+
+    # No source mtime changed after the first scan, but the durable pair still emits next run.
+    wake, second_out = _run(mod)
+    second = json.loads((tmp_path / "wiki" / ".prediction-regrade-watermark.json").read_text())
+    assert wake is True and "already served" in second_out and "sources/s-new.md" in second_out
+    assert second["pending"] == {}
+
+
+def test_regrade_source_cap_carries_remaining_sources(tmp_path, monkeypatch):
+    _vault(tmp_path, monkeypatch)
+    _mk(tmp_path, "sources", "s-second",
+        "type: source\npublished: '2026-06-19'\ntitle: second fresh\n")
+    _edges(tmp_path, {
+        "sources/s-new": [{"page": "predictions/p-akira"}],
+        "sources/s-second": [{"page": "predictions/p-akira"}],
+    })
+    _state(tmp_path, watermark_ns=0, last_fallback_ns=__import__("time").time_ns())
+    monkeypatch.setenv("PREDICTION_REGRADE_MAX_SRC", "1")
+    mod = _load("select_regrade_batch")
+
+    wake, first_out = _run(mod)
+    first = json.loads((tmp_path / "wiki" / ".prediction-regrade-watermark.json").read_text())
+    assert wake is True
+    assert sum(path in first_out for path in ("sources/s-new.md", "sources/s-second.md")) == 1
+    assert len(first["pending"]["predictions/p-akira"]) == 1
+
+    wake, second_out = _run(mod)
+    second = json.loads((tmp_path / "wiki" / ".prediction-regrade-watermark.json").read_text())
+    assert wake is True
+    assert sum(path in second_out for path in ("sources/s-new.md", "sources/s-second.md")) == 1
+    assert second["pending"] == {}
+    combined = first_out + second_out
+    assert "sources/s-new.md" in combined and "sources/s-second.md" in combined
+
+
+def test_regrade_wakes_for_recommendation_without_new_source(tmp_path, monkeypatch):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-06-19")
+    _mk(tmp_path, "predictions", "p", "type: prediction\nstatus: open\nconfidence: 0.5\n"
+        "subject: entities/x\ntitle: scored claim\n")
+    data = tmp_path / "data"
+    path = data / "state" / "okengine.predictions" / "confidence-recommendations.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "proposition": "predictions/p", "confidence_before": .5,
+        "confidence_after_suggested": .6, "delta_suggested": .1,
+        "events": [{"evidence_index": 0, "event_id": "events/e",
+                    "update_driver": {"signal_strength": .8}}],
+    }) + "\n")
+    monkeypatch.setenv("HERMES_DATA", str(data))
+    wake, out = _run(_load("select_regrade_batch"))
+    assert wake is True and "deterministic recommendation" in out
+    assert "0.5 -> 0.6" in out and "deviation reason" in out
+
+
+def test_skeptic_fallback_blocks_third_raise_until_counterevidence(monkeypatch):
+    monkeypatch.setenv("PREDICTION_RECOMMENDER_SKEPTIC_AFTER_RAISES", "2")
+    mod = _load("select_regrade_batch")
+    raises = {"evidence": [
+        {"direction": "reinforces", "confidence_before": .5, "confidence_after": .6},
+        {"direction": "reinforces", "confidence_before": .6, "confidence_after": .7},
+    ]}
+    assert mod.skeptic_fallback_allows_raise(raises) is False
+    raises["evidence"].append({"direction": "neutral", "confidence_before": .7,
+                                "confidence_after": .7, "note": "skeptic pass"})
+    assert mod.skeptic_fallback_allows_raise(raises) is True
+
+
 def test_empty_vault_all_skip(tmp_path, monkeypatch):
     monkeypatch.setenv("WIKI_PATH", str(tmp_path))
     monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-06-19")

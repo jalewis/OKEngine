@@ -1,0 +1,21 @@
+proposition: forecasts/f1
+proposition_type: forecast
+changed_evidence: [sources/report-a]
+assessment_change:
+  prior: {confidence: 0.60}
+  new: {confidence: 0.45}
+  cause: sources/report-a
+  evidence: [sources/report-a]
+  evaluator: deterministic-plus-analyst
+  method: bounded-update-v1
+review:
+  required: true
+  status: approved
+  reviewer: fixture-analyst
+resolution:
+  status: refuted
+  outcome: forecast did not occur by its declared deadline
+learning:
+  measure: calibration_or_outcome_quality
+  value: 0.3025
+

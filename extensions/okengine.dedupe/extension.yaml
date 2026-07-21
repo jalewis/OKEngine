@@ -3,12 +3,16 @@ kind: operation
 version: 0.1.0
 name: Dedupe
 description: >-
-  Surfaces likely DUPLICATE entities — distinct pages whose normalized name collides, or whose
-  name matches another page's `aliases:` — and proposes merges: tombstone the loser with
-  `superseded_by` and absorb its aliases/sources into the canonical. Deterministic detection
-  (a wake-gate selector) + an agent merge lane. Domain-agnostic KB hygiene; the engine does
-  STRUCTURAL canonicalization, this catches "same entity, different name". Opt-in (proposes
-  mutations + spends model). A first-party reference for an agent op that mutates via the guard.
+  Duplicate-page hygiene, two lanes. entity-merge surfaces likely DUPLICATE entities —
+  distinct pages whose normalized name collides, or whose name matches another page's
+  `aliases:` — and proposes merges via an agent: tombstone the loser with `superseded_by`
+  and absorb its aliases/sources into the canonical ("same entity, different name").
+  same-story merges duplicate SOURCE pages describing one article — a composed multi-pack
+  deployment fetches the same feed item through several packs' raw/ trees and ingest mints
+  a page per copy, double-counting every per-story signal downstream ("same story,
+  different slug"; exact raw-basename/URL matching only, no_agent, zero tokens).
+  Domain-agnostic KB hygiene; the engine does STRUCTURAL canonicalization, this catches
+  content duplication. Opt-in (mutates pages; entity-merge also spends model).
 
 trust: in-gateway
 requires:
@@ -16,17 +20,27 @@ requires:
 
 capabilities:
   read: [wiki/**]
-  write: [entities/**]
+  write: [wiki/**]   # winners+tombstones in entities/ + sources/, AND inbound-reference
+                     # rewrites touch whatever cites a merged page — truthfully broad
   network: false
   secrets: []
   delivery: false
 
-operation:
-  schedule: {kind: cron, expr: "40 5 * * *"}   # daily 05:40
-  entrypoint: select_dup_candidates.py          # wake-gate: name/alias-collision groups
-  prompt_file: prompts/dedupe.md
-  toolsets: [hermes-cron, okengine-write, okengine]
-  timeout: 1200
+operations:
+  entity-merge:
+    schedule: {kind: cron, expr: "40 5 * * *"}   # daily 05:40
+    entrypoint: select_dup_candidates.py          # wake-gate: name/alias-collision groups
+    prompt_file: prompts/dedupe.md
+    toolsets: [file, todo, okengine-write, okengine]
+    timeout: 1200
+  # RENAME NOTE: this extension previously declared a single anonymous `operation:` whose
+  # synthesized job was named `okengine.dedupe`. It is now `okengine.dedupe:entity-merge` —
+  # a redeploy regenerates the job under the new name; remove any stale `okengine.dedupe`
+  # job left in a deployment's runtime store.
+  same-story:
+    schedule: {kind: cron, expr: "25 5 * * *"}   # daily, after overnight ingest, before entity-merge
+    entrypoint: same_story_dedupe.py              # no prompt -> no_agent script op, ZERO tokens
+    timeout: 900
 
 config:
   max_groups:

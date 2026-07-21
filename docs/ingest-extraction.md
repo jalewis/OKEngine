@@ -1,5 +1,9 @@
 # Raw document extraction (binary/markup → text companion → ingest)
 
+For opt-in revision-aware capture of HTML and plain-text links discovered by
+feeds, see [Revision-aware web capture](web-capture.md). The hard-format
+extraction described here remains a separate downstream concern.
+
 How non-plain-text source files (PDF, HTML, Word, PowerPoint) get turned into
 agent-ingestible text. This is an
 **engine-level** subsystem: domain-agnostic, knows nothing but "document in, text

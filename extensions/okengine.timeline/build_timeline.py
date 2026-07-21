@@ -16,7 +16,9 @@ except Exception:                              # pragma: no cover - yaml is a ru
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
 DASH_PATH = WIKI / "dashboards" / "timeline.md"
-MAX_ENTRIES = int(os.environ.get("OKENGINE_CONFIG_MAX_ENTRIES", "300"))
+MAX_ENTRIES = int(os.environ.get(
+    "OKENGINE_CONFIG_MAX_ENTRIES", os.environ.get("OKENGINE_TIMELINE_MAX_ENTRIES", "300")
+))
 
 _FM = re.compile(r"^---\n(.*?)\n---\n", re.S)
 _DATE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")

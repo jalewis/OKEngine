@@ -1,0 +1,36 @@
+profile: continuous-hypothesis
+profile_version: 1.0.0
+bindings:
+  propositions:
+    - type: forecast
+      namespace: forecasts
+      status_field: status
+      open_values: [open]
+      resolved_values: [confirmed, refuted, ambiguous]
+      confidence_field: confidence
+      evidence_field: evidence
+      resolution_field: outcome
+      review_field: needs_review
+      operations: {reassess: forecast-reassess, resolve: forecast-resolve, measure: forecast-measure}
+    - type: diagnostic
+      namespace: diagnostics
+      status_field: status
+      open_values: [active, disputed]
+      resolved_values: [resolved, withdrawn]
+      confidence_field: confidence_band
+      evidence_field: evidence
+      resolution_field: resolution
+      review_field: needs_review
+      operations: {reassess: diagnostic-reassess, resolve: diagnostic-resolve, measure: diagnostic-measure}
+surfaces:
+  dependency_explanation: dashboards/reevaluation-impact
+  assessment_review: dashboards/assessment-review
+  portfolio_learning: dashboards/epistemic-learning
+queues:
+  affected_reassessment: diagnostics-and-forecasts
+  assessment_review: dashboards/assessment-review
+success_measures:
+  caused_reassessment_precision: dashboards/reevaluation-impact
+  review_queue_age: dashboards/assessment-review
+  resolution_yield: dashboards/epistemic-learning
+  calibration_or_outcome_quality: dashboards/epistemic-learning

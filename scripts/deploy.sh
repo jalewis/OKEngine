@@ -111,6 +111,15 @@ if ! "$PYTHON" -c "import sys, pathlib; sys.path.insert(0, '$ENGINE_DIR/scripts'
 fi
 echo "    schema artifact recomposed from current schema.yaml + extensions"
 
+# Materialize the exact composed policy that write, audit, CI, and Cockpit consume.
+# This is generated runtime state; a digest mismatch is a deploy failure, not a warning.
+if ! OKENGINE_POLICY_CATALOG="$ENGINE_DIR/config/policy/catalog.yaml" \
+     "$PYTHON" "$ENGINE_DIR/tools/policy_plane.py" materialize --vault "$PACK"; then
+    echo "==> [1c/6] FAILED: policy composition/materialization failed" >&2
+    exit 1
+fi
+echo "    policy artifact composed from engine + pack + enabled extension policy"
+
 # 2. seed the runtime dir + ensure it's writable by HERMES_UID BEFORE compose binds it,
 #    and install the cron-plus scheduler plugin into the runtime (the seeded config
 #    enables it, so it must be present before the gateway starts).

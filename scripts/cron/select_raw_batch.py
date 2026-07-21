@@ -198,7 +198,10 @@ def main() -> int:
     processed: set[str] = set()
     if sources_dir.exists():
         for src in sources_dir.rglob("*.md"):
-            processed |= extract_processed_paths(src.read_text(errors="replace"))
+            try:
+                processed |= extract_processed_paths(src.read_text(errors="replace"))
+            except OSError:
+                continue  # page moved/deleted by a concurrent lane mid-scan
 
     all_raw: list[tuple[str, str, int, float]] = []
     bogus_paths: list[str] = []
@@ -242,7 +245,10 @@ def main() -> int:
             continue
         rel = str(p.relative_to(VAULT))
         norm = normalize_path(rel)
-        mtime = p.stat().st_mtime
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue  # file removed/moved by a concurrent lane mid-scan
         all_raw.append((rel, norm, derive_year(rel, mtime), mtime))
 
     unprocessed_all = [(rel, year, mtime) for (rel, norm, year, mtime) in all_raw if norm not in processed]
@@ -345,6 +351,14 @@ def main() -> int:
           "provenance keys the raw page carries. Copy what exists; never invent values. These keys "
           "are schema-legal on every type (base common_optional) — dropping them loses the vault's "
           "ability to attribute/filter by ingest source (okengine#194).\n")
+    print("Keep source roles separate: `publisher` is the organization/site that published the "
+          "article; `source_feed` is the repository or feed that supplied it; `source_channel` is "
+          "the transport (for example `api` or `feed`); and `matched_query` is discovery context. "
+          "Never put a retrieval repository/feed, a search engine, or text such as `via <feed>` "
+          "in `publisher`. Preserve `published` from the raw record and omit an "
+          "unknown field — never write placeholder strings such as `undefined`. If `publisher` is "
+          "absent, identify it from the article URL or leave it unset; do not substitute "
+          "`source_feed`, `source_channel`, or `matched_query`.\n")
     print("If a raw file DUPLICATES a story that already has a source page (different slug), do NOT "
           "create a second page — instead APPEND this raw path to that existing source's `raw:` list "
           "(via `mcp_okengine_write_update_entity`). That records it as processed so it stops being "

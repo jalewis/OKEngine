@@ -1,0 +1,22 @@
+schema_version: 1
+id: fixture-child
+version: 0.1.0
+name: Fixture child
+extends:
+  profile: fixture-parent
+  version: ">=1.1.0"
+binding_contract:
+  required_roles:
+    decision_record:
+      minimum: 1
+      required_fields: [type, namespace, subject_field, status_field]
+      required_operations: [refresh]
+      allow_multiple: true
+operating_loop:
+  - {id: decide, capability: decision, after: [assess]}
+required_surfaces: [decision_trace]
+required_queues: [decision_queue]
+required_success_measures: [decision_latency]
+policy:
+  optional_review: true
+  reviewed_decisions: true

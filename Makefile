@@ -1,6 +1,6 @@
 # OKEngine dev tasks. See CONTRIBUTING.md. Run `make help` for the list.
 .DEFAULT_GOAL := help
-.PHONY: help dev test lint scrub preflight test-release scaffold-check check audit coverage typecheck docker-smoke smoke-e2e render-lint content-lint publish-snapshot
+.PHONY: help dev test lint scrub preflight test-release release-evidence scaffold-check check audit coverage typecheck docker-smoke smoke-e2e sandbox-start sandbox-stop sandbox-reset render-lint content-lint publish-snapshot
 
 help:  ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -24,6 +24,10 @@ preflight:  ## verify the canonical release-test environment (deps/tools present
 test-release:  ## full suite with the ALLOWED-SKIP policy enforced — a missing-dep skip FAILS (okengine#204)
 	bash scripts/preflight.sh
 	python scripts/check-test-skips.py
+
+release-evidence:  ## validate EVIDENCE=... and optional TAG=... against the release-audit policy
+	@test -n "$(EVIDENCE)" || { echo "usage: make release-evidence EVIDENCE=scripts/audit/evidence/vX.Y.Z.json [TAG=vX.Y.Z]"; exit 2; }
+	python scripts/audit/release_evidence.py validate "$(EVIDENCE)" $(if $(TAG),--tag "$(TAG)")
 
 scaffold-check:  ## scaffold a pack and validate it end-to-end
 	rm -rf /tmp/okengine-scaffold-check
@@ -58,6 +62,18 @@ smoke-e2e:  ## render-surface e2e: seed a vault, run reader/cockpit/mcp, assert 
 	# rendered HTML/PDF + rendered DOM — the render/integration regressions unit fixtures miss.
 	# Point SMOKE_PYTHON at a venv with pytest (+ playwright & system Chrome for the DOM layer).
 	bash tests/e2e/smoke/smoke-e2e.sh
+
+sandbox-start:  ## start the verified local sample vault (reader :9880, cockpit :9881, MCP :8880)
+	# Reuse the render-smoke stack as the contributor sandbox: it builds the images, verifies every
+	# surface against seeded content, then leaves the loopback-only stack running for exploration.
+	bash tests/e2e/smoke/smoke-e2e.sh --keep
+
+sandbox-stop:  ## stop the local sample-vault sandbox and remove its disposable index volume
+	docker compose -f tests/e2e/smoke/docker-compose.smoke.yml down -v --remove-orphans
+
+sandbox-reset:  ## reset disposable sandbox state, rebuild/verify it, and leave it running
+	$(MAKE) sandbox-stop
+	$(MAKE) sandbox-start
 
 render-lint:  ## sweep a LIVE deployment's whole vault through the reader and flag rendered-output defects
 	# The real-data companion to smoke-e2e: crawls every page via the reader and flags leaked

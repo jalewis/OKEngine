@@ -36,6 +36,9 @@ for _p in ("/opt/hermes", str(Path(__file__).resolve().parents[2])):
         sys.path.insert(0, _p)
 from tools.schema_validator import schema_reject_reason  # type: ignore[import]
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # scripts/cron, for sibling libs
+import tz_lib  # noqa: E402
+
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
 REPORT = WIKI / "operational" / "schema-conformance.md"
@@ -101,7 +104,7 @@ def main() -> int:
             worst.append((p.relative_to(VAULT).as_posix(), reason))
 
     pct = 100.0 * (scanned - bad) / scanned if scanned else 100.0
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now = tz_lib.deployment_now().strftime("%Y-%m-%d %H:%M %Z")  # okengine#301: deployment zone, not "UTC"
 
     lines = [
         "---", "type: dashboard", 'title: "Schema Conformance (OKF + domain)"', "---",

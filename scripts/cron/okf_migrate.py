@@ -181,6 +181,34 @@ def reshard_seg(reshard_by: str, slug: str, fm: dict) -> "str | None":
     return fn(slug, fm) if fn else None
 
 
+def write_key(root: Path, namespace: str, slug: str, fm: dict | None = None) -> str:
+    """Wiki-relative key (no .md) a direct writer should use.
+
+    Existing pages are updated in place so an importer never forks a page merely because a
+    reshard/migration has not run yet. New pages include the configured ``reshard_by`` segment
+    immediately. That distinction matters once an oversized namespace has been split: continuing
+    to mint pages in the base bucket makes the daily reshard job and importer recreate opposite
+    sides of a partition collision forever (okengine#243).
+
+    ``canonical_key`` remains the base partition key used by the migration/oversize detector;
+    direct writers and collision cleanup should use this helper.
+    """
+    root = Path(root)
+    fm = fm or {}
+    base_key = canonical_key(root, namespace, slug, fm)
+    pcfg = _partition_cfg(_governing_schema(root, namespace), namespace)
+    seg = reshard_seg(pcfg.get("reshard_by"), slug, fm)
+    desired = f"{base_key.rsplit('/', 1)[0]}/{seg}/{slug}" if seg else base_key
+    desired_path = root / "wiki" / f"{desired}.md"
+    if desired_path.is_file():
+        return desired
+
+    existing = find_page(root, namespace, slug)
+    if existing is not None:
+        return existing.relative_to(root / "wiki").as_posix()[:-3]
+    return desired
+
+
 def _is_reshard_bucket(cur: str, new: str, pcfg: dict, slug: str, fm: dict) -> bool:
     """True when `cur` is the canonical key `new` split ONE level deeper into a VALID reshard
     sub-bucket (`<canonical-prefix>/<reshard-seg>/<slug>`), so build_map leaves it in place instead
@@ -255,6 +283,29 @@ def make_rewriter(move_map: dict[str, str], namespace: str):
         key, delim = mt.group(1), mt.group(2)
         new = move_map.get(key)
         return f"[[{new}{delim}" if new else mt.group(0)
+
+    return pat, repl
+
+
+def make_path_rewriter(move_map: dict[str, str]):
+    """Rewrite BARE path references to a moved page — not [[wikilinks]] (make_rewriter's job).
+
+    A page can point at another by its plain wiki-relative path in a frontmatter scalar
+    (e.g. an assessment's `subject: entities/a/foo`) or in prose, with no `[[ ]]` around it.
+    make_rewriter never sees those, so a reshard that only fixes wikilinks leaves every bare
+    reference dangling — the exact break that stranded assessment subjects when big `entities/`
+    buckets split a level deeper. This matches each old key as a WHOLE path token: the
+    boundaries keep `entities/a/foo` from matching inside a longer slug (`entities/a/foobar`)
+    or an already-deeper path, and the `[`/`/` lookbehind leaves `[[…]]` links (and paths that
+    are themselves segments of a longer path) to the wikilink rewriter. Longest-key-first so a
+    key that is a prefix of another can't shadow it."""
+    if not move_map:
+        return re.compile(r"(?!x)x"), (lambda mt: mt.group(0))   # matches nothing
+    alt = "|".join(re.escape(k) for k in sorted(move_map, key=len, reverse=True))
+    pat = re.compile(r"(?<![\w/\-\[])(" + alt + r")(?![\w/\-])")
+
+    def repl(mt):
+        return move_map.get(mt.group(1), mt.group(0))
 
     return pat, repl
 

@@ -460,11 +460,47 @@ every page of type T) are staged as a small JSON binding file at deploy time.
 This keeps the extension/UI boundary data-only: a new map, quadrant, or
 chip-strip needs zero frontend changes.
 
+Application profiles may also select engine-owned, read-only projections through a Cockpit
+`tab_defs` box. The threat-informed-detection profile supplies three native views:
+
+| View | Projection |
+|---|---|
+| `tid-trace` | source evidence → procedure → requirement → strategy → analytic revision → deployment → validation → coverage → outcome |
+| `tid-actor-posture` | actor-level roll-up of procedure coverage without changing the underlying assessments |
+| `tid-facet-matrix` | versioned coverage rows across relevance, observability, telemetry, implementation, deployment, validation, signal path, and operational effectiveness |
+| `tid-detection-dossier` | exact repository/deployed revisions, strategy, telemetry prerequisites, validation history, limitations, and dependencies |
+| `tid-validation-queue` | deterministic ordering by consequence, missing or stale validation, revision change, and pending review, with every scoring reason exposed |
+| `tid-gap-workbench` | proposed-through-validated lifecycle, governed decision context, optimistic version, review identity/state, and expirable deferral or accepted risk |
+
+These views resolve the application declaration's role bindings rather than hard-coding a pack.
+Every assessed cell links back to its canonical record. Missing links render as `Unknown` or
+`Unassessed`, superseded assessments remain visible as history, and no projection writes canonical
+state. A pack enables them like any other declarative box:
+
+```yaml
+cockpit:
+  tabs: [tid]
+  tab_defs:
+    tid:
+      label: Detection
+      boxes:
+        - {title: Threat-to-defense trace, span: 12, view: tid-trace}
+        - {title: Actor defensive posture, span: 12, view: tid-actor-posture}
+        - {title: Coverage facets, span: 12, view: tid-facet-matrix}
+        - {title: Detection dossier, span: 12, view: tid-detection-dossier}
+        - {title: Validation queue, span: 12, view: tid-validation-queue}
+        - {title: Gap workbench, span: 12, view: tid-gap-workbench}
+```
+
 ### 9.4 Index/graph artifacts
 
-`corpus_indexer.py` builds JSONL indexes over any OKF vault (page → type,
-fields, links) consumed by lanes and dashboards, complementing the same-purpose
-runtime queries.
+`corpus_indexer.py` builds one JSONL view per schema-owned knowledge namespace.
+`corpus_query.py` is the stable streaming read API over those artifacts: it can
+load any pack-defined namespace and provides common source, prediction, and
+event-score filters. `corpus_lookup.py` lets synthesis wake-gates reuse an
+optional pack-owned question corpus by matching canonical questions to related
+entity/concept slugs. The engine supplies the mechanism; question taxonomy and
+curated question pages remain pack content.
 
 ---
 
@@ -834,7 +870,7 @@ okengine-mcp/server.py         read MCP (search/get_page/find_references)
 okengine-reader/               reading UI          okengine-cockpit/  operator UI
 scripts/cron/                  engine + engine-template lanes, schema_lib, llm_lib
 scripts/cron_pack_split.py     fleet composition   scripts/extension_compose.py
-scripts/framework.py           pack CLI (init/validate/extensions)
+scripts/framework.py           operator CLI (pack lifecycle + composed operations)
 scripts/build-engine-image.sh  pin-verified image build
 scripts/ensure-runtime.sh      pre-compose runtime seeding + hazard unlocks
 scripts/deploy-cron-*.sh       deploy surfaces

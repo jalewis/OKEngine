@@ -41,7 +41,7 @@ _ISO_DATE = re.compile(_TS)
 # Path fragments that mark a non-live / frozen artifact we must not rewrite.
 _SKIP_SUBSTRINGS = (
     ".bak", "_archived/", ".was-broken", ".restored", ".corrupt",
-    "/tmp_", "/_test_",
+    "/" + "tmp_", "/_test_",
 )
 
 

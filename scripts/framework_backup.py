@@ -69,10 +69,17 @@ def _excluded(rel: Path, include_secrets: bool) -> bool:
     for pre in _SKIP_PREFIXES:
         if s == pre or s.startswith(pre + "/"):
             return True
+    # qmd's cache co-locates the restorable SQLite search index with ~2 GB of downloaded GGUF model
+    # blobs and other rebuildable caches. Keep SQLite databases (captured consistently by the online
+    # backup path below), but never copy the heavyweight model/cache payload into every vault backup.
+    if s.startswith(".hermes-data/qmd/cache/") and not _is_sqlite(rel):
+        return True
     if not include_secrets and s in _SECRET_PATHS:
         return True
     if any(rel.name.endswith(sc) for sc in _SQLITE_SIDECARS):
         return True                     # transient sqlite WAL/journal — folded into the db snapshot
+    if s.startswith(".hermes-data/cron-plus/") and rel.name.startswith("jobs.json."):
+        return True                     # superseded runtime copy; may be root-only and is not active state
     return False
 
 

@@ -51,6 +51,8 @@ def test_covers_every_required_surface():
         "cockpit checked only if compose defines it (B7.5)": 'grep -Fxq "$COCKPIT"',
         "api_server exposure (#120)": "api_server is LAN-exposed",
         "read-MCP baked-lib drift (M-B4.1)": "read-MCP $lib is STALE",
+        "policy digest verification (#283)": "runtime policy digest matches composed source",
+        "least-privilege capability probe (#283)": "source-quality capability probe rejects",
         # NB: the iwe-dep check (#168) was intentionally removed by #179 — backlinks-refresh now
         # builds the graph with an in-process link-scanner and needs no gateway iwe binary, so the
         # verifier no longer probes for it. (Stale required-surface entry dropped.)
@@ -90,3 +92,13 @@ def test_checks_config_at_runtime_mount_not_vault():
     body = VERIFY.read_text()
     assert "CFG=/opt/data/config.yaml" in body, "verifier should read the runtime config at /opt/data"
     assert "/opt/vault/.hermes-data/config.yaml" not in body, "stale vault config path still present"
+
+
+def test_verifier_engine_path_cannot_be_overwritten_by_pack_env():
+    """#283: deployments legitimately pin ENGINE_DIR in .env. The verifier's
+    own merged source path must use a private name so sourcing that file cannot
+    redirect the expected-policy calculation to an old or missing checkout."""
+    body = VERIFY.read_text()
+    assert 'VERIFY_ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"' in body
+    assert 'OKENGINE_POLICY_CATALOG="$VERIFY_ENGINE_DIR/config/policy/catalog.yaml"' in body
+    assert 'python3 "$VERIFY_ENGINE_DIR/tools/policy_plane.py" digest' in body

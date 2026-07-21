@@ -1,0 +1,35 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+title: OKEngine local evidence resolution result
+type: object
+required: [contract, policy_id, subject_ref, question_kind, status, resolved, unresolved,
+  held_alias_matches, malformed, searched, snapshot_digest]
+properties:
+  contract: {const: local-evidence-resolution/v1}
+  policy_id: {type: string, minLength: 1}
+  subject_ref: {type: string, minLength: 1}
+  subject_title: {type: string}
+  question_kind: {type: string, minLength: 1}
+  status: {enum: [resolved, failed]}
+  snapshot_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+  searched:
+    type: object
+    required: [local_pages, declared_references]
+    properties:
+      local_pages: {type: integer, minimum: 0}
+      declared_references: {type: integer, minimum: 0}
+      resolved_artifacts: {type: integer, minimum: 0}
+      unresolved_references: {type: integer, minimum: 0}
+  resolved:
+    type: array
+    items:
+      type: object
+      required: [artifact, artifact_digest, artifact_type, source_identity,
+        ingestion_provenance, evidence_access, evidence_lineage, claim_role,
+        subject_match_basis, identity_transfer, reference, reference_origin]
+  unresolved:
+    type: array
+    items:
+      type: object
+      required: [reference, origin, reason]
+  held_alias_matches: {type: array}
+  malformed: {type: array}

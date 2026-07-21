@@ -39,3 +39,10 @@ If a patch fails to apply after a Hermes bump, `git apply --3way` it against the
 new version, resolve, and regenerate the `.patch` (`git diff <sha^> <sha> -- <file>`).
 Full bump records (internal): `docs/hermes-upgrades/v2026.7.7.2-v0.18.2.md`,
 `docs/hermes-upgrades/v2026.7.1-v0.18.0.md`.
+
+**Watch items to fold into the next bump** (deferred; tracked in GitLab):
+- **okengine#255** — pick up the upstream DeepSeek-v4 **pricing snapshot + reasoning-timeout
+  floor**. The fleet runs `deepseek-v4-flash`/`-pro`, but this pin predates those entries, so
+  budget-guard cost accounting for v4 is approximate and the reasoning timeout uses a default
+  (accuracy only — v4 resolves + runs fine, the ids are served natively by the DeepSeek API).
+  Reconcile against carried patch 04 (`04-usage-pricing-models.patch`), which may overlap.

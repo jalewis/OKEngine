@@ -8,8 +8,8 @@ keep the fullest body, delete the losers, and rewrite `[[links]]` that pointed a
 
 This is the "dedup pass" that okf_migrate.build_map deliberately HOLDS collisions back for (it
 refuses to move a page onto an occupied seat). The winning path is chosen by
-okf_migrate.canonical_key — the SAME function the reshelve drain and the importers
-(_okf_write.write_page) use — so cleanup, importer, and drain agree and the duplication loop
+okf_migrate.write_key — the SAME function direct importers use — so cleanup, importer, reshard,
+and drain agree and the duplication loop
 cannot re-open. deployment_validate.check_partition_dups() FAILs until this has run.
 
 Safety: bodies are union-merged by keeping the LONGEST; if two copies carry materially different
@@ -124,7 +124,7 @@ def dedup_namespace(root: Path, ns: str, apply: bool) -> tuple[dict[str, str], l
         paths = sorted(paths, key=lambda p: (-len(p.parts), p.as_posix()))
         parsed = [(p, *_read(p)) for p in paths]
         merged_fm = _merge_fm([fm for _p, fm, _b in parsed])
-        canonical = okf_migrate.canonical_key(root, ns, slug, merged_fm)   # the ONE true path
+        canonical = okf_migrate.write_key(root, ns, slug, merged_fm)   # writer/reshard contract
         dest = wiki / (canonical + ".md")
         bodies = [b.strip() for _p, _fm, b in parsed if b.strip()]
         winner_body = max(bodies, key=len) if bodies else ""

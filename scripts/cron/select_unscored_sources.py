@@ -15,7 +15,6 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -97,7 +96,10 @@ def main() -> int:
 
     print()
     print(f"=== batch ({len(chosen)} of {len(unscored)} unscored) ===")
-    print(f"Process IN ORDER. Score each in-place by updating frontmatter only — do NOT rewrite the body.\n")
+    print("Process IN ORDER. Update ONLY `reliability` and `credibility`. Do not send or change "
+          "type, id, version, created, last_updated, publisher, published, source_kind/kind, "
+          "title, URL, raw, TLP, confidence, or the body. Missing metadata remains an explicit "
+          "quality problem for its repair lane; never write `undefined` or invent a value.\n")
     for i, (p, fm) in enumerate(chosen, 1):
         rel = p.relative_to(VAULT).as_posix()
         publisher = fm.get("publisher") or "(no publisher)"
@@ -109,7 +111,8 @@ def main() -> int:
         print(f"   raw={raw_path}")
 
     print()
-    print(f"After scoring: append a single `wiki/log.md` entry: `## [{datetime.now(timezone.utc).strftime('%Y-%m-%d')}] source-quality-backfill | {len(chosen)} sources scored`. Then respond with exactly `[SILENT]`.")
+    print("Each accepted patch is logged automatically by the governed write server. Do not edit "
+          "wiki/log.md or any other page. Then respond with exactly `[SILENT]`.")
     print()
     print(json.dumps({"wakeAgent": True}))
     return 0

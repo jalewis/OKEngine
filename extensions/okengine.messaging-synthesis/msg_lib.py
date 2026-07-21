@@ -22,7 +22,10 @@ _FM = re.compile(r"\A---\s*\n(.*?)\n---", re.S)
 def anchor_path() -> Path:
     """PRODUCT_ANCHOR_PATH env (operator/pack config) wins; else the pack default under the
     vault. The extension SHIPS NO anchor — an absent file just means 'no product configured'."""
-    p = os.environ.get("PRODUCT_ANCHOR_PATH", "").strip()
+    p = os.environ.get(
+        "PRODUCT_ANCHOR_PATH",
+        os.environ.get("OKENGINE_MESSAGING_SYNTHESIS_PRODUCT_ANCHOR_PATH", ""),
+    ).strip()
     return Path(p) if p else (VAULT / "config" / "product-anchor.yaml")
 
 

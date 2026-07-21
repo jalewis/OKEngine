@@ -1,0 +1,11 @@
+{
+  "fixture_version": 1,
+  "pages": [{
+    "body": {"count": 2, "results": [
+      {"document_number": "2026-15001", "title": "Example final rule", "type": "Rule", "publication_date": "2026-07-18", "html_url": "https://www.federalregister.gov/d/2026-15001"},
+      {"document_number": "2026-15002", "title": "Example notice", "type": "Notice", "publication_date": "2026-07-18", "html_url": "https://www.federalregister.gov/d/2026-15002"}
+    ]}
+  }, {
+    "body": {"count": 2, "results": []}
+  }]
+}

@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -35,6 +36,7 @@ _WORKDIR = "/opt/vault"
 # run.py can't collide, and isolated from the flat engine/pack scripts dir.
 SCRIPTS_ROOT = "/opt/data/scripts"
 TRIGGER_NAME = "trigger.sh"            # the generated sidecar launcher (#135)
+_ENV_TOKEN_RE = re.compile(r"[^A-Z0-9]+")
 
 
 def _discovery_mod():
@@ -49,6 +51,54 @@ def _job_id(ext_id: str) -> str:
     """Deterministic 12-hex job id from the extension id — reproducible from the
     manifest (no clock/random), so regeneration is stable."""
     return hashlib.sha1(ext_id.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]  # deterministic id, not security
+
+
+def extension_config_env_name(ext_id: str, key: str) -> str:
+    """Canonical, collision-safe env name for one in-gateway config value (#210).
+
+    The engine-owned ``okengine.`` id prefix is omitted for readability; every
+    remaining non-alphanumeric run becomes ``_``.  Third-party ids retain their
+    full namespace, so ``acme.example`` and ``other.example`` cannot collide.
+    """
+    namespace = ext_id[len("okengine."):] if ext_id.startswith("okengine.") else ext_id
+    ns_token = _ENV_TOKEN_RE.sub("_", namespace.upper()).strip("_")
+    key_token = _ENV_TOKEN_RE.sub("_", str(key).upper()).strip("_")
+    if not ns_token or not key_token:
+        raise ValueError(f"cannot form config env name from extension={ext_id!r}, key={key!r}")
+    return f"OKENGINE_{ns_token}_{key_token}"
+
+
+def _env_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _in_gateway_config_env(ext_id: str, manifest: dict) -> tuple[dict[str, str], list[str]]:
+    """Manifest ``config:`` values rendered for cron-plus' per-job environment."""
+    config = manifest.get("config") or {}
+    if not isinstance(config, dict):
+        return {}, [f"{ext_id}: config must be a mapping"]
+    env: dict[str, str] = {}
+    owners: dict[str, str] = {}
+    errors: list[str] = []
+    for key, declaration in config.items():
+        try:
+            name = extension_config_env_name(ext_id, key)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        if name in owners:
+            errors.append(
+                f"{ext_id}: config keys {owners[name]!r} and {key!r} both map to {name}"
+            )
+            continue
+        owners[name] = str(key)
+        value = declaration.get("default") if isinstance(declaration, dict) else declaration
+        env[name] = _env_value(value)
+    return env, errors
 
 
 def _iter_ops(m: dict) -> tuple[list[tuple[str | None, dict]], str | None]:
@@ -267,6 +317,12 @@ def synthesize_ops(record: dict) -> tuple[list[dict], list[str], list[str]]:
         return [], errors, warnings
 
     trust = m.get("trust")
+    config_env: dict[str, str] = {}
+    if trust != "sidecar":
+        config_env, config_errors = _in_gateway_config_env(ext_id, m)
+        errors.extend(config_errors)
+        if config_errors:
+            return [], errors, warnings
     ext_dir = record.get("dir")
     ops, err = _collect_ops(m, ext_dir)         # manifest operation(s) + crons/*.cron.json (#63 P1)
     if err:
@@ -287,6 +343,10 @@ def synthesize_ops(record: dict) -> tuple[list[dict], list[str], list[str]]:
         if job["name"] in local_seen:           # defensive — keys are unique by construction
             errors.append(f"{ext_id}: duplicate operation job name {job['name']}")
         local_seen.add(job["name"])
+        if trust != "sidecar" and config_env:
+            # cron-plus' runner applies this mapping to its isolated subprocess
+            # environment before either the wake-gate or agent is invoked.
+            job["env"] = dict(config_env)
         jobs.append(job)
     return jobs, errors, warnings
 
@@ -480,7 +540,7 @@ def render_sidecar_service(spec: dict, mcp_url: str, write_url: str,
         "security_opt": ["no-new-privileges:true"],
         "cap_drop": ["ALL"],
         "read_only": True,
-        "tmpfs": ["/tmp"],
+        "tmpfs": [str(Path("/") / "tmp")],
         "pids_limit": int((spec.get("limits") or {}).get("pids", 256)),
         "mem_limit": str((spec.get("limits") or {}).get("memory", "1024m")),
         "cpus": float((spec.get("limits") or {}).get("cpus", 1.0)),
@@ -495,7 +555,11 @@ def render_sidecar_service(spec: dict, mcp_url: str, write_url: str,
 # --- composed schema (okengine#90 P3 / #133) ------------------------------
 
 def _schema_lib():
-    p = _HERE / "cron" / "schema_lib.py"
+    # Repository layout keeps schema_lib under scripts/cron; gateway staging
+    # intentionally flattens cron scripts into /opt/data/scripts. Support both
+    # layouts so the deployed validator can reproduce a full source composition.
+    candidates = (_HERE / "cron" / "schema_lib.py", _HERE / "schema_lib.py")
+    p = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
     spec = importlib.util.spec_from_file_location("schema_lib", p)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)

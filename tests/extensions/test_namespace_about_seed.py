@@ -70,3 +70,8 @@ def test_noop_without_about_md(tmp_path):
     target = _ext(tmp_path, about_text=None)                    # extension ships no about.md
     fe._seed_about(tmp_path, target)
     assert not (tmp_path / "wiki" / "foo" / "_about.md").exists()
+
+
+def test_assessment_methodology_has_a_reader_title():
+    text = (REPO / "extensions" / "okengine.assessments" / "about.md").read_text()
+    assert text.startswith("---\ntitle: How assessments work\n---\n")

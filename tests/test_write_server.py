@@ -116,6 +116,27 @@ def test_create_degenerate_page_is_flagged_needs_review(vault):
     assert "needs_review: true" in page
 
 
+def test_entity_path_designation_conflict_is_flagged_for_quarantine(vault):
+    """The Gentlemen regression: Storm-2698 in the path vs Storm-2697 in aliases."""
+    m, root = vault
+    res = m._create("entities/gentlemen-ransomware-group-storm-2698",
+                    "type: actor\nname: The Gentlemen\naliases: [Storm-2697]",
+                    "A substantive profile body with enough detail for review.")
+    assert res.startswith("created") and "flagged for review" in res
+    page = next((root / "wiki" / "entities").rglob("gentlemen-ransomware-group-storm-2698.md"))
+    assert "needs_review: true" in page.read_text()
+    assert "identity contradiction" in (root / "wiki" / "_review-queue.md").read_text()
+
+
+def test_matching_entity_designation_is_not_flagged(vault):
+    m, root = vault
+    res = m._create("entities/storm-2697", "type: actor\nname: Storm-2697\naliases: [The Gentlemen]",
+                    "A substantive profile body with enough detail for review.")
+    assert res.startswith("created") and "flagged for review" not in res
+    page = next((root / "wiki" / "entities").rglob("storm-2697.md"))
+    assert "needs_review" not in page.read_text()
+
+
 # ── _safe path normalization — dotted slugs must not be truncated ─────────────────────────────────
 
 def test_dotted_slug_not_truncated(vault):
@@ -131,6 +152,16 @@ def test_dotted_slug_not_truncated(vault):
     bad = root / "wiki" / "sources" / "2026" / "07" / "openssl-3.0.md"
     assert good.is_file(), "dotted slug must keep its full stem + .md"
     assert not bad.exists(), "must NOT truncate at the last dot"
+
+
+def test_create_rejects_whitespace_and_run_on_basenames(vault):
+    m, root = vault
+    spaced = m._create("entities/a/prose sentence", {"type": "entity", "name": "X"}, "body")
+    assert spaced.startswith("refused: unsafe wiki path")
+    long_slug = "x" * 81
+    run_on = m._create(f"entities/x/{long_slug}", {"type": "entity", "name": "X"}, "body")
+    assert run_on.startswith("refused: unsafe wiki path")
+    assert not list((root / "wiki" / "entities").rglob(f"{long_slug}.md"))
 
 
 # ── engine-generated root dashboards are write-refused (paired with the validator exemption) ───────
@@ -306,6 +337,23 @@ def test_valid_create(vault):
     assert fm["last_updated"] == "2026-06-15"
     assert "create" in _log_text(root)
     assert "entities/vendor/acme.md v1" in _log_text(root)
+
+
+def test_strict_pack_normalizes_type_alias_and_rejects_unknown(vault):
+    m, root = vault
+    (root / "schema.yaml").write_text(
+        _SCHEMA.replace("strict_types: false", "strict_types: true")
+        + "\ntype_aliases: {thing: entity}\n", encoding="utf-8")
+    m.schema_lib._SCHEMA_CACHE.clear()
+    m.schema_reject_reason.__globals__["_schema_cache"].clear()
+    m.schema_reject_reason.__globals__["_dir_to_schema"].clear()
+    created = m._create("entities/a/aliased", {"type": "thing", "name": "Aliased"}, "body")
+    assert created.startswith("created"), created
+    fm, _ = m._read_page(root / "wiki" / "entities" / "a" / "aliased.md")
+    assert fm["type"] == "entity"
+    rejected = m._create("entities/a/unknown", {"type": "wildcat", "name": "Unknown"}, "body")
+    assert "unknown type 'wildcat'" in rejected
+    assert not (root / "wiki" / "entities" / "a" / "unknown.md").exists()
 
 
 def test_entity_shard_normalized_to_one_level(vault):
@@ -631,6 +679,75 @@ def test_append_creates_missing_section(vault):
     assert "## Claim" in txt
 
 
+def test_append_section_normalizes_prefixed_heading(vault):
+    """okengine#242: an agent may pass an already-`##`-prefixed section name. The create
+    path must NOT double-prefix (`## ## Recent activity` — the fleet-wide corruption class).
+    Both create and re-append on the same page must produce exactly ONE `## Recent activity`."""
+    m, root = vault
+    _mk(m, "predictions/p242",
+        "type: prediction\nstatus: open\nconfidence: 0.5\nsubject: X\nresolves_by: 2027-01-01",
+        "## Claim\n\nC.\n")
+    # 1. create the section with a '## '-prefixed heading arg
+    m._append_section("predictions/p242", "## Recent activity", "- entry one")
+    txt = (root / "wiki" / "predictions" / "p242.md").read_text()
+    assert "## ## Recent activity" not in txt, "double-prefixed heading (the #242 bug)"
+    assert txt.count("## Recent activity") == 1
+    # 2. re-append with the SAME prefixed arg must match the existing section, not make a 2nd
+    m._append_section("predictions/p242", "## Recent activity", "- entry two")
+    txt = (root / "wiki" / "predictions" / "p242.md").read_text()
+    assert txt.count("## Recent activity") == 1, "second append created a duplicate section"
+    assert "- entry one" in txt and "- entry two" in txt
+
+
+def test_write_path_rejects_introduced_reader_derived_panels(vault):
+    m, root = vault
+    created = m._create(
+        "entities/a/acme",
+        "type: entity\nname: Acme",
+        "# Acme\n\n## Incoming backlinks\n\n- frozen graph\n",
+    )
+    assert created.startswith("rejected:") and "reader-derived panel" in created
+
+    _mk(m, "entities/b/beta", "type: entity\nname: Beta", "# Beta\n\n## Notes\n\nClean.\n")
+    before = (root / "wiki" / "entities" / "b" / "beta.md").read_text()
+    appended = m._append_section("entities/b/beta", "Outbound references", "- computed")
+    assert appended.startswith("rejected:") and "reader-derived panel" in appended
+    assert (root / "wiki" / "entities" / "b" / "beta.md").read_text() == before
+
+
+def test_body_integrity_guard_ignores_fenced_markdown_examples(vault):
+    m, root = vault
+    body = (
+        "# Acme\n\n## Notes\n\nExample:\n\n"
+        "```markdown\n## ## Recent activity\n## Incoming backlinks\n```\n"
+    )
+
+    created = m._create("entities/a/acme", "type: entity\nname: Acme", body)
+
+    assert created.startswith("created"), created
+    assert "## Incoming backlinks" in (
+        root / "wiki" / "entities" / "a" / "acme.md"
+    ).read_text()
+
+
+def test_legacy_derived_panel_can_be_removed(vault):
+    m, root = vault
+    path = root / "wiki" / "entities" / "a" / "acme.md"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "---\ntype: entity\nname: Acme\nid: entities:a:acme\nversion: 1\n---\n"
+        "# Acme\n\n## Incoming backlinks\n\n- stale\n\n## Notes\n\nKeep.\n"
+    )
+
+    removed = m._patch(
+        "entities/a/acme",
+        "## Incoming backlinks\n\n- stale\n\n",
+        "",
+    )
+    assert removed.startswith("patched"), removed
+    assert "Incoming backlinks" not in path.read_text()
+
+
 def test_reserved_files_refused(vault):
     """Engine-managed structural files (log.md/index.md/INDEX.md/AGENTS.md/HOT.md/
     _review-queue.md) are NOT agent-writable — append/patch/update/create on them
@@ -707,6 +824,41 @@ def test_create_slug_variant_does_not_duplicate(vault):
     assert "slug id collision" in (root / "wiki" / "_review-queue.md").read_text()
     # the stamped id is the content-derived identity, independent of the path
     assert _fm(root / "wiki" / "entities" / "a" / "akira.md")["id"] == "entities:akira"
+
+
+def test_create_name_matching_existing_alias_converges(vault):
+    m, root = vault
+    first = m._create(
+        "entities/s/shinyhunters",
+        {"type": "entity", "name": "ShinyHunters", "aliases": ["UNC6240"]},
+        "canonical body",
+    )
+    assert first.startswith("created"), first
+    second = m._create(
+        "entities/u/unc6240",
+        {"type": "entity", "name": "UNC6240", "aliases": ["ShinyHunters crew"]},
+        "new observation",
+    )
+    assert second.startswith("converged"), second
+    assert not (root / "wiki" / "entities" / "u" / "unc6240.md").exists()
+    canonical = _fm(root / "wiki" / "entities" / "s" / "shinyhunters.md")
+    assert "ShinyHunters crew" in canonical["aliases"]
+
+
+def test_invalid_type_rejects_before_alias_dedup(vault):
+    m, root = vault
+    assert m._create(
+        "entities/s/shinyhunters",
+        {"type": "entity", "name": "ShinyHunters", "aliases": ["UNC6240"]},
+        "canonical body",
+    ).startswith("created")
+    out = m._create(
+        "entities/u/unc6240",
+        {"type": "threat_actor", "name": "UNC6240"},
+        "bad type",
+    )
+    assert out.startswith("rejected:") and "type" in out
+    assert "bad type" not in (root / "wiki" / "entities" / "s" / "shinyhunters.md").read_text()
 
 
 def test_create_stamps_name_from_h1_when_absent(vault):
@@ -827,6 +979,89 @@ def test_create_allows_excluded_namespace(ns_vault):
     m, root = ns_vault
     res = m._create("operational/health", "type: dashboard\ntitle: Health", "# Health")
     assert "not declared" not in res, res
+
+
+# ── type<->namespace consistency guard (okengine#276) ─────────────────────────
+_TNS_SCHEMA = """\
+okf:
+  required: [type]
+types:
+  source: {required: [type, source_kind, published]}
+  concept: {required: [type]}
+  cve: {required: [type]}
+  entity: {required: [type, name]}
+strict_types: false
+partitioning:
+  namespaces:
+    sources:  {strategy: by-date, date_field: published}
+    concepts: {strategy: by-letter}
+    entities: {strategy: by-letter}
+    cves:     {strategy: by-date, date_field: date_added}
+# domain type home (core types use the built-in convention; cve is declared here)
+type_namespaces:
+  cve: cves
+exclude:
+  - wiki/operational/
+permissions:
+  default: {create: true, update: true, delete: false}
+"""
+
+
+@pytest.fixture
+def tns_vault(tmp_path, monkeypatch):
+    (tmp_path / "wiki").mkdir()
+    (tmp_path / "schema.yaml").write_text(_TNS_SCHEMA, encoding="utf-8")
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-06-15")
+    sys.modules.pop("write_server", None)
+    return _load(), tmp_path
+
+
+def test_type_home_namespace_helper():
+    """schema_lib.type_home_namespace: `type_namespaces` wins, else the core convention, else None."""
+    import importlib.util
+    sl_spec = importlib.util.spec_from_file_location("schema_lib", REPO / "scripts" / "cron" / "schema_lib.py")
+    sl = importlib.util.module_from_spec(sl_spec)
+    sl_spec.loader.exec_module(sl)
+    sch = {"type_namespaces": {"cve": "cves"}}
+    assert sl.type_home_namespace(sch, "cve") == "cves"        # declared override
+    assert sl.type_home_namespace(sch, "source") == "sources"  # core convention
+    assert sl.type_home_namespace(sch, "entity") is None       # no rule -> guard no-ops
+
+
+def test_create_rejects_type_in_wrong_declared_namespace(tns_vault):
+    """okengine#276: a `type: source` page written under `concepts/` (both declared, but source
+    belongs in sources/) is refused — the exact misfiling the compile lane produced."""
+    m, root = tns_vault
+    res = m._create("concepts/c/some-paper",
+                    "type: source\nsource_kind: paper\npublished: 2026-06-01", "# Paper")
+    assert res.startswith("rejected"), res
+    assert "belongs in 'sources/'" in res and "concepts/" in res
+    assert not (root / "wiki" / "concepts" / "c" / "some-paper.md").exists()   # nothing written
+
+
+def test_create_allows_type_in_home_namespace(tns_vault):
+    """The canonical home is accepted — core convention (source->sources) + declared (cve->cves)."""
+    m, root = tns_vault
+    assert m._create("sources/2026-06-01-paper",
+                     "type: source\nsource_kind: paper\npublished: 2026-06-01", "# P").startswith("created")
+    assert m._create("cves/2026/CVE-2026-1",
+                     "type: cve\ndate_added: 2026-06-01", "# CVE").startswith("created")
+
+
+def test_create_rejects_domain_type_via_type_namespaces(tns_vault):
+    """A schema-declared domain home is enforced too: a `type: cve` under `entities/` is refused."""
+    m, root = tns_vault
+    res = m._create("entities/c/CVE-2026-9", "type: cve\ndate_added: 2026-06-01", "# CVE")
+    assert res.startswith("rejected") and "belongs in 'cves/'" in res, res
+
+
+def test_create_no_op_for_type_without_a_home_rule(tns_vault):
+    """A type with no home rule (not core, not in type_namespaces) is NOT blocked by this guard —
+    no vacuous reject; `entity` can live in the declared `entities/`."""
+    m, root = tns_vault
+    res = m._create("entities/g/ghost", "type: entity\nname: Ghost", "# Ghost\n\nBody.\n")
+    assert res.startswith("created"), res
 
 
 # --- frontmatter reference normalization (wikilink -> plain path) -----------------
@@ -1267,6 +1502,70 @@ def test_flat_entity_path_normalizes_to_shard(vault):
     assert not (root / "wiki" / "entities" / "qilin.md").exists()
 
 
+def test_create_routes_flat_concept_through_schema_partition(vault):
+    """#262: the enforced writer must not mint a flat concept beside its
+    by-letter canonical, even when the caller supplies the logical flat key."""
+    m, root = vault
+    schema = _SCHEMA.replace(
+        "  entity:\n    required: [type, name]\n",
+        "  entity:\n    required: [type, name]\n  concept:\n    required: [type, name]\n",
+    ) + """partitioning:
+  namespaces:
+    concepts:
+      strategy: by-letter
+"""
+    (root / "schema.yaml").write_text(schema, encoding="utf-8")
+
+    out = m._create("concepts/quantum-risk", {"type": "concept", "name": "Quantum risk"}, "body")
+
+    assert out.startswith("created"), out
+    assert (root / "wiki" / "concepts" / "q" / "quantum-risk.md").is_file()
+    assert not (root / "wiki" / "concepts" / "quantum-risk.md").exists()
+
+
+def test_create_routes_year_flat_source_through_date_partition(vault):
+    """#262: a caller-supplied year directory cannot bypass the month shard
+    derived from the source's governed ``published`` field."""
+    m, root = vault
+    (root / "schema.yaml").write_text(_SCHEMA + """partitioning:
+  namespaces:
+    sources:
+      strategy: by-date
+      date_field: published
+""", encoding="utf-8")
+    fm = {"type": "source", "source_kind": "article", "publisher": "Example",
+          "published": "2026-06-14"}
+
+    out = m._create("sources/2026/example-report", fm, "body")
+
+    assert out.startswith("created"), out
+    assert (root / "wiki" / "sources" / "2026" / "06" / "example-report.md").is_file()
+    assert not (root / "wiki" / "sources" / "2026" / "example-report.md").exists()
+
+
+def test_create_refuses_when_partitioned_canonical_already_exists(vault):
+    """A wrong physical spelling resolves to the canonical owner before the
+    existence gate; it never creates a second page."""
+    m, root = vault
+    schema = _SCHEMA.replace(
+        "  entity:\n    required: [type, name]\n",
+        "  entity:\n    required: [type, name]\n  concept:\n    required: [type, name]\n",
+    ) + """partitioning:
+  namespaces:
+    concepts:
+      strategy: by-letter
+"""
+    (root / "schema.yaml").write_text(schema, encoding="utf-8")
+    canonical = root / "wiki" / "concepts" / "q" / "quantum-risk.md"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text("---\ntype: concept\nname: Quantum risk\n---\nbody\n")
+
+    out = m._create("concepts/quantum-risk", {"type": "concept", "name": "Quantum risk"}, "new")
+
+    assert out.startswith("refused: concepts/q/quantum-risk.md already exists"), out
+    assert not (root / "wiki" / "concepts" / "quantum-risk.md").exists()
+
+
 def test_unknown_permission_key_fails_closed(vault):
     """L58: a typo'd namespace permission key (`creat: false`) was silently dropped and the
     namespace defaulted OPEN — a human-authored ns could go agent-writable with no error."""
@@ -1395,3 +1694,122 @@ def test_update_entity_wrapper_passes_body_and_frontmatter_through(vault):
     assert out.startswith("updated"), out
     assert "original body text" not in p.read_text()
     assert p.read_text().split("---", 2)[2].strip() == ""
+
+
+# ── H3: identity + provenance immutability on update / patch (invariant-audit) ─────────────────
+
+def _read_fm(root: Path, rel: str) -> dict:
+    import yaml, re as _re
+    text = (root / "wiki" / (rel + ".md")).read_text(encoding="utf-8")
+    m = _re.match(r"\A---\n(.*?\n)---", text, _re.S)
+    return yaml.safe_load(m.group(1)) if m else {}
+
+
+def test_update_reverts_forged_id_and_provenance(vault):
+    m, root = vault
+    rel = "entities/a/acme"
+    m._create(rel, {"type": "entity", "name": "Acme",
+                    "id": "entities:acme", "created": "2026-01-01",
+                    "created_by": "cron:import", "discovered_by": "feed:rss"},
+              "# Acme\n\nBody.\n")
+    before = _read_fm(root, rel)
+    # a caller tries to rewrite id + every provenance field
+    res = m._update(rel, {"id": "entities:HIJACKED", "created": "2000-01-01",
+                          "created_by": "attacker", "discovered_by": "attacker",
+                          "note": "legit field change"}, None)
+    assert not res.startswith(("refused", "rejected")), res
+    after = _read_fm(root, rel)
+    for k in ("id", "created", "created_by", "discovered_by"):
+        assert after[k] == before[k], f"{k} was mutated: {before.get(k)!r} -> {after.get(k)!r}"
+    assert after.get("note") == "legit field change", "a normal field update must still apply"
+    assert after.get("needs_review") is True, "an attempted immutable-field change must be flagged"
+
+
+def test_update_may_backfill_a_missing_id_but_not_change_an_existing_one(vault):
+    m, root = vault
+    # a legacy page WITHOUT an id (written directly, bypassing _create's stamping)
+    (root / "wiki" / "entities" / "n").mkdir(parents=True)
+    (root / "wiki" / "entities" / "n" / "noid.md").write_text(
+        "---\ntype: entity\nname: NoId\nversion: 1\n---\n\n# NoId\n\nBody.\n", encoding="utf-8")
+    # backfilling an id onto an id-less page is legitimate (bringing it into compliance) — allowed
+    res = m._update("entities/n/noid", {"id": "entities:noid-backfilled", "note": "x"}, None)
+    assert not res.startswith(("refused", "rejected")), res
+    assert _read_fm(root, "entities/n/noid")["id"] == "entities:noid-backfilled"
+    # but once it HAS an id, a later update cannot change it
+    res2 = m._update("entities/n/noid", {"id": "entities:HIJACKED"}, None)
+    assert not res2.startswith(("refused", "rejected")), res2
+    after = _read_fm(root, "entities/n/noid")
+    assert after["id"] == "entities:noid-backfilled", "an existing id must be immutable"
+    assert after.get("needs_review") is True
+
+
+def test_patch_reverts_forged_provenance(vault):
+    m, root = vault
+    rel = "entities/b/beta"
+    m._create(rel, {"type": "entity", "name": "Beta", "created": "2026-02-02",
+                    "discovered_by": "feed:x"}, "# Beta\n\nBody.\n")
+    before = _read_fm(root, rel)
+    # a surgical patch that rewrites the created date in the frontmatter (dates serialize quoted)
+    res = m._patch(rel, "created: '2026-02-02'", "created: '1999-09-09'")
+    assert not res.startswith(("refused", "rejected")), res
+    after = _read_fm(root, rel)
+    assert str(after["created"]) == str(before["created"]), "patch must not rewrite the immutable created date"
+    assert after.get("needs_review") is True
+
+
+def test_update_normal_change_is_not_flagged_as_immutable(vault):
+    m, root = vault
+    rel = "entities/c/clean"
+    m._create(rel, {"type": "entity", "name": "Clean", "created": "2026-03-03"},
+              "# Clean\n\nBody.\n")
+    # echo the same immutable values (read-modify-write) + change a normal field: no revert, no flag
+    res = m._update(rel, {"created": "2026-03-03", "summary": "updated"}, None)
+    assert not res.startswith(("refused", "rejected")), res
+    after = _read_fm(root, rel)
+    assert after.get("summary") == "updated"
+    # echoing the unchanged immutable value must NOT trip the immutable-change flag
+    # (needs_review may be set by other governance, but not for a reverted immutable field)
+    assert after["created"] == "2026-03-03"
+
+
+# ── fabricated-source guard (okengine#348): a CITED source must exist ─────────
+
+def _mk_source(root, rel):
+    p = root / "wiki" / (rel + ".md")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("---\ntype: source\nsource_kind: report\npublisher: X\npublished: '2026-06-01'\n---\n\nreal.\n",
+                 encoding="utf-8")
+
+
+def test_create_entity_with_fabricated_source_is_rejected(vault):
+    m, root = vault
+    res = m._create("entities/a/p/apt35",
+                    {"type": "entity", "name": "APT35", "sources": ["source/mandiant/q1-apt-report"]},
+                    "# APT35\n\nx.\n")
+    assert res.startswith("rejected:") and "singular" in res, res
+    assert not (root / "wiki" / "entities" / "a" / "p" / "apt35.md").exists(), "rejected write must not land"
+
+
+def test_create_entity_with_real_source_and_provenance_label_allowed(vault):
+    m, root = vault
+    _mk_source(root, "sources/2026/06/real-report")
+    res = m._create("entities/a/real-actor",
+                    {"type": "entity", "name": "Real", "sources": ["sources/2026/06/real-report", "MITRE ATT&CK"]},
+                    "# Real\n\nx.\n")
+    assert not res.startswith("rejected:"), res     # resolvable page-ref + provenance label both fine
+
+
+def test_update_grandfathers_legacy_bad_ref_but_blocks_new_one(vault):
+    m, root = vault
+    pg = root / "wiki" / "entities" / "l" / "legacy.md"      # canonical first-letter shard for 'legacy'
+    pg.parent.mkdir(parents=True, exist_ok=True)
+    pg.write_text("---\ntype: entity\nname: Legacy\nid: entities:legacy\nsources:\n- source/old/fake\n---\n\nx.\n",
+                  encoding="utf-8")
+    # resending the legacy fabricated ref while touching another field is grandfathered (not rejected)
+    ok = m._update("entities/l/legacy",
+                   {"sources": ["source/old/fake"], "confidence": "medium"})
+    assert not ok.startswith("rejected:"), ok
+    # but ADDING a new fabricated ref is rejected
+    bad = m._update("entities/l/legacy",
+                    {"sources": ["source/old/fake", "source/new/alsofake"]})
+    assert bad.startswith("rejected:") and "alsofake" in bad, bad

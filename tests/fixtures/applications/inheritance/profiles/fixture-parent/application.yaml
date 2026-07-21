@@ -1,0 +1,36 @@
+schema_version: 1
+id: fixture-parent
+version: 1.2.0
+name: Fixture parent
+requires:
+  engine: ">=0.11.0"
+  extensions:
+    okengine.reevaluation: ">=0.1.0"
+    okengine.assessments: ">=0.1.0"
+binding_contract:
+  minimum_proposition_classes: 1
+  required_fields:
+    - type
+    - namespace
+    - status_field
+    - open_values
+    - resolved_values
+    - confidence_field
+    - evidence_field
+    - resolution_field
+    - review_field
+  required_operations: [reassess, resolve, measure]
+  required_roles:
+    evidence_item:
+      minimum: 1
+      required_fields: [type, namespace, behavior_field, evidence_field, as_of_field]
+      allow_multiple: false
+operating_loop:
+  - {id: register, capability: registration, after: []}
+  - {id: assess, capability: assessment, after: [register]}
+required_surfaces: [assessment_review]
+required_queues: [assessment_review]
+required_success_measures: [review_queue_age]
+policy:
+  preserve_evidence: true
+  optional_review: false

@@ -34,20 +34,28 @@ from __future__ import annotations
 import contextvars
 import datetime
 import difflib
+import hashlib
 import hmac
+import json
 import os
 import re
 import sys
+import tempfile
+import fcntl
+from collections import Counter
 from pathlib import Path
 from typing import Optional, Union
 
 import yaml
+from starlette.requests import Request as StarletteRequest
 
 # Robust import of the engine validator regardless of CWD: repo root is the
 # parent of this file's directory (okengine-mcp/'s parent).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from tools.schema_validator import schema_reject_reason, governing_policy, drift_policy  # noqa: E402
+from tools.schema_validator import schema_reject_reason, governing_policy, drift_policy, \
+    canonicalize_enum_case  # noqa: E402
+from tools import policy_plane  # noqa: E402
 import scope as _scope  # noqa: E402  per-extension token resolution (okengine#132)
 
 # Converge-on-write (composable okpacks P2) needs the id + schema + merge libs.
@@ -60,6 +68,7 @@ try:
     import schema_lib   # noqa: E402
     import id_index     # noqa: E402
     import converge     # noqa: E402
+    import okf_migrate  # noqa: E402  — canonical partition contract for every writer
 except Exception:       # pragma: no cover
     _CONVERGE_OK = False
 
@@ -71,6 +80,15 @@ _FM = re.compile(r"\A---[ \t]*\n(.*?\n)---(.*)\Z", re.S)
 # A TRUE H1 (`# title`). `[ \t]+` after the single `#` means `## Summary` and deeper
 # section headings never match — only a page-title H1 is captured (group 1).
 _H1 = re.compile(r"^#[ \t]+(.+?)[ \t]*$", re.M)
+_MAX_ENTITY_SLUG_LEN = 80
+_REVIEW_STATES = {"open", "in-review", "changes-requested", "approved", "rejected", "dismissed"}
+_REVIEW_DECISIONS = {
+    "approve": ("approved", False),
+    "request-changes": ("changes-requested", True),
+    "reject": ("rejected", True),
+    "dismiss": ("dismissed", False),
+    "defer": ("open", True),
+}
 
 
 def _today() -> str:
@@ -108,7 +126,63 @@ _caller_var: contextvars.ContextVar = contextvars.ContextVar("okengine_write_cal
 
 def _caller() -> dict:
     c = _caller_var.get()
-    return c if c is not None else {"kind": "admin", "write_scopes": None, "ext_id": None}
+    if c is not None:
+        return c
+    # A dedicated stdio MCP process may be bound to one scheduler identity in
+    # config.yaml.  The agent cannot supply or alter this value as a tool argument.
+    actor = os.environ.get("OKENGINE_WRITE_ACTOR", "").strip()
+    if actor:
+        return {"kind": "job", "actor": actor, "write_scopes": None, "ext_id": None}
+    return {"kind": "admin", "actor": "admin", "write_scopes": None, "ext_id": None}
+
+
+_policy_cache: dict = {"key": None, "value": None}
+
+
+def _effective_policy() -> dict:
+    """Load composed policy with cheap mtime invalidation for long-lived servers."""
+    vault = Path(os.environ.get("WIKI_PATH") or str(VAULT))
+    paths = policy_plane.discover_documents(vault)
+    key = tuple((str(path), path.stat().st_mtime_ns if path.exists() else None) for path in paths)
+    if _policy_cache["key"] != key:
+        _policy_cache["value"] = policy_plane.compose_documents(paths)
+        _policy_cache["key"] = key
+    return _policy_cache["value"]
+
+
+def _capability_reject(p: Path, operation: str, *, page_type: str = "",
+                       changed_fields=(), body_change: str = "none") -> Optional[str]:
+    """Enforce the authenticated caller's operation/type/field/body authority.
+
+    This runs before every filesystem mutation.  A rejected attempt is emitted as
+    the common structured finding and the human MCP response retains a concise
+    policy rule ID and remediation.
+    """
+    caller = _caller()
+    if caller.get("kind") == "admin":
+        return None
+    actor = str(caller.get("actor") or
+                (f"extension:{caller.get('ext_id')}" if caller.get("ext_id") else "unknown"))
+    policy = _effective_policy()
+    if caller.get("kind") == "extension":
+        declared = caller.get("write_capability")
+        # Existing extension manifests remain path-scoped until they opt into the
+        # richer contract.  Their path authority is still enforced by _wauth_refusal.
+        if not declared:
+            return None
+        policy = dict(policy)
+        policy["capabilities"] = dict(policy.get("capabilities") or {})
+        policy["capabilities"][actor] = declared
+    result = policy_plane.evaluate_capability(
+        policy, actor, operation, _rel(p), page_type,
+        changed_fields, body_change)
+    if result is None:
+        return None
+    try:
+        policy_plane.append_event(Path(os.environ.get("WIKI_PATH") or str(VAULT)), result)
+    except OSError:
+        pass
+    return policy_plane.finding_message(result)
 
 
 def _apply_extension_provenance(fm: dict, *, creating: bool,
@@ -133,11 +207,37 @@ def _apply_extension_provenance(fm: dict, *, creating: bool,
         fm["extension_id"] = existing_ext_id         # provenance is set once, never re-stamped
 
 
+_REVIEW_MANAGED_FIELDS = {
+    "review_state", "review_id", "reviewed_by", "reviewed_on", "reviewed_at", "reviewed_version",
+}
+
+
+def _apply_review_governance(fm: dict, prev: dict | None = None) -> list[str]:
+    """Keep human-decision projections server-owned and invalidate them on content writes.
+
+    Ordinary entity mutation may raise ``needs_review`` but cannot clear an existing flag or forge
+    reviewer identity. Any edit after a review request/decision opens a new version-scoped request;
+    only ``_resolve_review`` may write the managed projection fields.
+    """
+    for key in _REVIEW_MANAGED_FIELDS:
+        fm.pop(key, None)
+    if prev is None:
+        return []
+    if prev.get("needs_review") is True:
+        fm["needs_review"] = True
+    if any(prev.get(key) not in (None, "") for key in _REVIEW_MANAGED_FIELDS):
+        fm["needs_review"] = True
+        return ["content changed after a prior review request or decision"]
+    return []
+
+
 def _authorize_write(path: str) -> bool:
     """May the current caller write this wiki-relative path? Admin (stdio gateway) =
     always; an extension = only within its declared write scopes."""
     c = _caller()
-    if c.get("kind") == "admin":
+    if c.get("kind") in {"admin", "job"}:
+        # Jobs are path/type/operation/field/body-gated by _capability_reject.
+        # They do not use extension path scopes, which are a separate token model.
         return True
     return _scope.path_in_scopes(str(path), c.get("write_scopes") or [])
 
@@ -229,6 +329,15 @@ def _safe(path: str) -> Optional[Path]:
     rel = rel.lstrip("/")
     while rel == "wiki" or rel.startswith("wiki/"):
         rel = rel[len("wiki"):].lstrip("/")
+    # Page basenames are identifiers, not prose. Whitespace and run-on names are
+    # strong evidence that an extraction lane passed a sentence as the slug
+    # (okengine#240). Reject at the boundary before such pages become links.
+    raw_name = rel.rsplit("/", 1)[-1]
+    raw_stem = raw_name[:-3] if raw_name.endswith(".md") else raw_name
+    if rel.startswith("entities/") and (
+        any(ch.isspace() for ch in raw_stem) or len(raw_stem) > _MAX_ENTITY_SLUG_LEN
+    ):
+        return None
     rel = _normalize_entity_shard(rel)
     p = wiki / rel
     if p.suffix != ".md":
@@ -242,6 +351,32 @@ def _safe(path: str) -> Optional[Path]:
     except (OSError, ValueError):
         return None
     return p
+
+
+def _partitioned_create_path(p: Path, fm: dict) -> Path:
+    """Return the schema-canonical destination for a newly created page.
+
+    ``_safe`` historically normalized only ``entities``.  That left the same
+    enforced MCP boundary able to mint flat ``concepts/<slug>`` pages and
+    year-only ``sources/YYYY/<slug>`` pages beside their canonical shards.  Use
+    the exact helper shared by importers, reshelve, and collision cleanup so all
+    namespaces follow one partition contract.  Existing pages remain where
+    they are (``write_key`` deliberately converges on them); migration owns
+    moving stale layouts.
+    """
+    if not _CONVERGE_OK:
+        return p
+    try:
+        rel = p.relative_to(_wiki().resolve())
+        namespace = rel.parts[0]
+        if not okf_migrate.is_partitioned(Path(os.environ.get("WIKI_PATH") or str(VAULT)), namespace):
+            return p
+        key = okf_migrate.write_key(
+            Path(os.environ.get("WIKI_PATH") or str(VAULT)), namespace, p.stem, fm
+        )
+        return (_wiki() / f"{key}.md").resolve()
+    except (OSError, ValueError, IndexError):
+        return p
 
 
 _WIKILINK_FULL = re.compile(r"^\[\[\s*([^\]|#]+?)\s*(?:[#|][^\]]*)?\]\]$")
@@ -349,6 +484,130 @@ def _int_fields_for(page_path) -> set:
     return fields
 
 
+def _enum_case_coerce(p, fm) -> None:
+    """Case-canonicalize enum values IN PLACE before validation (okengine#226): `tlp: clear`
+    lands as `CLEAR` instead of rejecting — a case-insensitive match to exactly one allowed
+    value is unambiguous intent (same philosophy as the digit-string int coercion). Genuinely
+    unknown values still reject downstream (schema_reject_reason/_enum_reject_reason).
+    Never raises: a broken schema must not brick a write (the runtime gate is fail-open)."""
+    if not isinstance(fm, dict):
+        return
+    try:
+        canonicalize_enum_case(_governing(p), str(fm.get("type") or ""), fm)
+    except Exception:
+        pass
+
+
+# ITEM contracts (okengine#211): per-key rules for LIST-OF-DICT fields (field_items — e.g. the
+# predictions `evidence:` records). The vocabulary a consumer buckets on (evidence[].direction)
+# previously lived only in prompt text, so agent-authored values drifted and the cockpit tally
+# silently mis-bucketed them (D1: 18 drifted entries). Enforcement lives HERE — the boundary every
+# writer crosses — not in prompts (instruction, not enforcement) and not in consumer synonym maps
+# (laundering that masks producer drift). Out-of-enum/wrong-shape REJECTS with field, index, and
+# the allowed set named, so an agent retry self-corrects (and, on a page carrying legacy drifted
+# entries, effectively backfills them — it must resubmit the full list clean). Schemas that declare
+# no field_items make the check inert.
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+_base_item_rules_cache = None
+
+
+def _base_item_rules() -> dict:
+    global _base_item_rules_cache
+    if _base_item_rules_cache is None:
+        try:
+            _base_item_rules_cache = schema_lib.item_rules(schema_lib.base_schema())
+        except Exception:
+            _base_item_rules_cache = {}
+    return _base_item_rules_cache
+
+
+def _item_rules_for(page_path) -> dict:
+    rules = dict(_base_item_rules())
+    if page_path is not None:
+        try:
+            rules.update(schema_lib.item_rules(_governing(page_path)))
+        except Exception:
+            pass
+    return rules
+
+
+def _item_shape_reject(p, fm) -> Optional[str]:
+    """Validate schema-declared ITEM contracts on list-of-dict fields; None = clean.
+    Coerces an unambiguous numeric string in place; rejects out-of-enum / wrong-shape values with
+    the exact location named. Non-dict items (legacy prose strings) and absent keys pass — item
+    requiredness is not this guard's job, vocabulary/shape integrity is."""
+    if not isinstance(fm, dict):
+        return None
+    for field, keyrules in _item_rules_for(p).items():
+        items = fm.get(field)
+        if not isinstance(items, list):
+            continue
+        item_spec = keyrules.get("_item") or {}
+        for i, item in enumerate(items):
+            if not isinstance(item, dict):
+                if item_spec.get("shape") == "dict":
+                    return (f"`{field}[{i}]` must be an object — got "
+                            f"{type(item).__name__}: {str(item)[:60]!r}")
+                continue
+            missing = [key for key in sorted(item_spec.get("required") or set())
+                       if key not in item or item[key] is None
+                       or (isinstance(item[key], str) and not item[key].strip())]
+            if missing:
+                return (f"`{field}[{i}]` is missing required item field(s): "
+                        f"{', '.join(missing)}")
+            for key, rule in keyrules.items():
+                if key == "_item":
+                    continue
+                v = item.get(key)
+                if v is None:
+                    continue
+                allowed = rule.get("enum")
+                if allowed is not None:
+                    if isinstance(v, str) and v not in allowed:
+                        # case-variant of exactly one allowed value -> coerce (#226)
+                        ci = [a for a in allowed if a.casefold() == v.casefold()]
+                        if len(ci) == 1:
+                            item[key] = ci[0]
+                            continue
+                    if not isinstance(v, str) or v not in allowed:
+                        return (f"`{field}[{i}].{key}` = {str(v)[:60]!r} is not in the sanctioned "
+                                f"vocabulary ({', '.join(sorted(allowed))}). Resubmit the complete "
+                                f"list using only those values.")
+                    continue
+                shape = rule.get("shape")
+                if shape == "number":
+                    if isinstance(v, bool) or not isinstance(v, (int, float)):
+                        coerced = None
+                        if isinstance(v, str):
+                            try:
+                                coerced = float(v.strip())
+                            except ValueError:
+                                pass
+                        if coerced is None:
+                            return (f"`{field}[{i}].{key}` must be a number — got "
+                                    f"{type(v).__name__}: {str(v)[:60]!r}")
+                        item[key] = coerced                 # unambiguous intent — coerce
+                elif shape == "date":
+                    if isinstance(v, (datetime.date, datetime.datetime)):
+                        continue                            # yaml parses bare ISO dates natively
+                    if not (isinstance(v, str) and _ISO_DATE_RE.match(v.strip())):
+                        return (f"`{field}[{i}].{key}` must be an ISO date (YYYY-MM-DD) — got "
+                                f"{str(v)[:60]!r}")
+                elif shape == "str":
+                    if not isinstance(v, str):
+                        return (f"`{field}[{i}].{key}` must be a string — got {type(v).__name__}")
+                elif shape == "bool":
+                    if not isinstance(v, bool):
+                        return (f"`{field}[{i}].{key}` must be a boolean — got {type(v).__name__}")
+                elif shape == "list":
+                    if not isinstance(v, list):
+                        return (f"`{field}[{i}].{key}` must be a list — got {type(v).__name__}")
+                elif shape == "dict":
+                    if not isinstance(v, dict):
+                        return (f"`{field}[{i}].{key}` must be an object — got {type(v).__name__}")
+    return None
+
+
 def _int_shape_reject(p, fm) -> Optional[str]:
     """Coerce digit-strings in place; return a reject reason when a schema-declared int field holds
     anything else (list/path/prose/bool). None = clean."""
@@ -430,6 +689,278 @@ def _read_page(p: Path) -> tuple[dict, str]:
     if body.startswith("\n"):
         body = body[1:]
     return fm, body
+
+
+def _review_digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _review_store() -> Path:
+    return _wiki() / "operational" / "reviews"
+
+
+def _review_record_path(review_id: str) -> Path:
+    return _review_store() / f"{_review_digest(review_id)}.yaml"
+
+
+def _review_page_state(p: Path) -> tuple[dict, str, str, int, str]:
+    fm, body = _read_page(p)
+    content = p.read_text(encoding="utf-8", errors="replace")
+    try:
+        version = int(fm.get("version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    subject = _rel(p).removesuffix(".md")
+    return fm, body, subject, version, _review_digest(content)
+
+
+def _structured_review_reasons(fm: dict, body: str, flags=None) -> list[dict]:
+    """Convert legacy booleans/write-path strings into durable, explainable reason records."""
+    reasons: list[dict] = []
+    for flag in (flags or []):
+        code = "categorical-confidence" if "categorical" in flag else \
+               "changed-after-approval" if "changed after" in flag else \
+               "agent-draft" if "degenerate" in flag else "manual"
+        reasons.append({"code": code, "detail": str(flag)})
+    for conflict in (fm.get("conflicts") or []):
+        if isinstance(conflict, dict):
+            reasons.append({"code": "conflict", "field": str(conflict.get("field") or ""),
+                            "detail": "sources disagree on this field"})
+    if re.search(r"##[ \t]+Grounding check.*?(unsupported|not[- ]found|not in source|contradict)",
+                 body or "", re.S | re.I):
+        reasons.append({"code": "grounding", "detail": "grounding check flagged an unsupported claim"})
+    if not reasons:
+        reasons.append({"code": "legacy-unspecified", "detail": "legacy needs_review flag"})
+    # Stable de-duplication: the same write-path flag may be surfaced by more than one guard.
+    out, seen = [], set()
+    for reason in reasons:
+        key = (reason.get("code"), reason.get("field"), reason.get("detail"))
+        if key not in seen:
+            seen.add(key); out.append(reason)
+    return out
+
+
+def _ensure_review_request(p: Path, flags=None) -> dict:
+    fm, body, subject, version, digest = _review_page_state(p)
+    reasons = _structured_review_reasons(fm, body, flags)
+    reason_key = json.dumps(reasons, sort_keys=True, ensure_ascii=False)
+    review_id = f"review:{subject}:{version}:{digest[:16]}:{_review_digest(reason_key)[:12]}"
+    rp = _review_record_path(review_id)
+    if rp.is_file():
+        rec = yaml.safe_load(rp.read_text(encoding="utf-8")) or {}
+        return rec if isinstance(rec, dict) else {}
+    caller = _caller()
+    requested_by = caller.get("ext_id") or caller.get("kind") or "unknown"
+    evidence = fm.get("sources") or fm.get("source") or []
+    if not isinstance(evidence, list):
+        evidence = [evidence]
+    rec = {
+        "version": 1, "review_id": review_id, "subject": subject,
+        "subject_version": version, "subject_hash": digest, "state": "open",
+        "reasons": reasons, "evidence": [str(v) for v in evidence if str(v).strip()],
+        "requested_by": str(requested_by), "requested_at": _now(),
+        "assigned_to": None, "history": [], "machine_checks": [],
+    }
+    rp.parent.mkdir(parents=True, exist_ok=True)
+    rp.write_text(yaml.safe_dump(rec, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return rec
+
+
+def _load_review_record(review_id: str) -> tuple[Path, dict] | tuple[None, None]:
+    rp = _review_record_path(review_id)
+    if not rp.is_file():
+        return None, None
+    try:
+        rec = yaml.safe_load(rp.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None, None
+    return (rp, rec) if isinstance(rec, dict) else (None, None)
+
+
+def _assign_review(path: str, reviewer: str, expected_version: int, expected_hash: str,
+                   review_id: str | None = None, service: str = "cli") -> dict:
+    """Claim the current review request without changing the subject page."""
+    candidate = _safe(path)
+    if candidate is not None:
+        cap = _capability_reject(candidate, "review")
+        if cap:
+            return {"ok": False, "status": 403, "error": cap}
+    reviewer = str(reviewer or "").strip()
+    if not reviewer:
+        return {"ok": False, "status": 400, "error": "reviewer identity is required"}
+    try:
+        expected_version = int(expected_version)
+    except (TypeError, ValueError):
+        return {"ok": False, "status": 400, "error": "expected page version is required"}
+    if not re.fullmatch(r"[0-9a-f]{64}", str(expected_hash or "")):
+        return {"ok": False, "status": 400, "error": "expected page hash is required"}
+    p = _safe(path)
+    if p is None or not p.is_file():
+        return {"ok": False, "status": 404, "error": "subject page not found"}
+    lock = _wiki().parent / ".okengine" / "review.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("a+", encoding="utf-8") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        _, _, subject, version, digest = _review_page_state(p)
+        if version != expected_version or not hmac.compare_digest(digest, str(expected_hash)):
+            return {"ok": False, "status": 409, "error": "subject changed; refresh before assigning"}
+        rec = _ensure_review_request(p)
+        if review_id and review_id != rec.get("review_id"):
+            return {"ok": False, "status": 409, "error": "review request is stale"}
+        if rec.get("state") in {"approved", "rejected", "dismissed"}:
+            return {"ok": False, "status": 409, "error": "closed review cannot be assigned"}
+        stamp = _now()
+        rec["state"] = "in-review"
+        rec["assigned_to"] = reviewer
+        rec.setdefault("history", []).append({"action": "assign", "state": "in-review",
+                                               "assigned_to": reviewer, "at": stamp,
+                                               "service": service})
+        rec["version"] = int(rec.get("version") or 1) + 1
+        rp = _review_record_path(rec["review_id"])
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=rp.parent,
+                                         prefix=".review-record-", delete=False) as f:
+            yaml.safe_dump(rec, f, sort_keys=False, allow_unicode=True)
+            tmp = Path(f.name)
+        try:
+            os.replace(tmp, rp)
+        finally:
+            tmp.unlink(missing_ok=True)
+        _append_log(f"- {_today()} review assign {subject} v{version} to {reviewer} via {service}")
+        return {"ok": True, "status": 200, "review_id": rec["review_id"],
+                "state": "in-review", "assigned_to": reviewer}
+
+
+def _resolve_review(path: str, decision: str, reviewer: str, note: str,
+                    expected_version: int, expected_hash: str,
+                    review_id: str | None = None, service: str = "cli") -> dict:
+    """Apply one version-locked human decision and its audit record as a single governed action."""
+    candidate = _safe(path)
+    if candidate is not None:
+        cap = _capability_reject(candidate, "review")
+        if cap:
+            return {"ok": False, "status": 403, "error": cap}
+    decision = str(decision or "").strip().lower()
+    reviewer = str(reviewer or "").strip()
+    note = str(note or "").strip()
+    if decision not in _REVIEW_DECISIONS:
+        return {"ok": False, "status": 400, "error": "invalid review decision"}
+    if not reviewer:
+        return {"ok": False, "status": 400, "error": "reviewer identity is required"}
+    try:
+        expected_version = int(expected_version)
+    except (TypeError, ValueError):
+        return {"ok": False, "status": 400, "error": "expected page version is required"}
+    if not re.fullmatch(r"[0-9a-f]{64}", str(expected_hash or "")):
+        return {"ok": False, "status": 400, "error": "expected page hash is required"}
+    if decision != "approve" and not note:
+        return {"ok": False, "status": 400, "error": f"{decision} requires a decision note"}
+    p = _safe(path)
+    if p is None or not p.is_file():
+        return {"ok": False, "status": 404, "error": "subject page not found"}
+    lock = _wiki().parent / ".okengine" / "review.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("a+", encoding="utf-8") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        fm, body, subject, version, digest = _review_page_state(p)
+        if version != expected_version or not hmac.compare_digest(digest, str(expected_hash)):
+            return {"ok": False, "status": 409, "error": "subject changed; refresh before deciding",
+                    "current_version": version, "current_hash": digest}
+        rec = _ensure_review_request(p)
+        if review_id and review_id != rec.get("review_id"):
+            return {"ok": False, "status": 409, "error": "review request is stale"}
+        if rec.get("state") in {"approved", "dismissed"}:
+            return {"ok": False, "status": 409, "error": "review request is already closed"}
+        state, remains_flagged = _REVIEW_DECISIONS[decision]
+        stamp = _now()
+        event = {"decision": decision, "state": state, "decision_by": reviewer,
+                 "decision_at": stamp, "decision_note": note or None, "service": service,
+                 "subject_version": version, "subject_hash": digest}
+        rec["state"] = state
+        rec["decision_by"] = reviewer
+        rec["decision_at"] = stamp
+        rec["decision_note"] = note or None
+        rec["decision_service"] = service
+        rec.setdefault("history", []).append(event)
+        rec["version"] = int(rec.get("version") or 1) + 1
+        new_fm = dict(fm)
+        new_fm["needs_review"] = remains_flagged
+        new_fm["review_state"] = state
+        new_fm["review_id"] = rec["review_id"]
+        new_fm["reviewed_version"] = version
+        if state == "approved":
+            new_fm.update({"reviewed_by": reviewer, "reviewed_on": _today(), "reviewed_at": stamp})
+        else:
+            # A prior approval must never remain current after a non-approval disposition.
+            for key in ("reviewed_by", "reviewed_on", "reviewed_at"):
+                new_fm.pop(key, None)
+        new_fm["version"] = version + 1
+        new_fm["last_updated"] = stamp
+        new_content = _compose(new_fm, body)
+        reject = schema_reject_reason(str(p), new_content)
+        if reject:
+            return {"ok": False, "status": 422, "error": f"review update violates schema: {reject}"}
+        rp = _review_record_path(rec["review_id"])
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        old_content = p.read_text(encoding="utf-8", errors="replace")
+        old_record = rp.read_text(encoding="utf-8", errors="replace") if rp.exists() else None
+        page_tmp = record_tmp = None
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=p.parent,
+                                             prefix=".review-page-", delete=False) as f:
+                f.write(new_content); page_tmp = Path(f.name)
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=rp.parent,
+                                             prefix=".review-record-", delete=False) as f:
+                yaml.safe_dump(rec, f, sort_keys=False, allow_unicode=True); record_tmp = Path(f.name)
+            os.replace(page_tmp, p); page_tmp = None
+            os.replace(record_tmp, rp); record_tmp = None
+        except Exception as exc:
+            p.write_text(old_content, encoding="utf-8")
+            if old_record is None:
+                rp.unlink(missing_ok=True)
+            else:
+                rp.write_text(old_record, encoding="utf-8")
+            return {"ok": False, "status": 500, "error": f"atomic review write failed: {exc}"}
+        finally:
+            if page_tmp: page_tmp.unlink(missing_ok=True)
+            if record_tmp: record_tmp.unlink(missing_ok=True)
+        _append_log(f"- {_today()} review {decision} {subject} v{version} by {reviewer} via {service}")
+        return {"ok": True, "status": 200, "review_id": rec["review_id"], "state": state,
+                "subject": subject, "reviewed_version": version, "page_version": version + 1}
+
+
+def _record_machine_review(path: str, evaluator: str, outcome: str, note: str = "") -> dict:
+    """Attach a machine check without clearing or impersonating human approval."""
+    if outcome not in {"supported", "unsupported", "unresolved"}:
+        return {"ok": False, "status": 400, "error": "invalid machine review outcome"}
+    p = _safe(path)
+    if p is not None:
+        cap = _capability_reject(p, "review")
+        if cap:
+            return {"ok": False, "status": 403, "error": cap}
+    if p is None or not p.is_file():
+        return {"ok": False, "status": 404, "error": "subject page not found"}
+    lock = _wiki().parent / ".okengine" / "review.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("a+", encoding="utf-8") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        rec = _ensure_review_request(p)
+        check = {"evaluator": str(evaluator or "machine"), "outcome": outcome,
+                 "note": str(note or ""), "checked_at": _now()}
+        rec.setdefault("machine_checks", []).append(check)
+        rec["version"] = int(rec.get("version") or 1) + 1
+        rp = _review_record_path(rec["review_id"])
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=rp.parent,
+                                         prefix=".review-record-", delete=False) as f:
+            yaml.safe_dump(rec, f, sort_keys=False, allow_unicode=True)
+            tmp = Path(f.name)
+        try:
+            os.replace(tmp, rp)
+        finally:
+            tmp.unlink(missing_ok=True)
+        _append_log(f"- {_today()} review-machine {outcome} {rec['subject']} by {check['evaluator']}")
+        return {"ok": True, "status": 200, "review_id": rec["review_id"], "state": rec["state"],
+                "machine_check": check}
 
 
 def _frontmatter_error(p: Path) -> Optional[str]:
@@ -626,6 +1157,47 @@ def _namespace_reject(p: Path) -> Optional[str]:
             f"stray tree the dashboards/index never see (okengine#115)")
 
 
+def _type_namespace_reject(p: Path, fm: dict) -> Optional[str]:
+    """A page whose `type` has a canonical HOME namespace must be CREATED there — not drifted into
+    another DECLARED namespace. `_namespace_reject` catches an *undeclared* stray (`source/` vs
+    `sources/`); this catches a valid type in the *wrong declared* namespace: a `type: source` page
+    written under `concepts/` (both declared, but source belongs in `sources/`) — a fork the
+    dashboards/index/type-scoped panels never see (okengine#276). Home from the governing schema's
+    `type_namespaces` else the engine-core convention (schema_lib.type_home_namespace). No-op when the
+    home is unknown or not a declared namespace here (never a vacuous reject); excluded dirs allowed."""
+    typ = str((fm or {}).get("type") or "").strip()
+    if not typ:
+        return None
+    ns = _namespace(p)
+    if not ns:
+        return None
+    try:
+        schema = _governing(p)
+        home = schema_lib.type_home_namespace(schema, typ)
+        declared = schema_lib.knowledge_namespaces(schema)
+        excluded = schema_lib.excluded_dirs(schema)
+    except Exception:                       # pragma: no cover - schema load is best-effort
+        return None
+    if not home or home not in declared:    # no rule / home isn't a namespace here -> don't enforce
+        return None
+    if ns == home or ns in excluded:
+        return None
+    return (f"type '{typ}' belongs in '{home}/', but this page is being created under '{ns}/' — a "
+            f"page in the wrong namespace forks the graph (type-scoped panels/indices never see it, "
+            f"okengine#276). Write it under '{home}/'.")
+
+
+def _type_ns_reject_on_change(p: Path, new_fm: dict, cur_fm: dict) -> Optional[str]:
+    """`_type_namespace_reject` for the MUTATING lanes (update/patch/converge). The create-time guard
+    was CREATE-ONLY, so update/patch/converge could rewrite a page's `type` to one whose home is a
+    different namespace, forking the graph exactly as a bad create would (invariant-audit). Only
+    reject when the type is actually CHANGING — a legacy page already in the 'wrong' namespace stays
+    editable (grandfathered); a NEW drift of the type out of its home namespace is blocked."""
+    if str((new_fm or {}).get("type") or "") == str((cur_fm or {}).get("type") or ""):
+        return None
+    return _type_namespace_reject(p, new_fm)
+
+
 def _review_flags(p: Path, fm: dict, prev: dict | None = None) -> list[str]:
     """Return review reasons (flag, do NOT block). prev=None => create. A value
     that is unchanged from `prev` never re-flags (so backfills/no-ops don't churn
@@ -680,10 +1252,17 @@ def _normalize_drift(fm: dict, p: Path) -> tuple[dict, list[str]]:
     """Converge frontmatter on the schema's vocabulary BEFORE write (okengine#46): rename alias
     keys to their canonical name, map aliased values, and surface unknown fields for review.
     Returns (normalized_fm, unknown-field flags). No-op when the pack declares no drift policy."""
+    out = dict(fm)
+    # Type aliases are a write-boundary migration, not merely a validation
+    # exception: accepting `threat_actor` without storing canonical `actor`
+    # would keep fragmenting the entity corpus (#245).
+    try:
+        out["type"] = schema_lib.canonical_type(_governing(p), out.get("type"))
+    except Exception:
+        pass
     pol = drift_policy(str(p))
     if not pol:
-        return fm, []
-    out = dict(fm)
+        return out, []
     for alias, canon in (pol.get("field_aliases") or {}).items():   # country -> suspected_origin
         if alias in out:
             v = out.pop(alias)
@@ -724,10 +1303,60 @@ def _queue_review(p: Path, flags: list[str]) -> str:
     with queue.open("a", encoding="utf-8") as f:
         f.write(f"- {_today()} **{_rel(p)}** — {reason}\n")
     _append_log(f"- {_today()} mcp-write review-flag {_rel(p)} — {reason}")
+    _ensure_review_request(p, flags)
     return f" — flagged for review ({len(flags)} reason(s))"
 
 
 # --- plain logic helpers (tested directly) -------------------------------
+
+def _alias_matches(cur_fm: dict, stem: str, incoming_name: str, incoming_aliases: set) -> bool:
+    """primary-name<->alias bidirectional match between an existing page and the incoming one."""
+    cur_name = id_lib.normalize_key(str(cur_fm.get("name") or cur_fm.get("title") or stem))
+    cur_aliases = cur_fm.get("aliases") or []
+    if isinstance(cur_aliases, str):
+        cur_aliases = [a.strip() for a in cur_aliases.split(",") if a.strip()]
+    elif not isinstance(cur_aliases, list):
+        cur_aliases = []
+    cur_aliases = {id_lib.normalize_key(str(a)) for a in cur_aliases if str(a).strip()}
+    return incoming_name in cur_aliases or cur_name in incoming_aliases
+
+
+def _alias_hits(p: Path, incoming_name: str, incoming_aliases: set) -> "list[tuple[Path, dict]]":
+    """LIVE entity pages whose name<->alias matches the incoming page (okengine#324).
+
+    Consults the pre-built id-index name/alias maps (O(#matches)); only the candidate REL PATHS come
+    from the index — each hit is still read from disk to confirm the match against the current file
+    (the index can lag a concurrent edit) and to hand its frontmatter to the converge/collision logic.
+    FALLS BACK to the full entities/ scan (the pre-#324 behavior) when the loaded index is a pre-v2
+    artifact with no identity maps, so dedup is never blind in the window before the refresh cron
+    rewrites a v2 artifact."""
+    self_rel = _rel(p)
+    reg = _registry()
+    if not reg.name_to_rels and not reg.alias_to_rels:   # pre-v2 artifact -> full scan (old behavior)
+        candidates = [(c, c) for c in (_wiki() / "entities").rglob("*.md")]
+    else:
+        rels = set(reg.alias_to_rels.get(incoming_name, []))          # incoming name == existing alias
+        for a in incoming_aliases:
+            rels |= set(reg.name_to_rels.get(a, []))                  # existing name == incoming alias
+        rels.discard(self_rel)
+        candidates = [(_wiki() / rel, rel) for rel in sorted(rels)]
+    hits: list[tuple[Path, dict]] = []
+    for candidate, _key in candidates:
+        try:
+            if candidate.resolve() == p.resolve():
+                continue
+        except OSError:
+            continue
+        try:
+            cur_fm, _ = _read_page(candidate)
+        except OSError:
+            continue
+        if str(cur_fm.get("status") or "").lower() == "tombstoned":
+            continue
+        if _alias_matches(cur_fm, candidate.stem, incoming_name, incoming_aliases):
+            hits.append((candidate, cur_fm))
+    return hits
+
 
 def _dedup_on_create(path: str, p: Path, fm: dict, body: str) -> Optional[str]:
     """Identity-based dedup for create_entity (okengine#98/#99/#100).
@@ -750,6 +1379,30 @@ def _dedup_on_create(path: str, p: Path, fm: dict, body: str) -> Optional[str]:
     are unavailable or no id can be derived."""
     if not _CONVERGE_OK:
         return None
+    # Names and aliases are identity evidence too. A source may call an actor by
+    # an alias already curated on the canonical page (UNC6240 vs ShinyHunters);
+    # minted-id-only dedup misses that and creates a second entity. Match only
+    # primary-name↔alias (not alias↔alias), and only when the hit is unique.
+    if _namespace(p) == "entities":
+        incoming_name = id_lib.normalize_key(str(fm.get("name") or fm.get("title") or p.stem))
+        incoming_aliases = fm.get("aliases") or []
+        if isinstance(incoming_aliases, str):
+            incoming_aliases = [a.strip() for a in incoming_aliases.split(",") if a.strip()]
+        elif not isinstance(incoming_aliases, list):
+            incoming_aliases = []
+        incoming_aliases = {id_lib.normalize_key(str(a)) for a in incoming_aliases if str(a).strip()}
+        hits = _alias_hits(p, incoming_name, incoming_aliases)
+        if len(hits) == 1:
+            existing_path, existing_fm = hits[0]
+            existing_id, _ = _page_id_and_kind(
+                existing_fm, _governing(existing_path), "entities", existing_path.stem
+            )
+            fm["id"] = existing_id
+            return _converge(path, fm, body, _alias_verified=True)
+        if len(hits) > 1:
+            rels = ", ".join(_rel(hit[0]) for hit in hits[:5])
+            _flag(path, f"ambiguous entity alias on create; matches {rels}")
+            return f"refused: entity alias matches multiple canonicals ({rels}) — flagged for review"
     namespace = _namespace(p)
     try:
         schema = _governing(p)      # sub-domain aware (okengine#177); namespace is the bare mint scope
@@ -896,6 +1549,82 @@ def _unresolvable_link_flags(p: Path, body: Optional[str]) -> list:
     return [f"{len(bad)} unresolvable wikilink(s): " + "; ".join(bad[:5]) + (" …" if len(bad) > 5 else "")]
 
 
+# A `sources:` entry that uses the SINGULAR `source/` page-path — a structurally-invalid spelling of
+# the schema's plural `sources/` namespace. EVERY observed entity-backfill hallucination cited sources
+# this way (apt35 → source/mandiant/…, nightshade → source/darkread-…, apt29 → source/cisa/…). Legit
+# citations use plural `sources/…`, and a plural forward-ref to a not-yet-created source page is
+# TOLERATED (importers write an entity before its source in the same batch — okengine#196's coercion
+# test relies on it), so we do NOT touch plural — corpus-audit's dangling-ref detector (#336) covers
+# plural fabrications after the fact. Provenance LABELS ("MITRE ATT&CK") carry spaces and never match.
+_SINGULAR_SOURCE_REF = re.compile(r"^source/[a-z0-9][a-z0-9._/-]+$")
+
+
+def _entity_sources(fm: dict) -> list:
+    raw = fm.get("sources")
+    if raw is None:
+        raw = fm.get("source")
+    return raw if isinstance(raw, list) else ([raw] if isinstance(raw, str) else [])
+
+
+def _fabricated_source_reject(p: Path, fm: dict, prev_fm: Optional[dict] = None) -> Optional[str]:
+    """HARD-reject an entity whose `sources:` uses the invalid SINGULAR `source/` namespace — the
+    entity-backfill hallucination signature (okengine#348 follow-up). The schema's source namespace is
+    plural `sources/`; a singular `source/<…>` page-ref is never valid, and every fabricated cohort page
+    cited sources exactly this way. Plural `sources/…` refs are left alone (forward-refs are legitimate;
+    corpus-audit catches plural dangling refs). On UPDATE, refs ALREADY on the page are grandfathered —
+    the lane resends the full list, so block only NEWLY-introduced fabrication, never freeze a page that
+    carries a legacy bad ref (e.g. apt29's pre-existing source/cisa/… stays editable)."""
+    if _namespace(p) != "entities":
+        return None
+    grandfathered = {str(s).strip() for s in _entity_sources(prev_fm)} if prev_fm else set()
+    bad = []
+    for s in _entity_sources(fm):
+        if not isinstance(s, str) or s.strip() in grandfathered:
+            continue
+        t = s.strip().strip("[]").removeprefix("wiki/")
+        if t.endswith(".md"):
+            t = t[:-3]
+        if _SINGULAR_SOURCE_REF.match(t):               # singular `source/` — invalid namespace = fabrication
+            bad.append(s)
+    if not bad:
+        return None
+    return ("rejected: sources use the invalid singular `source/` namespace (the schema's source "
+            "namespace is plural `sources/`): " + "; ".join(bad[:5]) + (" …" if len(bad) > 5 else "")
+            + " — this is the entity-backfill fabrication signature; cite an EXISTING `sources/<…>` "
+              "page or a provenance label (e.g. 'MITRE ATT&CK').")
+
+
+_SLUG_DESIGNATION = re.compile(r"(?:^|[-_])([a-z]{2,16})[-_](\d{3,8})(?:[-_]|$)", re.I)
+_VALUE_DESIGNATION = re.compile(r"\b([a-z]{2,16})[-_ ](\d{3,8})\b", re.I)
+
+
+def _identity_contradiction_flags(p: Path, fm: dict) -> list[str]:
+    """Flag a filename designation that contradicts the page's own name/aliases.
+
+    Domain-neutral shape only (``prefix-number``). A disagreement is review evidence, not a hard
+    reject: aliases can legitimately document historical designations, but a polished profile must
+    be quarantined until a human resolves the identity.
+    """
+    if _namespace(p) != "entities" or not isinstance(fm, dict):
+        return []
+    slug_ids = {(prefix.casefold(), number) for prefix, number in _SLUG_DESIGNATION.findall(p.stem)}
+    if not slug_ids:
+        return []
+    values = [fm.get("name"), fm.get("title")]
+    aliases = fm.get("aliases") or []
+    values.extend(aliases if isinstance(aliases, list) else [aliases])
+    declared = {(prefix.casefold(), number) for value in values if value is not None
+                for prefix, number in _VALUE_DESIGNATION.findall(str(value))}
+    conflicts = sorted({(prefix, slug_num, declared_num)
+                        for prefix, slug_num in slug_ids for dprefix, declared_num in declared
+                        if prefix == dprefix and slug_num != declared_num})
+    if not conflicts:
+        return []
+    detail = ", ".join(f"{prefix.upper()}-{slug_num} vs {prefix.upper()}-{declared_num}"
+                       for prefix, slug_num, declared_num in conflicts[:4])
+    return [f"entity identity contradiction between path and declared name/aliases: {detail}"]
+
+
 # Degeneration guard: a model in a repetition loop emits a long unpunctuated word-salad. It
 # renders a clean 200, so it slips past every render check and only the periodic content lint
 # catches it — weeks after it lands. Flag it SOFTLY at the enforced write boundary instead,
@@ -982,7 +1711,8 @@ def _briefing_link_reject(p: Path, body: Optional[str]) -> Optional[str]:
 def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> str:
     p = _safe(path)
     if p is None:
-        return "refused: path outside the vault wiki/"
+        return (f"refused: unsafe wiki path (must stay inside wiki/; basename must contain no "
+                f"whitespace and entity basenames must be ≤{_MAX_ENTITY_SLUG_LEN} characters)")
     _wa = _wauth_refusal(path)
     if _wa:
         return _wa
@@ -994,22 +1724,55 @@ def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> st
     fm = _coerce_fm(frontmatter_yaml, p)
     if fm is None:
         return "rejected: frontmatter_yaml is not a valid YAML mapping"
+    # Route every partitioned namespace through the shared canonical writer
+    # contract before the existence, authorization, and schema gates.  A caller
+    # may supply a logical flat key; the physical write must never create a
+    # flat-vs-sharded duplicate (#262).
+    canonical_p = _partitioned_create_path(p, fm)
+    if canonical_p != p:
+        p = canonical_p
+        _wa = _wauth_refusal(p)
+        if _wa:
+            return _wa
+        if p.exists():
+            return f"refused: {_rel(p)} already exists — use update_entity"
+    cap = _capability_reject(p, "create", page_type=str(fm.get("type") or ""),
+                             changed_fields=fm.keys(),
+                             body_change="replace" if body else "none")
+    if cap:
+        return f"rejected: {cap}"
+    # Underscore type spellings are the observed taxonomy-bypass class
+    # (`threat_actor` beside canonical `threat-actor`/`actor`). Permit one only
+    # when the governing schema explicitly declares it as a type or type_alias.
+    ptype = str(fm.get("type") or "").strip()
+    if "_" in ptype:
+        try:
+            schema = _governing(p)
+            allowed_types = schema_lib.canonical_types(schema) | set(schema_lib.type_aliases(schema))
+        except Exception:
+            allowed_types = set()
+        if ptype not in allowed_types:
+            return f"rejected: type {ptype!r} is not declared by the governing schema"
     # Enforce the page lands in a schema-declared namespace (no stray-namespace fork, #115).
     nsr = _namespace_reject(p)
     if nsr:
         return f"rejected: {nsr}"
+    # ... and in the RIGHT declared namespace for its type (no type: source under concepts/, #276).
+    tnr = _type_namespace_reject(p, fm)
+    if tnr:
+        return f"rejected: {tnr}"
+    fsr = _fabricated_source_reject(p, fm)   # a cited source must exist — no fabricated `source/…` (#348)
+    if fsr:
+        return fsr
     fdr = _future_date_reject(fm)
     if fdr:
         return f"rejected: {fdr}"
     blr = _briefing_link_reject(p, body)
     if blr:
         return f"rejected: {blr}"
-    # Identity-based dedup BEFORE writing: route a cosmetic duplicate to the
-    # existing canonical (authority) or flag+refuse a slug collision, instead of
-    # minting a second canonical (okengine#98/#99/#100). Stamps fm["id"].
-    dedup = _dedup_on_create(path, p, fm, body)
-    if dedup is not None:
-        return dedup
+    bir = _body_integrity_reject("", body)
+    if bir:
+        return f"rejected: {bir}"
     fm, drift = _normalize_drift(fm, p)            # converge on schema vocab (okengine#46)
     # Server stamps version/last_updated if absent, and an IMMUTABLE `created` on first write
     # (the OKF-envelope creation date = when the page was ingested; unlike last_updated it never
@@ -1025,6 +1788,7 @@ def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> st
     # extension caller writes — the key disable/orphan/purge reads. Server-side, derived
     # from the scoped token, so a client can't spoof it (strips any supplied value first).
     _apply_extension_provenance(fm, creating=True)
+    review_invalidation = _apply_review_governance(fm)
     # Ensure every page carries a human `name`. The ingest agent (esp. source ingest:
     # select_raw_batch -> agent -> okengine-write) puts the article title in the body's
     # `# H1` but doesn't always set a `name`/`title` field, leaving the page nameless in
@@ -1035,16 +1799,39 @@ def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> st
         _h1 = _H1.search(body or "")
         if _h1:
             fm["name"] = _h1.group(1).strip()
+    _enum_case_coerce(p, fm)
     isr = _int_shape_reject(p, fm)
     if isr:
         return f"rejected: {isr}"
+    itr = _item_shape_reject(p, fm)
+    if itr:
+        return f"rejected: {itr}"
     pol = _policy_reject(p, fm, "create")
     if pol:
         return f"rejected: {pol}"
-    flags = drift + _review_flags(p, fm, prev=None) + _unresolvable_link_flags(p, body) + \
-        _degeneration_flags(body)
+    flags = review_invalidation + drift + _review_flags(p, fm, prev=None) + _identity_contradiction_flags(p, fm) + \
+        _unresolvable_link_flags(p, body) + _degeneration_flags(body)
     if flags:
         fm["needs_review"] = True
+    # Stamp the content-derived id before schema validation (the OKF envelope
+    # requires it). Duplicate routing itself stays after validation below.
+    if _CONVERGE_OK:
+        try:
+            pid, _ = _page_id_and_kind(fm, _governing(p), _namespace(p), p.stem)
+            if pid:
+                fm["id"] = pid
+        except Exception:
+            pass
+    content = _compose(fm, body)
+    reason = schema_reject_reason(str(p), content)
+    if reason:
+        return f"rejected: {reason}"
+    # Dedup runs only AFTER the complete candidate passes schema validation. The
+    # old order let an invalid type alias-match and converge before the validator
+    # saw it. This stamps fm["id"], so recompose/revalidate the final new page.
+    dedup = _dedup_on_create(path, p, fm, body)
+    if dedup is not None:
+        return dedup
     content = _compose(fm, body)
     reason = schema_reject_reason(str(p), content)
     if reason:
@@ -1058,10 +1845,45 @@ def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> st
             _registry().by_id[fm["id"]] = _rel(p)
         except Exception:           # pragma: no cover - registry is best-effort
             pass
+    # Write-synchronous name/alias claim (okengine#324): keep _alias_hits' index current WITHIN this
+    # process so two matching entity pages created back-to-back dedup against each other (the pre-#324
+    # rglob saw the just-written page on disk; the index must too). Tombstoned pages excluded.
+    if _CONVERGE_OK and _namespace(p) == "entities" \
+            and str(fm.get("status") or "").lower() != "tombstoned":
+        try:
+            _registry()._add_identity(_rel(p), fm)
+        except Exception:           # pragma: no cover - registry is best-effort
+            pass
     ver = fm.get("version", 1)
     _append_log(f"- {_today()} mcp-write create {_rel(p)} v{ver}")
     note = _queue_review(p, flags)
     return f"created {_rel(p)} v{ver}{note}"
+
+
+# Identity + provenance fields that are IMMUTABLE after creation: `id` never changes (id_lib.py:22),
+# and created/created_by/discovered_by are the create-time provenance the converge lane already
+# protects (converge._PROVENANCE_KEYS, M19). But _update merged caller frontmatter wholesale
+# (new_fm.update(patch)) and _patch re-parsed the edited text wholesale — neither preserved these, so
+# update_entity/patch_entity could freely rewrite an id or forge provenance: exactly the class the
+# audit closed on converge, left open on the other two mutating lanes (invariant-audit HIGH #3).
+# extension_id is handled separately by _apply_extension_provenance; maintained_by is additive.
+_IMMUTABLE_KEYS = ("id", "created", "created_by", "discovered_by")
+
+
+def _preserve_immutable(new_fm: dict, cur_fm: dict) -> list:
+    """Force any immutable identity/provenance field that ALREADY EXISTS back to its stored value,
+    overriding a caller change — so a read-modify-write that echoes the whole frontmatter is fine,
+    but a forged CHANGE is silently reverted. A field the page LACKS may still be set (backfilling an
+    id/created onto a legacy or non-compliant page is legitimate — and, since base-schema makes `id`
+    required, necessary). The invariant is 'never CHANGES', not 'never appears'. Returns the fields
+    whose change was reverted, so the caller can flag the attempt for review."""
+    reverted = []
+    for key in _IMMUTABLE_KEYS:
+        if key in cur_fm:                       # exists -> immutable: restore (no-op if unchanged)
+            if new_fm.get(key) != cur_fm[key]:
+                reverted.append(key)
+            new_fm[key] = cur_fm[key]
+    return reverted
 
 
 def _update(path: str, frontmatter_yaml: Union[str, dict, None] = None,
@@ -1085,6 +1907,7 @@ def _update(path: str, frontmatter_yaml: Union[str, dict, None] = None,
     if tr:
         return tr
     new_fm = dict(cur_fm)
+    patch = {}
     if frontmatter_yaml is not None:
         patch = _coerce_fm(frontmatter_yaml, p)
         if patch is None:
@@ -1095,14 +1918,25 @@ def _update(path: str, frontmatter_yaml: Union[str, dict, None] = None,
         if fdr:
             return f"rejected: {fdr}"
         new_fm.update(patch)
+    cap = _capability_reject(
+        p, "update", page_type=str(new_fm.get("type") or cur_fm.get("type") or ""),
+        changed_fields=patch.keys(), body_change="replace" if body is not None else "none")
+    if cap:
+        return f"rejected: {cap}"
     # extension_id is server-derived: strip any client forge, keep the create-time stamp (M14).
     _apply_extension_provenance(new_fm, creating=False, existing_ext_id=cur_fm.get("extension_id"))
+    # id + created/created_by/discovered_by are immutable — revert any caller change (audit HIGH #3).
+    reverted_immutable = _preserve_immutable(new_fm, cur_fm)
+    review_invalidation = _apply_review_governance(new_fm, cur_fm)
     new_fm, drift = _normalize_drift(new_fm, p)    # converge on schema vocab (okengine#46)
     new_body = cur_body if body is None else body
     if body is not None:                           # only when this update REWRITES the body
         blr = _briefing_link_reject(p, new_body)
         if blr:
             return f"rejected: {blr}"
+        bir = _body_integrity_reject(cur_body, new_body)
+        if bir:
+            return f"rejected: {bir}"
     # Bump version, stamp last_updated.
     try:
         new_fm["version"] = int(new_fm.get("version", 1)) + 1
@@ -1110,14 +1944,25 @@ def _update(path: str, frontmatter_yaml: Union[str, dict, None] = None,
         new_fm["version"] = 2
     new_fm["last_updated"] = _now()
     _stamp_maintainer(new_fm, creation=False)   # add this pack as a maintainer (okengine#90 P3)
+    _enum_case_coerce(p, new_fm)
     isr = _int_shape_reject(p, new_fm)
     if isr:
         return f"rejected: {isr}"  # existing file left untouched
+    itr = _item_shape_reject(p, new_fm)
+    if itr:
+        return f"rejected: {itr}"  # existing file left untouched
     pol = _policy_reject(p, new_fm, "update", prev=cur_fm)
     if pol:
         return f"rejected: {pol}"  # existing file left untouched
-    flags = drift + _review_flags(p, new_fm, prev=cur_fm) + \
-        (_unresolvable_link_flags(p, new_body) + _degeneration_flags(new_body) if body is not None else [])
+    tnr = _type_ns_reject_on_change(p, new_fm, cur_fm)   # type can't drift out of its home ns (audit)
+    if tnr:
+        return f"rejected: {tnr}"  # existing file left untouched
+    fsr = _fabricated_source_reject(p, new_fm, prev_fm=cur_fm)   # block NEW fabricated source refs (#348)
+    if fsr:
+        return fsr  # existing file left untouched
+    flags = review_invalidation + drift + _review_flags(p, new_fm, prev=cur_fm) + _identity_contradiction_flags(p, new_fm) + \
+        (_unresolvable_link_flags(p, new_body) + _degeneration_flags(new_body) if body is not None else []) + \
+        ([f"immutable field change reverted: {', '.join(reverted_immutable)}"] if reverted_immutable else [])
     if flags:
         new_fm["needs_review"] = True
     content = _compose(new_fm, new_body)
@@ -1147,6 +1992,13 @@ def _tombstone(path: str, reason: str, superseded_by: Optional[str] = None) -> s
     if ferr:
         return f"refused: {ferr} — fix the page's frontmatter before tombstoning (would silently wipe it)"
     cur_fm, cur_body = _read_page(p)
+    changed = {"status", "tombstone_reason", "last_updated", "version"}
+    if superseded_by:
+        changed.add("superseded_by")
+    cap = _capability_reject(p, "tombstone", page_type=str(cur_fm.get("type") or ""),
+                             changed_fields=changed)
+    if cap:
+        return f"rejected: {cap}"
     # a tombstone IS an update — it must clear the same namespace permission
     # matrix as every other mutation (found via okengine#166: an agent-read-only
     # lookup/ namespace could still be tombstoned through this one path)
@@ -1190,6 +2042,9 @@ def _flag(path: str, note: str) -> str:
     p = _safe(path)
     if p is None:
         return "refused: path outside the vault wiki/"
+    cap = _capability_reject(p, "flag")
+    if cap:
+        return f"rejected: {cap}"
     _wa = _wauth_refusal(path)
     if _wa:
         return _wa
@@ -1275,6 +2130,17 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
         return f"rejected: edit produced invalid frontmatter YAML: {str(e)[:120]}"
     if not isinstance(new_fm, dict):
         return "rejected: edit produced non-mapping frontmatter"
+    changed_fields = {key for key in set(cur_fm) | set(new_fm)
+                      if cur_fm.get(key) != new_fm.get(key)}
+    old_match = _FM.match(text)
+    old_body = old_match.group(2).lstrip("\n") if old_match else ""
+    candidate_body = m.group(2).lstrip("\n")
+    cap = _capability_reject(
+        p, "patch", page_type=str(new_fm.get("type") or cur_fm.get("type") or ""),
+        changed_fields=changed_fields,
+        body_change="replace" if candidate_body != old_body else "none")
+    if cap:
+        return f"rejected: {cap}"
     # patch_entity is a full write chokepoint: apply the SAME shape coercion _create/_update/_converge
     # do (#196 — a schema-declared list field authored as a scalar becomes a list; bare [[wikilink]]
     # values are stripped), so an edit can't land a malformed shape that poisons a downstream lane.
@@ -1288,15 +2154,28 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
     new_fm, drift = _normalize_drift(new_fm, p)
     # extension_id is server-derived: strip any patched-in forge, keep the create-time stamp (M14).
     _apply_extension_provenance(new_fm, creating=False, existing_ext_id=cur_fm.get("extension_id"))
+    # id + created/created_by/discovered_by are immutable — revert any patched-in change (audit HIGH #3).
+    reverted_immutable = _preserve_immutable(new_fm, cur_fm)
+    review_invalidation = _apply_review_governance(new_fm, cur_fm)
+    _enum_case_coerce(p, new_fm)
     isr = _int_shape_reject(p, new_fm)
     if isr:
         return f"rejected: {isr}"
+    itr = _item_shape_reject(p, new_fm)
+    if itr:
+        return f"rejected: {itr}"
     pol = _policy_reject(p, new_fm, "update", prev=cur_fm)
     if pol:
         return f"rejected: {pol}"
+    tnr = _type_ns_reject_on_change(p, new_fm, cur_fm)   # type can't drift out of its home ns (audit)
+    if tnr:
+        return f"rejected: {tnr}"
     body = m.group(2)
     if body.startswith("\n"):
         body = body[1:]
+    bir = _body_integrity_reject(_cur_body, body)
+    if bir:
+        return f"rejected: {bir}"
     blr = _briefing_link_reject(p, body)   # briefings must have only resolvable links + a citation
     if blr:
         return f"rejected: {blr}"
@@ -1307,8 +2186,9 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
     # Same review gate as create/update: drift (aliased field/value), degenerate body, and dead
     # wikilinks must be attributable at THIS write, not only via a nightly report-only lint that
     # carries no write attribution (invariant-audit — patch bypassed all three).
-    flags = drift + _review_flags(p, new_fm, prev=cur_fm) + \
-        _unresolvable_link_flags(p, body) + _degeneration_flags(body)
+    flags = review_invalidation + drift + _review_flags(p, new_fm, prev=cur_fm) + _identity_contradiction_flags(p, new_fm) + \
+        _unresolvable_link_flags(p, body) + _degeneration_flags(body) + \
+        ([f"immutable field change reverted: {', '.join(reverted_immutable)}"] if reverted_immutable else [])
     if flags:
         new_fm["needs_review"] = True
     content = _compose(new_fm, body)
@@ -1323,6 +2203,57 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
 
 
 _HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.*?)[ \t]*$")
+_MALFORMED_HEADING_RE = re.compile(r"^##[ \t]+##(?:[ \t]+|$)", re.MULTILINE)
+_FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+# These headings are generated by the read MCP from the live backlink graph. Authoring them into a
+# canonical page freezes derived state into prose and makes the same panel appear twice to readers.
+_DERIVED_PANEL_HEADINGS = {
+    "incoming backlinks",
+    "outbound references",
+    "referenced by",
+    "references",
+}
+
+
+def _body_integrity_counts(body: str) -> tuple[int, Counter]:
+    """Count structural defects outside fenced code blocks."""
+    malformed = 0
+    counts: Counter = Counter()
+    fence: tuple[str, int] | None = None
+    for line in (body or "").splitlines():
+        marker = _FENCE_RE.match(line)
+        if marker:
+            run = marker.group(1)
+            if fence is None:
+                fence = (run[0], len(run))
+            elif run[0] == fence[0] and len(run) >= fence[1]:
+                fence = None
+            continue
+        if fence is not None:
+            continue
+        if _MALFORMED_HEADING_RE.match(line):
+            malformed += 1
+        match = _HEADING_RE.match(line)
+        if match and len(match.group(1)) == 2:
+            name = match.group(2).strip().casefold()
+            if name in _DERIVED_PANEL_HEADINGS:
+                counts[name] += 1
+    return malformed, counts
+
+
+def _body_integrity_reject(previous: str, proposed: str) -> Optional[str]:
+    """Reject newly introduced malformed or reader-derived H2s, while allowing legacy pages to be
+    edited or repaired. Counts matter: adding a second copy is also an introduction."""
+    old_bad, old_panels = _body_integrity_counts(previous)
+    new_bad, new_panels = _body_integrity_counts(proposed)
+    if new_bad > old_bad:
+        return "body introduces malformed `## ##` heading — pass a plain section name"
+    introduced = sorted(name for name, count in new_panels.items() if count > old_panels[name])
+    if introduced:
+        return ("body introduces reader-derived panel heading(s): "
+                + ", ".join(introduced)
+                + " — backlink/reference panels are computed and must not be authored")
+    return None
 
 
 def _insert_into_section(body: str, heading: str, block: str) -> tuple[str, str]:
@@ -1330,7 +2261,12 @@ def _insert_into_section(body: str, heading: str, block: str) -> tuple[str, str]
     text, any level), before the next heading of the same-or-higher level. If the
     heading is absent, create the section at the end of the body."""
     lines = body.split("\n")
-    want = heading.strip().lstrip("#").strip().lower()
+    # Normalize the heading argument: an agent may pass an already-`##`-prefixed name
+    # (`## Recent activity`). The MATCH stripped `#`, but the section-CREATE path below
+    # wrote `## {heading}` from the raw arg — double-prefixing to `## ## Recent activity`
+    # (okengine#242, 38 corrupted pages fleet-wide). Strip here so create and match agree.
+    heading = heading.strip().lstrip("#").strip()
+    want = heading.lower()
     block = block.rstrip("\n")
     idx = level = None
     for i, ln in enumerate(lines):
@@ -1372,10 +2308,17 @@ def _append_section(path: str, heading: str, text: str) -> str:
     if ferr:
         return f"refused: {ferr} — fix the page's frontmatter before appending (would silently wipe it)"
     cur_fm, cur_body = _read_page(p)
+    cap = _capability_reject(p, "append", page_type=str(cur_fm.get("type") or ""),
+                             body_change="append")
+    if cap:
+        return f"rejected: {cap}"
     tr = _tombstone_refuse(cur_fm, p)   # tombstone-guard (a separate concern)
     if tr:
         return tr
     new_body, where = _insert_into_section(cur_body, heading, text)
+    bir = _body_integrity_reject(cur_body, new_body)
+    if bir:
+        return f"rejected: {bir}"
     new_fm = dict(cur_fm)
     blr = _briefing_link_reject(p, new_body)   # append is the hot path for growing a briefing's
     if blr:                                    # `## Recent activity` — apply the same dead-link guard
@@ -1455,7 +2398,7 @@ def _page_id_and_kind(fm: dict, schema: dict, namespace: str, stem: str) -> tupl
 
 
 def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
-              pack: str = "", remove: str = "") -> str:
+              pack: str = "", remove: str = "", _alias_verified: bool = False) -> str:
     """Upsert a page by id: merge into a live page that already carries the id
     (page+field ownership), else create + claim. (RFC composable-okpacks §5a.)"""
     pack = pack or _prov_pack()   # deployment-pinned provenance + field ownership (okengine#90 P3)
@@ -1473,6 +2416,11 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
     fm = _coerce_fm(frontmatter_yaml, p)
     if fm is None:
         return "rejected: frontmatter_yaml is not a valid YAML mapping"
+    cap = _capability_reject(p, "converge", page_type=str(fm.get("type") or ""),
+                             changed_fields=fm.keys(),
+                             body_change="replace" if body else "none")
+    if cap:
+        return f"rejected: {cap}"
     namespace = _namespace(p)
     schema = _governing(p)          # sub-domain aware (okengine#177); namespace is the bare mint scope
     pid, kind = _page_id_and_kind(fm, schema, namespace, p.stem)
@@ -1490,7 +2438,7 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
         existing_path = _wiki() / existing_rel
         same = existing_path.exists() and existing_path.resolve() == p.resolve()
         if not same:
-            if kind != "authority":
+            if kind != "authority" and not _alias_verified:
                 _flag(path, f"slug id collision: {pid} already used by {existing_rel}")
                 return (f"refused: slug id {pid} already used by {existing_rel} — "
                         "flagged for review (slug ids never auto-merge)")
@@ -1498,6 +2446,13 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
             _wa = _wauth_refusal(p)                 # re-authorize: the redirect can point OUTSIDE
             if _wa:                                 # the caller's declared scope (okengine#178)
                 return _wa
+            _rr = _reserved_refuse(p)               # re-check reserved: the id-index CAN resolve a
+            if _rr:                                 # pack-reserved page (id_index._skip only knows the
+                return _rr                          # engine set, not schema reserved_files) — the
+                                                    # original _reserved_refuse was on the pre-redirect
+                                                    # path, so a converge could land on a reserved page
+                                                    # (invariant-audit HIGH — every other mutating lane
+                                                    # re-checks reserved on the exact path it writes)
         if p.is_file():
             cur_fm, cur_body = _read_page(p)
             # invariant-audit M14: the registry tombstone check above reads the id-index, which is
@@ -1518,6 +2473,7 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
             # extension_id is server-derived: converge.merge treats it as a _SERVER_KEY, but strip any
             # residual forge and re-assert the on-disk stamp so it can never be reassigned (M14).
             _apply_extension_provenance(merged, creating=False, existing_ext_id=cur_fm.get("extension_id"))
+            review_invalidation = _apply_review_governance(merged, cur_fm)
             new_body = cur_body if not body else body     # same guard as _create/_update (invariant-audit)
             _stamp(merged, cur_fm)
             if pack:
@@ -1525,13 +2481,21 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
             blr = _briefing_link_reject(p, new_body)   # briefings must cite resolvable pages — the same
             if blr:                                    # guard create/update/patch/append enforce (L3)
                 return f"rejected: {blr}"
+            if body:
+                bir = _body_integrity_reject(cur_body, new_body)
+                if bir:
+                    return f"rejected: {bir}"
             fd = _future_date_reject(merged)   # the boundary every writer crosses (invariant-audit)
             if fd:
                 return f"rejected: {fd}"        # file left untouched
+            _enum_case_coerce(p, merged)        # case-canonicalize enums (#226) before the guards
             isr = _int_shape_reject(p, merged)  # machine-owned int fields (recent_reports/total_mentions):
             if isr:                             # create/update/patch all reject here; _dedup_on_create
                 return f"rejected: {isr}"       # redirects create_entity INTO converge, so this lane must
                                                 # enforce it too or the guard is bypassed (invariant-audit)
+            itr = _item_shape_reject(p, merged)  # item contracts (#211): same bypass reasoning
+            if itr:
+                return f"rejected: {itr}"
             # Converge is an agent write into an EXISTING page: apply the same
             # write-governance as update_entity, not a bypass (#21). HARD namespace
             # permission gate first (a human-authored namespace refuses the write,
@@ -1539,9 +2503,12 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
             pol = _policy_reject(p, merged, "update", prev=cur_fm)
             if pol:
                 return f"rejected: {pol}"
+            tnr = _type_ns_reject_on_change(p, merged, cur_fm)   # type can't drift out of home ns (audit)
+            if tnr:
+                return f"rejected: {tnr}"
             # ...then SOFT review flags (categorical confidence verdict, changed
             # review field) — flag, never block.
-            review = drift + _review_flags(p, merged, prev=cur_fm) + _unresolvable_link_flags(p, new_body) + \
+            review = review_invalidation + drift + _review_flags(p, merged, prev=cur_fm) + _identity_contradiction_flags(p, merged) + _unresolvable_link_flags(p, new_body) + \
                 (_degeneration_flags(new_body) if body else [])   # degenerate body attributable at write (M15)
             if review:
                 merged["needs_review"] = True
@@ -1633,6 +2600,26 @@ try:
         return _append_section(path, heading, text)
 
     @mcp.tool()
+    def resolve_review(path: str, decision: str, reviewer: str, expected_version: int,
+                       expected_hash: str, note: str = "", review_id: str = "") -> dict:
+        """Record a version-locked human review decision. Approval/dismissal may clear the
+        review flag; every disposition writes an auditable review record and page projection."""
+        return _resolve_review(path, decision, reviewer, note, expected_version, expected_hash,
+                               review_id or None, service="mcp")
+
+    @mcp.tool()
+    def assign_review(path: str, reviewer: str, expected_version: int,
+                      expected_hash: str, review_id: str = "") -> dict:
+        """Assign the exact current review request to a human reviewer."""
+        return _assign_review(path, reviewer, expected_version, expected_hash,
+                              review_id or None, service="mcp")
+
+    @mcp.tool()
+    def record_machine_review(path: str, evaluator: str, outcome: str, note: str = "") -> dict:
+        """Attach a machine evidence check without clearing human-required review state."""
+        return _record_machine_review(path, evaluator, outcome, note)
+
+    @mcp.tool()
     def converge_entity(path: str, frontmatter_yaml: str, body: str = "",
                         pack: str = "", remove: str = "") -> str:
         """Upsert a page by its IDENTITY (not its path). The id is taken from the
@@ -1663,18 +2650,22 @@ class _ScopedWriteAuth:
         self.app, self.admin_token = app, admin_token
 
     async def __call__(self, scope, receive, send):
-        if scope.get("type") == "http":
+        if scope.get("type") == "http" and scope.get("path") != "/healthz":
             headers = dict(scope.get("headers") or [])
             provided = headers.get(b"authorization", b"").decode()
             token = provided[7:] if provided.startswith("Bearer ") else ""
             caller = None
             if self.admin_token and hmac.compare_digest(token, self.admin_token):
-                caller = {"kind": "admin", "write_scopes": None, "ext_id": None}
+                caller = {"kind": "admin", "actor": "admin",
+                          "write_scopes": None, "ext_id": None}
             else:
                 rec = _scope.resolve(token)
                 if rec is not None:
-                    caller = {"kind": "extension", "ext_id": rec.get("ext_id"),
-                              "write_scopes": rec.get("write_scopes") or []}
+                    ext_id = rec.get("ext_id")
+                    caller = {"kind": "extension", "ext_id": ext_id,
+                              "actor": rec.get("actor") or f"extension:{ext_id}",
+                              "write_scopes": rec.get("write_scopes") or [],
+                              "write_capability": rec.get("write_capability") or {}}
             if caller is None:
                 await send({"type": "http.response.start", "status": 401,
                             "headers": [(b"content-type", b"text/plain")]})
@@ -1684,23 +2675,102 @@ class _ScopedWriteAuth:
         await self.app(scope, receive, send)
 
 
+def _review_http_app():
+    """Small review-only REST surface for a protected operator UI.
+
+    It deliberately does not expose generic entity mutation. `_ScopedWriteAuth` wraps the whole
+    service, while the operation itself enforces version/hash locking and the review state machine.
+    """
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
+
+    review_app = FastAPI(title="OKEngine review write", docs_url=None, redoc_url=None)
+
+    @review_app.get("/healthz")
+    def healthz():
+        return {"ok": True}
+
+    @review_app.post("/review/resolve")
+    async def review_resolve(request: StarletteRequest):
+        try:
+            data = await request.json()
+        except Exception:
+            return JSONResponse({"ok": False, "error": "invalid JSON"}, status_code=400)
+        result = _resolve_review(
+            str(data.get("path") or ""), str(data.get("decision") or ""),
+            str(data.get("reviewer") or ""), str(data.get("note") or ""),
+            data.get("expected_version"), str(data.get("expected_hash") or ""),
+            str(data.get("review_id") or "") or None, service=str(data.get("service") or "cockpit"))
+        return JSONResponse(result, status_code=int(result.get("status") or 500))
+
+    @review_app.post("/review/assign")
+    async def review_assign(request: StarletteRequest):
+        try:
+            data = await request.json()
+        except Exception:
+            return JSONResponse({"ok": False, "error": "invalid JSON"}, status_code=400)
+        result = _assign_review(
+            str(data.get("path") or ""), str(data.get("reviewer") or ""),
+            data.get("expected_version"), str(data.get("expected_hash") or ""),
+            str(data.get("review_id") or "") or None, service=str(data.get("service") or "cockpit"))
+        return JSONResponse(result, status_code=int(result.get("status") or 500))
+
+    @review_app.post("/review/machine")
+    async def review_machine(request: StarletteRequest):
+        try:
+            data = await request.json()
+        except Exception:
+            return JSONResponse({"ok": False, "error": "invalid JSON"}, status_code=400)
+        result = _record_machine_review(str(data.get("path") or ""),
+                                        str(data.get("evaluator") or "machine"),
+                                        str(data.get("outcome") or ""), str(data.get("note") or ""))
+        return JSONResponse(result, status_code=int(result.get("status") or 500))
+    return review_app
+
+
+# Keep in sync with okengine-mcp/server.py DEFAULT_LOCAL_TOKEN / _LOOPBACK (the read server). The
+# well-known local token is PUBLIC (it ships in the source); the enforced WRITE path must never serve
+# it beyond loopback (invariant-audit CRITICAL — the read server fails closed on exactly this, but
+# write_server only checked the token was non-empty, so a networked write bound off-loopback with the
+# seeded compose default served UNAUTHENTICATED full create/update/converge/tombstone access).
+DEFAULT_LOCAL_TOKEN = "okengine-local"
+_LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def _resolve_write_auth(env: dict, host: str) -> str:
+    """The admin bearer token for the networked write transport, or raise SystemExit (fail CLOSED).
+
+    - empty (no WRITE_TOKEN and no MCP_TOKEN) → refuse: writes must be authenticated.
+    - the built-in DEFAULT token while bound beyond loopback → refuse unless
+      OKENGINE_WRITE_ALLOW_DEFAULT_TOKEN=1 (the public token can't guard a networked WRITE surface).
+      On loopback the default is painless, same as the read server."""
+    admin = (env.get("OKENGINE_WRITE_TOKEN") or env.get("OKENGINE_MCP_TOKEN") or "")
+    if not admin:
+        raise SystemExit("okengine-write: networked transport requires OKENGINE_WRITE_TOKEN "
+                         "(or OKENGINE_MCP_TOKEN) — refusing to serve writes unauthenticated.")
+    exposed = host not in _LOOPBACK
+    if admin == DEFAULT_LOCAL_TOKEN and exposed and \
+            env.get("OKENGINE_WRITE_ALLOW_DEFAULT_TOKEN", "") != "1":
+        raise SystemExit(
+            f"okengine-write: refusing to bind {host} with the built-in DEFAULT token — it is "
+            "public, and this is the ENFORCED WRITE path. Set OKENGINE_WRITE_TOKEN (or "
+            "OKENGINE_MCP_TOKEN) to a secret, or OKENGINE_WRITE_ALLOW_DEFAULT_TOKEN=1 to override.")
+    return admin
+
+
 if __name__ == "__main__":  # pragma: no cover
     if mcp is None:
         raise SystemExit("mcp package not installed; cannot run the server")
     transport = os.environ.get("OKENGINE_WRITE_TRANSPORT", "stdio")
     if transport in ("streamable-http", "http"):
-        # Networked write surface for out-of-process sidecars. Requires a scoped or
-        # admin token; refuses the built-in default unless explicitly allowed, and
-        # fails closed off-loopback with the default (mirrors the read server).
+        # Networked write surface for out-of-process sidecars. Requires a scoped or admin token;
+        # refuses the built-in default off-loopback unless explicitly allowed (mirrors server.py).
         import uvicorn
         host = os.environ.get("OKENGINE_WRITE_HOST", "127.0.0.1")
-        admin = (os.environ.get("OKENGINE_WRITE_TOKEN")
-                 or os.environ.get("OKENGINE_MCP_TOKEN") or "")
-        if not admin:
-            raise SystemExit("okengine-write: networked transport requires "
-                             "OKENGINE_WRITE_TOKEN (or OKENGINE_MCP_TOKEN) — refusing "
-                             "to serve writes unauthenticated.")
-        app = _ScopedWriteAuth(mcp.streamable_http_app(), admin)
+        admin = _resolve_write_auth(os.environ, host)
+        inner = _review_http_app() if os.environ.get("OKENGINE_WRITE_REVIEW_ONLY") == "1" \
+            else mcp.streamable_http_app()
+        app = _ScopedWriteAuth(inner, admin)
         uvicorn.run(app, host=host, port=int(os.environ.get("OKENGINE_WRITE_PORT", "8731")))
     else:
         mcp.run(transport="stdio")

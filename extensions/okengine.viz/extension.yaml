@@ -30,13 +30,13 @@ config:
     description: >-
       Concept frontmatter field for the x (evolution/maturity) axis — Wardley scale
       genesis<custom<product<commodity, or a 0-1/0-100 number. Absent -> graph-ubiquity heuristic.
-      Override via VIZ_EVOLUTION_FIELD.
+      Env: OKENGINE_VIZ_EVOLUTION_FIELD.
   value_field:
     type: string
     default: "value_chain"
     description: >-
       Concept frontmatter field for the y (value-chain) axis (0-1/0-100). Absent -> entity-coupling
-      heuristic. Override via VIZ_VALUE_FIELD.
+      heuristic. Env: OKENGINE_VIZ_VALUE_FIELD.
   anchor:
     type: string
     default: ""
@@ -45,20 +45,20 @@ config:
       to the anchors' neighborhood — concepts they link directly plus concepts linked from entities
       they link (1 hop) — instead of the whole vault (which surfaces global hub concepts).
       Percentiles stay global so scoped nodes keep true positions. Cap defaults 35 anchored / 75
-      global (WARDLEY_MAX_NODES). Override via VIZ_ANCHOR.
+      global (WARDLEY_MAX_NODES). Env: OKENGINE_VIZ_ANCHOR.
   enrich_batch:
     type: string
     default: "25"
     description: >-
       Concepts enriched per concept-enrich run (2 llm_lib.classify calls each, ~12s/concept
-      on a local mid-size model). Override via ENRICH_BATCH.
+      on a local mid-size model). Env: OKENGINE_VIZ_ENRICH_BATCH.
   enrich_time_budget:
     type: string
     default: "300"
     description: >-
       Own-clock seconds per concept-enrich run — the lane checkpoints each page and stops
-      cleanly at the budget (a host timeout is a kill, not a budget). Override via
-      ENRICH_TIME_BUDGET.
+      cleanly at the budget (a host timeout is a kill, not a budget). Env:
+      OKENGINE_VIZ_ENRICH_TIME_BUDGET.
 operations:
   wardley-refresh:
     schedule: {kind: cron, expr: "20 5 * * *"}      # daily, like the origin job

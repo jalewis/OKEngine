@@ -1,0 +1,43 @@
+diff --git a/runner.py b/runner.py
+index 69f66e7..31f7d3c 100644
+--- a/runner.py
++++ b/runner.py
+@@ -76,3 +76,25 @@ def _utc_now() -> datetime:
+-def _write_pid_file(job_id: str) -> Path:
++def _apply_job_env(job: dict) -> None:
++    """Apply a job's declarative environment inside this isolated runner.
++
++    The scheduler starts one runner subprocess per job, so these values cannot
++    leak into another concurrent job.  Reject malformed mappings loudly instead
++    of passing surprising objects or invalid names to extension code.
++    """
++    env = job.get("env")
++    if env is None:
++        return
++    if not isinstance(env, dict):
++        raise ValueError("job env must be an object")
++    for key, value in env.items():
++        if not isinstance(key, str) or not key or not key.replace("_", "A").isalnum():
++            raise ValueError(f"invalid job env name: {key!r}")
++        if isinstance(value, (dict, list, tuple, set)):
++            raise ValueError(f"job env value for {key} must be scalar")
++        if value is None:
++            value = ""
++        os.environ.setdefault(key, str(value))
++
++
++def _write_pid_file(job_id: str) -> Path:
+     """Record this runner's PID + start time so scheduler.py's
+     `_job_is_running` can detect PID reuse on the next tick.
+@@ -151,3 +173,10 @@ def main() -> int:
+-        job_name = job.get("name", args.job_id)
++        try:
++            _apply_job_env(job)
++        except ValueError as e:
++            logger.error("invalid job environment: %s", e)
++            jobs_mod.mark_job_run(args.job_id, success=False, error=str(e))
++            return 2
++
++        job_name = job.get("name", args.job_id)
+         logger.info(
+             "cron-plus runner starting (job=%s, id=%s, pid=%d, started=%s)",

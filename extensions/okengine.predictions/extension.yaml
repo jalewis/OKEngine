@@ -4,14 +4,16 @@
 # into an opt-in extension — the design's canonical example (extension-system.md §1).
 # Three wake-gated agent lanes: file candidates, grade overdue, re-grade on new evidence.
 #
-# Reuses the pack's `prediction` type (write: predictions/**) — it does NOT bring a schema
-# fragment, so a pack that wants predictions must declare the `prediction` type in its
-# schema.yaml (every current pack already does). The bundled prompts are generic and defer
-# domain specifics to $WIKI_PATH/CLAUDE.md; override per-deployment via
-# <pack>/.okengine/extension-prompts.json keyed by the job name (e.g. okengine.predictions:grade).
+# Reuses the pack's `prediction` TYPE (write: predictions/**) — a pack that wants predictions
+# must declare the `prediction` type in its schema.yaml (every current pack already does). The
+# fragment below brings NO type — only the `evidence:` ITEM contract (okengine#217), the single
+# source of the direction vocabulary that the write path enforces and the digest + cockpit
+# derive. The bundled prompts are generic and defer domain specifics to $WIKI_PATH/CLAUDE.md;
+# override per-deployment via <pack>/.okengine/extension-prompts.json keyed by the job name
+# (e.g. okengine.predictions:grade).
 id: okengine.predictions
 kind: operation
-version: 0.1.0
+version: 0.3.0
 name: Predictions
 description: >-
   Falsifiable, dated forecasts: file prediction candidates from recently-active entities,
@@ -23,22 +25,39 @@ requires:
 capabilities:
   read: ["wiki/**"]
   write: ["predictions/**", "dashboards/**"]   # predictions + derived dashboards (base-rates, outcome-eval)
+schema:
+  - schema/predictions.schema.yaml   # evidence-record ITEM contract (#217) — single source of the
+                                     #   direction vocabulary; wires into the composer (without this
+                                     #   the fragment is orphaned and the write path never sees it)
+config:
+  # Composer/runtime contract: OKENGINE_PREDICTIONS_<KEY>.
+  recommender_signal_weight: {type: number, default: 0.40}
+  recommender_source_quality_weight: {type: number, default: 0.30}
+  recommender_corroboration_weight: {type: number, default: 0.05}
+  recommender_contradiction_weight: {type: number, default: 0.30}
+  recommender_neutral_offset: {type: number, default: 0.40}
+  recommender_per_event_cap: {type: number, default: 0.15}
+  recommender_per_cycle_cap: {type: number, default: 0.20}
+  recommender_skeptic_after_raises: {type: integer, default: 2}
 operations:
   candidate-watch:
     schedule: {kind: cron, expr: "17 6 * * *"}
     entrypoint: select_prediction_candidates.py      # wake-gate selector
     prompt_file: prompts/candidate-watch.md
-    toolsets: [hermes-cron, okengine-write, okengine]
+    toolsets: [file, todo, okengine-write, okengine]
   grade:
     schedule: {kind: cron, expr: "23 6 * * *"}
     entrypoint: select_predictions_for_grading.py
     prompt_file: prompts/grade.md
-    toolsets: [hermes-cron, okengine-write, okengine]
+    toolsets: [file, todo, okengine-write, okengine]
   regrade:
     schedule: {kind: cron, expr: "29 */6 * * *"}
     entrypoint: select_regrade_batch.py
     prompt_file: prompts/regrade.md
-    toolsets: [hermes-cron, okengine-write, okengine]
+    toolsets: [file, todo, okengine-write, okengine]
+  confidence-recommender:
+    schedule: {kind: cron, expr: "27 */6 * * *"}  # materialize before regrade at :29
+    entrypoint: confidence_recommender.py          # recommendation-only JSONL + digest
   # Forecasting-discipline MEASUREMENT lanes (okengine#159) — deterministic, no_agent (no
   # prompt_file): pure computation over resolved/open predictions, writing a dashboard. Zero model
   # cost. Empty until predictions resolve; activate as the agent lanes above close them out.
@@ -68,33 +87,37 @@ operations:
     schedule: {kind: cron, expr: "30 21 * * 0"}   # ported cadence: weekly (Sun)
     entrypoint: select_prediction_schema_drain.py
     prompt_file: prompts/schema-drain.md
-    toolsets: [hermes-cron, okengine-write, okengine]
+    toolsets: [file, todo, okengine-write, okengine]
   prediction-structural-backfill:
     schedule: {kind: cron, expr: "45 */6 * * *"}   # ported cadence: every 6h, drains 5/run
     entrypoint: select_prediction_structural_backfill.py
     prompt_file: prompts/structural-backfill.md
-    toolsets: [hermes-cron, okengine-write, okengine]
-  # Forecasting-discipline JUDGMENT lanes (okengine#159 P2) — agent ops (wake-gate + prompt). The
-  # redundant candidates (backtest~=calibration, update-recommender~=regrade, portfolio-watch~=
-  # calibration+schema-audit combined) are deliberately NOT built.
+    toolsets: [file, todo, okengine-write, okengine]
+  # Forecasting-discipline JUDGMENT lanes (okengine#159 P2) — agent ops (wake-gate + prompt).
+  # The origin backtest's useful portfolio slices and portfolio-watch are folded into the one
+  # deterministic calibration-refresh authority (#222); update-recommender remains separate.
   forecast-review:
     schedule: {kind: cron, expr: "0 16 * * 6"}   # weekly (Sat) — the meta-layer, ported from
                                                   # the origin system's weekly-forecast-review
     entrypoint: select_forecast_review.py
     prompt_file: prompts/forecast-review.md
-    toolsets: [hermes-cron, okengine-write, okengine]
+    toolsets: [file, todo, okengine-write, okengine]
   base-rates:
     schedule: {kind: cron, expr: "50 6 * * 1"}
     entrypoint: select_base_rates.py
     prompt_file: prompts/base-rates.md
-    toolsets: [hermes-cron, okengine-write, okengine]
+    toolsets: [file, todo, okengine-write, okengine]
+    # Selector first writes deterministic A–E rate families to base-rate-metrics + JSONL (#223),
+    # then wakes the agent only when there is enough resolved history to interpret them.
   prediction-falsification-search:
     schedule: {kind: cron, expr: "35 */6 * * *"}
     entrypoint: select_falsification.py
     prompt_file: prompts/falsification-search.md
-    toolsets: [hermes-cron, okengine-write, okengine]
+    toolsets: [web, file, todo, okengine-write, okengine]
   output-outcome-eval:
     schedule: {kind: cron, expr: "55 6 * * 1"}
     entrypoint: select_output_outcome.py
     prompt_file: prompts/output-outcome-eval.md
-    toolsets: [hermes-cron, okengine-write, okengine]
+    toolsets: [file, todo, okengine-write, okengine]
+    # Selector first writes deterministic output→later-state joins + JSONL (#223); the agent adds
+    # qualitative accuracy review only when outputs and enough resolved outcomes exist.

@@ -22,7 +22,10 @@ _FM = re.compile(r"\A---\s*\n(.*?)\n---", re.S)
 def watchlist_path() -> Path:
     """WATCHLIST_PATH env (operator/pack config) wins; else the pack default under the vault.
     The extension SHIPS NO watchlist — an absent file just means 'no segments to analyse'."""
-    p = os.environ.get("WATCHLIST_PATH", "").strip()
+    p = os.environ.get(
+        "WATCHLIST_PATH",
+        os.environ.get("OKENGINE_COMPETITIVE_ANALYTICS_WATCHLIST_PATH", ""),
+    ).strip()
     return Path(p) if p else (VAULT / "config" / "competitive-watchlist.yaml")
 
 

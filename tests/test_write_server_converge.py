@@ -295,3 +295,135 @@ def test_merge_frontmatter_never_overwrites_server_provenance():
     assert not ({"created", "created_by", "discovered_by"} & set(dec.updated))
     # id/version/updated ARE re-stamped by the write path, so merge pass-through of them is fine
     # (this test targets provenance forgery, not the re-stamped keys).
+
+
+# ── H4 (okengine#324): alias-dedup consults the id-index, no per-create full scan ──────────────
+
+def _mk_entity_file(root, rel, fm_lines):
+    p = root / "wiki" / (rel + ".md")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("---\n" + fm_lines + "\n---\n\nbody\n", encoding="utf-8")
+
+
+def test_dedup_index_incoming_name_matches_existing_alias(tmp_path):
+    m = _load(tmp_path)
+    m._create("entities/acme", "type: vendor\nname: Acme\naliases: [Acme Corporation]", "body")
+    # a second create whose NAME equals the first's ALIAS must converge, not fork
+    out = m._create("entities/acme-corporation", "type: vendor\nname: Acme Corporation", "body")
+    assert out.startswith("converged into"), out
+
+
+def test_dedup_index_incoming_alias_matches_existing_name(tmp_path):
+    m = _load(tmp_path)
+    m._create("entities/beta", "type: vendor\nname: Beta", "body")
+    out = m._create("entities/other", "type: vendor\nname: Other\naliases: [Beta]", "body")
+    assert out.startswith("converged into"), out
+
+
+def test_dedup_index_catches_idless_existing_page(tmp_path):
+    m = _load(tmp_path)
+    # a legacy entity page with NO id (written directly), present before the registry is built.
+    # H4's contract is that id-less entity pages are INDEXED and returned as dedup candidates (unlike
+    # by_id, which is id-only) — so a duplicate of a legacy id-less page is still caught. (What the
+    # converge step then does with an id-less target is separate, pre-#324 behavior.)
+    _mk_entity_file(tmp_path, "entities/g/gamma", "type: vendor\nname: Gamma")
+    p = m._safe("entities/new")
+    hits = m._alias_hits(p, m.id_lib.normalize_key("New"), {m.id_lib.normalize_key("Gamma")})
+    assert [h[0].name for h in hits] == ["gamma.md"], hits
+    assert hits[0][1].get("name") == "Gamma"
+
+
+def test_dedup_does_not_full_scan_entities(tmp_path, monkeypatch):
+    m = _load(tmp_path)
+    # populate many UNRELATED entities so a full scan would be expensive
+    for i in range(25):
+        m._create(f"entities/unrelated-{i}", f"type: vendor\nname: Unrelated {i}", "body")
+    m._create("entities/target", "type: vendor\nname: Target\naliases: [Codename Zed]", "body")
+    # count _read_page calls during ONE matching create — index path reads only the hit(s), O(1)
+    real = m._read_page
+    calls = {"n": 0}
+    def counting(pp):
+        calls["n"] += 1
+        return real(pp)
+    monkeypatch.setattr(m, "_read_page", counting)
+    out = m._create("entities/zed", "type: vendor\nname: Codename Zed", "body")
+    assert out.startswith("converged into"), out
+    assert calls["n"] <= 4, f"read {calls['n']} pages — expected O(1), not a full entities/ scan"
+
+
+def test_dedup_falls_back_to_scan_on_pre_v2_index(tmp_path):
+    m = _load(tmp_path)
+    m._create("entities/delta", "type: vendor\nname: Delta\naliases: [DeltaCorp]", "body")
+    # simulate a pre-v2 persisted artifact: identity maps empty (only by_id present)
+    reg = m._registry()
+    reg.name_to_rels.clear()
+    reg.alias_to_rels.clear()
+    out = m._create("entities/deltacorp", "type: vendor\nname: DeltaCorp", "body")
+    assert out.startswith("converged into"), out   # fallback scan still catches it — never blind
+
+
+def test_dedup_same_process_back_to_back(tmp_path):
+    m = _load(tmp_path)
+    # first create is a genuinely new entity; the SECOND (same process) matches its alias and must
+    # dedup against it via the write-synchronous identity claim (not a stale load-time index)
+    m._create("entities/epsilon", "type: vendor\nname: Epsilon\naliases: [EPS]", "body")
+    out = m._create("entities/eps", "type: vendor\nname: EPS", "body")
+    assert out.startswith("converged into"), out
+
+
+def test_dedup_multiple_alias_hits_refused_for_review(tmp_path):
+    m = _load(tmp_path)
+    m._create("entities/one", "type: vendor\nname: One\naliases: [Shared]", "body")
+    m._create("entities/two", "type: vendor\nname: Two\naliases: [Shared]", "body")
+    out = m._create("entities/three", "type: vendor\nname: Shared", "body")
+    assert out.startswith("refused") and "multiple canonicals" in out, out
+
+
+def test_converge_authority_redirect_rechecks_reserved_file(tmp_path):
+    """invariant-audit HIGH #5: converge checks _reserved_refuse on the ORIGINAL path, then the
+    authority-id redirect points p at an existing canonical — which id_index CAN resolve to a
+    pack-reserved page (id_index._skip only knows the engine set, not schema reserved_files). The
+    redirect re-checks _wauth but used to skip _reserved, so a converge could land on a reserved
+    page. It must be refused on the redirected path, like every other mutating lane."""
+    schema = SCHEMA + "reserved_files: [pinned.md]\n"
+    m = _load(tmp_path, schema)
+    # an authority page living AT a pack-reserved filename, carrying its authority id (written
+    # directly — the write path would refuse to CREATE a reserved file, but one can pre-exist)
+    (tmp_path / "wiki" / "attack-pattern").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "wiki" / "attack-pattern" / "pinned.md").write_text(
+        "---\ntype: attack-pattern\ntechnique_id: T1059\nid: mitre:t1059\nversion: 1\n---\n\nBody.\n",
+        encoding="utf-8")
+    m._registries.clear()                            # rebuild the id-index so it sees pinned.md
+    # a converge from a different path with the SAME authority id -> redirects to the reserved page
+    out = m._converge("attack-pattern/incoming.md",
+                      "type: attack-pattern\ntechnique_id: T1059\ntactic: execution", pack="atk")
+    assert out.startswith("refused") and "reserved" in out.lower(), out
+    # the reserved page must be untouched (no tactic merged in)
+    assert "tactic" not in (tmp_path / "wiki" / "attack-pattern" / "pinned.md").read_text()
+
+
+_TYPENS = (
+    "types:\n  source: {required: [type]}\n  concept: {required: [type]}\n"
+    "type_namespaces: {source: sources, concept: concepts}\n"
+    "partitioning:\n  namespaces: {sources: {strategy: flat}, concepts: {strategy: flat}}\n"
+)
+
+
+def test_update_cannot_drift_type_out_of_its_home_namespace(tmp_path):
+    """invariant-audit: the type-namespace guard was CREATE-ONLY, so update/patch/converge could
+    rewrite a page's type to one whose home is a different namespace, forking the graph. Now the
+    mutating lanes reject a type CHANGE that drifts — but grandfather a legacy mismatched page."""
+    m = _load(tmp_path, _TYPENS)
+    # a compliant page: type concept under concepts/
+    assert m._create("concepts/c/idea", "type: concept\ntitle: Idea").startswith("created")
+    # changing its type to `source` (home = sources/) while it lives under concepts/ must be REFUSED
+    out = m._update("concepts/c/idea", {"type": "source"}, None)
+    assert out.startswith("rejected") and "belongs in 'sources/'" in out, out
+    assert _read_id(m, "concepts/c/idea")["type"] == "concept"   # untouched
+    # grandfather: a legacy page already mismatched (written directly) stays editable when the type
+    # is NOT changing
+    (tmp_path / "wiki" / "concepts" / "l").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "wiki" / "concepts" / "l" / "legacy.md").write_text(
+        "---\ntype: source\ntitle: Legacy\nid: sources:legacy\nversion: 1\n---\n\nbody\n", encoding="utf-8")
+    out2 = m._update("concepts/l/legacy", {"note": "edited"}, None)   # type unchanged
+    assert not out2.startswith(("refused", "rejected")), out2         # grandfathered

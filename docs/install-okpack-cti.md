@@ -109,5 +109,11 @@ Re-pull the bundle to re-resolve the recipe, or `--update` an individual compose
 local config and generated content aren't overwritten:
 
 ```bash
-python ../okengine/scripts/framework.py validate .
+python ../okengine/scripts/framework.py install-domain <okcti-deployment> <updated-member-pack> \
+  --refresh --apply
+python ../okengine/scripts/framework.py validate <okcti-deployment>
 ```
+
+`install-domain` records pack ownership under `.okengine/installed-domains/`. Refresh may replace
+only the member's accepted cron definitions and lane scripts; it cannot overwrite an unrelated
+same-named host artifact. Deploy after validation to stage the refreshed copy into the gateway.

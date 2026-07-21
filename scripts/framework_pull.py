@@ -13,7 +13,11 @@ Usage:
   --update re-fetches into an EXISTING pack dir without clobbering your config:
   runtime + content (.env, .hermes-data/, raw/, wiki/) are untouched, new upstream
   files are added, and changed definition files (schema.yaml, CLAUDE.md, crons, …)
-  are written as `<file>.upstream` next to yours for a manual diff/merge.
+  are written as `<file>.upstream` next to yours for `framework reconcile`. It also
+  computes the PACK-VERSION migration span (installed, incoming] and previews the
+  pack's `migrations/m_*.py` for it; `--apply-migrations` runs them through the
+  engine's upgrade runner — snapshot, roll-forward validation gate, automatic
+  rollback (okengine#312; see migrations/README.md).
 
   <source> forms:
     okpack-foo                    a catalog name (resolved via catalog.json)
@@ -88,7 +92,8 @@ def read_catalog(src: str = DEFAULT_CATALOG) -> tuple[dict | None, str | None]:
     what actually failed (issue #8)."""
     try:
         if src.startswith(("http://", "https://")):
-            with urllib.request.urlopen(src, timeout=15) as r:   # noqa: S310
+            # This branch is reachable only for the explicit http(s) prefixes above.
+            with urllib.request.urlopen(src, timeout=15) as r:  # nosec B310
                 raw = r.read().decode("utf-8")
         else:
             p = Path(src).expanduser()
@@ -351,6 +356,15 @@ def _engine_meta_mod():
     return m
 
 
+def _framework_upgrade_mod():
+    """Load the sibling framework_upgrade module by path (the migration runner, okengine#312)."""
+    spec = importlib.util.spec_from_file_location(
+        "framework_upgrade", ENGINE_ROOT / "scripts" / "framework_upgrade.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
 def _validate(dest: Path) -> int:
     spec = importlib.util.spec_from_file_location(
         "framework_validate", ENGINE_ROOT / "scripts" / "framework_validate.py")
@@ -513,6 +527,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--update", action="store_true",
                     help="update an EXISTING pack in place: keep .env/.hermes-data/raw/wiki, add new "
                          "upstream files, and write changed ones as <file>.upstream for manual merge")
+    ap.add_argument("--apply-migrations", action="store_true",
+                    help="with --update: APPLY the pack-version migrations pending for the update "
+                         "span (snapshot + roll-forward gate + auto-rollback). Default: dry-run "
+                         "preview only (okengine#312)")
     ap.add_argument("--no-validate", action="store_true")
     ap.add_argument("--catalog", default=DEFAULT_CATALOG)
     ap.add_argument("--port-offset", type=int, default=None,
@@ -563,6 +581,14 @@ def main(argv: list[str]) -> int:
                     f"in place (it would copy only the recipe skin, leaving the composed guests "
                     f"stale). Re-pull it fresh into a new dir, or update the member packs "
                     f"individually.")
+            # okengine#312: capture the INCOMING pack version + CHANGELOG while the clone is
+            # alive — the migration run happens after this tempdir closes, against dest (whose
+            # migrations/m_*.py the copy below just brought in as new files).
+            incoming_version = str((up_meta or {}).get("version") or "") or None
+            try:
+                incoming_changelog = (up / "CHANGELOG.md").read_text(encoding="utf-8")
+            except OSError:
+                incoming_changelog = None
             s = _update_in_place(up, dest)
             # invariant-audit HIGH #5: the update corridor writes NEW upstream files with zero
             # collision analysis and bypasses all 7 coinstall preflight checks. On a COMPOSED vault
@@ -582,12 +608,25 @@ def main(argv: list[str]) -> int:
         if s["changed"]:
             print("    review:  " + ", ".join(f"{x}.upstream" for x in s["changed"][:8])
                   + (" …" if len(s["changed"]) > 8 else ""))
-            print("    → diff each *.upstream against your file, merge, then delete the .upstream copies.")
+            print(f"    → framework reconcile {dest} --interactive")
         print("    preserved: .env / .hermes-data/ / raw/ / wiki/ untouched.")
+        # okengine#312: pack-VERSION migrations for the span (installed, incoming], through the
+        # engine's upgrade runner (dry-run default; --apply-migrations = snapshot + gate +
+        # auto-rollback). Installed version: the state record wins (a prior dry-run floors it
+        # there, surviving reconcile of pack.yaml.upstream); else the preserved dest pack.yaml.
+        fu = _framework_upgrade_mod()
+        dest_meta = _load_meta_safe(dest)
+        pname = str((dest_meta or {}).get("name") or spec["name"])
+        installed = fu.installed_pack_version(
+            dest, pname, fallback=str((dest_meta or {}).get("version") or "") or None)
+        rc_mig = fu.run_pack_migrations(dest, pname, installed, incoming_version,
+                                        apply=args.apply_migrations,
+                                        changelog_text=incoming_changelog,
+                                        no_validate=args.no_validate)
         _engine_check(dest)
         if not args.no_validate:
             _validate(dest)
-        return 0
+        return 0 if rc_mig == 0 else 1
 
     print(f"  ↓ {spec['name']}  ←  {where}{' @ ' + spec['ref'] if spec['ref'] else ''}")
     fetch(spec, dest, args.force)
@@ -617,6 +656,12 @@ def main(argv: list[str]) -> int:
         print(f"    (offset {offset} is the bundle recipe's default — override with --port-offset)")
     print(f"  ✓ fetched into {dest} (definition; runtime reset + config.yaml seeded)")
     _engine_check(dest)
+    # okengine#312: baseline the installed pack version now, so a later `pull --update` can
+    # compute the migration span even after reconcile rewrites pack.yaml.
+    fresh_meta = _load_meta_safe(dest)
+    if fresh_meta and str(fresh_meta.get("version") or "") not in ("", "0.0.0"):
+        _framework_upgrade_mod().record_pack_version(
+            dest, str(fresh_meta["name"]), str(fresh_meta["version"]))
 
     if not args.no_validate:
         _validate(dest)

@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO = Path(__file__).resolve().parent.parent
 INIT = REPO / "scripts" / "framework_init.py"
@@ -83,6 +84,16 @@ def test_broken_schema_is_a_fail(tmp_path):
     assert v.main([str(pack), "--quiet"]) == 1
 
 
+def test_feed_validation_rejects_dtd_entity_opml(tmp_path):
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    feeds = pack / "feeds" / "feeds.opml"
+    feeds.write_text('<!DOCTYPE opml [<!ENTITY x "boom">]><opml><body>&x;</body></opml>')
+    v = _load("framework_validate_safe_xml", VAL)
+    rows = v.validate(pack).rows
+    assert any(s == "FAIL" and "DTD/entity" in d for s, _c, d in rows)
+
+
 def test_missing_persona_is_a_fail(tmp_path):
     pack = tmp_path / "pack"
     _scaffold(pack)
@@ -118,15 +129,45 @@ def test_runtime_config_context_aware(tmp_path):
     cfg = pack / ".hermes-data" / "config.yaml"
     # (a) scaffold seeds it with valid keys -> OK
     assert any(s == "OK" and "config.yaml" in c for s, c, d in v.validate(pack).rows)
-    # (b) remove it; the scaffold .gitignore excludes .hermes-data -> WARN, not FAIL
+    # (b) remove it; the scaffold .gitignore excludes .hermes-data -> INFO, not FAIL
     cfg.unlink()
     rows = v.validate(pack).rows
-    assert any(s == "WARN" and "config.yaml" in c for s, c, d in rows)
+    assert any(s == "INFO" and "config.yaml" in c for s, c, d in rows)
     assert not any(s == "FAIL" and "config.yaml" in c for s, c, d in rows)
-    assert v.main([str(pack), "--quiet"]) == 0   # WARN doesn't block deploy
+    assert v.main([str(pack), "--quiet"]) == 0   # expected definition-only absence doesn't block
     # (c) if .hermes-data isn't gitignored, a missing config is a real FAIL
     (pack / ".gitignore").write_text("# no runtime ignore\n.env\n")
     assert any(s == "FAIL" and "config.yaml" in c for s, c, d in v.validate(pack).rows)
+
+
+def test_declared_analysis_overlay_has_no_feed_warning(tmp_path):
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    meta = yaml.safe_load((pack / "pack.yaml").read_text())
+    meta["collection"] = {"mode": "overlay", "feeds": "none"}
+    (pack / "pack.yaml").write_text(yaml.safe_dump(meta, sort_keys=False))
+    # The skeleton already ships an empty active OPML: it is intentional for this mode.
+    v = _load("framework_validate_overlay", VAL)
+    rows = v.validate(pack).rows
+    assert any(s == "OK" and c == "pack.yaml collection" for s, c, _d in rows)
+    assert not any(s == "WARN" and c.startswith("feeds/") for s, c, _d in rows)
+
+
+def test_empty_feeds_still_warn_without_overlay_contract(tmp_path):
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    v = _load("framework_validate_ingest", VAL)
+    assert any(s == "WARN" and c.startswith("feeds/") for s, c, _d in v.validate(pack).rows)
+
+
+def test_invalid_collection_contract_fails(tmp_path):
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    meta = yaml.safe_load((pack / "pack.yaml").read_text())
+    meta["collection"] = {"mode": "magic", "feeds": "none"}
+    (pack / "pack.yaml").write_text(yaml.safe_dump(meta, sort_keys=False))
+    v = _load("framework_validate_bad_collection", VAL)
+    assert any(s == "FAIL" and c == "pack.yaml collection" for s, c, _d in v.validate(pack).rows)
 
 
 def _mini_exposed_pack(d, trust):
@@ -201,6 +242,17 @@ def test_bad_cron_json_and_script_syntax_are_fails(tmp_path):
     assert v.main([str(pack), "--quiet"]) == 1
 
 
+def test_domain_cron_may_reference_known_engine_script(tmp_path):
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    (pack / "crons" / "domain-crons.json").write_text(
+        '[{"name":"nvd","schedule":"0 1 * * *","script":"nvd_import.py"}]')
+    v = _load("framework_validate_engine_script", VAL)
+    rows = v.validate(pack).rows
+    assert any(s == "INFO" and "supplied by the engine" in d for s, _c, d in rows)
+    assert not any(s == "WARN" and "nvd_import.py" in d for s, _c, d in rows)
+
+
 def test_engine_input_keys_shape_checked(tmp_path):
     """Optional engine-input keys: absent ⇒ clean (scaffold), bad shape ⇒ FAIL,
     type reference to an undeclared type ⇒ WARN (not FAIL)."""
@@ -219,9 +271,38 @@ def test_engine_input_keys_shape_checked(tmp_path):
     assert not any(s == "FAIL" and "type_aliases" in c for s, c, d in r.rows)
 
 
-def test_pack_level_strict_types_warns_engine_owned(tmp_path):
-    """#23: strict_types is engine-owned — a pack declaring it is WARNed (ignored,
-    not a FAIL). A scaffold (which doesn't declare it) does not warn."""
+def test_schema_inputs_may_reference_inherited_engine_core_types(tmp_path):
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    schema = yaml.safe_load((pack / "schema.yaml").read_text())
+    schema["type_aliases"] = {"article": "source", "weekly-note": "briefing"}
+    schema["classify_hints"] = {"concept": ["pattern"]}
+    (pack / "schema.yaml").write_text(yaml.safe_dump(schema, sort_keys=False))
+    v = _load("framework_validate_core_refs", VAL)
+    rows = v.validate(pack).rows
+    assert not any(s == "WARN" and c.startswith("schema.") for s, c, _d in rows)
+
+
+def test_bundle_does_not_require_runtime_environment_example(tmp_path):
+    pack = tmp_path / "bundle"
+    pack.mkdir()
+    (pack / "pack.yaml").write_text(
+        "name: bundle\nversion: 0.1.0\nkind: bundle\ntrust: public\n"
+        "owns: {types: [], namespaces: []}\n"
+        "bundle: {host: host-pack, compose: [child-pack]}\n"
+        "requires: [host-pack, child-pack]\n")
+    manifest = yaml.safe_load((REPO / "engine-manifest.yaml").read_text())
+    (pack / "engine.version").write_text(
+        f"engine: okengine\nversion: {manifest['engine_release']}\n"
+        f"hermes_pin: {manifest['runtime']['pinned_tag']}\n")
+    (pack / "README.md").write_text("# Bundle\n\n## Install\n\nUse framework pull.\n")
+    (pack / "LICENSE").write_text("test\n")
+    v = _load("framework_validate_bundle_env", VAL)
+    rows = v.validate(pack).rows
+    assert not any(c == ".env.example" for _s, c, _d in rows)
+
+
+def test_pack_level_strict_types_is_boolean_opt_in(tmp_path):
     pack = tmp_path / "pack"
     _scaffold(pack)
     v = _load("framework_validate", VAL)
@@ -229,8 +310,10 @@ def test_pack_level_strict_types_warns_engine_owned(tmp_path):
     (pack / "schema.yaml").write_text(
         "okf:\n  required: [type]\nstrict_types: true\ntypes:\n  entity: {required: [type]}\n")
     rows = v.validate(pack).rows
-    assert any(s == "WARN" and "strict_types" in c for s, c, d in rows)
-    assert not any(s == "FAIL" and "strict_types" in c for s, c, d in rows)
+    assert not any("strict_types" in c for s, c, d in rows)
+    (pack / "schema.yaml").write_text(
+        "okf:\n  required: [type]\nstrict_types: closed\ntypes:\n  entity: {required: [type]}\n")
+    assert any(s == "FAIL" and "strict_types" in c for s, c, d in v.validate(pack).rows)
 
 
 def test_local_first_default_passes_clean(tmp_path):

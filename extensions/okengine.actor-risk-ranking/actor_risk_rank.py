@@ -58,7 +58,10 @@ def _fm(path: Path) -> dict:
 
 
 def load_config(vault: Path) -> dict | None:
-    rel = os.environ.get("ACTOR_RISK_TARGETS", "config/actor-risk-targets.yaml")
+    rel = os.environ.get(
+        "ACTOR_RISK_TARGETS",
+        os.environ.get("OKENGINE_ACTOR_RISK_RANKING_TARGETS_FILE", "config/actor-risk-targets.yaml"),
+    )
     p = vault / rel
     if not p.is_file():
         print(f"actor-risk-rank: no-op — no target config at {rel} "
@@ -80,7 +83,10 @@ def load_config(vault: Path) -> dict | None:
 
 def load_artifact(vault: Path) -> dict:
     p = vault / "wiki" / ".backlinks.json"
-    max_age_h = int(os.environ.get("ACTOR_RISK_ARTIFACT_MAX_AGE_HOURS", "48"))
+    max_age_h = int(os.environ.get(
+        "ACTOR_RISK_ARTIFACT_MAX_AGE_HOURS",
+        os.environ.get("OKENGINE_ACTOR_RISK_RANKING_ARTIFACT_MAX_AGE_HOURS", "48"),
+    ))
     if not p.is_file():
         print("ERROR: wiki/.backlinks.json missing — enable the backlinks-refresh "
               "engine cron (okengine#168) before this lane", file=sys.stderr)
@@ -130,7 +136,11 @@ def classify_pages(vault: Path, cfg: dict) -> dict[str, dict]:
             out[key] = {
                 "type": t,
                 "title": str(fm.get("title") or fm.get("name") or key.split("/")[-1]),
-                "aliases": [str(a) for a in (fm.get("aliases") or []) if a],
+                # `aliases` is a schema list field, but the write path only coerces a STRING scalar
+                # (not a bare int/bool/date), so guard the shape or a non-iterable scalar crashes the
+                # whole weekly lane with TypeError (invariant-audit — consumer-shape class, #196).
+                "aliases": ([str(a) for a in (fm.get("aliases") or []) if a]
+                            if isinstance(fm.get("aliases"), list) else []),
                 "published": str(fm.get("published") or fm.get("date") or ""),
                 "url": str(fm.get("url") or ""),
                 "publisher": str(fm.get("publisher") or ""),

@@ -1,0 +1,44 @@
+connector_version: 1
+id: reference.federal-register-documents
+name: Federal Register documents
+description: Bounded newest-first poll of the Federal Register API; verify legal reliance against linked govinfo.gov editions.
+mode: poll
+trust:
+  permission: public
+  data_sensitivity: clear
+  source_authority: Office of the Federal Register / U.S. Government Publishing Office
+permissions:
+  network: true
+  allowed_hosts: [www.federalregister.gov]
+  allow_private_network: false
+  write_raw: true
+auth: {type: none, secret_refs: {}}
+inputs: {required: []}
+request:
+  url: https://www.federalregister.gov/api/v1/documents.json
+  method: GET
+  headers: {}
+  query: {per_page: "100", order: newest}
+  timeout_seconds: 30
+  max_bytes: 10485760
+response:
+  format: json
+  records_path: results
+  stable_id_path: document_number
+  revision_path: publication_date
+  deleted_path: deleted
+pagination: {type: page, max_pages: 3, start: 1, request_param: page}
+checkpoint: {path: reference.federal-register-documents.json}
+conditional_requests: {enabled: true}
+rate_limit: {max_requests: 3, per_seconds: 60}
+archive:
+  enabled: true
+  raw_responses: true
+  path: reference.federal-register-documents
+  retention_days: 365
+license:
+  name: U.S. Government work / FederalRegister.gov API terms
+  url: https://www.federalregister.gov/developers/documentation/api/v1
+  redistribution: allowed
+  max_retention_days: 3650
+health: {path: reference.federal-register-documents.json}

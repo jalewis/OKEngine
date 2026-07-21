@@ -89,3 +89,25 @@ def test_trusted_coref_relaxes_single_alias():
 def test_normalize_ignores_spacing_and_case():
     m = _load()
     assert m.normalize("APT 28") == m.normalize("apt28") == "apt28"
+
+
+def test_normalize_coerces_non_string_scalars():
+    """okengine#348: a numeric alias (apt35 `aliases: [10768]`) must not crash normalize —
+    one bad record was taking down the whole canonical-assemble lane."""
+    m = _load()
+    assert m.normalize(10768) == "10768"      # the offending int
+    assert m.normalize(None) == ""
+    assert m.normalize(0) == "0"
+    assert m.normalize("APT 28") == "apt28"   # unchanged string behavior
+
+
+def test_build_index_survives_integer_alias():
+    """The end-to-end path that crashed: build_index over a record whose aliases include an int."""
+    m = _load()
+    idx = m.build_index([
+        ("apt35", "APT35", [10768, "Charming Kitten"]),   # numeric alias mixed in
+        ("apt29", "APT29", ["Cozy Bear"]),
+    ])
+    assert "charmingkitten" in idx.keys      # the good alias still indexes
+    assert "10768" in idx.keys               # the int is coerced, not fatal
+    assert idx.keys["charmingkitten"] == {"apt35"}

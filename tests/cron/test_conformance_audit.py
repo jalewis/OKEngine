@@ -58,3 +58,51 @@ def test_audit_flags_prose_sources(tmp_path, monkeypatch):
     assert "1** page(s)" in dash or "**1**" in dash      # exactly 1 violating page (bad.md)
     assert "Cisco Talos disclosure" in dash               # the prose entry surfaced
     assert "good" not in dash.split("Non-conformant entries")[-1]  # good.md not in the sample table
+
+
+# ─── nonempty_fields (capture-lane metadata completeness) ────────────────
+
+def test_nonempty_fields_flags_blank_and_missing(tmp_path, monkeypatch):
+    """A `source` page with a blank `published:` (what feed_fetch writes for a
+    dateless item) or with the key absent is flagged; complete pages and pages
+    of other types are not."""
+    vault = tmp_path
+    w = vault / "wiki" / "sources" / "2026" / "07"
+    w.mkdir(parents=True)
+    (w / "complete.md").write_text(
+        "---\ntype: source\npublished: 2026-07-13\n---\n# ok\n")
+    (w / "blank.md").write_text(
+        "---\ntype: source\npublished:\n---\n# blank published\n")
+    (w / "absent.md").write_text(
+        "---\ntype: source\n---\n# no published key\n")
+    e = vault / "wiki" / "entities" / "a"
+    e.mkdir(parents=True)
+    (e / "ent.md").write_text("---\ntype: entity\n---\n# entity, out of rule scope\n")
+    (vault / "schema.yaml").write_text(yaml.safe_dump({
+        "okf": {"required": ["type"]},
+        "conformance": {"rules": [
+            {"id": "source-metadata-complete", "kind": "nonempty_fields",
+             "type": "source", "fields": ["published"],
+             "severity": "fix", "remediation": "recover dates"}]}}))
+    monkeypatch.setenv("WIKI_PATH", str(vault))
+    audit = _load("conformance_audit_ne", "scripts/cron/conformance_audit.py")
+    assert audit.main() == 0
+    dash = (vault / "wiki" / "dashboards" / "conformance.md").read_text()
+    assert "source-metadata-complete" in dash
+    assert "**2** page(s)" in dash          # blank.md + absent.md
+    assert "(empty)" in dash and "(missing)" in dash
+    tail = dash.split("Non-conformant entries")[-1]
+    assert "sources/2026/07/complete" not in tail   # complete page not sampled
+    assert "entities/a/ent" not in tail             # type filter respected
+
+
+def test_unknown_rule_kind_is_forward_compatible(tmp_path, monkeypatch):
+    vault = tmp_path
+    (vault / "wiki").mkdir(parents=True)
+    (vault / "schema.yaml").write_text(yaml.safe_dump({
+        "okf": {"required": ["type"]},
+        "conformance": {"rules": [
+            {"id": "future-rule", "kind": "not-implemented-yet"}]}}))
+    monkeypatch.setenv("WIKI_PATH", str(vault))
+    audit = _load("conformance_audit_fc", "scripts/cron/conformance_audit.py")
+    assert audit.main() == 0                 # no crash on unknown kinds

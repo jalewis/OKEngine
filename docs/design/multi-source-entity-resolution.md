@@ -173,6 +173,25 @@ observation that covers that field, without a surfaced conflict — until every 
 in observation mode. We accept this (it self-corrects as sources re-import); no synthetic
 "legacy" observations are minted.
 
+### Alias-fragment prevention and reviewed convergence (#246)
+
+`canonical_assemble` now resolves every source-native observation slug against active canonical
+names and aliases before writing. It converges an exact primary-name match or two independent
+identity-key matches; a lone alias remains separate and is reported as ambiguous, preserving the
+Iridium/Sandworm over-merge guard.
+
+Legacy fragments are handled by `scripts/cron/entity_converge.py`. Its default dry-run emits
+candidate source→canonical mappings. Heuristic candidates never authorize mutation: `--apply`
+requires an explicit analyst-reviewed YAML `--approve` mapping that still matches the current
+candidate set. On approval the lane unions additive frontmatter only, retains the selected
+canonical prose, tombstones duplicates, and rewrites address-bearing internal references. This
+split is intentional: automatic prevention is conservative; historical cleanup is review-gated.
+
+Cockpit applies the complementary presentation boundary. An entity with no linked source page,
+an unresolved review flag, missing required fields, unsupported grounding, or conflicts is shown
+as a quarantined unverified draft with its profile collapsed. A tombstone is shown as a retired
+duplicate linked to its canonical rather than as a current actor profile.
+
 ### Source reliability — declared once, stamped on every observation, human-visible
 
 The fusion weight (decision 3) is **Admiralty reliability**, and it must be both

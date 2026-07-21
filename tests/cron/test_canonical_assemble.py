@@ -205,6 +205,42 @@ def test_write_canonical_conflict_does_not_regress_existing(tmp_path):
     assert fm["needs_review"] is True             # but flagged for analyst arbitration
 
 
+def test_observation_slug_resolves_to_existing_canonical_on_two_identity_keys(tmp_path):
+    """#246: a source-native Storm typo enriches the established canonical, not a duplicate."""
+    m = _load("canonical_assemble")
+    canonical = tmp_path / "wiki" / "entities" / "g" / "gentlemen-ransomware-group.md"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text(
+        "---\ntype: actor\ntitle: The Gentlemen ransomware group\n"
+        "aliases: [The Gentlemen, Storm-2697]\n---\nGrounded canonical.\n"
+    )
+    groups = {
+        "gentlemen-ransomware-group-storm-2698": [{
+            "source": "unit42", "type": "actor", "reliability": "A", "observed": "2026-07-10",
+            "fields": {"name": "Gentlemen", "aliases": ["The Gentlemen", "Storm-2697"]},
+        }]
+    }
+    routed, decisions = m.resolve_observation_groups(tmp_path, groups)
+    assert list(routed) == ["gentlemen-ransomware-group"]
+    assert decisions[0]["evidence"] == "multi-alias"
+
+
+def test_observation_single_alias_remains_separate(tmp_path):
+    """The #39 over-merge safety rule survives the #246 importer integration."""
+    m = _load("canonical_assemble")
+    canonical = tmp_path / "wiki" / "entities" / "s" / "sandworm.md"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text(
+        "---\ntype: actor\nname: Sandworm\naliases: [IRIDIUM, Voodoo Bear]\n---\nbody\n"
+    )
+    groups = {"iranian-iridium": [{"source": "feed", "type": "actor", "reliability": "B",
+                                    "observed": "2026-07-10",
+                                    "fields": {"name": "Iridium", "aliases": []}}]}
+    routed, decisions = m.resolve_observation_groups(tmp_path, groups)
+    assert list(routed) == ["iranian-iridium"]
+    assert decisions[0]["ambiguous"] == "sandworm"
+
+
 def test_write_canonical_renders_relationships_as_wikilinks(tmp_path):
     m = _load("canonical_assemble")
     p = _canon(tmp_path, "apt29", "type: intrusion-set\nname: APT29\n", "Agent prose.\n")

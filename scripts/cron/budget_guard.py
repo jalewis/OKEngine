@@ -37,6 +37,16 @@ SELF_NAME = "budget-guard"
 WINDOWS = {"day": 86400, "week": 604800, "month": 2592000}
 _TOKEN_COLS = ("input_tokens", "output_tokens", "cache_read_tokens",
                "cache_write_tokens", "reasoning_tokens")
+_TOKEN_SUM_QUERIES = {
+    "input_tokens": "SELECT COALESCE(SUM(input_tokens),0) FROM sessions",
+    "output_tokens": "SELECT COALESCE(SUM(output_tokens),0) FROM sessions",
+    "cache_read_tokens": "SELECT COALESCE(SUM(cache_read_tokens),0) FROM sessions",
+    "cache_write_tokens": "SELECT COALESCE(SUM(cache_write_tokens),0) FROM sessions",
+    "reasoning_tokens": "SELECT COALESCE(SUM(reasoning_tokens),0) FROM sessions",
+}
+_TOKEN_WINDOW_QUERIES = {
+    name: query + " WHERE started_at >= ?" for name, query in _TOKEN_SUM_QUERIES.items()
+}
 
 
 def window_seconds(name: str) -> int:
@@ -69,16 +79,17 @@ def tokens_in_window(db_path: str | os.PathLike, window_s: int, now: float) -> i
         cols = [c for c in _TOKEN_COLS if c in have]
         if not cols:
             return 0
-        tcol = "started_at" if "started_at" in have else None
-        expr = " + ".join(f"COALESCE({c},0)" for c in cols)
-        if tcol:
+        total = 0
+        if "started_at" in have:
             cutoff = now - window_s
-            row = con.execute(
-                f"SELECT COALESCE(SUM({expr}),0) FROM sessions WHERE {tcol} >= ?",
-                (cutoff,)).fetchone()
+            for col in cols:
+                row = con.execute(_TOKEN_WINDOW_QUERIES[col], (cutoff,)).fetchone()
+                total += int(row[0] or 0)
         else:
-            row = con.execute(f"SELECT COALESCE(SUM({expr}),0) FROM sessions").fetchone()
-        return int(row[0] or 0)
+            for col in cols:
+                row = con.execute(_TOKEN_SUM_QUERIES[col]).fetchone()
+                total += int(row[0] or 0)
+        return total
     except sqlite3.Error:
         return 0
     finally:

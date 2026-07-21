@@ -130,11 +130,15 @@ def knowledge_namespaces() -> set[str]:
     return names
 
 
-def scan_queues():
-    """Return dict[queue-name -> int depth]."""
+def scan_queues(details: dict | None = None):
+    """Return dict[queue-name -> int depth].
+
+    When ``details`` is supplied, populate actionable samples for queues whose scalar depth alone
+    is insufficient to diagnose. Schema drift is measured against each page's GOVERNING composed
+    schema (base ⊕ pack ⊕ enabled extensions, walk-up aware), including declared type aliases.
+    """
     pages = all_wiki_pages()
     schema = schema_lib.governing_schema(VAULT)
-    declared_types = schema_lib.canonical_types(schema)  # empty ⇒ accept any type
     refpol = schema_lib.reference_policy(schema)  # reference-catalog pages → out of content-debt counts
     knowledge_ns = knowledge_namespaces()
     fm_parse_errors = 0
@@ -144,6 +148,10 @@ def scan_queues():
     sources_missing_quality = 0
     pages_missing_index = 0
     publisher_drift = 0
+    drift_by_type: dict[str, int] = {}
+    drift_examples: dict[str, list[str]] = {}
+    drift_alias_targets: dict[str, set[str]] = {}
+    schema_cache: dict[Path, tuple[set[str], dict[str, str], set[str]]] = {}
 
     # All wikilinks → set of resolved/unresolved targets
     all_targets = set()
@@ -198,12 +206,35 @@ def scan_queues():
         if not fm:
             continue
 
-        # Schema drift: type present but not among the pack's declared canonical
-        # types (and not an operational type). When the pack declares no types,
-        # `declared_types` is empty ⇒ accept any type (no drift counted).
+        # Schema drift: compare with the page's GOVERNING COMPOSED taxonomy, not the raw root
+        # schema. The old root-only check counted every base/extension type as drift (tens of
+        # thousands of false positives on composed vaults) and ignored walk-up subdomains.
         t = str(fm.get("type", ""))
-        if declared_types and t and t not in declared_types and t not in OPERATIONAL_TYPES:
-            schema_drift += 1
+        if t and t not in OPERATIONAL_TYPES:
+            rel = p.relative_to(VAULT / "wiki")
+            namespace = rel.parent.as_posix() if rel.parent != Path(".") else ""
+            govdir = schema_lib._governing_dir(VAULT, namespace)
+            if govdir not in schema_cache:
+                governing = schema_lib.merged_schema(VAULT, namespace)
+                aliases = schema_lib.type_aliases(governing)
+                known = schema_lib.canonical_types(governing)
+                operational = set(OPERATIONAL_TYPES)
+                declared_operational = governing.get("operational_types")
+                if isinstance(declared_operational, (list, tuple, set)):
+                    operational.update(str(item) for item in declared_operational)
+                schema_cache[govdir] = (known, aliases, operational)
+            known, aliases, operational = schema_cache[govdir]
+            # Alias spellings remain queue debt: schema-type-drain deterministically rewrites them
+            # to canonical values. They are valid at the fail-open write boundary but are not the
+            # canonical vocabulary the corpus should converge on.
+            if known and t not in known and t not in operational:
+                schema_drift += 1
+                drift_by_type[t] = drift_by_type.get(t, 0) + 1
+                if t in aliases:
+                    drift_alias_targets.setdefault(t, set()).add(aliases[t])
+                samples = drift_examples.setdefault(t, [])
+                if len(samples) < 3:
+                    samples.append(rel.as_posix())
 
         # Reference-catalog pages (pack-declared: CVE / ATT&CK / encyclopedia imports) are
         # link-target scaffolding, not synthesized content — tracked, but kept out of the orphan
@@ -267,6 +298,17 @@ def scan_queues():
         if cnt >= 10 and pub not in canonical_publishers and pub not in {"Unknown", "TBD", "N/A"}:
             publisher_drift += 1
 
+    if details is not None:
+        details["schema-drift"] = {
+            "by_type": dict(sorted(drift_by_type.items(), key=lambda item: (-item[1], item[0]))),
+            "examples": drift_examples,
+            "alias_targets": {
+                typ: sorted(targets)
+                for typ, targets in drift_alias_targets.items()
+            },
+            "taxonomy": "governing composed canonical schema; aliases are drainable debt",
+        }
+
     return {
         "broken-wikilinks": broken_wikilinks,
         "orphans": orphans,
@@ -328,7 +370,7 @@ def append_snapshot(today, queues):
         f.write(row)
 
 
-def write_today_report(today, queues, prior, alerts):
+def write_today_report(today, queues, prior, alerts, details: dict | None = None):
     report = OPS_DIR / f"lint-watch-{today}.md"
     OPS_DIR.mkdir(parents=True, exist_ok=True)
     out = [
@@ -380,6 +422,31 @@ def write_today_report(today, queues, prior, alerts):
         out.append("")
         out.append("None — all queues healthy or draining as expected.")
         out.append("")
+    drift = (details or {}).get("schema-drift") or {}
+    by_type = drift.get("by_type") or {}
+    out += [
+        "## Schema drift detail",
+        "",
+        "> Non-canonical `type:` values measured against each page's governing composed schema "
+        "(base + pack + enabled extensions; walk-up aware). Declared aliases remain visible as "
+        "deterministically drainable debt.",
+        "",
+    ]
+    if not by_type:
+        out.append("None.")
+        out.append("")
+    else:
+        out += ["| Non-canonical type | Pages | Classification | Samples |", "|---|---:|---|---|"]
+        examples = drift.get("examples") or {}
+        alias_targets = drift.get("alias_targets") or {}
+        for typ, count in by_type.items():
+            sample = ", ".join(f"`{path}`" for path in examples.get(typ, []))
+            classification = (
+                "declared alias → " + ", ".join(f"`{target}`" for target in alias_targets[typ])
+                if typ in alias_targets else "unknown — classify or add an explicit alias"
+            )
+            out.append(f"| `{typ}` | {count} | {classification} | {sample} |")
+        out.append("")
     report.write_text("\n".join(out))
     return report
 
@@ -390,7 +457,8 @@ def main() -> int:
     # tomorrow in UTC, so a UTC date files "today's" ops report under TOMORROW (invariant-audit B6.2).
     # datetime.now() honors the process TZ env (which the gateway sets); UTC deployments are unchanged.
     today = datetime.now().strftime("%Y-%m-%d")
-    queues = scan_queues()
+    details: dict = {}
+    queues = scan_queues(details)
     prior = read_prior_snapshot()
 
     alerts = []
@@ -407,7 +475,7 @@ def main() -> int:
             alerts.append(f"`{q}` grew by {delta} (now {depth}) despite an expected drain cron — drain may be stuck or behind.")
 
     append_snapshot(today, queues)
-    report = write_today_report(today, queues, prior, alerts)
+    report = write_today_report(today, queues, prior, alerts, details)
 
     print(f"=== lint-watcher: {today} ===")
     print(f"  vault: {VAULT}")

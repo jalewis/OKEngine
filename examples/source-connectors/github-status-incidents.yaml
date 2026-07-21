@@ -1,0 +1,44 @@
+connector_version: 1
+id: reference.github-status-incidents
+name: GitHub Status incidents
+description: Vendor-operated incident history from GitHub's public status API.
+mode: poll
+trust:
+  permission: public
+  data_sensitivity: clear
+  source_authority: GitHub Status
+permissions:
+  network: true
+  allowed_hosts: [www.githubstatus.com]
+  allow_private_network: false
+  write_raw: true
+auth: {type: none, secret_refs: {}}
+inputs: {required: []}
+request:
+  url: https://www.githubstatus.com/api/v2/incidents.json
+  method: GET
+  headers: {}
+  query: {}
+  timeout_seconds: 20
+  max_bytes: 5242880
+response:
+  format: json
+  records_path: incidents
+  stable_id_path: id
+  revision_path: updated_at
+  deleted_path: deleted
+pagination: {type: none, max_pages: 1}
+checkpoint: {path: reference.github-status-incidents.json}
+conditional_requests: {enabled: true}
+rate_limit: {max_requests: 1, per_seconds: 60}
+archive:
+  enabled: true
+  raw_responses: true
+  path: reference.github-status-incidents
+  retention_days: 30
+license:
+  name: GitHub Terms of Service
+  url: https://docs.github.com/en/site-policy/github-terms/github-terms-of-service
+  redistribution: restricted
+  max_retention_days: 30
+health: {path: reference.github-status-incidents.json}

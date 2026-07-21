@@ -28,7 +28,9 @@ VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
 DASH = WIKI / "dashboards" / "event-ledger.md"
 SNAP = WIKI / "operational" / "event-ledger-snapshots.md"
-MAX_EVENTS = int(os.environ.get("EVENT_LEDGER_MAX", "500"))
+MAX_EVENTS = int(os.environ.get(
+    "EVENT_LEDGER_MAX", os.environ.get("OKENGINE_EVENTS_MAX_EVENTS", "500")
+))
 
 _FM = re.compile(r"\A---\s*\n(.*?)\n---", re.S)
 _DATE_FULL = re.compile(r"(\d{4}-\d{2}-\d{2})")

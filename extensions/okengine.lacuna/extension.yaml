@@ -36,9 +36,12 @@ operation:
   schedule: {kind: cron, expr: "0 6 * * *"}   # daily (06:00) — drift-gated, cheap, one field per run
   entrypoint: select_lacuna_field.py          # wake-gate: densest concept cluster not analyzed lately
   prompt_file: prompts/lacuna.md
-  toolsets: [hermes-cron, okengine-write, okengine]
+  toolsets: [file, todo, okengine-write, okengine]
   tier: analyze                   # okengine#129 hint: run AFTER ingest/compile so the graph is fresh
 config:
+  # The composer maps these values to per-job `OKENGINE_LACUNA_*` env vars. Operators may still
+  # override a value in `$HERMES_HOME/.env`; the runner loads that file before applying the job's
+  # declarative environment.
   # A field worth analyzing must be dense enough that the geometry is well-sampled — a thin patch
   # makes step 6 extrapolation, not inference. Floor on the cluster's reference count.
   min_density: {type: integer, default: 8}
@@ -47,3 +50,9 @@ config:
   # How many of the densest unanalyzed clusters to surface to the agent per run (it produces at
   # most one lacuna per field, deferring when no real force can be named — coverage is not a goal).
   batch_size: {type: integer, default: 3}
+  # OPERATOR TOPIC OVERRIDE. Empty (default) = autonomous: the densest unanalyzed field, everything
+  # considered. Set to a concept slug (or `concepts/<shard>/<slug>` / `[[concepts/…]]`) to PIN lacuna
+  # to that one field this run, bypassing the density rank + reanalyze rotation. The field still needs
+  # a real concept page + >=1 referencing page; below min_density it maps with an extrapolation
+  # warning. Env: `OKENGINE_LACUNA_FOCUS`; empty resumes autonomous selection.
+  focus: {type: string, default: ""}

@@ -7,11 +7,26 @@ const dlLinks = qs => `<span class="dl">⬇ <a href="/api/download?fmt=md&${qs}"
 const j = u => fetch(u).then(r => { if (!r.ok) throw new Error(r.status); return r.json(); });
 
 // ── clock ──────────────────────────────────────────────────────────────────
+// Renders in the DEPLOYMENT timezone (okengine#301), set from /api/about `tz`; defaults UTC until
+// About loads (and if Intl doesn't know the zone). Shows the zone abbreviation (EDT/UTC/…).
+let CLOCK_TZ = "UTC";
 function tick() {
   const d = new Date();
-  $("#clock").textContent = d.toISOString().slice(0, 16).replace("T", " ") + " UTC";
+  let out;
+  try {
+    const p = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+      timeZone: CLOCK_TZ, hour12: false, year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", timeZoneName: "short",
+    }).formatToParts(d).map(x => [x.type, x.value]));
+    out = `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute} ${p.timeZoneName}`;
+  } catch (e) {
+    out = d.toISOString().slice(0, 16).replace("T", " ") + " UTC";
+  }
+  $("#clock").textContent = out;
 }
 tick(); setInterval(tick, 30000);
+// set the clock's zone from the server once at load (About loads lazily, so fetch it directly)
+fetch("/api/about").then(r => r.json()).then(a => { if (a && a.tz) { CLOCK_TZ = a.tz; tick(); } }).catch(() => {});
 
 // ── browse: directories → pages ──────────────────────────────────────────────
 let CURRENT_DIR = null;
@@ -182,6 +197,15 @@ function provPanel(d) {
   }
   return h + `</div>`;
 }
+function recentReportingPanel(items) {
+  if (!items || !items.length) return "";
+  return `<div class="prov"><div class="prov-head">Recent reporting — grouped by story</div>` +
+    `<div class="obs-list">` + items.map(item => {
+      const primary = item.sources[0];
+      const extra = item.count > 1 ? ` <span class="mchip">+${item.count - 1} duplicate ref</span>` : "";
+      return `<a class="wl obs-item" data-page="${esc(primary.path)}">${esc(item.title)}${extra} ↗</a>`;
+    }).join("") + `</div></div>`;
+}
 // ≥B filter: hide any conflicting value whose best source reliability ranks below B (4).
 function wireProvFilter(root) {
   const cb = $("#prov-bfilter", root); if (!cb) return;
@@ -264,7 +288,7 @@ async function openPage(path, push = true) {
     $("#ov-title").textContent = d.title || path;
     $("#ov-path").textContent = (d.type ? d.type + " · " : "") + (d.rel || path);
     $("#ov-dl").innerHTML = dlLinks(`path=${encodeURIComponent(d.rel || path)}`);
-    c.innerHTML = provHtml(d.provenance) + panelHtml(d.panel) + d.html + factPanel(d.meta) + provPanel(d) + auxPanel(d.meta_aux) + `<div id="backlinks" class="backlinks"></div>`; c.scrollTop = 0;
+    c.innerHTML = provHtml(d.provenance) + panelHtml(d.panel) + recentReportingPanel(d.recent_reporting) + d.html + factPanel(d.meta) + provPanel(d) + auxPanel(d.meta_aux) + `<div id="backlinks" class="backlinks"></div>`; c.scrollTop = 0;
     wireProvFilter(c);
     $("#ov-back").style.visibility = pageStack.length > 1 ? "visible" : "hidden";
     loadBacklinks(d.rel || path);
@@ -501,8 +525,21 @@ async function sendChat(text) {
   });
 })();
 async function initChat() {
-  try { if ((await j("/api/about")).chat_enabled) $("#tab-chat").hidden = false; }
-  catch (e) { /* leave the tab hidden */ }
+  try {
+    const about = await j("/api/about");
+    if (!about.chat_enabled) return;
+    $("#tab-chat").hidden = false;
+    // okengine#257: editing off -> the agent answers from the vault but cannot write back to it.
+    if (about.editing_enabled === false) {
+      const log = $("#chat-log");
+      if (log) {
+        const note = document.createElement("div");
+        note.className = "chat-readonly";
+        note.textContent = "Read-only — the agent answers from the vault but cannot edit it on this deployment.";
+        log.insertBefore(note, log.firstChild);
+      }
+    }
+  } catch (e) { /* leave the tab hidden */ }
 }
 
 // ── boot ─────────────────────────────────────────────────────────────────────

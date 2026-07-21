@@ -44,9 +44,13 @@ obsolete). This is a companion to the authoring guides and to [`pack-building-ch
 - **A selector-gated agent burns its whole turn re-fetching and writes nothing.** The digest lacked a
   "**trust the digest — don't re-fetch**" instruction. Every selector→agent prompt needs it
   (mirror daily-pdb's pattern), or the agent re-reads each source and never gets to the write.
-- **`deploy-cron-*.sh` didn't pick up your change.** A deployed pack dir may be a standalone **copy**,
-  not a git checkout of the pack repo. Committing to the pack repo does not update the deployment —
-  sync the changed `crons/scripts/*` + `domain-crons.json` into the deployment dir first.
+- **`deploy-cron-*.sh` didn't pick up a composed pack change.** The deployment stages its own
+  accepted copy; committing upstream does not mutate a running vault. Refresh the pack-owned copy
+  through the ownership gate, then deploy it:
+  `framework install-domain <deployment> <updated-pack> --refresh --apply`. A normal re-install
+  fails loudly when owned cron definitions or scripts differ, and `framework validate` warns if an
+  accepted installed copy is later edited, removed, or replaced. `--refresh` is not a force flag:
+  unrelated collisions remain blocked.
 - **Container won't recreate / runs as the wrong uid.** Recreate needs `ENGINE_DIR` set and
   `HERMES_UID`/`HERMES_GID` matching the running container user (check `docker inspect … --format
   '{{.Config.User}}'`), not the compose default.

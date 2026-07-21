@@ -1,11 +1,19 @@
 """health_export (okengine#64): Prometheus metrics + transition-based alerts."""
-import importlib.util, sys, json
+import importlib.util, sys, json, os
 from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent.parent
 
 
 def _dash(dd, name, body):
     (dd / f"{name}.md").write_text(f"---\ntype: dashboard\ntitle: {name}\nupdated: 2026-06-28T20:00:00Z\n---\n{body}\n")
+
+
+def _lanes(dd, *, errored=(), offmodel=()):
+    (dd / ".fleet-lanes.json").write_text(json.dumps({
+        "updated": "2026-07-16T12:00:00Z",
+        "errored": list(errored),
+        "off-model": list(offmodel),
+    }))
 
 
 def _run(tmp, monkeypatch):
@@ -35,6 +43,63 @@ def test_metrics_and_alert(tmp_path, monkeypatch):
     before = alerts
     _run(tmp_path, monkeypatch)
     assert (tmp_path / "wiki" / "dashboards" / "alerts.md").read_text() == before
+
+
+def test_equal_error_count_with_new_lane_identities_alerts(tmp_path, monkeypatch):
+    """A/B recover while C/D fail: count stays 2, but the newly failed lanes must notify."""
+    dd = tmp_path / "wiki" / "dashboards"
+    dd.mkdir(parents=True)
+    _dash(dd, "fleet-health",
+          "- 🟢 ok: 50  ·  🔴 stale: 0  ·  🔴 errored: 2  ·  🔴 off-model: 0")
+    _lanes(dd, errored=("lane-a", "lane-b"))
+    _run(tmp_path, monkeypatch)
+    alerts = dd / "alerts.md"
+    before = alerts.read_text(encoding="utf-8")
+
+    _lanes(dd, errored=("lane-c", "lane-d"))
+    _run(tmp_path, monkeypatch)
+
+    added = alerts.read_text(encoding="utf-8")[len(before):]
+    assert "newly ERRORED: lane-c, lane-d" in added
+    state = json.loads((tmp_path / "metrics" / ".health-state.json").read_text())
+    assert state["errored_lanes"] == ["lane-c", "lane-d"]
+
+
+def test_recovery_without_new_lane_does_not_alert(tmp_path, monkeypatch):
+    dd = tmp_path / "wiki" / "dashboards"
+    dd.mkdir(parents=True)
+    _dash(dd, "fleet-health",
+          "- 🟢 ok: 50  ·  🔴 stale: 0  ·  🔴 errored: 2  ·  🔴 off-model: 0")
+    _lanes(dd, errored=("lane-a", "lane-b"))
+    _run(tmp_path, monkeypatch)
+    alerts = dd / "alerts.md"
+    before = alerts.read_text(encoding="utf-8")
+
+    _dash(dd, "fleet-health",
+          "- 🟢 ok: 51  ·  🔴 stale: 0  ·  🔴 errored: 1  ·  🔴 off-model: 0")
+    _lanes(dd, errored=("lane-b",))
+    _run(tmp_path, monkeypatch)
+
+    assert alerts.read_text(encoding="utf-8") == before
+
+
+def test_stale_lane_sidecar_falls_back_to_counts(tmp_path, monkeypatch):
+    dd = tmp_path / "wiki" / "dashboards"
+    dd.mkdir(parents=True)
+    _lanes(dd, errored=("old-lane",))
+    _dash(dd, "fleet-health",
+          "- 🟢 ok: 50  ·  🔴 stale: 0  ·  🔴 errored: 2  ·  🔴 off-model: 0")
+    # Do not depend on filesystem timestamp granularity: some CI filesystems give two immediate
+    # writes the same mtime, which makes the intentionally stale sidecar look current.
+    dashboard_mtime = (dd / "fleet-health.md").stat().st_mtime
+    os.utime(dd / ".fleet-lanes.json", (dashboard_mtime - 1, dashboard_mtime - 1))
+
+    _run(tmp_path, monkeypatch)
+
+    alerts = (dd / "alerts.md").read_text(encoding="utf-8")
+    assert "a cron lane newly ERRORED (now 2)" in alerts
+    state = json.loads((tmp_path / "metrics" / ".health-state.json").read_text())
+    assert "errored_lanes" not in state
 
 
 def test_stale_or_missing_monitor_exports_red(tmp_path, monkeypatch):  # invariant-audit #9

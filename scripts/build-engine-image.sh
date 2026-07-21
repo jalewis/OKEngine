@@ -98,6 +98,7 @@ bash "$ENGINE_DIR/patches/apply.sh" "$WORK"
 #    it into /opt/hermes). Keep in sync with engine-manifest.yaml engine_layer.
 echo "==> overlaying engine layer"
 install -m 0644 "$ENGINE_DIR/tools/schema_validator.py" "$WORK/tools/schema_validator.py"
+install -m 0644 "$ENGINE_DIR/tools/policy_plane.py" "$WORK/tools/policy_plane.py"
 rm -rf "$WORK/okengine-mcp" "$WORK/okengine-reader"
 cp -r "$ENGINE_DIR/okengine-mcp"    "$WORK/okengine-mcp"
 cp -r "$ENGINE_DIR/okengine-reader" "$WORK/okengine-reader"

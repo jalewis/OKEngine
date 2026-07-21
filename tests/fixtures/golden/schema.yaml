@@ -1,0 +1,7 @@
+# Golden conformance fixture pack (okengine#75). Deliberately minimal — the ENGINE BASE
+# schema (config/base-schema.yaml, merged in by the validator) owns the type taxonomy, the
+# okf required floor [type, id], and the closed `tlp` enum. This pack just anchors the vault
+# (a schema.yaml must exist above wiki/ for the walk-up validator to engage). A regression in
+# any governed rejection shows up as a diff in test_golden_fixtures / EXPECTED.yaml.
+name: okpack-golden-fixture
+apply_under: [wiki/]

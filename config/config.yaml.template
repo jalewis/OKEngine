@@ -79,6 +79,16 @@ mcp_servers:
     args:
     - /opt/hermes/okengine-mcp/write_server.py
 
+  # Dedicated, server-bound identity for the source-quality scheduler lane.
+  # The agent cannot select this identity through a tool argument: its toolset
+  # exposes only this process, whose environment binds the capability.
+  okengine-write-source-quality:
+    command: /opt/hermes/.venv/bin/python
+    args:
+    - /opt/hermes/okengine-mcp/write_server.py
+    env:
+      OKENGINE_WRITE_ACTOR: cron:source-quality-backfill
+
 # Cron jobs opt into MCP explicitly. This keeps maintenance drains and pure
 # script jobs from opening MCP connections unless a job requests them.
 platform_toolsets:
@@ -90,6 +100,11 @@ platform_toolsets:
   # code_execution/file/computer_use (the "do not skip this" footgun in docs/agent-chat.md is
   # now the default, not a manual step). Add `web` here per-deployment if chat should also
   # research the internet. Inert unless the api_server platform is enabled.
+  #
+  # okengine#257 — UI editing switch: `okengine-write` is what lets the reader Chat WRITE BACK to
+  # the vault. Set `OKENGINE_EDITING=0` in `.env` to make an exposed deployment read-only —
+  # ensure-runtime then DROPS `okengine-write` from this list on the next gateway recreate (chat
+  # still answers, just can't edit). OKENGINE_HARDENED=1 requires it off.
   api_server:
     - okengine
     - okengine-write

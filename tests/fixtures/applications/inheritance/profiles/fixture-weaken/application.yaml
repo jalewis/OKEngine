@@ -1,0 +1,7 @@
+schema_version: 1
+id: fixture-weaken
+version: 0.1.0
+name: Weakening child
+extends: {profile: fixture-parent, version: ">=1.0.0"}
+policy:
+  preserve_evidence: false

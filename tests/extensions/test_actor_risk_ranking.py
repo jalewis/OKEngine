@@ -200,3 +200,17 @@ def test_alias_folding_and_unresolved_report(tmp_path, monkeypatch):
     # cobalt vs cobalt-gang: undeclared near-duplicate -> reported, not merged
     assert "Unresolved alias candidates" in rk
     assert "cobalt" in rk
+
+
+def test_classify_pages_survives_non_list_aliases(tmp_path):
+    """invariant-audit: a bare non-string scalar `aliases` (YAML int/bool) — which the write path
+    does NOT coerce — must not crash classify_pages (TypeError: 'int' object is not iterable) and
+    take the whole weekly actor-risk lane down. The shape is guarded; the value is dropped to []."""
+    vault = tmp_path / "vault"
+    (vault / "wiki" / "entities" / "a").mkdir(parents=True)
+    _page(vault / "wiki", "entities/a/apt-x", {"type": "actor", "title": "APT-X", "aliases": 8220})
+    _page(vault / "wiki", "entities/a/apt-y", {"type": "actor", "title": "APT-Y",
+                                               "aliases": ["Foo", "Bar"]})
+    out = mod.classify_pages(vault, {})            # must not raise
+    assert out["entities/a/apt-x"]["aliases"] == []        # non-list scalar -> []
+    assert out["entities/a/apt-y"]["aliases"] == ["Foo", "Bar"]   # a real list still works

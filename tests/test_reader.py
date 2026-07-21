@@ -36,6 +36,17 @@ def test_hidden_pages_are_not_renderable(tmp_path, monkeypatch):
     assert ei.value.status_code == 403
 
 
+def test_composed_schema_is_reader_authority_when_present(tmp_path, monkeypatch):
+    (tmp_path / "wiki").mkdir()
+    (tmp_path / "schema.yaml").write_text("display_groups: {Stale: [source]}\n")
+    artifact = tmp_path / ".okengine" / "composed-schema.yaml"
+    artifact.parent.mkdir()
+    artifact.write_text("display_groups: {Composed: [actor]}\n")
+    m = _load(tmp_path, monkeypatch)
+    assert m._governing_schema_path() == artifact
+    assert m._display_groups() == [("Composed", frozenset({"actor"}))]
+
+
 def test_provenance_fields_render_in_secondary(tmp_path, monkeypatch):
     # okengine#90 P3: composition provenance (maintained_by/discovered_by) renders in the collapsed
     # record-keeping panel, labeled — not mixed into the primary domain-intel rows.
@@ -191,14 +202,14 @@ def test_about_reports_purpose_and_composition(tmp_path, monkeypatch):
     """About = deployment purpose + composition, ALL derived from live state files
     (pack.yaml declaration, the installer's CLAUDE.md markers, walk-up subtrees,
     extensions enable-state) — never scraped from the agent persona prose."""
-    (tmp_path / "wiki" / "doctrine").mkdir(parents=True)
-    (tmp_path / "wiki" / "doctrine" / "schema.yaml").write_text("types: {}\n")
+    (tmp_path / "wiki" / "fintech").mkdir(parents=True)
+    (tmp_path / "wiki" / "fintech" / "schema.yaml").write_text("types: {}\n")
     (tmp_path / "wiki" / "plain").mkdir()          # dir WITHOUT schema -> not a sub-domain
     (tmp_path / "pack.yaml").write_text(
         "name: okpack-x\nversion: 0.2.0\ndescription: Vendor risk watch\n"
         "mission: Track the suppliers we depend on.\n")
     (tmp_path / "CLAUDE.md").write_text(
-        "# persona\n\n## Installed domain: doctrine (okpack-doctrine sub-domain)\n\nrules\n"
+        "# persona\n\n## Installed domain: fintech (okpack-fintech sub-domain)\n\nrules\n"
         "\n## Installed domain: security KB (okpack-cti co-install)\n\nrules\n")
     (tmp_path / ".okengine").mkdir()
     (tmp_path / ".okengine" / "extensions.yaml").write_text(
@@ -207,9 +218,9 @@ def test_about_reports_purpose_and_composition(tmp_path, monkeypatch):
     a = m._about_info()
     assert a["description"] == "Vendor risk watch"
     assert a["mission"] == "Track the suppliers we depend on."
-    assert a["installed_domains"] == ["doctrine (okpack-doctrine sub-domain)",
+    assert a["installed_domains"] == ["fintech (okpack-fintech sub-domain)",
                                       "security KB (okpack-cti co-install)"]
-    assert a["sub_domains"] == ["doctrine"]
+    assert a["sub_domains"] == ["fintech"]
     assert [e["id"] for e in a["extensions"]] == ["okengine.completeness", "okengine.events"]
 
 
@@ -451,8 +462,26 @@ def test_no_fresh_host_vulnerable_ttl_caches():  # reader + cockpit: monotonic-v
     apps (5 caches); scan both so it can't regress in either."""
     bad = []
     for app in (REPO / "okengine-reader" / "app.py", REPO / "okengine-cockpit" / "app.py"):
-        for m in re.finditer(r"(_\w*CACHE)\s*:[^=\n]*=\s*\((?:0\.0|0),\s*(?:\{\}|\[\]|frozenset\(\)|\(\s*\))",
+        # Case-insensitive name + optional annotation: the original `_\w*CACHE` (uppercase only,
+        # annotated module-level only) let a lowercase `_review_snapshot_cache = (0.0, [], [])`
+        # ship the exact trap this guard exists for (2026-07-19 UI sweep) — and an invalidate
+        # helper REASSIGNING `(0.0, <empty>)` is the same bug wearing a different line.
+        for m in re.finditer(r"(_\w*[Cc][Aa][Cc][Hh][Ee]\w*)\s*(?::[^=\n]*)?=\s*"
+                             r"\((?:0\.0|0),\s*(?:\{\}|\[\]|frozenset\(\)|\(\s*\))",
                              app.read_text()):
             bad.append(f"{app.name}:{m.group(1)}")
     assert not bad, ("TTL caches init to a finite timestamp with an EMPTY payload — they serve "
                      f"stale-empty on a freshly-booted host; init to float('-inf') instead: {bad}")
+
+
+def test_editing_flag_defaults_on_and_honors_falsey(tmp_path, monkeypatch):
+    """okengine#257: the reader's editing flag (surfaced in /api/about as `editing_enabled` so the
+    UI can show a read-only indicator) defaults on and turns off on a falsey OKENGINE_EDITING."""
+    monkeypatch.delenv("OKENGINE_EDITING", raising=False)
+    assert _load(tmp_path, monkeypatch)._EDITING is True          # unset -> on (back-compat)
+    monkeypatch.setenv("OKENGINE_EDITING", "0")
+    assert _load(tmp_path, monkeypatch)._EDITING is False
+    monkeypatch.setenv("OKENGINE_EDITING", "off")
+    assert _load(tmp_path, monkeypatch)._EDITING is False
+    monkeypatch.setenv("OKENGINE_EDITING", "1")
+    assert _load(tmp_path, monkeypatch)._EDITING is True

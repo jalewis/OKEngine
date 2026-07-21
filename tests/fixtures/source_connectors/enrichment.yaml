@@ -1,0 +1,22 @@
+connector_version: 1
+id: fixture.enrichment
+name: Fixture enrichment
+mode: enrichment
+trust: {permission: authenticated, data_sensitivity: internal, source_authority: Fixture Scoring}
+permissions: {network: true, allowed_hosts: [enrich.example], allow_private_network: false, write_raw: false}
+auth:
+  type: bearer
+  secret_refs: {token: FIXTURE_ENRICH_TOKEN}
+inputs: {required: [entity_id]}
+request:
+  url: "https://enrich.example/entity/${input.entity_id}"
+  method: GET
+  headers: {Authorization: "Bearer ${secret.token}"}
+response: {format: json, records_path: "", stable_id_path: id, revision_path: version}
+pagination: {type: none, max_pages: 1}
+checkpoint: {path: fixture.enrichment.json}
+conditional_requests: {enabled: true}
+rate_limit: {max_requests: 10, per_seconds: 60}
+archive: {enabled: false, raw_responses: false, path: "", retention_days: 0}
+license: {name: Internal API, redistribution: prohibited, max_retention_days: 0}
+health: {path: fixture.enrichment.json}

@@ -238,6 +238,47 @@ def _enum_rule(schema: dict, typ: str, field: str):
     return rule if rule.get("enum") else None
 
 
+def canonicalize_enum_case(schema: dict, typ: str, fm: dict) -> list:
+    """Coerce case-variant enum values to their canonical casing IN PLACE (okengine#226).
+
+    A value differing from exactly ONE allowed value only by case is unambiguous author
+    intent (live incident: `tlp: clear` ×10,378 vs the uppercase TLP enum) — coerce it
+    instead of rejecting, the same philosophy as the digit-string int coercion. A genuinely
+    unknown value is left untouched for _enum_reject_reason to reject. Applies to
+    EXTENSIBLE enums too: coercion only fires on a case-insensitive match to an existing
+    value, so it never blocks a legitimately novel one. An ambiguous match (two allowed
+    values differing only by case) is left alone. Returns 'field: old -> new' strings."""
+    out: list = []
+    enums = (schema or {}).get("enums") or {}
+    if not isinstance(fm, dict) or not isinstance(enums, dict):
+        return out
+    for field in (schema or {}).get("field_enums") or {}:
+        if field not in fm:
+            continue
+        rule = _enum_rule(schema, typ, field)
+        if not rule:
+            continue
+        allowed = enums.get(rule.get("enum"))
+        if not isinstance(allowed, list):
+            continue
+        exact = {str(a) for a in allowed}
+        folded: dict = {}
+        for a in exact:
+            folded.setdefault(a.casefold(), []).append(a)
+
+        def _fix(v):
+            if isinstance(v, str) and v not in exact:
+                m = folded.get(v.casefold())
+                if m and len(m) == 1:
+                    out.append(f"{field}: {v!r} -> {m[0]!r}")
+                    return m[0]
+            return v
+
+        val = fm[field]
+        fm[field] = [_fix(v) for v in val] if isinstance(val, list) else _fix(val)
+    return out
+
+
 def _enum_reject_reason(schema: dict, typ: str, fm: dict) -> Optional[str]:
     enums = schema.get("enums") or {}
     if not isinstance(enums, dict):
@@ -253,6 +294,14 @@ def _enum_reject_reason(schema: dict, typ: str, fm: dict) -> Optional[str]:
         if not isinstance(allowed, list):
             continue
         allowed_values = {str(v) for v in allowed}
+        # `tombstoned` is a RESERVED, universal status (okengine#249): the engine tombstone
+        # convention sets `status: tombstoned` (same_story_dedupe; deployment_validate detects on
+        # it), but a pack may enum-bind `status` per type (e.g. okcti actor_status =
+        # active/dormant/defunct/unknown). Without this, tombstoning a `type: actor` page is a
+        # conformance violation. A page carrying this value IS a tombstone — superseded, not a live
+        # conformance target — so accept it for the status field regardless of the type's enum.
+        if field == "status":
+            allowed_values.add("tombstoned")
         bad = [v for v in _field_values(fm[field]) if v not in allowed_values]
         if bad:
             allowed_fmt = ", ".join(sorted(allowed_values))
@@ -335,13 +384,15 @@ def _evaluate(abs_path: str, content: str) -> tuple[str, Optional[str]]:
         # required floors and CLOSED enums must bind even when no composed artifact exists and the
         # raw pack omits them (else base governance silently toggles with unrelated extension state).
         eff = _base_merged(schema)
-        t = str(fm.get("type") or "").strip()
+        raw_t = str(fm.get("type") or "").strip()
+        aliases = eff.get("type_aliases") or {}
+        t = str(aliases.get(raw_t, raw_t)) if isinstance(aliases, dict) else raw_t
         types = eff.get("types") or {}
         if t not in types:
-            # strict_types is ENGINE-OWNED (base), not pack-settable — a pack
-            # cannot loosen/tighten the global type taxonomy under composition.
-            if _base_schema().get("strict_types"):
-                return ("fail", f"unknown type '{t}' — not in schema.yaml taxonomy")
+            # Packs may opt into the composed taxonomy; the base can also make
+            # strictness universal. An alias is resolved before this check.
+            if eff.get("strict_types") or _base_schema().get("strict_types"):
+                return ("fail", f"unknown type '{raw_t}' — not in schema.yaml taxonomy")
             return ("ok", None)
         req = types[t].get("required") or ["type"]
         miss = [k for k in req if not _present(fm, k)]

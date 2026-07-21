@@ -23,7 +23,6 @@ description: >-
   The math is generic; the product identity (what "we" are, what "we" can claim) is pack config
   (PRODUCT_ANCHOR_PATH), never shipped. Inactive (all ops silent) until configured.
 trust: in-gateway
-tier: analyze
 requires:
   engine: ">=0.5.0"
 capabilities:
@@ -40,28 +39,28 @@ config:
       truth for what capabilities may be claimed), display name, and optionally which
       okengine.competitive-analytics watchlist segments to message against. The extension ships
       none; an absent file means every operation's wake-gate reports no anchor and stays silent.
-      Override via the PRODUCT_ANCHOR_PATH env. See README for the format.
+      Env: OKENGINE_MESSAGING_SYNTHESIS_PRODUCT_ANCHOR_PATH. See README for the format.
 operations:
   content-pegs:
     schedule: {kind: cron, expr: "0 14 * * 5"}        # weekly (Fri) — cheap, drift-gated
     entrypoint: select_content_pegs.py
     prompt_file: prompts/content-pegs.md
-    toolsets: [hermes-cron, okengine-write, okengine]
+    toolsets: [file, todo, okengine-write, okengine]
   positioning-battle-cards:
     schedule: {kind: cron, expr: "@morning:0"}         # daily @ the deployment brief hour (#177); drift-gated (only refreshes a card
                                                         # when its competitor has new activity)
     entrypoint: select_positioning_battle_cards.py
     prompt_file: prompts/battle-cards.md
-    toolsets: [hermes-cron, okengine-write, okengine]
+    toolsets: [file, todo, okengine-write, okengine]
   value-prop-gap-refresh:
     schedule: {kind: cron, expr: "0 14 * * 5"}        # weekly (Fri) — same slot as content-pegs;
                                                         # both are cheap+drift-gated, fine to co-fire
     entrypoint: select_value_prop_refresh.py
     prompt_file: prompts/value-prop-refresh.md
-    toolsets: [hermes-cron, okengine-write, okengine]
+    toolsets: [file, todo, okengine-write, okengine]
   messaging-synthesis:
     schedule: {kind: cron, expr: "@morning:15"}        # daily @ brief hour +15 (after positioning); meta-layer; drift-gated on the
                                                         # 3 upstream artifacts, rarely actually wakes
     entrypoint: select_messaging_synthesis.py
     prompt_file: prompts/messaging-synthesis.md
-    toolsets: [hermes-cron, okengine-write, okengine]
+    toolsets: [file, todo, okengine-write, okengine]

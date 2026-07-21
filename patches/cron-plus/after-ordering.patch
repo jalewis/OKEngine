@@ -1,0 +1,71 @@
+diff --git a/jobs.py b/jobs.py
+index 4a2a853..3d073b7 100644
+--- a/jobs.py
++++ b/jobs.py
+@@ -23,6 +23,11 @@ from pathlib import Path
+ from typing import Any, Optional
+ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+ 
++try:
++    from .after_ordering import after_ready, begin_claim, record_outcome
++except ImportError:
++    from after_ordering import after_ready, begin_claim, record_outcome
++
+ logger = logging.getLogger(__name__)
+ 
+ HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+@@ -522,6 +527,7 @@ def claim_due_jobs(is_running_check=None) -> list[dict]:
+ 
+     def _do(jobs: list[dict]):
+         nonlocal claimed
++        by_name = {job.get("name"): job for job in jobs if job.get("name")}
+         # ── Phase 1: self-heal null next_run_at on enabled jobs ──────
+         # A freshly-deployed jobs.json from a sanitized source-of-truth
+         # has no runtime state — every enabled job arrives with
+@@ -578,6 +584,16 @@ def claim_due_jobs(is_running_check=None) -> list[dict]:
+                     job.get("name", job["id"]), job["id"],
+                 )
+                 continue
++            ready, after_claim, reason = after_ready(job, by_name)
++            if not ready:
++                # Leave next_run_at due.  The next scheduler tick retries, so
++                # a slow or failed upstream cannot make the downstream miss a
++                # whole schedule interval.
++                logger.info(
++                    "cron-plus: job '%s' (id=%s) held by after: gate — %s",
++                    job.get("name", job["id"]), job["id"], reason,
++                )
++                continue
+             # Claim: advance next_run_at INSIDE the lock so a concurrent
+             # tick can't claim the same job. This is the same logic as
+             # advance_next_run but inlined to stay under one lock.
+@@ -590,6 +606,10 @@ def claim_due_jobs(is_running_check=None) -> list[dict]:
+                 now_iso = now.isoformat()
+                 job["next_run_at"] = compute_next_run(schedule, last_run_at=now_iso)
+                 job["last_run_at"] = now_iso
++            # A claim is in progress, not a successful completion.  Clearing
++            # the prior value closes the race where a downstream sees the new
++            # last_run_at paired with the previous run's success=True.
++            begin_claim(job, after_claim)
+             # Snapshot a deep-ish copy so the caller's mutations don't
+             # affect the persisted dict
+             import copy
+@@ -643,8 +663,13 @@ def mark_job_run(
+     delivery failure leaves success=True but populates delivery_error
+     so the CLI can render the distinction. 
+     """
+-    update_job(job_id, {
+-        "last_run_success": success,
+-        "last_error": error,
+-        "last_delivery_error": delivery_error,
+-    })
++    def _do(jobs: list[dict]):
++        for job in jobs:
++            if job.get("id") != job_id:
++                continue
++            job["last_error"] = error
++            job["last_delivery_error"] = delivery_error
++            record_outcome(job, success, _utc_now().isoformat())
++            return jobs, None
++        return None, None
++    locked_modify(_do)

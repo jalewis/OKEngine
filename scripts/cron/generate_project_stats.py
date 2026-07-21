@@ -40,6 +40,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import schema_lib  # noqa: E402
+import tz_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 HERMES_DATA = Path(os.environ.get("HERMES_DATA_DIR", "/opt/data"))
@@ -376,7 +377,7 @@ def render(corpus, ns_stats, sources, cron, hermes, freshness, namespaces) -> st
     lines.append("")
     lines.append("# Project Stats")
     lines.append("")
-    lines.append(f"> Generated: {NOW.strftime('%Y-%m-%d %H:%M UTC')}  ")
+    lines.append(f"> Generated: {tz_lib.deployment_now().strftime('%Y-%m-%d %H:%M %Z')}  ")  # okengine#301
     lines.append(f"> Regenerated daily by `scripts/cron/generate_project_stats.py` — safe to overwrite.")
     lines.append("")
 

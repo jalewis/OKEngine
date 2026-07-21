@@ -111,3 +111,45 @@ def test_reserved_guard_refuses_engine_files_allows_the_rest(tmp_path, monkeypat
     # fail-open when WIKI_PATH is unset (never block a legit write)
     monkeypatch.delenv("WIKI_PATH", raising=False)
     assert fn(under("HOT.md")) is None
+
+
+def test_patch_wires_creation_guard_into_write_and_move():
+    """okengine#54 — the file tool must not CREATE a new vault page (that's okengine-write's
+    job: canonical sharding + schema). Assert the patch defines the creation guard and wires
+    it into write() and move()'s EFFECTIVE destination."""
+    body = PATCH.read_text()
+    assert "def _creation_reject" in body, "patch 01 no longer defines the creation guard"
+    assert "WriteResult(error=f\"Write rejected: {_cr}\")" in body, "write() creation leg unguarded"
+    assert "_creation_reject(_eff_dst)" in body, \
+        "move_file must creation-guard the effective destination (a Move can mint a new page too)"
+
+
+def _load_creation_guard():
+    src = _hunk1_added()
+    assert "def _creation_reject" in src, "hunk 1 no longer defines the creation guard"
+    ns: dict = {"Optional": Optional, "re": re}
+    exec(compile(src, "<patch01-hunk1>", "exec"), ns)   # noqa: S102 — executing our own patched source
+    return ns["_creation_reject"]
+
+
+def test_creation_guard_refuses_new_pages_allows_edits(tmp_path, monkeypatch):
+    fn = _load_creation_guard()
+    (tmp_path / "wiki" / "concepts" / "d").mkdir(parents=True)
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+
+    # a brand-new page (flat OR sharded) -> REFUSED: creation goes through okengine-write
+    assert fn(str(tmp_path / "wiki" / "concepts" / "new-flat-page.md")), \
+        "creating a new flat page via the file tool must be refused (okengine#54)"
+    assert fn(str(tmp_path / "wiki" / "concepts" / "d" / "new-sharded-page.md")), \
+        "even a correctly-sharded NEW page must go through okengine-write (schema validation)"
+
+    # an EXISTING page -> editable (repair lanes patch broken frontmatter in place)
+    existing = tmp_path / "wiki" / "concepts" / "d" / "existing.md"
+    existing.write_text("---\ntype: concept\n---\nbody\n", encoding="utf-8")
+    assert fn(str(existing)) is None, "editing an existing page must stay allowed"
+
+    # out of scope -> fail-open: non-.md, .md outside the vault, WIKI_PATH unset
+    assert fn(str(tmp_path / "raw" / "notes.txt")) is None
+    assert fn(str(tmp_path.parent / "elsewhere" / "new.md")) is None
+    monkeypatch.delenv("WIKI_PATH", raising=False)
+    assert fn(str(tmp_path / "wiki" / "concepts" / "another-new.md")) is None

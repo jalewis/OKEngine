@@ -74,6 +74,14 @@ def test_plan_upgrade_for_minor_bump(tmp_path):
     assert pl.status == "upgrade"             # 0.4 -> 0.5 is the breaking unit
 
 
+def test_plan_ahead_refuses_inverted_upgrade_range(tmp_path):
+    m, meta = _mod(), _meta()
+    pl = m.plan_upgrade(_pack(tmp_path, "v0.6.0"), "v0.5.0", None, [], meta)
+    assert pl.status == "ahead"
+    assert pl.migrations == []
+    assert "NEWER" in m.render(pl)
+
+
 def test_plan_unknown_when_no_pin(tmp_path):
     m, meta = _mod(), _meta()
     (tmp_path / "p").mkdir()
@@ -152,6 +160,22 @@ def test_main_apply_bumps_to_running_engine(tmp_path):
     rc = m.main([str(pack), "--apply", "--no-validate", "--migrations-dir", str(tmp_path / "none")])
     assert rc == 0
     assert m.read_pin(pack)[0] == target       # bumped to the real engine release
+
+
+def test_main_refuses_to_downgrade_pack_ahead_of_running_engine(tmp_path, capsys):
+    m = _mod()
+    pack = _pack(tmp_path, "v999.0.0")
+
+    assert m.main([
+        str(pack), "--apply", "--no-validate", "--migrations-dir", str(tmp_path / "none")
+    ]) == 2
+
+    captured = capsys.readouterr()
+    assert "downgrade is unsupported" in captured.out
+    assert "refusing to rewrite a newer pack" in captured.err
+    assert m.read_pin(pack)[0] == "v999.0.0"
+    assert not (pack / m.SNAPSHOTS_REL).exists()
+    assert not (pack / m.STATE_REL).exists()
 
 
 # --- Phase 2: real transforms, dry-run preview, pack hooks, roll-forward gate ---
@@ -262,15 +286,35 @@ def test_snapshot_copies_source_excludes_runtime(tmp_path):
     m = _mod()
     pack = _pack(tmp_path, "v0.4.0")
     (pack / "schema.yaml").write_text("x: 1\n")
+    (pack / "data").mkdir(); (pack / "data" / "reference.json").write_text('{"version": 1}\n')
     (pack / ".git").mkdir(); (pack / ".git" / "HEAD").write_text("ref")
     (pack / ".hermes-data").mkdir(); (pack / ".hermes-data" / "big.log").write_text("noise")
     snap = m.snapshot(pack, "snap1", {"to": "v0.5.0"})
     tree = snap / "tree"
     assert (tree / "schema.yaml").read_text() == "x: 1\n"
+    assert (tree / "data" / "reference.json").read_text() == '{"version": 1}\n'
     assert (tree / "engine.version").exists()
     assert not (tree / ".git").exists()                  # VCS excluded
     assert not (tree / ".hermes-data").exists()          # runtime excluded
     assert json.loads((snap / "manifest.json").read_text())["to"] == "v0.5.0"
+
+
+def test_restore_reverts_pack_data_source(tmp_path):
+    """`<pack>/data/` is distributable pack source, not `.hermes-data` runtime state."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    source = pack / "data" / "reference.json"
+    source.parent.mkdir()
+    source.write_text('{"version": 1}\n')
+    snap = m.snapshot(pack, "s-data")
+
+    source.write_text('{"version": 2}\n')
+    added = pack / "data" / "migration-added.json"
+    added.write_text('{"new": true}\n')
+    m.restore(pack, snap)
+
+    assert source.read_text() == '{"version": 1}\n'
+    assert not added.exists()
 
 
 def test_restore_reverts_modify_add_delete(tmp_path):
@@ -497,13 +541,8 @@ def test_roll_forward_catches_partial_within_type_corruption(tmp_path, monkeypat
         f"exhaustive scan missed a partial-within-type corruption: {fails}"
 
 
-def test_roll_forward_does_not_flag_unknown_type_retype(tmp_path, monkeypatch):  # invariant-audit B5.3 boundary
-    """CHARACTERIZATION of a deliberate boundary (B5.3 re-verify round 4): the roll-forward gate uses
-    the fail-OPEN schema_reject_reason (strict_types:false engine base default), so a retype to a
-    type NOT in the taxonomy (actor→threatactor, never added to schema.yaml) is NOT flagged. This is
-    intentional — a strict FAIL here would false-roll-back an upgrade over a PRE-EXISTING out-of-
-    taxonomy page (no before/after diff) and false-positive under multipack composition. Pinned so a
-    future reader doesn't assume unknown-type retypes are covered by this gate."""
+def test_raw_conformance_scan_stays_fail_open_for_unknown_type(tmp_path, monkeypatch):
+    """The runtime-profile raw scan remains fail-open; #207 adds a separate snapshot diff gate."""
     m = _mod()
     monkeypatch.setenv("OKENGINE_BASE_SCHEMA", str(REPO / "config" / "base-schema.yaml"))
     pack = tmp_path / "pack"
@@ -519,7 +558,58 @@ def test_roll_forward_does_not_flag_unknown_type_retype(tmp_path, monkeypatch): 
     fails = m._sample_page_failures(pack, cap=50)
     # fail-open by design: the unknown type is NOT reported (documents the boundary, not an endorsement)
     assert not any("actors/r" in f for f in fails), \
-        f"unexpected: fail-open gate flagged an unknown type — boundary changed: {fails}"
+        f"runtime-profile scan unexpectedly became strict: {fails}"
+
+
+def test_unknown_type_regression_detects_new_value_without_flagging_preexisting(tmp_path, monkeypatch):
+    m = _mod()
+    monkeypatch.setenv("OKENGINE_BASE_SCHEMA", str(REPO / "config" / "base-schema.yaml"))
+    before = tmp_path / "before"
+    after = tmp_path / "after"
+    for root in (before, after):
+        ns = root / "wiki" / "actors"
+        ns.mkdir(parents=True)
+        (root / "schema.yaml").write_text(
+            "types:\n  actor: {required: [type, id]}\n", encoding="utf-8")
+        (ns / "legacy.md").write_text(
+            "---\ntype: legacy_unknown\nid: actors:legacy\n---\nold debt\n", encoding="utf-8")
+    (before / "wiki" / "actors" / "changed.md").write_text(
+        "---\ntype: actor\nid: actors:changed\n---\nbefore\n", encoding="utf-8")
+    (after / "wiki" / "actors" / "changed.md").write_text(
+        "---\ntype: threatactor\nid: actors:changed\n---\nafter\n", encoding="utf-8")
+
+    regressions = m._unknown_type_regressions(before, after)
+    assert regressions == [
+        "actors/changed.md: unknown type 'threatactor' newly introduced by migration"
+    ]
+    assert not any("legacy_unknown" in item for item in regressions)
+
+
+def test_unknown_type_regression_accepts_composed_extension_type_and_alias(tmp_path, monkeypatch):
+    m = _mod()
+    monkeypatch.setenv("OKENGINE_BASE_SCHEMA", str(REPO / "config" / "base-schema.yaml"))
+    before = tmp_path / "before"
+    after = tmp_path / "after"
+    for root in (before, after):
+        (root / "wiki" / "items").mkdir(parents=True)
+        (root / "schema.yaml").write_text(
+            "types:\n  item: {required: [type]}\n", encoding="utf-8")
+        composed = root / ".okengine" / "composed-schema.yaml"
+        composed.parent.mkdir(parents=True)
+        composed.write_text(
+            "types:\n"
+            "  item: {required: [type]}\n"
+            "  extension_event: {required: [type]}\n"
+            "type_aliases:\n"
+            "  ext-event: extension_event\n",
+            encoding="utf-8",
+        )
+    (after / "wiki" / "items" / "canonical.md").write_text(
+        "---\ntype: extension_event\n---\nvalid extension type\n", encoding="utf-8")
+    (after / "wiki" / "items" / "alias.md").write_text(
+        "---\ntype: ext-event\n---\nvalid alias\n", encoding="utf-8")
+
+    assert m._unknown_type_regressions(before, after) == []
 
 
 # --- roll-forward is a REGRESSION gate, not an absolute-conformance gate (fleet-roll regression) ---
@@ -576,6 +666,32 @@ def test_conformance_regression_rolls_back(tmp_path, monkeypatch):  # roll-forwa
     assert "frontmatter" in (ent / "x.md").read_text() or "type: entity" in (ent / "x.md").read_text()
     # after rollback the page is conformant again
     assert m._page_failure_map(pack) == {}, "rollback left a corrupted page behind"
+
+
+def test_new_unknown_type_regression_rolls_back(tmp_path, monkeypatch):
+    """A migration may not silently retype a page outside the composed taxonomy."""
+    m = _mod()
+    monkeypatch.setenv("OKENGINE_BASE_SCHEMA", str(REPO / "config" / "base-schema.yaml"))
+    monkeypatch.setattr(m, "VALIDATOR", lambda p: (True, "ok"))
+    pack, ent = _vault_pack(tmp_path)
+    page = ent / "x.md"
+    page.write_text("---\ntype: entity\nid: entities:x\n---\nfine before\n", encoding="utf-8")
+    md = tmp_path / "migs"
+    md.mkdir()
+    (md / "m_retype.py").write_text(
+        'ID = "retype"\nFROM = "v0.11.2"\nTO = "v0.11.3"\nDESCRIPTION = "bad retype"\n'
+        'def apply(pack, dry_run):\n'
+        '    p = pack / "wiki/entities/x.md"\n'
+        '    if not dry_run: p.write_text("---\\ntype: entitty\\nid: entities:x\\n---\\nbad\\n")\n'
+        '    return ["retyped x.md"]\n',
+        encoding="utf-8",
+    )
+
+    rc = m.main([str(pack), "--apply", "--migrations-dir", str(md)])
+
+    assert rc == 1
+    assert "type: entity\n" in page.read_text(encoding="utf-8")
+    assert "entitty" not in page.read_text(encoding="utf-8")
 
 
 def test_conformance_regression_ignores_preexisting_failure(tmp_path, monkeypatch):  # no false-rollback
@@ -669,3 +785,19 @@ def test_rollback_quarantines_added_files_never_deletes(tmp_path):  # invariant-
     assert not (pack / "wiki" / "live.md").exists()                     # removed from its place
     q = pack / ".okengine" / "rolled-back" / "s1" / "wiki" / "live.md"
     assert q.read_text() == "concurrent content"                        # preserved, not destroyed
+
+
+def test_duplicate_engine_migration_id_fails_loud(tmp_path):
+    """invariant-audit: two engine migration files sharing an ID silently dropped one (dict-comp
+    last-wins), so a real transform never ran for any pack while state recorded success. Must raise."""
+    m = _mod()
+    d = tmp_path / "migrations"
+    _migration(d, id_="dup", frm="v0.4.0", to="v0.5.0", marker="A.txt")
+    # a second file with the SAME id (copy-paste collision), different to_version
+    (d / "m_dup2.py").write_text(
+        'ID = "dup"\nFROM = "v0.5.0"\nTO = "v0.6.0"\nDESCRIPTION = "copy-paste collision"\n'
+        'def apply(pack, dry_run):\n    return []\n', encoding="utf-8")
+    pack = _pack(tmp_path, "v0.4.0")
+    import pytest as _pytest
+    with _pytest.raises(SystemExit):
+        m.load_all_migrations(d, pack)

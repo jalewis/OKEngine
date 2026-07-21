@@ -41,10 +41,18 @@ import llm_lib    # noqa: E402  (vendored — reasoning-off default, truncation 
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
-EVO_FIELD = os.environ.get("VIZ_EVOLUTION_FIELD", "evolution")
-VAL_FIELD = os.environ.get("VIZ_VALUE_FIELD", "value_chain")
-BATCH = int(os.environ.get("ENRICH_BATCH", "25"))
-BUDGET = int(os.environ.get("ENRICH_TIME_BUDGET", "300"))
+EVO_FIELD = os.environ.get(
+    "VIZ_EVOLUTION_FIELD", os.environ.get("OKENGINE_VIZ_EVOLUTION_FIELD", "evolution")
+)
+VAL_FIELD = os.environ.get(
+    "VIZ_VALUE_FIELD", os.environ.get("OKENGINE_VIZ_VALUE_FIELD", "value_chain")
+)
+BATCH = int(os.environ.get(
+    "ENRICH_BATCH", os.environ.get("OKENGINE_VIZ_ENRICH_BATCH", "25")
+))
+BUDGET = int(os.environ.get(
+    "ENRICH_TIME_BUDGET", os.environ.get("OKENGINE_VIZ_ENRICH_TIME_BUDGET", "300")
+))
 # per-call ceiling: a contended local host can take >60s for even a tiny classify
 CALL_TIMEOUT = int(os.environ.get("ENRICH_CALL_TIMEOUT", "90"))
 
@@ -96,7 +104,9 @@ def main() -> int:
         return 0
 
     # anchor scope: stems the anchor pages link (same neighborhood rule as the map builder)
-    anchors = [a.strip() for a in os.environ.get("VIZ_ANCHOR", "").split(",") if a.strip()]
+    anchors = [a.strip() for a in os.environ.get(
+        "VIZ_ANCHOR", os.environ.get("OKENGINE_VIZ_ANCHOR", "")
+    ).split(",") if a.strip()]
     anchor_stems: set = set()
     for a in anchors:
         ap = WIKI / a
@@ -109,7 +119,10 @@ def main() -> int:
     for p in cdir.rglob("*.md"):
         if p.name.startswith(("_", "INDEX")):
             continue
-        text = p.read_text(encoding="utf-8", errors="replace")
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue  # page moved/deleted by a concurrent lane mid-scan
         m = _fm_text(text)
         if not m:
             continue                      # no frontmatter — not a governed concept page, skip
@@ -125,7 +138,11 @@ def main() -> int:
             continue
         rel = p.relative_to(WIKI).as_posix()
         anchor_hop = rel.startswith("entities/") and p.stem.lower() in anchor_stems
-        for slug in _CLINK.findall(p.read_text(encoding="utf-8", errors="replace")):
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue  # page moved/deleted by a concurrent lane mid-scan
+        for slug in _CLINK.findall(text):
             s = slug.lower()
             if s in indeg:
                 indeg[s] += 1

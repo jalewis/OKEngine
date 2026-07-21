@@ -103,6 +103,25 @@ def test_warm_tab_datasets_prepopulates_configured_dirs(tmp_path, monkeypatch):
     assert set(scanned) == {"entities", "briefings"}, f"warmer scanned {scanned}"
 
 
+def test_initial_warmer_scans_only_landing_tab(tmp_path, monkeypatch):
+    (tmp_path / "schema.yaml").write_text(
+        "cockpit:\n  tabs: [overview, che]\n  tab_defs:\n"
+        "    overview:\n      boxes:\n"
+        "        - {title: Actors, dataset: {dir: entities}}\n"
+        "        - {title: Brief, view: doc, dir: dashboards}\n"
+        "    che:\n      boxes:\n"
+        "        - {title: Ledger, dataset: {dir: assessments}}\n",
+        encoding="utf-8",
+    )
+    m = _load(tmp_path, monkeypatch)
+    m._DIR_CACHE.clear()
+    scanned = []
+    monkeypatch.setattr(m, "_scan_dir_meta", lambda sub: scanned.append(sub) or [])
+    m._warm_initial_tab_datasets()
+    assert set(scanned) == {"entities", "dashboards"}
+    assert "assessments" not in scanned
+
+
 def test_ds_sorted_date_fields_honor_direction(tmp_path, monkeypatch):
     """Live incident #2 (Knowledge-gaps box): ISO dates aren't floatable, so a date-sorted box lives
     entirely in the non-numeric bucket — the first junk-last fix sorted that bucket ascending
@@ -444,7 +463,9 @@ def test_evidence_section_grades_and_dates_citations(tmp_path, monkeypatch):
         encoding="utf-8")
     src = tmp_path / "wiki" / "sources" / "2026"
     src.mkdir(parents=True)
-    (src / "rep1.md").write_text("---\ntype: source\ntitle: Rep1\npublished: 2026-07-01\n---\n", encoding="utf-8")
+    (src / "rep1.md").write_text(
+        "---\ntype: source\ntitle: Rep1\npublished: 2026-07-01\nreliability: A\n---\n",
+        encoding="utf-8")
     ent = tmp_path / "wiki" / "entities" / "a"
     ent.mkdir(parents=True)
     (ent / "apt.md").write_text(
@@ -457,6 +478,7 @@ def test_evidence_section_grades_and_dates_citations(tmp_path, monkeypatch):
     assert cites["MISP galaxy"]["reliability"] == "B"
     assert cites["sources/2026/rep1"]["page"] == "sources/2026/rep1"   # internal link
     assert cites["sources/2026/rep1"]["date"] == "2026-07-01"          # recency from the source page
+    assert cites["sources/2026/rep1"]["reliability"] == "A"           # specific reviewed record
     assert "Sources" not in {r["label"] for r in d["meta"]}    # dropped from the fact panel
 
 
@@ -548,6 +570,41 @@ def test_page_quality_badges_flag_health_problems(tmp_path, monkeypatch):
         "---\ntype: actor\nname: Good\naliases: [Alt]\nsources: [sources/2026/s1]\n"
         f"updated: {m.TODAY().isoformat()}\n---\n" + ("Substantial prose. " * 20) + "\n", encoding="utf-8")
     assert m.api_page(path="entities/a/good")["quality"] == []
+
+
+def test_source_record_uses_upstream_capture_as_grounding(tmp_path, monkeypatch):
+    """A source is an evidence record, not a knowledge claim that must cite another source page."""
+    (tmp_path / "schema.yaml").write_text(
+        "types:\n  source: {required: [type, published]}\n", encoding="utf-8")
+    sources = tmp_path / "wiki" / "sources" / "2026" / "07"
+    sources.mkdir(parents=True)
+    (sources / "report.md").write_text(
+        "---\ntype: source\ntitle: Report\npublished: 2026-07-13\n"
+        "url: https://example.test/report\nraw: raw/feed/report.md\n---\n" +
+        ("Substantial captured source text. " * 12) + "\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    labels = {badge["label"] for badge in m.api_page(path="sources/2026/07/report")["quality"]}
+    assert "no sources" not in labels
+    assert "ungrounded" not in labels
+
+
+def test_priority_candidate_leads_are_provenance_not_support(tmp_path, monkeypatch):
+    sources = tmp_path / "wiki/sources"
+    sources.mkdir(parents=True)
+    (sources / "report.md").write_text("---\ntype: source\ntitle: Report\n---\nBody.\n")
+    priorities = tmp_path / "wiki/hypotheses/priorities"
+    priorities.mkdir(parents=True)
+    (priorities / "one.md").write_text(
+        "---\ntype: actor-assessment-priority\ntitle: Priority\n"
+        "candidate_evidence:\n- artifact: sources/report\n  evidence_role: candidate-lead\n"
+        "  artifact_digest: sha256:" + "a" * 64 + "\n---\n" + ("Priority detail. " * 30))
+    m = _load(tmp_path, monkeypatch)
+    result = m.api_page(path="hypotheses/priorities/one")
+    labels = {row["label"] for row in result["quality"]}
+    assert "no sources" not in labels
+    assert "1 candidate lead" in labels
+    assert result["provenance"]["candidate_pages"] == 1
+    assert result["citations"] == []
 
 
 def test_ops_auto_appends_before_browse(tmp_path, monkeypatch):
@@ -714,7 +771,8 @@ def test_group_by_bar_link_page_opens_the_named_page(tmp_path, monkeypatch):
     rows = [{"techniques": ["T1105", "T9999"]}, {"techniques": ["T1105"]}]  # T9999 has no page
 
     lpm = m._link_page_map(box)
-    assert lpm.get("T1105") == "techniques/t/1/T1105"   # resolved to the real page (shards included)
+    assert lpm.get("T1105", {}).get("path") == "techniques/t/1/T1105"  # resolved to the real page (shards included)
+    assert lpm.get("T1105", {}).get("label") == ""       # no label_field configured -> empty label
     assert "T9999" not in lpm                            # no page -> not in the map
 
     html = m._v_bars(box, rows, drill=("adversaries", 3))
@@ -834,3 +892,86 @@ def test_cockpit_search_glob_exempts_reshard_bucket(tmp_path, monkeypatch):
     monkeypatch.setattr(m.subprocess, "run", lambda cmd, **k: (cap.__setitem__("cmd", cmd), _P())[1])
     m.api_search(q="hello")
     assert "!_?*" in cap["cmd"] and "!_*" not in cap["cmd"], cap["cmd"]
+
+
+def test_unreviewed_ungrounded_entity_is_quarantined(tmp_path, monkeypatch):
+    """The Gentlemen regression: warning chips may not decorate a polished canonical profile."""
+    ent = tmp_path / "wiki" / "entities" / "g"
+    ent.mkdir(parents=True)
+    (ent / "gentlemen-ransomware-group-storm-2698.md").write_text(
+        "---\ntype: actor\nname: The Gentlemen\nneeds_review: true\n"
+        "sources: [https://example.invalid/rumor]\n---\n"
+        "# Summary\n\nAn unverified but polished-looking actor profile.\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    d = m.api_page(path="entities/g/gentlemen-ransomware-group-storm-2698")
+    assert d["trust"]["state"] == "quarantined"
+    assert set(d["trust"]["reasons"]) >= {"ungrounded", "needs review"}
+
+
+def test_tombstoned_entity_points_to_canonical_instead_of_rendering_as_profile(tmp_path, monkeypatch):
+    ent = tmp_path / "wiki" / "entities" / "g"
+    ent.mkdir(parents=True)
+    (ent / "duplicate.md").write_text(
+        "---\ntype: actor\nstatus: tombstoned\n"
+        "redirect_to: entities/g/canonical\n---\nOld body.\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    d = m.api_page(path="entities/g/duplicate")
+    assert d["trust"] == {"state": "retired", "reasons": ["superseded record"],
+                           "redirect_to": "entities/g/canonical"}
+
+
+def test_non_entity_without_sources_is_not_quarantined(tmp_path, monkeypatch):
+    dash = tmp_path / "wiki" / "dashboards"
+    dash.mkdir(parents=True)
+    (dash / "health.md").write_text("---\ntype: dashboard\n---\n# Health\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    assert m.api_page(path="dashboards/health")["trust"]["state"] == "normal"
+
+
+def test_ds_cell_pct_formats_epss_probability(tmp_path, monkeypatch):
+    """okengine#259: a `pct: true` column renders a 0..1 probability (EPSS score) as a percentage —
+    one decimal below 10% so small scores don't collapse to 0%, whole numbers above."""
+    m = _load(tmp_path, monkeypatch)
+    col = {"field": "epss_score", "pct": True}
+    assert ">0.8%<" in m._ds_cell({"epss_score": 0.00783}, col)   # small: one decimal, not "1%"
+    assert ">94%<" in m._ds_cell({"epss_score": 0.94}, col)       # large: whole percent
+    assert ">100%<" in m._ds_cell({"epss_score": 1.0}, col)
+    assert ">—<" in m._ds_cell({"epss_score": None}, col)         # missing -> placeholder, no crash
+    assert "n/a" in m._ds_cell({"epss_score": "n/a"}, col)        # non-numeric -> left as-is
+
+
+def test_ds_cell_tone_by_colors_severity_by_value(tmp_path, monkeypatch):
+    """okengine#259: `tone_by` picks the cell tone FROM the value (severity enum) rather than one
+    static column colour; unmapped values and blanks fall back cleanly."""
+    m = _load(tmp_path, monkeypatch)
+    col = {"field": "severity", "tone_by": {"critical": "crit", "high": "warn", "medium": "acc"}}
+    assert 't-crit' in m._ds_cell({"severity": "critical"}, col)
+    assert 't-warn' in m._ds_cell({"severity": "high"}, col)
+    assert 't-acc' in m._ds_cell({"severity": "medium"}, col)
+    assert 't-crit' in m._ds_cell({"severity": "Critical"}, col)  # case-insensitive fallback
+    out_low = m._ds_cell({"severity": "low"}, col)                # not in map -> no tone class
+    assert "t-crit" not in out_low and "t-warn" not in out_low
+    assert ">—<" in m._ds_cell({"severity": None}, col)           # blank -> placeholder
+
+
+def test_operation_control_requires_plan_and_uses_generic_operation_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("OKENGINE_OPERATION_API", "http://operation-runner:8732")
+    monkeypatch.setenv("OKENGINE_OPERATION_TOKEN", "fixture-token")
+    monkeypatch.setenv("OKENGINE_REVIEWER_NAME", "operator")
+    monkeypatch.setenv("OKENGINE_REVIEW_TRUSTED_NETWORK", "1")
+    m = _load(tmp_path, monkeypatch)
+    html = m._v_operation_control({
+        "operation": "actor-review", "arguments": ["--all"],
+        "description": "Review every canonical actor.",
+    })
+    assert 'data-operation="actor-review"' in html
+    assert "Plan scope" in html and "Start operation" in html
+    assert 'data-operation-run disabled' in html
+    assert "Review every canonical actor" in html
+
+
+def test_operation_control_client_plans_before_starting():
+    js = (REPO / "okengine-cockpit/static/app.js").read_text(encoding="utf-8")
+    assert "planOperation(panel)" in js and "startOperation(panel)" in js
+    assert js.index("panel.dataset.planDigest") < js.index("confirm(`Start ${name}")
+    assert '"X-OKEngine-Operation":"1"' in js

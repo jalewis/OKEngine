@@ -7,6 +7,10 @@ Offline contract tests (no live stack, no docker):
   + `make scrub`, wired into `make check` (gap 6)."""
 import re
 import subprocess
+import json
+import importlib.util
+
+import pytest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -102,3 +106,85 @@ def test_preflight_is_valid_bash_and_executable():
     import subprocess
     if shutil.which("bash"):
         assert subprocess.run(["bash", "-n", str(pf)]).returncode == 0
+
+
+# ── P2: durable release evidence + audited-SHA/tag binding ────────────────────────────────────────
+
+# scripts/audit/ is EXCLUDED from the public snapshot (publish-snapshot.sh), so these three
+# tests must SKIP — not error — on the scrubbed public tree, the same convention the sibling gate
+# files already follow (test_cron_plus_deploy guards CLAUDE.md; test_audit_batch8_gates skips on an
+# absent publish-snapshot.sh). Without this they FileNotFoundError/AssertionError in public GitHub
+# CI (invariant-audit HIGH #7).
+_RELEASE_EVIDENCE = REPO / "scripts" / "audit" / "release_evidence.py"
+_audit_excluded = pytest.mark.skipif(
+    not _RELEASE_EVIDENCE.is_file(),
+    reason="scripts/audit/ is excluded from the public snapshot — runs in the source repo only")
+
+
+def _evidence_module():
+    spec = importlib.util.spec_from_file_location("release_evidence", _RELEASE_EVIDENCE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@_audit_excluded
+def test_release_evidence_policy_rejects_pending_and_incomplete_waivers(tmp_path):
+    mod = _evidence_module()
+    record = mod.initial_record(REPO, "v-test")
+    errors = mod.validate_record(record, REPO)
+    assert any("pending" in error for error in errors)
+
+    for gate, allowed in mod.GATE_POLICY.items():
+        status = "passed" if "passed" in allowed else sorted(allowed)[0]
+        record["gates"][gate] = {"status": status, "evidence": f"{gate} evidence"}
+    record["runner"] = {
+        "identity": "reviewer",
+        "workflow_runtime": "Claude Code Workflow",
+        "runtime_version": "1.2.3",
+    }
+    record["reverification"] = {
+        "status": "clean",
+        "audited_sha": record["audited_sha"],
+        "rounds": 1,
+        "summary": "zero blocking findings",
+    }
+    record["findings"] = [{
+        "id": "f1", "severity": "low", "summary": "deferred",
+        "disposition": "waived", "waiver": {"owner": "reviewer", "reason": "bounded"},
+    }]
+    errors = mod.validate_record(record, REPO)
+    assert errors == ["findings[0].waiver needs expires_on or target_release"]
+    record["findings"][0]["waiver"]["target_release"] = "v-next"
+    assert mod.validate_record(record, REPO) == []
+
+
+@_audit_excluded
+def test_release_evidence_cli_and_make_target_are_wired():
+    script = REPO / "scripts" / "audit" / "release_evidence.py"
+    template = REPO / "scripts" / "audit" / "evidence" / "template.json"
+    assert script.is_file() and template.is_file()
+    assert json.loads(template.read_text())["schema_version"] == 1
+    mk = MAKEFILE.read_text()
+    assert "\nrelease-evidence:" in mk
+    assert "--tag" in mk and "EVIDENCE" in mk
+
+
+@_audit_excluded
+def test_release_evidence_binds_tag_to_exact_audited_sha(tmp_path):
+    mod = _evidence_module()
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "test"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "test@example.invalid"], check=True)
+    (tmp_path / "x").write_text("one")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "x"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "one"], check=True)
+    record = mod.initial_record(tmp_path, "v1")
+    subprocess.run(["git", "-C", str(tmp_path), "tag", "v1"], check=True)
+    assert not any("tag" in error for error in mod.validate_record(record, tmp_path, "v1"))
+
+    (tmp_path / "x").write_text("two")
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qam", "two"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "tag", "-f", "v1"], check=True,
+                   stdout=subprocess.DEVNULL)
+    assert any("not audited_sha" in error for error in mod.validate_record(record, tmp_path, "v1"))

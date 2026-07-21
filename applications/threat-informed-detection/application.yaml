@@ -1,0 +1,111 @@
+schema_version: 1
+id: threat-informed-detection
+version: 0.1.0
+name: Threat-Informed Detection Engineering
+description: >-
+  An evidence-qualified chain from sourced actor procedure through environment relevance,
+  observability, analytic deployment, validation, defensive coverage, and measured improvement.
+
+extends:
+  profile: continuous-hypothesis
+  version: ">=1.0.0"
+
+requires:
+  engine: ">=0.11.5"
+  extensions: {}
+
+binding_contract:
+  required_roles:
+    threat_procedure:
+      minimum: 1
+      required_fields: [type, namespace, behavior_field, evidence_field, as_of_field]
+      required_operations: [ingest]
+      allow_multiple: true
+    detection_requirement:
+      minimum: 1
+      required_fields: [type, namespace, procedure_field, environment_field, telemetry_refs_field, status_field]
+      required_operations: [refresh]
+      allow_multiple: false
+    environment_snapshot:
+      minimum: 1
+      required_fields: [type, namespace, scope_field, telemetry_refs_field, observed_at_field]
+      required_operations: [inventory]
+      allow_multiple: false
+    telemetry_source:
+      minimum: 1
+      required_fields: [type, namespace, platform_field, scope_field, observed_at_field, status_field]
+      required_operations: [inventory]
+      allow_multiple: false
+    detection_strategy:
+      minimum: 1
+      required_fields: [type, namespace, requirement_field, hypothesis_field, status_field]
+      required_operations: [refresh]
+      allow_multiple: false
+    detection_analytic:
+      minimum: 1
+      required_fields: [type, namespace, strategy_field, revision_field, status_field]
+      required_operations: [inventory]
+      allow_multiple: false
+    deployment_snapshot:
+      minimum: 1
+      required_fields: [type, namespace, analytic_field, revision_field, scope_field, observed_at_field]
+      required_operations: [inventory]
+      allow_multiple: false
+    validation_test:
+      minimum: 1
+      required_fields: [type, namespace, procedure_field, analytic_field, status_field]
+      required_operations: [import]
+      allow_multiple: false
+    validation_result:
+      minimum: 1
+      required_fields: [type, namespace, analytic_field, revision_field, environment_field, result_field, executed_at_field]
+      required_operations: [import]
+      allow_multiple: false
+    coverage_assessment:
+      minimum: 1
+      required_fields: [type, namespace, procedure_field, environment_field, facets_field, as_of_field, status_field]
+      required_operations: [evaluate]
+      allow_multiple: false
+
+operating_loop:
+  - {id: import-threat-procedures, capability: threat-procedure-ingest, after: []}
+  - {id: assess-relevance, capability: environment-relevance, after: [import-threat-procedures]}
+  - {id: specify-observability, capability: telemetry-requirements, after: [assess-relevance]}
+  - {id: import-defensive-state, capability: defensive-inventory, after: []}
+  - {id: evaluate-coverage, capability: evidence-qualified-coverage, after: [specify-observability, import-defensive-state]}
+  - {id: select-gaps, capability: gap-prioritization, after: [evaluate-coverage]}
+  - {id: validate, capability: control-validation, after: [evaluate-coverage]}
+  - {id: decide-act, capability: governed-defensive-action, after: [select-gaps, validate]}
+  - {id: measure-outcome, capability: defensive-outcome, after: [decide-act]}
+
+required_surfaces:
+  - threat_to_defense_trace
+  - actor_defensive_posture
+  - coverage_facets
+  - detection_dossier
+  - validation_queue
+  - gap_workbench
+
+required_queues:
+  - unassessed_procedures
+  - telemetry_gaps
+  - unvalidated_analytics
+  - stale_coverage
+
+required_success_measures:
+  - procedure_to_requirement_latency
+  - telemetry_qualification_rate
+  - current_validation_rate
+  - dependency_caused_downgrades
+  - validated_gap_closure_time
+
+policy:
+  preserve_source_procedure: true
+  technique_mapping_is_not_coverage: true
+  coverage_requires_scope_and_as_of: true
+  coverage_is_faceted: true
+  deployment_is_not_validation: true
+  expected_absence_requires_qualification: true
+  model_output_cannot_self_validate: true
+  production_writeback_requires_review: true
+  preserve_validation_artifact_identity: true

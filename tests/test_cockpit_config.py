@@ -42,6 +42,7 @@ def test_defaults_with_no_cockpit_block(tmp_path, monkeypatch):
 
     # title defaults to the titleized vault dir name
     assert cfg["title"] == "Acme Research"
+    assert cfg["short_title"] == "Acme Research"
     # one generic "Recent briefings" stream over briefings/
     assert [s["key"] for s in cfg["streams"]] == ["briefings"]
     assert cfg["streams"][0]["dir"] == "briefings"
@@ -55,6 +56,32 @@ def test_defaults_with_no_cockpit_block(tmp_path, monkeypatch):
     assert cfg["predictions_dirs"] == ["predictions"]
     # dashboards auto-listed (no curated groups)
     assert cfg["dashboards"] is None
+    assert cfg["application"] is None
+
+
+def test_application_declaration_surfaces_in_ops_not_as_empty_workspace_tab(tmp_path, monkeypatch):
+    m = _load(tmp_path, monkeypatch)
+    vault = tmp_path
+    _write_schema(vault, "cockpit:\n  tabs: [briefings, browse]\n")
+    app = vault / ".okengine" / "application.yaml"
+    app.parent.mkdir()
+    app.write_text(
+        "profile: continuous-hypothesis\nprofile_version: 1.0.0\n"
+        "bindings:\n  propositions:\n    - type: prediction\n      namespace: predictions\n"
+        "      operations: {reassess: 'okengine.predictions:regrade'}\n"
+        "surfaces: {assessment_review: dashboards/adversarial-evidence-review}\n",
+        encoding="utf-8")
+
+    cfg = m.load_cockpit_config(vault)
+    assert cfg["tabs"] == ["briefings", "browse"]
+    assert "application" not in cfg["tab_defs"]
+    assert cfg["application"]["propositions"][0]["type"] == "prediction"
+    rendered = m.api_application()["html"]
+    assert "Continuous Hypothesis" in rendered and "prediction" in rendered
+    assert 'data-page="dashboards/adversarial-evidence-review"' in rendered
+    groups = {g["group"]: g["items"] for g in m.api_ops()["groups"]}
+    assert groups["Applications"][0]["action"] == "application"
+    assert "ops" in m.api_config()["tabs"]
 
 
 def test_defaults_when_schema_present_but_no_cockpit_key(tmp_path, monkeypatch):
@@ -65,6 +92,16 @@ def test_defaults_when_schema_present_but_no_cockpit_key(tmp_path, monkeypatch):
     assert cfg["watchlist"] is None
     assert cfg["tabs"] == ["home", "briefings", "predictions", "dashboards"]
     assert [s["key"] for s in cfg["streams"]] == ["briefings"]
+
+
+def test_composed_schema_is_cockpit_authority_when_present(tmp_path, monkeypatch):
+    m = _load(tmp_path, monkeypatch)
+    _write_schema(tmp_path, "cockpit: {title: Stale pack title}\n")
+    artifact = tmp_path / ".okengine" / "composed-schema.yaml"
+    artifact.parent.mkdir()
+    artifact.write_text("cockpit: {title: Composed title}\n", encoding="utf-8")
+    assert m.load_cockpit_config(tmp_path)["title"] == "Composed title"
+    assert m._governing_schema_path(tmp_path) == artifact
 
 
 # ── tracker tabs hidden without a watchlist config ───────────────────────────
@@ -89,6 +126,7 @@ def test_tracker_tabs_dropped_without_watchlist(tmp_path, monkeypatch):
 SAMPLE = """
 cockpit:
   title: "Acme Intelligence"
+  short_title: "Acme"
   streams:
     - {key: pdb, label: "Daily brief", dir: briefings, type: daily-brief}
     - {key: weekly, label: "Weekly review", dir: weekly, glob: "*-week-in-review.md"}
@@ -121,6 +159,11 @@ def test_full_block_parse(tmp_path, monkeypatch):
     cfg = m.load_cockpit_config(vault)
 
     assert cfg["title"] == "Acme Intelligence"
+    assert cfg["short_title"] == "Acme"
+    monkeypatch.setattr(m, "cockpit_config", lambda: cfg)
+    api = m.api_config()
+    assert api["title"] == "Acme Intelligence"
+    assert api["short_title"] == "Acme"
 
     # streams: type vs glob both preserved; pdf flag honoured
     by_key = cfg["streams_by_key"]

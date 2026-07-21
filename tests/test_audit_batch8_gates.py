@@ -12,6 +12,22 @@ def test_ci_hard_fails_on_mcp_install_and_verifies_import():  # invariant-audit 
     assert 'python -c "import mcp"' in ci, "CI must verify mcp actually imported"
 
 
+def test_mcp_cve_fix_is_pinned_and_no_longer_ignored():
+    requirements = (REPO / "okengine-mcp" / "requirements.txt").read_text()
+    audit = (REPO / "scripts" / "audit.sh").read_text()
+    assert "mcp==1.28.1" in requirements
+    assert "CVE-2026-59950" not in audit
+    assert "--ignore-vuln" not in audit
+
+
+def test_bandit_has_zero_debt_baseline():
+    """SAST debt cannot disappear behind a committed accepted-findings file."""
+    audit = (REPO / "scripts" / "audit.sh").read_text()
+    assert not (REPO / "bandit-baseline.json").exists()
+    assert "-b bandit-baseline.json" not in audit
+    assert "zero accepted findings" in audit
+
+
 def test_scrub_check_scans_whole_tracked_tree_not_a_glob_subset():  # invariant-audit #55
     """The pre-commit scrub must scan the whole tracked tree (like the publish scrub), or shipped
     non-glob files (static/*.js, Dockerfiles, patches/*.patch) go unscanned at commit time."""

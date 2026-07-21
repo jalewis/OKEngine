@@ -46,7 +46,8 @@ def test_all_prompts_trust_the_digest():
 def test_manifest_shape():
     m = yaml.safe_load((EXT / "extension.yaml").read_text())
     assert m["id"] == "okengine.messaging-synthesis"
-    assert m["trust"] == "in-gateway" and m.get("tier") == "analyze"
+    assert m["trust"] == "in-gateway"
+    assert "tier" not in m  # unsupported manifest keys must not survive as ignored decoration
     assert set(m["operations"]) == {
         "content-pegs", "positioning-battle-cards", "value-prop-gap-refresh", "messaging-synthesis",
     }

@@ -50,3 +50,8 @@ def test_unconfigured_raises_helpfully(monkeypatch):
     monkeypatch.delenv("OKENGINE_LLM_MODEL", raising=False)
     with pytest.raises(L.LLMError, match="OKENGINE_LLM_BASE_URL"):
         L.chat("hi")
+
+
+def test_endpoint_rejects_non_http_scheme():
+    with pytest.raises(L.LLMError, match=r"http\(s\)"):
+        L._resolve("file:///etc/passwd", "model")

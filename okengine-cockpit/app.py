@@ -30,6 +30,7 @@ Env:
 """
 from __future__ import annotations
 
+import functools
 import os
 import re
 import json
@@ -40,12 +41,13 @@ import hmac
 import threading
 import time
 import datetime
-from collections import Counter
+from collections import Counter, defaultdict
 import subprocess
 import shutil
 import tempfile
 import urllib.request
 import urllib.error
+from contextlib import asynccontextmanager
 from urllib.parse import quote, urlparse
 from pathlib import Path
 from typing import Any
@@ -58,9 +60,36 @@ from fastapi.staticfiles import StaticFiles
 
 VAULT = Path(os.environ.get("VAULT_DIR", "/vault"))
 WIKI = VAULT / "wiki"
+
+
+def _governing_schema_path(vault: Path = VAULT) -> Path:
+    """One schema authority for every Cockpit consumer.
+
+    A composed deployment's generated artifact is engine + pack + enabled
+    extensions and is also what the write path enforces. Falling back to the
+    pack schema preserves plain, non-composed deployments.
+    """
+    artifact = vault / ".okengine" / "composed-schema.yaml"
+    return artifact if artifact.is_file() else vault / "schema.yaml"
+
+
 STATIC = Path(__file__).parent / "static"
 
-app = FastAPI(title="OKEngine · cockpit", docs_url=None, redoc_url=None)
+
+@asynccontextmanager
+async def _lifespan(_app):
+    """Start Cockpit cache workers through FastAPI's supported lifespan contract."""
+    # Populate the landing page before declaring readiness. Starting whole-vault/all-tab Python
+    # scans in background threads here starves the first UI request on large deployments.
+    _warm_initial_tab_datasets()
+    # Do not eagerly warm the global review snapshot here. Its YAML-heavy whole-vault scan competes
+    # with initial UI requests even in a background thread. Dashboard review launchers declare
+    # namespace-scoped `review_dirs`; the complete global worklist initializes only when requested.
+    yield
+
+
+app = FastAPI(title="OKEngine · cockpit", docs_url=None, redoc_url=None,
+              lifespan=_lifespan)
 
 
 # ── optional HTTP Basic auth ─────────────────────────────────────────────────
@@ -93,9 +122,32 @@ class _BasicAuth:
 
 
 _READER_PASSWORD = os.environ.get("OKENGINE_READER_PASSWORD", "")
+_READER_USER = os.environ.get("OKENGINE_READER_USER", "okengine")
 if _READER_PASSWORD:
-    app.add_middleware(_BasicAuth, user=os.environ.get("OKENGINE_READER_USER", "okengine"),
-                       password=_READER_PASSWORD)
+    app.add_middleware(_BasicAuth, user=_READER_USER, password=_READER_PASSWORD)
+
+# Review writes are opt-in and fail closed. Cockpit keeps its vault mount read-only and proxies only
+# the narrow review state-machine operation to a bridge-only governed write service. A configured
+# write service without browser authentication is deliberately treated as disabled.
+_REVIEW_API = os.environ.get("OKENGINE_REVIEW_API", "").rstrip("/")
+_REVIEW_TOKEN = os.environ.get("OKENGINE_REVIEW_TOKEN", "")
+_REVIEWER_CONFIGURED = os.environ.get("OKENGINE_REVIEWER_NAME", "").strip()
+_REVIEWER = _REVIEWER_CONFIGURED or _READER_USER
+_REVIEW_TRUSTED_NETWORK = os.environ.get("OKENGINE_REVIEW_TRUSTED_NETWORK", "").strip().lower() \
+    in {"1", "true", "yes", "on"}
+_REVIEW_AUTH_MODE = "basic" if _READER_PASSWORD else \
+    "trusted-network" if _REVIEW_TRUSTED_NETWORK else "disabled"
+_REVIEW_ENABLED = bool(
+    _REVIEW_API and _REVIEW_TOKEN and
+    ((_READER_PASSWORD and _REVIEWER) or (_REVIEW_TRUSTED_NETWORK and _REVIEWER_CONFIGURED)))
+
+# Mutating operation controls use a separate, bridge-only runner. They share the
+# established operator authentication decision, but not the review state-machine API.
+_OPERATION_API = os.environ.get("OKENGINE_OPERATION_API", "").rstrip("/")
+_OPERATION_TOKEN = os.environ.get("OKENGINE_OPERATION_TOKEN", "")
+_OPERATION_ENABLED = bool(
+    _OPERATION_API and _OPERATION_TOKEN and
+    ((_READER_PASSWORD and _REVIEWER) or (_REVIEW_TRUSTED_NETWORK and _REVIEWER_CONFIGURED)))
 
 # Trust enforcement (okengine#90 P4a): a PRIVATE vault must never be served unauthenticated when
 # publicly exposed. Mirrors okengine-reader exactly — default trust=private → fail-safe: refuse to
@@ -167,12 +219,42 @@ def _humanize(s: str) -> str:
     return " ".join(_DISPLAY_ACRONYMS.get(w.lower(), w.capitalize()) for w in words)
 
 
+def load_application_declaration(vault: Path) -> dict | None:
+    """Load the pack's active application binding for the read-only Cockpit surface.
+
+    Deployment validation remains the authority for conformance. Cockpit only normalizes the
+    already-deployed declaration so an application cannot be operational yet invisible.
+    """
+    path = vault / ".okengine" / "application.yaml"
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) if path.is_file() else None
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(raw, dict) or not str(raw.get("profile") or "").strip():
+        return None
+    propositions = ((raw.get("bindings") or {}).get("propositions")
+                    if isinstance(raw.get("bindings"), dict) else [])
+    roles = ((raw.get("bindings") or {}).get("roles")
+             if isinstance(raw.get("bindings"), dict) else {})
+    return {
+        "profile": str(raw["profile"]).strip(),
+        "profile_version": str(raw.get("profile_version") or "").strip(),
+        "propositions": [row for row in (propositions or []) if isinstance(row, dict)],
+        "roles": roles if isinstance(roles, dict) else {},
+        "surfaces": raw.get("surfaces") if isinstance(raw.get("surfaces"), dict) else {},
+        "queues": raw.get("queues") if isinstance(raw.get("queues"), dict) else {},
+        "success_measures": (raw.get("success_measures")
+                             if isinstance(raw.get("success_measures"), dict) else {}),
+    }
+
+
 def load_cockpit_config(vault: Path) -> dict:
     """Parse the OPTIONAL `cockpit:` block from <vault>/schema.yaml into a normalized
     config with generic defaults. PURE (no caching / no globals) so it is importable
-    and unit-testable. Reads schema.yaml directly — no hermes import."""
+    and unit-testable. Reads the governing composed artifact when present,
+    otherwise schema.yaml; no hermes import."""
     raw: dict = {}
-    sp = vault / "schema.yaml"
+    sp = _governing_schema_path(vault)
     if sp.is_file():
         try:
             sch = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}
@@ -186,6 +268,9 @@ def load_cockpit_config(vault: Path) -> dict:
     title = str(raw.get("title") or "").strip()
     if not title:
         title = _humanize(vault.resolve().name or "vault") or "Vault"
+    # The document title may be descriptive while the toolbar has deliberately scarce space.
+    # With no explicit compact label, preserve the original single-title behaviour.
+    short_title = str(raw.get("short_title") or "").strip() or title
 
     # streams (the rail) — default: one "Recent briefings" stream over briefings/
     streams: list[dict] = []
@@ -278,6 +363,15 @@ def load_cockpit_config(vault: Path) -> dict:
                     "label": str(v.get("label") or _humanize(k)).strip(),
                     "boxes": [b for b in v["boxes"] if isinstance(b, dict)],
                 }
+    tab_aliases = {str(k).strip(): str(v).strip()
+                   for k, v in (raw.get("tab_aliases") or {}).items()
+                   if str(k).strip() and str(v).strip()} \
+        if isinstance(raw.get("tab_aliases"), dict) else {}
+
+    # Application contracts are operational metadata surfaced generically from Ops. A pack may
+    # independently define an `application` dataset tab as its domain workspace; keeping these two
+    # concepts separate prevents contract/status plumbing from displacing the work itself.
+    application = load_application_declaration(vault)
 
     # per-type fact-panel field ORDER (okengine — type-aware profile). A pack declares
     # `profiles: {<type>: [field, field, …]}`; the page overlay then renders that type's fact panel
@@ -295,6 +389,7 @@ def load_cockpit_config(vault: Path) -> dict:
 
     return {
         "title": title,
+        "short_title": short_title,
         "streams": streams,
         "streams_by_key": streams_by_key,
         "watchlist": watchlist,
@@ -303,7 +398,9 @@ def load_cockpit_config(vault: Path) -> dict:
         "tabs": tabs,
         "dashboards": dashboards,
         "tab_defs": tab_defs,
+        "tab_aliases": tab_aliases,
         "profiles": profiles,
+        "application": application,
     }
 
 
@@ -507,11 +604,15 @@ def api_config():
             tabs.insert(tabs.index("browse"), "ops")
         else:
             tabs.append("ops")
-    return {"title": cfg["title"], "tabs": tabs,
+    return {"title": cfg["title"], "short_title": cfg["short_title"], "tabs": tabs,
             "watchlist": cfg["watchlist"] is not None,
             # labels for pack-defined dataset tabs (the frontend builds their panes dynamically)
             "tab_labels": {k: v["label"] for k, v in (cfg.get("tab_defs") or {}).items()},
-            "chat_enabled": _chat_enabled()}      # gate the Chat tab on a configured agent
+            "chat_enabled": _chat_enabled(),      # gate the Chat tab on a configured agent
+            # deployment timezone for the UI clock (okengine#301) — the container starts with $TZ
+            # (compose passes TZ=${TZ:-UTC}); the clock renders in this zone, not hardcoded UTC.
+            "tz": os.environ.get("TZ") or "UTC",
+            "review_enabled": _REVIEW_ENABLED, "review_auth_mode": _REVIEW_AUTH_MODE}
 
 
 # ── briefings (read mode) — streams are pack-config-driven ──────────────────
@@ -731,14 +832,50 @@ def _trajectory(fm: dict) -> list[float]:
 # `[YYYY-MM-DD tag] free text` strings (the regrade lanes stamp this compact form). Parse both
 # into one render-ready shape so the ledger tally and the detail drilldown agree.
 _EV_PREFIX_RE = re.compile(r"^\s*\[(\d{4}-\d{2}-\d{2})(?:\s+([^\]]+?))?\]\s*(.*)$", re.S)
-_EV_DIR_SYNONYM = {
-    "reinforces": "reinforces", "reinforce": "reinforces", "supports": "reinforces",
+
+# The sanctioned direction vocabulary is DERIVED from the vault's composed schema — single
+# source: the predictions extension's schema fragment, enforced at the write path (okengine
+# #211/#217). This map covers only PRE-BACKFILL history (okengine#219) and the compact
+# string-form tags; it must never grow to absorb new producer drift — the write path now
+# rejects that at the boundary, and laundering it here is exactly the D1 anti-pattern.
+_EV_DIR_LEGACY = {
+    "reinforce": "reinforces", "supports": "reinforces",
     "support": "reinforces", "confirms": "reinforces", "confirm": "reinforces", "up": "reinforces",
-    "contradicts": "contradicts", "contradict": "contradicts", "refutes": "contradicts",
+    "contradict": "contradicts", "refutes": "contradicts",
     "refute": "contradicts", "weakens": "contradicts", "down": "contradicts",
-    "partial": "partial", "mixed": "partial",
-    "neutral": "neutral", "regrade": "neutral", "note": "neutral", "context": "neutral",
+    "mixed": "partial",
+    "regrade": "neutral", "note": "neutral", "context": "neutral",
 }
+_EV_DIR_FALLBACK = frozenset({"reinforces", "contradicts", "partial", "neutral"})
+
+
+@functools.lru_cache(maxsize=1)
+def _ev_direction_enum() -> frozenset:
+    """Sanctioned `evidence[].direction` values from the vault's composed schema artifact
+    (.okengine/composed-schema.yaml -> field_items.evidence.direction.enum). Falls back to
+    the canonical four when no artifact declares it. Cached for the process lifetime — the
+    composition changes only at (re)deploy, which recreates this container."""
+    try:
+        art = VAULT / ".okengine" / "composed-schema.yaml"
+        doc = yaml.safe_load(art.read_text(encoding="utf-8")) if art.is_file() else None
+        rule = (((doc or {}).get("field_items") or {}).get("evidence") or {}).get("direction") or {}
+        ev = rule.get("enum")
+        if isinstance(ev, list) and ev:
+            return frozenset(str(v) for v in ev)
+    except Exception:
+        pass
+    return _EV_DIR_FALLBACK
+
+
+def _ev_bucket(raw: str) -> str | None:
+    """Bucket a raw direction/tag: schema-sanctioned values pass through; legacy synonyms
+    map (pre-backfill history only); anything else is None (surfaced as its raw `tag`,
+    never silently absorbed into a bucket)."""
+    if not raw:
+        return None
+    if raw in _ev_direction_enum():
+        return raw
+    return _EV_DIR_LEGACY.get(raw)
 
 
 def _evidence_entries(fm: dict) -> list[dict]:
@@ -775,7 +912,7 @@ def _evidence_entries(fm: dict) -> list[dict]:
             continue
         out.append({
             "date": date,
-            "direction": _EV_DIR_SYNONYM.get(raw) if raw else None,
+            "direction": _ev_bucket(raw),
             "tag": raw or None,
             "note": note,
             "source": str(src).strip() if src else None,
@@ -963,7 +1100,7 @@ def _scan_dir_meta(sub: str) -> list[dict]:
             if name.startswith(("_", ".")) or ".bak." in name or _reserved_seg(p):
                 continue
             try:
-                fm, _ = split_fm(p.read_text(encoding="utf-8", errors="replace"))
+                fm, body = split_fm(p.read_text(encoding="utf-8", errors="replace"))
             except OSError:
                 continue
             fm["_name"] = p.stem
@@ -971,6 +1108,9 @@ def _scan_dir_meta(sub: str) -> list[dict]:
             # the TRUE path under wiki/<sub> (shards included) — page links must carry it:
             # basename resolution papers over it until two shards collide on a stem
             fm["_rel"] = p.relative_to(base).as_posix()[:-3]
+            # Scoped review launchers reuse this namespace cache instead of walking the whole
+            # corpus. Preserve the one body-derived review signal while the file is already open.
+            fm["_body_review_flag"] = bool(_GROUNDING_REVIEW.search(body or ""))
             out.append(fm)
     return out
 
@@ -1035,8 +1175,64 @@ def _warm_tab_datasets() -> None:
             pass
 
 
+def _warm_initial_tab_datasets() -> None:
+    """Synchronously warm only the configured landing tab before the service becomes ready.
+
+    Other namespaces remain lazy and typically cost milliseconds to under a second. Warming every
+    tab plus the backlink graph in background threads made a nominally ready Cockpit contend on the
+    GIL and disk for tens of seconds on large vaults.
+    """
+    cfg = cockpit_config()
+    tabs = [str(tab) for tab in (cfg.get("tabs") or []) if str(tab)]
+    tab_defs = cfg.get("tab_defs") or {}
+    landing = tab_defs.get(tabs[0]) if tabs else None
+    if not isinstance(landing, dict):
+        return
+    subs: set[str] = set()
+    for box in landing.get("boxes") or []:
+        dataset = box.get("dataset") or {}
+        if isinstance(dataset, dict) and dataset.get("dir"):
+            subs.add(str(dataset["dir"]))
+        if box.get("dir"):
+            subs.add(str(box["dir"]))
+    for sub in subs:
+        try:
+            _DIR_CACHE[sub] = (time.monotonic(), _scan_dir_meta(sub))
+        except Exception:
+            pass
+
+
 def _disp(fm: dict) -> str:
-    return str(fm.get("title") or fm.get("name") or fm.get("_name") or "").strip()
+    explicit = str(fm.get("title") or fm.get("name") or "").strip()
+    return explicit or _humanize(str(fm.get("_name") or ""))
+
+
+def _source_title(row: dict) -> str:
+    """Human-readable source title, repairing obvious path/slug leakage at display time."""
+    title = str(row.get("title") or row.get("name") or "").strip()
+    if title and not re.search(r"\s", title) and ("-" in title or "_" in title):
+        title = re.sub(r"[-_](?:md|html?|pdf)$", "", title, flags=re.I)
+        return _humanize(title)
+    return title or _humanize(str(row.get("_name") or ""))
+
+
+def _source_publisher(row: dict) -> str:
+    """Compact publisher truth, with the article host as a transparent fallback.
+
+    Publisher is an organization/outlet label, not a synopsis. Failed metadata extraction can fold
+    a paragraph into this scalar; trusting it makes every source table unreadable. Keep legitimate
+    composite labels, but treat prose-sized values as malformed and show the source hostname.
+    """
+    publisher = str(row.get("publisher") or "").strip()
+    placeholder = publisher.casefold().startswith(("unknown", "no publisher", "(no publisher"))
+    prose_sized = len(publisher) > 64 or len(publisher.split()) > 10
+    if publisher and publisher not in {"—", "-"} and not placeholder and not prose_sized:
+        return publisher
+    try:
+        host = (urlparse(str(row.get("url") or "")).hostname or "").removeprefix("www.")
+    except ValueError:
+        host = ""
+    return host or "Unknown publisher ⚠"
 
 
 def _page_link(fm: dict) -> str:
@@ -1233,14 +1429,29 @@ def api_home():
                 f'{pr["idle"]} idle</p>' + _html_table(["Prediction", "Conf", "Resolves by"], prows))
         sections.append({"group": "Predictions", "title": "Open predictions", "html": html})
 
-    # 4. knowledge gaps — latest lacuna findings, when the extension maintains that namespace
+    # 4. knowledge gaps — lacuna findings ranked by how FLESHED-OUT each is: field density
+    #    (surround_density) → confidence → whether the proposed fill is already a testable
+    #    prediction. Most-grounded first, so a well-supported gap that's close to actionable
+    #    surfaces above a thin/speculative one — the maturity is legible without opening each page.
     gaps = _load_dir("lacuna")
     if gaps:
-        recent = sorted(gaps, key=lambda c: str(c.get("last_updated") or c.get("created") or ""),
-                        reverse=True)[:8]
-        grows = [[_page_link(c), _esc(str(c.get("created") or "")[:10] or "—")] for c in recent]
-        sections.append({"group": "Knowledge gaps", "title": "Latest lacuna findings",
-                         "html": _html_table(["Gap", "Found"], grows)})
+        _CONF = {"high": 3, "medium": 2, "low": 1}
+
+        def _gap_density(c) -> int:
+            mm = re.match(r"\s*(\d+)", str(c.get("surround_density") or ""))
+            return int(mm.group(1)) if mm else 0
+
+        ranked = sorted(gaps, key=lambda c: (
+            _gap_density(c),
+            _CONF.get(str(c.get("confidence") or "").lower(), 0),
+            1 if c.get("prediction_candidate") else 0), reverse=True)[:10]
+        grows = [[_page_link(c),
+                  (str(_gap_density(c)) if _gap_density(c) else "—"),
+                  _esc(str(c.get("confidence") or "—")),
+                  ("✓" if c.get("prediction_candidate") else "—"),
+                  _esc(str(c.get("created") or "")[:10] or "—")] for c in ranked]
+        sections.append({"group": "Knowledge gaps", "title": "Lacuna findings — most grounded first",
+                         "html": _html_table(["Gap", "Density", "Confidence", "Testable", "Found"], grows)})
 
     # 5. jump-offs — the pack's CURATED dashboards (not the raw all-pages list). Two config
     # shapes exist: a flat slug list (["top-actors", ...] → dashboards/<slug>) and the grouped
@@ -1281,20 +1492,23 @@ _TONES = ("crit", "warn", "ok", "info", "mut", "acc")
 # curated label (okengine#188).
 _UM_FLAG = (' <span class="um-flag" title="unmapped value — no label configured '
             '(okengine#188)">⚠</span>')
+# Sentinel group value for the collapsed "unmapped (N)" bucket a `bucket_unmapped` box emits
+# (okengine#259). Not a real frontmatter value; api_drill reads it as "pages whose group value is
+# outside the labels vocabulary" — the drill to the drift offenders.
+_UNMAPPED_KEY = "__unmapped__"
 
 
-def _ds_rows(spec: dict) -> list[dict]:
-    rows = _load_dir(str(spec.get("dir") or "").strip("/"))
-    types = spec.get("types") or ([spec["type"]] if spec.get("type") else [])
-    if types:
-        ts = {str(t) for t in types}
-        rows = [r for r in rows if str(r.get("type")) in ts]
+def _refine_rows(rows: list[dict], spec: dict) -> list[dict]:
     for f, v in (spec.get("where") or {}).items():
         rows = [r for r in rows if str(r.get(f)) == str(v)]
     for f in (spec.get("has") or []):        # field-presence filter (e.g. theme pages vs
         rows = [r for r in rows if r.get(f) not in (None, "", [])]   # shift docs in one dir)
     for f in (spec.get("missing") or []):    # field-ABSENCE filter (mirror of `has`) — e.g. unsourced actors
         rows = [r for r in rows if r.get(f) in (None, "", [])]
+    for f, values in (spec.get("exclude_values") or {}).items():
+        excluded = {str(value).casefold() for value in (values if isinstance(values, list) else [values])}
+        rows = [r for r in rows if not any(
+            str(value).casefold() in excluded for value in _gb_values(r.get(f)))]
     tp = spec.get("today_prefix")            # e.g. published starts with today's date
     if tp:
         # UTC, not the container's LOCAL date: the fields this filters (published/created) are
@@ -1306,12 +1520,48 @@ def _ds_rows(spec: dict) -> list[dict]:
     return rows
 
 
+def _ds_rows(spec: dict) -> list[dict]:
+    rows = _load_dir(str(spec.get("dir") or "").strip("/"))
+    types = spec.get("types") or ([spec["type"]] if spec.get("type") else [])
+    if types:
+        ts = {str(t) for t in types}
+        rows = [r for r in rows if str(r.get("type")) in ts]
+    return _refine_rows(rows, spec)
+
+
+def _configured_rows(owner: dict, dataset: dict | None = None) -> list[dict]:
+    """Load a box/item dataset with its declarative filters applied at the same level.
+
+    Pack schemas historically place ``where``/``has``/``missing``/``today_prefix`` beside
+    ``dataset``. Passing only the nested dataset silently ignored those filters in both rendering
+    and drill-through. Dataset-local filters remain supported and owner-level values take
+    precedence when both are present.
+    """
+    spec = dict(dataset if dataset is not None else (owner.get("dataset") or {}))
+    for key in ("where", "has", "missing", "exclude_values", "today_prefix"):
+        if key in owner:
+            spec[key] = owner[key]
+    return _ds_rows(spec)
+
+
 def _ds_sorted(rows: list[dict], srt: dict) -> list[dict]:
     f = str(srt.get("field") or "")
     if not f:
         return rows
     if srt.get("require"):
         rows = [r for r in rows if r.get(f) not in (None, "", [])]
+
+    # Explicit date mode validates before sorting. Legacy placeholders such as `[auto]`, `original`,
+    # and prose in date fields must never outrank ISO timestamps merely because `[`/`o` sort after
+    # digits. With `require: true`, invalid dates are excluded; otherwise they sink below valid rows.
+    if srt.get("date"):
+        dated, invalid = [], []
+        for row in rows:
+            parsed = _as_date(row.get(f))
+            (dated if parsed else invalid).append((parsed, row))
+        dated.sort(key=lambda item: item[0], reverse=bool(srt.get("desc")))
+        return [row for _date, row in dated] + ([] if srt.get("require") else
+                                                [row for _date, row in invalid])
 
     # TWO buckets — numeric, then everything-else — each honoring the sort direction WITHIN itself.
     # Two live incidents shaped this:
@@ -1329,13 +1579,16 @@ def _ds_sorted(rows: list[dict], srt: dict) -> list[dict]:
     desc = bool(srt.get("desc"))
     then = str(srt.get("then") or "")
 
-    def _sec(r: dict) -> float:
+    def _sec(r: dict) -> tuple[int, int, float, str]:
         if not then:
-            return 0.0                        # no tie-break -> constant key -> stable order preserved
+            return (0, 0, 0.0, "")           # constant key -> stable order preserved
+        value = r.get(then)
+        if value in (None, "", []):
+            return (0, 0, 0.0, "")           # missing secondary sinks on descending boards
         try:
-            return float(r.get(then))
+            return (1, 1, float(value), "")   # preserve existing numeric tie-break behavior
         except (TypeError, ValueError):
-            return float("-inf")              # missing/non-numeric secondary sinks within the tie
+            return (1, 0, 0.0, str(value))    # ISO/RFC 3339 and other strings sort lexically
 
     nums, others = [], []
     for r in rows:
@@ -1353,18 +1606,162 @@ def _defang(v: str) -> str:
     return v.replace("http://", "hxxp://").replace("https://", "hxxps://").replace(".", "[.]")
 
 
+def _row_path(row: dict) -> str:
+    return f'{row.get("_sub", "")}/{row.get("_rel") or row.get("_name", "")}'.strip("/")
+
+
+def _assessment_for_row(row: dict, spec: dict) -> dict | None:
+    """Newest current ledger judgment for a dataset row and assessment family."""
+    subject = _row_path(row)
+    kind = str(spec.get("kind") or "").strip()
+    statuses = {str(value) for value in (spec.get("statuses") or ["active", "disputed"])}
+    return next((record for record in _assessment_subject_index().get(subject, [])
+                 if (not kind or record.get("assessment_kind") == kind)
+                 and record.get("status") in statuses), None)
+
+
+_assessment_terminal_cache: tuple[float, dict[str, dict]] = (float("-inf"), {})
+
+
+def _assessment_terminal_for_row(row: dict, spec: dict) -> dict | None:
+    """Read the bounded-search projection; never scan the corpus on a UI request."""
+    global _assessment_terminal_cache
+    if str(spec.get("kind") or "") != "actor-country-linkage":
+        return None
+    cached_at, cached = _assessment_terminal_cache
+    if time.monotonic() - cached_at >= 15:
+        path = VAULT / ".okengine" / "actor-country-review-coverage.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            cached = payload.get("subjects") if isinstance(payload.get("subjects"), dict) else {}
+        except (OSError, json.JSONDecodeError, AttributeError):
+            cached = {}
+        _assessment_terminal_cache = (time.monotonic(), cached)
+    return cached.get(_row_path(row))
+
+
+def _assessment_terminal_label(state: str) -> str:
+    return {"no-association-established": "No association established",
+            "collection-required": "Collection required", "review-not-run": "Review not run",
+            "assessed": "Assessment reference stale",
+            "failed": "Review failed"}.get(state, "Review not run")
+
+
+def _assessment_bucket(row: dict, spec: dict) -> tuple[str, dict | None]:
+    """Epistemically safe aggregate bucket; never falls back to a canonical entity field."""
+    record = _assessment_for_row(row, spec)
+    if not record:
+        terminal = _assessment_terminal_for_row(row, spec)
+        state = str((terminal or {}).get("state") or "review-not-run")
+        return f"__{state.replace('-', '_')}__", None
+    state = str(record.get("epistemic_status") or "assessed").lower()
+    if state in {"disputed", "inconclusive", "unknown"}:
+        return f"__{state}__", record
+    raw = record.get(str(spec.get("value_field") or "assessed_value"))
+    if raw in (None, "", []):
+        return "__metadata_unavailable__", record
+    return str(raw), record
+
+
+def _current_assessment_subject(row: dict) -> bool:
+    """Only canonical, current subjects belong in assessment coverage aggregates."""
+    return (str(row.get("status") or "").casefold() != "tombstoned"
+            and not bool(row.get("redirect_to")))
+
+
+def _assessed_value_cell(row: dict, spec: dict) -> str:
+    """Render a ledger judgment without laundering it into an unqualified fact."""
+    record = _assessment_for_row(row, spec)
+    if not record:
+        terminal = _assessment_terminal_for_row(row, spec)
+        state = str((terminal or {}).get("state") or "review-not-run")
+        label = _assessment_terminal_label(state)
+        reason = str((terminal or {}).get("reason") or
+                     "No covering actor review result is available for this actor.")
+        return (f'<a class="wl assessment-empty assessment-terminal assessment-{_esc(state)}" '
+                f'data-page="dashboards/actor-review-status" '
+                f'aria-label="{_esc(label)}; {_esc(reason)}" title="{_esc(reason)}">'
+                f'{_esc(label)}</a>')
+    value_field = str(spec.get("value_field") or "assessed_value")
+    raw_value = record.get(value_field)
+    state = str(record.get("epistemic_status") or "assessed").lower()
+    labels = spec.get("labels") if isinstance(spec.get("labels"), dict) else {}
+    if state == "inconclusive":
+        value = "Inconclusive"
+    elif state == "unknown":
+        value = "Unknown"
+    elif raw_value in (None, "", []):
+        value = "assessment metadata unavailable"
+        state = "metadata-unavailable"
+    else:
+        value = str(labels.get(raw_value, labels.get(str(raw_value), raw_value)))
+    state_label = {
+        "reported": "Reported", "assessed": "Assessed", "confirmed": "Confirmed",
+        "disputed": "Disputed", "inconclusive": "Inconclusive", "unknown": "Unknown",
+        "metadata-unavailable": "Assessment metadata unavailable",
+    }.get(state, "Assessed")
+    confidence = record.get("confidence")
+    confidence_text = (f"{round(float(confidence) * 100):d}%"
+                       if isinstance(confidence, (int, float)) else "")
+    band = str(record.get("confidence_band") or "").replace("-", " ").strip()
+    review = "human review pending" if record.get("needs_review") else "reviewed"
+    aria_bits = [f"{state_label} analytical judgment"]
+    if band:
+        aria_bits.append(f"{band} confidence")
+    elif confidence_text:
+        aria_bits.append(f"{confidence_text} confidence")
+    aria_bits.append(review)
+    aria = "; ".join(aria_bits)
+    warn = (' <span class="assessment-review-pending" title="human review pending" '
+            'aria-hidden="true">⚠</span>' if record.get("needs_review") else "")
+    conf = f' <span class="assessment-confidence">{_esc(confidence_text)}</span>' if confidence_text else ""
+    marker = "◆" if state == "confirmed" else "◇"
+    return (f'<a class="wl assessed-value assessment-{_esc(state)}" '
+            f'data-page="{_esc(record["path"])}" aria-label="{_esc(aria)}" '
+            f'title="{_esc(aria)}"><strong>{_esc(value)}</strong> '
+            f'<span class="assessment-marker" aria-hidden="true">{marker}</span>{conf}{warn}</a>')
+
+
 def _ds_cell(r: dict, col: dict) -> str:
     if col.get("link"):
+        if col.get("source_title"):
+            rel = r.get("_rel") or r["_name"]
+            return f'<a class="wl" data-page="{_esc(r["_sub"])}/{_esc(rel)}">{_esc(_source_title(r))}</a>'
         return _page_link(r)
-    v = r.get(str(col.get("field") or ""))
+    if isinstance(col.get("assessment"), dict):
+        return _assessed_value_cell(r, col["assessment"])
+    raw = (_source_publisher(r) if col.get("source_publisher") else
+           r.get(str(col.get("field") or "")))
+    v = raw
+    labels = col.get("labels") if isinstance(col.get("labels"), dict) else {}
     if isinstance(v, list):
-        v = ", ".join(str(x) for x in v[: int(col.get("max") or 3)])
-    v = "—" if v in (None, "", []) else str(v)
+        v = ", ".join(str(labels.get(x, labels.get(str(x), x)))
+                      for x in v[: int(col.get("max") or 3)])
+    elif v not in (None, ""):
+        v = labels.get(v, labels.get(str(v), v))
+    v = str(col.get("empty") or "—") if v in (None, "", []) else str(v)
+    if col.get("pct") and raw not in (None, "", []):
+        # A 0..1 probability/ratio (e.g. an EPSS score, 0.00783) is unreadable raw — render it as a
+        # percentage. One decimal below 10% so small-but-nonzero scores don't collapse to "0%"/"1%"
+        # (0.00783 -> "0.8%"), whole numbers above (0.94 -> "94%"). okengine#259.
+        try:
+            p = float(raw) * 100
+            v = f"{p:.1f}%" if 0 < p < 10 else f"{p:.0f}%"
+        except (TypeError, ValueError):
+            pass                             # non-numeric -> leave the labelled/raw value as-is
     if col.get("date"):
-        v = v[:10]
+        parsed = _as_date(raw)
+        if raw not in (None, "") and parsed is None:
+            return '<span class="t-warn nw">⚠ invalid date</span>'
+        v = parsed.isoformat() if parsed else "—"
     if col.get("defang"):                    # IOC hygiene: never render a live URL/domain
         return f"<code>{_esc(_defang(v))}</code>"
     tone = col.get("tone")
+    # tone_by: pick the column tone FROM the cell value (a severity enum colours critical=crit,
+    # high=warn, …) instead of one static colour for the whole column. Falls back to `tone`. #259.
+    tb = col.get("tone_by")
+    if isinstance(tb, dict) and raw not in (None, "", []):
+        tone = tb.get(str(raw), tb.get(str(raw).lower(), tone))
     classes = [f"t-{tone}"] if tone in _TONES else []
     # A structured single-token value — a date, a number, or an enum like "moderate-high" — must
     # never break mid-token when the column squeezes (dates broke at their hyphens, confidence
@@ -1401,6 +1798,45 @@ def _ds_pairs(box: dict, rows: list[dict]) -> list:
     `unmapped` is True only when a `labels:` map is configured but this grouped value is absent
     from it (okengine#188). `key` is the RAW group value (drives a group_by drilldown filter), or
     None for value_field pairs (which are already one page each)."""
+    if isinstance(box.get("assessment"), dict):
+        spec = box["assessment"]
+        labels = {str(k): str(v) for k, v in (spec.get("labels") or box.get("labels") or {}).items()}
+        counts: Counter = Counter()
+        confidences: dict[str, list[float]] = {}
+        pending: Counter = Counter()
+        for row in rows:
+            if not _current_assessment_subject(row):
+                continue
+            key, record = _assessment_bucket(row, spec)
+            counts[key] += 1
+            if record and isinstance(record.get("confidence"), (int, float)):
+                confidences.setdefault(key, []).append(float(record["confidence"]))
+            if record and record.get("needs_review"):
+                pending[key] += 1
+        special = {
+            "__not_assessed__": "Not assessed", "__review_not_run__": "Review not run",
+            "__assessed__": "Assessment reference stale",
+            "__no_association_established__": "No association established",
+            "__collection_required__": "Collection required", "__failed__": "Review failed",
+            "__disputed__": "Disputed",
+            "__inconclusive__": "Inconclusive", "__unknown__": "Unknown",
+            "__metadata_unavailable__": "Assessment metadata unavailable",
+        }
+        assessed = []
+        remainder = []
+        for key, count in counts.items():
+            if key in special:
+                remainder.append((special[key], count, False, key))
+                continue
+            conf = confidences.get(key) or []
+            avg = f" {round(sum(conf) / len(conf) * 100):d}% avg" if conf else ""
+            warn = f" ⚠{pending[key]}" if pending[key] else ""
+            assessed.append((f"{labels.get(key, key)} ◇{avg}{warn}", count,
+                             bool(labels) and key not in labels, key))
+        limit = int(box.get("limit") or 8)
+        assessed.sort(key=lambda item: (-item[1], item[0]))
+        remainder.sort(key=lambda item: (-item[1], item[0]))
+        return assessed[:limit] + remainder
     if box.get("group_by"):
         labels = {str(k): str(v) for k, v in (box.get("labels") or {}).items()}
         drop = {"", "None", "Unknown", "nan"}
@@ -1409,8 +1845,26 @@ def _ds_pairs(box: dict, rows: list[dict]) -> list:
             for s in _gb_values(r.get(box["group_by"])):
                 if s not in drop:
                     cnt[s] += 1
-        return [(labels.get(k, k), v, bool(labels) and k not in labels, k)
-                for k, v in cnt.most_common(int(box.get("limit") or 8))]
+        limit = int(box.get("limit") or 8)
+        # okengine#259: with a `labels:` vocabulary configured, `bucket_unmapped` COLLAPSES every
+        # value outside it into ONE "unmapped (N)" row appended after the top-N sanctioned
+        # categories — so the raw NAICS codes, the "China ⚠" near-duplicate, and free-text leaking
+        # into an enum stop each occupying a real-category slot. The row drills (via _UNMAPPED_KEY)
+        # to the offender pages. Without bucket_unmapped, the demote path below just RANKS mapped
+        # above unmapped (still shown individually) — the pre-existing, less aggressive behavior.
+        if labels and box.get("bucket_unmapped"):
+            mapped = sorted(((k, v) for k, v in cnt.items() if k in labels),
+                            key=lambda kv: (-kv[1], kv[0]))[:limit]
+            pairs = [(labels.get(k, k), v, False, k) for k, v in mapped]
+            um = [(k, v) for k, v in cnt.items() if k not in labels]
+            if um:
+                pairs.append((f"unmapped ({len(um)})", sum(v for _, v in um), True, _UNMAPPED_KEY))
+            return pairs
+        if labels:
+            ranked = sorted(cnt.items(), key=lambda kv: (kv[0] not in labels, -kv[1], kv[0]))[:limit]
+        else:
+            ranked = cnt.most_common(limit)
+        return [(labels.get(k, k), v, bool(labels) and k not in labels, k) for k, v in ranked]
     vf = str(box.get("value_field") or "")
     lf = str(box.get("label_field") or "title")
     rs = [r for r in rows if r.get(vf) not in (None, "")]
@@ -1426,26 +1880,403 @@ def _v_table(box: dict, rows: list[dict]) -> str:
     rows = _ds_sorted(rows, box.get("sort") or {})[: int(box.get("limit") or 10)]
     if not rows or not cols:
         return ""
-    return _html_table([str(c.get("label") or c.get("field") or "") for c in cols],
-                       [[_ds_cell(r, c) for c in cols] for r in rows])
+    table = _html_table([str(c.get("label") or c.get("field") or "") for c in cols],
+                        [[_ds_cell(r, c) for c in cols] for r in rows])
+    if any(isinstance(col.get("assessment"), dict) for col in cols):
+        table += (
+            '<p class="assessment-legend"><span aria-hidden="true">◇</span> Assessed judgment — '
+            'supported by evaluated evidence, but not presented as established fact. Unassessed cells '
+            'distinguish bounded no-finding, collection required, and review not run. Select a value '
+            'to inspect its evidence, alternatives, confidence, and review state. '
+            '<a class="wl" data-page="assessments/_about">How assessments work</a>.</p>')
+    return table
+
+
+def _v_review_queue(box: dict) -> str:
+    """Render a reusable launcher into the complete review worklist with a pack-owned type scope."""
+    types = [str(v).strip() for v in (box.get("review_types") or []) if str(v).strip()]
+    allowed = set(types)
+    directories = [str(v).strip().strip("/") for v in (box.get("review_dirs") or [])
+                   if str(v).strip().strip("/")]
+    if directories:
+        # A dashboard count scoped to known domain namespaces does not need the expensive global
+        # review worklist (25k-page scan on live OKCTI). _load_dir is prewarmed and stale-while-
+        # revalidate; the launcher still opens the canonical complete /api/reviews worklist.
+        candidates = [row for directory in directories for row in _load_dir(directory)]
+        scoped = [row for row in candidates
+                  if (not allowed or row.get("type") in allowed)
+                  and _requires_review(row, "unsupported" if row.get("_body_review_flag") else "")]
+    else:
+        rows, _records = _review_queue_snapshot()
+        scoped = [row for row in rows if not allowed or row.get("type") in allowed]
+    counts = Counter(str(row.get("type") or "unknown") for row in scoped)
+    scope = ",".join(types)
+    detail = " · ".join(f"{_humanize(kind)} {count}" for kind, count in sorted(counts.items()))
+    empty = str(box.get("empty") or "No records currently require review.")
+    if not scoped:
+        return f'<p class="dnote">{_esc(empty)}</p>'
+    return (
+        f'<a class="review-scope-launch" data-review-types="{_esc(scope)}">'
+        f'<strong>{len(scoped)} awaiting review</strong>'
+        f'<span>{_esc(detail)}</span><span>Open the complete filtered worklist →</span></a>')
+
+
+_TID_FACETS = [
+    "relevance", "observable-requirements", "telemetry-source", "telemetry-fields",
+    "strategy", "repository-analytic", "deployed-revision", "current-validation",
+    "signal-path", "operational-effectiveness",
+]
+_TID_STATES = {"unassessed", "not-applicable", "unknown", "gap", "partial", "validated",
+               "degraded", "stale", "covered", "error", "active", "disabled", "passed",
+               "failed", "inconclusive", "enabled", "present", "approved", "draft", "retired",
+               "resolved", "superseded", "improved", "unchanged", "not-run", "not-required",
+               "pending", "rejected", "proposed", "deferred", "accepted-risk", "completed"}
+
+
+def _tid_path(row: dict | None) -> str:
+    if not row:
+        return ""
+    return f'{row.get("_sub", "")}/{row.get("_rel") or row.get("_name", "")}'.strip("/")
+
+
+def _tid_ref(value) -> str:
+    ref = str(value or "").strip()
+    if ref.startswith("[[") and ref.endswith("]]" ):
+        ref = ref[2:-2].split("|", 1)[0]
+    ref = ref.split("#", 1)[0].removeprefix("wiki/").lstrip("/")
+    return ref[:-3] if ref.endswith(".md") else ref
+
+
+def _tid_application_data() -> dict:
+    """Resolve application role bindings into records and a cross-reference index."""
+    application = cockpit_config().get("application") or {}
+    roles = application.get("roles") if isinstance(application.get("roles"), dict) else {}
+    records: dict[str, list[dict]] = {}
+    index: dict[str, dict] = {}
+    for role, bindings in roles.items():
+        rows: list[dict] = []
+        for binding in bindings if isinstance(bindings, list) else []:
+            if not isinstance(binding, dict) or not binding.get("namespace"):
+                continue
+            for row in _load_dir(str(binding["namespace"])):
+                if binding.get("type") and row.get("type") != binding["type"]:
+                    continue
+                rows.append(row)
+                for key in (row.get("id"), _tid_path(row)):
+                    if key:
+                        index[_tid_ref(key)] = row
+        records[role] = rows
+    # These workflow records are owned by the TID pack but are downstream of the profile's required
+    # role contract. Projections may consume them when present; absence remains explicit unknown.
+    if application.get("profile") == "threat-informed-detection":
+        for role, namespace in {
+            "detection_gap": "detection-gaps",
+            "defensive_decision": "defensive-decisions",
+            "defensive_action": "defensive-actions",
+            "defensive_outcome": "defensive-outcomes",
+        }.items():
+            rows = _load_dir(namespace)
+            records[role] = rows
+            for row in rows:
+                for key in (row.get("id"), _tid_path(row)):
+                    if key:
+                        index[_tid_ref(key)] = row
+    return {"application": application, "roles": records, "index": index}
+
+
+def _tid_match(index: dict[str, dict], ref) -> dict | None:
+    return index.get(_tid_ref(ref))
+
+
+def _tid_link(row: dict | None, fallback: str = "Not assessed") -> str:
+    if not row:
+        return f'<span class="tid-missing">{_esc(fallback)}</span>'
+    label = row.get("title") or row.get("claim") or row.get("id") or row.get("_name") or fallback
+    path = _tid_path(row)
+    return f'<a class="wl" data-page="{_esc(path)}">{_esc(str(label))}</a>' if path else _esc(str(label))
+
+
+def _tid_state(value) -> str:
+    state = str(value or "unknown").strip().lower().replace("_", "-")
+    if state not in _TID_STATES:
+        state = "unknown"
+    label = _humanize(state)
+    return f'<span class="tid-state tid-state--{_esc(state)}">{_esc(label)}</span>'
+
+
+def _tid_latest(rows: list[dict]) -> dict | None:
+    return sorted(rows, key=lambda row: (str(row.get("as_of") or row.get("executed_at") or row.get("captured_at") or ""), _tid_path(row)))[-1] if rows else None
+
+
+def _tid_groups(data: dict) -> list[dict]:
+    """Join the role graph once for all three read-only TID projections."""
+    roles, index = data["roles"], data["index"]
+    groups = []
+    for procedure in sorted(roles.get("threat_procedure", []), key=lambda row: str(row.get("title") or row.get("id") or "")):
+        pid = procedure.get("id") or _tid_path(procedure)
+        requirements = [row for row in roles.get("detection_requirement", []) if _tid_ref(row.get("procedure_ref")) in {_tid_ref(pid), _tid_path(procedure)}]
+        strategies = [row for row in roles.get("detection_strategy", []) if any(_tid_match(index, row.get("requirement_ref")) is req for req in requirements)]
+        analytics = [row for row in roles.get("detection_analytic", []) if any(_tid_match(index, row.get("strategy_ref")) is strategy for strategy in strategies)]
+        deployments = [row for row in roles.get("deployment_snapshot", []) if any(_tid_match(index, row.get("analytic_ref")) is analytic for analytic in analytics)]
+        validations = [row for row in roles.get("validation_result", []) if any(_tid_match(index, row.get("analytic_ref")) is analytic for analytic in analytics)]
+        outcomes = [row for row in roles.get("defensive_outcome", []) if any(_tid_match(index, row.get("validation_ref")) is validation for validation in validations)]
+        coverage = [row for row in roles.get("coverage_assessment", []) if _tid_ref(row.get("procedure_ref")) in {_tid_ref(pid), _tid_path(procedure)}]
+        current_coverage = _tid_latest([row for row in coverage if row.get("status") not in {"superseded", "resolved"}]) or _tid_latest(coverage)
+        groups.append({
+            "procedure": procedure, "actor_ref": procedure.get("actor_ref"),
+            "sources": list(procedure.get("sources") or []), "requirements": requirements,
+            "strategies": strategies, "analytics": analytics, "deployments": deployments,
+            "validations": validations, "coverage": coverage, "current_coverage": current_coverage,
+            "outcomes": outcomes,
+        })
+    return groups
+
+
+def _tid_node(label: str, row: dict | None, state, detail: str = "") -> str:
+    detail_html = f'<div class="tid-node-detail">{_esc(detail)}</div>' if detail else ""
+    return (f'<div class="tid-node"><div class="tid-node-label">{_esc(label)}</div>'
+            f'<div class="tid-node-value">{_tid_link(row)}</div>{_tid_state(state)}'
+            f'{detail_html}</div>')
+
+
+def _v_tid_trace(_box: dict) -> str:
+    data = _tid_application_data()
+    groups = _tid_groups(data)
+    if not groups:
+        return ""
+    index = data["index"]
+    rendered = []
+    for group in groups:
+        procedure = group["procedure"]
+        requirement, strategy = _tid_latest(group["requirements"]), _tid_latest(group["strategies"])
+        analytic, deployment = _tid_latest(group["analytics"]), _tid_latest(group["deployments"])
+        validation, coverage = _tid_latest(group["validations"]), group["current_coverage"]
+        outcome = _tid_latest(group["outcomes"])
+        source_ref = group["sources"][0] if group["sources"] else ""
+        source = _tid_match(index, source_ref) if source_ref else None
+        if source_ref and not source:
+            source_path = _tid_ref(source_ref)
+            source = {"id": source_path.rsplit("/", 1)[-1], "title": _humanize(source_path.rsplit("/", 1)[-1]),
+                      "_sub": source_path.split("/", 1)[0] if "/" in source_path else "",
+                      "_rel": source_path.split("/", 1)[1] if "/" in source_path else source_path}
+        source_state = "present" if group["sources"] else "unknown"
+        deploy_state = "enabled" if deployment and deployment.get("enabled") else "disabled" if deployment else "unknown"
+        coverage_state = (coverage or {}).get("assessed_value") or "unassessed"
+        superseded = sum(1 for row in group["coverage"] if row.get("status") == "superseded")
+        actor = _tid_ref(group.get("actor_ref"))
+        actor_link = f'<a class="wl" data-page="{_esc(actor)}">{_esc(actor.rsplit("/", 1)[-1])}</a>' if actor else "Unlinked actor"
+        nodes = [
+            _tid_node("Source evidence", source, source_state, f"{len(group['sources'])} source reference(s)"),
+            _tid_node("Procedure", procedure, "present"),
+            _tid_node("Requirement", requirement, (requirement or {}).get("status")),
+            _tid_node("Strategy", strategy, (strategy or {}).get("status")),
+            _tid_node("Analytic", analytic, (analytic or {}).get("status"), str((analytic or {}).get("revision") or "")),
+            _tid_node("Deployment", deployment, deploy_state, str((deployment or {}).get("analytic_revision") or "")),
+            _tid_node("Validation", validation, (validation or {}).get("result"), str((validation or {}).get("executed_at") or "")),
+            _tid_node("Coverage", coverage, coverage_state, str((coverage or {}).get("as_of") or "")),
+            _tid_node("Outcome", outcome, (outcome or {}).get("effectiveness_state"), str((outcome or {}).get("measured_at") or "")),
+        ]
+        rendered.append(
+            '<article class="tid-trace-record">'
+            f'<header><strong>{_tid_link(procedure)}</strong><span>{actor_link}</span>'
+            f'<span>{superseded} superseded assessment(s)</span></header>'
+            '<div class="tid-trace-chain">'
+            + '<span class="tid-arrow" aria-hidden="true">→</span>'.join(nodes)
+            + '</div>'
+            '</article>')
+    return '<div class="tid-trace">' + "".join(rendered) + '</div>'
+
+
+def _v_tid_actor_posture(_box: dict) -> str:
+    groups = _tid_groups(_tid_application_data())
+    actors: dict[str, list[dict]] = defaultdict(list)
+    for group in groups:
+        actors[_tid_ref(group.get("actor_ref")) or "unlinked"].append(group)
+    rows = []
+    for actor, actor_groups in sorted(actors.items()):
+        counts = Counter(str((group.get("current_coverage") or {}).get("assessed_value") or "unassessed") for group in actor_groups)
+        latest = max((str((group.get("current_coverage") or {}).get("as_of") or "") for group in actor_groups), default="")
+        actor_cell = (f'<a class="wl" data-page="{_esc(actor)}">{_esc(actor.rsplit("/", 1)[-1])}</a>' if actor != "unlinked" else "Unlinked actor")
+        rows.append([actor_cell, str(len(actor_groups)), str(counts.get("validated", 0)), str(counts.get("partial", 0)), str(counts.get("gap", 0)), str(counts.get("unknown", 0) + counts.get("unassessed", 0)), str(counts.get("stale", 0) + counts.get("degraded", 0)), _esc(latest or "—")])
+    return '<div class="tid-table-wrap">' + _html_table(["Actor", "Procedures", "Validated", "Partial", "Gap", "Unknown / unassessed", "Stale / degraded", "As of"], rows) + '</div>'
+
+
+def _v_tid_facet_matrix(_box: dict) -> str:
+    groups = _tid_groups(_tid_application_data())
+    rows = []
+    for group in groups:
+        assessments = sorted(group["coverage"], key=lambda row: (str(row.get("as_of") or ""), _tid_path(row)), reverse=True)
+        if not assessments:
+            rows.append([_tid_link(group["procedure"]), _tid_state("unassessed"), *[_tid_state("unknown") for _ in _TID_FACETS], "—"])
+            continue
+        for assessment in assessments:
+            facets = {item.get("facet"): item for item in assessment.get("facets", []) if isinstance(item, dict)}
+            path = _tid_path(assessment)
+            cells = []
+            for name in _TID_FACETS:
+                state = (facets.get(name) or {}).get("state") or "unknown"
+                cells.append(f'<a class="tid-facet-link" data-page="{_esc(path)}" title="{_esc((facets.get(name) or {}).get("reason") or "No basis recorded")}">{_tid_state(state)}</a>')
+            lifecycle = str(assessment.get("status") or "unknown")
+            rows.append([_tid_link(group["procedure"]), _tid_state(assessment.get("assessed_value") or "unknown"), *cells, f'{_esc(lifecycle)} · {_esc(str(assessment.get("as_of") or "—"))}'])
+    headers = ["Procedure", "Overall", *[_humanize(name) for name in _TID_FACETS], "Assessment version"]
+    return '<div class="tid-table-wrap tid-facet-matrix">' + _html_table(headers, rows) + '</div>'
+
+
+def _tid_refs(rows: list[dict]) -> str:
+    links = [_tid_link(row) for row in rows]
+    return '<span class="tid-ref-list">' + "".join(links) + "</span>" if links else _tid_state("unknown")
+
+
+def _tid_validation_history(rows: list[dict]) -> str:
+    if not rows:
+        return _tid_state("unknown")
+    items = []
+    for row in sorted(rows, key=lambda item: str(item.get("executed_at") or ""), reverse=True):
+        items.append(
+            '<span class="tid-validation-history-item">'
+            f'{_tid_link(row)} {_tid_state(row.get("result"))} '
+            f'<code>{_esc(str(row.get("analytic_revision") or "Unknown revision"))}</code> · '
+            f'{_esc(str(row.get("executed_at") or "Unknown time"))}</span>')
+    return '<span class="tid-validation-history">' + "".join(items) + '</span>'
+
+
+def _v_tid_detection_dossier(_box: dict) -> str:
+    data = _tid_application_data()
+    roles, index = data["roles"], data["index"]
+    groups = _tid_groups(data)
+    procedure_by_analytic: dict[int, dict] = {}
+    for group in groups:
+        for analytic in group["analytics"]:
+            procedure_by_analytic[id(analytic)] = group
+    cards = []
+    for analytic in sorted(roles.get("detection_analytic", []), key=lambda row: str(row.get("title") or row.get("id") or "")):
+        group = procedure_by_analytic.get(id(analytic), {})
+        strategy = _tid_match(index, analytic.get("strategy_ref"))
+        requirement = _tid_match(index, (strategy or {}).get("requirement_ref"))
+        deployments = [row for row in roles.get("deployment_snapshot", []) if _tid_match(index, row.get("analytic_ref")) is analytic]
+        validations = [row for row in roles.get("validation_result", []) if _tid_match(index, row.get("analytic_ref")) is analytic]
+        deployment = _tid_latest(deployments)
+        current_revision = str(analytic.get("revision") or "Unknown")
+        deployed_revision = str((deployment or {}).get("analytic_revision") or "Unknown")
+        revision_state = "validated" if current_revision == deployed_revision and deployment else "stale" if deployment else "unknown"
+        telemetry = [_tid_match(index, ref) for ref in (requirement or {}).get("telemetry_refs", [])]
+        telemetry = [row for row in telemetry if row]
+        limitations = []
+        for row in validations:
+            limitations.extend(str(value) for value in (row.get("limitations") or []))
+        cards.append(
+            '<article class="tid-dossier">'
+            f'<header><strong>{_tid_link(analytic)}</strong>{_tid_state((analytic or {}).get("status"))}</header>'
+            '<dl>'
+            f'<dt>Procedure</dt><dd>{_tid_link(group.get("procedure"))}</dd>'
+            f'<dt>Requirement</dt><dd>{_tid_link(requirement)}</dd>'
+            f'<dt>Strategy</dt><dd>{_tid_link(strategy)}</dd>'
+            f'<dt>Repository</dt><dd>{_esc(str(analytic.get("repository") or "Unknown"))} · {_esc(str(analytic.get("repository_path") or "Unknown"))}</dd>'
+            f'<dt>Repository revision</dt><dd><code>{_esc(current_revision)}</code></dd>'
+            f'<dt>Deployed revision</dt><dd><code>{_esc(deployed_revision)}</code> {_tid_state(revision_state)}</dd>'
+            f'<dt>Telemetry prerequisites</dt><dd>{_tid_refs(telemetry)}</dd>'
+            f'<dt>Validation history</dt><dd>{_tid_validation_history(validations)}</dd>'
+            f'<dt>Limitations</dt><dd>{_esc("; ".join(dict.fromkeys(limitations)) or "None recorded")}</dd>'
+            f'<dt>Dependencies</dt><dd>{_esc(", ".join(str(value) for value in (analytic.get("dependencies") or [])) or "None recorded")}</dd>'
+            '</dl></article>')
+    return '<div class="tid-dossiers">' + "".join(cards) + '</div>' if cards else ""
+
+
+def _tid_expired(value: object) -> bool:
+    raw = str(value or "").strip().replace("Z", "+00:00")
+    if not raw:
+        return False
+    try:
+        return datetime.datetime.fromisoformat(raw).astimezone(datetime.timezone.utc) < datetime.datetime.now(datetime.timezone.utc)
+    except ValueError:
+        return False
+
+
+def _v_tid_validation_queue(_box: dict) -> str:
+    data = _tid_application_data()
+    roles, index = data["roles"], data["index"]
+    gaps = roles.get("detection_gap", [])
+    priority_weight = {"critical": 400, "high": 300, "medium": 200, "low": 100}
+    queue = []
+    for analytic in roles.get("detection_analytic", []):
+        validations = [row for row in roles.get("validation_result", []) if _tid_match(index, row.get("analytic_ref")) is analytic]
+        latest = _tid_latest(validations)
+        linked_gaps = [row for row in gaps if _tid_ref(row.get("analytic_ref")) in {_tid_ref(analytic.get("id")), _tid_path(analytic)}]
+        gap_ids = {_tid_ref(row.get("id") or _tid_path(row)) for row in linked_gaps}
+        linked_decisions = [row for row in roles.get("defensive_decision", []) if _tid_ref(row.get("gap_ref")) in gap_ids]
+        priority = max((str(row.get("priority") or "low") for row in linked_gaps), key=lambda value: priority_weight.get(value, 0), default="low")
+        reasons, score = [], priority_weight.get(priority, 0)
+        reasons.append(f"{priority} consequence")
+        if not latest:
+            score += 80
+            reasons.append("no validation result")
+        elif str(latest.get("analytic_revision") or "") != str(analytic.get("revision") or ""):
+            score += 60
+            reasons.append("analytic revision changed")
+        if latest and _tid_expired(latest.get("valid_until")):
+            score += 40
+            reasons.append("validation stale")
+        if any(row.get("needs_review") or row.get("review_state") == "pending"
+               for row in [*linked_gaps, *linked_decisions]):
+            score += 20
+            reasons.append("review pending")
+        queue.append((score, analytic, latest, priority, reasons))
+    queue.sort(key=lambda item: (-item[0], str(item[1].get("title") or item[1].get("id") or "")))
+    rows = [[_tid_link(analytic), _tid_state((latest or {}).get("result") or "not-run"),
+             _esc(priority), str(score), _esc(" · ".join(reasons)),
+             _esc(str((latest or {}).get("executed_at") or "Never"))]
+            for score, analytic, latest, priority, reasons in queue]
+    return '<div class="tid-table-wrap tid-validation-queue">' + _html_table(
+        ["Analytic", "Latest validation", "Consequence", "Priority score", "Inspectable reasons", "Executed"], rows) + '</div>' if rows else ""
+
+
+def _v_tid_gap_workbench(_box: dict) -> str:
+    data = _tid_application_data()
+    roles, index = data["roles"], data["index"]
+    decisions = roles.get("defensive_decision", [])
+    rows = []
+    for gap in sorted(roles.get("detection_gap", []), key=lambda row: (str(row.get("status") or ""), str(row.get("title") or row.get("id") or ""))):
+        linked = [row for row in decisions if _tid_match(index, row.get("gap_ref")) is gap]
+        decision = _tid_latest(linked)
+        expiry = (decision or {}).get("expires_at") or gap.get("expires_at")
+        expiry_label = str(expiry or "—") + (" · expired" if _tid_expired(expiry) else "")
+        version = (decision or {}).get("expected_version")
+        review = (decision or {}).get("review_state") or ("pending" if (decision or {}).get("needs_review") else "not-required")
+        rows.append([
+            _tid_link(gap), _tid_state(gap.get("status")), _esc(str(gap.get("priority") or "unknown")),
+            _tid_link(decision), _esc(str((decision or {}).get("rationale") or gap.get("rationale") or "No rationale recorded")),
+            _esc("; ".join(str(value) for value in ((decision or {}).get("alternatives") or [])) or "None recorded"),
+            _esc(str((decision or {}).get("owner") or (decision or {}).get("decided_by") or gap.get("owner") or "Unassigned")),
+            _esc(str((decision or {}).get("decided_at") or gap.get("updated") or gap.get("as_of") or "—")),
+            _esc(str(version if version is not None else "—")), _tid_state(review), _esc(expiry_label),
+        ])
+    return '<div class="tid-table-wrap tid-gap-workbench">' + _html_table(
+        ["Gap", "Lifecycle", "Priority", "Decision", "Rationale", "Alternatives", "Owner", "Timestamp", "Expected version", "Review", "Expires"], rows) + '</div>' if rows else ""
 
 
 def _link_page_map(box: dict) -> dict:
-    """For a group_by box with `link_page: {dir, by}`, map each bucket value -> the page path
-    (<dir>/<rel>) of the page in <dir> whose <by> field equals the value. Lets an aggregate bar
-    open the entity it NAMES (e.g. an ATT&CK technique id -> its technique page) instead of
-    drilling to the members that share it. {} when not configured; values with no matching page
-    keep the normal group_by drilldown."""
+    """For a group_by box with `link_page: {dir, by}`, map each bucket value -> `{"path": <page
+    path>, "label": <display label>}` for the page in <dir> whose <by> field equals the value. Lets
+    an aggregate bar open the entity it NAMES (e.g. an ATT&CK technique id -> its technique page)
+    instead of drilling to the members that share it.
+
+    okengine#259: when link_page also declares `label_field`, `label` carries that field from the
+    linked page (e.g. `label_field: title` -> "Ingress Tool Transfer") so the bar/chip DISPLAYS the
+    human name instead of the opaque id; unset -> "" and the raw group value stays the label. {}
+    when link_page not configured; values with no matching page keep the normal group_by drilldown."""
     lp = box.get("link_page")
     if not isinstance(lp, dict) or not lp.get("dir"):
         return {}
     by = str(lp.get("by") or "id")
+    lf = str(lp.get("label_field") or "")
     out: dict = {}
     for r in _load_dir(str(lp["dir"])):
         k = r.get(by)
         if k in (None, ""):
             continue
-        out.setdefault(str(k), f'{r.get("_sub", "")}/{r.get("_rel") or r.get("_name", "")}'.strip("/"))
+        path = f'{r.get("_sub", "")}/{r.get("_rel") or r.get("_name", "")}'.strip("/")
+        label = str(r.get(lf) or "").strip() if lf else ""
+        out.setdefault(str(k), {"path": path, "label": label})
     return out
 
 
@@ -1455,12 +2286,15 @@ def _v_bars(box: dict, rows: list[dict], drill=None) -> str:
         return ""
     mx = max(v for _, v, _, _ in pairs) or 1
     tone = box.get("tone") if box.get("tone") in _TONES else "acc"
-    grp = bool(box.get("group_by"))
-    lpm = _link_page_map(box) if grp else {}
+    grp = bool(box.get("group_by")) or isinstance(box.get("assessment"), dict)
+    lpm = _link_page_map(box) if box.get("group_by") else {}
     out = []
     for l, v, um, key in pairs:
         if grp:
-            pg = lpm.get(str(key))
+            info = lpm.get(str(key))
+            pg = info.get("path") if info else None
+            if info and info.get("label"):
+                l = info["label"]                       # okengine#259: linked page's name, not the id
             dc, da = _drill_attrs(drill, page=pg) if pg else _drill_attrs(drill, value=key)
         else:
             dc, da = _drill_attrs(drill, page=key)
@@ -1468,25 +2302,43 @@ def _v_bars(box: dict, rows: list[dict], drill=None) -> str:
                    f'<span class="bl">{_esc(l)}{_UM_FLAG if um else ""}</span>'
                    f'<span class="btrk"><i class="bfill t-{tone}" style="width:{100 * v / mx:.0f}%"></i></span>'
                    f'<span class="bnum">{v:,}</span></div>')
-    return "".join(out)
+    rendered = "".join(out)
+    if isinstance(box.get("assessment"), dict):
+        rendered += _assessment_aggregate_legend()
+    return rendered
 
 
 def _v_chips(box: dict, rows: list[dict], drill=None) -> str:
     pairs = _ds_pairs(box, rows)
     if not pairs:
         return ""
-    grp = bool(box.get("group_by"))
-    lpm = _link_page_map(box) if grp else {}
+    grp = bool(box.get("group_by")) or isinstance(box.get("assessment"), dict)
+    lpm = _link_page_map(box) if box.get("group_by") else {}
     out = []
     for l, v, um, key in pairs:
         if grp:
-            pg = lpm.get(str(key))
+            info = lpm.get(str(key))
+            pg = info.get("path") if info else None
+            if info and info.get("label"):
+                l = info["label"]                       # okengine#259: linked page's name, not the id
             dc, da = _drill_attrs(drill, page=pg) if pg else _drill_attrs(drill, value=key)
         else:
             dc, da = _drill_attrs(drill, page=key)
         out.append(f'<span class="dchip{" um" if um else ""}{dc}"{da}>'
                    f'{_esc(l)}{_UM_FLAG if um else ""} <b>{v:,}</b></span>')
-    return '<div class="dchips">' + "".join(out) + "</div>"
+    rendered = '<div class="dchips">' + "".join(out) + "</div>"
+    if isinstance(box.get("assessment"), dict):
+        rendered += _assessment_aggregate_legend()
+    return rendered
+
+
+def _assessment_aggregate_legend() -> str:
+    return (
+        '<p class="assessment-legend"><span aria-hidden="true">◇</span> Assessment-backed rollup. '
+        'Values count the newest current judgment per subject; disputed, inconclusive, unknown, and '
+        'not-assessed subjects remain separate. Confidence is the mean of contributing judgments; '
+        '⚠ marks judgments awaiting human review. '
+        '<a class="wl" data-page="assessments/_about">How assessments work</a>.</p>')
 
 
 def _v_bignums(box: dict, rows: list[dict], drill=None) -> str:
@@ -1494,9 +2346,7 @@ def _v_bignums(box: dict, rows: list[dict], drill=None) -> str:
     for i, it in enumerate(box.get("items") or []):
         if not isinstance(it, dict):
             continue
-        rs = _ds_rows(it["dataset"]) if it.get("dataset") else rows
-        for f, v in (it.get("where") or {}).items():
-            rs = [r for r in rs if str(r.get(f)) == str(v)]
+        rs = _configured_rows(it) if it.get("dataset") else _refine_rows(rows, it)
         if it.get("stat") == "top" and it.get("group_by"):
             cnt = Counter(str(r.get(it["group_by"])) for r in rs if r.get(it["group_by"]))
             val = cnt.most_common(1)[0][0] if cnt else "—"
@@ -1524,8 +2374,15 @@ def _v_cards(box: dict, rows: list[dict]) -> str:
              "emerging": ("◆", "acc"), "flat": ("→", "mut"), "steady": ("→", "mut")}
     cards = []
     for r in rows[: int(box.get("limit") or 12)]:
-        g, gc = glyph.get(str(r.get(df)), ("→", "mut"))
-        counts = r.get(series) if isinstance(r.get(series), dict) else {}
+        comparison = str(r.get("comparison") or box.get("comparison") or "full-period")
+        if comparison == "partial-period":
+            g, gc, direction = "◒", "warn", "partial period"
+        else:
+            g, gc = glyph.get(str(r.get(df)), ("→", "mut"))
+            direction = str(r.get(df) or "—")
+        series_name = ("count_ytd_by_year" if comparison == "ytd" and
+                       isinstance(r.get("count_ytd_by_year"), dict) else series)
+        counts = r.get(series_name) if isinstance(r.get(series_name), dict) else {}
         mini = ""
         if counts:
             try:
@@ -1536,13 +2393,19 @@ def _v_cards(box: dict, rows: list[dict]) -> str:
             except (TypeError, ValueError):
                 mini = ""
         name = str(r.get(tf) or r.get("name") or r.get("_name") or "?")
+        cutoff = str(r.get("comparison_as_of") or "").strip()
+        period = (f'YTD through {_esc(cutoff)}' if comparison == "ytd" and cutoff else
+                  "partial period · direction suppressed" if comparison == "partial-period" else
+                  "full-period comparison")
         cards.append(f'<div class="dcard"><div class="dc-n">{_page_link(r) if box.get("link") else _esc(name)}</div>'
-                     f'<div class="dc-m"><span class="t-{gc}">{g} {_esc(str(r.get(df) or "—"))}</span>'
-                     f'<span class="dchip">{_esc(str(r.get(sf) or "—"))}</span></div>{mini}</div>')
+                     f'<div class="dc-m"><span class="t-{gc}" title="comparison: {_esc(comparison)}">'
+                     f'{g} {_esc(direction)}</span>'
+                     f'<span class="dchip">{_esc(str(r.get(sf) or "—"))}</span></div>'
+                     f'<div class="dc-period">{period}</div>{mini}</div>')
     return f'<div class="dcards">{"".join(cards)}</div>' if cards else ""
 
 
-def _v_coverage(box: dict, rows: list[dict]) -> str:
+def _v_coverage(box: dict, rows: list[dict], drill=None) -> str:
     """Join coverage: this dataset's `list_field` values vs a `versus` dataset's key field,
     grouped by the versus dataset's group field (e.g. detections' covers_techniques vs
     techniques' attack_id, grouped by tactic) — covered/total ratio bars, health-toned."""
@@ -1571,15 +2434,15 @@ def _v_coverage(box: dict, rows: list[dict]) -> str:
     for grp, (cvd, tot) in ranked:
         pct = 100 * cvd / tot if tot else 0
         tone = "ok" if pct >= 50 else "warn" if pct >= 30 else "crit"
-        out.append(f'<div class="brow"><span class="bl">{_esc(grp)}</span>'
+        dc, da = _drill_attrs(drill, value=grp)
+        out.append(f'<div class="brow{dc}"{da}><span class="bl">{_esc(grp)}</span>'
                    f'<span class="btrk"><i class="bfill t-{tone}" style="width:{pct:.0f}%"></i></span>'
                    f'<span class="bnum">{cvd}/{tot}</span></div>')
     return "".join(out)
 
 
-def _v_doc(box: dict):
-    """Render the LATEST matching document inline (dated filenames sort by name).
-    Returns (html, meta)."""
+def _latest_doc(box: dict):
+    """Return (frontmatter, body, page path, stem) for the latest matching document."""
     d = str(box.get("dir") or "").strip("/")
     pat = str(box.get("glob") or "*.md")
     if not pat.endswith(".md"):
@@ -1592,40 +2455,232 @@ def _v_doc(box: dict):
     cands = sorted((p for p in base.rglob(pat) if _visible_page(p, base)),
                    key=lambda p: (_file_date(p.name) or "", p.name), reverse=True) if base.is_dir() else []
     if not cands:
-        return "", ""
+        return None
     fm, body = split_fm(safe_read(base, str(cands[0].relative_to(base))))
-    return f'<div class="ddoc">{render_md(body)}</div>', cands[0].stem
+    page = str(cands[0].relative_to(WIKI).with_suffix(""))
+    return fm, body, page, cands[0].stem
+
+
+# A doc box renders a whole vault page inline. A generated dashboard can grow without bound
+# (okcti's adversarial-evidence-review hit 500KB source → a 650KB HTML panel that dominated the
+# tab payload and stalled the browser render — 2026-07-19 UI sweep). Cap what a PANEL inlines;
+# the full document stays one click away.
+_DOC_INLINE_CAP = 65536
+
+
+def _v_doc(box: dict):
+    """Render the latest matching document inline (truncated at _DOC_INLINE_CAP — a panel is a
+    view, not a document reader). Returns (html, meta)."""
+    latest = _latest_doc(box)
+    if not latest:
+        return "", ""
+    _fm, body, page, stem = latest
+    if len(body) > _DOC_INLINE_CAP:
+        cut = body.rfind("\n", 0, _DOC_INLINE_CAP)
+        clipped = body[:cut if cut > 0 else _DOC_INLINE_CAP]
+        note = (f'<p class="dnote">Document truncated for inline view '
+                f'({len(body) // 1024} KB total) — '
+                f'<a class="wl" data-page="{_esc(page)}">open the full page</a>.</p>')
+        return f'<div class="ddoc">{render_md(clipped)}{note}</div>', stem
+    return f'<div class="ddoc">{render_md(body)}</div>', stem
+
+
+def _v_operation_control(box: dict) -> str:
+    """Generic plan/confirm/start surface for one declarative operation."""
+    name = str(box.get("operation") or "").strip()
+    if not re.fullmatch(r"[a-z][a-z0-9-]{1,79}", name):
+        return '<p class="dnote">Invalid operation configuration.</p>'
+    arguments = box.get("arguments") or []
+    if not isinstance(arguments, list) or not all(isinstance(value, str) for value in arguments):
+        return '<p class="dnote">Invalid operation arguments.</p>'
+    description = str(box.get("description") or
+                      "Plan the operation to confirm its frozen scope before starting it.")
+    disabled = "" if _OPERATION_ENABLED else " disabled"
+    availability = "" if _OPERATION_ENABLED else (
+        '<p class="op-unavailable">Operation controls are not enabled for this deployment.</p>')
+    return (
+        f'<div class="operation-control" data-operation="{_esc(name)}" '
+        f'data-arguments="{_esc(json.dumps(arguments))}">'
+        f'<p>{_esc(description)}</p>{availability}'
+        f'<div class="operation-actions"><button data-operation-plan{disabled}>Plan scope</button>'
+        f'<button data-operation-run disabled>Start operation</button></div>'
+        '<div class="operation-result" aria-live="polite">Plan required before execution.</div>'
+        '</div>')
+
+
+def _summary_markdown(body: str, section: str = "", max_sections: int = 2) -> str:
+    """Select one named Markdown section or the first bounded top-level sections."""
+    lines = body.splitlines()
+    headings = []
+    for i, line in enumerate(lines):
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if match:
+            headings.append((i, len(match.group(1)), match.group(2).strip()))
+    if not headings:
+        return "\n".join(lines[:40]).strip()
+    if section:
+        wanted = section.casefold().strip()
+        for pos, (start, level, title) in enumerate(headings):
+            if title.casefold() != wanted:
+                continue
+            end = next((line_no for line_no, next_level, _ in headings[pos + 1:]
+                        if next_level <= level), len(lines))
+            return "\n".join(lines[start:end]).strip()
+        return ""
+    # Treat the first heading level encountered as the document's summary-section level. This
+    # handles briefs whose body begins at H2 as well as ordinary H1→H2 documents.
+    level = headings[0][1]
+    if level == 1 and any(hlevel == 2 for _line, hlevel, _title in headings[1:]):
+        level = 2
+    starts = [(i, line_no) for i, (line_no, hlevel, _title) in enumerate(headings)
+              if hlevel == level]
+    take = starts[:max(1, max_sections)]
+    if not take:
+        return ""
+    end_pos = take[-1][0] + 1
+    end = headings[end_pos][0] if end_pos < len(headings) else len(lines)
+    return "\n".join(lines[take[0][1]:end]).strip()
+
+
+def _v_doc_summary(box: dict):
+    """Render a bounded excerpt of the latest document plus a full-document link."""
+    latest = _latest_doc(box)
+    if not latest:
+        return "", ""
+    _fm, body, page, stem = latest
+    excerpt = _summary_markdown(
+        body, str(box.get("section") or ""), int(box.get("max_sections") or 2))
+    if not excerpt:
+        return (f'<p class="dnote">Configured section “{_esc(box.get("section"))}” is absent.</p>'
+                f'<p><a class="wl" data-page="{_esc(page)}">Open full brief →</a></p>', stem)
+    return (f'<div class="ddoc">{render_md(excerpt)}'
+            f'<p><a class="wl" data-page="{_esc(page)}">Open full brief →</a></p></div>', stem)
+
+
+def _application_ref(value) -> str:
+    """Render a declared operation/artifact reference, linking canonical vault pages."""
+    ref = str(value or "").strip()
+    if ref.startswith("dashboards/"):
+        return f'<a class="wl" data-page="{_esc(ref)}">{_esc(ref)}</a>'
+    return f"<code>{_esc(ref or '—')}</code>"
+
+
+def _v_application(application: dict) -> str:
+    """Generic application-profile summary; no CHE/domain names are hardcoded here."""
+    profile = str(application.get("profile") or "application")
+    version = str(application.get("profile_version") or "—")
+    propositions = application.get("propositions") or []
+    rows = []
+    for binding in propositions:
+        operations = binding.get("operations") if isinstance(binding.get("operations"), dict) else {}
+        op_text = " · ".join(
+            f"{_esc(kind)}: {_application_ref(operation)}"
+            for kind, operation in operations.items()) or "—"
+        rows.append(
+            f"<tr><td><strong>{_esc(binding.get('type') or '—')}</strong></td>"
+            f"<td><code>{_esc(binding.get('namespace') or '—')}</code></td><td>{op_text}</td></tr>")
+    proposition_table = (
+        '<table><thead><tr><th>Proposition</th><th>Namespace</th><th>Lifecycle operations</th></tr>'
+        f'<tbody>{"".join(rows)}</tbody></table>' if rows else '<p class="dnote">No proposition bindings.</p>')
+
+    def refs(title: str, values: dict) -> str:
+        items = "".join(
+            f"<tr><td>{_esc(name)}</td><td>{_application_ref(value)}</td></tr>"
+            for name, value in values.items())
+        return (f"<h3>{_esc(title)}</h3><table><tbody>{items}</tbody></table>" if items else "")
+
+    return (
+        '<div class="app-contract">'
+        f'<div class="bignums"><div class="bn-item"><div class="bn-v t-ok">active</div>'
+        f'<div class="bn-l">{_esc(_humanize(profile))} · v{_esc(version)}</div></div>'
+        f'<div class="bn-item"><div class="bn-v">{len(propositions)}</div>'
+        '<div class="bn-l">bound proposition classes</div></div></div>'
+        f"<h3>Lifecycle bindings</h3>{proposition_table}"
+        f"{refs('Analyst surfaces', application.get('surfaces') or {})}"
+        f"{refs('Queues', application.get('queues') or {})}"
+        f"{refs('Success measures', application.get('success_measures') or {})}</div>")
+
+
+@app.get("/api/application")
+def api_application():
+    """Operational inspection surface for the deployed application contract."""
+    application = cockpit_config().get("application")
+    if not application:
+        raise HTTPException(404, "no application declaration")
+    return {"title": _humanize(application["profile"]),
+            "profile": application["profile"],
+            "profile_version": application.get("profile_version") or "",
+            "html": _v_application(application)}
 
 
 @app.get("/api/tab/{key}")
 def api_tab(key: str):
     cfg = cockpit_config()
-    d = (cfg.get("tab_defs") or {}).get(key)
+    canonical_key = (cfg.get("tab_aliases") or {}).get(key, key)
+    d = (cfg.get("tab_defs") or {}).get(canonical_key)
     if not d:
         raise HTTPException(404, "no such tab")
     views = {"table": _v_table, "bars": _v_bars, "chips": _v_chips,
              "bignums": _v_bignums, "cards": _v_cards, "coverage": _v_coverage}
-    drillable = {"bars", "chips", "bignums"}
+    drillable = {"bars", "chips", "bignums", "coverage"}
     boxes = []
     for bi, b in enumerate(d["boxes"]):
         view = str(b.get("view") or "table")
         meta = str(b.get("meta") or "")
         unmapped: list = []
-        if view == "doc":
+        if view == "application":
+            html = _v_application(cfg.get("application") or {})
+        elif view == "application-help":
+            summary = _esc(str(b.get("summary") or "Open workspace guide"))
+            html = (f'<details class="app-help"><summary>{summary}</summary>'
+                    f'{_v_application(cfg.get("application") or {})}</details>')
+        elif view == "review-queue":
+            html = _v_review_queue(b)
+        elif view == "tid-trace":
+            html = _v_tid_trace(b)
+        elif view == "tid-actor-posture":
+            html = _v_tid_actor_posture(b)
+        elif view == "tid-facet-matrix":
+            html = _v_tid_facet_matrix(b)
+        elif view == "tid-detection-dossier":
+            html = _v_tid_detection_dossier(b)
+        elif view == "tid-validation-queue":
+            html = _v_tid_validation_queue(b)
+        elif view == "tid-gap-workbench":
+            html = _v_tid_gap_workbench(b)
+        elif view == "doc":
             html, stem = _v_doc(b)
             meta = meta or stem
+        elif view == "doc-summary":
+            html, stem = _v_doc_summary(b)
+            meta = meta or stem
+        elif view == "operation-control":
+            html = _v_operation_control(b)
+            meta = meta or ("available" if _OPERATION_ENABLED else "not configured")
         else:
-            rows = _ds_rows(b.get("dataset") or {})
+            rows = _configured_rows(b)
             fn = views.get(view)
             if not fn:
-                html = ""
+                html = f'<p class="dnote">Unsupported configured view: {_esc(view)}</p>'
+                meta = "configuration error"
             elif view in drillable:           # rows/values open a filtered list (okengine#189)
-                html = fn(b, rows, (key, bi))
+                html = fn(b, rows, (canonical_key, bi))
             else:
                 html = fn(b, rows)
-            if not meta and rows:
+            template = str(b.get("meta_template") or "")
+            if template:
+                eligible = _ds_sorted(rows, b.get("sort") or {})
+                shown = min(len(eligible), int(b.get("limit") or 10))
+                try:
+                    meta = template.format(shown=shown, total=len(eligible))
+                except (KeyError, ValueError):
+                    meta = "invalid metadata template"
+            elif not meta and rows:
                 meta = f"{len(rows):,} pages"
-            if view in ("bars", "chips"):     # surface partial-labels-map drift (okengine#188)
+            if view in ("bars", "chips") and not b.get("bucket_unmapped"):
+                # surface partial-labels-map drift (okengine#188). Skipped when bucket_unmapped is
+                # on — there the single collapsed "unmapped (N)" bar IS the surfacing, and its label
+                # is not a real drift value to list on the degraded card (okengine#259).
                 unmapped = [l for l, _v, um, _k in _ds_pairs(b, rows) if um]
         if not html and b.get("empty"):      # honest-empty: pipeline state is information
             html = f'<p class="dnote">{_esc(str(b["empty"]))}</p>'
@@ -1633,10 +2688,25 @@ def api_tab(key: str):
         if html:
             box = {"title": str(b.get("title") or ""), "meta": meta,
                    "span": int(b.get("span") or 6), "html": html}
+            if str(b.get("section") or "").strip():
+                box["section"] = str(b["section"]).strip()
             if unmapped:                      # only present when the card is degraded
                 box["unmapped"] = unmapped
+            # Provenance affordance (okengine#259 Rec 11): a panel measuring the CORPUS (reporting
+            # volume / collection coverage) rather than the THREAT must be visibly distinct, so a
+            # "ransomware ▼" coverage dip isn't misread as the threat declining. The pack tags such a
+            # panel `provenance:` (a short label + optional note); the UI renders a badge + tooltip.
+            prov = b.get("provenance")
+            if isinstance(prov, str) and prov.strip():
+                prov = {"label": prov.strip()}
+            if isinstance(prov, dict) and str(prov.get("label") or "").strip():
+                box["provenance"] = {"label": str(prov["label"]).strip(),
+                                     "note": str(prov.get("note") or "").strip()}
             boxes.append(box)
-    return {"label": d["label"], "boxes": boxes}
+    # Echo the route identity so API consumers can correlate a declarative response without
+    # reconstructing it from the request URL (and so composed guest tabs have the same shape as
+    # built-in tab payloads).
+    return {"key": key, "canonical_key": canonical_key, "label": d["label"], "boxes": boxes}
 
 
 _DRILL_CAP = 300
@@ -1667,20 +2737,57 @@ def api_drill(tab: str, box: int, value: str = Query(default=""), item: int = Qu
         if not (0 <= item < len(items)) or not isinstance(items[item], dict):
             raise HTTPException(404, "no such item")
         it = items[item]
-        rows = _ds_rows(it["dataset"]) if it.get("dataset") else _ds_rows(b.get("dataset") or {})
-        for f, v in (it.get("where") or {}).items():
-            rows = [r for r in rows if str(r.get(f)) == str(v)]
+        rows = _configured_rows(it) if it.get("dataset") else _configured_rows(b)
+        if not it.get("dataset"):
+            rows = _refine_rows(rows, it)
         heading = str(it.get("label") or heading)
         if it.get("stat") == "top" and it.get("group_by"):     # drill the WINNING bucket
             cnt = Counter(s for r in rows for s in _gb_values(r.get(it["group_by"])))
             top = cnt.most_common(1)[0][0] if cnt else None
             rows = [r for r in rows if top in _gb_values(r.get(it["group_by"]))] if top else []
             heading = f"{heading}: {top}" if top else heading
+    elif view in ("bars", "chips") and isinstance(b.get("assessment"), dict):
+        spec = b["assessment"]
+        source_rows = [row for row in _configured_rows(b) if _current_assessment_subject(row)]
+        matches = [(row, record) for row in source_rows
+                   for key, record in [_assessment_bucket(row, spec)] if key == value]
+        labels = {str(k): str(v) for k, v in (spec.get("labels") or b.get("labels") or {}).items()}
+        special = {
+            "__not_assessed__": "Not assessed", "__review_not_run__": "Review not run",
+            "__assessed__": "Assessment reference stale",
+            "__no_association_established__": "No association established",
+            "__collection_required__": "Collection required", "__failed__": "Review failed",
+            "__disputed__": "Disputed",
+            "__inconclusive__": "Inconclusive", "__unknown__": "Unknown",
+            "__metadata_unavailable__": "Assessment metadata unavailable",
+        }
+        heading = f"{heading}: {special.get(value, labels.get(value, value))}"
+        pages = []
+        matches.sort(key=lambda pair: _disp(pair[0]).casefold())
+        for row, record in matches[:_DRILL_CAP]:
+            pages.append(_row_page(row))
+            if record:
+                pages.append({"path": record["path"], "title": record["title"],
+                              "type": "assessment"})
+        return {"title": heading, "count": len(matches), "pages": pages}
     elif view in ("bars", "chips") and b.get("group_by"):
         gb = b["group_by"]
-        rows = [r for r in _ds_rows(b.get("dataset") or {}) if value in _gb_values(r.get(gb))]
-        lbl = {str(k): str(v) for k, v in (b.get("labels") or {}).items()}.get(value, value)
-        heading = f"{heading}: {lbl}"
+        lblmap = {str(k): str(v) for k, v in (b.get("labels") or {}).items()}
+        if value == _UNMAPPED_KEY:                     # the collapsed "unmapped (N)" bucket row
+            drop = {"", "None", "Unknown", "nan"}
+            rows = [r for r in _configured_rows(b)
+                    if any(s not in lblmap and s not in drop for s in _gb_values(r.get(gb)))]
+            heading = f"{heading}: unmapped values"
+        else:
+            rows = [r for r in _configured_rows(b) if value in _gb_values(r.get(gb))]
+            heading = f"{heading}: {lblmap.get(value, value)}"
+    elif view == "coverage":
+        versus = b.get("versus") or {}
+        group_by = str(versus.get("group_by") or "")
+        if not group_by:
+            raise HTTPException(400, "coverage box has no versus group")
+        rows = [r for r in _ds_rows(versus) if value in _gb_values(r.get(group_by))]
+        heading = f"{heading}: {value}"
     else:
         raise HTTPException(400, "box is not drillable")
     rows = _ds_sorted(rows, {"field": "title"})[:_DRILL_CAP]
@@ -1760,7 +2867,7 @@ def api_dashboards():
 # so a new artifact is never silently hidden.
 _DATED_SERIES_RE = re.compile(r"^(.*)-(\d{4}-\d{2}-\d{2})$")   # `<series>-YYYY-MM-DD` daily snapshots
 _OPS_GROUPS = [
-    ("Health", ["dashboards/fleet-health", "HEALTH", "operational/kb-health-snapshots",
+    ("Health", ["dashboards/fleet-health", "operational/collection-health", "HEALTH", "operational/kb-health-snapshots",
                 "operational/page-quality-snapshots", "operational/page-quality-queue"]),
     ("Conformance", ["operational/schema-conformance", "dashboards/schema-drift",
                      "operational/schema-drift", "operational/deployment-validation",
@@ -1792,13 +2899,28 @@ def _ops_groups() -> list[dict]:
     """The operational/health page groups surfaced in the Ops tab. Only pages that exist are
     included; empty groups are dropped. Present on any OKF vault the engine crons have run."""
     out, seen = [], set()
+    application = load_application_declaration(VAULT)
+    if application:
+        out.append({"group": "Applications", "items": [{
+            "action": "application",
+            "title": _humanize(application["profile"]),
+            "desc": "Application contract, lifecycle bindings, queues, surfaces, and measures",
+            "updated": None,
+        }]})
     for label, paths in _OPS_GROUPS:
         items = []
         for path in paths:
             if path in seen or not (WIKI / (path + ".md")).is_file():
                 continue
             seen.add(path)
-            items.append(_ops_item(path))
+            item = _ops_item(path)
+            if path == "_review-queue":
+                item.update({
+                    "action": "reviews",
+                    "title": "Human review",
+                    "desc": "Complete, prioritized review worklist and evidence decisions",
+                })
+            items.append(item)
         if items:
             out.append({"group": label, "items": items})
     # nothing hides: anything else under operational/ (new artifacts, per-day snapshots). A daily
@@ -1834,6 +2956,30 @@ def _ops_available() -> bool:
 @app.get("/api/ops")
 def api_ops():
     return {"groups": _ops_groups()}
+
+
+@app.get("/api/policy")
+def api_policy():
+    """Structured policy health; the Ops dashboard is its human-readable projection."""
+    def load(name: str, default):
+        try:
+            value = json.loads((VAULT / ".okengine" / name).read_text(encoding="utf-8"))
+            return value if isinstance(value, type(default)) else default
+        except (OSError, json.JSONDecodeError):
+            return default
+
+    effective = load("effective-policy.json", {})
+    coverage = load("policy-coverage.json", {})
+    findings = load("policy-findings.json", {})
+    return {
+        "digest": effective.get("digest"),
+        "rules": effective.get("rules") or [],
+        "capabilities": effective.get("capabilities") or {},
+        "waivers": effective.get("waivers") or [],
+        "coverage": coverage.get("rules") or [],
+        "findings": findings.get("findings") or [],
+        "generated_at": findings.get("generated_at") or coverage.get("generated_at"),
+    }
 
 
 def _content_dirs() -> list:
@@ -1896,6 +3042,11 @@ def _provenance(fm: dict, body: str) -> dict:
     # exclude an http(s) scheme (tighter than the reader's port, which double-counted URLs as pages).
     page_srcs = sum(1 for s in srcs if not str(s).lower().startswith(("http://", "https://"))
                     and ("/" in str(s) or str(s).lower().endswith(".md")))
+    leads = fm.get("candidate_evidence")
+    leads = leads if isinstance(leads, list) else []
+    candidate_refs = [str(row.get("artifact") or "") for row in leads
+                      if isinstance(row, dict) and row.get("evidence_role") == "candidate-lead"]
+    candidate_pages = sum(1 for ref in candidate_refs if _ref_target(ref))
     grounding = None
     g = re.search(r"##\s+Grounding check(.*?)(?:\n##\s|\Z)", body, re.S | re.I)
     if g:
@@ -1910,14 +3061,16 @@ def _provenance(fm: dict, body: str) -> dict:
         return ", ".join(str(i) for i in x) if isinstance(x, list) else str(x)
 
     prov = {
-        "sources": len(srcs), "source_pages": page_srcs, "grounding": grounding,
+        "sources": len(srcs), "source_pages": page_srcs,
+        "candidate_leads": len(candidate_refs), "candidate_pages": candidate_pages,
+        "grounding": grounding,
         "needs_review": bool(fm.get("needs_review")),
         "reviewed_by": _v("reviewed_by"), "reviewed_on": _v("reviewed_on"),
         "tlp": _v("tlp"), "sensitivity": _v("sensitivity"),
         "reliability": _v("reliability"), "credibility": _v("credibility"),
         "maintained_by": _v("maintained_by"), "discovered_by": _v("discovered_by"),
     }
-    has_signal = (prov["sources"] or grounding or prov["needs_review"] or prov["reviewed_by"]
+    has_signal = (prov["sources"] or prov["candidate_leads"] or grounding or prov["needs_review"] or prov["reviewed_by"]
                   or prov["tlp"] or prov["sensitivity"] or prov["reliability"] or prov["credibility"]
                   or prov["maintained_by"] or prov["discovered_by"])
     return prov if has_signal else {}
@@ -1928,13 +3081,20 @@ def _provenance(fm: dict, body: str) -> dict:
 # (fact panel), record-keeping is tucked away (record details), and the assembler's multi-source
 # `conflicts:` + `observations/` records show "what each source says". All domain-agnostic — it
 # renders whatever fields/conflicts/observations exist, in frontmatter order.
-_META_PANEL_SKIP = {"title", "name", "type", "version", "raw", "needs_review", "sources"}   # needs_review -> badge/strip; sources -> the graded Evidence section (both drop from the fact panel)
+_META_PANEL_SKIP = {"title", "name", "type", "version", "raw", "needs_review", "sources",
+                    "candidate_evidence", "qualification_result", "collection_attempt",
+                    "score_components", "source_refs"}
 _META_SECONDARY = {"tlp", "created", "updated", "last_updated", "last_seen", "first_seen",
                    "assembled_from", "tier", "tlp_caveat",
                    "maintained_by", "discovered_by", "created_by", "last_modified_by"}
 _REL_RANK = {c: i for i, c in enumerate("FEDCBA")}    # A=5 (highest) … F=0; unknown -> -1
 _SRC_REL_CACHE: tuple[float, dict] = (float("-inf"), {})   # -inf, not 0.0 — see the note at _DIR_TTL
 _OBS_INDEX_CACHE: tuple[float, dict] = (float("-inf"), {})   # -inf, not 0.0 — see the note at _DIR_TTL
+_ID_INDEX_CACHE: tuple[float, dict] = (float("-inf"), {})   # -inf, not 0.0 — see the note at _DIR_TTL
+# Namespaces whose pages are the TARGETS of bare-id frontmatter refs. Cross-reference/enrichment
+# lanes stamp bare ids or slugs (e.g. an entity id `G0022`, a `CVE-…` id) that _ref_target
+# (path-shaped only) won't linkify; _id_index resolves them against these namespaces for the overlay.
+_ID_INDEX_NS = ("entities", "techniques", "cves", "concepts")
 
 
 def _source_reliability() -> dict:
@@ -1945,7 +3105,7 @@ def _source_reliability() -> dict:
     if now - _SRC_REL_CACHE[0] < _DIR_TTL:
         return _SRC_REL_CACHE[1]
     out: dict = {}
-    sp = VAULT / "schema.yaml"
+    sp = _governing_schema_path()
     if sp.is_file():
         try:
             reg = (yaml.safe_load(sp.read_text(encoding="utf-8")) or {}).get("source_registry") or {}
@@ -2001,9 +3161,47 @@ def _ref_target(s: str) -> str | None:
     return None
 
 
+def _id_index() -> dict:
+    """Cached ``{bare id-or-slug -> {"page": key, "label": display}}`` over the reference namespaces
+    (_ID_INDEX_NS), so a bare-id frontmatter ref that _ref_target can't linkify (it's path-shaped
+    only) still becomes a page link in the overlay — e.g. a bare `[G0022, shinyhunters]` ref -> the
+    entity pages. Keyed by BOTH the page `id` field and its stem/slug (a lane may stamp either — the
+    id where present, else the slug). `label` is the page TITLE when the
+    token is an OPAQUE id (differs from the slug — G0022 -> "Sandworm Team"), else the token itself
+    (readable slugs and self-describing ids like CVE-2026-… stay as written). A token owned by >1 page
+    is dropped — no guessed link. TTL-cached; -inf sentinel so a fresh host never serves an empty index
+    as valid (the fresh-host cache trap)."""
+    global _ID_INDEX_CACHE
+    now = time.monotonic()
+    if now - _ID_INDEX_CACHE[0] < _DIR_TTL:
+        return _ID_INDEX_CACHE[1]
+    idx: dict = {}
+    dup: set = set()
+    for sub in _ID_INDEX_NS:
+        for r in _load_dir(sub):
+            stem = str(r.get("_name") or "")
+            key = f'{r.get("_sub", "")}/{r.get("_rel") or stem}'.strip("/")
+            title = str(r.get("title") or stem)
+            for tok, is_id in ((r.get("id"), True), (stem, False)):
+                if not isinstance(tok, str) or not tok.strip():
+                    continue
+                t = tok.strip()
+                if t in dup:
+                    continue
+                if t in idx and idx[t]["page"] != key:
+                    del idx[t]                       # same token, different pages -> ambiguous
+                    dup.add(t)
+                    continue
+                label = title if (is_id and t != stem) else t   # opaque id -> name; slug/self-id -> keep
+                idx[t] = {"page": key, "label": label}
+    _ID_INDEX_CACHE = (now, idx)
+    return idx
+
+
 def _meta_values(v) -> list[dict]:
     """One frontmatter value -> display chips. http(s) scalars + url/href list items become external
-    links; a value resolving to a vault page becomes an internal page link; dicts compact to k=v."""
+    links; a value resolving to a vault page (path-shaped ref, else a bare id via _id_index) becomes
+    an internal page link; dicts compact to k=v."""
     out: list[dict] = []
     for el in (v if isinstance(v, list) else [v]):
         if isinstance(el, dict):
@@ -2017,7 +3215,11 @@ def _meta_values(v) -> list[dict]:
                 out.append({"text": _url_label(s), "url": s})
             else:
                 tgt = _ref_target(s)
-                out.append({"text": s, "page": tgt} if tgt else {"text": s})
+                if tgt:
+                    out.append({"text": s, "page": tgt})
+                else:
+                    hit = _id_index().get(s.strip())    # bare id/slug -> its page (exploiting_actors etc.)
+                    out.append({"text": hit["label"], "page": hit["page"]} if hit else {"text": s})
     return out
 
 
@@ -2095,14 +3297,19 @@ def _evidence_sources(fm: dict) -> list[dict]:
             continue
         page = _ref_target(name)
         date = ""
+        page_reliability = ""
         if page:
             try:
                 pfm, _ = split_fm(_read_head(WIKI / (page + ".md")))
                 date = str(pfm.get("published") or pfm.get("date") or pfm.get("updated")
                            or pfm.get("last_updated") or "")[:10]
+                # A citation is a concrete source record. Its reviewed reliability grade is more
+                # specific than a registry default keyed by an importer/feed name.
+                page_reliability = str(pfm.get("reliability") or "")
             except OSError:
                 pass
-        out.append({"name": name, "page": page, "reliability": rel.get(name, ""), "date": date})
+        out.append({"name": name, "page": page,
+                    "reliability": page_reliability or rel.get(name, ""), "date": date})
     return out
 
 
@@ -2145,7 +3352,7 @@ def _type_required_fields() -> dict:
     if now - _TYPE_REQ_CACHE[0] < _DIR_TTL:
         return _TYPE_REQ_CACHE[1]
     out: dict = {}
-    sp = VAULT / "schema.yaml"
+    sp = _governing_schema_path()
     if sp.is_file():
         try:
             types = (yaml.safe_load(sp.read_text(encoding="utf-8")) or {}).get("types") or {}
@@ -2169,13 +3376,22 @@ def _quality_badges(fm: dict, body: str, ptype: str, prov: dict, conflicts: list
     if missing:
         b.append({"label": f"missing {', '.join(missing[:3])}", "level": "bad",
                   "title": f"required field(s) absent for type '{ptype}': {', '.join(missing)}"})
-    # sourcing / grounding (an empty prov dict means no sources — the badge is correct)
+    # Knowledge pages must cite source records. A source page IS the evidence record: its
+    # upstream URL/raw capture is its grounding, so requiring it to cite another source page
+    # produces the nonsensical "no sources" badge on properly captured articles.
     nsrc = prov.get("sources", 0)
-    if not nsrc:
-        b.append({"label": "no sources", "level": "bad", "title": "no sources cited"})
-    elif not prov.get("source_pages"):
-        b.append({"label": "ungrounded", "level": "warn",
-                  "title": f"{nsrc} prose source(s) — none link to a source page"})
+    source_record_grounded = ptype == "source" and bool(fm.get("url") or fm.get("raw"))
+    candidate_leads = int(prov.get("candidate_leads") or 0)
+    if not source_record_grounded:
+        if not nsrc and candidate_leads:
+            b.append({"label": f"{candidate_leads} candidate lead{'s' if candidate_leads != 1 else ''}",
+                      "level": "warn",
+                      "title": "collection leads informed prioritization but do not support an assessment"})
+        elif not nsrc:
+            b.append({"label": "no sources", "level": "bad", "title": "no sources cited"})
+        elif not prov.get("source_pages"):
+            b.append({"label": "ungrounded", "level": "warn",
+                      "title": f"{nsrc} prose source(s) — none link to a source page"})
     g = prov.get("grounding")
     if g and g.get("unsupported"):
         n = g["unsupported"]
@@ -2199,6 +3415,525 @@ def _quality_badges(fm: dict, body: str, ptype: str, prov: dict, conflicts: list
     if len(prose) < _THIN_CHARS and nfields < 4:
         b.append({"label": "thin", "level": "warn", "title": f"sparse page (<{_THIN_CHARS} chars, few fields)"})
     return b
+
+
+def _page_trust_state(rel: str, fm: dict, quality: list[dict]) -> dict:
+    """Keep unresolved entity records from presenting as verified canonical profiles."""
+    status = str(fm.get("status") or "").strip().lower()
+    redirect = str(fm.get("redirect_to") or fm.get("superseded_by") or "").strip()
+    if status == "tombstoned":
+        return {"state": "retired", "reasons": ["superseded record"],
+                "redirect_to": redirect or None}
+    if not rel.startswith("entities/"):
+        return {"state": "normal", "reasons": [], "redirect_to": None}
+    blocking = {"no sources", "ungrounded", "needs review"}
+    reasons = [str(b.get("label")) for b in quality
+               if b.get("level") == "bad" or b.get("label") in blocking
+               or str(b.get("label") or "").startswith(("missing ", "unsupported", "conflicting"))]
+    return {"state": "quarantined" if reasons else "verified", "reasons": reasons,
+            "redirect_to": None}
+
+
+_GROUNDING_REVIEW = re.compile(
+    r"##[ \t]+Grounding check.*?(unsupported|not[- ]found|not in source|contradict)", re.S | re.I)
+
+
+def _review_reasons(fm: dict, body: str) -> list[dict]:
+    reasons = []
+    conflicts = fm.get("conflicts") if isinstance(fm.get("conflicts"), list) else []
+    for conflict in conflicts:
+        if isinstance(conflict, dict):
+            reasons.append({"code": "conflict", "field": str(conflict.get("field") or ""),
+                            "detail": "sources disagree on this field"})
+    if _GROUNDING_REVIEW.search(body or ""):
+        reasons.append({"code": "grounding", "detail": "grounding check flagged an unsupported claim"})
+    if fm.get("needs_review") is True and not reasons:
+        reasons.append({"code": "legacy-unspecified", "detail": "legacy needs_review flag"})
+    if str(fm.get("type") or "") in _review_required_types() and not reasons:
+        reasons.append({"code": "import-unvetted",
+                        "detail": f"{fm.get('type')} requires human review under pack policy"})
+    return reasons
+
+
+@functools.lru_cache(maxsize=1)
+def _review_required_types() -> frozenset[str]:
+    for path in (VAULT / ".okengine" / "composed-schema.yaml", VAULT / "schema.yaml"):
+        try:
+            doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        values = doc.get("review_required_types") if isinstance(doc, dict) else None
+        if isinstance(values, list):
+            return frozenset(str(v) for v in values)
+    return frozenset()
+
+
+def _legacy_review_current(fm: dict) -> bool:
+    """Compatibility for pre-ledger sign-offs; new writes invalidate their projection."""
+    reviewed = str(fm.get("reviewed_on") or "")[:10]
+    updated = str(fm.get("last_updated") or fm.get("updated") or fm.get("created") or "")[:10]
+    return bool(reviewed and updated and reviewed >= updated)
+
+
+def _requires_review(fm: dict, body: str) -> bool:
+    if fm.get("needs_review") is True or _GROUNDING_REVIEW.search(body or ""):
+        return True
+    if str(fm.get("type") or "") in _review_required_types():
+        return not (str(fm.get("review_state") or "") == "approved" or _legacy_review_current(fm))
+    return False
+
+
+def _review_records() -> list[dict]:
+    base = WIKI / "operational" / "reviews"
+    out = []
+    if not base.is_dir():
+        return out
+    for p in base.glob("*.yaml"):
+        try:
+            rec = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def _review_record_for(subject: str, version: int, digest: str) -> dict | None:
+    matches = [r for r in _review_records() if r.get("subject") == subject]
+    exact = [r for r in matches if int(r.get("subject_version") or -1) == version
+             and r.get("subject_hash") == digest]
+    rows = exact or matches
+    rows.sort(key=lambda r: str(r.get("requested_at") or ""), reverse=True)
+    return rows[0] if rows else None
+
+
+def _review_decision_context(fm: dict) -> dict:
+    """Project a page's bounded proposition into explicit, non-overclaiming review semantics."""
+    ptype = str(fm.get("type") or "record")
+    noun = "assessment" if ptype in {"assessment", "actor-assessment"} else "record"
+    proposition = str(fm.get("review_proposition") or fm.get("claim")
+                      or fm.get("title") or fm.get("name") or "this record")
+    return {
+        "question": str(fm.get("question") or "Is the current version supported by its cited evidence?"),
+        "proposition": proposition,
+        "scope": str(fm.get("review_scope") or
+                     f"Decide whether the cited evidence supports this {noun} as written. Approval does not expand the claim beyond its stated scope or confidence."),
+        "approve": str(fm.get("review_approve_meaning") or
+                       f"The evidence supports this {noun} as written at its stated scope and confidence."),
+        "reject": str(fm.get("review_reject_meaning") or
+                      f"The evidence does not support this {noun} as written. Rejection does not prove the opposite proposition."),
+        "request_changes": str(fm.get("review_change_meaning") or
+                               "The proposition, evidence, scope, or confidence must be corrected before a decision."),
+        "defer": "More evidence or analysis is required before deciding.",
+        "dismiss": "This review item is duplicate, out of scope, or not applicable.",
+        "noun": noun,
+    }
+
+
+def _review_detail(cand: Path) -> dict:
+    text = cand.read_text(encoding="utf-8", errors="replace")
+    fm, body = split_fm(text)
+    subject = cand.resolve().relative_to(WIKI.resolve()).as_posix()[:-3]
+    try:
+        version = int(fm.get("version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    record = _review_record_for(subject, version, digest)
+    current_record = record if (record and int(record.get("subject_version") or -1) == version
+                                and record.get("subject_hash") == digest) else None
+    evidence = _evidence_sources(fm)
+    return {
+        "subject": subject, "title": str(fm.get("title") or fm.get("name") or cand.stem),
+        "type": str(fm.get("type") or ""), "version": version, "hash": digest,
+        "needs_review": bool(fm.get("needs_review")),
+        "state": (current_record or {}).get("state") or fm.get("review_state") or "open",
+        # A prior record remains visible as history, but must never be sent as the id for a
+        # decision against the current version. The writer will create the current request.
+        "review_id": (current_record or {}).get("review_id"),
+        "reasons": (current_record or record or {}).get("reasons") or _review_reasons(fm, body),
+        "evidence": evidence, "evidence_total": len(evidence),
+        "evidence_resolved": sum(1 for row in evidence if row.get("page")),
+        "machine_checks": (current_record or record or {}).get("machine_checks") or [],
+        "history": (current_record or record or {}).get("history") or [],
+        "assigned_to": (current_record or {}).get("assigned_to"),
+        "decision_context": _review_decision_context(fm),
+        "review_enabled": _REVIEW_ENABLED, "review_auth_mode": _REVIEW_AUTH_MODE,
+    }
+
+
+def _review_candidate(path: str) -> Path:
+    if ".." in path or path.startswith("/"):
+        raise HTTPException(400, "bad path")
+    cand = WIKI / (path.removesuffix(".md") + ".md")
+    if not cand.is_file():
+        raise HTTPException(404, "page not found")
+    try:
+        cand.resolve().relative_to(WIKI.resolve())
+    except ValueError:
+        raise HTTPException(403, "blocked")
+    return cand
+
+
+@app.get("/api/review")
+def api_review(path: str = Query(...)):
+    return _review_detail(_review_candidate(path))
+
+
+# -inf, not 0.0 (fresh-host trap — see _DIR_TTL note): a finite init on a just-booted container
+# reads the EMPTY snapshot as fresh and serves a blank review queue for the whole TTL.
+_review_snapshot_cache: tuple[float, list[dict], list[dict]] = (float("-inf"), [], [])
+_review_snapshot_lock = threading.Lock()
+_REVIEW_SNAPSHOT_TTL = 120.0   # vault is :ro + cron-refreshed; queue staleness of minutes is fine
+_review_snapshot_refreshing = False
+
+
+def _invalidate_review_snapshot() -> None:
+    """Force the NEXT read to rebuild synchronously (an operator review action must be reflected
+    immediately, so serve-stale is wrong right after a state change)."""
+    global _review_snapshot_cache
+    _review_snapshot_cache = (float("-inf"), [], [])
+
+
+def _review_queue_snapshot() -> tuple[list[dict], list[dict]]:
+    """The complete review worklist, STALE-WHILE-REVALIDATE (same contract as _load_dir).
+
+    The rebuild walks the WHOLE vault (head-read + frontmatter parse of every page — tens of
+    seconds at 10k+ pages). It used to run ON the request path behind a 30s cache, so any tab
+    carrying a review-queue box (Detections, CHE) hung on a bare 'Loading…' for ~24s once every
+    30 seconds (2026-07-19 UI sweep). Now a request only ever blocks when this process has NEVER
+    built a snapshot; after that, expiry serves the last snapshot and kicks ONE background
+    rebuild."""
+    global _review_snapshot_cache, _review_snapshot_refreshing
+    cached_at, cached_rows, cached_records = _review_snapshot_cache
+    if time.monotonic() - cached_at < _REVIEW_SNAPSHOT_TTL:
+        return cached_rows, cached_records
+    if cached_at != float("-inf"):
+        # stale but present: serve it now, refresh off the request path (single-flight)
+        kick = False
+        with _review_snapshot_lock:
+            if not _review_snapshot_refreshing:
+                _review_snapshot_refreshing = True
+                kick = True
+        if kick:
+            def _work():
+                global _review_snapshot_cache, _review_snapshot_refreshing
+                try:
+                    _review_snapshot_cache = (time.monotonic(), *_build_review_snapshot())
+                finally:
+                    with _review_snapshot_lock:
+                        _review_snapshot_refreshing = False
+            threading.Thread(target=_work, daemon=True,
+                             name="review-snapshot-refresh").start()
+        return cached_rows, cached_records
+    with _review_snapshot_lock:                 # first build of this process — nothing to serve
+        cached_at, cached_rows, cached_records = _review_snapshot_cache
+        if time.monotonic() - cached_at < _REVIEW_SNAPSHOT_TTL:
+            return cached_rows, cached_records
+        rows, all_records = _build_review_snapshot()
+        _review_snapshot_cache = (time.monotonic(), rows, all_records)
+        return rows, all_records
+
+
+def _build_review_snapshot() -> tuple[list[dict], list[dict]]:
+    """The uncached full-vault worklist build (see _review_queue_snapshot for the caching contract)."""
+    records = {}
+    all_records = sorted(_review_records(), key=lambda r: str(r.get("requested_at") or ""))
+    for rec in all_records:
+        if rec.get("subject"):
+            records[str(rec["subject"])] = rec
+    rows = []
+    for p in WIKI.rglob("*.md"):
+        try:
+            rel = p.relative_to(WIKI)
+        except ValueError:
+            continue
+        if any(part.startswith(("_", ".")) for part in rel.parts) or "operational" in rel.parts:
+            continue
+        try:
+            fm, body = split_fm(_read_head(p, 65536))
+        except OSError:
+            continue
+        if not isinstance(fm, dict) or not _requires_review(fm, body):
+            continue
+        subject = rel.as_posix()[:-3]
+        rec = records.get(subject) or {}
+        reasons = rec.get("reasons") or _review_reasons(fm, body)
+        evidence = _evidence_sources(fm)
+        resolved, total = sum(1 for e in evidence if e.get("page")), len(evidence)
+        resolution = "none" if not total else "complete" if resolved == total else "partial"
+        updated = str(fm.get("last_updated") or fm.get("updated") or fm.get("created") or "")
+        parsed = _as_date(updated)
+        rows.append({"subject": subject,
+                     "title": str(fm.get("title") or fm.get("name") or p.stem),
+                     "type": str(fm.get("type") or ""),
+                     "state": str(rec.get("state") or "open"), "reasons": reasons,
+                     "assigned_to": rec.get("assigned_to"), "updated": updated,
+                     "age_days": max(0, (TODAY() - parsed).days) if parsed else None,
+                     "evidence_total": total, "evidence_resolved": resolved,
+                     "source_resolution": resolution,
+                     "machine_eligible": bool(rec.get("machine_eligible"))})
+    priority = {"grounding": 0, "conflict": 1, "categorical-confidence": 2,
+                "agent-draft": 3, "legacy-unspecified": 4}
+    rows.sort(key=lambda row: (min((priority.get(str(r.get("code")), 9)
+                                   for r in row["reasons"]), default=9),
+                               row["updated"], row["subject"]))
+    return rows, all_records
+
+
+@app.get("/api/reviews")
+def api_reviews(offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=100),
+                reason: str = Query(""), page_type: str = Query(""), state: str = Query(""),
+                assignment: str = "", source_resolution: str = "", age: str = "",
+                machine_eligible: str = "", page_types: str = ""):
+    """Complete, paginated review worklist; the Markdown dashboard remains only a projection."""
+    snapshot, all_records = _review_queue_snapshot()
+    rows = []
+    type_scope = {value.strip() for value in page_types.split(",") if value.strip()}
+    for row in snapshot:
+        codes = [str(r.get("code") or "") for r in row["reasons"] if isinstance(r, dict)]
+        row_state, ptype = row["state"], row["type"]
+        resolution, eligible, age_days = (row["source_resolution"], row["machine_eligible"],
+                                           row["age_days"])
+        assigned_to = row["assigned_to"]
+        if reason and reason not in codes: continue
+        if type_scope and ptype not in type_scope: continue
+        if page_type and page_type != ptype: continue
+        if state and state != row_state: continue
+        if assignment == "unassigned" and assigned_to: continue
+        if assignment == "assigned" and not assigned_to: continue
+        if assignment not in {"", "assigned", "unassigned"} and assignment != assigned_to: continue
+        if source_resolution and source_resolution != resolution: continue
+        if machine_eligible in {"true", "false"} and eligible != (machine_eligible == "true"): continue
+        if age == "0-30" and (age_days is None or age_days > 30): continue
+        if age == "31-90" and (age_days is None or not 31 <= age_days <= 90): continue
+        if age == "91+" and (age_days is None or age_days < 91): continue
+        rows.append(row)
+    states = Counter(row["state"] for row in rows)
+    reasons_count = Counter(code for row in rows for code in
+                            [str(r.get("code") or "") for r in row["reasons"] if isinstance(r, dict)])
+    ages = [row["age_days"] for row in rows if row["age_days"] is not None]
+    reopened = sum(reasons_count[c] for c in ("changed-after-approval",))
+    cutoff = TODAY() - datetime.timedelta(days=30)
+    throughput = 0
+    for rec in all_records:
+        for event in rec.get("history") or []:
+            if not isinstance(event, dict) or not event.get("decision"):
+                continue
+            when = _as_date(event.get("decision_at"))
+            if when and when >= cutoff:
+                throughput += 1
+    return {"total": len(rows), "offset": offset, "limit": limit,
+            "items": rows[offset:offset + limit],
+            "facets": {"states": dict(states), "reasons": dict(reasons_count),
+                       "types": dict(Counter(row["type"] for row in rows)),
+                       "source_resolution": dict(Counter(row["source_resolution"] for row in rows))},
+            "metrics": {"oldest_days": max(ages) if ages else None,
+                        "assigned": sum(1 for row in rows if row["assigned_to"]),
+                        "throughput_30d": throughput, "reopened": reopened,
+                        "reopen_rate": round(reopened / max(1, len(rows) + throughput), 4)}}
+
+
+def _same_origin_review(request: Request) -> bool:
+    if request.headers.get("x-okengine-review") != "1":
+        return False
+    origin = request.headers.get("origin")
+    if not origin:  # non-browser/API tests; Basic auth still protects the endpoint
+        return True
+    expected = f"{request.url.scheme}://{request.headers.get('host', '')}"
+    return hmac.compare_digest(origin.rstrip("/"), expected.rstrip("/"))
+
+
+def _same_origin_operation(request: Request) -> bool:
+    if request.headers.get("x-okengine-operation") != "1":
+        return False
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    expected = f"{request.url.scheme}://{request.headers.get('host', '')}"
+    return hmac.compare_digest(origin.rstrip("/"), expected.rstrip("/"))
+
+
+def _operation_request(path: str, *, data: dict | None = None, method: str = "GET"):
+    request = urllib.request.Request(
+        _OPERATION_API + path,
+        data=json.dumps(data).encode("utf-8") if data is not None else None,
+        method=method,
+        headers={"Authorization": f"Bearer {_OPERATION_TOKEN}",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=310 if path.endswith("/plan") else 20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            detail = {"detail": "operation service rejected the request"}
+        raise HTTPException(exc.code, str(detail.get("detail") or detail.get("error") or detail))
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise HTTPException(503, f"operation service unavailable: {exc}")
+
+
+@app.get("/api/operations")
+def api_operations():
+    if not _OPERATION_ENABLED:
+        raise HTTPException(404, "operation capability is disabled")
+    return _operation_request("/operations")
+
+
+@app.post("/api/operations/{name}/plan")
+async def api_operation_plan(name: str, request: Request):
+    if not _OPERATION_ENABLED:
+        raise HTTPException(404, "operation capability is disabled")
+    if not _same_origin_operation(request):
+        raise HTTPException(403, "operation request failed same-origin protection")
+    data = await request.json()
+    return _operation_request(f"/operations/{name}/plan", data=data, method="POST")
+
+
+@app.post("/api/operations/{name}/run", status_code=202)
+async def api_operation_run(name: str, request: Request):
+    if not _OPERATION_ENABLED:
+        raise HTTPException(404, "operation capability is disabled")
+    if not _same_origin_operation(request):
+        raise HTTPException(403, "operation request failed same-origin protection")
+    data = await request.json()
+    return _operation_request(f"/operations/{name}/run", data=data, method="POST")
+
+
+@app.get("/api/operations/requests/{request_id}")
+def api_operation_request(request_id: str):
+    if not _OPERATION_ENABLED:
+        raise HTTPException(404, "operation capability is disabled")
+    return _operation_request(f"/operations/requests/{request_id}")
+
+
+@app.post("/api/review/decision")
+async def api_review_decision(request: Request):
+    if not _REVIEW_ENABLED:
+        raise HTTPException(404, "review write capability is disabled")
+    if not _same_origin_review(request):
+        raise HTTPException(403, "review request failed same-origin protection")
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid JSON")
+    payload = {
+        "path": str(data.get("path") or ""), "decision": str(data.get("decision") or ""),
+        "note": str(data.get("note") or ""), "expected_version": data.get("expected_version"),
+        "expected_hash": str(data.get("expected_hash") or ""),
+        "review_id": str(data.get("review_id") or ""),
+        "reviewer": _REVIEWER, "service": "cockpit",
+    }
+    req = urllib.request.Request(
+        _REVIEW_API + "/review/resolve", data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"Authorization": f"Bearer {_REVIEW_TOKEN}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            _invalidate_review_snapshot()
+            return result
+    except urllib.error.HTTPError as exc:
+        try: detail = json.loads(exc.read().decode("utf-8"))
+        except Exception: detail = {"error": "review service rejected the decision"}
+        raise HTTPException(exc.code, str(detail.get("error") or detail))
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise HTTPException(503, f"review service unavailable: {exc}")
+
+
+@app.post("/api/review/assign")
+async def api_review_assign(request: Request):
+    if not _REVIEW_ENABLED:
+        raise HTTPException(404, "review write capability is disabled")
+    if not _same_origin_review(request):
+        raise HTTPException(403, "review request failed same-origin protection")
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid JSON")
+    payload = {
+        "path": str(data.get("path") or ""), "expected_version": data.get("expected_version"),
+        "expected_hash": str(data.get("expected_hash") or ""),
+        "review_id": str(data.get("review_id") or ""),
+        "reviewer": _REVIEWER, "service": "cockpit",
+    }
+    req = urllib.request.Request(
+        _REVIEW_API + "/review/assign", data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"Authorization": f"Bearer {_REVIEW_TOKEN}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            _invalidate_review_snapshot()
+            return result
+    except urllib.error.HTTPError as exc:
+        try: detail = json.loads(exc.read().decode("utf-8"))
+        except Exception: detail = {"error": "review service rejected assignment"}
+        raise HTTPException(exc.code, str(detail.get("error") or detail))
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise HTTPException(503, f"review service unavailable: {exc}")
+
+
+_assessment_subject_cache: tuple[float, dict[str, list[dict]]] = (float("-inf"), {})  # -inf: fresh-host trap
+_assessment_subject_lock = threading.Lock()
+
+
+def _subject_path(value: Any) -> str:
+    raw = str(value or "").strip()
+    match = _WIKILINK.search(raw)
+    if match:
+        raw = match.group(1).strip()
+    raw = raw.removeprefix("wiki/").removesuffix(".md")
+    return raw
+
+
+def _assessment_subject_index() -> dict[str, list[dict]]:
+    """Current assessment records keyed by their canonical subject page."""
+    global _assessment_subject_cache
+    cached_at, cached = _assessment_subject_cache
+    if time.monotonic() - cached_at < 30:
+        return cached
+    with _assessment_subject_lock:
+        cached_at, cached = _assessment_subject_cache
+        if time.monotonic() - cached_at < 30:
+            return cached
+        out: dict[str, list[dict]] = {}
+        base = WIKI / "assessments"
+        for page in base.rglob("*.md") if base.is_dir() else []:
+            try:
+                fm, _ = split_fm(_read_head(page, 131072))
+            except OSError:
+                continue
+            if not isinstance(fm, dict) or str(fm.get("type") or "") not in {"assessment", "actor-assessment"}:
+                continue
+            # Actor pages present current judgments. Superseded/retired records remain directly
+            # browsable as audit history, but must not read as active evidence on the subject.
+            if str(fm.get("status") or "").strip().lower() in {
+                    "superseded", "retired", "tombstoned"}:
+                continue
+            subject = _subject_path(fm.get("subject") or fm.get("subject_ref"))
+            if not subject.startswith("entities/"):
+                continue
+            rel = page.relative_to(WIKI).as_posix()[:-3]
+            confidence = fm.get("confidence")
+            out.setdefault(subject, []).append({
+                "path": rel, "title": str(fm.get("title") or fm.get("claim") or page.stem),
+                "claim": str(fm.get("claim") or ""), "status": str(fm.get("status") or ""),
+                "assessment_kind": str(fm.get("assessment_kind") or ""),
+                "assessed_value": fm.get("assessed_value"),
+                "assessed_label": str(fm.get("assessed_label") or ""),
+                "epistemic_status": str(fm.get("epistemic_status") or "assessed"),
+                "confidence": round(float(confidence), 3) if isinstance(confidence, (int, float)) else None,
+                "confidence_band": str(fm.get("confidence_band") or ""),
+                "as_of": str(fm.get("as_of") or "")[:10],
+                "last_updated": str(fm.get("last_updated") or fm.get("as_of") or ""),
+                "needs_review": bool(fm.get("needs_review")),
+                "reviewed_by": str(fm.get("reviewed_by") or ""),
+                "reviewed_on": str(fm.get("reviewed_on") or ""),
+            })
+        for rows in out.values():
+            rows.sort(key=lambda row: (row["last_updated"], row["as_of"], row["path"]), reverse=True)
+        _assessment_subject_cache = (time.monotonic(), out)
+        return out
 
 
 @app.get("/api/page")
@@ -2228,8 +3963,12 @@ def api_page(path: str = Query(...)):
     slug = cp.stem.lower()
     prov = _provenance(fm, body)
     conflicts = _shape_conflicts(fm)
+    rel = str(cp.relative_to(WIKI.resolve()))
+    quality = _quality_badges(fm, body, ptype, prov, conflicts)
+    trust = _page_trust_state(rel, fm, quality)
+    subject = rel.removesuffix(".md")
     return {"path": path, "title": str(title), "type": ptype,
-            "rel": str(cp.relative_to(WIKI.resolve())), "html": render_md(body),
+            "rel": rel, "html": render_md(body),
             # a type the pack gives a `profiles:` order to splits its fields into a primary fact
             # panel (`meta`) vs secondary Record details (`meta_aux`). The body always leads the
             # page; the fact panel follows it (see openPage in static/app.js).
@@ -2237,9 +3976,11 @@ def api_page(path: str = Query(...)):
             "panel": _panel_for(fm, body), "provenance": prov,
             "meta": m["primary"], "meta_aux": m["secondary"],
             "conflicts": conflicts, "needs_review": bool(fm.get("needs_review")),
+            "review_enabled": _REVIEW_ENABLED, "review_auth_mode": _REVIEW_AUTH_MODE,
             "observations": _observations_by_canonical().get(slug, []),
+            "assessments": _assessment_subject_index().get(subject, []),
             "citations": _evidence_sources(fm),
-            "quality": _quality_badges(fm, body, ptype, prov, conflicts)}
+            "quality": quality, "trust": trust}
 
 
 @app.get("/api/rollup")
@@ -2582,7 +4323,7 @@ def _backlink_drop_dirs() -> frozenset:
     if _BL_DROP_CACHE[1] is not None and now - _BL_DROP_CACHE[0] < _DIR_TTL:
         return _BL_DROP_CACHE[1]
     drop = {"sources"}
-    sp = VAULT / "schema.yaml"
+    sp = _governing_schema_path()
     if sp.is_file():
         try:
             sch = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}
@@ -2763,14 +4504,6 @@ def _load_backlinks(blocking: bool = True) -> dict:
     return _BACKLINKS["map"] or {}
 
 
-@app.on_event("startup")
-def _prewarm_backlinks() -> None:
-    """Build the backlink graph AND pre-scan the tab datasets in the background at startup so the
-    first user request doesn't block on the build or a cold multi-thousand-file namespace scan."""
-    threading.Thread(target=_load_backlinks, daemon=True).start()
-    threading.Thread(target=_warm_tab_datasets, daemon=True).start()
-
-
 _BL_GROUP_CAP = 12   # items shown per Related-rail type group (the rest collapse to "+N more")
 
 
@@ -2837,7 +4570,7 @@ def _excluded_dirs() -> frozenset:
     if now - _EXCLUDE_CACHE[0] < _BROWSE_TTL:
         return _EXCLUDE_CACHE[1]
     out: set[str] = set()
-    sp = VAULT / "schema.yaml"
+    sp = _governing_schema_path()
     if sp.is_file():
         try:
             sch = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}
@@ -2862,7 +4595,7 @@ def _display_groups() -> list[tuple[str, frozenset]]:
     if now - _GROUPS_CACHE[0] < _BROWSE_TTL:
         return _GROUPS_CACHE[1]
     groups: list[tuple[str, frozenset]] = []
-    sp = VAULT / "schema.yaml"
+    sp = _governing_schema_path()
     if sp.is_file():
         try:
             dg = (yaml.safe_load(sp.read_text(encoding="utf-8")) or {}).get("display_groups") or {}
@@ -2886,7 +4619,7 @@ def _rail_top_section() -> tuple[str, tuple]:
     if now - _RAILTOP_CACHE[0] < _BROWSE_TTL:
         return _RAILTOP_CACHE[1]
     label, ns = "", ()
-    sp = VAULT / "schema.yaml"
+    sp = _governing_schema_path()
     if sp.is_file():
         try:
             d = (yaml.safe_load(sp.read_text(encoding="utf-8")) or {}).get("rail_top_section") or {}
@@ -3025,9 +4758,15 @@ def api_tree():
 @app.get("/api/groups")
 def api_groups():
     """Pack-declared display groups (label -> page count) — browse entities BY KIND across
-    namespaces. Empty when the pack declares none."""
-    return {"groups": [{"label": label, "count": len(_pages_of_types(types))}
-                       for label, types in _display_groups()]}
+    namespaces. A declared-but-UNPOPULATED kind (0 pages, e.g. a 'Report vendors' group whose
+    type was never ingested) is omitted, matching how /api/tree hides empty namespaces — else the
+    browse rail shows a dead '… 0' row (okengine#259, Browse cleanup). Empty when none populated."""
+    out = []
+    for label, types in _display_groups():
+        n = len(_pages_of_types(types))
+        if n:
+            out.append({"label": label, "count": n})
+    return {"groups": out}
 
 
 @app.get("/api/pages")

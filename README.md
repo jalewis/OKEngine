@@ -100,8 +100,8 @@ shape first).
 - **Reader:** `okengine-reader/` is a read-only web UI for the wiki.
 - **MCP query surface:** `okengine-mcp/` exposes read-only tools such as search,
   page fetch, references, and page listing.
-- **Framework CLI:** `scripts/framework.py` scaffolds, lists, pulls, and validates
-  packs.
+- **Framework CLI:** `scripts/framework.py` manages pack lifecycle and discovers, plans,
+  executes, resumes, cancels, and inspects durable operations contributed by packs/extensions.
 - **OKF-compatible floor:** markdown + YAML pages with the minimal `type` field
   baseline where conformance is enabled.
 
@@ -171,6 +171,8 @@ Controls:
 - [`docs/install-okpack-ai-research.md`](docs/install-okpack-ai-research.md) —
   install the AI/LLM research-watch pack.
 - [`docs/authoring-a-pack.md`](docs/authoring-a-pack.md) — author a new pack.
+- [`docs/source-connectors.md`](docs/source-connectors.md) — declarative Bundle,
+  Query, Enrichment, and Stream/Poll source acquisition.
 - [`docs/deploy-a-new-domain.md`](docs/deploy-a-new-domain.md) — pack spec and
   deployment guide.
 - [`docs/engine-domain-boundary.md`](docs/engine-domain-boundary.md) — engine vs

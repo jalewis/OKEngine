@@ -165,6 +165,63 @@ services:
     deploy:
       restart_policy: {condition: on-failure, delay: 10s, max_attempts: 5, window: 120s}
       resources: {limits: {cpus: "2.0", memory: 2560M}}
+  okengine-review-write:
+    profiles: ["review"]
+    build:
+      context: ${ENGINE_DIR:-../engine}
+      dockerfile: okengine-mcp/Dockerfile.review
+    image: okengine-review-write
+    container_name: {{PACK}}-review-write
+    user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
+    restart: unless-stopped
+    # Deliberately bridge-only: no host port and only narrowly scoped review
+    # endpoints. Enable with `docker compose --profile review up -d --build` after
+    # setting OKENGINE_REVIEW_TOKEN, reviewer identity, and either Cockpit Basic auth or the
+    # explicit trusted-network mode.
+    environment:
+      - WIKI_PATH=/opt/vault
+      - OKENGINE_WRITE_TRANSPORT=http
+      - OKENGINE_WRITE_REVIEW_ONLY=1
+      - OKENGINE_WRITE_HOST=0.0.0.0
+      - OKENGINE_WRITE_PORT=8731
+      - OKENGINE_WRITE_TOKEN=${OKENGINE_REVIEW_TOKEN:-}
+      - TZ=${TZ:-UTC}
+    volumes: ["./:/opt/vault"]
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8731/healthz', timeout=2)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      restart_policy: {condition: on-failure, delay: 10s, max_attempts: 5, window: 120s}
+      resources: {limits: {cpus: "0.5", memory: 256M}}
+  okengine-operation-runner:
+    profiles: ["review"]
+    build:
+      context: ${ENGINE_DIR:-../engine}
+      dockerfile: okengine-operations/Dockerfile
+    image: okengine-operation-runner
+    container_name: {{PACK}}-operation-runner
+    user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
+    restart: unless-stopped
+    # Bridge-only governed execution. The allowlist is required; an empty value
+    # exposes no operations. Cockpit plans before it can start a mutation.
+    environment:
+      - WIKI_PATH=/opt/vault
+      - OKENGINE_OPERATION_TOKEN=${OKENGINE_REVIEW_TOKEN:-}
+      - OKENGINE_OPERATION_ALLOW=${OKENGINE_OPERATION_ALLOW:-}
+      - TZ=${TZ:-UTC}
+    volumes: ["./:/opt/vault"]
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8732/healthz', timeout=2)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      restart_policy: {condition: on-failure, delay: 10s, max_attempts: 5, window: 120s}
+      resources: {limits: {cpus: "4.0", memory: 3584M}}
   okengine-cockpit:
     build: ${ENGINE_DIR:-../engine}/okengine-cockpit
     image: okengine-cockpit
@@ -187,6 +244,15 @@ services:
       - OKENGINE_TRUST=${OKENGINE_TRUST:-private}
       - OKENGINE_BIND=${OKENGINE_BIND:-127.0.0.1}
       - TZ=${TZ:-UTC}
+      # Human review decisions are opt-in and fail closed. The Cockpit remains
+      # read-only unless all three values below AND OKENGINE_READER_PASSWORD are set.
+      # Start the bridge-only writer with `docker compose --profile review up -d`.
+      - OKENGINE_REVIEW_API=${OKENGINE_REVIEW_API:-}
+      - OKENGINE_REVIEW_TOKEN=${OKENGINE_REVIEW_TOKEN:-}
+      - OKENGINE_REVIEWER_NAME=${OKENGINE_REVIEWER_NAME:-}
+      - OKENGINE_REVIEW_TRUSTED_NETWORK=${OKENGINE_REVIEW_TRUSTED_NETWORK:-0}
+      - OKENGINE_OPERATION_API=http://okengine-operation-runner:8732
+      - OKENGINE_OPERATION_TOKEN=${OKENGINE_REVIEW_TOKEN:-}
       # Agent Chat (OPT-IN) — relays to the gateway api_server (:8642) by SERVICE NAME on the
       # per-pack bridge; the Chat tab appears only when these are set. Requires the gateway
       # api_server on (API_SERVER_ENABLED=true + key in .env, api_server toolset lockdown in

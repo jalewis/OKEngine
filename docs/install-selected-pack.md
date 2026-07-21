@@ -85,7 +85,9 @@ python ../okengine/scripts/framework.py pull <pack-name> . --update
 - **Added:** brand-new upstream files (e.g. a new cron script) copied straight in.
 - **Flagged, not overwritten:** a changed definition file (`schema.yaml`,
   `CLAUDE.md`, crons, …) is written next to yours as `<file>.upstream`. Diff it,
-  merge what you want, then delete the `.upstream` copy.
+  reconcile them with
+  `python3 <engine>/scripts/framework.py reconcile <pack-dir> --interactive`; the command shows
+  inline diffs, supports accept/keep/external-merge decisions, and validates after the last one.
 
 It prints a summary (`+ new · ~ changed · = unchanged`) and re-validates. After
 merging, bump `engine.version` if the update targets a newer engine and re-run

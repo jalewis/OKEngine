@@ -1,0 +1,26 @@
+connector_version: 1
+id: fixture.bundle
+name: Fixture bundle
+mode: bundle
+trust: {permission: public, data_sensitivity: clear, source_authority: Fixture Authority}
+permissions: {network: true, allowed_hosts: [sources.example], allow_private_network: false, write_raw: true}
+auth: {type: none, secret_refs: {}}
+inputs: {required: []}
+request:
+  url: https://sources.example/catalog
+  method: GET
+  timeout_seconds: 20
+  max_bytes: 1048576
+response:
+  format: json
+  records_path: objects
+  stable_id_path: id
+  revision_path: modified
+  deleted_path: deleted
+pagination: {type: none, max_pages: 1}
+checkpoint: {path: fixture.bundle.json}
+conditional_requests: {enabled: true}
+rate_limit: {max_requests: 1, per_seconds: 1}
+archive: {enabled: true, raw_responses: true, path: fixture.bundle, retention_days: 30}
+license: {name: CC0-1.0, redistribution: allowed, max_retention_days: 3650}
+health: {path: fixture.bundle.json}

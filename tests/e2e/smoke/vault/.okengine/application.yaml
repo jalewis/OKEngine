@@ -1,0 +1,12 @@
+profile: threat-informed-detection
+profile_version: 0.1.0
+bindings:
+  propositions: []
+  roles:
+    threat_procedure: [{type: threat-procedure, namespace: procedures}]
+    detection_requirement: [{type: detection-requirement, namespace: detection-requirements}]
+    detection_strategy: [{type: detection-strategy, namespace: detection-strategies}]
+    detection_analytic: [{type: detection-analytic, namespace: detection-analytics}]
+    deployment_snapshot: [{type: deployment-snapshot, namespace: deployment-snapshots}]
+    validation_result: [{type: validation-result, namespace: validation-results}]
+    coverage_assessment: [{type: coverage-assessment, namespace: coverage-assessments}]

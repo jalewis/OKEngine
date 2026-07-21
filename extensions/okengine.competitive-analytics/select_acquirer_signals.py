@@ -41,7 +41,10 @@ def main() -> int:
         for p in sdir.rglob("*.md"):
             if p.name.startswith("_") or p.name == "INDEX.md":
                 continue
-            txt = p.read_text(errors="replace")
+            try:
+                txt = p.read_text(errors="replace")
+            except OSError:
+                continue  # page moved/deleted by a concurrent lane mid-scan
             pm = _PUB.search(txt)
             if not pm:
                 continue

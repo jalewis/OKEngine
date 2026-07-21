@@ -14,10 +14,75 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
 > **About panel** (reader/cockpit deployment purpose + composition from live state); and now **pack
 > bundles** (v0.10.0). If you are jumping from v0.3.5, read v0.4.0 onward.
 
+## v0.13.0
+
+MINOR — a rapid corrective release folding the fixes and features that landed on `main` after the
+v0.12.0 tag (both devs), plus a **version-integrity correction**: the `okengine-v0.12.0` gateway
+image had been rebuilt with post-tag code, so the tag no longer identified its bits; v0.13.0
+re-establishes tag ↔ code ↔ image agreement. No breaking engine changes; packs on v0.12.x re-stamp.
+
+- **Write-path hardening (#348):** the enforced write path now rejects an entity write whose
+  `sources:` uses the invalid singular `source/` namespace — the entity-backfill fabrication
+  signature (hallucinated actor pages cited `source/<vendor>/<slug>` pages that never existed). Legacy
+  refs already on a page are grandfathered on update.
+- **Reshard correctness (#336):** `okf_migrate.make_path_rewriter` repoints BARE frontmatter path
+  references (e.g. an assessment's `subject:`) on a reshard, not only `[[wikilinks]]` — fixes
+  assessment subjects stranded when `entities/` buckets split a level deeper. New `corpus_audit`
+  dangling-path-reference detector makes the class a standing dashboard row.
+- **entity-resolve robustness (#348):** `normalize()` coerces non-string aliases — a numeric alias
+  (e.g. a mis-imported `aliases: [10768]`) no longer crashes the whole canonical-assemble lane.
+- **Assessments (#343–349):** attested operator-evidence resolver, qualification-result contract,
+  candidate-lead-vs-evidence cockpit distinction; hide superseded assessments, exclude tombstoned
+  subjects from rollups, surface stale references, and leaked-frontmatter detection with line-aware
+  review parsing.
+- **Publish / security:** scrub the internal org-name abbreviation on content (not only via
+  file-exclusion); keep PRIVATE pack names and the private repo's GitLab project ids out of the public
+  snapshot, enforced by a dedicated private-pack publish guard.
+- Pre-release invariant-audit backlog captured in #351 (candidates; no v0.13.0 regressions).
+
+## v0.12.0
+
+MINOR — the largest feature fold since the multipack/extension arc. No breaking engine changes;
+packs on v0.11.x keep validating. Headline capabilities:
+
+- **Threat-informed detection (TID) application (#286–#299):** the detection-engineering epic —
+  versioned application profiles with safe inheritance and a `threat-informed-detection` profile,
+  application role binding, atomic candidate evidence bundles, and cockpit surfaces for the
+  threat-to-defense trace, coverage facets, detection dossier, validation queue, and gap workbench.
+- **Review auto-verification (#313):** deterministic, Admiralty-graded clearing of `needs_review`
+  (1×A or 2×distinct-publisher-B), with judgment types (assessment/proposition/prediction/hypothesis/
+  forecast) never evidence-cleared. The MCP write path still forbids an agent clearing quarantine.
+- **Collection fidelity + identity (#272–#275, #312, #314):** `web_capture` (content-addressed,
+  append-only full-text capture), the declarative `source_connector` runtime + `collection_ledger`,
+  identity-authority enrichment (`authority_enrich`, additive authority-ID stamping), and pack-version
+  migrations auto-applied on `framework pull --update` / `install-domain`.
+- **Composable operations layer (#325)** + the assessments local-evidence resolver.
+- **CI test-category program (#59, #279–#282):** ruff/yamllint/shellcheck linters, Bandit/pip-audit
+  SAST + secret-scan parity, the engine-wired library gate, composed-vault integration, and E2E render
+  smoke on a dedicated dind runner.
+- **Security & write-path hardening:** the `OKENGINE_HARDENED` fail-closed deployment profile (#78);
+  `id`/`created`/provenance immutability on `update`/`patch`; the reserved-file and type-namespace
+  guards extended to every mutating lane; converge's networked-write default-token fail-closed; and an
+  indexed alias-dedup replacing the O(vault) per-create scan.
+- **Deployment-timezone correctness (#301)**, the render-lint scaling series (#305–#311), predictions/
+  corpus fixes, and ecosystem production-readiness (#300).
+- **Internal tooling:** the invariant-audit redesign — a no-LLM deterministic pass plus Sonnet
+  semantic finders (verify phase dropped for main-loop triage) with incremental `since`/`suppress`
+  knobs (#334).
+
+Every fix in the hardening waves followed the standing pattern: root cause + a validation at the
+earliest gate + a red-proven regression test.
+
 ## v0.11.5
 
 Correctness patch — the seven-issue backlog triaged after v0.11.4, in three fix waves. Every fix:
 root cause + a validation at the earliest gate + a red-proven regression test.
+
+- **feat(applications #247):** ship the first versioned application profile,
+  `continuous-hypothesis`. Packs bind domain proposition classes, lifecycle fields, operations,
+  work queues, views, and success measures through `.okengine/application.yaml`; `framework
+  validate` rejects incoherent composition before runtime. A two-class synthetic fixture proves
+  exact changed-evidence selection and preserves a reviewed reassessment-to-learning receipt.
 
 - **fix(mcp #198):** `_run` starts helpers in their own process group and `killpg`s the tree on
   timeout — the orphaned-`iwe` leak (internal timeouts were cosmetic; grandchildren piled up) is

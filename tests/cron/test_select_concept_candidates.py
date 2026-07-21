@@ -66,3 +66,23 @@ def test_existing_hierarchical_concept_not_reported_missing(tmp_path):
     assert "ransomware" not in missing
     # the genuinely-absent one IS missing
     assert "q/quantum-risk" in missing
+
+
+def test_missing_concept_instruction_uses_canonical_partition(tmp_path, capsys, monkeypatch):
+    wiki = tmp_path / "wiki"
+    (wiki / "concepts").mkdir(parents=True)
+    (wiki / "schema.yaml").write_text(
+        "types:\n  concept: {}\npartitioning:\n  namespaces:\n"
+        "    concepts:\n      strategy: by-letter\n"
+    )
+    (wiki / "sources").mkdir()
+    for i in range(3):
+        (wiki / "sources" / f"s{i}.md").write_text("[[concepts/q/quantum-risk]]\n")
+    m = _load(tmp_path)
+    monkeypatch.setattr(m, "MIN_INBOUND_TO_FIRE", 3)
+
+    assert m.main() == 0
+    out = capsys.readouterr().out
+    assert "canonical write key: `concepts/q/quantum-risk`" in out
+    assert "wiki/concepts/<slug>.md" not in out
+    assert "mcp_okengine_write_create_entity" in out

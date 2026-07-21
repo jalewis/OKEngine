@@ -220,9 +220,42 @@ def resolve_for_pack(pack_dir) -> tuple[dict[str, dict], list[str]]:
     core-not-disabled). The single chokepoint the compose / stage / sidecar / schema
     paths use, so default-on core extensions are honored everywhere uniformly."""
     extensions, disc_err = discover(pack_dir)
+    enabled, _ = load_enabled_state(pack_dir)
     eff, en_err = effective_enabled(pack_dir, extensions)
     resolved, res_err = resolve_enabled(sorted(eff), extensions)
-    return resolved, list(en_err) + list(disc_err) + list(res_err)
+    config_err: list[str] = []
+    for ext_id, rec in list(resolved.items()):
+        settings = enabled.get(ext_id) or {}
+        overrides = settings.get("config") if isinstance(settings, dict) else None
+        if overrides is None:
+            continue
+        if not isinstance(overrides, dict):
+            config_err.append(f"FAIL: enabled extension '{ext_id}' config override must be a mapping")
+            continue
+        manifest = dict(rec.get("manifest") or {})
+        declarations = manifest.get("config") or {}
+        if not isinstance(declarations, dict):
+            config_err.append(f"FAIL: extension '{ext_id}' manifest config must be a mapping")
+            continue
+        unknown = sorted(set(overrides) - set(declarations))
+        if unknown:
+            config_err.append(
+                f"FAIL: enabled extension '{ext_id}' has unknown config override(s): "
+                + ", ".join(unknown)
+            )
+            continue
+        effective_config = {}
+        for key, declaration in declarations.items():
+            if isinstance(declaration, dict):
+                effective = dict(declaration)
+                if key in overrides:
+                    effective["default"] = overrides[key]
+            else:
+                effective = overrides.get(key, declaration)
+            effective_config[key] = effective
+        manifest["config"] = effective_config
+        resolved[ext_id] = {**rec, "manifest": manifest}
+    return resolved, list(en_err) + list(disc_err) + list(res_err) + config_err
 
 
 def resolve_enabled(enabled_ids, discovered: list[dict]) -> tuple[dict[str, dict], list[str]]:

@@ -53,6 +53,20 @@ def test_contradictions_extension_ships_valid():
     assert job["no_agent"] is True
 
 
+def test_every_first_party_manifest_is_warning_free():
+    """First-party manifests define the reference contract; ignored fields are release failures."""
+    disc = _load("extension_discovery")
+    em = _load("extension_manifest")
+    exts, errors = disc.discover(None, engine_root=REPO)
+    assert errors == [], errors
+    findings = {}
+    for rec in exts:
+        manifest_errors, warnings = em.validate_manifest(rec["manifest"])
+        if manifest_errors or warnings:
+            findings[rec["id"]] = {"errors": manifest_errors, "warnings": warnings}
+    assert findings == {}
+
+
 def test_contradictions_fully_migrated_out_of_engine_fleet():
     jobs = json.loads((REPO / "config" / "engine-crons.json").read_text())
     assert "contradictions-refresh" not in {j.get("name") for j in jobs}

@@ -34,8 +34,14 @@ import yaml
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
-RULES_FILE = os.environ.get("COMPLETENESS_RULES", "config/completeness-rules.yaml")
-BATCH = int(os.environ.get("GAP_DRAIN_BATCH", "5"))
+RULES_FILE = os.environ.get(
+    "COMPLETENESS_RULES",
+    os.environ.get("OKENGINE_COMPLETENESS_RULES_FILE", "config/completeness-rules.yaml"),
+)
+BATCH = int(os.environ.get(
+    "GAP_DRAIN_BATCH",
+    os.environ.get("OKENGINE_COMPLETENESS_GAP_DRAIN_BATCH", "5"),
+))
 _FM = re.compile(r"\A---[ \t]*\n(.*?\n)---", re.S)
 
 

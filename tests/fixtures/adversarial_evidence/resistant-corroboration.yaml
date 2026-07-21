@@ -1,0 +1,36 @@
+id: assessment:actor-candidate:infrastructure-link
+type: assessment
+subject: entities/a/actor-candidate
+question: Is the cluster operationally linked to the previously tracked actor?
+claim: Independent telemetry supports an operational link.
+status: active
+as_of: 2026-07-16
+confidence: 0.55
+confidence_band: moderate
+proposed_confidence_change: 0.08
+consequence: medium
+alternatives:
+  - Coincidental infrastructure overlap
+adversarial_evidence:
+  - observation: Two independently controlled sensors observed the same rare protocol sequence.
+    source: sources/2026/07/sensor-a
+    observation_confidence: high
+    diagnosticity: high
+    manipulation_susceptibility: low
+    source_independence: primary-direct
+    evidence_lineage: sensor-a
+    claim_role: observation
+    deception_possible: false
+    collection_context: Defender-controlled network sensor with raw packet retention.
+    alternatives: [coincidental overlap]
+  - observation: A separate incident preserved the same sequence and key material.
+    source: sources/2026/07/incident-b
+    observation_confidence: high
+    diagnosticity: high
+    manipulation_susceptibility: low
+    source_independence: independent-origin
+    evidence_lineage: incident-b
+    claim_role: observation
+    deception_possible: false
+    collection_context: Independent victim image acquired before public reporting.
+    alternatives: [shared third-party service]

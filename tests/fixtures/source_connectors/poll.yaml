@@ -1,0 +1,22 @@
+connector_version: 1
+id: fixture.poll
+name: Fixture cursor poll
+mode: poll
+trust: {permission: public, data_sensitivity: clear, source_authority: Fixture Poll}
+permissions: {network: true, allowed_hosts: [poll.example], allow_private_network: false, write_raw: true}
+auth: {type: none, secret_refs: {}}
+inputs: {required: []}
+request: {url: https://poll.example/changes, method: GET}
+response:
+  format: json
+  records_path: changes
+  stable_id_path: id
+  revision_path: revision
+  deleted_path: deleted
+pagination: {type: cursor, max_pages: 3, request_param: cursor, response_path: next_cursor}
+checkpoint: {path: fixture.poll.json}
+conditional_requests: {enabled: true}
+rate_limit: {max_requests: 3, per_seconds: 0}
+archive: {enabled: true, raw_responses: false, path: fixture.poll, retention_days: 14}
+license: {name: CC-BY-4.0, redistribution: allowed, max_retention_days: 365}
+health: {path: fixture.poll.json}

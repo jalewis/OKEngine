@@ -1,0 +1,201 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://okengine.dev/schemas/source-connector-v1.yaml
+title: OKEngine declarative source connector
+type: object
+additionalProperties: false
+required:
+  - connector_version
+  - id
+  - mode
+  - trust
+  - permissions
+  - auth
+  - request
+  - response
+  - pagination
+  - checkpoint
+  - conditional_requests
+  - rate_limit
+  - archive
+  - license
+  - health
+properties:
+  connector_version:
+    const: 1
+  id:
+    type: string
+    pattern: '^[a-z0-9][a-z0-9.-]{1,126}[a-z0-9]$'
+  name:
+    type: string
+  description:
+    type: string
+  mode:
+    enum: [bundle, query, enrichment, stream, poll]
+  trust:
+    type: object
+    additionalProperties: false
+    required: [permission, data_sensitivity, source_authority]
+    properties:
+      permission:
+        enum: [public, authenticated, licensed, internal]
+      data_sensitivity:
+        enum: [clear, internal, restricted]
+      source_authority:
+        type: string
+        minLength: 1
+  permissions:
+    type: object
+    additionalProperties: false
+    required: [network, allowed_hosts, allow_private_network, write_raw]
+    properties:
+      network:
+        const: true
+      allowed_hosts:
+        type: array
+        minItems: 1
+        uniqueItems: true
+        items:
+          type: string
+          pattern: '^[a-z0-9.-]+$'
+      allow_private_network:
+        type: boolean
+      write_raw:
+        type: boolean
+  auth:
+    type: object
+    additionalProperties: false
+    required: [type, secret_refs]
+    properties:
+      type:
+        enum: [none, bearer, api-key, basic]
+      secret_refs:
+        type: object
+        additionalProperties:
+          type: string
+          pattern: '^[A-Z][A-Z0-9_]*$'
+  inputs:
+    type: object
+    additionalProperties: false
+    properties:
+      required:
+        type: array
+        uniqueItems: true
+        items: {type: string, minLength: 1}
+  request:
+    type: object
+    additionalProperties: false
+    required: [url, method]
+    properties:
+      url: {type: string, pattern: '^https?://'}
+      method: {const: GET}
+      headers:
+        type: object
+        additionalProperties: {type: string}
+      query:
+        type: object
+        additionalProperties: {type: string}
+      timeout_seconds: {type: integer, minimum: 1, maximum: 120}
+      max_bytes: {type: integer, minimum: 1, maximum: 26214400}
+  response:
+    type: object
+    additionalProperties: false
+    required: [format, records_path, stable_id_path]
+    properties:
+      format: {enum: [json, jsonl]}
+      records_path: {type: string}
+      stable_id_path: {type: string, minLength: 1}
+      revision_path: {type: string}
+      deleted_path: {type: string}
+  pagination:
+    type: object
+    additionalProperties: false
+    required: [type, max_pages]
+    properties:
+      type: {enum: [none, page, cursor]}
+      max_pages: {type: integer, minimum: 1, maximum: 100}
+      start: {type: integer, minimum: 0}
+      request_param: {type: string, minLength: 1}
+      response_path: {type: string, minLength: 1}
+  checkpoint:
+    type: object
+    additionalProperties: false
+    required: [path]
+    properties:
+      path: {$ref: '#/$defs/relativePath'}
+  conditional_requests:
+    type: object
+    additionalProperties: false
+    required: [enabled]
+    properties:
+      enabled: {type: boolean}
+  rate_limit:
+    type: object
+    additionalProperties: false
+    required: [max_requests, per_seconds]
+    properties:
+      max_requests: {type: integer, minimum: 1}
+      per_seconds: {type: number, minimum: 0}
+  archive:
+    type: object
+    additionalProperties: false
+    required: [enabled, raw_responses, path, retention_days]
+    properties:
+      enabled: {type: boolean}
+      raw_responses: {type: boolean}
+      path: {$ref: '#/$defs/relativePathOrEmpty'}
+      retention_days: {type: integer, minimum: 0}
+  license:
+    type: object
+    additionalProperties: false
+    required: [name, redistribution, max_retention_days]
+    properties:
+      name: {type: string, minLength: 1}
+      url: {type: string}
+      redistribution: {enum: [allowed, restricted, prohibited]}
+      max_retention_days: {type: integer, minimum: 0}
+  health:
+    type: object
+    additionalProperties: false
+    required: [path]
+    properties:
+      path: {$ref: '#/$defs/relativePath'}
+  enrich:
+    # identity-authority application (okengine#314) — declares how authority_enrich.py maps this
+    # enrichment connector's records onto vault pages. Only valid with mode: enrichment.
+    type: object
+    additionalProperties: false
+    required: [authority, id_path, match, targets]
+    properties:
+      authority: {type: string, pattern: '^[a-z][a-z0-9_]{0,30}$'}
+      id_path: {type: string, minLength: 1}
+      match:
+        type: object
+        additionalProperties: false
+        required: [query_input, page_field, candidate_paths]
+        properties:
+          query_input: {type: string, minLength: 1}
+          page_field: {type: string, minLength: 1}
+          candidate_paths:
+            type: array
+            minItems: 1
+            items: {type: string, minLength: 1}
+      targets:
+        type: object
+        additionalProperties: false
+        required: [types]
+        properties:
+          types:
+            type: array
+            minItems: 1
+            items: {type: string, minLength: 1}
+          namespaces:
+            type: array
+            items: {type: string, minLength: 1}
+$defs:
+  relativePath:
+    type: string
+    minLength: 1
+    pattern: '^(?!/)(?!.*(?:^|/)\.\.(?:/|$)).+$'
+  relativePathOrEmpty:
+    type: string
+    pattern: '^(?:$|(?!/)(?!.*(?:^|/)\.\.(?:/|$)).+)$'

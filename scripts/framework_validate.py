@@ -48,6 +48,7 @@ _TOKEN_RE = re.compile(r"\{\{[A-Z][A-Z0-9_]*\}\}")
 # scripts are excluded — they're compile-checked, and f-strings use {{ }}.)
 _TOKEN_SCAN = ("schema.yaml", "CLAUDE.md", "pack.yaml", "engine.version",
                "README.md", ".env.example", "docker-compose.yml",
+               ".okengine/application.yaml",
                "crons/domain-crons.json", "crons/engine-template-prompts.json",
                ".hermes-data/config.yaml")
 # scaffold placeholders that mean a field is still unfilled
@@ -138,11 +139,15 @@ def check_schema(pack: Path, r: Report) -> None:
     for block in ("permissions", "review", "tier"):
         if isinstance(sch.get(block), dict):
             r.info(f"schema.{block}", "declared (G2/G3/G4 policy)")
-    if "strict_types" in sch:
-        r.warn("schema.strict_types", "engine-owned (set in the engine base-schema) — a "
-               "pack-level value is ignored; remove it")
-    type_names = set(types) if isinstance(types, dict) else set()
-    _check_engine_inputs(sch, type_names, r)
+    if "strict_types" in sch and not isinstance(sch.get("strict_types"), bool):
+        r.fail("schema.strict_types", "must be a boolean (true closes the composed type taxonomy)")
+    local_type_names = set(types) if isinstance(types, dict) else set()
+    # Pack schemas are additive fragments over the engine-owned core. Taxonomy
+    # inputs may target core types without illegally redeclaring those types.
+    base = _load_yaml(Path(__file__).resolve().parents[1] / "config" / "base-schema.yaml") or {}
+    base_types = base.get("types") if isinstance(base, dict) else {}
+    effective_type_names = local_type_names | (set(base_types) if isinstance(base_types, dict) else set())
+    _check_engine_inputs(sch, effective_type_names, r)
 
 
 def _check_engine_inputs(sch: dict, type_names: set, r: Report) -> None:
@@ -397,36 +402,61 @@ def check_engine_version(pack: Path, r: Report) -> None:
 
 
 def check_feeds(pack: Path, r: Report, probe: bool) -> None:
+    raw_meta = _load_yaml(pack / "pack.yaml") or {}
+    collection = raw_meta.get("collection") if isinstance(raw_meta, dict) else None
+    non_ingest_overlay = (isinstance(collection, dict)
+                          and collection.get("mode") == "overlay"
+                          and collection.get("feeds") == "none")
     fdir = pack / "feeds"
     opmls = sorted(fdir.glob("*.opml")) if fdir.is_dir() else []  # glob-ok: pack feeds/ is a flat dir, not a sharded content namespace
     if not opmls:
-        r.warn("feeds/*.opml", "no OPML feed lists (pack may be query/enrichment-only)")
+        if non_ingest_overlay:
+            r.info("feeds/*.opml", "none by declared collection contract (analysis overlay)")
+        else:
+            r.warn("feeds/*.opml", "no OPML feed lists (pack may be query/enrichment-only)")
         return
     import xml.etree.ElementTree as ET
+    from urllib.parse import urlparse
+
+    def safe_root(path: Path) -> ET.Element:
+        raw = path.read_bytes()
+        if len(raw) > 10 * 1024 * 1024:
+            raise ET.ParseError("OPML exceeds 10 MiB safety limit")
+        upper = raw[:4096].upper()
+        if b"<!DOCTYPE" in upper or b"<!ENTITY" in upper:
+            raise ET.ParseError("DTD/entity declarations are not permitted")
+        return ET.fromstring(raw)  # nosec B314
     urls: list[str] = []
     for f in opmls:
         try:
-            tree = ET.parse(f)
-        except Exception as e:
+            root = safe_root(f)
+        except (OSError, ET.ParseError) as e:
             r.fail(f"feeds/{f.name} parses", f"XML error: {str(e)[:120]}")
             continue
         found = [u for u in (el.attrib.get("xmlUrl", "").strip()
-                             for el in tree.iter("outline")) if u]
+                             for el in root.iter("outline")) if u]
         urls += found
         r.ok(f"feeds/{f.name}", f"{len(found)} feed url(s)")
     if not urls:
         names = ", ".join(f"feeds/{f.name}" for f in opmls)
-        r.warn(names, "0 active feed URLs — pack is deployable but ingest stays idle until you add "
-               "RSS/Atom <outline xmlUrl=…> entries (suggestions in feeds/*.example). Expected for a "
-               "fresh inert pack; ignore until you enable ingest.")
+        if non_ingest_overlay:
+            r.info(names, "0 active feed URLs by declared collection contract (analysis overlay; "
+                   "host/connectors own collection)")
+        else:
+            r.warn(names, "0 active feed URLs — pack is deployable but ingest stays idle until you add "
+                   "RSS/Atom <outline xmlUrl=…> entries (suggestions in feeds/*.example). Expected for a "
+                   "fresh inert pack; ignore until you enable ingest.")
         return
     if probe:
         import urllib.request
         dead = []
         for u in urls:
             try:
+                parsed = urlparse(u)
+                if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                    raise ValueError("feed URL must use http(s) and include a host")
                 req = urllib.request.Request(u, method="GET", headers={"User-Agent": "framework-validate/1"})
-                with urllib.request.urlopen(req, timeout=12) as resp:
+                with urllib.request.urlopen(req, timeout=12) as resp:  # nosec B310
                     if resp.status >= 400:
                         dead.append(f"{u} ({resp.status})")
             except Exception as e:
@@ -437,6 +467,47 @@ def check_feeds(pack: Path, r: Report, probe: bool) -> None:
             r.ok("feeds reachable", f"{len(urls)}/{len(urls)} live")
     else:
         r.info("feeds reachable", f"{len(urls)} url(s) not probed (pass --probe-feeds)")
+
+
+def check_source_connectors(pack: Path, r: Report) -> None:
+    """Validate every declarative source manifest before it can be deployed.
+
+    The runtime validator owns the grammar; framework validate is the pack-lifecycle
+    adapter so a malformed permission, inline secret, or impossible retention policy
+    fails at authoring/deploy time rather than at the first scheduled tick.
+    """
+    connector_dir = pack / "connectors"
+    if not connector_dir.is_dir():
+        return
+    # glob-ok: connectors/ is a flat pack configuration directory, never a content namespace.
+    paths = sorted((*connector_dir.glob("*.yaml"), *connector_dir.glob("*.yml")))
+    if not paths:
+        r.warn("connectors/", "directory exists but contains no *.yaml or *.yml manifests")
+        return
+    try:
+        import importlib.util
+
+        module_path = Path(__file__).resolve().parent / "cron" / "source_connector.py"
+        spec = importlib.util.spec_from_file_location("okengine_source_connector", module_path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        r.fail("source connector validator", f"could not load engine validator: {exc}")
+        return
+    for path in paths:
+        label = f"connectors/{path.name}"
+        try:
+            manifest = module.load_yaml(path)
+            errors = module.validate_manifest(manifest)
+        except Exception as exc:
+            r.fail(label, str(exc))
+            continue
+        if errors:
+            for error in errors:
+                r.fail(label, error)
+        else:
+            r.ok(label, f"{manifest['mode']} connector {manifest['id']}")
 
 
 def _cron_expr(d: dict) -> str:
@@ -555,6 +626,7 @@ def check_crons(pack: Path, r: Report) -> None:
             r.fail("crons/engine-template-prompts.json parses", f"JSON error: {str(e)[:120]}")
     # shape + script existence for domain defs
     sdir = cdir / "scripts"
+    engine_sdir = Path(__file__).resolve().parent / "cron"
     for d in defs:
         if not isinstance(d, dict) or not d.get("name"):
             r.fail("domain cron shape", f"entry missing name: {str(d)[:80]}")
@@ -571,7 +643,9 @@ def check_crons(pack: Path, r: Report) -> None:
         scr = d.get("script") or ""
         if scr:
             base = Path(scr).name
-            if not (sdir / base).is_file():
+            if (engine_sdir / base).is_file():
+                r.info(f"cron '{d.get('name')}' script", f"{base} supplied by the engine")
+            elif not (sdir / base).is_file():
                 r.warn(f"cron '{d.get('name')}' script", f"{base} not in crons/scripts/ (engine-provided?)")
     # syntax-check pack scripts in-process (compile() — no .pyc side effect, so a
     # read-only/foreign-owned scripts dir never yields a false positive).
@@ -588,11 +662,34 @@ def check_crons(pack: Path, r: Report) -> None:
                                   f"syntax errors in: {bad}" if bad else "all parse")
 
 
-def check_env(pack: Path, r: Report) -> None:
-    ex = pack / ".env.example"
-    if not ex.is_file():
-        r.warn(".env.example", "missing — operators won't know which secrets to set")
+def check_installed_domain_drift(pack: Path, r: Report) -> None:
+    """Warn when a composed pack's deployable host copy no longer matches its ownership snapshot."""
+    base = pack / ".okengine" / "installed-domains"
+    if not base.is_dir():
+        return
+    try:
+        import importlib.util
+        path = Path(__file__).resolve().parent / "composed_pack_state.py"
+        spec = importlib.util.spec_from_file_location("composed_pack_state_validate", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        drift = module.all_installed_drift(pack)
+    except Exception as exc:
+        r.warn("composed pack drift", f"detector failed: {exc}")
+        return
+    if drift:
+        for item in drift:
+            r.warn("composed pack drift", item + "; refresh from the owning pack before deploy")
     else:
+        count = len(list(base.glob("*.json")))  # glob-ok: flat installed-domain manifest directory
+        r.ok("composed pack drift", f"{count} ownership manifest(s) match")
+
+
+def check_env(pack: Path, r: Report, *, required: bool = True) -> None:
+    ex = pack / ".env.example"
+    if not ex.is_file() and required:
+        r.warn(".env.example", "missing — operators won't know which secrets to set")
+    elif ex.is_file():
         txt = ex.read_text(encoding="utf-8", errors="replace")
         if not re.search(r"(ANTHROPIC_API_KEY|DEEPSEEK_API_KEY|OPENROUTER_API_KEY|GOOGLE_API_KEY)", txt):
             r.warn(".env.example model key", "no model-provider key documented")
@@ -780,9 +877,9 @@ def check_runtime_config(pack: Path, r: Report) -> None:
         # repo (.hermes-data gitignored) its absence is expected → WARN. Elsewhere
         # (a deploy-ready dir that should have seeded it) it's a FAIL.
         if _runtime_gitignored(pack):
-            r.warn(".hermes-data/config.yaml", "absent — runtime state (gitignored). Seed it before "
-                   "`docker compose up` with `scripts/ensure-runtime.sh` (`framework init`/`pull` do "
-                   "this automatically). Fine for a pack-definition checkout")
+            r.info(".hermes-data/config.yaml", "absent in definition checkout (gitignored runtime "
+                   "state); `framework init`/`pull` or `scripts/ensure-runtime.sh` must seed it "
+                   "before deployment")
         else:
             r.fail(".hermes-data/config.yaml", "missing — copy the engine config template and fill deployment keys")
         return
@@ -805,10 +902,18 @@ def check_runtime_config(pack: Path, r: Report) -> None:
         missing.append("mcp_servers.okengine")
     if not isinstance(servers, dict) or "okengine-write" not in servers:
         missing.append("mcp_servers.okengine-write")
+    scoped_writer_missing = (not isinstance(servers, dict)
+                             or "okengine-write-source-quality" not in servers)
     if missing:
         r.fail(".hermes-data/config.yaml required keys", ", ".join(missing))
     else:
         r.ok(".hermes-data/config.yaml")
+    if scoped_writer_missing:
+        r.warn("mcp_servers.okengine-write-source-quality",
+               "missing from an older runtime config; ensure-runtime.sh will add the "
+               "server-bound job identity before containers are recreated")
+    else:
+        r.ok("mcp_servers.okengine-write-source-quality", "server-bound job identity declared")
     # The seeded read-MCP Authorization header must be a real token, not the
     # template placeholder — an unsubstituted `<...>` 401s the gateway agent on
     # every read-MCP call (okengine#32).
@@ -905,6 +1010,17 @@ def check_pack_meta(pack: Path, r: Report) -> None:
     # `framework list` — one declaration, three surfaces (multi-surface rule). Read
     # raw: load_pack_meta normalizes composition keys only.
     raw = _load_yaml(pack / "pack.yaml") or {}
+    collection = raw.get("collection")
+    if collection is not None:
+        if not isinstance(collection, dict):
+            r.fail("pack.yaml collection", "must be a mapping")
+        else:
+            mode, feeds = collection.get("mode"), collection.get("feeds")
+            if (mode, feeds) != ("overlay", "none"):
+                r.fail("pack.yaml collection", "supported declaration is "
+                       "{mode: overlay, feeds: none}; omit collection for ingest-capable packs")
+            else:
+                r.ok("pack.yaml collection", "analysis overlay; host/connectors own collection")
     if not str(raw.get("description") or "").strip():
         r.warn("pack.yaml description", "missing — the About panel and catalog have "
                                         "nothing to say about this deployment's purpose")
@@ -1055,18 +1171,76 @@ def check_tokens(pack: Path, r: Report) -> None:
         r.ok("template tokens", "all rendered")
 
 
+def check_application_profile(pack: Path, r: Report) -> None:
+    """Validate an optional supported-application declaration.
+
+    The application module owns the grammar and profile catalog. Keeping this adapter small makes
+    ``framework validate`` the one author-facing conformance command instead of creating a second
+    application CLI.
+    """
+    declaration = pack / ".okengine" / "application.yaml"
+    if not declaration.is_file():
+        return
+    try:
+        import importlib.util
+
+        path = Path(__file__).resolve().parent / "application_profiles.py"
+        spec = importlib.util.spec_from_file_location("application_profiles", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        errors = module.validate(pack, Path(__file__).resolve().parents[1])
+    except Exception as exc:
+        r.fail("application profile", f"validator failed: {exc}")
+        return
+    if errors:
+        for error in errors:
+            r.fail("application profile", error)
+    else:
+        data = _load_yaml(declaration) or {}
+        r.ok("application profile", f"{data.get('profile')} {data.get('profile_version')}")
+
+
+def check_policy_plane(pack: Path, r: Report) -> None:
+    """Compose engine, pack, and extension policy before deployment."""
+    try:
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "tools" / "policy_plane.py"
+        spec = importlib.util.spec_from_file_location("okengine_policy_plane", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        policy = module.effective_policy(pack)
+    except Exception as exc:
+        r.fail("policy plane", str(exc))
+        return
+    r.ok("policy plane", f"{len(policy['rules'])} rule(s); digest {policy['digest'][:12]}")
+    prompt_path = pack / "crons" / "engine-template-prompts.json"
+    if prompt_path.is_file():
+        try:
+            prompts = json.loads(prompt_path.read_text(encoding="utf-8"))
+            prompt = str(prompts.get("source-quality-backfill") or "")
+            errors = module.check_prompt(policy, "cron:source-quality-backfill", prompt)
+        except Exception as exc:
+            errors = [str(exc)]
+        for error in errors:
+            r.fail("source-quality capability/prompt", error)
+        if not errors:
+            r.ok("source-quality capability/prompt", "prompt conforms to enforced field/body authority")
+
+
 def validate(pack: Path, probe: bool = False) -> Report:
     r = Report()
     check_tokens(pack, r)
     if _is_bundle(pack):
         # A bundle (okengine#181) owns nothing and ships no schema/persona/crons/feeds/wiki —
-        # it composes other packs. Validate identity + recipe + engine pin + docs/env only; the
+        # it composes other packs. Validate identity + recipe + engine pin + docs and the
+        # tracked-secret guard; a non-runtime recipe has no environment to document. The
         # domain-content checks below don't apply and would spuriously FAIL on absent files.
         check_pack_meta(pack, r)
         check_bundle(pack, r)
         check_engine_version(pack, r)
         check_docs(pack, r)
-        check_env(pack, r)
+        check_env(pack, r, required=False)
         return r
     check_schema(pack, r)
     check_persona(pack, r)
@@ -1074,8 +1248,12 @@ def validate(pack: Path, probe: bool = False) -> Report:
     check_pack_meta(pack, r)
     check_extension_requirements(pack, r)
     check_enabled_extensions_resolve(pack, r)
+    check_application_profile(pack, r)
+    check_policy_plane(pack, r)
     check_feeds(pack, r, probe)
+    check_source_connectors(pack, r)
     check_crons(pack, r)
+    check_installed_domain_drift(pack, r)
     check_model_profiles(pack, r)
     check_env(pack, r)
     check_gateway_env(pack, r)

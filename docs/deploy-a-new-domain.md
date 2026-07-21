@@ -25,6 +25,7 @@ vault repo). Layout:
 ├── CLAUDE.md                # persona / curation rules (domain voice + workflow)
 ├── engine.version           # the engine release this pack is pinned to
 ├── feeds/*.opml             # feed sources (read by the generic feed_fetch.py)
+├── connectors/*.yaml        # optional declarative Bundle/Query/Enrichment/Stream/Poll sources
 ├── data/*                   # domain data tables (consumed by engine-template crons)
 ├── crons/
 │   ├── domain-crons.json            # your domain-tier cron definitions (full)
@@ -201,7 +202,12 @@ files, and writes each changed definition file as `<file>.upstream` next to your
    # private/monorepo packs: framework.py pull /path/to/repo:packs/<pack> <deployment-dir> --update
    ```
 
-2. **Reconcile every `.upstream` file — never bulk-adopt.** Diff each one. Rules of thumb:
+2. **Reconcile every `.upstream` file — never bulk-adopt.** Use
+   `python3 <engine>/scripts/framework.py reconcile <deployment-dir> --interactive`.
+   It shows each inline diff and requires an explicit accept-upstream, keep-local, merge, or
+   skip decision. A merge tool can be supplied with `--merge-tool 'meld'` (the command receives
+   `LOCAL UPSTREAM`) or `OKENGINE_MERGE_TOOL`. Non-interactive equivalents are `--show FILE`,
+   `--accept FILE`, `--keep FILE`, and `--merge FILE`. Rules of thumb:
    - **Keep the deployment's copy** for anything carrying deployment state:
      `pack.yaml` (a deliberate `trust:` flip), the active `feeds/feeds.opml`,
      `crons/domain-crons.json` (install-time jittered minutes + locally added jobs),
@@ -213,9 +219,12 @@ files, and writes each changed definition file as `<file>.upstream` next to your
      via `type_aliases`). Merge the upstream delta by hand, or skip it if the change
      doesn't apply.
    - **Adopt upstream** for everything else (validators, conformance suites, docs, CI).
-   - Delete each `.upstream` as you settle it; finish with none left.
-3. **Validate the pack offline:** `python3 validate.py` in the deployment dir
-   (plus its conformance suite, if it ships one).
+   - Finish with no `.upstream` files. The reconcile command runs `framework validate` after the
+     final decision; a validation failure is a hard stop. Run the pack's own conformance suite too,
+     if it ships one.
+3. **Validate the pack-specific contract:** run `python3 validate.py` in the deployment dir
+   (plus its conformance suite, if it ships one). The engine-level validation already ran at the
+   end of reconciliation.
 4. **Redeploy crons only if cron files changed** (`domain-crons.json`,
    `engine-template-prompts.json`, `crons/scripts/`): `deploy-cron-scripts.sh` +
    `deploy-cron-plus-jobs.sh` with `HERMES_UID` exported (§3 step 2). Definition-only

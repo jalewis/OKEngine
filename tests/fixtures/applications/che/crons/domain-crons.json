@@ -1,0 +1,9 @@
+[
+  {"name": "forecast-reassess", "schedule": "0 1 * * *", "action": "true"},
+  {"name": "forecast-resolve", "schedule": "0 2 * * *", "action": "true"},
+  {"name": "forecast-measure", "schedule": "0 3 * * *", "action": "true"},
+  {"name": "diagnostic-reassess", "schedule": "0 4 * * *", "action": "true"},
+  {"name": "diagnostic-resolve", "schedule": "0 5 * * *", "action": "true"},
+  {"name": "diagnostic-measure", "schedule": "0 6 * * *", "action": "true"}
+]
+

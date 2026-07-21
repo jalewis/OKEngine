@@ -10,12 +10,18 @@ Commands:
   framework pull <source> [dest] [--into DIR] [--ref REF] [--force] [--update] [--port-offset N]
       Fetch an EXISTING pack definition from a repo or the catalog (framework_pull).
       --update refreshes a deployed pack in place, keeping .env/runtime/content and
-      surfacing changed definition files as <file>.upstream for manual merge.
+      surfacing changed definition files as <file>.upstream for reconciliation; it
+      previews the pack-version migrations pending for the update span, and
+      --apply-migrations runs them (snapshot + validation gate + auto-rollback;
+      okengine#312).
+  framework reconcile <pack> [--interactive | --show/--accept/--keep/--merge FILE]
+      Review and resolve files from `pull --update`; validates the pack after the final
+      pending file is settled (framework_reconcile; okengine#61).
   framework list [--catalog URL|PATH] [--json]
       Browse the pack catalog (delegates to framework_list).
   framework validate <pack> [--probe-feeds] [--quiet]
       Pre-deploy sanity check on a pack (delegates to framework_validate).
-  framework install-domain <deployment> <pack> [--under wiki/<slug>] [--shape ...] [--apply]
+  framework install-domain <deployment> <pack> [--under wiki/<slug>] [--shape ...] [--refresh] [--apply]
       Install a pack ALONGSIDE the host in a live deployment (okengine#173): both
       co-install shapes (walk-up subtree / taxonomy-augmenting), collision-preflighted,
       key-based merges (idempotent), dry-run by default.
@@ -39,6 +45,9 @@ Commands:
       tiers, enable/disable them, and emit deploy artifacts (delegates to
       framework_extensions; okengine#134, #113, #128, #135). enable/disable manage
       vault-level state + scoped MCP tokens; redeploy regenerates the fleet.
+  framework operations (list | inspect | plan | run | status | logs | history | resume | cancel) …
+      Discover and execute durable operations contributed by the engine, packs, and extensions.
+      Operations share manifests, receipts, locking, and status across CLI and Cockpit.
 
 Each subcommand's own --help lists its flags. Exit code is the subcommand's.
 """
@@ -61,6 +70,7 @@ def _load(modname: str, filename: str):
 _COMMANDS = {
     "init": ("framework_init", "framework_init.py"),
     "pull": ("framework_pull", "framework_pull.py"),
+    "reconcile": ("framework_reconcile", "framework_reconcile.py"),
     "list": ("framework_list", "framework_list.py"),
     "validate": ("framework_validate", "framework_validate.py"),
     "import": ("framework_import", "framework_import.py"),
@@ -71,6 +81,7 @@ _COMMANDS = {
     "compose-preview": ("framework_compose_preview", "framework_compose_preview.py"),
     "budget": ("framework_budget", "framework_budget.py"),
     "extensions": ("framework_extensions", "framework_extensions.py"),
+    "operations": ("framework_operations", "framework_operations.py"),
 }
 
 

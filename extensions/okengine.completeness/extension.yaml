@@ -45,7 +45,7 @@ operations:
     schedule: {kind: cron, expr: "25 6 * * *"}   # after the 05:55 audit refreshes the queue
     entrypoint: select_gap_fixes.py              # wake-gate: silent when nothing is fixable
     prompt_file: prompts/gap_drain.md
-    toolsets: [hermes-cron, okengine-write, okengine]
+    toolsets: [file, todo, okengine-write, okengine]
     tier: analyze
 config:
   rules_file:
@@ -53,17 +53,18 @@ config:
     default: "config/completeness-rules.yaml"
     description: >-
       Vault-relative path to the pack's rule set. Absent -> the lane no-ops LOUDLY (the
-      relevance-gate convention: never guess a boundary). Override via COMPLETENESS_RULES.
+      relevance-gate convention: never guess a boundary). Env:
+      OKENGINE_COMPLETENESS_RULES_FILE.
   gap_drain_batch:
     type: string
     default: "5"
     description: >-
       Open agent-fixable gaps drained per gap-drain run (oldest first; the backlog drains
-      across days). Override via GAP_DRAIN_BATCH.
+      across days). Env: OKENGINE_COMPLETENESS_GAP_DRAIN_BATCH.
   max_gaps_per_rule:
     type: string
     default: "200"
     description: >-
       Cap on OPEN gaps a single rule may hold; beyond it the rule is marked saturated on
       the dashboard instead of flooding the queue (silent truncation is logged, never
-      hidden). Override via COMPLETENESS_MAX_PER_RULE.
+      hidden). Env: OKENGINE_COMPLETENESS_MAX_GAPS_PER_RULE.

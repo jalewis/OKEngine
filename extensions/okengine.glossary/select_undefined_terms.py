@@ -16,7 +16,9 @@ from collections import Counter
 from pathlib import Path
 
 WIKI = Path(os.environ.get("WIKI_PATH", "/opt/vault")) / "wiki"
-MIN_REFS = int(os.environ.get("OKENGINE_GLOSSARY_MIN_REFS", "3"))   # config.min_references
+MIN_REFS = int(os.environ.get(
+    "OKENGINE_GLOSSARY_MIN_REFS", os.environ.get("OKENGINE_GLOSSARY_MIN_REFERENCES", "3")
+))
 # Tolerate the alias/anchor wikilink forms — `[[glossary/api-gateway|API gateway]]` and
 # `[[glossary/api-gateway#usage]]` are canonical (rebuild_index / broken-wikilinks-drain / lacuna
 # all handle them). The old `]]`-immediately-after-slug pattern counted zero references for a term

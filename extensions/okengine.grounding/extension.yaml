@@ -23,4 +23,4 @@ operations:
     schedule: {kind: cron, expr: "50 4 * * *"}     # daily; wake-gated to fresh grounded entities
     entrypoint: select_grounding_check.py
     prompt_file: prompts/grounding-check.md
-    toolsets: [hermes-cron, okengine-write, okengine]
+    toolsets: [file, todo, okengine-write, okengine]

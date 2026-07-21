@@ -57,6 +57,12 @@ RULES = """rules:
     field: last_reviewed
     max_age_days: 90
     severity: low
+  - id: prediction-gradeable
+    when: {type: prediction}
+    expect: section
+    section: What would refute this
+    min_chars: 20
+    severity: medium
 """
 
 
@@ -179,3 +185,20 @@ def test_gap_drain_silent_when_nothing_fixable(tmp_path, monkeypatch, capsys):
     assert m.main() == 0
     out = capsys.readouterr().out
     assert '"wakeAgent": false' in out and "operator-only" in out
+
+
+def test_section_kind_gradeability_gate(tmp_path, monkeypatch):
+    """okengine#214: a resolvable proposition without substantive refutation criteria opens a
+    gap; a thick section satisfies; a present-but-thin section still gaps (vacuous criteria)."""
+    _vault(tmp_path)
+    _page(tmp_path, "predictions/p-good", "type: prediction\ntitle: Good\n",
+          "# G\n\n## What would refute this\n\nA vendor advisory retracting the CVE, or 90 days with zero KEV additions.\n")
+    _page(tmp_path, "predictions/p-missing", "type: prediction\ntitle: Missing\n",
+          "# M\n\nNo criteria section at all.\n")
+    _page(tmp_path, "predictions/p-thin", "type: prediction\ntitle: Thin\n",
+          "# T\n\n## What would refute this\n\nTBD\n\n## Other\nx\n")
+    _run(tmp_path, monkeypatch)
+    gaps = {p.stem for p in (tmp_path / "wiki" / "gaps").rglob("*.md")}
+    assert "prediction-gradeable--predictions-p-missing" in gaps
+    assert "prediction-gradeable--predictions-p-thin" in gaps
+    assert not any("p-good" in g for g in gaps), gaps

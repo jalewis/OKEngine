@@ -40,8 +40,12 @@ import panel_svg    # noqa: E402  (sibling: server-side SVG — the chart lives 
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
-EVO_FIELD = os.environ.get("VIZ_EVOLUTION_FIELD", "evolution")
-VAL_FIELD = os.environ.get("VIZ_VALUE_FIELD", "value_chain")
+EVO_FIELD = os.environ.get(
+    "VIZ_EVOLUTION_FIELD", os.environ.get("OKENGINE_VIZ_EVOLUTION_FIELD", "evolution")
+)
+VAL_FIELD = os.environ.get(
+    "VIZ_VALUE_FIELD", os.environ.get("OKENGINE_VIZ_VALUE_FIELD", "value_chain")
+)
 _FM = re.compile(r"\A---[ \t]*\n(.*?\n)---", re.S)
 # final path segment — concepts may be letter-sharded ([[concepts/t/slug]]) or flat ([[concepts/slug]])
 _CLINK = re.compile(r"\[\[\s*concepts/(?:[a-z0-9._-]+/)*([a-z0-9][a-z0-9-]*)\s*(?:[|#\]])")
@@ -94,7 +98,9 @@ def main() -> int:
     # anchor scope (VIZ_ANCHOR): stems the anchor pages link. A stem that resolves to a concept is
     # directly in scope; a stem that resolves to an entity marks that entity as an anchor entity,
     # whose own concept links join the scope during the graph scan below (1 hop).
-    anchors = [a.strip() for a in os.environ.get("VIZ_ANCHOR", "").split(",") if a.strip()]
+    anchors = [a.strip() for a in os.environ.get(
+        "VIZ_ANCHOR", os.environ.get("OKENGINE_VIZ_ANCHOR", "")
+    ).split(",") if a.strip()]
     anchor_stems: set = set()
     for a in anchors:
         ap = WIKI / a
@@ -119,7 +125,11 @@ def main() -> int:
         src_concept = p.stem.lower() if rel.startswith("concepts/") else None
         anchor_hop = is_entity and anchored and p.stem.lower() in anchor_stems
         seen = set()
-        for slug in _CLINK.findall(p.read_text(encoding="utf-8", errors="replace")):
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue  # page moved/deleted by a concurrent lane mid-scan
+        for slug in _CLINK.findall(text):
             s = slug.lower()
             if s in indeg:
                 indeg[s] += 1

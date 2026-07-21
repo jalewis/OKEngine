@@ -29,7 +29,8 @@ extensions/<id>/                 # tier-1 engine (extensions/), tier-2 pack (<pa
   <selector>.py / run.py         # in-gateway script(s) — staged into the gateway at deploy
   <lib>.py                       # shared code the scripts import (staged alongside)
   prompts/<op>.md                # bundled agent prompts (optional)
-  schema/<frag>.schema.yaml       # schema fragment, if it owns/extends types (optional)
+  schema/<frag>.schema.yaml       # schema fragment: owns/extends plus optional enums,
+                                  # field_enums, field_shapes, and field_items contracts
   README.md
 ```
 
@@ -122,6 +123,28 @@ dependency contract.
   okengine#124), `sidecar` (its own container — the isolation boundary).
 - **`capabilities`** = what it may touch: `read` scopes, `write` namespaces, `network`,
   `secrets`, `delivery` — granted by the operator at enable, independent of trust.
+
+Path scope can be narrowed with an optional field/body policy for every new writer whose
+responsibility is smaller than a namespace:
+
+```yaml
+capabilities:
+  read: [sources/**]
+  write: [sources/**]
+  write_policy:
+    rule_id: my-extension-quality-fields
+    operations: [update]
+    paths: [sources/**]
+    types: [source]
+    update_fields: [my_score, my_score_reason]
+    protected_fields: [type, id, publisher, published, url]
+    body: deny
+```
+
+The token store binds this grant to the authenticated extension. Writes outside its operation,
+path, type, field, or body authority fail atomically. See
+[`policy-plane.md`](design/policy-plane.md) for rule ownership, composition, tests, diagnosis, and
+waivers.
 
 ## 5. Schema — own / reuse / extend
 

@@ -33,6 +33,9 @@ def test_wrapper_wires_shipped_extractors():
     assert 'if [ -f "$REPO/scripts/extract-docs.py" ]' in txt
     # Single-flight guard so long first passes never overlap.
     assert "flock" in txt
+    assert 'LOCK_KEY="$(printf \'%s\' "$RAW" | cksum' in txt
+    assert "okengine-extract-raw-${LOCK_KEY}.lock" in txt
+    assert "EXTRACT_LOCK_FILE" in txt
 
 
 def test_installer_is_idempotent_guarded():

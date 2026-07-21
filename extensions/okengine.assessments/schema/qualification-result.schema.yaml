@@ -1,0 +1,32 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+title: OKEngine claim qualification result
+type: object
+required: [contract, subject_ref, dimension, question, specialist_policy, examined,
+  qualified_observations, missing_elements, search_scope, terminal_recommendation, result_digest]
+properties:
+  contract: {const: claim-qualification/v1}
+  subject_ref: {type: string, minLength: 1}
+  dimension: {type: string, minLength: 1}
+  question: {type: string, minLength: 1}
+  specialist_policy: {type: string, minLength: 1}
+  result_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+  search_scope: {type: string, minLength: 1}
+  terminal_recommendation:
+    enum: [assessed, collection-required, searched-not-found, not-applicable, failed]
+  missing_elements:
+    type: array
+    uniqueItems: true
+    items: {type: string, minLength: 1}
+  qualified_observations: {type: array}
+  examined:
+    type: array
+    items:
+      type: object
+      required: [artifact, artifact_digest, evidence_role, outcome, reason_code]
+      properties:
+        artifact: {type: string, minLength: 1}
+        artifact_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+        evidence_role: {const: candidate-lead}
+        outcome: {enum: [qualified, rejected, unresolved]}
+        reason_code: {type: string, minLength: 1}
+        missing_elements: {type: array, items: {type: string}}

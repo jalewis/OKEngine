@@ -18,7 +18,9 @@ except Exception:                              # pragma: no cover
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 ENTITIES = VAULT / "wiki" / "entities"
-MAX_GROUPS = int(os.environ.get("OKENGINE_CONFIG_MAX_GROUPS", "25"))
+MAX_GROUPS = int(os.environ.get(
+    "OKENGINE_CONFIG_MAX_GROUPS", os.environ.get("OKENGINE_DEDUPE_MAX_GROUPS", "25")
+))
 _FM = re.compile(r"^---\n(.*?)\n---\n", re.S)
 
 

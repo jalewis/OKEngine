@@ -13,7 +13,8 @@ enabled lane:
   NEVER-RUN  — enabled lane with no run log yet
 
 Writes wiki/dashboards/fleet-health.md (🟢/🟡/🔴 + tables) + a loud stdout summary so a red shows
-up in the run output. Domain-agnostic; reads runtime only (no wiki content).
+up in the run output. Also writes `.fleet-lanes.json`, the machine-readable lane-identity handoff
+health_export uses for transition alerts. Domain-agnostic; reads runtime only (no wiki content).
 
 Env: WIKI_PATH (/opt/vault) · CRON_JOBS (/opt/data/cron-plus/jobs.json) ·
      CRON_LOGS (/opt/data/logs/cron-plus) · FLEET_STALE_GRACE (3.0)
@@ -72,6 +73,7 @@ def main() -> int:
     nowts = now.timestamp()
     rows = []          # (status, name, detail)
     counts = {"stale": 0, "errored": 0, "off-model": 0, "never-run": 0, "ok": 0}
+    lane_sets = {key: [] for key in counts}
     for j in jobs:
         if not j.get("enabled", True):
             continue
@@ -81,6 +83,7 @@ def main() -> int:
         log, mt = _latest_log(name)
         if log is None:
             counts["never-run"] += 1
+            lane_sets["never-run"].append(name)
             rows.append(("🟡 never-run", name, f"enabled, no run log ({expr})"))
             continue
         age = nowts - mt
@@ -93,17 +96,21 @@ def main() -> int:
         if interval and age > interval * GRACE:
             status, detail = "🔴 STALE", f"last run {int(age // 3600)}h ago (cadence ~{int(interval // 3600)}h)"
             counts["stale"] += 1
+            lane_sets["stale"].append(name)
         elif _ERR.search(tail):
             status = "🔴 ERRORED"
             hit = next((ln.strip()[:80] for ln in tail.splitlines() if _ERR.search(ln)), "error")
             detail = f"last run: {hit}"
             counts["errored"] += 1
+            lane_sets["errored"].append(name)
         elif model and ":free" not in str(model) and _FREE.search(tail):
             status = "🔴 OFF-MODEL"
             detail = f"configured {model} but ran on a free/fallback model"
             counts["off-model"] += 1
+            lane_sets["off-model"].append(name)
         else:
             counts["ok"] += 1
+            lane_sets["ok"].append(name)
         rows.append((status, name, detail))
 
     bad = counts["stale"] + counts["errored"] + counts["off-model"]
@@ -124,14 +131,24 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     try:
         out.write_text("\n".join(L), encoding="utf-8")
+        # Atomic producer/consumer handoff: health_export must never parse a half-written JSON file
+        # and silently fall back to count transitions during a real composition change.
+        sidecar = out.parent / ".fleet-lanes.json"
+        tmp = sidecar.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({
+            "updated": nowiso,
+            **{key: sorted(names) for key, names in lane_sets.items()},
+        }, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(sidecar)
     except OSError as e:
         # The dashboard file is foreign-owned (root, from a bare `docker exec` write), so the lane
         # uid can't overwrite it — the exact uid-desync condition check_ownership/fix-vault-ownership
         # exist for. A raw PermissionError here would crash the monitor ON ITS OWN OUTPUT with no
         # peer, and a downstream pipeline that scrapes this dashboard (health_export #9) would read
         # the frozen last-green copy forever. Fail loud with the remedy instead (okengine#178).
-        print(f"fleet-health: ERROR cannot write {out}: {e} — likely a foreign-owned (root) "
-              "dashboard file. Repair: scripts/fix-vault-ownership.sh <deployment-dir>", file=sys.stderr)
+        print(f"fleet-health: ERROR cannot write dashboard/sidecar under {out.parent}: {e} — likely "
+              "a foreign-owned (root) file. Repair: scripts/fix-vault-ownership.sh <deployment-dir>",
+              file=sys.stderr)
         print(json.dumps({"wakeAgent": False}))
         return 1
 

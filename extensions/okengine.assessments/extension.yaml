@@ -1,0 +1,30 @@
+id: okengine.assessments
+kind: operation
+version: 0.1.0
+name: Assessments
+description: >-
+  Reusable estimative-assessment ledger with adversarial-evidence qualifications,
+  deterministic confidence-move constraints, and an analyst-readable review dashboard.
+trust: in-gateway
+core: false
+requires:
+  engine: ">=0.5.0"
+capabilities:
+  read: [assessments/**]
+  write: [dashboards/**]
+  network: false
+schema:
+  - schema/assessments.schema.yaml
+  - schema/qualification-result.schema.yaml
+operations:
+  adversarial-evidence-review:
+    schedule: {kind: cron, expr: "12 7 * * *"}
+    entrypoint: adversarial_evidence.py
+    tier: analyze
+config:
+  large_confidence_move:
+    type: number
+    default: 0.10
+  manipulable_evidence_cap:
+    type: number
+    default: 0.05

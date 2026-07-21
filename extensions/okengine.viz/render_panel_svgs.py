@@ -36,7 +36,10 @@ def main() -> int:
     for p in sorted(base.rglob("*.md")):
         if p.name.startswith(("_", "INDEX")):
             continue
-        text = p.read_text(encoding="utf-8", errors="replace")
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue  # page moved/deleted by a concurrent lane mid-scan
         m = _FM.match(text)
         if not m:
             continue

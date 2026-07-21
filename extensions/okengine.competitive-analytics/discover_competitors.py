@@ -83,7 +83,10 @@ def _load_entities():
     for p in edir.rglob("*.md"):
         if p.name.startswith(("_", ".")) or p.name.startswith("INDEX"):
             continue
-        txt = p.read_text(errors="replace")[:8000]
+        try:
+            txt = p.read_text(errors="replace")[:8000]
+        except OSError:
+            continue  # page moved/deleted by a concurrent lane mid-scan
         m = _FM.search(txt)
         if not m:
             continue
@@ -118,7 +121,10 @@ def _mine_alternatives(anchor_names, exclude_norms):
     for p in sdir.rglob("*.md"):
         if p.name.startswith(("_", ".")) or p.name.startswith("INDEX"):
             continue
-        raw = p.read_text(errors="replace")[:50000]
+        try:
+            raw = p.read_text(errors="replace")[:50000]
+        except OSError:
+            continue  # page moved/deleted by a concurrent lane mid-scan
         body = _FM.sub("", raw, count=1)                    # BODY only — skip frontmatter (publishers, titles)
         for am in arx.finditer(body):
             ctx = body[max(0, am.start() - 60): am.end() + 60]

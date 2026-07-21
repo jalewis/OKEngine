@@ -1,0 +1,7 @@
+schema_version: 1
+id: fixture-conflict
+version: 0.1.0
+name: Conflicting child
+extends: {profile: fixture-parent, version: ">=1.0.0"}
+operating_loop:
+  - {id: assess, capability: replacement, after: []}

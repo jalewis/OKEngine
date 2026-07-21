@@ -15,7 +15,7 @@
 #   pip install -r okengine-mcp/requirements.txt # MCP-dependent tests
 #   pip install fastapi markdown nh3 httpx pyyaml croniter python-docx python-pptx openpyxl striprtf
 #   pip install playwright && playwright install chromium    # smoke DOM layer
-#   # + docker, gitleaks, node (Claude Code Workflow runtime), ripgrep on PATH
+#   # + docker, gitleaks, Claude Code with Workflow support, ripgrep on PATH
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
 PY="${PREFLIGHT_PYTHON:-${SMOKE_PYTHON:-python3}}"
@@ -41,10 +41,19 @@ done
 
 # System tools.
 echo "== system tools =="
-for t in git rg docker gitleaks node; do
+for t in git rg docker gitleaks; do
   if command -v "$t" >/dev/null 2>&1; then printf '  ✓ %s  (%s)\n' "$t" "$(command -v "$t")"
   else printf '  ⚠ %s  (absent)\n' "$t"; warn=$((warn+1)); fi
 done
+# Agent-driven audit layers are application-hosted Workflows, NOT Node scripts. `node` being
+# present proves nothing (running invariant-audit.mjs directly produces an expected syntax error).
+if command -v claude >/dev/null 2>&1; then
+  printf '  ✓ claude  (%s; confirm this build exposes Workflow(...))\n' \
+    "$(claude --version 2>/dev/null || command -v claude)"
+else
+  echo "  ⚠ claude CLI absent (invariant-audit/re-verify require Claude Code with Workflow support)"
+  warn=$((warn+1))
+fi
 # playwright system browser (the smoke DOM layer needs a system Chrome via channel="chrome")
 if "$PY" -c 'import playwright' 2>/dev/null; then
   if "$PY" -c 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(channel="chrome"); b.close(); p.stop()' 2>/dev/null; then

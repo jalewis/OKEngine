@@ -28,6 +28,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -42,7 +43,7 @@ STATE_REL = Path(".okengine") / "migrations-state.json"
 SNAPSHOTS_REL = Path(".okengine") / "snapshots"
 # Runtime/generated/VCS trees the snapshot+rollback scope skips — migrations transform the pack
 # SOURCE (schema, crons, wiki, configs, .okengine state), not these.
-SNAPSHOT_EXCLUDES = {".git", ".hermes-data", "data", "tmp", "logs",
+SNAPSHOT_EXCLUDES = {".git", ".hermes-data", "tmp", "logs",
                      "node_modules", ".venv", "__pycache__",
                      "rolled-back"}   # quarantine of files a rollback set aside (#32) — never re-scoped
 
@@ -139,7 +140,7 @@ def applicable(migrations: list, pin: str, target: str, meta) -> list:
 
 @dataclass
 class Plan:
-    status: str                 # current | compatible | upgrade | unknown
+    status: str                 # current | compatible | upgrade | ahead | unknown
     pin: Optional[str]
     target: Optional[str]
     target_hermes: Optional[str]
@@ -154,6 +155,10 @@ def plan_upgrade(pack: Path, target, target_hermes, migrations, meta) -> Plan:
         return Plan("unknown", pin, target, target_hermes)
     if pin == target:
         return Plan("current", pin, target, target_hermes)
+    if meta._semver(pin) > meta._semver(target):
+        # This command has no down-migrations. Treating an ahead pin as an "upgrade" selected an
+        # empty migration range and then silently rewrote the pack to the older running engine.
+        return Plan("ahead", pin, target, target_hermes)
     status = "compatible" if meta.satisfies_pin(pin, target) else "upgrade"
     migs = applicable(migrations, pin, target, meta)
     pending = [m for m in migs if m.id not in applied]
@@ -206,7 +211,16 @@ def load_all_migrations(engine_dir: Path, pack: Path) -> list:
     wins) — but ONLY when they share a to_version; a same-id/DIFFERENT-to_version pair is an accidental
     id collision that would silently suppress the engine migration forever (invariant-audit B5.2),
     so fail loud and make the author pick a unique id."""
-    eng = {m.id: m for m in load_migrations(engine_dir)}
+    # Fail loud on a duplicate id WITHIN the engine migrations dir — a plain dict comprehension
+    # silently kept the later-sorted file and dropped the earlier, so a copy-paste id collision made
+    # one engine migration never run for ANY pack, with migrations-state recording success
+    # (invariant-audit — asymmetric with the pack-vs-engine collision guard below, which IS loud).
+    eng: dict = {}
+    for m in load_migrations(engine_dir):
+        if m.id in eng:
+            raise SystemExit(f"duplicate engine migration id {m.id!r} in {engine_dir} — two "
+                             "migration files share an ID; give each a unique ID.")
+        eng[m.id] = m
     by_id = dict(eng)
     meta = _engine_meta()
 
@@ -288,13 +302,85 @@ def _page_failure_map(root: Path) -> dict:
     return out
 
 
+def _unknown_type_map(root: Path) -> dict:
+    """{unknown_type: [wiki-relative page paths]} under ``root/wiki``.
+
+    This is deliberately separate from the runtime conformance profile:
+    ``schema_reject_reason`` remains fail-open for unknown types, while an upgrade can safely
+    compare this map with its pre-migration snapshot. The validator's own schema resolver is used
+    so each page sees the same root/sub-domain composed schema, exclusions, and reserved-file
+    rules as the write path. Alias keys and values are accepted alongside canonical ``types``.
+
+    Fail-open on validator/schema/read errors. A broken audit must never create a false rollback;
+    the normal structural/conformance gates still run independently.
+    """
+    try:
+        sv = importlib.util.spec_from_file_location(
+            "schema_validator_unknown_types", _HERE.parent / "tools" / "schema_validator.py")
+        schema_validator = importlib.util.module_from_spec(sv)
+        sv.loader.exec_module(schema_validator)
+    except Exception:
+        return {}
+    wiki = root / "wiki"
+    if not wiki.is_dir():
+        return {}
+    out: dict[str, list[str]] = {}
+    for p in sorted(wiki.rglob("*.md")):
+        try:
+            content = p.read_text(encoding="utf-8", errors="replace")
+            kind, _reason = schema_validator._evaluate(str(p), content)
+            if kind != "ok":
+                continue
+            match = schema_validator._FM_RE.match(content)
+            fm = schema_validator.yaml.safe_load(match.group(1)) if match else None
+            if not isinstance(fm, dict):
+                continue
+            typ = str(fm.get("type") or "").strip()
+            if not typ:
+                continue
+            schema_path = schema_validator._find_schema(str(p))
+            schema = schema_validator._load_schema(schema_path) if schema_path else None
+            if not isinstance(schema, dict):
+                continue
+            effective = schema_validator._base_merged(schema)
+            aliases = effective.get("type_aliases") or {}
+            known = set((effective.get("types") or {}).keys())
+            if isinstance(aliases, dict):
+                known.update(str(k) for k in aliases)
+                known.update(str(v) for v in aliases.values())
+            if typ not in known:
+                out.setdefault(typ, []).append(p.relative_to(wiki).as_posix())
+        except Exception:
+            continue
+    return out
+
+
+def _unknown_type_regressions(before_root: Path, after_root: Path, cap: int = 300) -> list:
+    """Newly-unknown type values introduced by a migration.
+
+    Compare VALUES, not only paths: moving/resharding a page carrying a pre-existing unknown type
+    must not false-roll-back an unrelated upgrade. Conversely, removing a formerly-known type from
+    the composed taxonomy is caught because it was absent from the before-unknown set. Returns up
+    to ``cap`` ``path: unknown type '…'`` examples.
+    """
+    before_types = set(_unknown_type_map(before_root))
+    after = _unknown_type_map(after_root)
+    out = []
+    for typ in sorted(set(after) - before_types):
+        for rel in after[typ]:
+            out.append(f"{rel}: unknown type '{typ}' newly introduced by migration")
+            if len(out) >= cap:
+                return out
+    return out
+
+
 def _sample_page_failures(pack: Path, cap: int = 300) -> list:
     """EXHAUSTIVE OKF conformance scan of `pack/wiki`; up to `cap` `path: reason` strings for pages
     that violate their type's schema (missing/invalid required field, bad YAML, absent type). This is
     the raw after-scan; the roll-forward GATE diffs it against the pre-upgrade baseline via
-    `_conformance_regressions` so pre-existing failures don't roll back a legit upgrade. Does NOT flag
-    an out-of-taxonomy retype (schema_reject_reason is fail-open; `strict_types:false` engine base
-    default) — see `okengine#207`."""
+    `_conformance_regressions` so pre-existing failures don't roll back a legit upgrade. Unknown
+    types remain outside this raw runtime-profile scan; the snapshot-aware
+    `_unknown_type_regressions` gate handles only migration-introduced values (okengine#207)."""
     return [f"{rel}: {reason}" for rel, reason in sorted(_page_failure_map(pack).items())[:cap]]
 
 
@@ -468,6 +554,192 @@ def prune_snapshots(pack: Path, keep: int) -> int:
     return removed
 
 
+# --- pack-VERSION migrations on update (okengine#312) ------------------------
+# The runner above triggers on ENGINE-pin reconciliation. Packs also ship their own
+# migrations — `<pack>/migrations/m_*.py`, same module contract, keyed on PACK versions
+# (okpacks-library VERSIONING.md). `framework pull --update` / `install-domain` over an
+# existing member call run_pack_migrations() so a pack update carries its transforms
+# through the SAME snapshot / dry-run / roll-forward machinery.
+
+PACK_MIGRATIONS_REL = Path("migrations")
+
+
+def installed_pack_version(vault: Path, name: str, fallback: Optional[str] = None) -> Optional[str]:
+    """The recorded installed version of pack `name` in this vault, else `fallback`.
+    The state record is authoritative over pack.yaml: after a dry-run surfaces pending
+    migrations, `framework reconcile` may accept pack.yaml.upstream (new version) before
+    anyone applies them — the recorded floor is what keeps the span alive."""
+    v = (read_state(vault).get("pack_versions") or {}).get(name)
+    return str(v) if v else fallback
+
+
+def record_pack_version(vault: Path, name: str, version: str) -> None:
+    f = vault / STATE_REL
+    f.parent.mkdir(parents=True, exist_ok=True)
+    state = read_state(vault)
+    state.setdefault("pack_versions", {})[name] = version
+    f.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
+def _record_pack_applied(vault: Path, name: str, version: str,
+                         applied_ids: list, now_iso: str) -> None:
+    """Applied pack-migration ids join the SAME `applied` set as engine ones (ids are
+    globally unique by convention); history rows carry the pack name."""
+    f = vault / STATE_REL
+    f.parent.mkdir(parents=True, exist_ok=True)
+    state = read_state(vault)
+    state.setdefault("pack_versions", {})[name] = version
+    state["applied"] = sorted(set(state.get("applied", [])) | set(applied_ids))
+    state.setdefault("history", []).append(
+        {"at": now_iso, "pack": name, "to": version, "migrations": list(applied_ids)})
+    f.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
+def changelog_impact(changelog_text: Optional[str], installed: str, incoming: str, meta) -> list:
+    """`version: migration-impact` lines for the CHANGELOG sections in (installed, incoming].
+    A schema-touching release must carry a `Migration impact:` line (VERSIONING.md R3) — a
+    section without one is surfaced as such rather than silently skipped."""
+    if not changelog_text:
+        return []
+    lo, hi = meta._semver(installed), meta._semver(incoming)
+    if lo is None or hi is None:
+        return []
+    out = []
+    section_ver, section_lines = None, []
+
+    def _flush():
+        if section_ver is None:
+            return
+        impact = [ln.strip() for ln in section_lines if "migration impact" in ln.lower()]
+        out.append(f"{section_ver}: " + ("; ".join(impact) if impact
+                                         else "(no migration-impact line in CHANGELOG)"))
+    for ln in changelog_text.splitlines():
+        m2 = re.match(r"##\s+v?(\d+\.\d+\.\d+)\b", ln)
+        if m2:
+            _flush()
+            v = meta._semver(m2.group(1))
+            section_ver = m2.group(1) if (v and lo < v <= hi) else None
+            section_lines = []
+        elif section_ver is not None:
+            section_lines.append(ln)
+    _flush()
+    return out
+
+
+def run_pack_migrations(vault: Path, name: str, installed: Optional[str], incoming: Optional[str],
+                        *, apply: bool, migrations_dir: Optional[Path] = None,
+                        changelog_text: Optional[str] = None, keep_snapshots: int = 3,
+                        no_validate: bool = False, record: bool = True,
+                        apply_hint: str = "--apply-migrations") -> int:
+    """Plan/apply the pack-version migration span (installed, incoming] against `vault`.
+
+    Mirrors the engine-pin apply path: dry-run preview by default; on `apply` — snapshot,
+    run, record state, roll-forward gate (structural validate + conformance/unknown-type
+    regressions vs the snapshot), automatic rollback on any failure. `record=False` makes a
+    dry-run fully write-free (install-domain's plan mode). Returns 0 ok / 1 failed+rolled-back
+    or packaging error."""
+    meta = _engine_meta()
+    if not incoming or meta._semver(incoming) is None:
+        return 0                                    # upstream has no comparable version
+    if not installed or installed == "0.0.0" or meta._semver(installed) is None:
+        # Pre-versioning install (or no record): no span to compute. NEVER guess one from
+        # 0.0.0 — that would replay every migration ever shipped onto a live vault. Baseline
+        # at the incoming version and tell the operator to follow the CHANGELOG by hand once.
+        if record:
+            record_pack_version(vault, name, incoming)
+        print(f"  pack version: {name} installed version unknown — baselined at {incoming}; "
+              f"apply any older CHANGELOG migration steps manually")
+        return 0
+    iv, nv = meta._semver(installed), meta._semver(incoming)
+    if iv == nv:
+        if record and installed_pack_version(vault, name) is None:
+            record_pack_version(vault, name, incoming)
+        return 0
+    if iv > nv:
+        print(f"  ⚠ pack version: installed {installed} is NEWER than incoming {incoming} "
+              f"({name}) — downgrade migrations are unsupported; nothing run")
+        return 0
+    mdir = migrations_dir if migrations_dir is not None else vault / PACK_MIGRATIONS_REL
+    try:
+        migs = load_migrations(mdir)
+        span = applicable(migs, installed, incoming, meta)   # raises on unparseable to_version (#178)
+    except (RuntimeError, ValueError) as e:
+        print(f"ERROR: pack migrations ({name}): {e}", file=sys.stderr)
+        return 1
+    applied = set(read_state(vault).get("applied", []))
+    pending = [m for m in span if m.id not in applied]
+    print(f"  pack version: {installed} → {incoming}  ({name})")
+    for line in changelog_impact(changelog_text, installed, incoming, meta):
+        print(f"    changelog {line}")
+    if not pending:
+        if record:
+            record_pack_version(vault, name, incoming)
+        skipped = f" ({len(span)} already applied)" if span else ""
+        print(f"    no pending pack migrations{skipped} — recorded version {incoming}")
+        return 0
+    print(f"    pack migrations to apply ({len(pending)}):")
+    for m in pending:
+        print(f"      • {m.id}: {m.from_version}→{m.to_version}  {m.description}")
+    if not apply:
+        for m in pending:
+            for c in (m.apply_fn(vault, True) or []):
+                print(f"      [{m.id}] {c}")
+        if record and installed_pack_version(vault, name) is None:
+            # Floor the span NOW: reconcile may accept pack.yaml.upstream before the operator
+            # applies, and without this record the next update would see old==new and skip.
+            record_pack_version(vault, name, installed)
+        print(f"    (dry-run — re-run with {apply_hint} to perform, with snapshot + rollback)")
+        return 0
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    snap = snapshot(vault, now.strftime("%Y%m%dT%H%M%S"),
+                    {"at": now_iso, "pack": name, "from": installed, "to": incoming,
+                     "migrations": [m.id for m in pending]})
+    print(f"    snapshot: .okengine/snapshots/{snap.name} (pre-migration source)")
+    try:
+        changes = []
+        for m in pending:
+            for c in (m.apply_fn(vault, False) or []):
+                changes.append(f"[{m.id}] {c}")
+        _record_pack_applied(vault, name, incoming, [m.id for m in pending], now_iso)
+    except Exception as e:
+        n = restore(vault, snap, added=added_since_snapshot(vault, snap),
+                    modified=changed_since_snapshot(vault, snap))
+        shutil.rmtree(snap, ignore_errors=True)
+        print(f"    ✗ pack migration FAILED mid-apply: {e}")
+        print(f"    ↩ ROLLED BACK ({n} files restored) — vault unchanged; added files "
+              f"quarantined under .okengine/rolled-back/, not deleted.")
+        return 1
+    # Freeze added/modified BEFORE the slow validation gate — same live-vault-write
+    # protection as the engine path (#12). The state record above is inside `modified`,
+    # so a rollback reverts it too and the span stays pending for a retry.
+    added = added_since_snapshot(vault, snap)
+    modified = changed_since_snapshot(vault, snap)
+    for c in changes:
+        print(f"    {c}")
+    print(f"    state recorded in .okengine/migrations-state.json ({name} → {incoming})")
+    ok, summary = (True, "validation skipped (--no-validate)") if no_validate else VALIDATOR(vault)
+    if ok and not no_validate:
+        reg = _conformance_regressions(snap / "tree", vault, cap=300)
+        if reg:
+            ok, summary = False, (f"{len(reg)}+ page(s) REGRESSED conformance after the "
+                                  f"migration (e.g. {reg[0]}) — rolling back")
+        else:
+            unknown = _unknown_type_regressions(snap / "tree", vault, cap=300)
+            if unknown:
+                ok, summary = False, (f"{len(unknown)}+ page(s) gained a NEW out-of-taxonomy "
+                                      f"type after the migration (e.g. {unknown[0]}) — rolling back")
+    print(f"    roll-forward check: {summary}")
+    if not ok:
+        n = restore(vault, snap, added=added, modified=modified)
+        shutil.rmtree(snap, ignore_errors=True)
+        print(f"    ↩ ROLLED BACK ({n} files restored) — vault unchanged; added files "
+              f"quarantined under .okengine/rolled-back/, not deleted.")
+        return 1
+    prune_snapshots(vault, keep_snapshots)
+    return 0
+
+
 # --- CLI ---------------------------------------------------------------------
 
 def render(plan: Plan) -> str:
@@ -478,6 +750,8 @@ def render(plan: Plan) -> str:
         L.append("  ~ compatible (same series, engine is patch-newer); --apply records the exact pin.")
     elif plan.status == "upgrade":
         L.append("  ⤴ minor/major bump — pin is STALE; `validate` FAILs until upgraded.")
+    elif plan.status == "ahead":
+        L.append("  ✗ pack pin is NEWER than the running engine; downgrade is unsupported.")
     else:
         L.append("  ? cannot compare versions (missing or unparseable pin / engine release).")
     if plan.migrations:
@@ -521,6 +795,10 @@ def main(argv: list) -> int:
     plan = plan_upgrade(pack, target, htag, migrations, meta)
     print(render(plan))
     if plan.status == "unknown":
+        return 2
+    if plan.status == "ahead":
+        print("ERROR: refusing to rewrite a newer pack with an older engine. "
+              "Use the matching/newer engine checkout.", file=sys.stderr)
         return 2
     if not a.apply:
         if plan.migrations:
@@ -587,6 +865,12 @@ def main(argv: list) -> int:
             ok = False
             summary = (f"{len(reg)}+ vault page(s) REGRESSED conformance after the migration "
                        f"(e.g. {reg[0]}) — rolling back")
+        else:
+            unknown = _unknown_type_regressions(snap / "tree", pack, cap=300)
+            if unknown:
+                ok = False
+                summary = (f"{len(unknown)}+ vault page(s) gained a NEW out-of-taxonomy type "
+                           f"after the migration (e.g. {unknown[0]}) — rolling back")
     print(f"\nRoll-forward check: {summary}")
     if not ok:
         if snap:

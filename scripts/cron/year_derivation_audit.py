@@ -25,6 +25,7 @@ from pathlib import Path
 
 # Sibling-script import — both live in /opt/data/scripts/ after deploy.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tz_lib  # noqa: E402
 from select_raw_batch import (  # noqa: E402
     BULK_IMPORT_MTIMES,
     BULK_IMPORT_SENTINEL_YEAR,
@@ -176,7 +177,7 @@ def render(data: dict) -> str:
     lines.append("")
     lines.append("# Year-derivation audit")
     lines.append("")
-    lines.append(f"> Generated: {NOW.strftime('%Y-%m-%d %H:%M UTC')}  ")
+    lines.append(f"> Generated: {tz_lib.deployment_now().strftime('%Y-%m-%d %H:%M %Z')}  ")  # okengine#301
     lines.append("> One-shot diagnostic of how `select_raw_batch.derive_year()` classifies each raw file.")
     lines.append("> Re-run via `bash scripts/cron-plus.sh` (no cron) — purely informational.")
     lines.append("")

@@ -1,0 +1,20 @@
+# Narrow, bridge-only human-review write service. Build context is the engine
+# repository root so write_server keeps its normal repository-relative imports.
+FROM python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f
+
+WORKDIR /engine
+COPY okengine-mcp/requirements.txt /engine/requirements.txt
+RUN pip install --no-cache-dir -r /engine/requirements.txt
+
+COPY okengine-mcp/write_server.py okengine-mcp/scope.py /engine/okengine-mcp/
+COPY tools/schema_validator.py tools/policy_plane.py /engine/tools/
+COPY config/policy/catalog.yaml /engine/config/policy/catalog.yaml
+
+ENV WIKI_PATH=/opt/vault \
+    OKENGINE_WRITE_TRANSPORT=http \
+    OKENGINE_WRITE_REVIEW_ONLY=1 \
+    OKENGINE_WRITE_HOST=0.0.0.0 \
+    OKENGINE_WRITE_PORT=8731
+EXPOSE 8731
+
+CMD ["python", "/engine/okengine-mcp/write_server.py"]

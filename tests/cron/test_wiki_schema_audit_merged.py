@@ -7,10 +7,12 @@ aliases as unsanctioned types. This pins `merged_schema` + `type_aliases`.
 """
 import importlib.util
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO = Path(__file__).resolve().parents[2]
 MOD = REPO / "scripts" / "cron" / "wiki_schema_audit.py"
@@ -40,3 +42,13 @@ def test_base_types_are_canonical_not_drift(tmp_path):
         assert base in m.CANONICAL_TYPES, f"{base} should be canonical via merged_schema"
     assert "actor" in m.CANONICAL_TYPES                 # the pack type too
     assert m.TYPE_ALIASES.get("threat-actor") == "actor"   # alias resolves, not counted as drift
+
+
+def test_schema_lib_bootstraps_packaged_yaml_for_system_python():
+    site_packages = str(Path(yaml.__file__).resolve().parents[1])
+    env = {**os.environ, "OKENGINE_PACKAGED_SITE_PACKAGES": site_packages}
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", "import schema_lib; print(schema_lib.yaml.__name__)"],
+        cwd=REPO / "scripts" / "cron", env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "yaml"

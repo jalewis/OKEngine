@@ -28,10 +28,19 @@ from datetime import date, timedelta
 from pathlib import Path
 
 WIKI = Path(os.environ.get("WIKI_PATH", "/opt/vault")) / "wiki"
-MIN_DEMAND = int(os.environ.get("OKENGINE_FRONTIER_MIN_DEMAND", "5"))       # config.min_demand
-MAX_SUPPLY = int(os.environ.get("OKENGINE_FRONTIER_MAX_SUPPLY", "2"))       # config.max_supply
-REANALYZE_DAYS = int(os.environ.get("OKENGINE_FRONTIER_REANALYZE_DAYS", "60"))  # config.reanalyze_days
-BATCH = int(os.environ.get("OKENGINE_FRONTIER_BATCH_SIZE", "5"))            # config.batch_size
+MIN_DEMAND = int(os.environ.get(
+    "OKENGINE_FRONTIER_MIN_DEMAND", os.environ.get("OKENGINE_FRONTIER_WATCH_MIN_DEMAND", "5")
+))
+MAX_SUPPLY = int(os.environ.get(
+    "OKENGINE_FRONTIER_MAX_SUPPLY", os.environ.get("OKENGINE_FRONTIER_WATCH_MAX_SUPPLY", "2")
+))
+REANALYZE_DAYS = int(os.environ.get(
+    "OKENGINE_FRONTIER_REANALYZE_DAYS",
+    os.environ.get("OKENGINE_FRONTIER_WATCH_REANALYZE_DAYS", "60"),
+))
+BATCH = int(os.environ.get(
+    "OKENGINE_FRONTIER_BATCH_SIZE", os.environ.get("OKENGINE_FRONTIER_WATCH_BATCH_SIZE", "5")
+))
 
 # Match `[[concepts/<slug>]]` AND sharded `[[concepts/<shard>/.../<slug>]]`, capturing the final
 # slug so both link forms fold into one capability (the okengine#145 sharding lesson).

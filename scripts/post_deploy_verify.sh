@@ -19,6 +19,11 @@ GW=${OKENGINE_GATEWAY_SVC:-gateway}
 MCP=${OKENGINE_MCP_SVC:-okengine-mcp}
 READER=${OKENGINE_READER_SVC:-okengine-reader}
 COCKPIT=${OKENGINE_COCKPIT_SVC:-okengine-cockpit}
+OPERATIONS=${OKENGINE_OPERATION_SVC:-okengine-operation-runner}
+# Keep the verifier's own source path out of the deployment environment's
+# ENGINE_DIR namespace. Packs commonly pin ENGINE_DIR in .env; that file is
+# sourced below and must not redirect verification to an older checkout.
+VERIFY_ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 pass=0; warn=0; fail=0
 ok()  { printf "  \033[32mPASS\033[0m  %s\n" "$1"; pass=$((pass+1)); }
@@ -154,6 +159,44 @@ else bad "okengine-write not in $CFG" "re-run deploy; the enforced write path mu
 if dcx "$GW" test -f /opt/hermes/okengine-mcp/write_server.py; then ok "write_server.py present in the gateway image"
 else bad "write_server.py missing in the gateway" "rebuild the gateway image (scripts/build-engine-image.sh)"; fi
 
+# 4a. composed policy digest + non-mutating least-privilege probe ----------------
+expected_policy=$(OKENGINE_POLICY_CATALOG="$VERIFY_ENGINE_DIR/config/policy/catalog.yaml" \
+    python3 "$VERIFY_ENGINE_DIR/tools/policy_plane.py" digest --vault "$PWD" 2>/dev/null)
+runtime_policy=$(python3 -c 'import json; print(json.load(open(".okengine/effective-policy.json")).get("digest", ""))' 2>/dev/null)
+if [ -n "$expected_policy" ] && [ "$expected_policy" = "$runtime_policy" ]; then
+    ok "runtime policy digest matches composed source ($runtime_policy)"
+else
+    bad "runtime policy digest drift (runtime=${runtime_policy:-missing}, expected=${expected_policy:-unavailable})" \
+        "rerun deploy.sh so policy is recomposed from merged engine/pack/extension sources"
+fi
+probe=$(dcx "$GW" /opt/hermes/.venv/bin/python -c \
+    'import sys;sys.path.insert(0,"/opt/hermes/tools");import policy_plane as p;x=p.effective_policy();r=p.evaluate_capability(x,"cron:source-quality-backfill","update","sources/probe","source",["type"],"none");print((r or {}).get("rule_id", "ALLOW"))')
+if [ "$probe" = "source-quality-fields-only" ]; then
+    ok "source-quality capability probe rejects protected-field mutation without writing"
+else
+    bad "source-quality capability probe returned ${probe:-nothing}" \
+        "rebuild the gateway image and verify the effective policy artifact"
+fi
+
+# 4b. governed operation runner (optional review profile) --------------------
+if docker compose --profile review config --services 2>/dev/null | grep -Fxq "$OPERATIONS"; then
+    echo "[4b] operation runner"
+    if docker compose ps --status running --services 2>/dev/null | grep -Fxq "$OPERATIONS"; then
+        if dcx "$OPERATIONS" python3 -c \
+            'import urllib.request;urllib.request.urlopen("http://127.0.0.1:8732/healthz",timeout=2)' ; then
+            ok "operation runner is healthy and bridge-only"
+        else
+            bad "operation runner health check failed" "docker compose --profile review logs $OPERATIONS"
+        fi
+        allow=$(dcx "$OPERATIONS" sh -c 'printf %s "$OKENGINE_OPERATION_ALLOW"')
+        if [ -n "$allow" ]; then ok "operation runner has an explicit allowlist"
+        else bad "operation runner allowlist is empty" "set OKENGINE_OPERATION_ALLOW to approved operation names"; fi
+    elif [ -n "${OKENGINE_OPERATION_ALLOW:-}" ]; then
+        wn "operations are allowlisted but the runner is not active" \
+           "docker compose --profile review up -d --build $OPERATIONS $COCKPIT"
+    fi
+fi
+
 # 5. cron-plus registration --------------------------------------------------
 echo "[5] cron-plus scheduler"
 if dcx "$GW" sh -c "grep -q 'cron-plus' $CFG"; then ok "cron-plus plugin enabled in config.yaml"
@@ -189,6 +232,20 @@ elif [ $(( now_epoch - lock_mtime )) -le 180 ] 2>/dev/null; then
 else
   bad "cron-plus .tick.lock is STALE ($(( now_epoch - lock_mtime ))s old, > 3 ticks) — the scheduler ticked once then STOPPED" \
       "docker compose logs $GW | grep -i 'tick error'; check CRON_PLUS_DISABLED in the gateway env and that plugins/cron-plus is present"
+fi
+# 5b. scheduler-stalled sentinel — the tick.lock freshness check above is BLIND to a
+# ticking-but-not-loading scheduler: tick() refreshes .tick.lock via open("w") BEFORE load_jobs(),
+# so a store-unreadable stall (the exact condition cron-plus drops .scheduler-stalled for, #197)
+# keeps a fresh lock and passes 5a. The sentinel is the machine-readable alarm for "NO lanes
+# firing", but its only other reader is deployment_validate — a cron LANE the stalled scheduler
+# never runs. Read it HERE, at the scheduler-independent deploy gate (invariant-audit HIGH #2).
+stalled=$(dcx "$GW" sh -c 'f=/opt/data/cron-plus/.scheduler-stalled; [ -f "$f" ] && cat "$f" || true' 2>/dev/null)
+if [ -n "$stalled" ]; then
+  why=$(printf '%s' "$stalled" | python3 -c 'import sys,json;
+try: print(json.load(sys.stdin).get("error","") or "unreadable job store")
+except Exception: print("unreadable job store")' 2>/dev/null || echo "unreadable job store")
+  bad "cron-plus scheduler STALLED sentinel present ($why) — it is ticking but cannot load jobs.json, so NO lanes are firing (5a's fresh .tick.lock is misleading here)" \
+      "docker compose logs $GW | grep -iE 'cron-plus|load_jobs'; validate /opt/data/cron-plus/jobs.json, then restart $GW"
 fi
 # 5c. runtime-dir ownership — the ticker + every lane run AS $HERMES_UID and must OWN /opt/data to
 # write .tick.lock/jobs.json. A tree owned by a DIFFERENT uid (brought up with the compose default
@@ -246,6 +303,35 @@ else
     else
         bad "qmd index empty and $QDIR is NOT writable by $MCP — 'qmd update' fails with a PermissionError, the index stays empty forever" \
             "chown .hermes-data/qmd to the mcp uid (HERMES_UID) + recreate $MCP; a bare 'docker compose up' after 'rm .hermes-data/qmd' re-creates it root-owned"
+    fi
+fi
+
+# 8. deployment timezone reaches the UI clocks (okengine#301) ----------------
+# A non-UTC TZ in .env must actually reach the reader/cockpit containers, or their clocks AND the
+# dates cron scripts stamp onto content render in UTC — the drift that shipped to several readers
+# whose (stale-skeleton) compose omitted `TZ=${TZ:-UTC}` on the reader service even though the same
+# stack's cockpit had it. Only meaningful when a real zone is intended; unset/UTC is the engine
+# default and correct by definition, so we skip it (no false FAIL on a UTC deployment).
+echo "[8] deployment timezone -> UI clocks (okengine#301)"
+EXPECT_TZ="${TZ:-}"
+if [ -z "$EXPECT_TZ" ] || [ "$EXPECT_TZ" = "UTC" ]; then
+    ok "TZ unset/UTC — UTC clocks are correct by default (nothing to verify)"
+else
+    UI_AUTH=(); [ -n "$READER_PW" ] && UI_AUTH=(-u "${OKENGINE_READER_USER:-okengine}:$READER_PW")
+    # served tz from a UI JSON endpoint, or empty if unreachable/unauthorized/pre-#301
+    _served_tz() { curl -s -m8 "${UI_AUTH[@]}" "$1" 2>/dev/null \
+        | python3 -c "import sys,json;print((json.load(sys.stdin) or {}).get('tz',''))" 2>/dev/null; }
+    _check_ui_tz() {   # $1=label $2=service $3=api-path
+        local b; b=$(hostport "$2" 9200)
+        if [ -z "$b" ]; then wn "$1 port unpublished — clock tz UNVERIFIED" "expose $2, or check its container TZ directly (docker compose exec $2 printenv TZ)"; return; fi
+        local tz; tz=$(_served_tz "http://127.0.0.1:${b##*:}$3")
+        if [ -z "$tz" ]; then wn "$1 clock tz UNVERIFIED (no tz in $3 — auth, or a pre-#301 image)" "confirm OKENGINE_READER_USER/PASSWORD reach $2, or rebuild its image"
+        elif [ "$tz" = "$EXPECT_TZ" ]; then ok "$1 clock tz=$tz (matches TZ)"
+        else bad "$1 clock tz=$tz but the deployment TZ=$EXPECT_TZ" "add '- TZ=\${TZ:-UTC}' to the $2 service environment in docker-compose.yml, then: docker compose up -d --force-recreate $2 (okengine#301)"; fi
+    }
+    _check_ui_tz "reader" "$READER" "/api/about"
+    if docker compose config --services 2>/dev/null | grep -Fxq "$COCKPIT"; then
+        _check_ui_tz "cockpit" "$COCKPIT" "/api/config"
     fi
 fi
 

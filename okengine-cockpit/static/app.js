@@ -18,15 +18,30 @@ const sClass = s => /^expired/.test(s) ? "expired" : /^confirm/.test(s) ? "confi
 const sGlyph = s => GLYPH[s] || (/^expired/.test(s) ? "⊘" : "·");
 
 // ── clock ──────────────────────────────────────────────────────────────────
+// Renders in the DEPLOYMENT timezone (okengine#301), set from /api/config `tz`; defaults UTC until
+// config loads (and if Intl doesn't know the zone). Shows the zone abbreviation (EDT/UTC/…), not a
+// hardcoded "UTC".
+let CLOCK_TZ = "UTC";
 function tick() {
   const d = new Date();
-  $("#clock").textContent = d.toISOString().slice(0, 16).replace("T", " ") + " UTC";
+  let out;
+  try {
+    const p = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+      timeZone: CLOCK_TZ, hour12: false, year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", timeZoneName: "short",
+    }).formatToParts(d).map(x => [x.type, x.value]));
+    out = `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute} ${p.timeZoneName}`;
+  } catch (e) {
+    out = d.toISOString().slice(0, 16).replace("T", " ") + " UTC";
+  }
+  $("#clock").textContent = out;
 }
 tick(); setInterval(tick, 30000);
 
 // ── tabs (built at runtime from /api/config — domain-agnostic) ───────────────
 const TAB_LABELS = { home: "Home", briefings: "Briefings", dashboards: "Dashboards", predictions: "Predictions", ops: "Ops", competitors: "Competitors", watchlist: "Watchlist", browse: "Browse", chat: "Chat" };
 let TABS = [];
+let REVIEW_ENABLED = false;
 let TAB_DEF_LABELS = {};   // pack-defined dataset tabs (from /api/config tab_labels)
 function buildTabs(tabs) {
   TABS = (tabs && tabs.length) ? tabs.slice() : ["briefings"];
@@ -149,13 +164,65 @@ async function loadOps() {
     pane.innerHTML = groups.map(g =>
       `<div class="dash-group">${g.group ? `<div class="dash-h">${esc(g.group)}</div>` : ""}` +
       `<div class="dash-grid">` + (g.items || []).map(it =>
-        `<a class="dash-card" data-page="${esc(it.path)}">` +
+        `<a class="dash-card" ${it.action ? `data-action="${esc(it.action)}"` : `data-page="${esc(it.path)}"`}>` +
         `<span class="dash-t">${esc(it.title || it.path)}</span>` +
         (it.desc ? `<span class="dash-d">${esc(it.desc)}</span>` : "") +
         (it.updated ? `<span class="dash-d dim">updated ${esc(it.updated)}</span>` : "") + `</a>`).join("") +
       `</div></div>`).join("");
-    $$(".dash-card", pane).forEach(a => a.onclick = () => openPage(a.dataset.page));
+    $$(".dash-card", pane).forEach(a => a.onclick = () =>
+        a.dataset.action === "application" ? openApplicationContract() :
+        a.dataset.action === "reviews" ? openReviewQueue(0, "") : openPage(a.dataset.page));
   } catch (e) { pane.innerHTML = `<div class="empty">failed (${e.message})</div>`; }
+}
+
+const reviewFilters = {reason:"", page_type:"", page_types:"", state:"", assignment:"", source_resolution:"", age:""};
+async function openReviewQueue(offset = 0, presetTypes = null) {
+  if (presetTypes !== null) {
+    Object.keys(reviewFilters).forEach(k => reviewFilters[k] = "");
+    reviewFilters.page_types = presetTypes;
+  }
+  const ov = $("#page-overlay"), c = $("#ov-content");
+  ov.hidden = false; c.innerHTML = "<div class='empty'>Loading review queue…</div>";
+  pageStack.length = 0; $("#ov-title").textContent = "Human review"; $("#ov-path").textContent = "operator worklist";
+  $("#ov-dl").innerHTML = ""; $("#ov-back").style.visibility = "hidden";
+  try {
+    const qs = new URLSearchParams({offset, limit:50, ...reviewFilters});
+    const d = await j(`/api/reviews?${qs}`);
+    const opts = (values, selected) => `<option value="">all</option>` + values.map(v => `<option value="${esc(v)}" ${v===selected?"selected":""}>${esc(v)}</option>`).join("");
+    c.innerHTML = `<div class="review-queue-head"><strong>${d.total} awaiting review</strong><span>showing ${d.total ? d.offset + 1 : 0}–${Math.min(d.total,d.offset+d.items.length)}</span></div>` +
+      `<div class="review-metrics"><span>oldest ${d.metrics.oldest_days ?? "—"}d</span><span>assigned ${d.metrics.assigned}</span><span>decisions 30d ${d.metrics.throughput_30d}</span><span>reopened ${d.metrics.reopened}</span></div>` +
+      `<div class="review-filters">` +
+      `<label>reason<select data-review-filter="reason">${opts(Object.keys(d.facets.reasons||{}),reviewFilters.reason)}</select></label>` +
+      `<label>type<select data-review-filter="page_type">${opts(Object.keys(d.facets.types||{}),reviewFilters.page_type)}</select></label>` +
+      `<label>state<select data-review-filter="state">${opts(Object.keys(d.facets.states||{}),reviewFilters.state)}</select></label>` +
+      `<label>assignment<select data-review-filter="assignment">${opts(["assigned","unassigned"],reviewFilters.assignment)}</select></label>` +
+      `<label>sources<select data-review-filter="source_resolution">${opts(["complete","partial","none"],reviewFilters.source_resolution)}</select></label>` +
+      `<label>age<select data-review-filter="age">${opts(["0-30","31-90","91+"],reviewFilters.age)}</select></label></div>` +
+      `<div class="review-queue">` + d.items.map(row => `<a class="review-row" data-page="${esc(row.subject)}">` +
+        `<span><b>${esc(row.title)}</b><small>${esc(row.subject)}</small></span><span>${esc(row.type)}</span>` +
+        `<span>${(row.reasons||[]).map(r=>esc(r.code)).join(", ")}</span><span>${row.evidence_resolved}/${row.evidence_total} sources · ${row.age_days ?? "—"}d</span></a>`).join("") + `</div>` +
+      `<div class="review-pages">${offset>0?`<button data-review-offset="${Math.max(0,offset-50)}">Previous</button>`:""}` +
+      `${offset+d.items.length<d.total?`<button data-review-offset="${offset+50}">Next</button>`:""}</div>`;
+    $$(".review-row", c).forEach(a => a.onclick = () => openPage(a.dataset.page));
+    $$("[data-review-offset]", c).forEach(b => b.onclick = () => openReviewQueue(+b.dataset.reviewOffset));
+    $$("[data-review-filter]", c).forEach(s => s.onchange = () => {
+      reviewFilters[s.dataset.reviewFilter] = s.value; openReviewQueue(0);
+    });
+  } catch (e) { c.innerHTML = `<div class="empty">review queue failed: ${esc(e.message)}</div>`; }
+}
+
+async function openApplicationContract() {
+  const ov = $("#page-overlay"), c = $("#ov-content");
+  ov.hidden = false; c.innerHTML = "<div class='empty'>Loading…</div>";
+  try {
+    const d = await j("/api/application");
+    pageStack.length = 0;
+    $("#ov-title").textContent = d.title || "Application";
+    $("#ov-path").textContent = `${d.profile || "application"} · v${d.profile_version || "—"}`;
+    $("#ov-dl").innerHTML = "";
+    $("#ov-back").style.visibility = "hidden";
+    c.innerHTML = d.html; c.scrollTop = 0;
+  } catch (e) { c.innerHTML = `<div class='empty'>application contract unavailable</div>`; }
 }
 
 // ── predictions ────────────────────────────────────────────────────────────
@@ -318,18 +385,96 @@ async function loadDataTab(name) {
   const pane = $("#dpane-" + name);
   try {
     const { boxes } = await j("/api/tab/" + encodeURIComponent(name));
+    let lastSection = null;
     pane.innerHTML = boxes.map(b => {
       // partial labels-map drift: a compact header warning listing the raw codes (okengine#188)
       const um = (b.unmapped && b.unmapped.length)
         ? `<span class="um-warn" title="unmapped codes: ${esc(b.unmapped.join(", "))}">⚠ ${b.unmapped.length} unmapped</span>`
         : "";
-      return `<section class="dbox s${Math.min(12, Math.max(3, b.span || 6))}">` +
-        `<header><span class="eb">${esc(b.title)}</span>` +
+      // provenance affordance: mark a corpus/coverage metric so it isn't read as a threat measure (#259)
+      const prov = (b.provenance && b.provenance.label)
+        ? `<span class="prov-badge" title="${esc(b.provenance.note || "Measures our reporting/collection, not threat level.")}">◷ ${esc(b.provenance.label)}</span>`
+        : "";
+      const section = b.section && b.section !== lastSection
+        ? `<h2 class="dsection">${esc(b.section)}</h2>` : "";
+      if (b.section) lastSection = b.section;
+      return section + `<section class="dbox s${Math.min(12, Math.max(3, b.span || 6))}">` +
+        `<header><span class="eb">${esc(b.title)}${prov}</span>` +
         `<span class="dmeta">${um}${esc(b.meta || "")}</span></header>` +
         `<div class="db">${b.html}</div></section>`;
     }).join("")
       || `<div class="empty">nothing to show yet — boxes appear as their lanes produce data</div>`;
+    $$(".operation-control", pane).forEach(bindOperationControl);
   } catch (e) { pane.innerHTML = `<div class="empty">failed (${e.message})</div>`; }
+}
+
+function operationArguments(panel) {
+  try { return JSON.parse(panel.dataset.arguments || "[]"); }
+  catch (_) { return []; }
+}
+function bindOperationControl(panel) {
+  const plan = $("[data-operation-plan]", panel), run = $("[data-operation-run]", panel);
+  if (plan) plan.onclick = () => planOperation(panel);
+  if (run) run.onclick = () => startOperation(panel);
+}
+async function planOperation(panel) {
+  const name = panel.dataset.operation, result = $(".operation-result", panel);
+  const plan = $("[data-operation-plan]", panel), run = $("[data-operation-run]", panel);
+  plan.disabled = true; run.disabled = true; result.textContent = "Planning frozen scope…";
+  try {
+    const response = await fetch(`/api/operations/${encodeURIComponent(name)}/plan`, {
+      method:"POST", headers:{"Content-Type":"application/json","X-OKEngine-Operation":"1"},
+      body:JSON.stringify({arguments:operationArguments(panel)})});
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || data.error || response.status);
+    const actors = (data.actor_inventory || []).length, questions = (data.counts || {}).actor_questions;
+    const dimensions = (data.dimensions || []).length;
+    panel.dataset.planDigest = data.snapshot_digest || "";
+    result.innerHTML = `<strong>Planned:</strong> ${actors.toLocaleString()} actors · ` +
+      `${Number(questions || 0).toLocaleString()} questions · ${dimensions} dimensions` +
+      (data.snapshot_digest ? `<br><code>${esc(data.snapshot_digest)}</code>` : "");
+    run.disabled = false;
+  } catch (e) { result.textContent = `Planning failed: ${e.message}`; }
+  finally { plan.disabled = false; }
+}
+async function startOperation(panel) {
+  const name = panel.dataset.operation, result = $(".operation-result", panel);
+  if (!panel.dataset.planDigest) { result.textContent = "Plan the scope before starting."; return; }
+  if (!confirm(`Start ${name} against the planned full scope?`)) return;
+  $$('button', panel).forEach(button => button.disabled = true);
+  result.textContent = "Submitting operation…";
+  try {
+    const response = await fetch(`/api/operations/${encodeURIComponent(name)}/run`, {
+      method:"POST", headers:{"Content-Type":"application/json","X-OKEngine-Operation":"1"},
+      body:JSON.stringify({arguments:operationArguments(panel), plan_digest:panel.dataset.planDigest})});
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || data.error || response.status);
+    result.textContent = `Started request ${data.request_id}; waiting for receipt…`;
+    pollOperation(panel, data.request_id);
+  } catch (e) {
+    result.textContent = `Start failed: ${e.message}`;
+    $("[data-operation-plan]", panel).disabled = false;
+  }
+}
+async function pollOperation(panel, requestId) {
+  const result = $(".operation-result", panel);
+  try {
+    const data = await j(`/api/operations/requests/${encodeURIComponent(requestId)}`);
+    const progress = data.progress || {};
+    const lanes = progress.lanes_total ? ` · ${progress.lanes_complete || 0}/${progress.lanes_total} lanes` : "";
+    const actors = progress.actors ? ` · ${Number(progress.actors).toLocaleString()} actors` : "";
+    result.innerHTML = `<strong>${esc(data.status || "running")}</strong>${actors}${lanes}` +
+      (data.run_id ? `<br>Run <code>${esc(data.run_id)}</code>` : "");
+    if (["succeeded","failed","canceled"].includes(data.status)) {
+      $("[data-operation-plan]", panel).disabled = false;
+      if (data.status === "succeeded") setTimeout(() => location.reload(), 1000);
+      return;
+    }
+    setTimeout(() => pollOperation(panel, requestId), 2000);
+  } catch (e) {
+    result.textContent = `Status unavailable: ${e.message}`;
+    $("[data-operation-plan]", panel).disabled = false;
+  }
 }
 
 // ── analyst home (the flow: latest briefs → what moved → predictions → gaps) ──
@@ -645,6 +790,97 @@ function qualityHtml(badges) {
   return `<div class="qbadges">` + badges.map(b =>
     `<span class="qb qb-${esc(b.level || "warn")}" title="${esc(b.title || b.label)}">${esc(b.label)}</span>`).join("") + `</div>`;
 }
+function trustGatedHtml(trust, content, path, reviewEnabled) {
+  if (!trust || trust.state === "normal" || trust.state === "verified") return content;
+  if (trust.state === "retired") {
+    const target = trust.redirect_to
+      ? `<a class="wl" data-page="${esc(trust.redirect_to)}">Open canonical record →</a>` : "";
+    return `<div class="trust-gate trust-retired"><strong>Retired duplicate</strong>` +
+      `<span>This record is retained for audit history and is not a current profile.</span>${target}</div>`;
+  }
+  const why = (trust.reasons || []).map(esc).join(" · ");
+  return `<div class="trust-gate"><strong>Unverified draft — quarantined</strong>` +
+    `<span>This entity has not cleared the source and review gates${why ? `: ${why}` : ""}.</span>` +
+    (reviewEnabled ? `<button class="review-open" data-review-path="${esc(path)}">Review this page</button>` : "") +
+    `</div><div id="review-workspace"></div>` +
+    `<details class="quarantined-content"><summary>View unverified content</summary>${content}</details>`;
+}
+
+function reviewAffordance(d) {
+  if (!d.review_enabled || !d.provenance?.needs_review || d.trust?.state === "quarantined") return "";
+  return `<div class="review-affordance"><strong>Human review required</strong>` +
+    `<span>This current version is awaiting an evidence decision.</span>` +
+    `<button class="review-open" data-review-path="${esc(d.path)}">Review this page</button></div>` +
+    `<div id="review-workspace"></div>`;
+}
+
+function reviewReasons(rows) {
+  return (rows || []).map(r => `<li><b>${esc(r.code || "review")}</b>${r.field ? ` · ${esc(r.field)}` : ""}` +
+    `<span>${esc(r.detail || "")}</span></li>`).join("");
+}
+function reviewEvidence(rows) {
+  return (rows || []).map(e => `<div class="review-ev ${e.page ? "resolved" : "unresolved"}">` +
+    (e.page ? `<a class="wl" data-page="${esc(e.page)}">${esc(e.name)}</a>` : `<span>${esc(e.name)}</span>`) +
+    `<span>${e.page ? "linked" : "unresolved"}${e.reliability ? ` · reliability ${esc(e.reliability)}` : ""}${e.date ? ` · ${esc(e.date)}` : ""}</span></div>`).join("");
+}
+async function openReview(path) {
+  const box = $("#review-workspace"); if (!box) return;
+  box.innerHTML = `<div class="review-panel"><div class="empty">Loading review…</div></div>`;
+  try {
+    const d = await j(`/api/review?path=${encodeURIComponent(path)}`);
+    const machine = (d.machine_checks || []).map(c => `<li>${esc(c.outcome)} · ${esc(c.evaluator)} · ${esc(c.checked_at || "")}${c.note ? ` — ${esc(c.note)}` : ""}</li>`).join("");
+    const history = (d.history || []).map(h => `<li>${esc(h.decision || h.action || h.state)} · ${esc(h.decision_by || h.assigned_to || "")} · ${esc(h.decision_at || h.at || "")}${h.decision_note ? ` — ${esc(h.decision_note)}` : ""}</li>`).join("");
+    const dc = d.decision_context || {}, noun = dc.noun || "record";
+    const decisionContext = `<div class="review-decision-context"><h3>Decision to make</h3>` +
+      `<div class="review-question">${esc(dc.question || "Is this record supported by its cited evidence?")}</div>` +
+      `<blockquote>${esc(dc.proposition || d.title || path)}</blockquote>` +
+      `<div class="review-scope"><b>Scope:</b> ${esc(dc.scope || "Decide only the proposition as written.")}</div>` +
+      `<dl><dt>Approve ${esc(noun)}</dt><dd>${esc(dc.approve || "The evidence supports it as written.")}</dd>` +
+      `<dt>Reject ${esc(noun)}</dt><dd>${esc(dc.reject || "The evidence does not support it as written; this does not prove the opposite.")}</dd>` +
+      `<dt>Request changes</dt><dd>${esc(dc.request_changes || "The proposition or evidence needs correction.")}</dd>` +
+      `<dt>Defer</dt><dd>${esc(dc.defer || "More evidence is required.")}</dd>` +
+      `<dt>Dismiss</dt><dd>${esc(dc.dismiss || "Duplicate, out of scope, or not applicable.")}</dd></dl></div>`;
+    box.innerHTML = `<div class="review-panel" data-path="${esc(path)}" data-version="${d.version}" data-hash="${esc(d.hash)}" data-review-id="${esc(d.review_id || "")}">` +
+      `<div class="review-head"><strong>Review current version ${d.version}</strong><span>${esc(d.state)}</span></div>` +
+      decisionContext +
+      `<h3>Why this needs review</h3><ul class="review-reasons">${reviewReasons(d.reasons)}</ul>` +
+      `<h3>Evidence · ${d.evidence_resolved}/${d.evidence_total} linked</h3><div class="review-evidence">${reviewEvidence(d.evidence)}</div>` +
+      (machine ? `<h3>Machine checks (not human approval)</h3><ul>${machine}</ul>` : "") +
+      (history ? `<h3>Decision history</h3><ul>${history}</ul>` : "") +
+      `<label class="review-confirm"><input type="checkbox" id="review-confirm"> I examined the scoped content and cited evidence.</label>` +
+      `<textarea id="review-note" placeholder="Decision note (required except approval)"></textarea>` +
+      `<div class="review-actions"><button data-review-assign>Assign to me</button><button data-decision="approve">Approve ${esc(noun)}</button><button data-decision="request-changes">Request changes</button>` +
+      `<button data-decision="reject">Reject ${esc(noun)}</button><button data-decision="dismiss">Dismiss / not applicable</button><button data-decision="defer">Defer</button></div>` +
+      `<div class="review-result"></div></div>`;
+  } catch (e) { box.innerHTML = `<div class="review-panel review-error">Unable to load review: ${esc(e.message)}</div>`; }
+}
+async function assignReview(button) {
+  const panel = button.closest(".review-panel"), result = $(".review-result", panel);
+  button.disabled = true; result.textContent = "Assigning…";
+  try {
+    const response = await fetch("/api/review/assign", {method:"POST", headers:{"Content-Type":"application/json","X-OKEngine-Review":"1"},
+      body:JSON.stringify({path:panel.dataset.path, expected_version:+panel.dataset.version,
+        expected_hash:panel.dataset.hash, review_id:panel.dataset.reviewId || ""})});
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || data.error || response.status);
+    await openReview(panel.dataset.path);
+  } catch (e) { result.textContent = `Assignment failed: ${e.message}`; button.disabled = false; }
+}
+async function submitReview(button) {
+  const panel = button.closest(".review-panel"), decision = button.dataset.decision;
+  const result = $(".review-result", panel), note = $("#review-note", panel).value.trim();
+  if (!$("#review-confirm", panel).checked) { result.textContent = "Confirm that you examined the scoped content and evidence."; return; }
+  if (decision !== "approve" && !note) { result.textContent = "This disposition requires a decision note."; return; }
+  $$("button", panel).forEach(b => b.disabled = true); result.textContent = "Saving decision…";
+  try {
+    const response = await fetch("/api/review/decision", {method:"POST", headers:{"Content-Type":"application/json","X-OKEngine-Review":"1"},
+      body:JSON.stringify({path:panel.dataset.path, decision, note, expected_version:+panel.dataset.version,
+        expected_hash:panel.dataset.hash, review_id:panel.dataset.reviewId || ""})});
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || data.error || response.status);
+    await openPage(panel.dataset.path, false);
+  } catch (e) { result.textContent = `Decision failed: ${e.message}`; $$("button", panel).forEach(b => b.disabled = false); }
+}
 // Fact panel + record details (ported from the reader): the SURFACED frontmatter is the page's
 // profile (aliases, origin, refs, …) shown below the body; record-keeping/provenance is tucked
 // into a collapsed disclosure. A value resolving to a vault page -> internal a.wl link (the global
@@ -719,6 +955,15 @@ function citationsHtml(cites) {
     `<div class="cite-list">${rows}</div></div>`;
 }
 
+function assessmentPanel(rows) {
+  if (!rows || !rows.length) return "";
+  return `<section class="actor-assessments"><div class="prov-head">CHE actor assessments <span class="bl-n">${rows.length}</span></div>` +
+    rows.map(row => `<a class="actor-assessment wl" data-page="${esc(row.path)}">` +
+      `<span><b>${esc(row.title)}</b><small>${esc(row.claim || "")}</small></span>` +
+      `<span class="assessment-state">${esc(row.status || "—")} · ${row.confidence == null ? "—" : row.confidence.toFixed(2)}${row.confidence_band ? ` (${esc(row.confidence_band)})` : ""}` +
+      `${row.needs_review ? ` · <em>needs review</em>` : ""}</span></a>`).join("") + `</section>`;
+}
+
 async function openPage(path, push = true) {
   const ov = $("#page-overlay"), c = $("#ov-content");
   ov.hidden = false; c.innerHTML = "<div class='empty'>Loading…</div>";
@@ -733,9 +978,11 @@ async function openPage(path, push = true) {
     // still governs which fields are primary (fact panel) vs secondary (Record details) — it no
     // longer moves the panel above the body.
     const facts = factPanel(d.meta);
-    c.innerHTML = qualityHtml(d.quality) + provenanceHtml(d.provenance) + panelHtml(d.panel) +
-      d.html + facts +
-      citationsHtml(d.citations) + provPanel(d) + auxPanel(d.meta_aux) +
+    const profile = panelHtml(d.panel) + d.html + facts + citationsHtml(d.citations) +
+      provPanel(d) + auxPanel(d.meta_aux);
+    c.innerHTML = qualityHtml(d.quality) + provenanceHtml(d.provenance) + assessmentPanel(d.assessments) +
+      reviewAffordance(d) +
+      trustGatedHtml(d.trust, profile, d.path || path, d.review_enabled) +
       `<div id="backlinks" class="backlinks"></div>`; c.scrollTop = 0;
     wireProvFilter(c);
     $("#ov-back").style.visibility = pageStack.length > 1 ? "visible" : "hidden";
@@ -767,6 +1014,13 @@ function closeOverlay() { $("#page-overlay").hidden = true; pageStack.length = 0
 $("#ov-close").onclick = closeOverlay;
 $("#ov-back").onclick = () => { pageStack.pop(); const prev = pageStack[pageStack.length - 1]; prev ? openPage(prev, false) : closeOverlay(); };
 document.addEventListener("click", e => { const a = e.target.closest("a.wl"); if (a) { e.preventDefault(); openPage(a.dataset.page); } });
+document.addEventListener("click", e => {
+  const scoped = e.target.closest("[data-review-types]");
+  if (scoped) { e.preventDefault(); openReviewQueue(0, scoped.dataset.reviewTypes || ""); return; }
+  const open = e.target.closest("[data-review-path]"); if (open) { e.preventDefault(); openReview(open.dataset.reviewPath); return; }
+  const assign = e.target.closest("[data-review-assign]"); if (assign) { e.preventDefault(); assignReview(assign); return; }
+  const decision = e.target.closest("[data-decision]"); if (decision) { e.preventDefault(); submitReview(decision); }
+});
 
 // ── drilldown: a cockpit aggregate (bar/chip/bignum) → its filtered page list (okengine#189) ──
 async function openDrill(tab, box, qs) {
@@ -848,8 +1102,10 @@ async function bootstrap() {
   let cfg = { title: "cockpit", tabs: ["briefings"] };
   try { cfg = await j("/api/config"); } catch (e) { /* fall back to generic shell */ }
   TAB_DEF_LABELS = cfg.tab_labels || {};
+  REVIEW_ENABLED = !!cfg.review_enabled;
+  if (cfg.tz) { CLOCK_TZ = cfg.tz; tick(); }   // clock -> deployment timezone (okengine#301)
   document.title = cfg.title || "cockpit";
-  $("#brand").innerHTML = `⬢ <span>${esc(cfg.title || "cockpit")}</span>`;
+  $("#brand").innerHTML = `⬢ <span>${esc(cfg.short_title || cfg.title || "cockpit")}</span>`;
   // the cockpit's function tabs (pack-driven) + the two general-purpose tabs from
   // okengine-reader: Browse is always present; Chat only when an agent is configured.
   const tabs = (cfg.tabs && cfg.tabs.length ? cfg.tabs.slice() : ["briefings"]);

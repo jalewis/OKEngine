@@ -54,7 +54,8 @@ def test_composes_into_agent_and_no_agent_jobs():
              "okengine.predictions:prediction-schema-drain",
              "okengine.predictions:forecast-review"]
     no_agent = ["okengine.predictions:calibration-refresh", "okengine.predictions:prediction-date-audit",
-                "okengine.predictions:prediction-schema-audit"]
+                "okengine.predictions:prediction-schema-audit",
+                "okengine.predictions:confidence-recommender"]
     assert sorted(by_name) == sorted(agent + no_agent)
     for n in agent:
         j = by_name[n]
@@ -78,6 +79,12 @@ def test_bundled_prompt_files_exist_and_nonempty():
 
 def test_write_capabilities():
     m = _manifest()
-    # predictions (the book) + dashboards (derived base-rates / outcome-eval). No schema fragment.
+    # predictions (the book) + dashboards (derived base-rates / outcome-eval).
     assert m["capabilities"]["write"] == ["predictions/**", "dashboards/**"]
-    assert "schema" not in m                            # reuses the pack-owned prediction type
+    # #217: the extension SHIPS a fragment — but only the evidence ITEM contract. The
+    # prediction TYPE stays pack-owned: the fragment must never grow owns/extends (that
+    # was this assertion's original point, now stated precisely instead of as "no schema").
+    assert m.get("schema") == ["schema/predictions.schema.yaml"]
+    import yaml as _y
+    frag = _y.safe_load((EXT / "schema" / "predictions.schema.yaml").read_text(encoding="utf-8"))
+    assert set(frag) == {"field_items"}, f"fragment grew beyond the item contract: {set(frag)}"

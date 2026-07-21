@@ -83,7 +83,10 @@ def test_cron_mode_writes_dashboard_from_wiki_path(tmp_path, monkeypatch):
     out = tmp_path / "wiki" / "operational" / "content-lint.md"
     assert out.is_file(), "cron mode did not write the dashboard"
     assert "long-unpunctuated-run" in out.read_text(encoding="utf-8")
-    assert rc == 1                                           # offenders over the (default 0) threshold
+    assert rc == 0                                           # 1 degenerate is WITHIN the auto tolerance
+    # (max(10, 0.5%)) — a report-only monitor must not RED fleet-health on a single page; the strict
+    # opt-in still alarms:
+    assert cl.main([]) == 0 and cl.main(["--wiki", str(tmp_path / "wiki"), "--max-offenders", "0"]) == 1
 
 
 def test_scan_vault_and_report(tmp_path):
@@ -96,3 +99,36 @@ def test_scan_vault_and_report(tmp_path):
     rep = cl.render_report(2, offenders, "2026-01-01T00:00:00Z")
     assert "long-unpunctuated-run" in rep and "concepts/v/bad" in rep
     assert "Clean" in cl.render_report(2, {}, "2026-01-01T00:00:00Z")
+
+
+# ── exit-code threshold: a report-only monitor must not RED the fleet on routine noise ─────────
+
+def _vault(tmp_path, n_degenerate, n_clean):
+    wiki = tmp_path / "wiki"
+    wiki.mkdir(parents=True)
+    for i in range(n_degenerate):
+        (wiki / f"deg{i}.md").write_text(FM + f"# D{i}\n\n" + SALAD + ".\n", encoding="utf-8")
+    for i in range(n_clean):
+        (wiki / f"ok{i}.md").write_text(FM + f"# OK{i}\n\nA short coherent page. It ends.\n", encoding="utf-8")
+    return wiki
+
+
+def test_auto_threshold_tolerates_a_routine_handful(tmp_path):  # invariant-audit follow-up
+    """The default (--max-offenders -1 = auto) must NOT exit non-zero on a handful of degenerate
+    pages — else content-lint perpetually reds fleet-health on any large ingesting vault. Auto floor
+    is 10, so 5 degenerate is within tolerance -> exit 0."""
+    wiki = _vault(tmp_path, n_degenerate=5, n_clean=20)
+    assert cl.main(["--wiki", str(wiki), "--max-offenders", "-1"]) == 0
+
+
+def test_explicit_and_env_thresholds_still_alarm(tmp_path, monkeypatch):
+    """An explicit non-negative --max-offenders and the CONTENT_LINT_MAX_OFFENDERS env both override
+    the auto default and still fire on a spike over that bar."""
+    wiki = _vault(tmp_path, n_degenerate=5, n_clean=5)
+    monkeypatch.delenv("CONTENT_LINT_MAX_OFFENDERS", raising=False)
+    assert cl.main(["--wiki", str(wiki), "--max-offenders", "0"]) == 1     # strict opt-in
+    assert cl.main(["--wiki", str(wiki), "--max-offenders", "10"]) == 0    # 5 <= 10
+    monkeypatch.setenv("CONTENT_LINT_MAX_OFFENDERS", "3")
+    assert cl.main(["--wiki", str(wiki), "--max-offenders", "-1"]) == 1    # env 3 < 5 -> alarm
+    monkeypatch.setenv("CONTENT_LINT_MAX_OFFENDERS", "10")
+    assert cl.main(["--wiki", str(wiki), "--max-offenders", "-1"]) == 0    # env 10 >= 5 -> clear

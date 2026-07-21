@@ -94,6 +94,7 @@ def test_config_block_present():
     assert cfg["min_density"]["default"] == 8
     assert cfg["reanalyze_days"]["default"] == 90
     assert cfg["batch_size"]["default"] == 3
+    assert cfg["focus"]["default"] == "" and cfg["focus"]["type"] == "string"   # unset = autonomous
 
 
 # --- bring-your-own-schema: OWN the lacuna type (#133) --------------------
@@ -246,3 +247,54 @@ def test_selector_is_self_contained():
                "datetime", "pathlib", "yaml", "typing", "itertools", "math", "functools"}
     foreign = [i for i in imports if i.split(".")[0] not in allowed]
     assert not foreign, f"extension script imports non-stdlib siblings: {foreign}"
+
+
+# --- FOCUS override (operator-pinned topic; default unset = autonomous) -----
+
+def test_focus_unset_is_the_autonomous_default(tmp_path):
+    """The knob defaults to no focus — the densest unanalyzed field, everything considered."""
+    _dense_field(tmp_path, slug="latency", n=10)
+    out = _run_gate(tmp_path)                                # no OKENGINE_LACUNA_FOCUS
+    assert '"wakeAgent": true' in out and "concept: latency" in out
+    assert "FOCUS" not in out                                # no focus banner when unset
+
+
+def test_focus_pins_a_field_below_the_density_rank_with_extrapolation_warning(tmp_path):
+    _dense_field(tmp_path, slug="latency", n=10)             # the densest (autonomous pick)
+    _page(tmp_path, "concepts/z/niche.md", "---\ntype: concept\n---\nNiche.\n")
+    for i in range(4):                                       # 4 refs < default min_density 8
+        _page(tmp_path, f"entities/niche-e{i}.md", "Uses [[concepts/z/niche]].\n")
+    auto = _run_gate(tmp_path)
+    assert "concept: latency" in auto and "concept: niche" not in auto   # autonomous ignores the sparse field
+    foc = _run_gate(tmp_path, OKENGINE_LACUNA_FOCUS="niche")
+    assert '"wakeAgent": true' in foc
+    assert "concept: niche" in foc and "concept: latency" not in foc     # focus pins it exclusively
+    assert "EXTRAPOLATION" in foc                                        # below min_density -> warns
+
+
+def test_focus_accepts_slug_path_and_wikilink_forms(tmp_path):
+    _dense_field(tmp_path, slug="ransomware", n=10)
+    for form in ("ransomware", "concepts/r/ransomware", "[[concepts/ransomware]]"):
+        out = _run_gate(tmp_path, OKENGINE_LACUNA_FOCUS=form)
+        assert "concept: ransomware" in out and '"wakeAgent": true' in out, form
+
+
+def test_focus_on_missing_or_empty_field_skips_not_wakes(tmp_path):
+    _dense_field(tmp_path, slug="latency", n=10)             # a real dense field exists
+    miss = _run_gate(tmp_path, OKENGINE_LACUNA_FOCUS="does-not-exist")
+    assert '"wakeAgent": false' in miss and "no concept page" in miss    # can't map a non-existent field
+    _page(tmp_path, "concepts/o/orphan.md", "---\ntype: concept\n---\nOrphan.\n")
+    empty = _run_gate(tmp_path, OKENGINE_LACUNA_FOCUS="orphan")
+    assert '"wakeAgent": false' in empty and "NO referencing" in empty   # page but empty field -> skip
+
+
+def test_config_keys_are_read_from_env_by_selector():
+    """Local guard for lacuna's canonical config environment reads."""
+    cfg = _manifest().get("config") or {}
+    assert cfg, "lacuna should declare a config block"
+    src = SELECTOR.read_text(encoding="utf-8")
+    missing = [k for k in cfg if f"OKENGINE_LACUNA_{k.upper()}" not in src]
+    assert not missing, (
+        f"config keys with no OKENGINE_LACUNA_<KEY> read in {SELECTOR.name}: {missing} — the config "
+        "block would silently no-op."
+    )

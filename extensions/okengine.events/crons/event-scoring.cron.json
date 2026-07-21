@@ -1,0 +1,4 @@
+{
+  "schedule": {"kind": "cron", "expr": "45 5 * * *"},
+  "entrypoint": "event_scoring.py"
+}

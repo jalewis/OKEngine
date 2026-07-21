@@ -31,6 +31,7 @@ import subprocess
 import tempfile
 import urllib.request
 import urllib.error
+from contextlib import asynccontextmanager
 from urllib.parse import quote, urlparse
 from pathlib import Path
 
@@ -45,9 +46,27 @@ import limits
 
 VAULT = Path(os.environ.get("VAULT_DIR", "/vault"))
 WIKI = VAULT / "wiki"
+
+
+def _governing_schema_path(vault: Path = VAULT) -> Path:
+    """Return the same schema authority enforced by the write path."""
+    artifact = vault / ".okengine" / "composed-schema.yaml"
+    return artifact if artifact.is_file() else vault / "schema.yaml"
+
+
 STATIC = Path(__file__).parent / "static"
 
-app = FastAPI(title="OKEngine · vault reader", docs_url=None, redoc_url=None)
+
+@asynccontextmanager
+async def _lifespan(_app):
+    """Start read-cache workers through FastAPI's supported lifespan contract."""
+    _start_warmer()
+    _prewarm_backlinks()
+    yield
+
+
+app = FastAPI(title="OKEngine · vault reader", docs_url=None, redoc_url=None,
+              lifespan=_lifespan)
 
 
 # ── optional HTTP Basic auth ─────────────────────────────────────────────────
@@ -461,7 +480,7 @@ def _excluded_dirs() -> frozenset[str]:
     if now - _EXCLUDE_CACHE[0] < _DIR_TTL:
         return _EXCLUDE_CACHE[1]
     out: set[str] = set()
-    sp = VAULT / "schema.yaml"
+    sp = _governing_schema_path()
     if sp.is_file():
         try:
             sch = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}
@@ -491,7 +510,7 @@ def _backlink_drop_dirs() -> frozenset[str]:
     if _BL_DROP_CACHE[1] is not None and now - _BL_DROP_CACHE[0] < _DIR_TTL:
         return _BL_DROP_CACHE[1]
     drop = {"sources"}
-    sp = VAULT / "schema.yaml"
+    sp = _governing_schema_path()
     if sp.is_file():
         try:
             sch = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}
@@ -520,7 +539,7 @@ def _display_groups() -> list[tuple[str, frozenset[str]]]:
     if now - _GROUPS_CACHE[0] < _DIR_TTL:
         return _GROUPS_CACHE[1]
     groups: list[tuple[str, frozenset[str]]] = []
-    sp = VAULT / "schema.yaml"
+    sp = _governing_schema_path()
     if sp.is_file():
         try:
             dg = (yaml.safe_load(sp.read_text(encoding="utf-8")) or {}).get("display_groups") or {}
@@ -545,7 +564,7 @@ def _rail_top_section() -> tuple[str, tuple[str, ...]]:
     if now - _RAILTOP_CACHE[0] < _DIR_TTL:
         return _RAILTOP_CACHE[1]
     label, ns = "", ()
-    sp = VAULT / "schema.yaml"
+    sp = _governing_schema_path()
     if sp.is_file():
         try:
             d = (yaml.safe_load(sp.read_text(encoding="utf-8")) or {}).get("rail_top_section") or {}
@@ -596,7 +615,12 @@ def _read_head(p: Path, limit: int = _FM_SCAN_BYTES) -> str:
 
 
 def _page_meta(p: Path) -> dict:
-    """{path, title, type, updated} for one page, from its frontmatter (head-only read)."""
+    """Page-list metadata plus an opaque filesystem revision for cache invalidation.
+
+    ``updated`` is human-authored display metadata and can be absent or unchanged
+    across edits. ``revision`` is the reader-observed file identity used by
+    standing detectors that must never carry evidence over a changed page.
+    """
     rel = str(p.relative_to(WIKI.resolve()))
     rel = rel[:-3] if rel.endswith(".md") else rel
     fm, body = split_fm(_read_head(p))
@@ -604,8 +628,14 @@ def _page_meta(p: Path) -> dict:
     if not title:
         h1 = _H1_RE.search(body)
         title = h1.group(0).lstrip("# ").strip() if h1 else Path(rel).name
+    try:
+        st = p.stat()
+        revision = f"{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        revision = ""
     return {"path": rel, "title": title, "type": str(fm.get("type") or "").strip(),
-            "updated": _disp_ts(fm.get("last_updated") or fm.get("updated") or fm.get("created"))}
+            "updated": _disp_ts(fm.get("last_updated") or fm.get("updated") or fm.get("created")),
+            "revision": revision}
 
 
 def _disp_ts(v) -> str:
@@ -673,17 +703,15 @@ def _start_warmer() -> None:
     threading.Thread(target=_warm_loop, name="reader-cache-warmer", daemon=True).start()
 
 
-@app.on_event("startup")
-def _on_startup() -> None:
-    _start_warmer()
-
-
 def _about_info() -> dict:
     """Deployment identity for the About panel: the vault name + version (pack.yaml)
     and the engine/Hermes pins (engine.version). Read fresh — both files are tiny
     and About is cold."""
     info = {"vault": "", "vault_version": "", "engine_version": "", "hermes_pin": "",
-            "project_url": ""}
+            "project_url": "",
+            # deployment timezone for the UI clock (okengine#301) — the container is started with
+            # $TZ (compose passes TZ=${TZ:-UTC}); the clock renders in this zone, not UTC.
+            "tz": os.environ.get("TZ") or "UTC"}
 
     def _yaml(p: Path) -> dict:
         try:
@@ -752,11 +780,18 @@ def _about_info() -> dict:
     return info
 
 
+# okengine#257: UI-editing switch. The Chat's write-back happens on the gateway (the api_server
+# okengine-write toolset, which OKENGINE_EDITING=0 drops via ensure-runtime) — this flag is the
+# reader's VIEW of it, purely for the UI's read-only indicator. Default ON, matching hardening_lib.
+_EDITING = os.environ.get("OKENGINE_EDITING", "").strip().lower() not in ("0", "false", "no", "off")
+
+
 @app.get("/api/about")
 def api_about():
     """Vault name + engine/Hermes versions for the reader's About panel."""
     info = _about_info()
     info["chat_enabled"] = _chat_enabled()      # gate the Chat tab on a configured agent
+    info["editing_enabled"] = _EDITING          # false -> Chat is read-only (no vault write-back)
     return info
 
 
@@ -936,9 +971,15 @@ def api_tree():
 @app.get("/api/groups")
 def api_groups():
     """Pack-declared display groups (label -> page count) — browse entities BY KIND
-    (e.g. all pages of a few related types) across namespaces. Empty when the pack declares none."""
-    return {"groups": [{"label": label, "count": len(_pages_of_types(types))}
-                       for label, types in _display_groups()]}
+    (e.g. all pages of a few related types) across namespaces. A declared-but-UNPOPULATED kind
+    (0 pages) is omitted, matching how the browse tree hides empty namespaces — else the rail
+    shows a dead '… 0' row (okengine#259, Browse cleanup). Empty when none populated."""
+    out = []
+    for label, types in _display_groups():
+        n = len(_pages_of_types(types))
+        if n:
+            out.append({"label": label, "count": n})
+    return {"groups": out}
 
 
 @app.get("/api/pages")
@@ -953,6 +994,34 @@ def api_pages(dir: str = Query(default=""), group: str = Query(default="")):
     if "/" in dir or ".." in dir or dir.startswith((".", "/")):
         raise HTTPException(400, "bad dir")
     return {"dir": dir, "about": _ns_about(dir), "pages": _scan_dir(dir)}
+
+
+_REVISION_CACHE: tuple[float, list[dict]] = (float("-inf"), [])
+
+
+@app.get("/api/page-revisions")
+def api_page_revisions():
+    """Minimal cached full-vault revision inventory for standing detectors."""
+    global _REVISION_CACHE
+    now = time.monotonic()
+    if now - _REVISION_CACHE[0] < _DIR_TTL:
+        return {"pages": _REVISION_CACHE[1]}
+    out = []
+    excluded = _excluded_dirs()
+    root = WIKI.resolve()
+    for p in WIKI.rglob("*.md"):
+        if _skip(p.name) or _reserved_seg(p) or (_ns_dirs(p) & excluded):
+            continue
+        try:
+            rp = p.resolve()
+            st = rp.stat()
+            rel = str(rp.relative_to(root))[:-3]
+        except (OSError, ValueError):
+            continue
+        out.append({"path": rel, "revision": f"{st.st_mtime_ns}:{st.st_size}"})
+    out.sort(key=lambda row: row["path"])
+    _REVISION_CACHE = (now, out)
+    return {"pages": out}
 
 
 def _ns_about(dir: str) -> str:
@@ -1032,7 +1101,7 @@ def _source_reliability() -> dict:
     if now - _SRC_REL_CACHE[0] < _DIR_TTL:
         return _SRC_REL_CACHE[1]
     out: dict = {}
-    sp = VAULT / "schema.yaml"
+    sp = _governing_schema_path()
     if sp.is_file():
         try:
             reg = (yaml.safe_load(sp.read_text(encoding="utf-8")) or {}).get("source_registry") or {}
@@ -1241,7 +1310,55 @@ def api_page(path: str = Query(...)):
             "meta": m["primary"], "meta_aux": m["secondary"], "panel": _panel_for(fm, body),
             "provenance": _provenance(fm, body),
             "conflicts": _shape_conflicts(fm), "needs_review": bool(fm.get("needs_review")),
-            "observations": _observations_by_canonical().get(slug, [])}
+            "observations": _observations_by_canonical().get(slug, []),
+            "recent_reporting": _recent_reporting(fm)}
+
+
+def _recent_reporting(fm: dict) -> list[dict]:
+    """Group an entity's recent source refs by an explicit/URL story identity.
+
+    The old panel rendered one row per ref, so duplicate source pages for one
+    article looked like duplicate actor activity. Distinct outlets stay distinct
+    unless their pages explicitly share a story/cluster id.
+    """
+    refs = fm.get("recent_news_refs") or []
+    if isinstance(refs, str):
+        refs = [refs]
+    if not isinstance(refs, list):
+        return []
+    groups: dict[str, dict] = {}
+    for raw in refs:
+        rel = str(raw).strip().strip("[] ")
+        if rel.endswith(".md"):
+            rel = rel[:-3]
+        if not rel.startswith("sources/"):
+            continue
+        try:
+            path = (WIKI / f"{rel}.md").resolve()
+            path.relative_to(WIKI.resolve())
+            sfm, _ = split_fm(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            continue                              # stale ref: don't render a dead activity row
+        explicit = sfm.get("story_id") or sfm.get("same_story_cluster") or sfm.get("cluster_id")
+        url = str(sfm.get("canonical_url") or sfm.get("url") or "").strip()
+        if explicit:
+            key = f"cluster:{explicit}"
+        elif url:
+            from urllib.parse import urlsplit, urlunsplit
+            try:
+                parts = urlsplit(url)
+                key = "url:" + urlunsplit(("", parts.netloc.lower().removeprefix("www."),
+                                           parts.path.rstrip("/"), "", ""))
+            except ValueError:
+                key = f"path:{rel}"
+        else:
+            key = f"path:{rel}"
+        group = groups.setdefault(key, {
+            "title": str(sfm.get("title") or sfm.get("name") or Path(rel).name),
+            "sources": [],
+        })
+        group["sources"].append({"path": rel, "publisher": str(sfm.get("publisher") or "")})
+    return [{**group, "count": len(group["sources"])} for group in groups.values()]
 
 
 def _provenance(fm: dict, body: str) -> dict:
@@ -1657,7 +1774,6 @@ def _load_backlinks(blocking: bool = True) -> dict:
     return _BACKLINKS["map"] or {}
 
 
-@app.on_event("startup")
 def _prewarm_backlinks() -> None:
     """Build the backlink graph in the background at startup so the first user
     request doesn't block on the build."""

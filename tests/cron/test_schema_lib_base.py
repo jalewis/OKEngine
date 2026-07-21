@@ -102,7 +102,7 @@ def test_type_owner_and_field_owners(tmp_path):
     assert m.field_owners(sch, "entity") == {}
 
 
-def test_required_unions_and_strict_types_engine_owned(tmp_path):
+def test_required_unions_and_pack_can_opt_into_strict_types(tmp_path):
     m = _load()
     # a pack that adds a global required field AND tries to set strict_types: true
     root = _vault(tmp_path, (
@@ -113,8 +113,8 @@ def test_required_unions_and_strict_types_engine_owned(tmp_path):
     merged = m.merged_schema(root)
     # required is the union (sorted; stricter-only); base guarantees `type` + `id`
     assert merged["okf"]["required"] == ["id", "name", "type"]
-    # strict_types is ENGINE-OWNED: the pack's `true` is IGNORED, base default wins
-    assert merged["strict_types"] is False
+    # strictness is monotonic: the pack can close the composed taxonomy
+    assert merged["strict_types"] is True
     # a pack that omits strict_types likewise inherits the engine-base default
     root2 = _vault(tmp_path / "p2", "types:\n  entity: {required: [type]}\n")
     assert m.merged_schema(root2)["strict_types"] is False
@@ -188,3 +188,34 @@ def test_int_fields_from_base_and_pack(tmp_path):
     assert "recent_reports" in infl and "total_mentions" in infl   # base contributes
     assert "citation_count" in infl                                # pack adds
     assert "aliases" not in infl                                   # list fields stay out
+
+
+def test_governing_schema_reloads_after_mtime_change(tmp_path):
+    """invariant-audit HIGH: _SCHEMA_CACHE/_BASE_CACHE were cached FOREVER (path-keyed, no mtime),
+    so the long-running write path validated every write against the pre-edit schema for the life of
+    the gateway after any hand-edit. They must now invalidate on mtime, like _COMPOSED_CACHE."""
+    import os, time
+    m = _load()
+    v = _vault(tmp_path, "types:\n  vendor: {required: [type]}\n")
+    assert "vendor" in (m.governing_schema(v).get("types") or {})
+    assert "widget" not in (m.governing_schema(v).get("types") or {})
+    # hand-edit schema.yaml (no restart) + bump mtime — a fresh read must see the new type
+    sp = v / "wiki" / "schema.yaml"
+    sp_mtime = sp.stat().st_mtime
+    sp.write_text("types:\n  vendor: {required: [type]}\n  widget: {required: [type]}\n")
+    os.utime(sp, (sp_mtime + 2, sp_mtime + 2))       # guarantee a distinct mtime
+    got = m.governing_schema(v).get("types") or {}
+    assert "widget" in got, "governing_schema served a STALE schema after an on-disk edit"
+
+
+def test_base_schema_reloads_after_mtime_change(tmp_path, monkeypatch):
+    import os
+    m = _load()
+    bp = tmp_path / "base-schema.yaml"
+    bp.write_text("okf:\n  required: [type]\ntypes: {a: {required: [type]}}\n")
+    monkeypatch.setenv("OKENGINE_BASE_SCHEMA", str(bp))
+    assert "a" in (m.base_schema().get("types") or {}) and "b" not in (m.base_schema().get("types") or {})
+    mt = bp.stat().st_mtime
+    bp.write_text("okf:\n  required: [type]\ntypes: {a: {required: [type]}, b: {required: [type]}}\n")
+    os.utime(bp, (mt + 2, mt + 2))
+    assert "b" in (m.base_schema().get("types") or {}), "base_schema served a STALE base after an edit"

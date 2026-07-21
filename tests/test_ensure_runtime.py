@@ -2,6 +2,7 @@
 config.yaml (host-owned) before docker compose up, for git-cloned library packs
 that have no committed runtime."""
 import os
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -46,17 +47,162 @@ def test_seeds_missing_runtime(tmp_path):
     assert _norm(cfg.read_text()) == _norm(TEMPLATE.read_text())
 
 
-def test_idempotent_does_not_clobber(tmp_path):
-    """An existing config.yaml (the operator's, with secrets/edits) is untouched."""
+def test_existing_config_preserves_operator_values_and_adds_security_baseline(tmp_path):
+    """An old config keeps operator values/comments while gaining a newly introduced safe default."""
     rt = tmp_path / ".hermes-data"
     rt.mkdir()
     cfg = rt / "config.yaml"
     cfg.write_text("# my edited config\nterminal:\n  backend: local\n")
-    before = cfg.read_text()
     r = _run([str(tmp_path)])
     assert r.returncode == 0
-    assert cfg.read_text() == before          # not clobbered
+    after = cfg.read_text()
+    assert after.startswith("# my edited config\nterminal:\n  backend: local\n")
+    assert "platform_toolsets:\n  api_server:\n    - okengine\n    - okengine-write" in after
     assert "already present" in r.stdout
+
+
+def test_existing_platform_toolsets_gets_missing_api_server_without_clobber(tmp_path):
+    rt = tmp_path / ".hermes-data"
+    rt.mkdir()
+    cfg = rt / "config.yaml"
+    cfg.write_text(
+        "# keep me\n"
+        "platform_toolsets:\n"
+        "  cron:\n"
+        "    - hermes-cron\n"
+        "model:\n"
+        "  default: operator/model\n"
+    )
+
+    first = _run([str(tmp_path)])
+    assert first.returncode == 0, first.stderr
+    after = cfg.read_text()
+    assert "# keep me" in after and "default: operator/model" in after
+    assert "  cron:\n    - hermes-cron" in after
+    assert after.count("  api_server:") == 1
+    assert "  api_server:\n    - okengine\n    - okengine-write\nmodel:" in after
+
+    second = _run([str(tmp_path)])
+    assert second.returncode == 0, second.stderr
+    assert cfg.read_text() == after, "reconciliation must be idempotent"
+
+
+def test_existing_mcp_config_gains_server_bound_source_quality_writer(tmp_path):
+    rt = tmp_path / ".hermes-data"
+    rt.mkdir()
+    cfg = rt / "config.yaml"
+    cfg.write_text(
+        "mcp_servers:\n"
+        "  okengine-write:\n"
+        "    command: /custom/python\n"
+        "platform_toolsets:\n"
+        "  cron: [no_mcp]\n"
+    )
+    first = _run([str(tmp_path)])
+    assert first.returncode == 0, first.stderr
+    after = cfg.read_text()
+    assert after.count("okengine-write-source-quality:") == 1
+    assert "OKENGINE_WRITE_ACTOR: cron:source-quality-backfill" in after
+    assert "command: /custom/python" in after, "operator configuration must be preserved"
+    second = _run([str(tmp_path)])
+    assert second.returncode == 0
+    assert cfg.read_text() == after
+
+
+def test_materialized_cron_capabilities_gain_distinct_server_bound_writers(tmp_path):
+    rt = tmp_path / ".hermes-data"
+    rt.mkdir()
+    cfg = rt / "config.yaml"
+    cfg.write_text(
+        "mcp_servers:\n"
+        "  okengine-write:\n"
+        "    command: /custom/python\n"
+        "platform_toolsets:\n"
+        "  cron: [no_mcp]\n"
+    )
+    state = tmp_path / ".okengine"
+    state.mkdir()
+    (state / "effective-policy.json").write_text(json.dumps({
+        "capabilities": {
+            "cron:tid-procedure-candidate": {},
+            "cron:tid-gap-priority-candidate": {},
+            "extension:not-a-cron": {},
+        }
+    }))
+    first = _run([str(tmp_path)])
+    assert first.returncode == 0, first.stderr
+    after = cfg.read_text()
+    assert after.count("okengine-write-tid-procedure-candidate:") == 1
+    assert after.count("OKENGINE_WRITE_ACTOR: cron:tid-procedure-candidate") == 1
+    assert after.count("okengine-write-tid-gap-priority-candidate:") == 1
+    assert "extension:not-a-cron" not in after
+    assert "command: /custom/python" in after
+    second = _run([str(tmp_path)])
+    assert second.returncode == 0, second.stderr
+    assert cfg.read_text() == after
+
+
+def test_misplaced_source_quality_writer_is_moved_under_mcp_servers(tmp_path):
+    """A legacy reconciliation put the reserved writer under `web:`. Mere text
+    presence must not hide that invalid placement from subsequent deploys."""
+    rt = tmp_path / ".hermes-data"
+    rt.mkdir()
+    cfg = rt / "config.yaml"
+    cfg.write_text(
+        "mcp_servers:\n"
+        "  okengine-write:\n"
+        "    command: /custom/python\n"
+        "web:\n"
+        "  backend: rotate\n"
+        "  # Engine-managed server-bound identity for source-quality-backfill.\n"
+        "  okengine-write-source-quality:\n"
+        "    command: /opt/hermes/.venv/bin/python\n"
+        "    args:\n"
+        "    - /opt/hermes/okengine-mcp/write_server.py\n"
+        "    env:\n"
+        "      OKENGINE_WRITE_ACTOR: cron:source-quality-backfill\n"
+        "platform_toolsets:\n"
+        "  cron: [no_mcp]\n"
+    )
+
+    first = _run([str(tmp_path)])
+    assert first.returncode == 0, first.stderr
+    after = cfg.read_text()
+    assert after.count("okengine-write-source-quality:") == 1
+    mcp, web = after.split("web:\n", 1)
+    assert "okengine-write-source-quality:" in mcp
+    assert "okengine-write-source-quality:" not in web
+    assert "web:\n  backend: rotate\nplatform_toolsets:" in after
+
+    second = _run([str(tmp_path)])
+    assert second.returncode == 0, second.stderr
+    assert cfg.read_text() == after, "repair must reach an idempotent steady state"
+
+
+def test_existing_api_server_policy_is_operator_owned(tmp_path):
+    rt = tmp_path / ".hermes-data"
+    rt.mkdir()
+    cfg = rt / "config.yaml"
+    cfg.write_text("platform_toolsets:\n  api_server: [okengine, web]\n")
+
+    r = _run([str(tmp_path)])
+
+    assert r.returncode == 0, r.stderr
+    assert "api_server: [okengine, web]" in cfg.read_text()
+    assert cfg.read_text().count("api_server:") == 1
+
+
+def test_inline_platform_toolsets_is_not_duplicated(tmp_path):
+    rt = tmp_path / ".hermes-data"
+    rt.mkdir()
+    cfg = rt / "config.yaml"
+    cfg.write_text("platform_toolsets: {}\n")
+
+    r = _run([str(tmp_path)])
+
+    assert r.returncode == 0, r.stderr
+    assert cfg.read_text() == "platform_toolsets: {}\n"
+    assert "left operator config unchanged" in r.stdout
 
 
 def test_fails_when_not_writable_by_gateway_uid(tmp_path):
@@ -229,3 +375,23 @@ def test_existing_uid_pin_is_not_clobbered(tmp_path):
     assert r.returncode == 0, r.stderr
     assert (tmp_path / ".env").read_text().count("HERMES_UID=") == 1
     assert (tmp_path / ".env").read_text().count("HERMES_GID=") == 1
+
+
+def test_cron_plus_install_delegates_to_the_shared_installer():
+    """HIGH #6: ensure-runtime must install cron-plus via install-cron-plus.sh — the ONE installer
+    that also applies the carried patches (job-env + after-ordering) extension crons require. A
+    divergent inline `git clone`/`checkout` here ships an UNPATCHED scheduler. Static guard so the
+    clone-only block can't come back."""
+    txt = SCRIPT.read_text(encoding="utf-8")
+    assert "install-cron-plus.sh" in txt, "ensure-runtime must delegate cron-plus install to the shared, patch-applying installer"
+    # the old divergent shape (a bare clone of the plugin into plugins/cron-plus) must be gone
+    assert "git clone" not in txt or "cron-plus" not in txt.split("git clone", 1)[1][:200], \
+        "ensure-runtime should not inline-clone cron-plus — delegate to install-cron-plus.sh"
+
+
+def test_install_cron_plus_applies_both_carried_patches():
+    """The shared installer must apply BOTH carried patches + the after_ordering overlay — the
+    capabilities extension crons depend on (per-job env, after: ordering)."""
+    installer = (REPO / "scripts" / "install-cron-plus.sh").read_text(encoding="utf-8")
+    assert "job-env.patch" in installer and "after-ordering.patch" in installer
+    assert "after_ordering.py" in installer

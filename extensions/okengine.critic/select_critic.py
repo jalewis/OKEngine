@@ -21,9 +21,15 @@ from pathlib import Path
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
-STALE_DAYS = int(os.environ.get("CRITIC_STALE_DAYS", "14"))
-MIN_WORDS = int(os.environ.get("CRITIC_MIN_WORDS", "200"))
-MIN_SOURCES = int(os.environ.get("CRITIC_MIN_SOURCES", "3"))
+STALE_DAYS = int(os.environ.get(
+    "CRITIC_STALE_DAYS", os.environ.get("OKENGINE_CRITIC_STALE_DAYS", "14")
+))
+MIN_WORDS = int(os.environ.get(
+    "CRITIC_MIN_WORDS", os.environ.get("OKENGINE_CRITIC_MIN_WORDS", "200")
+))
+MIN_SOURCES = int(os.environ.get(
+    "CRITIC_MIN_SOURCES", os.environ.get("OKENGINE_CRITIC_MIN_SOURCES", "3")
+))
 
 _FM = re.compile(r"\A---\s*\n(.*?)\n---\s*(?:\n|\Z)(.*)\Z", re.S)
 _DATE = re.compile(r"(\d{4}-\d{2}-\d{2})")

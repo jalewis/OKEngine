@@ -44,6 +44,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 import schema_lib  # noqa: E402
+import tz_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
@@ -338,8 +339,8 @@ def dash_recent_ingest(sources, today, ts) -> Path:
 
 
 def main() -> int:
-    today = datetime.now(timezone.utc).date()
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    today = tz_lib.deployment_today()                              # okengine#301: deployment TZ
+    ts = tz_lib.deployment_now().strftime("%Y-%m-%d %H:%M %Z")     # %Z = the deployment zone, not "UTC"
     DASH_DIR.mkdir(parents=True, exist_ok=True)
 
     namespaces = _discover_namespaces()

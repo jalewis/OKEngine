@@ -6,6 +6,7 @@ regardless of real lane state (a dead-monitor-reads-healthy fail). This pins the
 format so the two halves cannot silently drift again.
 """
 import importlib.util
+import json
 import re
 from pathlib import Path
 
@@ -54,3 +55,27 @@ def test_producer_still_emits_plain_counts():
     for frag in ("ok: {counts['ok']}", "stale: {counts['stale']}",
                  "errored: {counts['errored']}", "off-model: {counts['off-model']}"):
         assert frag in src, f"producer format drifted: {frag!r} not in fleet_health.py"
+
+
+def test_fleet_health_emits_lane_identity_sidecar(tmp_path, monkeypatch):
+    jobs = tmp_path / "jobs.json"
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    wiki = tmp_path / "wiki"
+    jobs.write_text(json.dumps({"jobs": [
+        {"name": "lane-error", "enabled": True, "schedule": {"expr": "0 * * * *"}},
+        {"name": "lane-ok", "enabled": True, "schedule": {"expr": "0 * * * *"}},
+    ]}))
+    (logs / "lane-error-1.log").write_text("ERROR failed\n")
+    (logs / "lane-ok-1.log").write_text("completed\n")
+
+    fh = _load(FH, "fleet_health_sidecar")
+    monkeypatch.setattr(fh, "WIKI", wiki)
+    monkeypatch.setattr(fh, "JOBS", jobs)
+    monkeypatch.setattr(fh, "LOGS", logs)
+    monkeypatch.setattr(fh, "_interval_s", lambda _expr: None)
+
+    assert fh.main() == 0
+    sidecar = json.loads((wiki / "dashboards" / ".fleet-lanes.json").read_text())
+    assert sidecar["errored"] == ["lane-error"]
+    assert sidecar["ok"] == ["lane-ok"]

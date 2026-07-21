@@ -6,6 +6,7 @@ invalid enabled set, and generated-from-source (the deploy pass derives jobs fro
 manifests + enabled-state).
 """
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -106,6 +107,44 @@ def test_enable_then_compose_emits_namespaced_job(tmp_path):
     assert [j["name"] for j in jobs] == ["demo.alpha"]
 
 
+def test_enabled_config_override_reaches_composed_job_env(tmp_path):
+    disc, comp = _disc(), _comp()
+    pack = tmp_path / "pack"
+    ext_dir = _write_ext(pack, "demo.alpha")
+    manifest_path = ext_dir / "extension.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text())
+    manifest["config"] = {
+        "horizon_days": {"type": "integer", "default": 30},
+        "focus": {"type": "string", "default": ""},
+    }
+    manifest_path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    disc.set_enabled(pack, "demo.alpha", True, config={"horizon_days": 90})
+
+    jobs, errors = comp.extension_jobs(pack)
+
+    assert errors == []
+    assert jobs[0]["env"] == {
+        "OKENGINE_DEMO_ALPHA_HORIZON_DAYS": "90",
+        "OKENGINE_DEMO_ALPHA_FOCUS": "",
+    }
+
+
+def test_unknown_enabled_config_override_fails_before_runtime(tmp_path):
+    disc, comp = _disc(), _comp()
+    pack = tmp_path / "pack"
+    ext_dir = _write_ext(pack, "demo.alpha")
+    manifest_path = ext_dir / "extension.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text())
+    manifest["config"] = {"horizon_days": {"type": "integer", "default": 30}}
+    manifest_path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    disc.set_enabled(pack, "demo.alpha", True, config={"typo_days": 90})
+
+    jobs, errors = comp.extension_jobs(pack)
+
+    assert jobs
+    assert any("unknown config override(s): typo_days" in error for error in errors)
+
+
 def test_disable_drops_job_keeps_state_file(tmp_path):
     disc, comp = _disc(), _comp()
     pack = tmp_path / "pack"
@@ -134,6 +173,30 @@ def test_cli_enable_validates_and_writes(tmp_path, capsys):
     assert rc == 0
     enabled, _ = _disc().load_enabled_state(pack)
     assert "demo.alpha" in enabled
+
+
+def test_cli_reenable_reconciles_changed_manifest_scopes_without_rotation(tmp_path, capsys):
+    cli = _cli()
+    pack = tmp_path / "pack"
+    ext = _write_ext(pack, "demo.alpha", trust="sidecar")
+    assert cli.main(["enable", str(pack), "demo.alpha"]) == 0
+    secret_path = pack / ".okengine" / "extension-secrets.json"
+    original = json.loads(secret_path.read_text())["demo.alpha"]
+
+    manifest_path = ext / "extension.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text())
+    manifest["capabilities"]["read"] = ["wiki/news/**"]
+    manifest["capabilities"]["write"] = ["predictions/**"]
+    manifest_path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+
+    assert cli.main(["enable", str(pack), "demo.alpha"]) == 0
+    out = capsys.readouterr().out
+    assert "token scopes reconciled" in out
+    assert json.loads(secret_path.read_text())["demo.alpha"] == original
+    store = json.loads((pack / ".okengine" / "extension-tokens.json").read_text())
+    rec = next(r for r in store["tokens"] if r["ext_id"] == "demo.alpha")
+    assert rec["read_scopes"] == ["wiki/news/**"]
+    assert rec["write_scopes"] == ["predictions/**"]
 
 
 def test_cli_enable_missing_dependency_fails_without_writing(tmp_path):

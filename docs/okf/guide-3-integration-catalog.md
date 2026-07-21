@@ -4,6 +4,11 @@ Domain-agnostic; generalized from the security integration catalog; reflects the
 
 The Open Knowledge Format (OKF) gives a universal syntax for representing knowledge but deliberately omits guidance on *how* external data gets in. This catalog fills that gap **generically**: how any **domain pack** wires its sources into an agent-maintained vault without creating duplicate entities, losing provenance, or bloating the store with ephemera. The patterns here are the deliverable. The security source list (MITRE ATT&CK, CISA KEV, NVD, EPSS, MISP, Abuse.ch, STIX/TAXII, OCSF) is one worked example, summarized at the end.
 
+For an executable, pack-authored form of these acquisition patterns, see
+[Declarative source connectors](../source-connectors.md). The connector contract
+covers Bundle, Query, Enrichment, and bounded Stream/Poll acquisition with one
+engine runtime and no source-specific engine code.
+
 A **pack** is the domain-specific layer the engine consumes: its feed lists (`pack/feeds/*.opml`), data tables (`pack/data/*`), entity-type contract (`schema.yaml` `types`), and persona/curation rules. The engine is domain-clean; everything below is configured by the pack, not coded per-domain.
 
 ---
