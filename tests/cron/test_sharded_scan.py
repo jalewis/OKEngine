@@ -25,7 +25,7 @@ REPO = Path(__file__).resolve().parent.parent.parent
 
 # Engine source roots that scan vault content. tests/ is excluded (this file
 # itself talks about `.glob(`), as are generated/runtime trees.
-SCAN_ROOTS = ["scripts", "tools", "okengine-mcp", "okengine-reader"]
+SCAN_ROOTS = ["scripts", "tools", "okengine-mcp", "okengine-reader", "okengine-cockpit"]
 
 # `.rglob(` does not contain the substring `.glob(` (the char before `glob` is
 # `r`, not `.`), so a plain search for `.glob(` matches only the non-recursive call.

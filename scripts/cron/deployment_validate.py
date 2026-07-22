@@ -352,6 +352,44 @@ def check_timezone():
             "re-run ensure-runtime, recreate the gateway, THEN null the stale next_run_at in "
             ".hermes-data/cron-plus/jobs.json (it persists across the recreate under the old tz; "
             "cron-plus only recomputes a NULL next_run_at).")
+        return
+    # TZ is a real zone AND cron-plus is tz-aware — but a persisted next_run_at can STILL be stale if
+    # the TZ VALUE changed since it was computed (America/New_York -> America/Chicago, or UTC -> a
+    # zone). cron-plus only recomputes a NULL next_run_at, so a populated one keeps firing at the OLD
+    # local hour until it lapses — the prior branches only covered unset->set and the naive plugin
+    # (#326 [29]). Detect it directly: the next fire, viewed in the CURRENT tz, must land on the
+    # schedule's declared hour.
+    try:
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo(tz)
+    except Exception:
+        return
+    stale = []
+    for j in jobs:
+        if not j.get("enabled", True):
+            continue
+        m = _DAILY_RE.match((j.get("schedule") or {}).get("expr") or "")
+        nra = j.get("next_run_at")
+        if not m or not nra:
+            continue
+        try:
+            want_hour = int(m.group(2))
+            dt = datetime.fromisoformat(str(nra))
+            if dt.tzinfo is None:
+                continue                       # a naive stamp has no tz to compare — leave it
+            local_hour = dt.astimezone(zone).hour
+        except (ValueError, TypeError):
+            continue
+        if local_hour != want_hour:
+            stale.append(f"{j.get('name') or '?'} (next fire {local_hour:02d}:xx local, "
+                         f"schedule {want_hour:02d}:xx)")
+    if stale:
+        add("WARN", "timezone",
+            f"TZ={tz} is valid and cron-plus is tz-aware, but {len(stale)} daily lane(s) carry a "
+            "next_run_at computed under a DIFFERENT timezone (they fire at the wrong local hour): "
+            f"{', '.join(stale[:4])}{' …' if len(stale) > 4 else ''}. cron-plus honors a populated "
+            "next_run_at as-is (only a NULL one is recomputed), so null the stale next_run_at in "
+            ".hermes-data/cron-plus/jobs.json to adopt the current TZ.")
 
 
 def check_partition_dups():
@@ -465,11 +503,18 @@ def check_ownership():
     overwrite is a FAIL. Repair: scripts/fix-vault-ownership.sh (host) or ensure-runtime."""
     me = os.geteuid()
     strays = []
-    for base in ("wiki", "raw", "config"):
+    # .okengine holds the write-path-critical composed-schema.yaml (write_server PREFERS it; a
+    # root-owned copy that a lane can't regenerate silently degrades the write path to base+pack) plus
+    # extensions/connectors runtime — all lane-maintained, so it belongs in the ownership scan (#326
+    # [14]). Its snapshots/ + backups/ are transient transaction artifacts (framework upgrade/install/
+    # backup), not lane-maintained runtime, so skip them to avoid false FAILs.
+    for base in ("wiki", "raw", "config", ".okengine"):
         d = VAULT / base
         if not d.is_dir():
             continue
         for p in d.rglob("*"):
+            if base == ".okengine" and {"snapshots", "backups"} & set(p.relative_to(d).parts):
+                continue
             try:
                 # Flag stray DIRECTORIES too, not just files (invariant-audit #8): a root-owned dir
                 # (from a bare root `docker exec`) is unwritable by the lane uid, so the atomic-write
@@ -660,6 +705,28 @@ def check_write_path_libs():
         add("WARN", "write-path", f"base-schema.yaml exists in {present.parent} but is MISSING from "
             f"{absent.parent} — cannot verify the write path validates against the current base "
             f"schema (undetectable, not a pass).")
+    # tools/schema_validator.py is the OKF conformance validator — BAKED at HERMES/tools and imported
+    # by BOTH the write-guard hook AND the staged importer_guard/schema_drift_lint crons. It is
+    # image-only, so a validator change staged (its reference copy lands in DATA/config) without an
+    # image rebuild leaves the write path + those crons enforcing the OLD rules. Compare the baked copy
+    # against the staged reference the same way (okengine#326 [15]).
+    baked_sv = HERMES / "tools" / "schema_validator.py"
+    staged_sv = DATA / "config" / "schema_validator.py"
+    if baked_sv.is_file() and staged_sv.is_file():
+        try:
+            if baked_sv.read_bytes() != staged_sv.read_bytes():
+                add("FAIL", "write-path", f"schema_validator.py DIFFERS between the baked validator "
+                    f"({baked_sv}) and the staged reference ({staged_sv}) — the write-guard hook and "
+                    f"the importer_guard/schema_drift_lint crons run a STALE validator. Rebuild the "
+                    f"gateway image; staging alone does not reach the baked tools/. See "
+                    f"docs/id-index-runbook.md.")
+        except OSError as e:
+            add("WARN", "write-path", f"schema_validator.py: cannot compare ({e})")
+    elif baked_sv.is_file() != staged_sv.is_file():
+        present, absent = (baked_sv, staged_sv) if baked_sv.is_file() else (staged_sv, baked_sv)
+        add("WARN", "write-path", f"schema_validator.py exists in {present.parent} but is MISSING "
+            f"from {absent.parent} — cannot verify the write path/guards run the current validator "
+            f"(undetectable, not a pass).")
 
 
 def check_provenance_env():

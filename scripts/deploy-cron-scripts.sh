@@ -119,6 +119,19 @@ if [ -f "$REPO_ROOT/config/base-schema.yaml" ]; then
         | docker exec -i -u "$HERMES_UID" "$CONTAINER" tar -xf - -C /opt/data/config/
     echo "  engine base-schema deployed to $CONTAINER:/opt/data/config/"
 fi
+
+# --- tools/schema_validator.py REFERENCE -> /opt/data/config/ (okengine#326 [15]) ---
+# The OKF conformance validator is BAKED at /opt/hermes/tools — the write-guard hook AND the staged
+# importer_guard/schema_drift_lint crons import it from there. It is IMAGE-only, so a validator change
+# staged without an image rebuild leaves the write path + those crons enforcing the OLD rules, with
+# nothing catching the drift (the same trap as base-schema above). Stage a REFERENCE copy purely so
+# deployment_validate can compare it against the baked copy and FAIL a stale image. Nothing imports
+# this copy (the crons import `tools.schema_validator` from the baked /opt/hermes/tools).
+if [ -f "$REPO_ROOT/tools/schema_validator.py" ]; then
+    ( cd "$REPO_ROOT/tools" && tar -cf - schema_validator.py ) \
+        | docker exec -i -u "$HERMES_UID" "$CONTAINER" tar -xf - -C /opt/data/config/
+    echo "  schema_validator reference deployed to $CONTAINER:/opt/data/config/"
+fi
 if [ -d "$PACK_SCRIPTS" ]; then
     pcount="$(find "$PACK_SCRIPTS" -maxdepth 1 -name '*.py' | wc -l)"
     if [ "$pcount" -gt 0 ]; then

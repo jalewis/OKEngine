@@ -37,16 +37,33 @@ operations:
     schedule: {kind: cron, expr: "0 5 * * 1"}        # weekly (Mon) — gated, cheap
     entrypoint: select_competitor_quadrants.py
     prompt_file: prompts/quadrants.md
+    output_contract: &competitive_contract
+      api: 1
+      allowed_namespaces: [dashboards]
+      allowed_types: [dashboard]
+      operations: [create, update, converge]
+      required_fields: [type, title]
+      required_relationships: []
+      body: {required: true, min_non_whitespace: 100}
+      unknown_fields: reject
+      unresolved_links: review
+      placeholder_links: reject
+      completion: per-selected-item
+    adversarial_fixtures: &model_fixtures [tests/extensions/test_model_output_contracts.py]
     toolsets: [file, todo, okengine-write, okengine]
   sector-battle-cards:
     schedule: {kind: cron, expr: "0 5 * * 2"}        # weekly (Tue)
     entrypoint: select_sector_battle_cards.py
     prompt_file: prompts/battle-cards.md
+    output_contract: *competitive_contract
+    adversarial_fixtures: *model_fixtures
     toolsets: [file, todo, okengine-write, okengine]
   acquirer-signals:
     schedule: {kind: cron, expr: "0 5 * * 4"}        # weekly (Thu) — movement/acquisition signals
     entrypoint: select_acquirer_signals.py
     prompt_file: prompts/acquirer-signals.md
+    output_contract: *competitive_contract
+    adversarial_fixtures: *model_fixtures
     toolsets: [file, todo, okengine-write, okengine]
   discover-competitors:
     schedule: {kind: cron, expr: "0 5 * * 3"}        # weekly (Wed) — deterministic graph analysis

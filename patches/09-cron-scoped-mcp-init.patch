@@ -1,0 +1,51 @@
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 84b0cb4..a3c5dcd 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -222,6 +222,25 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
+         )
+         return None
+ 
++
++def _discover_cron_mcp_tools(enabled_toolsets: list[str] | None) -> list[str]:
++    """Initialize only MCP servers admitted by this cron job's allowlist."""
++    from tools.mcp_tool import _load_mcp_config, register_mcp_servers
++
++    servers = _load_mcp_config()
++    if enabled_toolsets is None:
++        return register_mcp_servers(servers)
++    allowed = set(enabled_toolsets)
++    selected = {name: value for name, value in servers.items() if name in allowed}
++    omitted = len(servers) - len(selected)
++    if omitted:
++        logger.info(
++            "Cron MCP scope: initializing %d of %d configured server(s)",
++            len(selected), len(servers),
++        )
++    return register_mcp_servers(selected)
++
++
+ # Valid delivery platforms — used to validate user-supplied platform names
+ # in cron delivery targets, preventing env var enumeration via crafted names.
+ _KNOWN_DELIVERY_PLATFORMS = frozenset({
+@@ -2968,9 +2987,9 @@ def run_job(
+         # ticks short-circuit on already-connected servers inside
+         # register_mcp_servers(). Non-fatal on failure: a broken MCP server
+         # shouldn't kill an otherwise-working cron job. See #4219.
++        _cron_enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
+         try:
+-            from tools.mcp_tool import discover_mcp_tools
+-            _mcp_tools = discover_mcp_tools()
++            _mcp_tools = _discover_cron_mcp_tools(_cron_enabled_toolsets)
+             if _mcp_tools:
+                 logger.info(
+                     "Job '%s': %d MCP tool(s) available",
+@@ -3001,7 +3020,7 @@ def run_job(
+             providers_order=pr.get("order"),
+             provider_sort=pr.get("sort"),
+             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
+-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
++            enabled_toolsets=_cron_enabled_toolsets,
+             disabled_toolsets=_apply_failure_path_toolset_guard(
+                 _resolve_cron_disabled_toolsets(_cfg), _script_failed
+             ),

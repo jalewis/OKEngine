@@ -146,3 +146,15 @@ def test_report_shows_model_usage_and_free_offload(tmp_path):
     assert "Model usage" in report and "cost offload" in report
     assert "66% on free tiers" in report          # 2 of 3 calls free
     assert "[PAID]  deepseek-v4-pro" in report
+
+
+def test_report_exposes_verified_receipt_counts(tmp_path):
+    m = _mod()
+    _seed(tmp_path, jobs=[])
+    receipt = tmp_path / "cron-plus" / "receipts" / "lane" / "run.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text(json.dumps({"counts": {
+        "selected": 30, "accepted": 3, "rejected": 2, "deferred": 4, "undisposed": 21,
+    }}))
+    report, _ = m.build_report(str(tmp_path))
+    assert "30 selected" in report and "3 accepted" in report and "21 undisposed" in report

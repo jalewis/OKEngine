@@ -27,6 +27,19 @@ operation:
   schedule: {kind: cron, expr: "37 5 * * *"}
   entrypoint: select_undefined_terms.py   # wake-gate: finds under-referenced undefined terms
   prompt_file: prompts/glossary.md
+  output_contract:
+    api: 1
+    allowed_namespaces: [glossary]
+    allowed_types: [term]
+    operations: [create, update, converge]
+    required_fields: [type, term, definition]
+    required_relationships: []
+    body: {required: false, min_non_whitespace: 0}
+    unknown_fields: reject
+    unresolved_links: review
+    placeholder_links: reject
+    completion: per-selected-item
+  adversarial_fixtures: [tests/extensions/test_model_output_contracts.py]
   toolsets: [file, todo, okengine-write, okengine]
   tier: concepts             # run alongside concept synthesis (#129 kickstart hint)
   # Defining a term is lightweight, so this lane is fine on the deployment's default model

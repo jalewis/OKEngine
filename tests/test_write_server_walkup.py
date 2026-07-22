@@ -93,6 +93,74 @@ def test_subdomain_create_succeeds(walkup):
     assert m._create("entities/e1", "type: entity\nname: RootCo", "body").startswith("created")
 
 
+_SHARDING_SCHEMA = """\
+okf: {required: [type]}
+types:
+  entity: {required: [type, name]}
+strict_types: false
+partitioning:
+  namespaces: {entities: {strategy: by-letter}, sources: {}, findings: {}}
+permissions:
+  default: {create: true, update: true, delete: false}
+"""
+
+
+@pytest.fixture
+def walkup_sharded(tmp_path, monkeypatch):
+    """A walk-up vault whose sub-domain shards entities BY-LETTER (the real base-schema shape) —
+    unlike the flat `entities: {}` fixture above, which masked the sub-domain sharding bug (#351)."""
+    (tmp_path / "wiki").mkdir()
+    (tmp_path / "schema.yaml").write_text(_SHARDING_SCHEMA, encoding="utf-8")
+    (tmp_path / "wiki" / "acme").mkdir()
+    (tmp_path / "wiki" / "acme" / "schema.yaml").write_text(_SHARDING_SCHEMA, encoding="utf-8")
+    (tmp_path / "wiki" / "acme" / "entities").mkdir(parents=True)
+    (tmp_path / "wiki" / "entities").mkdir(parents=True)
+    return _load(tmp_path, monkeypatch), tmp_path
+
+
+def test_subdomain_entity_shards_within_subdomain(walkup_sharded):  # invariant-audit #351 (A2)
+    """A2: a NEW entity under a sub-domain that shards entities by-letter must land at
+    wiki/acme/entities/<l>/<slug>.md — the shard the reshelve drain would file it under. Before the
+    fix, _partitioned_create_path read the CONTAINER 'acme' as the namespace, found no partition
+    config, and wrote FLAT (acme/entities/shinyhunters.md); the drain then sharded it, re-opening the
+    #54 flat-vs-sharded duplicate-canonical ping-pong for every co-installed vault."""
+    m, tmp = walkup_sharded
+    res = m._create("acme/entities/shinyhunters", "type: entity\nname: ShinyHunters", "body")
+    assert res.startswith("created"), res
+    landed = sorted(str(p.relative_to(tmp)) for p in (tmp / "wiki" / "acme" / "entities").rglob("*.md"))
+    assert (tmp / "wiki" / "acme" / "entities" / "s" / "shinyhunters.md").is_file(), landed
+    assert not (tmp / "wiki" / "acme" / "entities" / "shinyhunters.md").is_file(), \
+        f"sub-domain entity written FLAT (drain will duplicate it): {landed}"
+    # the flat/root entity still shards (single-pack behavior byte-identical)
+    m._create("entities/rootco", "type: entity\nname: RootCo", "body")
+    assert (tmp / "wiki" / "entities" / "r" / "rootco.md").is_file()
+
+
+def test_subdomain_alias_dedup_within_subdomain(walkup):  # invariant-audit #351 (A1)
+    """A1: create-time alias dedup must fire for sub-domain entities. The identity index + _alias_hits
+    were root-only, so a walk-up vault silently accreted duplicate canonicals (an alias curated on the
+    canonical page never matched an incoming variant). A second create whose name equals the first's
+    alias must CONVERGE, not fork a second page."""
+    m, _ = walkup
+    if not m._CONVERGE_OK:
+        pytest.skip("converge libs unavailable")
+    m._create("acme/entities/acme", "type: entity\nname: Acme\naliases: [Acme Corp]", "body")
+    out = m._create("acme/entities/acme-corp", "type: entity\nname: Acme Corp", "body")
+    assert out.startswith("converged into"), out
+
+
+def test_subdomain_alias_dedup_does_not_cross_subdomain(walkup):  # invariant-audit #351 (A1 scoping)
+    """A1 scoping guard: a sub-domain's entity must NOT converge into a same-named entity in ANOTHER
+    scope (here root). Co-installed sub-domains are separate knowledge bases; a global name index
+    would false-merge two distinct 'Acme's. The incoming acme/ page must create, not converge."""
+    m, _ = walkup
+    if not m._CONVERGE_OK:
+        pytest.skip("converge libs unavailable")
+    m._create("entities/acme", "type: entity\nname: Acme", "body")                    # ROOT scope
+    out = m._create("acme/entities/other", "type: entity\nname: Other\naliases: [Acme]", "body")
+    assert out.startswith("created"), f"cross-sub-domain false-merge: {out}"
+
+
 def test_subdomain_undeclared_namespace_still_rejected(walkup):
     """The #115 stray-tree guard must still fire for a genuinely undeclared namespace under a
     sub-domain (the fix must not blanket-allow)."""

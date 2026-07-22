@@ -183,6 +183,25 @@ def test_real_tz_with_daily_brief_is_clean(tmp_path, monkeypatch):
     assert f == [], f
 
 
+def test_stale_next_run_at_from_tz_value_change_warns(tmp_path, monkeypatch):  # okengine#326 [29]
+    """Valid zone + tz-aware plugin, but next_run_at was computed under a DIFFERENT tz (here as if
+    UTC), so it fires at the wrong local hour. cron-plus won't recompute a populated next_run_at, so
+    check_timezone must flag it to be nulled — the prior branches only covered unset->set + naive."""
+    job = _daily("daily-brief")                          # 30 7 * * *  -> 07:30 local
+    job["next_run_at"] = "2026-07-23T07:30:00+00:00"     # 07:30 UTC = 03:30 America/New_York -> wrong hour
+    f = _run_tz_check(tmp_path, monkeypatch, [job], tz="America/New_York", plugin_tz_aware=True)
+    assert any(lvl == "WARN" and "different timezone" in msg.lower() and "daily-brief" in msg
+               for lvl, _, msg in f), f
+
+
+def test_correct_next_run_at_under_current_tz_is_clean(tmp_path, monkeypatch):  # okengine#326 [29]
+    """A next_run_at that lands on the schedule's local hour under the current tz is NOT flagged."""
+    job = _daily("daily-brief")                          # 07:30 local
+    job["next_run_at"] = "2026-07-23T11:30:00+00:00"     # 11:30 UTC = 07:30 America/New_York -> correct
+    f = _run_tz_check(tmp_path, monkeypatch, [job], tz="America/New_York", plugin_tz_aware=True)
+    assert f == [], f
+
+
 def test_real_tz_but_stale_utc_naive_plugin_fails(tmp_path, monkeypatch):
     """The stale-pin regression: TZ is set but the installed cron-plus is UTC-naive, so it
     silently ignores TZ and briefs run in UTC. Explicit intent violated -> FAIL, not WARN."""
@@ -680,6 +699,7 @@ def _write_path_dirs(tmp_path):
     vault = tmp_path / "v"; (vault / "wiki").mkdir(parents=True)
     hermes = tmp_path / "h"; (hermes / "scripts" / "cron").mkdir(parents=True)
     (hermes / "config").mkdir(parents=True)
+    (hermes / "tools").mkdir(parents=True)
     data = tmp_path / "d"; (data / "scripts").mkdir(parents=True)
     (data / "config").mkdir(parents=True)
     for name in ("schema_lib.py", "id_lib.py", "id_index.py", "converge.py"):
@@ -687,6 +707,8 @@ def _write_path_dirs(tmp_path):
         (data / "scripts" / name).write_text("v1")
     (hermes / "config" / "base-schema.yaml").write_text("shape: v1\n")   # baked base-schema
     (data / "config" / "base-schema.yaml").write_text("shape: v1\n")     # staged, in sync
+    (hermes / "tools" / "schema_validator.py").write_text("validator v1")  # baked validator
+    (data / "config" / "schema_validator.py").write_text("validator v1")   # staged reference, in sync
     return vault, hermes, data
 
 
@@ -752,6 +774,30 @@ def test_write_path_base_schema_present_one_side_warns(tmp_path, monkeypatch):  
                for l, a, msg in m.F), m.F
 
 
+def test_write_path_schema_validator_drift_fails(tmp_path, monkeypatch):  # okengine#326 [15]
+    """schema_validator.py is BAKED at HERMES/tools and imported by the write-guard hook AND the
+    staged importer_guard/schema_drift_lint crons — but had no baked-vs-staged check. A validator
+    change staged (its reference in DATA/config) without an image rebuild leaves them running the OLD
+    validator; must FAIL, not ship green (same trap as the libs + base-schema)."""
+    vault, hermes, data = _write_path_dirs(tmp_path)
+    (data / "config" / "schema_validator.py").write_text("validator v2  # staged newer")
+    m = _load_dv(monkeypatch, vault, data, hermes)
+    m.check_write_path_libs()
+    assert any(l == "FAIL" and a == "write-path" and "schema_validator.py" in msg
+               for l, a, msg in m.F), m.F
+
+
+def test_write_path_schema_validator_present_one_side_warns(tmp_path, monkeypatch):  # okengine#326 [15]
+    """The staged schema_validator reference present on only one side is undetectable, not a pass."""
+    vault, hermes, data = _write_path_dirs(tmp_path)
+    (data / "config" / "schema_validator.py").unlink()         # staged reference gone, baked present
+    m = _load_dv(monkeypatch, vault, data, hermes)
+    m.check_write_path_libs()
+    assert any(l == "WARN" and a == "write-path" and "schema_validator.py" in msg and "MISSING" in msg
+               for l, a, msg in m.F), m.F
+    assert not any(l == "FAIL" for l, _, _ in m.F)
+
+
 def test_write_path_libs_pins_write_server_imports():  # invariant-audit M1/M23
     """_WRITE_PATH_LIBS is a hand-copy of the libs write_server imports from the BAKED tree; when it
     drifts, check_write_path_libs silently stops guarding a lib (id_index was ADDED to write_server's
@@ -785,7 +831,7 @@ def test_write_path_libs_pins_write_server_imports():  # invariant-audit M1/M23
     # (not scripts/cron; no cron script imports it) and so is scope.py. A change to either needs an
     # image rebuild (caught by the version stamp), but it must NOT be in _WRITE_PATH_LIBS or the drift
     # check hits the both-absent branch and silently never compares it (invariant-audit M23).
-    IMAGE_ONLY = {"scope.py", "converge.py"}
+    IMAGE_ONLY = {"scope.py", "converge.py", "output_contract_enforce.py"}
     unclassified = imported - tracked - IMAGE_ONLY
     assert not unclassified, (
         f"write_server imports {sorted(unclassified)} but they are neither in _WRITE_PATH_LIBS "
@@ -1095,3 +1141,28 @@ def test_schema_staleness_compares_base_pack_only_not_recorded_fragments():  # i
     src = MOD.read_text()
     body = src[src.index("def check_schema"):src.index("def check_subdomains")]
     assert "fragments=[]" in body, "staleness compare must use a base⊕pack recompose (fragments=[])"
+
+
+def test_check_ownership_scans_okengine_composed_schema(tmp_path, monkeypatch):  # okengine#326 [14]
+    """A mis-owned .okengine/composed-schema.yaml silently degrades the write path (write_server
+    PREFERS it over base+pack), so check_ownership must scan .okengine — while skipping the transient
+    snapshots/ + backups/ transaction artifacts to avoid false FAILs."""
+    vault = tmp_path / "vault"
+    (vault / "wiki").mkdir(parents=True)
+    (vault / ".okengine").mkdir()
+    (vault / ".okengine" / "composed-schema.yaml").write_text("types: {}\n")
+    (vault / ".okengine" / "snapshots" / "s1").mkdir(parents=True)
+    (vault / ".okengine" / "snapshots" / "s1" / "old.yaml").write_text("x\n")
+    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["deployment_validate"] = m
+    spec.loader.exec_module(m)
+    m.F.clear()
+    m.VAULT = vault
+    # Force every scanned path to read as foreign-owned so the scan's COVERAGE is what's asserted
+    # (a real uid mismatch needs root/chown, unavailable in CI).
+    monkeypatch.setattr(m.os, "geteuid", lambda: 999999)
+    m.check_ownership()
+    blob = " ".join(str(x) for x in m.F)
+    assert "composed-schema.yaml" in blob, "check_ownership must now scan .okengine"
+    assert "snapshots" not in blob, "transient .okengine/snapshots must be skipped"

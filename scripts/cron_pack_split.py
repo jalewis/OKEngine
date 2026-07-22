@@ -32,11 +32,15 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
 
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "cron"))
+import output_contract
 
 REPO = Path(__file__).resolve().parent.parent
 JOBS = REPO / "config" / "cron-plus-jobs.json"
@@ -132,6 +136,24 @@ def _ensure_id(job: dict) -> dict:
     return job
 
 
+def _stamp_output_contract(job: dict) -> dict:
+    """Bind the generated lane to the exact contract enforcement must apply."""
+    if not isinstance(job.get("output_contract"), dict):
+        return job
+    job = dict(job)
+    job["output_contract_digest"] = output_contract.digest(job["output_contract"])
+    env = dict(job.get("env") or {})
+    env["OKENGINE_LANE_ID"] = str(job.get("id") or "")
+    env["OKENGINE_CONTRACT_DIGEST"] = job["output_contract_digest"]
+    if job["output_contract"].get("completion") == "per-selected-item":
+        manifest = str(job.get("selection_manifest") or
+                       f"/opt/data/cron-plus/selections/{job.get('name')}.json")
+        job["selection_manifest"] = manifest
+        env["OKENGINE_SELECTION_MANIFEST"] = manifest
+    job["env"] = env
+    return job
+
+
 def _dump_jobs(jobs: list[dict]) -> str:
     """Canonical cron-plus-jobs.json text — name-sorted. DISABLED jobs
     (`enabled: false` placeholders) are NOT written to the deployed artifact:
@@ -139,7 +161,8 @@ def _dump_jobs(jobs: list[dict]) -> str:
     every tick and log 'invalid cron expr' noise (#27). They stay in the SOURCE
     (the pack's domain-crons.json); flip enabled:true + set a real expr to deploy
     one. The in-memory merge keeps them, so split/compose stay lossless."""
-    live = [_ensure_id(_normalize_schedule(j)) for j in jobs if j.get("enabled", True)]
+    live = [_stamp_output_contract(_ensure_id(_normalize_schedule(j)))
+            for j in jobs if j.get("enabled", True)]
     return json.dumps({"jobs": _by_name(live)}, indent=2, ensure_ascii=False) + "\n"
 
 
@@ -207,7 +230,53 @@ def split(jobs: list[dict], tier_of: dict[str, str]) -> dict[str, object]:
             EXTENSIONS: extensions}
 
 
-def merge(engine: list[dict], domain: list[dict], prompts: dict[str, str],
+def _prompt_parts(value, jobname: str) -> tuple[str, dict | None]:
+    """Accept the legacy string or v1 {prompt, output_contract} pack shape."""
+    if isinstance(value, str):
+        return value, None
+    if not isinstance(value, dict) or not isinstance(value.get("prompt"), str):
+        raise ValueError(f"engine-template prompt {jobname!r} must be a string or an object with prompt")
+    unknown = sorted(set(value) - {"prompt", "output_contract"})
+    if unknown:
+        raise ValueError(f"engine-template prompt {jobname!r} has unknown key(s): {unknown}")
+    return value["prompt"], value.get("output_contract")
+
+
+def validate_output_contracts(jobs: list[dict], *, require_declared: bool = False) -> list[str]:
+    errors: list[str] = []
+    for job in jobs:
+        name = job.get("name", "<unnamed>")
+        contract = job.get("output_contract")
+        is_model_writer = not job.get("no_agent") and "okengine-write" in (job.get("enabled_toolsets") or [])
+        if contract is not None:
+            errors.extend(output_contract.validate(contract, f"job {name!r} output_contract"))
+        elif require_declared and is_model_writer and not job.get("output_contract_exempt"):
+            errors.append(f"job {name!r} is model-writing but has no output_contract or explicit exemption")
+    return errors
+
+
+def contract_writer_name(job_name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", job_name.lower()).strip("-")
+    return f"okengine-write-{slug}"
+
+
+def bind_contract_writers(jobs: list[dict]) -> list[dict]:
+    """Route contracted model lanes away from the generic/admin writer."""
+    out = []
+    for source in jobs:
+        job = dict(source)
+        if not job.get("no_agent") and isinstance(job.get("output_contract"), dict):
+            bound = contract_writer_name(str(job.get("name") or ""))
+            tools = [bound if t == "okengine-write" else t
+                     for t in (job.get("enabled_toolsets") or [])]
+            if bound not in tools:
+                tools.append(bound)
+            job["enabled_toolsets"] = list(dict.fromkeys(tools))
+        out.append(job)
+    return out
+
+
+def merge(engine: list[dict], domain: list[dict], prompts: dict[str, object],
           tier_of: dict[str, str] | None = None,
           extensions: list[dict] | None = None) -> list[dict]:
     """Re-attach pack prompts onto the engine half.
@@ -224,12 +293,15 @@ def merge(engine: list[dict], domain: list[dict], prompts: dict[str, str],
                 and name not in prompts:
             continue                          # pack didn't opt into this template job
         j = dict(j)
-        if name in prompts:                   # re-attach engine-template prompt
-            j["prompt"] = prompts[name]
+        if name in prompts:                   # re-attach engine-template prompt + tighten contract
+            prompt, policy = _prompt_parts(prompts[name], name)
+            j["prompt"] = prompt
+            j["output_contract"] = output_contract.compose(j.get("output_contract"), policy,
+                                                              f"job {name!r} output_contract")
         out.append(j)
     out.extend(domain)
     out.extend(extensions or [])              # carry extension-tier jobs through (#141)
-    return out
+    return bind_contract_writers(out)
 
 
 def merge_packs(engine: list[dict], packs: list[dict],
@@ -280,7 +352,7 @@ def merge_packs(engine: list[dict], packs: list[dict],
                 job["after"] = [rename.get(a, a) for a in job["after"]]
             return job
 
-        for jobname, prompt in (pk.get("prompts") or {}).items():
+        for jobname, prompt_value in (pk.get("prompts") or {}).items():
             base = engine_by_name.get(jobname)
             if base is None or tier_of.get(jobname) != "engine-template":
                 errors.append(f"{pname}: prompt for '{jobname}' which is not an "
@@ -288,7 +360,14 @@ def merge_packs(engine: list[dict], packs: list[dict],
                 continue
             inst = _rewrite_after(dict(base))   # the inherited engine after: may name a lane this pack drives
             inst["name"] = f"{jobname}@{pname}"
-            inst["prompt"] = prompt
+            try:
+                prompt, policy = _prompt_parts(prompt_value, jobname)
+                inst["prompt"] = prompt
+                inst["output_contract"] = output_contract.compose(
+                    inst.get("output_contract"), policy, f"job {jobname!r} output_contract")
+            except ValueError as exc:
+                errors.append(f"{pname}: {exc}")
+                continue
             if inst["name"] in seen:
                 errors.append(f"job-id collision: {inst['name']}")
             seen[inst["name"]] = pname
@@ -371,6 +450,9 @@ def regen_composed(packs_dir: Path) -> list[dict]:
     id_errors = validate_unique_ids(jobs)              # M37: final safety net after N-way compose
     if id_errors:
         raise SystemExit("cron id/name collisions (not deploying):\n  " + "\n  ".join(id_errors))
+    contract_errors = validate_output_contracts(jobs)
+    if contract_errors:
+        raise SystemExit("cron output-contract errors (not deploying):\n  " + "\n  ".join(contract_errors))
     JOBS.write_text(_dump_jobs(jobs), encoding="utf-8")
     return jobs
 
@@ -420,7 +502,7 @@ def regen() -> list[dict]:
     if ext_errors:
         raise SystemExit("extension composition errors (not deploying):\n  "
                          + "\n  ".join(ext_errors))
-    merged = merged + ext_jobs
+    merged = bind_contract_writers(merged + ext_jobs)
     _, order_errors = validate_ordering(merged)        # okengine#129: fail-loud on broken/cyclic after:
     if order_errors:
         raise SystemExit("cron ordering errors (not deploying):\n  " + "\n  ".join(order_errors))
@@ -514,8 +596,16 @@ def validate_ordering(jobs: list[dict]) -> tuple[list[str], list[str]]:
     This is the enforcement GATE for the ordering contract: `after:` is a HARD dependency (a lane
     that consumes another lane's output), unlike `tier:` (an advisory kickstart-stage hint).
     Runtime ordering (staggered schedules / wake-gate freshness) is a later phase; this catches a
-    broken or circular dependency before it ships."""
+    broken or circular dependency before it ships.
+
+    Gates the DEPLOYED shape: only ENABLED jobs (disabled `enabled:false` placeholders never reach
+    jobs.json — see _dump_jobs), so an enabled lane whose `after:` names a DISABLED job is a dangling
+    dependency in the shipped artifact and must fail HERE, not deploy silently. Before this, ordering
+    validated the full pre-filter set (disabled targets counted as present) while _dump_jobs dropped
+    them — a real gate hole. Mirrors validate_unique_ids, which gates the same enabled/deployed set
+    (invariant-audit #351)."""
     from collections import deque
+    jobs = [j for j in jobs if j.get("enabled", True)]      # the deployed set (disabled never ship)
     by_name = {j["name"]: j for j in jobs}
     errors: list[str] = []
     adj: dict[str, list[str]] = {n: [] for n in by_name}
@@ -523,6 +613,11 @@ def validate_ordering(jobs: list[dict]) -> tuple[list[str], list[str]]:
     for j in jobs:
         for a in (j.get("after") or []):
             if not isinstance(a, str):
+                # A non-string after: entry is a malformed dependency; dropping it silently (the old
+                # `continue`) vanished an intended ordering edge with every gate green. Fail loud,
+                # like the missing-target / self / cycle branches below (invariant-audit #351).
+                errors.append(f"job {j['name']!r} has a non-string after: entry {a!r} "
+                              f"(after: targets must be job-name strings)")
                 continue
             if a == j["name"]:
                 errors.append(f"job {j['name']!r} declares after: itself")

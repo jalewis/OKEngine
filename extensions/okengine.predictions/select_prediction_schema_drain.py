@@ -33,6 +33,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pred_lib as P  # noqa: E402
+# Reuse the sibling audit's deterministic horizon math (single source) rather than re-derive the
+# bucket with judgment — #326 [24].
+from prediction_schema_audit import _horizon_for, _parse_date  # noqa: E402
 
 BATCH_SIZE = int(os.environ.get("PSD_BATCH_SIZE", "5"))
 MIN_HITS = int(os.environ.get("PSD_MIN_HITS", "1"))
@@ -82,7 +85,9 @@ def classify(fm: dict, body: str) -> tuple[list[str], bool]:
         return [], True   # batch container — flagged, not agent-fixable; skip value checks
 
     issues: list[str] = []
-    missing = [f for f in REQUIRED_FIELDS if not fm.get(f)]
+    # Horizon is derived below (deterministically from the dates), so it's excluded from the generic
+    # missing-required scan — otherwise a missing-but-computable horizon double-flags (#326 [24]).
+    missing = [f for f in REQUIRED_FIELDS if f != "horizon" and not fm.get(f)]
     if missing:
         issues.append(f"missing required: {', '.join(missing)}")
 
@@ -91,9 +96,21 @@ def classify(fm: dict, body: str) -> tuple[list[str], bool]:
         hint = STATUS_HINTS.get(str(s).strip().lower())
         issues.append(f"status drift: {s!r}" + (f" -> '{hint}'" if hint else " (read body)"))
 
+    # Horizon is a deterministic function of (resolves_by - made_on): compute the correct bucket via
+    # the sibling audit's _horizon_for rather than hand the agent a judgment call (#326 [24]). When
+    # both dates are present the computed value is authoritative for a missing, drifted, OR
+    # canonical-but-wrong horizon alike; only without dates do we fall back to a fuzzy hint.
+    made_on, resolves_by = _parse_date(fm.get("made_on")), _parse_date(fm.get("resolves_by"))
+    computed_horizon = _horizon_for((resolves_by - made_on).days) if made_on and resolves_by else None
     h = fm.get("horizon")
-    if h is not None and str(h).strip().lower() not in CANONICAL_HORIZON:
-        hint = HORIZON_HINTS.get(str(h).strip().lower())
+    h_norm = str(h).strip().lower() if h is not None else None
+    if computed_horizon:
+        if h_norm != computed_horizon:
+            issues.append(f"horizon {'missing' if h is None else repr(h)} -> {computed_horizon!r} (from dates)")
+    elif h is None:
+        issues.append("missing horizon (no made_on/resolves_by to derive it)")
+    elif h_norm not in CANONICAL_HORIZON:
+        hint = HORIZON_HINTS.get(h_norm)
         issues.append(f"horizon drift: {h!r}" + (f" -> '{hint}'" if hint else ""))
 
     c = fm.get("confidence")

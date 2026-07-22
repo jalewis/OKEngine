@@ -131,6 +131,30 @@ if you have the hardware. Whatever you pick must be reachable by a configured pr
 in the deployment `.env`); the `fallback_providers:` chain catches a provider that errors or
 rate-limits.
 
+### Shared local pool HTTP contracts
+
+When an inference pool publishes load-shedding status semantics, encode them in `config.yaml`
+instead of relying on the generic cloud-provider retry policy. `providers.<id>.request_timeout_seconds`
+sets the complete request deadline; `agent.http_status_policy` maps a status to its total
+`max_attempts` (the first request counts) and whether fallback routing is allowed:
+
+```yaml
+providers:
+  custom:
+    request_timeout_seconds: 350
+agent:
+  http_status_policy:
+    404: {max_attempts: 1, fallback: false}
+    500: {max_attempts: 2, fallback: false}
+    503: {max_attempts: 6, fallback: false}
+    504: {max_attempts: 1, fallback: false}
+```
+
+Hermes streams OpenAI-compatible chat completions and uses exponential backoff with jitter.
+With this policy, a capacity `503` stays on the local pool instead of silently routing the same
+work to a paid fallback. Keep cron `model_concurrency: 1` when the pool asks batch clients to run
+sequentially; pool-wide capacity is shared with other clients and is not a per-client allowance.
+
 ## Running on free models
 
 Free/`:free` tiers cost nothing but are **rate-limited** (requests-per-minute, tokens-per-day).
@@ -140,11 +164,15 @@ is only usable with the survival levers below — the trade is **throughput for 
 lanes run more serially and slower, but finish instead of dying in a rate-limit storm.
 
 - **Stagger the schedules** — the OKEngine fleet runs under the **cron-plus** scheduler, which
-  spawns a subprocess per due job with **no global parallelism cap**, so the busiest minute is
-  set by how many lanes share a `schedule`. Spread coincident lanes across different minutes/hours
-  so they don't fire at once. This is the biggest lever under cron-plus. (`HERMES_CRON_MAX_PARALLEL`
-  in the skeleton compose governs only *native* Hermes cron and is **inert** under cron-plus —
-  cron-plus reads it nowhere; don't rely on it to throttle the free tier.)
+  spawns a subprocess per due job. Agent jobs that resolve to the same provider, endpoint, and
+  model are single-flight: one holds that model slot while coincident jobs wait. Different models
+  can still run in parallel, and deterministic `no_agent` jobs do not take a slot. A job may set
+  `model_concurrency` above the conservative default of `1` when its endpoint has measured capacity;
+  every job sharing that model identity must use the same value. Slot acquisition and wait duration
+  are recorded in the lane log. Spread heavy
+  lanes across different minutes/hours anyway to reduce wait time and bursty downstream work.
+  (`HERMES_CRON_MAX_PARALLEL` in the skeleton compose governs only *native* Hermes cron and is
+  **inert** under cron-plus; cron-plus model slots provide this protection instead.)
 - **Keep the *whole* chain free** — `model.default` AND every `fallback_providers` entry on a
   `:free` tier (or `openrouter/free`, the **Free Models Router**, which routes to any available
   free model — the free counterpart of `openrouter/auto`; never use `openrouter/auto` itself, it

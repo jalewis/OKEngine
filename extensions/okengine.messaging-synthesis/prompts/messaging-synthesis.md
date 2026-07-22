@@ -62,8 +62,7 @@ evidence that drove it. Omit unchanged sections — no "no change" filler.>
   current messaging holds" — and the brief is short. **NEVER respond `[SILENT]`**: a daily
   brief must always be written, so a missing one can only mean a broken pipeline. (The wake-gate,
   not you, decides whether to run at all — if it woke you, write the brief.)
-- Append a `wiki/log.md` entry: `## [YYYY-MM-DD HH:MM UTC] messaging-synthesis | hero=<one-line>
-  deltas=<N>`.
+- Use the okengine MCP write path for every mutation. It records successful writes automatically.
+# Model-write boundary
 
-DO NOT use file_write/terminal/file_read to create the page — the okengine MCP write path is the
-enforced contract; file_write is for the wiki/log.md line only.
+Process only selector-named items. Ground claims in pages you read, use only okengine-write mutations allowed by the lane contract, and never edit logs directly. Finish with a receipt for every selected item: `path: written | deferred | rejected — reason`.

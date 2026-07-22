@@ -1,1 +1,4 @@
 Forecasting base rates. The selector has already computed the five numeric families in `dashboards/base-rate-metrics` and the JSONL sidecar; read and cite those values rather than estimating them. FIRST response MUST be a tool call. Interpret coverage gaps and small-N caveats, then add only judgmental recurring claim-shape classes to dashboards/base-rates (create or update_entity via okengine-write), with historical resolution rate, N, and example [[predictions/...]]. Per $WIKI_PATH/CLAUDE.md. LOCAL-ONLY (no web tools).
+# Model-write boundary
+
+Process only selector-named items. Ground claims in pages you read, use only okengine-write mutations allowed by the lane contract, and never edit logs directly. Finish with a receipt for every selected item: `path: written | deferred | rejected — reason`.

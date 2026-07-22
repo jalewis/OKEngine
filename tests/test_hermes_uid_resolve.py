@@ -79,6 +79,22 @@ def test_tree_owner_used_when_no_env_pin(tmp_path):
     assert got == owner, f"expected tree owner {owner}, got {got}"
 
 
+def test_root_uid_is_rejected_from_env_and_dotenv(tmp_path):  # okengine#326 [9]
+    """HERMES_UID/GID=0 must never be honoured — remapping the gateway to root writes a root-owned
+    jobs.json the pack-uid cron runner can't read (the fleet goes dark, #185). The tree-owner tier
+    already excludes root; the explicit env AND .env tiers must too, or a stray 0 short-circuits it."""
+    owner, group = str(os.stat(tmp_path).st_uid), str(os.stat(tmp_path).st_gid)
+    # env 0 -> rejected, falls through to the (non-root) tree owner
+    assert _resolve(tmp_path, env={"HERMES_UID": "0"}) == owner
+    assert _resolve(tmp_path, fn="resolve_hermes_gid", env={"HERMES_GID": "0"}) == group
+    # .env 0 -> also rejected
+    (tmp_path / ".env").write_text("HERMES_UID=0\nHERMES_GID=0\n")
+    assert _resolve(tmp_path) == owner
+    assert _resolve(tmp_path, fn="resolve_hermes_gid") == group
+    # a real non-root value still wins even with a root .env present
+    assert _resolve(tmp_path, env={"HERMES_UID": "1003"}) == "1003"
+
+
 def test_falls_back_to_10000_only_as_last_resort(tmp_path):
     """With no env, no .env, and a root-owned-looking path we can't stat as non-root, the resolver
     still yields a value (10000) rather than empty — the warning path. We assert it never returns

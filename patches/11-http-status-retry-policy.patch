@@ -1,0 +1,129 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 7bf75c9..5cf381c 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1497,6 +1497,31 @@ def init_agent(
+         _api_retries = 3
+     agent._api_max_retries = _api_retries
+ 
++    # Optional endpoint-specific HTTP attempt/fallback contract. Keys are
++    # status-code strings; values accept max_attempts and fallback. The loop
++    # ceiling permits a 503 policy to exceed the generic retry budget while
++    # each status still terminates at its own bound.
++    _raw_http_policy = _agent_section.get("http_status_policy", {})
++    if not isinstance(_raw_http_policy, dict):
++        _raw_http_policy = {}
++    _http_policy = {}
++    _retry_ceiling = _api_retries
++    for _status, _rule in _raw_http_policy.items():
++        if not isinstance(_rule, dict):
++            continue
++        try:
++            _status_key = str(int(_status))
++            _attempts = max(1, int(_rule.get("max_attempts", _api_retries)))
++        except (TypeError, ValueError):
++            continue
++        _http_policy[_status_key] = {
++            "max_attempts": _attempts,
++            "fallback": bool(_rule.get("fallback", True)),
++        }
++        _retry_ceiling = max(_retry_ceiling, _attempts)
++    agent._http_status_policy = _http_policy
++    agent._api_retry_loop_ceiling = _retry_ceiling
++
+     # Initialize context compressor for automatic context management
+     # Compresses conversation when approaching model's context limit
+     # Configuration via config.yaml (compression section)
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index cbcb856..3f82842 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1087,7 +1087,7 @@ def run_conversation(
+         
+         api_start_time = time.time()
+         retry_count = 0
+-        max_retries = agent._api_max_retries
++        max_retries = getattr(agent, "_api_retry_loop_ceiling", agent._api_max_retries)
+         _retry = TurnRetryState()
+         max_compression_attempts = 3
+ 
+@@ -2575,6 +2575,13 @@ def run_conversation(
+                     context_length=_ctx_len,
+                     num_messages=len(api_messages) if api_messages else 0,
+                 )
++                _status_rule = getattr(agent, "_http_status_policy", {}).get(
++                    str(status_code), {}
++                )
++                _attempt_limit = int(
++                    _status_rule.get("max_attempts", agent._api_max_retries)
++                )
++                _allow_status_fallback = bool(_status_rule.get("fallback", True))
+                 logger.debug(
+                     "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
+                     classified.reason.value, classified.status_code,
+@@ -2944,6 +2951,11 @@ def run_conversation(
+                     )
+ 
+                 retry_count += 1
++                if retry_count >= _attempt_limit:
++                    classified.retryable = False
++                    classified.should_fallback = (
++                        classified.should_fallback and _allow_status_fallback
++                    )
+                 elapsed_time = time.time() - api_start_time
+                 agent._touch_activity(
+                     f"API error recovery (attempt {retry_count}/{max_retries})"
+@@ -3162,7 +3174,7 @@ def run_conversation(
+                 _should_fallback = (
+                     is_rate_limited
+                     or (_is_transport_failure and retry_count >= 2)
+-                )
++                ) and _allow_status_fallback
+                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
+                     # Don't eagerly fallback if credential pool rotation may
+                     # still recover.  See _pool_may_recover_from_rate_limit
+@@ -3711,14 +3723,14 @@ def run_conversation(
+                     # exists; otherwise "trying fallback..." is a lie and the
+                     # session looks like it's recovering when it's about to
+                     # abort silently (#35314, #17446).
+-                    if agent._has_pending_fallback():
++                    if _allow_status_fallback and agent._has_pending_fallback():
+                         if classified.reason == FailoverReason.content_policy_blocked:
+                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
+                         elif classified.reason == FailoverReason.ssl_cert_verification:
+                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
+                         else:
+                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
+-                    if agent._try_activate_fallback():
++                    if _allow_status_fallback and agent._try_activate_fallback():
+                         active_system_prompt = _sync_failover_system_message(
+                             agent, api_messages, active_system_prompt)
+                         retry_count = 0
+@@ -3895,12 +3907,12 @@ def run_conversation(
+                         "error": _nonretryable_summary,
+                     }
+ 
+-                if retry_count >= max_retries:
++                if retry_count >= _attempt_limit:
+                     # Before falling back, try rebuilding the primary
+                     # client once for transient transport errors (stale
+                     # connection pool, TCP reset).  Only attempted once
+                     # per API call block.
+-                    if not _retry.primary_recovery_attempted and agent._try_recover_primary_transport(
++                    if not _status_rule and not _retry.primary_recovery_attempted and agent._try_recover_primary_transport(
+                         api_error, retry_count=retry_count, max_retries=max_retries,
+                     ):
+                         _retry.primary_recovery_attempted = True
+@@ -3914,9 +3926,9 @@ def run_conversation(
+                         agent._fallback_activated = False
+                         continue
+                     # Try fallback before giving up entirely
+-                    if agent._has_pending_fallback():
+-                        agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
+-                    if agent._try_activate_fallback():
++                    if _allow_status_fallback and agent._has_pending_fallback():
++                        agent._buffer_status(f"⚠️ Max retries ({_attempt_limit}) exhausted — trying fallback...")
++                    if _allow_status_fallback and agent._try_activate_fallback():
+                         active_system_prompt = _sync_failover_system_message(
+                             agent, api_messages, active_system_prompt)
+                         retry_count = 0

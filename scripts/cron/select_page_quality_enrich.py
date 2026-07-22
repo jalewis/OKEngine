@@ -30,6 +30,9 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from selection_manifest import write_selection_manifest  # noqa: E402
+
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
 STATE = Path(os.environ.get("HERMES_HOME", "/opt/data")) / "scripts" / "page-quality-enrich-state.json"
@@ -142,6 +145,11 @@ def main() -> int:
         print(json.dumps({"wakeAgent": False}))
         return 0
 
+    manifest = write_selection_manifest(
+        [q["page"] for q, _ in batch],
+        Path(os.environ.get("HERMES_HOME", "/opt/data")) / "cron-plus" / "selections" / "page-quality-enrich.json",
+    )
+
     # Optimistic cooldown: mark batched pages NOW so the queue rotates instead
     # of re-surfacing the same top-inbound pages every day. The daily audit
     # re-derives the deficient set, so a page that actually got fixed drops off
@@ -166,6 +174,7 @@ def main() -> int:
         print(f"    citing sources ({len(ctx)}):")
         for src, ex in ctx:
             print(f"      - [[{src[:-3]}]]" + (f" — \"{ex}\"" if ex else ""))
+    print(f"selection input_digest: {manifest['input_digest']}")
     print()
     print("After enriching, append one `wiki/log.md` line: "
           "`## [YYYY-MM-DD HH:MM UTC] page-quality-enrich | deepened N pages`. "

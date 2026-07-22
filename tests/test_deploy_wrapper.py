@@ -149,3 +149,17 @@ def test_skip_validate_proceeds_past_gate(tmp_path):
     # We can't assert success (docker may be absent), but it must get PAST validate
     # to the seed step — proving the gate was skipped.
     assert "[2/" in r.stdout and "seed runtime" in r.stdout   # past the gate, at the seed step
+
+
+def test_deploy_reconciles_engine_pin_before_validate():  # okengine#359
+    """A pack pinning an OLDER engine release must not dead-end at the 'different release series' FAIL.
+    deploy.sh reconciles the pin via `framework upgrade --apply` (step [0/6]) BEFORE the validate gate,
+    unless --no-upgrade — so an engine bump doesn't force every lagging pack onto --skip-validate (which
+    bypasses ALL checks). okengine#359."""
+    dp = SCRIPT.read_text()
+    assert "NO_UPGRADE" in dp and "--no-upgrade" in dp, "no --no-upgrade opt-out"
+    assert 'framework.py" upgrade "$PACK" --apply' in dp, "deploy no longer runs framework upgrade to reconcile the pin"
+    i0, i1 = dp.find("[0/6]"), dp.find("[1/6]")
+    assert 0 <= i0 < i1, "the pin reconcile ([0/6]) must run BEFORE the validate gate ([1/6])"
+    # reconcile is guarded on the pack actually having a pin to reconcile
+    assert '[ -f "$PACK/engine.version" ]' in dp

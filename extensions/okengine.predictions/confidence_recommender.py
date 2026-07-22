@@ -112,7 +112,17 @@ def event_delta(event: dict, direction: str) -> tuple[float, dict] | None:
     quality = _number(scores.get("source_reliability_score"))
     corroboration = _number(scores.get("corroboration_count"))
     penalty = _DIRECTION_PENALTY.get(direction)
-    if signal is None or quality is None or corroboration is None or penalty is None:
+    if penalty is None:
+        # An unrecognized `direction` (outside the sanctioned evidence[].direction vocabulary) was
+        # SILENTLY dropped — the event contributed nothing to the recommendation and the vocabulary
+        # drift was invisible (okengine#326 [23]). Surface it on the lane's stderr; the event stays
+        # excluded (an unknown direction has no defined penalty), but the drift is now visible.
+        sys.stderr.write(
+            f"confidence_recommender: unrecognized evidence direction {direction!r} "
+            f"(known: {sorted(_DIRECTION_PENALTY)}) — event excluded; declare it in the schema's "
+            f"evidence[].direction enum and the penalty map if intended\n")
+        return None
+    if signal is None or quality is None or corroboration is None:
         return None
     drivers = {"source_quality": quality, "signal_strength": signal,
                "corroboration": int(corroboration), "contradiction_penalty": penalty}

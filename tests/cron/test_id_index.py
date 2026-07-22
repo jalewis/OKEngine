@@ -117,3 +117,20 @@ def test_write_index_persists(tmp_path):
     # and a v2 payload round-trips through from_dict
     idx2 = m.from_dict(data)
     assert idx2.name_to_rels == idx.name_to_rels and idx2.alias_to_rels == idx.alias_to_rels
+
+
+def test_scan_indexes_subdomain_entities(tmp_path):  # invariant-audit #351 (A1)
+    """A walk-up page <sub>/entities/x is namespace 'entities' and MUST be indexed in the identity
+    maps (name/alias) so write_server's create-time dedup catches its duplicates. Before the fix the
+    scan gated on rel.split('/')[0]=='entities' (root only), so every sub-domain entity was invisible
+    to dedup and duplicate canonicals accreted in co-installed vaults."""
+    m = _load()
+    (tmp_path / "wiki" / "acme").mkdir(parents=True)
+    (tmp_path / "wiki" / "acme" / "schema.yaml").write_text("types: {entity: {}}\n")   # sub-domain container
+    _page(tmp_path, "acme/entities/s/shinyhunters.md", "type: entity\nname: ShinyHunters\naliases: [UNC6240]")
+    _page(tmp_path, "entities/r/rootco.md", "type: entity\nname: RootCo")               # root, still indexed
+    nk = m.id_lib.normalize_key
+    idx = m._scan(tmp_path)
+    assert "acme/entities/s/shinyhunters.md" in idx.name_to_rels.get(nk("ShinyHunters"), []), idx.name_to_rels
+    assert "acme/entities/s/shinyhunters.md" in idx.alias_to_rels.get(nk("UNC6240"), []), idx.alias_to_rels
+    assert "entities/r/rootco.md" in idx.name_to_rels.get(nk("RootCo"), [])             # root path preserved

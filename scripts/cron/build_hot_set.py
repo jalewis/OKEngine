@@ -209,6 +209,14 @@ def main() -> int:
             rendered.append((sec, _select_recent(sec, cutoff)))
         elif sec.get("kind") == "open":
             rendered.append((sec, _select_open(sec)))
+        else:
+            # An unrecognized `kind` was SILENTLY DROPPED: the whole section (heading + rows) just
+            # vanished from HOT.md — a typo'd kind, or a future kind that shipped ahead of the code,
+            # degraded the load-first set with no signal. Fail loud on the cron's stderr (okengine#326
+            # [19]); the run still completes (best-effort HOT.md), but the drop is now visible.
+            sys.stderr.write(
+                f"build_hot_set: section {sec.get('title') or sec.get('namespace') or sec!r} has "
+                f"unrecognized kind {sec.get('kind')!r} (expected 'recent' or 'open') — DROPPED\n")
 
     counts = "  ·  ".join(f"{s.get('title', s['namespace'])}: **{len(rows)}**"
                           for s, rows in rendered)

@@ -78,7 +78,7 @@ def page_summary(slug: str, max_activity: int = 5) -> dict:
             fm = {}
     activity = [a.strip()[:160] for a in re.findall(r"^[-*]\s+(.+)$", txt, re.M)][:max_activity]
     return {
-        "slug": slug, "found": True, "type": fm.get("type"),
+        "slug": slug, "found": True, "type": fm.get("type"), "path": str(p),
         "title": fm.get("title", slug), "updated": fm.get("updated") or fm.get("last_updated"),
         "activity": activity,
     }

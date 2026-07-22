@@ -45,22 +45,41 @@ operations:
     schedule: {kind: cron, expr: "0 14 * * 5"}        # weekly (Fri) — cheap, drift-gated
     entrypoint: select_content_pegs.py
     prompt_file: prompts/content-pegs.md
+    output_contract: &messaging_contract
+      api: 1
+      allowed_namespaces: [briefings]
+      allowed_types: [battle-card, marketing-pulse, value-prop-snapshot, messaging-brief]
+      operations: [create, update, converge]
+      required_fields: [type, title]
+      required_relationships: []
+      body: {required: true, min_non_whitespace: 100}
+      unknown_fields: reject
+      unresolved_links: review
+      placeholder_links: reject
+      completion: per-selected-item
+    adversarial_fixtures: &model_fixtures [tests/extensions/test_model_output_contracts.py]
     toolsets: [file, todo, okengine-write, okengine]
   positioning-battle-cards:
     schedule: {kind: cron, expr: "@morning:0"}         # daily @ the deployment brief hour (#177); drift-gated (only refreshes a card
                                                         # when its competitor has new activity)
     entrypoint: select_positioning_battle_cards.py
     prompt_file: prompts/battle-cards.md
+    output_contract: *messaging_contract
+    adversarial_fixtures: *model_fixtures
     toolsets: [file, todo, okengine-write, okengine]
   value-prop-gap-refresh:
     schedule: {kind: cron, expr: "0 14 * * 5"}        # weekly (Fri) — same slot as content-pegs;
                                                         # both are cheap+drift-gated, fine to co-fire
     entrypoint: select_value_prop_refresh.py
     prompt_file: prompts/value-prop-refresh.md
+    output_contract: *messaging_contract
+    adversarial_fixtures: *model_fixtures
     toolsets: [file, todo, okengine-write, okengine]
   messaging-synthesis:
     schedule: {kind: cron, expr: "@morning:15"}        # daily @ brief hour +15 (after positioning); meta-layer; drift-gated on the
                                                         # 3 upstream artifacts, rarely actually wakes
     entrypoint: select_messaging_synthesis.py
     prompt_file: prompts/messaging-synthesis.md
+    output_contract: *messaging_contract
+    adversarial_fixtures: *model_fixtures
     toolsets: [file, todo, okengine-write, okengine]

@@ -47,6 +47,14 @@ def _discovery_mod():
     return m
 
 
+def _output_contract_mod():
+    p = _HERE / "cron" / "output_contract.py"
+    spec = importlib.util.spec_from_file_location("extension_output_contract", p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
 def _job_id(ext_id: str) -> str:
     """Deterministic 12-hex job id from the extension id — reproducible from the
     manifest (no clock/random), so regeneration is stable."""
@@ -282,6 +290,22 @@ def _synthesize_one(ext_id: str, m: dict, trust, op_name: str | None, op: dict,
         "deliver": "local",
         "enabled_toolsets": list(op.get("toolsets") or _DEFAULT_TOOLSETS),
     }
+    if is_agent:
+        contract = op.get("output_contract")
+        if not isinstance(contract, dict):
+            errors.append(f"{label}: agent operation requires an executable output_contract")
+            return None, errors, warnings
+        contract_errors = _output_contract_mod().validate(contract, f"{label}.output_contract")
+        if contract_errors:
+            errors.extend(contract_errors)
+            return None, errors, warnings
+        job["output_contract"] = contract
+        fixtures = op.get("adversarial_fixtures")
+        if not isinstance(fixtures, list) or not fixtures or any(
+                not isinstance(item, str) or not item.strip() for item in fixtures):
+            errors.append(f"{label}: agent operation requires non-empty adversarial_fixtures")
+            return None, errors, warnings
+        job["adversarial_fixtures"] = fixtures
     if has_script:
         # Absolute, namespaced path the staging step (#128) lands the script at.
         # no_agent: the work script; agent: the wake-gate selector.
@@ -836,4 +860,7 @@ def _apply_prompt_overrides(jobs: list[dict], pack_dir: Path) -> list[str]:
         job["prompt"] = prompt
         job["no_agent"] = False
         job.setdefault("enabled_toolsets", list(_DEFAULT_TOOLSETS))
+        if not isinstance(job.get("output_contract"), dict):
+            errors.append(f"extension-prompts.json[{name!r}]: cannot turn an uncontracted "
+                          "deterministic operation into a model-writing lane")
     return errors

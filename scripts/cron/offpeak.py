@@ -33,7 +33,11 @@ def _spec_has_valid_window(spec: str) -> bool:
         try:
             if "-" in part:
                 a, b = (int(x) for x in part.split("-", 1))
-                if 0 <= a <= 23 and 0 <= b <= 24:
+                # a==b is a DEGENERATE range: in_defer_window treats it as empty (neither the a<b nor
+                # the a>b wrap branch fires), so a spec of only '9-9' would validate here yet defer no
+                # hour — the very "silently never defers" class this guard exists to catch (require
+                # a != b so an all-degenerate spec trips offpeak_defer's loud warning — invariant-audit #351).
+                if a != b and 0 <= a <= 23 and 0 <= b <= 24:
                     return True
             elif 0 <= int(part) <= 23:
                 return True

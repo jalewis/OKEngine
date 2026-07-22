@@ -27,6 +27,15 @@ def _load(name, path):
 
 
 def _rec(op):
+    op = dict(op)
+    if op.get("prompt") or op.get("prompt_file"):
+        op.update({"output_contract": {"api": 1, "allowed_namespaces": ["x"],
+                   "allowed_types": ["x"], "operations": ["create"],
+                   "required_fields": ["type"], "required_relationships": [],
+                   "body": {"required": True, "min_non_whitespace": 1},
+                   "unknown_fields": "reject", "unresolved_links": "reject",
+                   "placeholder_links": "reject", "completion": "per-selected-item"},
+                   "adversarial_fixtures": ["tests/extensions/test_tier_hint.py"]})
     m = {"id": "okengine.scorer", "kind": "operation", "version": "0.1.0", "trust": "in-gateway",
          "requires": {"engine": ">=0.4.0"},
          "capabilities": {"read": ["wiki/**"], "write": ["x/**"]}, "operation": op}

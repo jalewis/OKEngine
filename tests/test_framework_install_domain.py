@@ -210,6 +210,29 @@ def test_taxonomy_apply(tmp_path):
     assert "okpack-tax" in (h / "CLAUDE.md").read_text()
 
 
+def test_taxonomy_composed_schema_failure_rolls_back_atomically(tmp_path, monkeypatch):  # okengine#326 [11]
+    """If composed-schema regeneration fails AFTER the schema.yaml merge, the whole install must roll
+    back — leaving a half-merged schema.yaml (and telling the operator to wait for 'the next deploy')
+    was a permanent structural break with no recovery. The transaction snapshot restores pre-install
+    state."""
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    before = (h / "schema.yaml").read_text()
+    real_load = mod._load_mod
+
+    def _fake_load(filename):
+        m2 = real_load(filename)
+        if filename == "extension_compose.py":            # force the post-merge regen to fail
+            m2.write_composed_schema = lambda host: ["forced composed-schema conflict"]
+        return m2
+
+    monkeypatch.setattr(mod, "_load_mod", _fake_load)
+    rc = mod.main([str(h), str(p), "--apply"])
+    assert rc == 1
+    # atomic: schema.yaml is byte-for-byte restored — no 'intrusion-set' half-merge left behind
+    assert (h / "schema.yaml").read_text() == before
+    assert "intrusion-set" not in (h / "schema.yaml").read_text()
+
+
 def test_taxonomy_merges_guest_coverage_fields(tmp_path):
     """okengine#264: a guest's `coverage_fields` (field-population ratios corpus_audit tracks) must
     fold into the composed host schema — else a bundle member's coverage declaration (okpack-vuln:

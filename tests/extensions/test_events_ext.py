@@ -205,3 +205,35 @@ def test_event_scoring_mechanism_has_no_domain_vocabulary_defaults():
     text = SCORING.read_text()
     for domain_term in ("funding", "m-and-a", "product-launch", "regulation", "high", "medium"):
         assert domain_term not in text
+
+
+def test_collect_sources_computes_independent_corroboration(tmp_path, monkeypatch):  # invariant-audit #351 (A5)
+    """collect_sources is the missing PRODUCER for independent_corroboration_count: a source's
+    corroboration = the number of DISTINCT OTHER publishers whose sources report on any entity it
+    references. Before, the field had no producer, was always 0, and score_source pinned 25% of the
+    source-evidence signal to a constant 0.5."""
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-06-15")
+    sdir = tmp_path / "wiki" / "sources"
+    sdir.mkdir(parents=True)
+
+    def src(name, publisher, body="reports on [[entities/acme]]"):
+        (sdir / f"{name}.md").write_text(
+            f"---\ntype: source\ntitle: {name}\npublisher: {publisher}\npublished: 2026-06-01\n---\n{body}\n",
+            encoding="utf-8")
+
+    src("s1", "Reuters"); src("s2", "AP"); src("s3", "Bloomberg")   # 3 distinct outlets on acme
+    src("s4", "Reuters")                                            # dup outlet: no NEW independent
+    src("s5", "Reuters", body="reports on [[entities/loner]]")      # lone entity -> 0
+    m = _load("event_scoring", SCORING)
+    rows = {r["source"].split("/")[-1]: r for r in m.collect_sources(m.config({}))}
+    assert rows["s1"]["corroboration_count"] == 2, rows["s1"]   # AP + Bloomberg (own Reuters excluded)
+    assert rows["s2"]["corroboration_count"] == 2               # Reuters + Bloomberg
+    assert rows["s4"]["corroboration_count"] == 2               # dup Reuters still sees AP + Bloomberg
+    assert rows["s5"]["corroboration_count"] == 0               # alone on 'loner'
+    # an explicit frontmatter value acts as a floor
+    (sdir / "s6.md").write_text(
+        "---\ntype: source\ntitle: s6\npublisher: Solo\nindependent_corroboration_count: 5\n---\nno refs\n",
+        encoding="utf-8")
+    rows2 = {r["source"].split("/")[-1]: r for r in m.collect_sources(m.config({}))}
+    assert rows2["s6"]["corroboration_count"] == 5

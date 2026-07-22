@@ -72,6 +72,7 @@ engine:
   - sanitize-frontmatter-updated
   - detect-field-loss
   - broken-wikilinks-drain
+  - model-write-repair-drain     # guarded, receipt-backed executor for historical contract findings
   - normalize-bare-name-links    # deterministic: bare-name wikilink -> canonical entity path
   - source-backlink-drain
   - orphans-drain

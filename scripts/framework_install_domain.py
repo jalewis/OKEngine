@@ -1193,7 +1193,12 @@ def main(argv: list[str]) -> int:
         host, pname, fallback=str(prior_manifest.get("pack_version") or "") or None)
         if prior_manifest else None)
     update_snapshot = None
-    if ns.apply and prior_manifest and incoming_ver and installed_ver != incoming_ver:
+    # Snapshot BEFORE plan.run() applies the merges so the whole install is a transaction: a
+    # post-merge failure (composed-schema regeneration or a pack migration) rolls back to the
+    # pre-install state instead of leaving a half-merged schema.yaml (#326 [11]). Previously only a
+    # version-changed pack UPDATE was snapshotted, so a taxonomy merge whose composed-schema
+    # regeneration then failed left the host schema.yaml permanently half-applied with no recovery.
+    if ns.apply and plan.steps:
         snap_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-install-domain"
         update_snapshot = fu.snapshot(
             host, snap_id, {"operation": "install-domain", "pack": pname,
@@ -1223,11 +1228,20 @@ def main(argv: list[str]) -> int:
         compose = _load_mod("extension_compose.py")
         errs = compose.write_composed_schema(host)
         if errs:
-            print("ERROR: schema.yaml merged, but composed-schema.yaml regeneration FAILED — the "
-                  "runtime write path will reject writes to the new namespace until the next deploy:",
-                  file=sys.stderr)
+            print("ERROR: schema.yaml merged, but composed-schema.yaml could not be regenerated — a "
+                  "STRUCTURAL conflict a redeploy will NOT resolve:", file=sys.stderr)
             for e in errs:
                 print(f"  - {e}", file=sys.stderr)
+            if update_snapshot is not None:
+                added = fu.added_since_snapshot(host, update_snapshot)
+                modified = fu.changed_since_snapshot(host, update_snapshot)
+                n = fu.restore(host, update_snapshot, added=added, modified=modified)
+                shutil.rmtree(update_snapshot, ignore_errors=True)
+                update_snapshot = None
+                print(f"  ↩ domain install transaction ROLLED BACK ({n} file(s) restored) — resolve "
+                      "the conflict, then re-run install-domain --apply", file=sys.stderr)
+            else:
+                print("  resolve the conflict, then re-run install-domain --apply", file=sys.stderr)
             return 1
         print("  regenerated .okengine/composed-schema.yaml — runtime write path now sees the merge")
     # okengine#312: re-installing an EXISTING member is a pack update — run the guest's

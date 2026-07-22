@@ -49,20 +49,38 @@ _okengine_tree_owner() {     # $1=pack_dir  $2=stat_fmt (%u|%g)  -> non-root own
     return 1
 }
 
-resolve_hermes_uid() {       # $1=pack_dir  -> echoes the uid to exec as
+resolve_hermes_uid() {       # $1=pack_dir  -> echoes the uid to exec as (never root: #185 / #326 [9])
     local pack_dir="$1" v
-    if [ -n "${HERMES_UID:-}" ]; then printf '%s' "$HERMES_UID"; return; fi
-    if v="$(_okengine_env_file_val "$pack_dir" HERMES_UID)"; then printf '%s' "$v"; return; fi
+    # An explicit 0 (root) from env OR .env is REJECTED, never honoured — remapping the gateway to
+    # root writes a root-owned jobs.json the pack-uid cron runner can't read (the fleet goes dark,
+    # #185). The tree-owner tier already excludes root; the explicit tiers must too, else a stray
+    # HERMES_UID=0 short-circuits the guard (#326 [9]).
+    if [ -n "${HERMES_UID:-}" ]; then
+        if [ "${HERMES_UID}" != "0" ]; then printf '%s' "$HERMES_UID"; return; fi
+        echo "  ⚠ HERMES_UID=0 (root) ignored — the gateway must never run as root (okengine#185)" >&2
+    fi
+    if v="$(_okengine_env_file_val "$pack_dir" HERMES_UID)"; then
+        if [ "$v" != "0" ]; then printf '%s' "$v"; return; fi
+        echo "  ⚠ .env HERMES_UID=0 (root) ignored — the gateway must never run as root (okengine#185)" >&2
+    fi
     if v="$(_okengine_tree_owner "$pack_dir" '%u')"; then printf '%s' "$v"; return; fi
-    echo "  ⚠ HERMES_UID unresolved (no env, no .env pin, tree owner root/unknown) — defaulting to" \
+    echo "  ⚠ HERMES_UID unresolved (env/.env root-rejected, tree owner root/unknown) — defaulting to" \
          "10000; the cron runner will STALL if /opt/data isn't 10000-owned (okengine#185)" >&2
     printf '10000'
 }
 
 resolve_hermes_gid() {       # $1=pack_dir  -> echoes the gid to exec as (mirrors the uid resolution)
     local pack_dir="$1" v
-    if [ -n "${HERMES_GID:-}" ]; then printf '%s' "$HERMES_GID"; return; fi
-    if v="$(_okengine_env_file_val "$pack_dir" HERMES_GID)"; then printf '%s' "$v"; return; fi
+    if [ -n "${HERMES_GID:-}" ]; then
+        if [ "${HERMES_GID}" != "0" ]; then printf '%s' "$HERMES_GID"; return; fi
+        echo "  ⚠ HERMES_GID=0 (root) ignored — the gateway must never run as root (okengine#185)" >&2
+    fi
+    if v="$(_okengine_env_file_val "$pack_dir" HERMES_GID)"; then
+        if [ "$v" != "0" ]; then printf '%s' "$v"; return; fi
+        echo "  ⚠ .env HERMES_GID=0 (root) ignored — the gateway must never run as root (okengine#185)" >&2
+    fi
     if v="$(_okengine_tree_owner "$pack_dir" '%g')"; then printf '%s' "$v"; return; fi
+    echo "  ⚠ HERMES_GID unresolved (env/.env root-rejected, tree owner root/unknown) — defaulting to" \
+         "10000; the cron runner will STALL if /opt/data isn't 10000-owned (okengine#185)" >&2
     printf '10000'
 }

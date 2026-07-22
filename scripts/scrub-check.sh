@@ -37,6 +37,11 @@ if [ -f .scrub-patterns ]; then
   if git grep -inE -f .scrub-patterns -- "${EXCL[@]}"; then
     found=1
   fi
+else
+  # .scrub-patterns is git-ignored (the patterns ARE the secrets) — absent on a fresh clone. Silently
+  # skipping the private-token half read as "clean" when it was UNDETECTABLE; WARN loudly instead, the
+  # same posture the CI takes when its SCRUB_PATTERNS variable is missing (okengine#326 [17]).
+  echo "scrub: ⚠ .scrub-patterns absent — the private-token half is UNDETECTABLE (this is NOT a pass; the generic 192.168 check still ran)." >&2
 fi
 
 if [ "$found" = 1 ]; then

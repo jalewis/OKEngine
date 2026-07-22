@@ -88,6 +88,39 @@ else
     else ok "reader open but bound to $RIP (local only)"; fi
 fi
 
+# 2b. HARDENED posture (okengine#326 [1]) ------------------------------------
+# deployment_validate.check_auth flags unsafe hardened settings, but only in the daily cron lane —
+# which dies with the scheduler, so a fresh or mis-set hardened deployment gets no signal at deploy
+# time. Reuse the SAME pure evaluator (hardening_lib.hardened_posture_violations) over the .env this
+# script already sourced. Empty => hardened profile off, or on-and-safe.
+echo "[2b] hardened posture"
+hv=$(python3 - "$VERIFY_ENGINE_DIR" <<'PY' 2>/dev/null
+import os, sys
+sys.path.insert(0, os.path.join(sys.argv[1], "scripts", "cron"))
+try:
+    from hardening_lib import hardened_posture_violations, is_hardened
+except Exception as exc:
+    print("ERR\t%s" % exc); raise SystemExit(0)
+if not is_hardened(os.environ):
+    print("OFF")
+else:
+    viols = hardened_posture_violations(os.environ)
+    print("OK" if not viols else "\n".join("V\t" + v for v in viols))
+PY
+)
+if [ -z "$hv" ] || [ "$hv" = "OFF" ]; then
+    ok "hardened profile off (OKENGINE_HARDENED unset) — posture checks N/A"
+elif [ "$hv" = "OK" ]; then
+    ok "OKENGINE_HARDENED on and posture is safe (token, reader auth, rate, exports, UI editing)"
+else
+    while IFS=$'\t' read -r tag msg; do
+        case "$tag" in
+            V)   bad "hardened posture: $msg" "fix the flagged .env setting and recreate the affected container" ;;
+            ERR) wn  "could not evaluate hardened posture ($msg)" "run from the deployment dir with the engine checkout intact" ;;
+        esac
+    done <<< "$hv"
+fi
+
 # 3. MCP read server ---------------------------------------------------------
 echo "[3] MCP read server"
 MB=$(hostport "$MCP" 8730)
@@ -124,12 +157,32 @@ for lib in kb_search.py kb_graph.py tier_lib.py; do
   fi
 done
 
-# 3b. gateway api_server exposure (okengine#120) ----------------------------
+# 3b. write-path baked-lib drift (okengine invariant-audit B2) ---------------
+# The enforced okengine-write MCP (write_server.py) runs INSIDE the gateway and imports its write-path
+# libs from the BAKED /opt/hermes/scripts/cron (its own parent.parent/scripts/cron), NOT the STAGED
+# /opt/data/scripts that the cron fleet + deployment_validate read. A stage-only deploy refreshes the
+# staged copy while the baked copy stays OLD -> the enforced write guard runs STALE code while
+# everything else runs new (the exact trap deployment_validate.check_write_path_libs and CLAUDE.md's
+# deploy-surfaces note describe). Compare the two copies INSIDE $GW, over the same libs as
+# _WRITE_PATH_LIBS. Present on only one side is UNDETECTABLE, never a pass (the M22 one-sided rule).
+for lib in schema_lib.py id_lib.py id_index.py okf_migrate.py; do
+  bh=$(dcx "$GW" sh -c "sha256sum /opt/hermes/scripts/cron/$lib 2>/dev/null | cut -d' ' -f1")
+  sh_=$(dcx "$GW" sh -c "sha256sum /opt/data/scripts/$lib 2>/dev/null | cut -d' ' -f1")
+  if [ -n "$bh" ] && [ -n "$sh_" ]; then
+    [ "$bh" != "$sh_" ] && bad "write-path lib $lib is STALE (baked vs staged) — the enforced write path is running old code; rebuild the gateway image" \
+        "rebuild the gateway image (build-engine-image.sh) && docker compose up -d $GW; a stage-only deploy misses it"
+  elif [ -n "$bh" ] || [ -n "$sh_" ]; then
+    wn "cannot compare write-path lib $lib — present on only one of {baked /opt/hermes/scripts/cron, staged /opt/data/scripts}" \
+       "undetectable, not a pass: ensure both the gateway image and /opt/data/scripts carry $lib"
+  fi
+done
+
+# 3c. gateway api_server exposure (okengine#120) ----------------------------
 # The host-net gateway's OpenAI-compatible api_server (the reader Chat relay target)
 # binds per API_SERVER_HOST. If it's listening on a NON-loopback interface it's
 # LAN-reachable — unnecessary attack surface even when authenticated. Defense-in-depth
 # guard, paralleling the MCP guard above (the equivalent posture #120 asks for).
-echo "[3b] gateway api_server exposure"
+echo "[3c] gateway api_server exposure"
 if ! command -v ss >/dev/null 2>&1; then
     wn "ss unavailable — can't probe api_server (:8642) exposure" "install iproute2 to enable the okengine#120 check"
 else

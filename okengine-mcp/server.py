@@ -524,11 +524,22 @@ def _index_update_cooldown(duration: float) -> float:
 
 
 def _vault_max_mtime() -> float:
-    """Newest .md mtime under the wiki — a cheap change-detector for prompt reindex (okengine#80).
-    Returns 0.0 if the tree is missing/empty."""
+    """Newest mtime under the wiki — a cheap change-detector for reindex (okengine#80). Returns 0.0
+    if the tree is missing/empty.
+
+    Includes DIRECTORY mtimes, not just .md files: a reshelve/reshard moves a page with os.rename,
+    which PRESERVES the file's mtime but bumps the source + destination directory mtimes. A file-only
+    scan therefore missed the move entirely, so search served the old path (and 404'd the new one)
+    until the 6h full refresh (okengine#326 [30])."""
     newest = 0.0
     try:
         for root, _dirs, files in os.walk(WIKI):
+            try:
+                m = os.stat(root).st_mtime          # dir mtime — catches os.rename moves (mtime-stable file)
+                if m > newest:
+                    newest = m
+            except OSError:
+                pass
             for fn in files:
                 if fn.endswith(".md"):
                     try:

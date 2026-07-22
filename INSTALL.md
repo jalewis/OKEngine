@@ -1,6 +1,6 @@
 # Installing OKEngine on Hermes
 
-OKEngine = **a pinned Hermes** + **8 carried patches** + an **overlay** (new
+OKEngine = **a pinned Hermes** + **12 carried patches** + an **overlay** (new
 files) + **plugins** + **config**, then **one pack or bundle**. This is the procedure
 to take a stock Hermes install and bring it up to OKEngine — i.e. the exact
 stock→OKEngine delta.
@@ -134,7 +134,7 @@ git clone https://github.com/NousResearch/hermes-agent.git hermes
 cd hermes && git checkout v2026.7.7.2         # == Hermes v0.18.2
 ```
 
-## 2. Apply the carried patches (8 core-file patches)
+## 2. Apply the carried patches (12 core-file patches)
 ```bash
 <OKEngine>/patches/apply.sh "$PWD"           # idempotent; fails loudly on drift
 ```

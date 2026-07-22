@@ -80,3 +80,15 @@ def test_page_quality_enrich_off_the_morning_stagger():  # invariant-audit #54
     # and its expr isn't shared by any OTHER enabled engine lane (no new collision from the move)
     others = [_expr(j) for j in d if j.get("enabled", True) and j.get("name") != "page-quality-enrich"]
     assert pqe_expr not in others, f"page-quality-enrich expr {pqe_expr} collides with another lane"
+
+
+def test_out_of_range_minute_fails_loud():  # invariant-audit #351
+    """`@morning:75` MATCHES _MORNING_RE (\\d{1,2}) but 75 > 59. Silently wrapping (75 % 60 = :15)
+    would ship the WRONG minute; instead expand_morning_one returns None so expand_brief_jobs trips
+    its fail-loud 'malformed @morning' guard — like every other unparseable sentinel."""
+    import pytest
+    assert cj.expand_morning_one("@morning:75", 7) is None
+    with pytest.raises(ValueError, match="malformed @morning"):
+        cj.expand_brief_jobs([{"schedule": {"expr": "@morning:75"}}], 7)
+    # an in-range minute still expands normally
+    assert cj.expand_morning_one("@morning:45", 7) == "45 7 * * *"

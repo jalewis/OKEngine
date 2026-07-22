@@ -103,6 +103,7 @@ def test_existing_mcp_config_gains_server_bound_source_quality_writer(tmp_path):
     after = cfg.read_text()
     assert after.count("okengine-write-source-quality:") == 1
     assert "OKENGINE_WRITE_ACTOR: cron:source-quality-backfill" in after
+    assert "OKENGINE_OUTPUT_CONTRACT_MODE: enforce" in after
     assert "command: /custom/python" in after, "operator configuration must be preserved"
     second = _run([str(tmp_path)])
     assert second.returncode == 0
@@ -140,6 +141,29 @@ def test_materialized_cron_capabilities_gain_distinct_server_bound_writers(tmp_p
     second = _run([str(tmp_path)])
     assert second.returncode == 0, second.stderr
     assert cfg.read_text() == after
+
+
+def test_generated_contracted_lane_gains_enforcing_bound_writer(tmp_path):
+    (tmp_path / "crons").mkdir()
+    rt = tmp_path / ".hermes-data"
+    rt.mkdir()
+    cfg = rt / "config.yaml"
+    cfg.write_text("mcp_servers:\n  okengine-write:\n    command: /custom/python\n")
+    jobs_path = REPO / "config" / "cron-plus-jobs.json"
+    original = jobs_path.read_bytes() if jobs_path.exists() else None
+    try:
+        jobs_path.write_text(json.dumps({"jobs": [{"name": "compile", "output_contract": {}}]}))
+        first = _run([str(tmp_path)])
+        assert first.returncode == 0, first.stderr
+        after = cfg.read_text()
+        assert "okengine-write-compile:" in after
+        assert "OKENGINE_WRITE_ACTOR: cron:compile" in after
+        assert "OKENGINE_OUTPUT_CONTRACT_MODE: enforce" in after
+    finally:
+        if original is None:
+            jobs_path.unlink(missing_ok=True)
+        else:
+            jobs_path.write_bytes(original)
 
 
 def test_misplaced_source_quality_writer_is_moved_under_mcp_servers(tmp_path):

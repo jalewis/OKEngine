@@ -65,6 +65,21 @@ def test_iter_files_excludes_runtime_secrets_vcs(tmp_path):
     assert ".okengine/backups/old.tar.gz" not in files   # backups dir: skipped (no recursion)
 
 
+def test_iter_files_excludes_cron_plus_transient_runtime(tmp_path):  # okengine#326 [26]
+    """cron-plus pidfiles + the tick lock are transient scheduler PROCESS state — restoring them
+    verbatim permanently orphans a lane (a stale pidfile blocks its re-trigger). They must never enter
+    a backup, while the live jobs.json (real schedule state) still does."""
+    m = _mod()
+    pack = _pack(tmp_path)
+    (pack / ".hermes-data/cron-plus/pids").mkdir(parents=True, exist_ok=True)
+    (pack / ".hermes-data/cron-plus/pids/lacuna-daily.pid").write_text("12345\n")
+    (pack / ".hermes-data/cron-plus/.tick.lock").write_text("locked\n")
+    files = {r.as_posix() for r in m.iter_files(pack, include_secrets=False)}
+    assert ".hermes-data/cron-plus/jobs.json" in files                  # real schedule state: kept
+    assert ".hermes-data/cron-plus/pids/lacuna-daily.pid" not in files  # transient pidfile: excluded
+    assert ".hermes-data/cron-plus/.tick.lock" not in files             # tick lock: excluded
+
+
 def test_include_secrets_captures_env(tmp_path):
     m = _mod()
     files = {r.as_posix() for r in m.iter_files(_pack(tmp_path), include_secrets=True)}

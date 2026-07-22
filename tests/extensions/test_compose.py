@@ -38,6 +38,30 @@ def _record(ext_id="demo.alpha", **op_over):
     return {"id": ext_id, "tier": "pack", "dir": f"/x/{ext_id}", "manifest": man}
 
 
+def _agent_record(ext_id="demo.agent"):
+    contract = {
+        "api": 1, "allowed_namespaces": ["alpha"], "allowed_types": ["entity"],
+        "operations": ["create"], "required_fields": ["type"],
+        "required_relationships": [], "body": {"required": True, "min_non_whitespace": 40},
+        "unknown_fields": "reject", "unresolved_links": "reject",
+        "placeholder_links": "reject", "completion": "run",
+    }
+    return _record(ext_id, prompt="write alpha", output_contract=contract,
+                   adversarial_fixtures=["tests/extensions/test_compose.py"])
+
+
+def test_agent_operation_requires_contract_and_adversarial_fixtures():
+    m = _mod()
+    bad = _record("demo.bad-agent", prompt="write alpha")
+    job, errors, _ = m.synthesize_job(bad)
+    assert job is None and any("output_contract" in error for error in errors)
+
+    job, errors, _ = m.synthesize_job(_agent_record())
+    assert errors == []
+    assert job["output_contract"]["allowed_namespaces"] == ["alpha"]
+    assert job["adversarial_fixtures"] == ["tests/extensions/test_compose.py"]
+
+
 def test_operation_synthesizes_namespaced_job():
     m = _mod()
     job, errors, warnings = m.synthesize_job(_record("demo.alpha"))

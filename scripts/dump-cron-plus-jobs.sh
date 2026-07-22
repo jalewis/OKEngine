@@ -20,6 +20,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIVE_IN_CONTAINER="/opt/data/cron-plus/jobs.json"
 OUT="$REPO_ROOT/config/cron-plus-jobs.json"
 SERVICE="${HERMES_DOCKER_SERVICE:-gateway}"
+PACK_DIR="${CRON_PACK_DIR:-/path/to/pack}"
+# Read the live jobs.json as the SAME uid the gateway runs as — NOT the image's `hermes` name (10000).
+# A pack that overrides HERMES_UID owns /opt/data with that uid, so execing under the hardcoded image
+# user read as the wrong user and failed with permission-denied on the very file this dump exists to
+# capture (invariant-audit B9). Resolve from env -> pack .env pin -> tree owner (okengine#185).
+# shellcheck source=lib/hermes_uid.sh
+. "$REPO_ROOT/scripts/lib/hermes_uid.sh"
+HERMES_UID="$(resolve_hermes_uid "$PACK_DIR")"
 
 cd "$REPO_ROOT"
 
@@ -35,14 +43,14 @@ if [ -z "$container_id" ]; then
     exit 1
 fi
 
-# Pull the live JSON out of the container as hermes (uid 10000) into a
+# Pull the live JSON out of the container as the resolved gateway uid into a
 # temp file. Using a file (not a pipe) decouples the docker exec stream
 # from Python's stdin — `python3 -` reads its program from stdin, so we
 # can't ALSO feed it the JSON via stdin in the same pipeline.
 TMP_JSON="$(mktemp -t cron-plus-live.XXXXXX.json)"
 trap 'rm -f "$TMP_JSON"' EXIT
 
-if ! docker compose exec -T --user hermes "$SERVICE" cat "$LIVE_IN_CONTAINER" > "$TMP_JSON"; then
+if ! docker compose exec -T --user "$HERMES_UID" "$SERVICE" cat "$LIVE_IN_CONTAINER" > "$TMP_JSON"; then
     echo "ERROR: failed to read $LIVE_IN_CONTAINER inside $SERVICE container." >&2
     exit 1
 fi

@@ -43,3 +43,6 @@ HARD rules:
 
 End with a per-page summary: what you set on each, and any page left for human review (with the
 reason).
+# Model-write boundary
+
+Process only selector-named items. Ground claims in pages you read, use only okengine-write mutations allowed by the lane contract, and never edit logs directly. Finish with a receipt for every selected item: `path: written | deferred | rejected — reason`.

@@ -54,6 +54,17 @@ grep -rinE "<vendor/product names>|<private hostnames>|192\.168\.|10\.0\." \
 - **The MCP write path is the enforced contract.** Agent writes go through
   `okengine-mcp/write_server.py`, which validates against the pack's `schema.yaml`.
   Don't add a bypass.
+- **Every new model-writing lane declares an executable output contract.** Prompt text is guidance,
+  not enforcement. Declare allowed namespaces/types/operations, semantic requirements, and
+  completion accounting as documented in `docs/model-write-contracts.md`; add adversarial tests.
+- **Bounded model lanes define every terminal outcome.** Success, partial completion, skip, retry,
+  and failure are machine-readable receipts, not narrative claims.
+- **Synthesized claims retain resolving provenance.** Missing evidence is rejected or quarantined;
+  never fabricate a citation to make a gate pass.
+- **Use deterministic scripts when judgment is unnecessary.** Model output is not a substitute for
+  parsing, propagation, hashing, accounting, or other mechanical transformations.
+- **Every confirmed incident graduates into a permanent gate, adversarial fixture, or health
+  metric.** A one-time cleanup without recurrence prevention is incomplete.
 - **Generated artifacts are not hand-edited** (e.g. `config/cron-plus-jobs.json` is
   produced by `scripts/cron_pack_split.py`). Edit the source, then regenerate.
 - **Hermes is a pinned dependency, not a fork.** Engine changes are additions

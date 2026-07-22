@@ -28,3 +28,6 @@ WRITE only via the MCP write path (never `file_write`). Be conservative and ters
 that isn't a true duplicate and note why in one line. LOCAL-ONLY — do not use web tools. End your
 response with a one-line summary of what you merged; the MCP write path logs each change to
 `wiki/log.md` automatically — do not write it yourself.
+# Model-write boundary
+
+Process only selector-named items. Ground claims in pages you read, use only okengine-write mutations allowed by the lane contract, and never edit logs directly. Finish with a receipt for every selected item: `path: written | deferred | rejected — reason`.

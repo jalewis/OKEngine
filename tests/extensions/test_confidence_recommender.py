@@ -166,3 +166,34 @@ def test_manifest_config_knobs_are_real_runtime_env_reads():
     for key in manifest["config"]:
         env = "PREDICTION_" + key.upper()
         assert env in recommender or env in selector, f"config key {key} has no runtime env read"
+
+
+def test_unrecognized_direction_is_surfaced_not_dropped(capsys):  # okengine#326 [23]
+    """An evidence `direction` outside the vocabulary was SILENTLY dropped (event_delta returned
+    None via `.get()` miss) — the event vanished from the recommendation with no signal. Now the
+    unrecognized value is surfaced on stderr; a legitimately missing-scores event stays silent."""
+    m = _load()
+    ev = {"scores": {"signal_strength": 0.8, "source_reliability_score": 0.7, "corroboration_count": 2}}
+    assert m.event_delta(ev, "reinforces") is not None          # known direction scores
+    assert m.event_delta(ev, "filed") is None                   # unrecognized -> excluded
+    err = capsys.readouterr().err
+    assert "unrecognized evidence direction" in err and "filed" in err, err
+    # a genuinely missing-scores event is excluded WITHOUT the drift warning (not vocabulary drift)
+    assert m.event_delta({"scores": {}}, "reinforces") is None
+    assert "unrecognized evidence direction" not in capsys.readouterr().err
+
+
+def test_direction_vocab_does_not_drift_across_copies():  # okengine#326 [23]
+    """The evidence[].direction vocabulary is hardcoded in several places (a schema-derived single
+    source is #217's goal). Until then, pin the copies together so a schema enum change can't leave
+    confidence_recommender scoring a stale set."""
+    import re
+    m = _load()
+    penalty_vocab = set(m._DIRECTION_PENALTY)
+    # read corpus_audit's sanctioned constant from source (importing the module pulls in schema_lib)
+    src = (REPO / "scripts" / "cron" / "corpus_audit.py").read_text()
+    mm = re.search(r"EVIDENCE_DIRECTION_ENUM\s*=\s*\{([^}]*)\}", src)
+    sanctioned = {t.strip().strip("'\"") for t in mm.group(1).split(",") if t.strip()}
+    assert penalty_vocab == sanctioned, (
+        f"_DIRECTION_PENALTY vocab {sorted(penalty_vocab)} drifted from the sanctioned "
+        f"evidence[].direction enum {sorted(sanctioned)}")

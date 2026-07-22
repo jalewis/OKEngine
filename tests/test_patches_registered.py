@@ -70,3 +70,46 @@ def test_ctx_patch_touches_the_three_sites():
     for path in ("cron/scheduler.py", "run_agent.py", "agent/agent_init.py"):
         assert f"b/{path}" in text, f"{ctx[0].name} should touch {path}"
     assert text.count("ollama_num_ctx") >= 4   # signature + forward + resolver + run_job call
+
+
+def test_cron_mcp_patch_filters_before_connecting():
+    text = (PATCHES / "09-cron-scoped-mcp-init.patch").read_text()
+    assert "_discover_cron_mcp_tools" in text
+    assert "if name in allowed" in text
+    assert "discover_mcp_tools()" in text  # removed broad call is visible in the diff
+
+
+def test_read_only_file_patch_excludes_mutators():
+    text = (PATCHES / "10-read-only-file-toolset.patch").read_text()
+    assert '"file_read"' in text
+    assert '"tools": ["read_file", "search_files"]' in text
+    added = "\n".join(line for line in text.splitlines() if line.startswith("+") and not line.startswith("+++"))
+    assert '"write_file"' not in added and '"patch"' not in added
+
+
+def test_http_status_policy_patch_is_bounded_and_opt_in():
+    text = (PATCHES / "11-http-status-retry-policy.patch").read_text()
+    assert 'http_status_policy' in text
+    assert 'max_attempts' in text and '_api_retry_loop_ceiling' in text
+    assert '_allow_status_fallback' in text
+    assert 'getattr(agent, "_http_status_policy", {})' in text
+
+
+def test_mcp_resource_patch_directs_file_paths_to_file_tools():
+    text = (PATCHES / "12-mcp-resource-uri-guidance.patch").read_text()
+    assert "returned verbatim by list_resources" in text
+    assert "Do not retry read_resource with this file URI" in text
+    assert "use read_file" in text and "get_page" in text
+
+
+def test_cron_plus_run_patch_is_null_safe():
+    text = (PATCHES / "cron-plus" / "cli-null-next-run.patch").read_text()
+    assert 'j.get("next_run_at")' in text
+    assert "pending scheduler reconciliation" in text
+
+
+def test_local_pool_contract_is_in_seed_template():
+    text = (REPO / "config" / "config.yaml.template").read_text()
+    for status, attempts in ((404, 1), (500, 2), (503, 6), (504, 1)):
+        assert f"{status}: {{max_attempts: {attempts}, fallback: false}}" in text
+    assert "request_timeout_seconds: 350" in text

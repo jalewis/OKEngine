@@ -35,6 +35,20 @@ fallback_providers:
 # A local model (no rate limits) is the better paid-free workhorse if you have the hardware:
 #   - {provider: custom, model: qwen3.5:27b, base_url: http://YOUR_OLLAMA_HOST:11434/v1}
 
+# Shared local pools may publish an HTTP load-shedding contract. Configure its
+# request deadline under the provider and exact retry/fallback behavior under
+# the agent. Example for a pool that queues 30s, runs up to 300s, uses 503 for
+# capacity, permits one retry on 500, and declares 404/504 deterministic:
+# providers:
+#   custom:
+#     request_timeout_seconds: 350
+# agent:
+#   http_status_policy:
+#     404: {max_attempts: 1, fallback: false}
+#     500: {max_attempts: 2, fallback: false}
+#     503: {max_attempts: 6, fallback: false}
+#     504: {max_attempts: 1, fallback: false}
+
 compression:
   enabled: true
   threshold: 0.7
@@ -88,6 +102,7 @@ mcp_servers:
     - /opt/hermes/okengine-mcp/write_server.py
     env:
       OKENGINE_WRITE_ACTOR: cron:source-quality-backfill
+      OKENGINE_OUTPUT_CONTRACT_MODE: enforce
 
 # Cron jobs opt into MCP explicitly. This keeps maintenance drains and pure
 # script jobs from opening MCP connections unless a job requests them.

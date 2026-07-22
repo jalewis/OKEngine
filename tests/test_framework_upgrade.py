@@ -138,6 +138,29 @@ def test_reapply_is_idempotent(tmp_path):
     assert again.status == "current" and again.migrations == []
 
 
+def test_apply_records_state_incrementally_per_migration(tmp_path):  # invariant-audit #351
+    """apply_upgrade records each migration's id as it COMPLETES, so a crash part-way through a batch
+    leaves the finished migrations recorded and only the in-flight one replays. Here the 2nd migration
+    raises: m1 must already be in `applied` (so it won't re-run), m2 must not. Before the fix,
+    record_state ran once AFTER the loop, so a mid-batch failure recorded NOTHING and m1 re-applied on
+    the next run — harmful for a non-idempotent migration."""
+    m, meta = _mod(), _meta()
+    pack = _pack(tmp_path, "v0.4.0")
+    md = tmp_path / "migs"
+    _migration(md, id_="m1", frm="v0.4.0", to="v0.5.0")
+    (md / "m_m2.py").write_text(                                   # m2 blows up mid-apply
+        'ID = "m2"\nFROM = "v0.5.0"\nTO = "v0.6.0"\nDESCRIPTION = "boom"\n'
+        'def apply(pack, dry_run):\n    raise RuntimeError("hard fail mid-batch")\n',
+        encoding="utf-8")
+    plan = m.plan_upgrade(pack, "v0.6.0", None, m.load_migrations(md), meta)
+    assert [mig.id for mig in plan.migrations] == ["m1", "m2"]     # both pending, ordered
+    with pytest.raises(RuntimeError):
+        m.apply_upgrade(pack, plan, "t0")
+    state = json.loads((pack / ".okengine" / "migrations-state.json").read_text())
+    assert "m1" in state["applied"], f"completed migration not recorded: {state}"
+    assert "m2" not in state["applied"], f"failed migration wrongly recorded: {state}"
+
+
 # --- CLI main ---------------------------------------------------------------
 
 def test_main_dryrun_does_not_change_pin(tmp_path, capsys):

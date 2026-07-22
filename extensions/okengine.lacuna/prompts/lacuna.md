@@ -60,3 +60,6 @@ a lacuna fill is rarely a short-horizon claim; double-check the arithmetic befor
 
 LOCAL-ONLY (no web tools). End with a one-line summary: the field analyzed and whether a lacuna
 was written or the field deferred.
+# Model-write boundary
+
+Process only selector-named items. Ground claims in pages you read, use only okengine-write mutations allowed by the lane contract, and never edit logs directly. Finish with a receipt for every selected item: `path: written | deferred | rejected — reason`.

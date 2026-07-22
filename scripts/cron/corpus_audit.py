@@ -127,6 +127,10 @@ SKIP_PARTS = {"dashboards", "operational", "_archived", ".okengine", ".backlinks
 CONSUMED_FIELDS: dict[str, tuple[str, str]] = {
     "signal_class": ("sources", "source_portfolio_watch (falls back to source_kind)"),
     "evidence": ("predictions", "cockpit trajectory sparkline + reinforces/contradicts tally"),
+    # okengine#326 [21]: the reader's "Recent reporting" panel reads recent_news_refs off entity
+    # pages (okengine-reader/app.py), but no lane produces it — a consumer with no producer. Register
+    # it so the dead-field detector reports it if it's referenced without ever being populated.
+    "recent_news_refs": ("entities", "reader Recent-reporting panel (okengine-reader/app.py)"),
 }
 
 # Sanctioned nested evidence[].direction vocabulary (matches the regrade digest in

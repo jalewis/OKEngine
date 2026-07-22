@@ -76,6 +76,17 @@ def test_engine_agent_lanes_declare_explicit_narrow_toolsets():
     assert not problems, "\n".join(problems)
 
 
+def test_model_write_lanes_never_receive_native_file_mutation_tools():
+    problems = []
+    for job in _engine_agent_lanes():
+        if "okengine-write" not in (job.get("enabled_toolsets") or []):
+            continue
+        toolsets = set(job["enabled_toolsets"])
+        if "file" in toolsets:
+            problems.append(f"{job['name']}: model writer uses mutable file toolset")
+    assert not problems, "\n".join(problems)
+
+
 def test_wiki_health_audit_uses_portable_schema_audit_command():
     job = next(lane for lane in _engine_agent_lanes() if lane["name"] == "wiki-health-audit")
     assert job["prompt"].startswith("Read /opt/vault/CLAUDE.md and follow")

@@ -53,12 +53,27 @@ def test_covers_every_required_surface():
         "read-MCP baked-lib drift (M-B4.1)": "read-MCP $lib is STALE",
         "policy digest verification (#283)": "runtime policy digest matches composed source",
         "least-privilege capability probe (#283)": "source-quality capability probe rejects",
+        "hardened posture host-side peer (#326 [1])": "hardened_posture_violations",
         # NB: the iwe-dep check (#168) was intentionally removed by #179 — backlinks-refresh now
         # builds the graph with an in-process link-scanner and needs no gateway iwe binary, so the
         # verifier no longer probes for it. (Stale required-surface entry dropped.)
     }
     missing = [name for name, token in required.items() if token not in body]
     assert not missing, f"verifier no longer checks: {missing}"
+
+
+def test_hardened_posture_check_reuses_pure_evaluator_and_fails_on_violation():  # okengine#326 [1]
+    """check_auth's hardened-posture rules only ran in the daily cron lane (dies with the scheduler).
+    The verifier must have a host-side peer that reuses the SAME pure evaluator and FAILs a violation
+    — not re-implement the rules (which would drift)."""
+    body = VERIFY.read_text()
+    assert "hardened_posture_violations" in body, "verifier does not call the shared posture evaluator"
+    assert "is_hardened" in body, "verifier must skip the checks when the hardened profile is off"
+    # a flagged violation must FAIL (not merely warn), and the profile-off path must not FAIL
+    assert 'bad "hardened posture:' in body, "a hardened-posture violation must FAIL the verifier"
+    assert "hardened profile off" in body, "profile-off must be a non-FAIL (N/A) branch"
+    # reuse, not re-implementation: it imports from hardening_lib, doesn't hardcode the rule strings
+    assert "from hardening_lib import" in body
 
 
 def test_tick_lock_check_tests_freshness_not_presence():  # invariant-audit HIGH

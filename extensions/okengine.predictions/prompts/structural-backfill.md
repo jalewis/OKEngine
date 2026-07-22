@@ -34,3 +34,6 @@ HARD rules:
 - If a page already has the section (a race with a prior run), skip it and note that in your summary.
 
 End with a one-line-per-prediction summary of the refutation criteria you added.
+# Model-write boundary
+
+Process only selector-named items. Ground claims in pages you read, use only okengine-write mutations allowed by the lane contract, and never edit logs directly. Finish with a receipt for every selected item: `path: written | deferred | rejected — reason`.

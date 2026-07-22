@@ -36,6 +36,19 @@ operation:
   schedule: {kind: cron, expr: "0 6 * * *"}   # daily (06:00) — drift-gated, cheap, one field per run
   entrypoint: select_lacuna_field.py          # wake-gate: densest concept cluster not analyzed lately
   prompt_file: prompts/lacuna.md
+  output_contract:
+    api: 1
+    allowed_namespaces: [lacuna, predictions]
+    allowed_types: [lacuna, prediction]
+    operations: [create, update, converge]
+    required_fields: [type]
+    required_relationships: []
+    body: {required: true, min_non_whitespace: 80}
+    unknown_fields: reject
+    unresolved_links: review
+    placeholder_links: reject
+    completion: per-selected-item
+  adversarial_fixtures: [tests/extensions/test_model_output_contracts.py]
   toolsets: [file, todo, okengine-write, okengine]
   tier: analyze                   # okengine#129 hint: run AFTER ingest/compile so the graph is fresh
 config:

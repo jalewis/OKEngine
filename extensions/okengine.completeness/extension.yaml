@@ -45,6 +45,19 @@ operations:
     schedule: {kind: cron, expr: "25 6 * * *"}   # after the 05:55 audit refreshes the queue
     entrypoint: select_gap_fixes.py              # wake-gate: silent when nothing is fixable
     prompt_file: prompts/gap_drain.md
+    output_contract:
+      api: 1
+      allowed_namespaces: ["*"]
+      allowed_types: ["*"]
+      operations: [update, patch, append, converge, flag]
+      required_fields: [type]
+      required_relationships: []
+      body: {required: false, min_non_whitespace: 0}
+      unknown_fields: reject
+      unresolved_links: review
+      placeholder_links: reject
+      completion: per-selected-item
+    adversarial_fixtures: [tests/extensions/test_model_output_contracts.py]
     toolsets: [file, todo, okengine-write, okengine]
     tier: analyze
 config:

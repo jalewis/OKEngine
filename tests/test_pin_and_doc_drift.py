@@ -41,13 +41,13 @@ def test_patch_count_literals_match_the_actual_patch_set():  # invariant-audit #
     n = len(list((REPO / "patches").glob("*.patch")))
     for rel in ("INSTALL.md", "engine-manifest.yaml"):
         text = (REPO / rel).read_text()
-        assert f"{n} core-file patch" in text or f"{n} carried patch" in text, \
+        assert re.search(rf"(?<!\d){n} (?:core-file|carried) patch", text), \
             f"{rel} does not state the actual patch count ({n})"
     # no STALE wrong-count phrasings survive
     for rel in ("INSTALL.md", "engine-manifest.yaml"):
         text = (REPO / rel).read_text()
         for wrong in (c for c in range(1, 20) if c != n):
-            assert f"{wrong} core-file patch" not in text and f"{wrong} carried patch" not in text, \
+            assert not re.search(rf"(?<!\d){wrong} (?:core-file|carried) patch", text), \
                 f"{rel} carries a stale patch count ({wrong}, actual {n})"
 
 

@@ -43,10 +43,13 @@ Rule of thumb: **SEARCH before CREATE; RETRIEVE before EDIT.** Update the existi
 (matched by name OR alias) rather than minting a near-duplicate. A page nothing links to
 — and that links to nothing — is barely worth more than the feed it came from.
 
-## Ingest workflow (sources → entities)
+## Staged ingest workflow (sources, then entities)
 
 Process each raw item in the digest IN ORDER. Read `schema.yaml` for the exact required
-fields per type.
+fields per type. Source compilation and entity extraction are separate lanes: the source
+lane stops after writing a complete accepted source, and the downstream entity lane consumes
+only accepted source pages. The source lane must not create or update entities, concepts,
+predictions, findings, or briefings.
 
 1. **Source page first (dedupe + provenance).** Create the source page at the
    **wiki-relative** path `sources/<YYYY>/<MM>/<slug>` (`type: source`). The MCP write tools
@@ -61,7 +64,11 @@ fields per type.
    > `bias_flags`. Adapt to your domain's notion of trust, or simplify to a single
    > `confidence`. Add the scoring fields to `source.required` in schema.yaml if you
    > want the gate to enforce them.
-3. **Extract entities** — every entity page lands at the wiki-relative path
+3. **Stop after the accepted source in the source-compilation lane.** A complete,
+   deduplicated source is the only accepted canonical output. If extraction is incomplete,
+   defer or fail the selected raw item instead of writing a partial or empty source. Account
+   for every selected input in the exact receipt format and identity supplied by the selector.
+4. **In the entity lane, extract grounded entities** — every entity page lands at the wiki-relative path
    **`entities/<first-letter-of-slug>/<slug>`** (the engine shards by the slug's FIRST
    letter, e.g. `entities/a/acme`, `entities/n/northwind`). The `type` is a **frontmatter
    field, never a path segment**: do NOT write `entities/<type>/…`, a top-level `<type>/…`,
@@ -70,21 +77,21 @@ fields per type.
    Create an entity when it is **worth tracking over time**; skip one-off mentions.
    > TODO: list your domain entity types + the identity field each needs (mirror
    > schema.yaml `types`).
-4. **Cross-link.** Link related entities with `[[wikilinks]]` — to pages that exist or
+5. **Cross-link.** Link related entities with `[[wikilinks]]` — to pages that exist or
    you create in this batch. The graph is the value. **One deliberate exception — concept
    links:** when a page exhibits a recurring cross-cutting theme, tag it
    `[[concepts/<slug>]]` *even if that concept page does not exist yet*. Those dangling
    concept links are the signal the `concept-backfill` cron uses to synthesize the concept
    page once a slug accrues enough inbound references — so link the theme on every page that
    exhibits it. Do **not** create the concept page yourself here.
-5. **Update, don't duplicate.** A new sighting of an existing entity appends to its
+6. **Update, don't duplicate.** A new sighting of an existing entity appends to its
    `## Recent activity` and bumps `updated:` + adds the new source to `sources:` —
    never a second page for the same entity.
-6. **Findings are HUMAN-AUTHORED.** You may *surface* candidate findings in your run
+7. **Findings are HUMAN-AUTHORED.** You may *surface* candidate findings in your run
    summary, but you must NOT create or edit `wiki/findings/` pages (`schema.yaml`
    `permissions.findings` is human-only — the write path refuses it).
    > TODO: delete this rule if your domain has no human-only gate.
-7. **File predictions** for explicit, falsifiable, dated forward claims a source makes.
+8. **File predictions only in the prediction lane** for explicit, falsifiable, dated forward claims a source makes.
    No falsifiable claim → file none. Never invent one.
 
 ## Predictions
@@ -108,6 +115,15 @@ review-flagged: asserting one lands the write but stamps `needs_review: true`.
   `status: tombstoned`). Dedup/merge = tombstone the loser with `superseded_by`.
 - Keep required fields present (the gate rejects non-conformant writes).
 - Respect any TLP / sensitivity convention your domain uses.
+
+## Model-lane governance
+
+- No model-writing lane ships without an executable output contract and adversarial fixtures.
+- Prompt text guides behavior; the write boundary and verified receipt enforce it.
+- Every selected item has exactly one success, partial, skip, retry, or failure disposition.
+- Claims retain resolving provenance. Quarantine missing evidence; never invent it.
+- Use deterministic scripts for transformations that require no judgment.
+- Graduate every production finding into a permanent gate, fixture, or health metric.
 
 ## Domain pointers
 

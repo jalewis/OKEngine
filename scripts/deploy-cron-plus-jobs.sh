@@ -31,6 +31,7 @@ PACK_DIR="${CRON_PACK_DIR:-/path/to/pack}"
 # shellcheck source=lib/hermes_uid.sh
 . "$REPO_ROOT/scripts/lib/hermes_uid.sh"
 HERMES_UID="$(resolve_hermes_uid "$PACK_DIR")"
+HERMES_GID="$(resolve_hermes_gid "$PACK_DIR")"
 # cron-plus runs INSIDE the gateway and reads /opt/data/cron-plus/jobs.json (the
 # mounted pack .hermes-data) — NOT host ~/.hermes. Deploy into the container as
 # the `hermes` user so ownership is correct (#18).
@@ -186,6 +187,12 @@ fi
 
 # Create the runtime dir, snapshot any existing jobs.json, then stream the new one
 # in as `hermes` (so the cron-plus subprocess, also hermes, can read it).
+# Reconcile model-slot artifacts as root first: an operator diagnostic may have
+# created the directory or a lock through `docker exec`'s root default. flock
+# state is process-owned, so changing inode ownership does not disturb a live
+# lock; it only restores the scheduler user's ability to open it on later runs.
+docker exec "$CONTAINER" sh -c \
+    "mkdir -p /opt/data/cron-plus/model-slots && chown -R '$HERMES_UID:$HERMES_GID' /opt/data/cron-plus/model-slots && chmod 700 /opt/data/cron-plus/model-slots && find /opt/data/cron-plus/model-slots -type f -exec chmod 600 {} +"
 docker exec -u "$HERMES_UID" "$CONTAINER" mkdir -p /opt/data/cron-plus
 docker exec -u "$HERMES_UID" "$CONTAINER" sh -c \
     "[ -f '$DEST_IN' ] && cp -p '$DEST_IN' '$DEST_IN.bak.$TS' && echo '  snapshot: $DEST_IN.bak.$TS' || true"

@@ -765,7 +765,7 @@ def _render_deck_pdf(md: Path) -> "Path | None":
         out = _DECK_CACHE / f"{md.stem}.{int(md.stat().st_mtime)}.pdf"
         if out.is_file() and out.stat().st_size > 0:
             return out
-        for stale in _DECK_CACHE.glob(f"{md.stem}.*.pdf"):   # drop renders of an older md version
+        for stale in _DECK_CACHE.glob(f"{md.stem}.*.pdf"):   # glob-ok: ephemeral deck-render cache, not a vault namespace
             stale.unlink(missing_ok=True)
         # marp/puppeteer write intermediate files under HOME/TMPDIR/XDG_*; the container often runs as
         # a home-less vault uid, so point them all at the writable cache or the render EACCES-fails.
@@ -957,6 +957,7 @@ def _prediction_files() -> list[str]:
     # and the date-partitioned layouts.
     files: list[str] = []
     for sub in cockpit_config()["predictions_dirs"]:
+        # glob-ok: recursive ** is already sharding-aware (matches forecasts at any shard depth)
         files += [f for f in glob.glob(str(WIKI / sub / "**" / "*.md"), recursive=True)
                   if not _reserved_seg(Path(f))]   # skip predictions/_archive/… retired forecasts
     return files
@@ -1048,6 +1049,7 @@ def api_prediction(id: str = Query(...)):
         # Rows are discovered RECURSIVELY (predictions/YYYY/qN/predict-*.md), so resolve the detail
         # the same way — a flat WIKI/<sub>/{id}.md missed every partitioned prediction (the row
         # appeared in the ledger, then 404'd on click). id is slash-free (validated above).
+        # glob-ok: recursive ** is already sharding-aware (matches pages at any shard depth)
         for hp in sorted(glob.glob(str(WIKI / sub / "**" / f"{id}.md"), recursive=True)):
             p = Path(hp)
             if not p.is_file():
@@ -2929,7 +2931,7 @@ def _ops_groups() -> list[dict]:
     base = WIKI / "operational"
     latest: dict[str, tuple[str, str]] = {}   # series-prefix -> (date, stem); "" key = non-dated (kept as-is)
     if base.is_dir():
-        for p in sorted(base.glob("*.md")):
+        for p in sorted(base.glob("*.md")):   # glob-ok: operational/ is a flat (unsharded) namespace
             if p.name.startswith(("_", ".")) or p.name == "INDEX.md":
                 continue
             path = f"operational/{p.stem}"
@@ -3488,7 +3490,7 @@ def _review_records() -> list[dict]:
     out = []
     if not base.is_dir():
         return out
-    for p in base.glob("*.yaml"):
+    for p in base.glob("*.yaml"):   # glob-ok: operational/reviews/ is a flat yaml dir (unsharded)
         try:
             rec = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
         except Exception:

@@ -80,6 +80,9 @@ def _excluded(rel: Path, include_secrets: bool) -> bool:
         return True                     # transient sqlite WAL/journal — folded into the db snapshot
     if s.startswith(".hermes-data/cron-plus/") and rel.name.startswith("jobs.json."):
         return True                     # superseded runtime copy; may be root-only and is not active state
+    if s.startswith(".hermes-data/cron-plus/pids/") or s == ".hermes-data/cron-plus/.tick.lock":
+        return True                     # transient scheduler runtime — restoring a stale pidfile or the
+                                        # tick lock verbatim permanently orphans a lane (blocks re-trigger); #326 [26]
     return False
 
 

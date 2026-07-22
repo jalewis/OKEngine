@@ -109,6 +109,18 @@ It creates idempotent open records for flagged pages, reports reason/type/age co
 legacy `reviewed_*` metadata as historical decisions labelled with unknown evidence scope. It never
 auto-approves the flagged backlog. Rerun the dry run and compare the Cockpit total after applying.
 
+`flag_for_review` is also replay-safe: the operational queue contains at most one outstanding row
+per canonical page. A repeated call returns `already flagged`, leaves that row unchanged, and writes
+the later reason to `wiki/log.md` so audit detail is not lost. This is required for every non-page
+model-write effect because a successful tool call and its completion receipt are separate
+transactions. To repair queues created before this invariant, preview and then apply the bounded
+cleanup (the original is retained as `.bak-okengine-397`):
+
+```sh
+python scripts/dedupe_review_queue.py --pack /path/to/pack
+python scripts/dedupe_review_queue.py --pack /path/to/pack --write
+```
+
 For recovery, inspect the subject page, its matching ledger YAML, and `wiki/log.md`. A stale conflict
 requires refresh, not manual metadata editing. If an interrupted storage operation is suspected,
 restore the page and ledger together from version control, then resubmit; the operation holds the

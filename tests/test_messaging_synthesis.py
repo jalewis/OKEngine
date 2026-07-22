@@ -6,6 +6,7 @@ Guards: the manifest shape, the deleak (NO product identity shipped), and that e
 gate this extension exists to enforce.
 """
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -131,6 +132,33 @@ def test_positioning_battle_cards_caps_batch_size(tmp_path):
     assert json.loads(out.strip().splitlines()[-1]) == {"wakeAgent": True}
     assert out.count("-> write to") == 3, "batch cap should limit the digest to 3 cards, not 8"
     assert "8 card(s) need refresh" in out and "this run covers 3" in out
+
+
+def test_positioning_battle_cards_same_day_edit_uses_mtime_tiebreak(tmp_path):  # okengine#326 [16]
+    """A same-DATE competitor edit made after the card was written must still refresh the card. The
+    old date-only string compare missed it; the mtime tiebreak (intra-day granularity) catches it."""
+    anchor = tmp_path / "anchor.yaml"
+    anchor.write_text(yaml.safe_dump({
+        "product_name": "Acme Shield", "capability_pages": [], "watchlist_segments": ["direct"]}))
+    wl = tmp_path / "wl.yaml"
+    wl.write_text(yaml.safe_dump({"segments": {"direct": {"competitors": ["acme-rival"]}}}))
+    comp = tmp_path / "wiki/entities/acme-rival.md"
+    _write(comp, "---\ntype: vendor\ntitle: acme-rival\nupdated: '2026-06-28'\n---\n- shipped v1\n")
+    card = tmp_path / "wiki/briefings/positioning-direct-acme-rival.md"
+    _write(card, "---\ntype: briefing\ntitle: card\nupdated: '2026-06-28'\n---\nold card\n")
+    env = {"WIKI_PATH": str(tmp_path), "PRODUCT_ANCHOR_PATH": str(anchor), "WATCHLIST_PATH": str(wl)}
+    base = 1_700_000_000
+
+    # same date, competitor page modified AFTER the card -> stale (would be MISSED by a date-only compare)
+    os.utime(card, (base, base)); os.utime(comp, (base + 100, base + 100))
+    out = _run("select_positioning_battle_cards.py", env)
+    assert json.loads(out.strip().splitlines()[-1]) == {"wakeAgent": True}, out
+    assert "-> write to" in out
+
+    # same date, card written AFTER the competitor page -> NOT stale
+    os.utime(card, (base + 200, base + 200)); os.utime(comp, (base + 100, base + 100))
+    out = _run("select_positioning_battle_cards.py", env)
+    assert json.loads(out.strip().splitlines()[-1]) == {"wakeAgent": False}, out
 
 
 def test_messaging_synthesis_silent_when_no_upstream_deltas(tmp_path):

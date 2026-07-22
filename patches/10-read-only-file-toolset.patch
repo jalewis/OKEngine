@@ -1,0 +1,29 @@
+diff --git a/hermes_cli/tools_config.py b/hermes_cli/tools_config.py
+index ee37627..5dd3922 100644
+--- a/hermes_cli/tools_config.py
++++ b/hermes_cli/tools_config.py
+@@ -62,6 +62,7 @@ CONFIGURABLE_TOOLSETS = [
+     ("browser",         "🌐 Browser Automation",       "navigate, click, type, scroll"),
+     ("terminal",        "💻 Terminal & Processes",      "terminal, process"),
+     ("file",            "📁 File Operations",           "read, write, patch, search"),
++    ("file_read",       "📖 Read-only Files",           "read and search; no write or patch"),
+     ("code_execution",  "⚡ Code Execution",            "execute_code"),
+     ("vision",          "👁️  Vision / Image Analysis",  "vision_analyze"),
+     ("video",           "🎬 Video Analysis",            "video_analyze (requires video-capable model)"),
+diff --git a/toolsets.py b/toolsets.py
+index 03e64fd..7361775 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -193,6 +193,12 @@ TOOLSETS = {
+         "tools": ["read_file", "write_file", "patch", "search_files"],
+         "includes": []
+     },
++
++    "file_read": {
++        "description": "Read-only file tools: read and search without write or patch",
++        "tools": ["read_file", "search_files"],
++        "includes": []
++    },
+     
+     "tts": {
+         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",

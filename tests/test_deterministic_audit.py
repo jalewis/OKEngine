@@ -54,3 +54,33 @@ def test_constant_drift_default_token_agrees():
     m.check_constant_drift()
     drift = [f for f in m._findings if f["dimension"] == "constant-drift" and "TOKEN" in f["detail"]]
     assert not drift, drift
+
+
+def test_record_run_tracks_recurrence(tmp_path):  # okengine#352
+    """Persist audit findings run-over-run so 'same bug rediscovered' is a NUMBER: record_run appends
+    the run's findings to a tracked history and returns each finding's recurrence (# of PRIOR runs
+    that surfaced the same dimension|file|detail key). Idempotent per run_id."""
+    m = _load()
+    hist = tmp_path / "findings-history.jsonl"
+    m._findings.clear()
+    m.add("high", "scrub-parity", ".scrub-patterns", "token X scrubbed at publish but not pre-commit")
+    m.add("medium", "pin-lag", "engine-manifest.yaml", "cron-plus pin behind upstream")
+    rec1 = m.record_run("run1", hist)
+    assert set(rec1.values()) == {0}, f"first run: nothing recurs — {rec1}"
+
+    m._findings.clear()
+    m.add("high", "scrub-parity", ".scrub-patterns", "token X scrubbed at publish but not pre-commit")  # REPEAT
+    m.add("high", "constant-drift", "okengine-mcp/server.py", "default token disagreement")             # NEW
+    rec2 = m.record_run("run2", hist)
+    scrub_key = next(k for k in rec2 if k.startswith("scrub-parity|"))
+    drift_key = next(k for k in rec2 if k.startswith("constant-drift|"))
+    assert rec2[scrub_key] == 1, f"repeated finding must show 1 prior run — {rec2}"
+    assert rec2[drift_key] == 0, f"new finding recurs 0 — {rec2}"
+
+    # idempotent: re-recording run2 does not double-count, and history stays at 2 runs (not 3)
+    rec2b = m.record_run("run2", hist)
+    assert rec2b[scrub_key] == 1, rec2b
+    assert len(m._load_history(hist)) == 2
+
+    # the raw detail is NOT persisted (leak-safe for a tracked file)
+    assert "token X scrubbed" not in hist.read_text()

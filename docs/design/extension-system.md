@@ -264,6 +264,8 @@ extension with several lanes (#multi-op). Per-operation keys:
 | `schedule` | `{kind: cron, expr: "<5-field>"}` (required) |
 | `entrypoint` | in-gateway script name / `{script: …}`, or `{image: …}` for a sidecar. Optional for an agent op (then there's no wake-gate). |
 | `prompt` / `prompt_file` | presence makes it an **agent** operation (`no_agent: false`): an inline prompt, or a bundled file under the extension dir (use exactly one). With a prompt, `entrypoint` is the wake-gate selector. No prompt ⇒ a deterministic `no_agent` script (entrypoint required). |
+| `output_contract` | required for every agent operation; declares allowed namespaces, types, mutations, required fields/relationships, body bounds, link policies, and receipt completion scope. The composer validates and stamps its digest, and the bound writer enforces it. |
+| `adversarial_fixtures` | required non-empty list of repository-relative tests for an agent operation's truncation, scope, grounding, and malformed-output boundaries. |
 | `toolsets` | agent toolsets (default `[okengine, okengine-write]`). |
 | `timeout` | seconds; bounds a runaway op. |
 | `tier` | optional kickstart-stage hint (#129) — slot the job into that stage's order instead of guessing a clock time. |

@@ -25,11 +25,24 @@ def _load(name, path):
 
 
 def _record(ext_id, op):
+    op = dict(op)
+    if op.get("prompt") or op.get("prompt_file"):
+        op.update(_contract_fields())
     m = {"id": ext_id, "kind": "operation", "version": "0.1.0", "trust": "in-gateway",
          "requires": {"engine": ">=0.4.0"},
          "capabilities": {"read": ["wiki/**"], "write": ["predictions/**"]},
          "operation": op}
     return {"id": ext_id, "tier": "engine", "dir": "/x", "manifest": m}
+
+
+def _contract_fields():
+    return {"output_contract": {"api": 1, "allowed_namespaces": ["predictions"],
+            "allowed_types": ["prediction"], "operations": ["create"],
+            "required_fields": ["type"], "required_relationships": [],
+            "body": {"required": True, "min_non_whitespace": 1},
+            "unknown_fields": "reject", "unresolved_links": "reject",
+            "placeholder_links": "reject", "completion": "per-selected-item"},
+            "adversarial_fixtures": ["tests/extensions/test_agent_op.py"]}
 
 
 def test_prompt_makes_an_agent_job_with_wake_gate():
@@ -94,7 +107,7 @@ def test_mixed_agent_and_no_agent_multi_op():
          "operations": {
              "candidate-watch": {"schedule": {"kind": "cron", "expr": "17 6 * * *"},
                                  "entrypoint": "select_candidates.py",
-                                 "prompt": "File prediction candidates."},
+                                 "prompt": "File prediction candidates.", **_contract_fields()},
              "regrade-sweep": {"schedule": {"kind": "cron", "expr": "0 3 * * *"},
                                "entrypoint": "reindex.py"},   # no prompt -> no_agent
          }}

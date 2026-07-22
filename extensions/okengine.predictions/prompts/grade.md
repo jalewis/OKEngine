@@ -1,3 +1,6 @@
 Resolve overdue predictions. The select_predictions_for_grading.py digest above lists open predictions whose `resolves_by` has passed. FIRST response MUST be a tool call. Per $WIKI_PATH/CLAUDE.md, for each: ADD a `## Postmortem` via mcp_okengine_write_append_to_section, then flip `status:` (confirmed/refuted/partial/expired-ungraded) via mcp_okengine_write_update_entity. Never edit made_on/subject/resolves_by or rewrite earlier sections. LOCAL-ONLY (no web tools).
 
 UNGRADEABLE FALLBACK (okengine#214): if you cannot grade because the resolution criteria are missing, vague, or unverifiable, set `status: expired-ungraded` AND record WHY in the `## Postmortem`: name the specific criterion that could not be verified (or state that none was declared). This turns an ungradeable expiry into structured feedback — the gradeability gate (completeness rule `prediction-needs-refutation-criteria`-class) uses it to tighten filing. Never silently expire a prediction without naming what was unverifiable.
+# Model-write boundary
+
+Process only selector-named items. Ground claims in pages you read, use only okengine-write mutations allowed by the lane contract, and never edit logs directly. Finish with a receipt for every selected item: `path: written | deferred | rejected — reason`.

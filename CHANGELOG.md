@@ -14,6 +14,112 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
 > **About panel** (reader/cockpit deployment purpose + composition from live state); and now **pack
 > bundles** (v0.10.0). If you are jumping from v0.3.5, read v0.4.0 onward.
 
+## v0.13.5
+
+PATCH — cron-plus scheduler pin bump (DST fall-back double-fire fix) + DST-window detector. Packs on
+v0.13.4 re-stamp. No engine code changed; the image is re-baked to capture the new pinned dependency +
+version marker (no baked-code delta from v0.13.4).
+
+- **cron-plus DST fall-back double-fire (#326 [28]).** The pinned scheduler dependency is bumped
+  `ee6d9f18 → bdb6cf5f` (jalewis/hermes-cron-plus#5): on a DST fall-back a repeated wall-clock hour
+  made `croniter` return the same local time one UTC-hour later, re-firing a slot whose set includes
+  the repeated hour (e.g. `0 1-23/2 * * *` fires at 01:00 EDT then again at 01:00 EST). The scheduler
+  now skips the fold. All 4 carried cron-plus patches verified against the new pin.
+- **DST-window detector.** `_fixed_hours` now expands ranges + steps (`1-23/2`, `*/2`), and the engine
+  DST-window guard is refined to flag only low-frequency (≤4×/day) crons — the every-2h maintenance
+  lanes structurally span the window and are now scheduler-protected.
+
+## v0.13.4
+
+PATCH — #326 invariant-audit burn-down + #349 parser fixtures + MCP/cron contract clarifications. No
+breaking changes; packs on v0.13.3 re-stamp. **BAKED** (gateway + read-MCP image rebuild + roll): the
+qmd change-detector fix ([30]).
+
+- **#326 invariant-audit burn-down (17 findings):** [1] hardened-posture host-side peer in
+  `post_deploy_verify.sh` (reuses `hardening_lib.hardened_posture_violations`); [9] `resolve_hermes_uid/gid`
+  rejects `HERMES_UID=0` from env + .env (root short-circuit, #185); [11] atomic `install-domain` with
+  transaction rollback; [14] `check_ownership` scans `.okengine`; [15] baked-vs-staged drift check for
+  `tools/schema_validator.py`; [16] positioning-battle-cards same-day mtime staleness tiebreak; [24]
+  prediction-schema-drain reuses the deterministic `_horizon_for`; [26] `framework backup` excludes
+  cron-plus `pids/`+`.tick.lock`; [29] `check_timezone` detects a `next_run_at` computed under a stale
+  TZ **value**; **[30] (BAKED)** the qmd change-detector (`_vault_max_mtime`) now includes directory
+  mtimes so a reshelve/reshard `os.rename` (which preserves the file mtime) is caught instead of going
+  stale until the 6h full refresh; plus the earlier merged [7]/[10]/[17]/[19]/[21]/[23]/[27]/[31].
+- **#349** — line-anchored front-matter parser regression fixtures (URLs with `---`, YAML comments,
+  body rules) pinning the write path against inline-`---` truncation.
+- **#398/#399** — MCP resource + cron trigger contract clarifications.
+
+Every finding ships a red-proven regression test or a standing detector.
+
+## v0.13.3
+
+PATCH — model-write concurrency/retry hardening + repair-receipt drains + detector burndown. No
+breaking changes; packs on v0.13.2 re-stamp. **BAKED** (gateway image rebuild + roll): `write_server`
+MCP-scoping + model-writer isolation from native file mutation.
+
+- **Model-write concurrency & retry hardening** (#397 and siblings): review flags made replay-safe;
+  model slot ownership reconciled; endpoint HTTP retry contracts enforced; shared model inference
+  serialized; model writers isolated from native file mutation.
+- **Repair-receipt drains**: unterminated receipt fences recovered; identity-matching receipts
+  recovered; exact repair-receipt template provided; historical repairs bounded to explicit raw
+  evidence and checkpointed; receipt-drain / repair-executor / MCP scoping fixes.
+- **cron-plus managed patches** refreshed from a clean pin; whole-number patch-count test.
+- **#326 / #352 detector burndown**: audit findings persisted run-over-run to measure recurrence
+  (#352); dead-field registry + cockpit sharded-scan coverage + default-token sync + un-ignored
+  post-deploy verify; hot-set / scrub / coinstall-preflight / predictions-vocab now surface
+  silently-dropped values instead of no-op (#326 [7],[10],[17],[19],[23],[27],[31]).
+
+## v0.13.2
+
+PATCH — model-write output contracts + deploy self-healing. No breaking changes; packs on v0.13.1
+re-stamp. The write-path enforcement is BAKED (gateway image rebuild + roll).
+
+- **Model-write output contracts (BAKED, report mode by default).** Each cron lane can declare an
+  `output_contract` (allowed namespaces/types/operations, required fields, body minimums, resolved
+  wikilinks/relationships, unknown-field/placeholder policy), stamped into `cron-plus-jobs.json` with
+  a digest. `okengine-mcp/output_contract_enforce.py` evaluates each server-authenticated lane write
+  against its contract in the write path. `OKENGINE_OUTPUT_CONTRACT_MODE` gates the action: default
+  `report` LOGS violations (write proceeds); `enforce` REJECTS. Lane prompts were aligned to declare
+  and conform to their contracts (okengine#354/#355/#362/#365).
+- **Model-write audit + run receipts.** A `model_write_audit` lane governs model-write violations;
+  a cron-plus patch (`run-receipts`) exposes runner-owned receipt identity so a write's authoring
+  lane is attributable (#357/#358/#360/#361).
+- **Staged ingestion before entity synthesis** — source ingest is staged/contracted ahead of entity
+  synthesis, and generated packs align to the staged contracted shape (#356/#364).
+- **Deploy self-healing (#359).** `deploy.sh` reconciles a lagging engine pin via `framework upgrade`
+  (roll-forward-gated) BEFORE validating, so a bump no longer dead-ends a lagging pack at
+  `--skip-validate`; the `check_engine_version` FAIL points at `framework upgrade`.
+- **owns-covers-schema is a WARN and honors `schema.exclude`** — an incomplete `owns` no longer hard-
+  FAILs `framework validate` (the compose gate is the real collision enforcement), and a namespace
+  clears by owning OR excluding it (the shared `dashboards`/`operational` render-tree convention).
+
+## v0.13.1
+
+PATCH — the pre-release invariant-audit remediation (okengine#351) plus the walk-up multipack
+write-path correctness pass. No breaking changes; packs on v0.13.0 re-stamp.
+
+- **Walk-up sub-domain write path (BAKED — requires a gateway image rebuild + roll).** A page at
+  `wiki/<subdomain>/entities/<slug>` was written FLAT (the create path read the sub-domain *container*
+  as the namespace) while the reshelve drain sharded it — re-opening the okengine#54 flat-vs-sharded
+  duplicate-canonical ping-pong for every co-installed vault. `_partitioned_create_path` now keeps the
+  sub-domain-qualified namespace so a sub-domain entity shards within its sub-domain, and the
+  create-time alias/name dedup (`id_index` scan + `_alias_hits`) is sub-domain-aware AND scoped to a
+  single sub-domain so two same-named entities in different sub-domains never cross-merge. A flat
+  single-pack vault is byte-identical to v0.13.0.
+- **Fail-loud hardening across the cron deploy gate** — `validate_ordering` gates the deployed
+  (enabled) shape and rejects a non-string `after:`; `@morning:MM` out-of-range and an offpeak `a==b`
+  window no longer silently misbehave.
+- **Framework/extension validation gaps closed** — cross-tier duplicate-extension errors surface;
+  non-rendering `two-axis` reader bindings are rejected; the vendored-`llm_lib` gate discovers copies
+  dynamically; a `owns` ⊇ schema check; an unconditional engine-crons classification test; a
+  `cost_bearing` discipline gate; and the write-path-lib baked-vs-staged drift check now runs at the
+  deploy gate.
+- **Robustness** — migration state is recorded incrementally (a hard-kill mid-batch no longer replays
+  it); `resolve_hermes_gid` warns before its fallback and ownership scripts resolve gid independently.
+- **Scoring signals** — source reliability/credibility grading is driven by the pack schema enum
+  (out-of-vocab grades surfaced, not laundered to neutral); and an independent-corroboration producer
+  replaces a never-written field that pinned 25% of source-evidence signal to a constant.
+
 ## v0.13.0
 
 MINOR — a rapid corrective release folding the fixes and features that landed on `main` after the

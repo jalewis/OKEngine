@@ -188,17 +188,44 @@ def collect(cfg: dict) -> list[dict]:
     return sorted(rows, key=lambda row: row["event_id"])
 
 
+def _source_entities(fm: dict, body: str, cfg: dict) -> set[str]:
+    """Entity slugs a source page reports on — body wikilinks into the entities/ namespace plus any
+    entity/subject frontmatter field. Leaf slug (namespace-stripped) so a flat ref and a sharded ref
+    (entities/s/shinyhunters) match. This is the corroboration grouping key."""
+    out: set[str] = set()
+    for ref in _REF.findall(body or ""):
+        ref = ref.strip().strip("/")
+        ref = ref[:-3] if ref.endswith(".md") else ref
+        if ref.startswith(("entities/", "entity/")):
+            out.add(ref.split("/")[-1].lower())
+    for field in (cfg.get("entity_field") or "entity", "entities", "subject", "subjects", "about"):
+        for ref in _refs(fm.get(field)):
+            leaf = ref.split("/")[-1].lower()
+            if leaf:
+                out.add(leaf)
+    return out
+
+
 def collect_sources(cfg: dict) -> list[dict]:
-    """Collect every canonical source page for source-intrinsic scoring.
+    """Collect every canonical source page for source-intrinsic scoring, computing each source's
+    INDEPENDENT CORROBORATION from the corpus.
 
     Event-only coverage starved prediction evidence: predictions cite ordinary source pages,
     while the old sidecar contained only sources referenced by event-typed pages. Keep the same
     score-vector contract, but emit one source-scoped row for every source page.
+
+    `corroboration_count` used to read `independent_corroboration_count` from frontmatter — a field
+    NO lane ever wrote, so it was always 0 and score_source pinned 25% of the source-evidence signal
+    to a constant 0.5 (invariant-audit #351). This lane is that missing producer: a source's
+    corroboration is the number of DISTINCT OTHER publishers whose sources report on any entity this
+    source references (a different outlet corroborating the same subject). An explicit frontmatter
+    `independent_corroboration_count` still acts as a floor if a page sets one.
     """
     source_dir = WIKI / "sources"
     if not source_dir.is_dir():
         return []
-    rows = []
+    metas: list[dict] = []
+    ent_publishers: dict[str, set] = defaultdict(set)   # entity slug -> {publisher}
     for path in source_dir.rglob("*.md"):
         if path.name.startswith(("_", "INDEX")) or ".bak." in path.name:
             continue
@@ -211,22 +238,38 @@ def collect_sources(cfg: dict) -> list[dict]:
             observed = _date(fm.get(field))
             if observed:
                 break
-        corroboration = fm.get("independent_corroboration_count", 0)
+        publisher = str(fm.get(cfg["publisher_field"]) or "(unset)")
+        entities = _source_entities(fm, body, cfg)
+        stored = fm.get("independent_corroboration_count", 0)
         try:
-            corroboration = max(0, int(corroboration))
+            stored = max(0, int(stored))
         except (TypeError, ValueError):
-            corroboration = 0
+            stored = 0
+        metas.append({"path": path, "fm": fm, "body": body, "source_id": source_id,
+                      "observed": observed, "publisher": publisher, "entities": entities,
+                      "stored": stored})
+        if publisher and publisher != "(unset)":
+            for e in entities:
+                ent_publishers[e].add(publisher)
+    rows = []
+    for meta in metas:
+        corroborating: set = set()
+        for e in meta["entities"]:
+            corroborating |= ent_publishers.get(e, set())
+        corroborating.discard(meta["publisher"])            # "independent" = a DIFFERENT outlet
+        corroboration = max(len(corroborating), meta["stored"])
+        fm, path = meta["fm"], meta["path"]
         rows.append({
-            "event_id": source_id,
+            "event_id": meta["source_id"],
             "event_type": "source-evidence",
             "entity": "",
-            "date": observed.isoformat() if observed else None,
+            "date": meta["observed"].isoformat() if meta["observed"] else None,
             "title": str(fm.get("title") or path.stem),
-            "body": body[:4000],
-            "source": source_id,
+            "body": meta["body"][:4000],
+            "source": meta["source_id"],
             "reliability": str(fm.get(cfg["reliability_field"]) or "C").upper(),
             "source_kind": str(fm.get(cfg["source_kind_field"]) or "(unset)"),
-            "publisher": str(fm.get(cfg["publisher_field"]) or "(unset)"),
+            "publisher": meta["publisher"],
             "corroboration_count": corroboration,
         })
     return sorted(rows, key=lambda row: row["source"])

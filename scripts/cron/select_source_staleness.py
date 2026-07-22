@@ -31,7 +31,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 from source_decay import (  # type: ignore[import]
-    STALE_THRESHOLD, compute_for, HALF_LIVES, DEFAULT_HALF_LIFE,
+    STALE_THRESHOLD, compute_for, HALF_LIVES, DEFAULT_HALF_LIFE, scale_from_enum,
 )
 import schema_lib  # noqa: E402
 import tz_lib  # noqa: E402
@@ -40,6 +40,28 @@ VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 _SCHEMA = schema_lib.governing_schema(VAULT)
 # Pack-declared canonical entity types (schema.yaml). Empty ⇒ accept any type.
 ENTITY_TYPES = schema_lib.canonical_types(_SCHEMA)
+
+
+def _ordered_enum(schema: dict, field: str) -> list:
+    """The ORDERED grading vocabulary a pack declares for `field` via the schema
+    `field_enums` -> `enums` indirection (or an inline list). [] if none is declared — source_decay
+    then falls back to the engine Admiralty default. base-schema states the reliability/credibility
+    scheme is a PACK enum, so this is how a non-Admiralty pack's grades get scored correctly instead
+    of silently laundered to neutral (invariant-audit #351)."""
+    fe = (schema.get("field_enums") or {}).get(field)
+    ev = fe.get("enum") if isinstance(fe, dict) else (fe if isinstance(fe, list) else None)
+    if isinstance(ev, list):
+        return [str(v) for v in ev]
+    if isinstance(ev, str):
+        named = (schema.get("enums") or {}).get(ev)
+        return [str(v) for v in named] if isinstance(named, list) else []
+    return []
+
+
+# Grading scales driven by the governing schema; None -> source_decay uses the engine Admiralty
+# default (byte-identical to the pre-#351 behavior for packs that declare no reliability/credibility enum).
+_REL_SCALE = scale_from_enum(_ordered_enum(_SCHEMA, "reliability")) or None
+_CRED_SCALE = scale_from_enum(_ordered_enum(_SCHEMA, "credibility")) or None
 DASH_PATH = VAULT / "wiki" / "dashboards" / "source-staleness.md"
 PRIMARY_CITATION_DEPTH = int(os.environ.get("DECAY_PRIMARY_CITATION_DEPTH", "3"))
 TOP_PAGES_PER_SECTION = int(os.environ.get("DECAY_TOP_PAGES", "30"))
@@ -57,6 +79,8 @@ class SourceScore:
     source_kind: str | None
     age_days: int
     base_score: float
+    reliability_oov: bool = False   # grade present but outside the active vocabulary (scored neutral)
+    credibility_oov: bool = False
 
 
 @dataclass
@@ -157,6 +181,8 @@ def score_all_sources(today: date) -> dict[str, SourceScore]:
             source_kind=fm.get("source_kind"),
             source_date=source_date,
             today=today,
+            reliability_scale=_REL_SCALE,
+            credibility_scale=_CRED_SCALE,
         )
         out[rel_path] = SourceScore(
             rel_path=rel_path,
@@ -165,6 +191,8 @@ def score_all_sources(today: date) -> dict[str, SourceScore]:
             source_kind=score["source_kind"],
             age_days=score["age_days"],
             base_score=score["base_score"],
+            reliability_oov=score["reliability_oov"],
+            credibility_oov=score["credibility_oov"],
         )
     return out
 
@@ -259,6 +287,7 @@ def _band(score: float) -> str:
 def render_dashboard(scores: dict[str, SourceScore], anchors: list[Anchor], today: date) -> str:
     n_total = len(scores)
     n_stale = sum(1 for s in scores.values() if s.is_stale)
+    oov = sorted(s.rel_path for s in scores.values() if s.reliability_oov or s.credibility_oov)
     band_counts: Counter = Counter(_band(s.effective_score) for s in scores.values())
     by_kind: dict[str, list[float]] = defaultdict(list)
     for s in scores.values():
@@ -301,6 +330,15 @@ def render_dashboard(scores: dict[str, SourceScore], anchors: list[Anchor], toda
              "`age_days` is computed from `min(published, ingested, filename_date)` to handle "
              "retroactive bulk imports correctly.")
     L.append("")
+    if oov:
+        # Grades present on the page but OUTSIDE the active vocabulary (the pack's declared enum, or
+        # the engine Admiralty default when the pack declares none) score NEUTRAL — surfaced here
+        # rather than silently laundered to 'average' (invariant-audit #351). Fix: declare the pack's
+        # reliability/credibility `field_enums`, or correct the grade.
+        L.append(f"> ⚠ **{len(oov)} source(s) carry an unrecognized reliability/credibility grade** "
+                 f"(scored neutral 0.5). Declare the pack's grading `field_enums` or fix the grade: "
+                 + ", ".join(f"`{r}`" for r in oov[:10]) + (" …" if len(oov) > 10 else ""))
+        L.append("")
     L.append("## Half-lives in use")
     L.append("")
     L.append("| `source_kind` | half-life (days) | half-life (years) |")

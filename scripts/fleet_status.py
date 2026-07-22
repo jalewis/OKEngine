@@ -105,6 +105,21 @@ def _job_of(logpath: str) -> str:
     return re.sub(r"-\d{8}-\d{6}\.log$", "", os.path.basename(logpath))
 
 
+def _receipt_counts(data_dir: str, cutoff: float) -> dict[str, int]:
+    totals = {k: 0 for k in ("selected", "accepted", "rejected", "deferred", "undisposed")}
+    pattern = os.path.join(data_dir, "cron-plus", "receipts", "*", "*.json")
+    for path in glob.glob(pattern):  # glob-ok: fixed cron-plus receipt layout, not a wiki namespace
+        try:
+            if os.path.getmtime(path) < cutoff:
+                continue
+            counts = json.load(open(path, encoding="utf-8")).get("counts") or {}
+            for key in totals:
+                totals[key] += int(counts.get(key) or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return totals
+
+
 def build_report(data_dir: str = "/opt/data", window_h: float = 24.0) -> tuple[str, int]:
     """-> (report_text, exit_code). exit_code is 1 when a CRITICAL signal fired."""
     jobs = _load_jobs(data_dir)
@@ -176,6 +191,11 @@ def build_report(data_dir: str = "/opt/data", window_h: float = 24.0) -> tuple[s
     L.append(f"Last {int(window_h)}h: {len(latest)} lanes ran  ·  "
              f"{counts['ok']} ok  ·  {counts['silent']} silent(no-agent)  ·  "
              f"{counts['incomplete']} incomplete")
+    receipts = _receipt_counts(data_dir, _now() - window_h * 3600)
+    if receipts["selected"]:
+        L.append("Verified model items: " + "  ·  ".join(
+            f"{receipts[key]} {key}" for key in
+            ("selected", "accepted", "rejected", "deferred", "undisposed")))
     if incomplete:
         L.append("  incomplete (no completion logged — timeout / crash / still-running):")
         for name in incomplete[:12]:

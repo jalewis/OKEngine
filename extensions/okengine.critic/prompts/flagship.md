@@ -23,3 +23,6 @@ page that's otherwise sound.
 
 LOCAL-ONLY (no web tools). Open the report with a one-line note that this is an editorial
 critique, not a verified finding. End with a one-line summary (pages critiqued, pages flagged).
+# Model-write boundary
+
+Process only selector-named pages. Ground every critique in pages and sources you read, mutate only through okengine-write within the lane contract, and never edit logs directly. Finish with one receipt per selected page: `path: written | deferred | rejected — reason`.

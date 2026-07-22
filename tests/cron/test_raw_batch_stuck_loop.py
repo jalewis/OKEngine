@@ -1,9 +1,8 @@
-"""Regression: select_raw_batch must stop re-offering a raw file that never becomes processed.
+"""Regression: rejected raw files remain visible and retryable until accepted.
 
 A DUPLICATE raw file (its story already has a source under another slug) never gets its own source,
-so it stayed "unprocessed" and — being newest — was re-offered in every batch: the raw-backfill lane
-looped on the same duplicates forever instead of draining. The offer-count manifest now skips a file
-after STUCK_AFTER fruitless offers so the selector advances.
+Duplicates are resolved by appending their raw key to an accepted canonical source. Offer count alone
+must never claim completion because that hid rejected/empty compilations.
 """
 import contextlib
 import importlib.util
@@ -37,7 +36,7 @@ def _run(m):
     return buf.getvalue()
 
 
-def test_duplicate_stops_being_offered_after_stuck_after(tmp_path):
+def test_rejected_item_remains_retryable_after_stuck_after(tmp_path):
     (tmp_path / "raw" / "2026").mkdir(parents=True)
     (tmp_path / "raw" / "2026" / "dup.md").write_text("a duplicate story", encoding="utf-8")
     (tmp_path / "wiki" / "sources").mkdir(parents=True)   # NO source references dup -> always unprocessed
@@ -48,11 +47,10 @@ def test_duplicate_stops_being_offered_after_stuck_after(tmp_path):
         out = _run(m)
         assert "raw/2026/dup.md" in out, f"run {i + 1} should still offer the file"
 
-    # ...then it's skipped as stuck and the lane reports caught-up instead of looping forever
+    # ...and remains visible/retryable rather than being falsely marked complete.
     out = _run(m)
-    assert "raw/2026/dup.md" not in out
-    assert "Backfill complete" in out
-    assert "skipped" in out.lower()
+    assert "raw/2026/dup.md" in out
+    assert "Retryable" in out
 
 
 def test_processed_file_is_pruned_and_never_stuck(tmp_path):
@@ -64,6 +62,8 @@ def test_processed_file_is_pruned_and_never_stuck(tmp_path):
     _run(m)                                            # offer it once (count -> 1)
     # simulate the agent ingesting it: a source now carries its raw: path
     (src / "real-story.md").write_text(
-        "---\ntype: source\nraw: raw/2026/real.md\n---\n", encoding="utf-8")
+        "---\ntype: source\nraw: raw/2026/real.md\npublisher: Example\n"
+        "published: 2026-01-01\n---\n\n# Real\n\n" + "Accepted source content. " * 6,
+        encoding="utf-8")
     out = _run(m)
     assert "real.md" not in out                        # now processed, not offered

@@ -28,19 +28,39 @@ _FM = re.compile(r"\A---\s*\n(.*?)\n---", re.S)
 BATCH_SIZE = int(os.environ.get("POSITIONING_BATCH_SIZE", "5"))
 
 
-def _card_updated(competitor: str, segment: str) -> "str | None":
+def _card_meta(competitor: str, segment: str) -> "tuple[str | None, float | None]":
+    """(card `updated` date, card file mtime) for an existing card — (None, None) if no card yet.
+    The mtime gives intra-day granularity the date string lacks (#326 [16])."""
     p = CARDS_DIR / f"positioning-{segment}-{competitor}.md"
     if not p.is_file():
-        return None
+        return None, None
+    mtime = p.stat().st_mtime
     m = _FM.match(p.read_text(errors="replace"))
     if not m:
-        return None
+        return None, mtime
     try:
         import yaml
         fm = yaml.safe_load(m.group(1)) or {}
     except Exception:
-        return None
-    return fm.get("updated") or fm.get("last_updated")
+        return None, mtime
+    return (fm.get("updated") or fm.get("last_updated")), mtime
+
+
+def _is_stale(comp: dict, competitor: str, segment: str) -> bool:
+    """A card is stale when no card exists, the competitor's `updated` date is strictly newer, OR —
+    on the SAME date — the competitor page file was modified after the card was written. The old
+    date-only string compare missed a same-day competitor edit made after the card (#326 [16]); the
+    mtime tiebreak mirrors the messaging-synthesis sibling's fix (invariant-audit #18)."""
+    card_updated, card_mtime = _card_meta(competitor, segment)
+    if card_updated is None:
+        return True
+    comp_updated = str(comp["updated"])
+    if comp_updated > str(card_updated):
+        return True
+    if comp_updated == str(card_updated) and card_mtime is not None:
+        comp_path = comp.get("path")
+        return bool(comp_path and os.path.getmtime(comp_path) > card_mtime)
+    return False
 
 
 def main() -> int:
@@ -65,8 +85,7 @@ def main() -> int:
             comp = page_summary(comp_slug)
             if not comp.get("found") or not comp.get("updated"):
                 continue
-            card_updated = _card_updated(comp_slug.split("/")[-1], seg_key)
-            if card_updated is None or str(comp["updated"]) > str(card_updated):
+            if _is_stale(comp, comp_slug.split("/")[-1], seg_key):
                 stale.append((seg_key, comp_slug, comp))
 
     if not stale:

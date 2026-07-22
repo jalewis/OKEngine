@@ -7,6 +7,8 @@ Output is deterministic — same vault state → same selection → idempotent r
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import re
 import sys
 import unicodedata
@@ -91,6 +93,12 @@ _YEAR_INDEX = _load_year_index()
 # offering it and the selector advances. A file that later gets a source drops out (pruned below).
 OFFER_MANIFEST = VAULT / "raw" / ".batch-offered.json"
 STUCK_AFTER = int(os.environ.get("RAW_STUCK_AFTER", "4"))
+ACCEPT_MIN_CHARS = int(os.environ.get("RAW_ACCEPT_MIN_CHARS", "80"))
+MAX_CONTEXT_BYTES = int(os.environ.get("RAW_MAX_CONTEXT_BYTES", "200000"))
+SELECTION_MANIFEST = Path(os.environ.get(
+    "OKENGINE_SELECTION_MANIFEST", str(VAULT / "raw" / ".selection.json")))
+ACCEPT_REQUIRED_FIELDS = tuple(x.strip() for x in os.environ.get(
+    "RAW_ACCEPT_REQUIRED_FIELDS", "type,raw,publisher,published").split(",") if x.strip())
 
 
 def _load_offered() -> dict[str, int]:
@@ -122,6 +130,12 @@ def extract_processed_paths(text: str) -> set[str]:
     except yaml.YAMLError:
         return set()
     if not isinstance(data, dict):
+        return set()
+    body = text[m.end():]
+    meaningful = len("".join(body.split()))
+    if data.get("type") != "source" or meaningful < ACCEPT_MIN_CHARS:
+        return set()
+    if any(data.get(key) in (None, "", [], {}) for key in ACCEPT_REQUIRED_FIELDS):
         return set()
     raw = data.get("raw")
     if isinstance(raw, str):
@@ -264,12 +278,12 @@ def main() -> int:
     ]
     deferred_older = len(unprocessed_all) - len(unprocessed)
 
-    # Break the duplicate-loop: a file offered STUCK_AFTER times without ever getting a source is a
-    # duplicate / low-signal item the agent won't ingest — stop offering it so the batch advances to
-    # fresh files. Prune the manifest of anything that DID get a source (it succeeded).
+    # Offer counts are visibility, never completion. Invalid/empty compiled pages and rejected writes
+    # remain retryable regardless of how many times they were offered.
     offered = {k: v for k, v in _load_offered().items() if k not in processed}
-    stuck = [t for t in unprocessed if offered.get(normalize_path(t[0]), 0) >= STUCK_AFTER]
-    unprocessed_live = [t for t in unprocessed if offered.get(normalize_path(t[0]), 0) < STUCK_AFTER]
+    repeatedly_rejected = [t for t in unprocessed
+                           if offered.get(normalize_path(t[0]), 0) >= STUCK_AFTER]
+    unprocessed_live = unprocessed
 
     def _emit_bogus_warning() -> None:
         if not bogus_paths:
@@ -287,10 +301,6 @@ def main() -> int:
         print(f"# Raw-backfill batch — {datetime.now(timezone.utc).isoformat()}\n")
         _emit_bogus_warning()
         msg = f"# Backfill complete\n\n0 ingestable files remaining at MIN_YEAR={MIN_YEAR} ({len(all_raw)} total in raw/, all priority files indexed in wiki/sources/)."
-        if stuck:
-            msg += (f"\n\n{len(stuck)} file(s) were offered {STUCK_AFTER}x without producing a source "
-                    "(duplicate of an existing story, or low-signal) and are now skipped — this is why "
-                    "the count stopped dropping, not a stall.")
         if deferred_older:
             msg += f"\n\n{deferred_older} pre-{MIN_YEAR} files are deferred — lower MIN_YEAR env var to ingest them."
         msg += "\n\nAction: run `hermes cron pause raw-backfill` and append a final log entry to $WIKI_PATH/wiki/log.md."
@@ -316,9 +326,9 @@ def main() -> int:
     print(f"**Total raw files:** {len(all_raw)}")
     print(f"**Already processed:** {len(processed)}")
     print(f"**Unprocessed (in scope, year>={MIN_YEAR}):** {len(unprocessed)}")
-    if stuck:
-        print(f"**Skipped (offered {STUCK_AFTER}x, no source — duplicate/low-signal):** {len(stuck)}")
-        print(f"**Ingestable this cycle:** {len(unprocessed_live)}")
+    if repeatedly_rejected:
+        print(f"**Retryable (offered >={STUCK_AFTER}x without an accepted source):** "
+              f"{len(repeatedly_rejected)} — still selected; inspect receipt rejection codes")
     if deferred_older:
         print(f"**Unprocessed (deferred, year<{MIN_YEAR}):** {deferred_older}")
     remaining = len(unprocessed_live) - len(chosen)
@@ -363,9 +373,32 @@ def main() -> int:
           "create a second page — instead APPEND this raw path to that existing source's `raw:` list "
           "(via `mcp_okengine_write_update_entity`). That records it as processed so it stops being "
           "re-queued; leaving it unmarked is what made the lane loop on duplicates.\n")
+    selected_keys = [rel for rel, _, _ in chosen]
+    lane_id = os.environ.get("OKENGINE_LANE_ID", "")
+    contract_digest = os.environ.get("OKENGINE_CONTRACT_DIGEST", "")
+    manifest = {"api": 1, "selected": selected_keys,
+                "input_digest": "sha256:" + hashlib.sha256(
+                    json.dumps(selected_keys, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest(),
+                "lane_id": lane_id, "contract_digest": contract_digest}
+    try:
+        SELECTION_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+        temp = SELECTION_MANIFEST.with_suffix(SELECTION_MANIFEST.suffix + ".tmp")
+        temp.write_text(json.dumps(manifest, indent=2) + "\n")
+        temp.replace(SELECTION_MANIFEST)
+    except OSError as exc:
+        print(f"ERROR: cannot write selection manifest {SELECTION_MANIFEST}: {exc}", file=sys.stderr)
+        return 1
+    print("## Verified receipt identity\n")
+    print(f"- `lane_id`: `{lane_id}`")
+    print(f"- `contract_digest`: `{contract_digest}`")
+    print(f"- `input_digest`: `{manifest['input_digest']}`")
+    print("Use these exact runner-owned values in the final `okengine-receipt` JSON block.\n")
     for i, (rel, year, mtime) in enumerate(chosen, 1):
         mtime_iso = datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
-        print(f"{i}. `{rel}` — derived_year={year}, mtime={mtime_iso}")
+        size = (VAULT / rel).stat().st_size
+        limit = (f", extraction=partial(first {MAX_CONTEXT_BYTES} bytes of {size}; receipt must "
+                 "declare deferred remainder)" if size > MAX_CONTEXT_BYTES else ", extraction=complete")
+        print(f"{i}. `{rel}` — derived_year={year}, mtime={mtime_iso}, bytes={size}{limit}")
     print()
 
     print("## After this batch\n")

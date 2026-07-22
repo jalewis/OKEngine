@@ -177,6 +177,27 @@ def _scan(vault: Path) -> IdIndex:
     if not wiki.is_dir():
         return idx
     base = wiki.resolve()
+    # Sub-domain containers (walk-up multipack #173): dirs UNDER wiki carrying their OWN schema.yaml.
+    # A page at <sub>/entities/x lives in namespace 'entities', not '<sub>', so its identity must be
+    # indexed for the create-time dedup — a root-only gate let duplicate canonicals slip into every
+    # co-installed vault (invariant-audit #351). A flat vault has no containers, so _leaf_ns == the
+    # first segment, identical to the old rel.split('/')[0] gate.
+    containers: set[str] = set()
+    for sp in wiki.rglob("schema.yaml"):
+        try:
+            d = sp.parent.resolve().relative_to(base).as_posix()
+        except (ValueError, OSError):
+            continue
+        if d and d != ".":
+            containers.add(d)
+
+    def _leaf_ns(rel: str) -> str:
+        parts = rel.split("/")
+        i = 0
+        while i < len(parts) - 1 and "/".join(parts[: i + 1]) in containers:
+            i += 1
+        return parts[i]
+
     for p in sorted(wiki.rglob("*.md")):
         if _skip(p):
             continue
@@ -190,7 +211,9 @@ def _scan(vault: Path) -> IdIndex:
             continue
         # Name/alias identity for entities/ dedup (okengine#324) — indexed for LIVE entity pages even
         # WITHOUT an id (the dedup must catch their duplicates), so this runs BEFORE the id skip below.
-        if rel.split("/", 1)[0] == "entities" and \
+        # Sub-domain-aware: a walk-up page <sub>/entities/x is namespace 'entities' too. The rel (with
+        # its sub-domain prefix) is stored, so write_server scopes dedup to the SAME sub-domain.
+        if _leaf_ns(rel) == "entities" and \
                 str(fm.get("status") or "").strip().lower() != "tombstoned":
             idx._add_identity(rel, fm)
         pid = fm.get("id")

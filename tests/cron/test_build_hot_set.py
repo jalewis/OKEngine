@@ -120,3 +120,23 @@ def test_select_open_without_due_filter_unchanged(tmp_path):
     rows = m._select_open({"namespace": "predictions", "status_field": "status",
                            "open_values": ["open"]})
     assert {p.stem for p, _ in rows} == {"a"}   # no due_within_days -> all open (backward-compatible)
+
+
+def test_unrecognized_section_kind_is_surfaced(tmp_path, capsys):  # okengine#326 [19]
+    """A hot_set section whose `kind` isn't recent/open was SILENTLY DROPPED — the section vanished
+    from HOT.md with no signal. Now it fails loud on the cron's stderr; the run still completes
+    (best-effort HOT.md), so a typo'd or future kind is visible, not invisible."""
+    (tmp_path / "wiki" / "sources").mkdir(parents=True)
+    (tmp_path / "schema.yaml").write_text(
+        "hot_set:\n"
+        "  days: 30\n"
+        "  sections:\n"
+        "    - {kind: bogus, namespace: sources, title: Broken}\n"
+        "    - {kind: recent, namespace: sources, date_field: published, title: Recent}\n",
+        encoding="utf-8")
+    m = _load(tmp_path)
+    assert m.main() == 0                                  # best-effort: the run still completes
+    err = capsys.readouterr().err
+    assert "unrecognized kind" in err and "bogus" in err, err
+    # the valid section still rendered (HOT.md written)
+    assert (tmp_path / "wiki" / "HOT.md").is_file()

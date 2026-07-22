@@ -48,3 +48,16 @@ def test_malformed_spec_warns_and_never_defers(monkeypatch, capsys):  # invarian
     # a VALID spec still parses and defers (no spurious warning)
     monkeypatch.setenv("CRON_DEFER_UTC_HOURS", "1-4,6-10")
     assert offpeak.offpeak_defer(datetime(2026, 7, 1, 2, tzinfo=timezone.utc)) is True
+
+
+def test_degenerate_equal_range_never_defers(monkeypatch, capsys):  # invariant-audit #351
+    """`9-9` (a==b) is EMPTY in in_defer_window (neither the a<b nor a>b branch fires), so a spec of
+    ONLY '9-9' would validate yet silently never defer — the silently-never-defers class this guard
+    exists to catch. _spec_has_valid_window must reject it so offpeak_defer warns and defers nothing."""
+    assert offpeak._spec_has_valid_window("9-9") is False
+    monkeypatch.setenv("CRON_DEFER_UTC_HOURS", "9-9")
+    for h in range(24):
+        assert offpeak.offpeak_defer(datetime(2026, 7, 1, h, tzinfo=timezone.utc)) is False, h
+    assert "no valid" in capsys.readouterr().err
+    # a MIX of a degenerate part + a real window still honors the real part (no false warning)
+    assert offpeak._spec_has_valid_window("9-9,1-4") is True

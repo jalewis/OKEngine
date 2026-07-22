@@ -1,6 +1,8 @@
 {
   "schedule": {"kind": "cron", "expr": "30 7 * * 1"},
   "prompt_file": "prompts/frontier-brief.md",
+  "output_contract": {"api": 1, "allowed_namespaces": ["frontier"], "allowed_types": ["report"], "operations": ["create", "update", "converge"], "required_fields": ["type"], "required_relationships": [], "body": {"required": true, "min_non_whitespace": 100}, "unknown_fields": "reject", "unresolved_links": "review", "placeholder_links": "reject", "completion": "run"},
+  "adversarial_fixtures": ["tests/extensions/test_model_output_contracts.py"],
   "toolsets": ["hermes-cron", "okengine-write", "okengine"],
   "tier": "deliver"
 }

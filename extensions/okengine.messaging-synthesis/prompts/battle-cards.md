@@ -32,8 +32,7 @@ vs <product> — <segment>", published: <date>, updated: <date>`. Body:
 <1-2 objections a buyer would raise citing the competitor, and a grounded response>
 ```
 
-Append a `wiki/log.md` entry per card: `## [YYYY-MM-DD HH:MM UTC] positioning-battle-cards |
-<competitor> / <segment>`.
+Use the okengine MCP write path for every mutation. It records successful writes automatically.
+# Model-write boundary
 
-DO NOT use file_write/terminal/file_read to create the page — the okengine MCP write path is the
-enforced contract; file_write is for the wiki/log.md lines only.
+Process only selector-named items. Ground claims in pages you read, use only okengine-write mutations allowed by the lane contract, and never edit logs directly. Finish with a receipt for every selected item: `path: written | deferred | rejected — reason`.

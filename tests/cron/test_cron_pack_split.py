@@ -53,6 +53,31 @@ def test_every_live_job_classified_exactly_once():
     assert not unclassified, f"unmarked jobs missing from cron-tiers.yaml: {unclassified}"
 
 
+def test_tracked_engine_crons_all_classified():  # invariant-audit #351
+    """Every job in the TRACKED source config/engine-crons.json must be classified in cron-tiers.yaml
+    (engine / engine-template). test_every_live_job_classified_exactly_once reads the GITIGNORED
+    generated cron-plus-jobs.json and pytest.skips on a fresh clone / CI, so an engine cron added to
+    engine-crons.json without a cron-tiers.yaml classification shipped UNCAUGHT until a deploy hit the
+    fail-loud SystemExit in split(). This runs UNCONDITIONALLY against tracked source, closing the CI
+    blindspot."""
+    m = _mod()
+    engine = json.loads(m.ENGINE_CRONS_FILE.read_text())
+    tier_of = m._tier_map(m.TIERS)
+    names = [j["name"] for j in engine]
+    assert len(names) == len(set(names)), f"duplicate names in engine-crons.json: {names}"
+    unclassified = [j["name"] for j in engine
+                    if not j.get("extension") and not j.get("pack") and j["name"] not in tier_of]
+    assert not unclassified, (
+        f"engine-crons.json job(s) with no cron-tiers.yaml classification: {unclassified} — "
+        f"add each under config/cron-tiers.yaml engine:/engine-template:")
+
+
+def test_tracked_model_writers_declare_contract_or_legacy_exemption():
+    m = _mod()
+    jobs = json.loads(m.ENGINE_CRONS_FILE.read_text())
+    assert m.validate_output_contracts(jobs, require_declared=True) == []
+
+
 def test_round_trip_is_lossless():
     m = _mod()
     jobs = _live_jobs(m)
@@ -191,8 +216,9 @@ def test_dump_from_live_round_trips_through_sources(tmp_path):
     livefile.write_text(__import__("json").dumps(live))
     m.dump_from_live(str(livefile))
     out = m._load_jobs(m.JOBS)
+    generated_expected = json.loads(m._dump_jobs(jobs))["jobs"]
     ne = lambda js: [j for j in js if not j.get("extension")]   # see test_regen (#141/#143)
-    assert m._canon(ne(out)) == m._canon(ne(jobs)), "dump->regen lost or mutated jobs"
+    assert m._canon(ne(out)) == m._canon(ne(generated_expected)), "dump->regen lost or mutated jobs"
     assert all(not (set(j) & m.RUNTIME_FIELDS) for j in out), "runtime fields leaked"
 
 
@@ -215,6 +241,75 @@ def test_engine_template_opt_in_skips_unprompted():
     assert next(j for j in merged if j["name"] == "tmpl-a")["prompt"] == "do A"
     # back-compat: no tier_of ships every engine cron
     assert len(m.merge(engine, [], prompts)) == 3
+
+
+def test_engine_template_object_prompt_composes_output_contract():
+    m = _mod()
+    base = {
+        "api": 1, "allowed_namespaces": ["sources", "entities"],
+        "allowed_types": ["source", "entity"], "operations": ["create", "update"],
+        "required_fields": ["type"], "required_relationships": [],
+        "body": {"required": False, "min_non_whitespace": 0},
+        "unknown_fields": "review", "unresolved_links": "review",
+        "placeholder_links": "reject", "completion": "run",
+    }
+    policy = {
+        **base, "allowed_namespaces": ["sources"], "allowed_types": ["source"],
+        "operations": ["create"], "required_fields": ["type", "raw"],
+        "body": {"required": True, "min_non_whitespace": 80},
+        "unknown_fields": "reject", "completion": "per-selected-item",
+    }
+    jobs = m.merge(
+        [{"name": "raw-backfill", "output_contract": base}], [],
+        {"raw-backfill": {"prompt": "compile sources", "output_contract": policy}},
+        tier_of={"raw-backfill": "engine-template"},
+    )
+    assert jobs[0]["prompt"] == "compile sources"
+    assert jobs[0]["output_contract"]["allowed_types"] == ["source"]
+    assert jobs[0]["output_contract"]["body"]["min_non_whitespace"] == 80
+
+
+def test_model_writer_contract_inventory_gate():
+    m = _mod()
+    jobs = [{"name": "unsafe", "enabled_toolsets": ["okengine-write"]},
+            {"name": "legacy", "enabled_toolsets": ["okengine-write"],
+             "output_contract_exempt": "migration pending"},
+            {"name": "script", "no_agent": True, "enabled_toolsets": ["okengine-write"]}]
+    assert m.validate_output_contracts(jobs, require_declared=True) == [
+        "job 'unsafe' is model-writing but has no output_contract or explicit exemption"
+    ]
+
+
+def test_generated_job_has_stable_lane_id_and_contract_digest():
+    m = _mod()
+    contract = {
+        "api": 1, "allowed_namespaces": ["sources"], "allowed_types": ["source"],
+        "operations": ["create"], "required_fields": ["raw"],
+        "required_relationships": [], "body": {"required": True, "min_non_whitespace": 80},
+        "unknown_fields": "reject", "unresolved_links": "reject",
+        "placeholder_links": "reject", "completion": "per-selected-item",
+    }
+    first = json.loads(m._dump_jobs([{"name": "compile", "output_contract": contract}]))["jobs"][0]
+    second = json.loads(m._dump_jobs([{"name": "compile", "output_contract": contract}]))["jobs"][0]
+    assert first["id"] == second["id"]
+    assert first["output_contract_digest"] == m.output_contract.digest(contract)
+    assert first["env"]["OKENGINE_LANE_ID"] == first["id"]
+    assert first["env"]["OKENGINE_CONTRACT_DIGEST"] == first["output_contract_digest"]
+
+
+def test_contracted_model_writer_is_lane_bound_not_generic_admin():
+    m = _mod()
+    contract = {
+        "api": 1, "allowed_namespaces": ["sources"], "allowed_types": ["source"],
+        "operations": ["create"], "required_fields": ["raw"],
+        "required_relationships": [], "body": {"required": True, "min_non_whitespace": 80},
+        "unknown_fields": "reject", "unresolved_links": "reject",
+        "placeholder_links": "reject", "completion": "per-selected-item",
+    }
+    jobs = m.merge([{"name": "raw-backfill", "output_contract": contract,
+                     "enabled_toolsets": ["file", "okengine-write", "okengine"]}], [], {})
+    assert jobs[0]["enabled_toolsets"] == ["file", "okengine-write-raw-backfill", "okengine"]
+    assert "okengine-write" not in jobs[0]["enabled_toolsets"]
 
 
 def test_round_trip_preserves_extension_jobs_synthetic():
@@ -256,6 +351,30 @@ def test_validate_ordering_topo_cycle_missing_self():
     assert any("no such job" in e for e in e_miss), e_miss
     _, e_self = m.validate_ordering([{"name": "a", "after": ["a"]}])
     assert any("itself" in e for e in e_self), e_self
+
+
+def test_validate_ordering_gates_deployed_enabled_shape():  # invariant-audit #351
+    """validate_ordering must gate the DEPLOYED (enabled) shape. A disabled `enabled:false`
+    placeholder never reaches jobs.json (_dump_jobs drops it), so an ENABLED lane whose after: names
+    a disabled job is a DANGLING dependency in the shipped artifact — fail loud here, not deploy it.
+    Before the fix, ordering validated the full pre-filter set (disabled target counted as present)
+    while _dump_jobs dropped it — a real gate hole."""
+    m = _mod()
+    _, errs = m.validate_ordering(
+        [{"name": "consumer", "after": ["producer"]},
+         {"name": "producer", "enabled": False, "schedule": {}}])
+    assert any("no such job" in e for e in errs), errs
+    # both enabled -> the same edge is sound
+    assert m.validate_ordering(
+        [{"name": "consumer", "after": ["producer"]}, {"name": "producer"}])[1] == []
+
+
+def test_validate_ordering_non_string_after_fails_loud():  # invariant-audit #351
+    """A non-string after: entry is a malformed dependency edge; dropping it silently (the old bare
+    `continue`) vanished an intended ordering constraint with every gate green. Fail loud."""
+    m = _mod()
+    _, errs = m.validate_ordering([{"name": "a", "after": [123]}])
+    assert any("non-string after" in e for e in errs), errs
 
 
 def test_missing_lane_scripts_catches_unstaged(tmp_path):

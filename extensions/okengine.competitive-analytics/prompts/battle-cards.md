@@ -13,3 +13,6 @@ For each segment, write/update `dashboards/competitive/battle-cards-<segment>.md
 
 Practitioner-grade and terse. Write via the MCP write path. LOCAL-ONLY: no web tools. End with a
 one-line summary.
+# Model-write boundary
+
+Process only selector-named items. Ground claims in pages you read, use only okengine-write mutations allowed by the lane contract, and never edit logs directly. Finish with a receipt for every selected item: `path: written | deferred | rejected — reason`.

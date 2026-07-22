@@ -45,6 +45,9 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from selection_manifest import write_selection_manifest  # noqa: E402
+
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 BATCH_SIZE = int(os.environ.get("BWD_BATCH_SIZE", "10"))
 MIN_INBOUND = int(os.environ.get("BWD_MIN_INBOUND", "3"))
@@ -228,6 +231,12 @@ def main() -> int:
     print()
 
     batch = high_impact[:BATCH_SIZE]
+    manifest = None
+    if batch:
+        manifest = write_selection_manifest(
+            [target for target, _ in batch],
+            Path(os.environ.get("HERMES_HOME", "/opt/data")) / "cron-plus" / "selections" / "broken-wikilinks-drain.json",
+        )
     print(f"=== batch ({len(batch)} of {total_high_impact}, max {BATCH_SIZE} per run) ===")
     print("Process IN ORDER. For each target: inspect 2-3 inbound source pages")
     print("to understand context, then classify (create-stub / rewrite-link / defer).")
@@ -255,6 +264,9 @@ def main() -> int:
         print(f"=== long-tail: {total_broken - total_high_impact} broken targets with <{MIN_INBOUND} inbound sources ===")
         print("(deferred for future passes once high-impact queue drains)")
         print()
+
+    if manifest:
+        print(f"selection input_digest: {manifest['input_digest']}")
 
     wake = bool(batch)
     print(json.dumps({"wakeAgent": wake}))

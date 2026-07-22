@@ -36,6 +36,12 @@ vault repo). Layout:
 
 Plus `wiki/` (the content the engine compiles + maintains) alongside.
 
+The scaffold's `engine-template-prompts.json` also demonstrates executable model-output
+contracts. Preserve its staged boundary: raw ingestion writes complete `source` pages only and
+returns selector-bound receipts; downstream entity synthesis consumes accepted sources and cites
+resolving provenance. Do not combine these into a same-run raw→entity prompt. Narrow a contract
+for domain requirements or add another contracted lane instead of widening raw ingestion.
+
 **`schema.yaml`** is the heart — three blocks the engine reads (never hardcodes):
 - `types:` — the domain's page types + required fields. The universal OKF core
   (`source`/`concept`/`prediction`/`finding`/`dashboard`/`briefing`/`trend` + the core

@@ -14,7 +14,7 @@ documents what is pinned, where, and how to bump each dependency safely.
 | **MCP Python deps** | `okengine-mcp/requirements.txt` | `==` pins (`mcp`, `PyYAML`, `uvicorn`) | exact versions |
 | **Reader Python deps** | `okengine-reader/requirements.txt` | `==` pins | exact versions |
 | **Hermes-Agent** runtime | `engine-manifest.yaml` → `runtime.pinned_sha` | tag `v2026.7.7.2` → commit `9de9c25…9596` | `build-engine-image.sh` verifies the clone matches |
-| **cron-plus** plugin (required runtime scheduler) | `engine-manifest.yaml` → `dependencies.cron-plus`, `INSTALL.md` §4 | commit `ee6d9f18…e676a6` (untagged) | operator clones + `git checkout` the pin |
+| **cron-plus** plugin (required runtime scheduler) | `engine-manifest.yaml` → `dependencies.cron-plus`, `INSTALL.md` §4 | commit `bdb6cf5f…c836d` (untagged) | operator clones + `git checkout` the pin |
 
 apt packages are intentionally **not** version-pinned individually: the base-image
 digest pins the Debian snapshot they come from, so they're reproducible without the

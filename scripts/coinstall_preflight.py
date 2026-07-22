@@ -288,6 +288,38 @@ def check_trust(host: Path, pack: Path) -> None:
             f"reader. Raise the guest's declared exposure, or don't co-install it here.")
 
 
+def check_extension_collisions(host: Path, pack: Path, subtree: bool = False) -> None:
+    """okengine#326 [10]: a pack type/namespace that collides with an ENABLED EXTENSION's owned id
+    was INVISIBLE — every other check compares against the host ROOT schema.yaml, never the enabled
+    extensions that also contribute ids. The composed artifact records an `owners` map tagging each
+    id `engine` / `pack` / `ext:<id>`; read it and flag a pack id colliding with an `ext:*`-owned one
+    (the same collision the compose gate enforces, surfaced pre-install). Absent composed artifact or
+    no enabled extensions -> nothing to check."""
+    composed_path = host / ".okengine" / "composed-schema.yaml"
+    if not composed_path.is_file():
+        return   # no composed artifact (no enabled extensions, or not yet composed) — nothing to check
+    composed = _yaml(composed_path)
+    owners = composed.get("owners") or {}
+    ext_types = {t: o for t, o in (owners.get("types") or {}).items()
+                 if isinstance(o, str) and o.startswith("ext:")}
+    ext_ns = {ns: o for ns, o in (owners.get("namespaces") or {}).items()
+              if isinstance(o, str) and o.startswith("ext:")}
+    if not ext_types and not ext_ns:
+        return
+    psch = _yaml(pack / "schema.yaml")
+    ptypes = set(psch.get("types") or {})
+    pns = set((psch.get("partitioning") or {}).get("namespaces") or {})
+    lvl = "WARN" if subtree else "FAIL"      # subtree keeps contracts separate (walk-up) -> awareness
+    for t in sorted(ptypes & set(ext_types)):
+        add(lvl, "types", f"type '{t}' collides with an EXTENSION-owned type ({ext_types[t]}) enabled "
+            f"on the host — invisible to a root-schema-only check. "
+            + ("walk-up separates the contracts; ensure pages land on the intended side"
+               if subtree else "reconcile before install (rename the pack type or disable the extension)"))
+    for ns in sorted(pns & set(ext_ns)):
+        add(lvl, "namespaces", f"namespace 'wiki/{ns}/' collides with an EXTENSION-owned namespace "
+            f"({ext_ns[ns]}) enabled on the host — reconcile before install")
+
+
 def main(argv) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("host")
@@ -306,6 +338,7 @@ def main(argv) -> int:
     check_trust(host, pack)
     check_types(host, pack, additions, subtree=a.subtree)
     check_namespaces(host, pack, subtree=a.subtree)
+    check_extension_collisions(host, pack, subtree=a.subtree)
     check_crons(host, pack)
     check_configs(host, pack)
     check_feeds(host, pack)

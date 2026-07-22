@@ -76,7 +76,13 @@ def expand_morning_one(expr: str, brief_hour: int) -> str | None:
     m = _MORNING_RE.match((expr or "").strip())
     if not m:
         return None
-    minute = int(m.group(1) or 0) % 60
+    minute = int(m.group(1) or 0)
+    if not 0 <= minute <= 59:
+        # `_MORNING_RE` allows `\d{1,2}` (0-99), so `@morning:75` MATCHES but is out of range. Silently
+        # wrapping (75 % 60 = 15) would ship the WRONG minute; instead return None so the caller
+        # (expand_brief_jobs) trips its fail-loud "malformed @morning" guard like every other
+        # unparseable sentinel, rather than a lane firing 45 minutes off (invariant-audit #351).
+        return None
     return f"{minute} {brief_hour % 24} * * *"
 
 

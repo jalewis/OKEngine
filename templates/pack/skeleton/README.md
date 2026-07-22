@@ -35,10 +35,19 @@ Five files control what this vault becomes. Edit these (not the engine):
 | `CLAUDE.md` | the **persona + ingest/curation workflow** the cron agents follow at runtime | set the voice, the source-scoring rubric, what's worth an entity, the cross-linking rules |
 | `feeds/feeds.opml` | the **active** RSS/Atom sources (empty by default) | enable ingest — copy entries from `feeds/feeds.opml.example` |
 | `crons/domain-crons.json` | the pack's **own** cron jobs (e.g. feed-fetch, daily brief; enabled + `@jitter:*` by default) | retune cadence (keep a non-:00 minute); populate feeds.opml to activate ingest |
-| `crons/engine-template-prompts.json` | the **prompts** for the engine-driven ingest lanes (raw→source/entity/concept, scoring, classification, enrichment, prediction grading) | tune how each lane curates for your domain |
+| `crons/engine-template-prompts.json` | the **prompts + executable output contracts** for model-driven lanes | tune curation while preserving the staged source-only and grounded-entity boundaries |
 
 After editing, run `python3 validate.py` (offline) and `framework validate` (the
 engine's deeper check) before deploy.
+
+### Preserve the staged model-write boundary
+
+`raw-backfill` is deliberately source-only: it compiles one complete canonical source per
+selected raw item and emits an exact, verifiable per-item receipt. `entity-backfill` runs
+downstream and may write an entity only when it cites a source page that resolves. Keep those
+lanes separate when replacing the placeholders. Narrow contracts when your schema needs more,
+but never widen raw ingestion beyond `sources`; add a separate contracted lane for another page
+class. Defer or fail incomplete extraction rather than committing an empty canonical.
 
 ## Useful by default, herd-safe by design
 

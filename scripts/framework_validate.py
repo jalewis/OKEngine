@@ -394,8 +394,11 @@ def check_engine_version(pack: Path, r: Report) -> None:
         r.ok("engine.version", f"{ver} pin · engine {target} — compatible (same release series)")
     else:
         r.fail("engine.version",
-               f"pins {ver} but this engine is {target} — incompatible release series; "
-               f"re-validate against {target} and bump engine.version (or check out a matching engine)")
+               f"pins {ver} but this engine is {target} — different release series. Reconcile the pin: "
+               f"`framework upgrade <pack> --apply` (bumps engine.version + runs any migrations under a "
+               f"roll-forward gate that auto-rolls-back on failure). deploy.sh does this automatically "
+               f"before validating (step [0/6]) unless --no-upgrade; only pin back to {ver} if you truly "
+               f"need the older engine.")
     if htag and hpin and hpin != htag:
         r.warn("engine.version hermes_pin",
                f"pins {hpin} but this engine targets Hermes {htag}")
@@ -590,6 +593,15 @@ def _collect_model_refs(pack: Path, mp) -> set[str]:
 
 
 def check_crons(pack: Path, r: Report) -> None:
+    oc = None
+    try:
+        import importlib.util
+        oc_path = Path(__file__).resolve().parent / "cron" / "output_contract.py"
+        spec = importlib.util.spec_from_file_location("okengine_output_contract", oc_path)
+        oc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(oc)
+    except Exception as exc:
+        r.fail("cron output contracts", f"validator failed: {exc}")
     cdir = pack / "crons"
     if not cdir.is_dir():
         r.warn("crons/", "absent — pack contributes no cron defs")
@@ -618,10 +630,30 @@ def check_crons(pack: Path, r: Report) -> None:
                 # An engine-template lane pairs an engine wake-gate script with a
                 # pack-supplied prompt; an empty prompt = the agent wakes with no
                 # instructions, so the lane is broken.
-                empties = [k for k, v in prompts.items() if not str(v or "").strip()]
+                def _prompt_text(v):
+                    return v.get("prompt") if isinstance(v, dict) else v
+                empties = [k for k, v in prompts.items() if not str(_prompt_text(v) or "").strip()]
                 (r.fail if empties else r.ok)(
                     "crons/engine-template-prompts.json",
                     f"empty prompt(s): {empties}" if empties else f"{len(prompts)} prompt(s)")
+                try:
+                    contract_errors = []
+                    for name, value in prompts.items():
+                        if isinstance(value, dict):
+                            unknown = sorted(set(value) - {"prompt", "output_contract"})
+                            if unknown:
+                                contract_errors.append(
+                                    f"engine-template prompt {name!r} has unknown key(s): {unknown}")
+                            if "output_contract" in value:
+                                contract_errors.extend(oc.validate(
+                                    value["output_contract"],
+                                    f"engine-template prompt {name!r} output_contract"))
+                    for error in contract_errors:
+                        r.fail("cron output contract", error)
+                    if not contract_errors:
+                        r.ok("cron output contracts", "engine-template contract shapes valid")
+                except Exception as exc:
+                    r.fail("cron output contracts", f"validator failed: {exc}")
         except Exception as e:
             r.fail("crons/engine-template-prompts.json parses", f"JSON error: {str(e)[:120]}")
     # shape + script existence for domain defs
@@ -640,6 +672,21 @@ def check_crons(pack: Path, r: Report) -> None:
             problems.append("no script or prompt")
         if problems:
             r.fail(f"cron '{d.get('name')}'", " + ".join(problems))
+        if d.get("output_contract") is not None:
+            errors = (oc.validate(d["output_contract"], f"cron {d.get('name')!r} output_contract")
+                      if oc is not None else ["output-contract validator unavailable"])
+            for error in errors:
+                r.fail("cron output contract", error)
+            fixtures = d.get("adversarial_fixtures")
+            if not isinstance(fixtures, list) or not fixtures or any(
+                    not isinstance(item, str) or not item.strip() for item in fixtures):
+                r.fail("cron adversarial fixtures",
+                       f"model-writing cron {d.get('name')!r} with a contract must declare "
+                       "adversarial_fixtures")
+        elif not d.get("no_agent") and "okengine-write" in (d.get("enabled_toolsets") or []) \
+                and not d.get("output_contract_exempt"):
+            r.fail("cron output contract",
+                   f"model-writing cron {d.get('name')!r} must declare output_contract")
         scr = d.get("script") or ""
         if scr:
             base = Path(scr).name
@@ -1028,6 +1075,58 @@ def check_pack_meta(pack: Path, r: Report) -> None:
         r.warn("pack.yaml mission", "still the scaffold TODO — write the reader-facing paragraph")
 
 
+def check_owns_covers_schema(pack: Path, r: Report) -> None:
+    """Every NON-CORE type in schema.yaml `types:` and every pack-INTRODUCED partitioning namespace
+    must be declared in pack.yaml `owns:`. compose-preview builds each secondary pack's schema
+    fragment from `owns.types` / `owns.namespaces` ONLY (framework_compose_preview.analyze), so a type
+    or namespace that lives in schema.yaml but is ABSENT from owns is INVISIBLE to the fail-loud
+    co-install collision detector — two packs could silently claim the same undeclared type and the
+    safety gate would never see it. owns is the compose contract; a schema/owns divergence is the gate
+    hole this closes (invariant-audit #351). Core (engine base-schema) types/namespaces are shared and
+    owned by no pack, so re-declaring them needs no owns entry."""
+    if not (pack / "pack.yaml").is_file() or not (pack / "schema.yaml").is_file():
+        return                                   # absence is flagged by check_pack_meta / check_schema
+    try:
+        meta = _pack_meta_mod().load_pack_meta(pack)
+    except Exception:
+        return                                   # a load fault is reported by check_pack_meta
+    if meta is None or meta.get("kind") == "bundle":
+        return                                   # a bundle owns nothing BY DESIGN (#181)
+    sch = _load_yaml(pack / "schema.yaml")
+    if not isinstance(sch, dict):
+        return                                   # parse fault flagged by check_schema
+    base = _load_yaml(Path(__file__).resolve().parents[1] / "config" / "base-schema.yaml") or {}
+    base_types = set(base.get("types") or {}) if isinstance(base, dict) else set()
+    base_ns = set((base.get("partitioning") or {}).get("namespaces") or {})
+    schema_types = set(sch.get("types") or {}) if isinstance(sch.get("types"), dict) else set()
+    schema_ns = set((sch.get("partitioning") or {}).get("namespaces") or {})
+    owns_types = set(meta.get("owns_types") or [])
+    owns_ns = set(meta.get("owns_namespaces") or [])
+    # A namespace in schema.exclude is intentionally OUTSIDE this pack's OKF scope (a shared render
+    # tree like `dashboards`/`operational`, or an archive) — it is deliberately NOT owned, so it needs
+    # no owns entry and must not warn. exclude entries are paths (`wiki/operational/`); reduce to the
+    # bare namespace leaf to compare against partitioning.namespaces.
+    excluded_ns = {str(e).replace("wiki/", "").strip("/").split("/")[0]
+                   for e in (sch.get("exclude") or []) if str(e).strip()}
+    # WARN, not FAIL: an incomplete `owns` is a co-install collision BLIND SPOT, but it only bites a
+    # pack that is actually composed with a colliding pack — and compose-preview / install-domain FAIL
+    # LOUD on a real collision. A standalone pack (the common case) with `owns` narrower than its
+    # schema is harmless, and a hard FAIL here would break `framework validate` (the deploy gate AND
+    # pack-repo CI) for the whole existing fleet, which lags this convention. Surface it so authors
+    # complete owns for safe future composition, without blocking a working deploy (invariant-audit
+    # #351; severity corrected after the v0.13.1 fleet roll showed every pack tripping it).
+    for t in sorted((schema_types - base_types) - owns_types):
+        r.warn("pack.yaml owns.types",
+               f"schema.yaml declares non-core type '{t}' but it is not in owns.types — compose-preview "
+               f"builds this pack's fragment from owns, so '{t}' is invisible to the co-install "
+               f"collision gate. Add '{t}' to owns.types for safe composition (harmless standalone).")
+    for ns in sorted((schema_ns - base_ns) - owns_ns - excluded_ns):
+        r.warn("pack.yaml owns.namespaces",
+               f"schema.yaml partitions namespace '{ns}' but it is neither in owns.namespaces nor "
+               f"schema.exclude — it is invisible to the co-install collision gate. Add '{ns}' to "
+               f"owns.namespaces (own it) or schema.exclude (shared render tree).")
+
+
 def _is_bundle(pack: Path) -> bool:
     """True iff the pack declares `kind: bundle` (owns nothing; composes other packs)."""
     if not (pack / "pack.yaml").is_file():
@@ -1145,7 +1244,12 @@ def check_enabled_extensions_resolve(pack: Path, r: Report) -> None:
     except Exception as e:                       # discovery faults are reported elsewhere; don't crash
         r.warn("enabled extensions", f"could not resolve enabled set: {e}")
         return
-    problems = list(en_errors) + list(res_errors)
+    # disc_errors carries discover()'s Rule-1/Rule-2 faults (notably a cross-tier duplicate id — a
+    # HARD FAIL per the discovery spec). resolve_enabled() indexes discovered records into a dict
+    # keyed by bare id, so a duplicate is silently last-wins and yields NO res_errors — dropping
+    # disc_errors here let `framework validate` / `pull --update` report an ambiguous extension as
+    # clean (invariant-audit #351). Fold them into the fail set.
+    problems = list(en_errors) + list(res_errors) + list(disc_errors)
     if problems:
         for p in problems:
             r.fail("enabled extension", p if not p.startswith("FAIL") else p[5:].strip())
@@ -1218,7 +1322,9 @@ def check_policy_plane(pack: Path, r: Report) -> None:
     if prompt_path.is_file():
         try:
             prompts = json.loads(prompt_path.read_text(encoding="utf-8"))
-            prompt = str(prompts.get("source-quality-backfill") or "")
+            prompt_value = prompts.get("source-quality-backfill") or ""
+            prompt = str(prompt_value.get("prompt") or "") if isinstance(prompt_value, dict) \
+                else str(prompt_value)
             errors = module.check_prompt(policy, "cron:source-quality-backfill", prompt)
         except Exception as exc:
             errors = [str(exc)]
@@ -1246,6 +1352,7 @@ def validate(pack: Path, probe: bool = False) -> Report:
     check_persona(pack, r)
     check_engine_version(pack, r)
     check_pack_meta(pack, r)
+    check_owns_covers_schema(pack, r)
     check_extension_requirements(pack, r)
     check_enabled_extensions_resolve(pack, r)
     check_application_profile(pack, r)

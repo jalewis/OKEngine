@@ -10,6 +10,8 @@ Tests call the plain `_create`/`_update`/`_tombstone`/`_flag` helpers directly
 test env). The module is loaded by file path so no package install is needed.
 """
 import importlib.util
+import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -69,6 +71,107 @@ def vault(tmp_path, monkeypatch):
 def _log_text(root: Path) -> str:
     log = root / "wiki" / "log.md"
     return log.read_text(encoding="utf-8") if log.exists() else ""
+
+
+def _enable_source_contract(root: Path, monkeypatch, *, mode="enforce", operations=None):
+    contract = {
+        "api": 1, "allowed_namespaces": ["sources"], "allowed_types": ["source"],
+        "operations": operations or ["create", "update", "patch", "append", "converge"],
+        "required_fields": ["type", "raw"], "required_relationships": [],
+        "body": {"required": True, "min_non_whitespace": 40},
+        "unknown_fields": "reject", "unresolved_links": "reject",
+        "placeholder_links": "reject", "completion": "per-selected-item",
+    }
+    raw = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    digest = "sha256:" + hashlib.sha256(raw.encode()).hexdigest()
+    jobs = root / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [{"name": "raw-backfill", "output_contract": contract,
+                                          "output_contract_digest": digest}]}))
+    monkeypatch.setenv("OKENGINE_CRON_JOBS", str(jobs))
+    monkeypatch.setenv("OKENGINE_WRITE_ACTOR", "cron:raw-backfill")
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", mode)
+
+
+def test_output_contract_rejects_qilin_class_atomically(vault, monkeypatch):
+    m, root = vault
+    _enable_source_contract(root, monkeypatch)
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    target = root / "wiki" / "sources" / "2026" / "07" / "bad.md"
+    result = m._create("sources/2026/07/bad", {
+        "type": "source", "source_kind": "vendor-blog", "publisher": "Example",
+        "published": "2026-06-14",
+    }, "[Read more](#)")
+    assert "output_contract.required_field_missing" in result
+    assert "body_too_short" in result and "placeholder_link" in result
+    assert not target.exists()
+
+
+def test_contract_only_lane_does_not_require_duplicate_policy_capability(vault, monkeypatch):
+    m, root = vault
+    _enable_source_contract(root, monkeypatch)
+    monkeypatch.setattr(m, "_effective_policy", lambda: {"capabilities": {}})
+    assert m._capability_reject(root / "wiki" / "sources" / "x.md", "create",
+                                page_type="source") is None
+
+
+def test_output_contract_accepts_valid_source_and_protects_updates(vault, monkeypatch):
+    m, root = vault
+    _enable_source_contract(root, monkeypatch)
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    body = "# Complete source\n\n" + ("Grounded captured content. " * 5)
+    result = m._create("sources/2026/07/good", {
+        "type": "source", "source_kind": "vendor-blog", "publisher": "Example",
+        "published": "2026-06-14", "raw": "raw/clippings/good.md",
+    }, body)
+    assert result.startswith("created"), result
+    target = root / "wiki" / "sources" / "2026" / "07" / "good.md"
+    before = target.read_bytes()
+    result = m._update("sources/2026/07/good", {}, "[placeholder](#)")
+    assert "output_contract" in result and "placeholder_link" in result
+    assert target.read_bytes() == before
+
+
+def test_output_contract_report_mode_records_without_blocking(vault, monkeypatch):
+    m, root = vault
+    _enable_source_contract(root, monkeypatch, mode="report")
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    result = m._create("sources/2026/07/report-only", {
+        "type": "source", "source_kind": "vendor-blog", "publisher": "Example",
+        "published": "2026-06-14",
+    }, "short")
+    assert result.startswith("created"), result
+    assert "output-contract report" in _log_text(root)
+
+
+def test_output_contract_denies_tombstone_and_flag_unless_declared(vault, monkeypatch):
+    m, root = vault
+    _enable_source_contract(root, monkeypatch)
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    body = "# Complete source\n\n" + ("Grounded captured content. " * 5)
+    assert m._create("sources/2026/07/protected", {
+        "type": "source", "source_kind": "vendor-blog", "publisher": "Example",
+        "published": "2026-06-14", "raw": "raw/clippings/protected.md",
+    }, body).startswith("created")
+    target = root / "wiki" / "sources" / "2026" / "07" / "protected.md"
+    before = target.read_bytes()
+    assert "operation_not_allowed" in m._tombstone("sources/2026/07/protected", "duplicate")
+    assert "operation_not_allowed" in m._flag("sources/2026/07/protected", "inspect")
+    assert target.read_bytes() == before
+    assert not (root / "wiki" / "_review-queue.md").exists()
+
+
+def test_output_contract_allows_declared_tombstone_and_flag(vault, monkeypatch):
+    m, root = vault
+    operations = ["create", "update", "patch", "append", "converge", "tombstone", "flag"]
+    _enable_source_contract(root, monkeypatch, operations=operations)
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    body = "# Complete source\n\n" + ("Grounded captured content. " * 5)
+    assert m._create("sources/2026/07/reviewed", {
+        "type": "source", "source_kind": "vendor-blog", "publisher": "Example",
+        "published": "2026-06-14", "raw": "raw/clippings/reviewed.md",
+    }, body).startswith("created")
+    assert m._flag("sources/2026/07/reviewed", "inspect").startswith("flagged")
+    assert m._tombstone("sources/2026/07/reviewed", "duplicate").startswith("tombstoned")
 
 
 # ── degeneration guard (soft flag at the enforced write boundary) ─────────────
@@ -372,6 +475,49 @@ def test_entity_shard_normalized_to_one_level(vault):
     assert not (root / "wiki" / "entities" / "a" / "p" / "apt-test.md").exists()
 
 
+def test_frontmatter_parser_is_line_anchored_not_substring_split(tmp_path):
+    """okengine#349 root-1: the DragonForce page carried a frontmatter URL value whose query suffix
+    held repeated hyphens (`?source=rss-1535934fa2f2------2`). The old `text.split('---', 2)` mistook
+    that INLINE `---` for the closing delimiter — truncating the frontmatter and spilling `---2\n...`
+    into the body. The line-anchored `_FM` parser only treats a `---` preceded by a newline as the
+    close, so an inline `---` inside a value (or a YAML comment) can no longer terminate front matter.
+    Pins the exact fixtures #349 asks for: a URL with `---`, a YAML comment containing `---`, and a
+    body horizontal-rule `---`."""
+    m = _load()
+    page = tmp_path / "dragonforce.md"
+    page.write_text(
+        "---\n"
+        "type: entity\n"
+        "name: DragonForce\n"
+        "source_url: https://ex.test/feed?source=rss-1535934fa2f2------2\n"
+        "# a yaml comment containing --- inside it\n"
+        "origin_country: null\n"
+        "---\n"
+        "# DragonForce\n\nCurated cartel body.\n\n---\n\nMore body.\n",
+        encoding="utf-8")
+    fm, body = m._read_page(page)
+    # Frontmatter parsed in full — the inline hyphen-URL did NOT terminate it early.
+    assert fm.get("name") == "DragonForce"
+    assert str(fm.get("source_url", "")).endswith("------2")   # URL preserved verbatim
+    assert "origin_country" in fm                              # field AFTER the hyphen-URL survived
+    # Body is the real content, NOT a leaked `---2...` YAML fragment; the body's own `---` rule stays.
+    assert body.startswith("# DragonForce")
+    assert not body.lstrip().startswith("---2")
+    assert "Curated cartel body." in body
+    # A correctly-parsed hyphen-URL page must NOT be falsely refused as malformed.
+    assert m._frontmatter_error(page) is None
+
+
+def test_frontmatter_error_refuses_unparseable_existing_page(tmp_path):
+    """okengine#349: a page that starts with `---` but has no line-anchored closing delimiter cannot
+    be parsed unambiguously — the write path must REFUSE it rather than rewrite from a partial parse."""
+    m = _load()
+    bad = tmp_path / "truncated.md"
+    bad.write_text("---\ntype: entity\nname: X\nno closing delimiter here\n", encoding="utf-8")
+    err = m._frontmatter_error(bad)
+    assert err and "frontmatter" in err.lower(), err
+
+
 def test_entity_shard_preserves_resharded_two_level(vault):
     """okengine invariant-audit: once a hot first-letter leaf is resharded to two levels
     (entities/<l>/<2nd>/<slug>.md), the enforced write path must NOT collapse the resharded canonical
@@ -507,6 +653,23 @@ def test_flag_for_review(vault):
     assert "entities/vendor/acme" in qtext
     assert p.read_text() == before, "flag must not mutate the target page"
     assert "flag" in _log_text(root)
+
+
+def test_flag_for_review_replay_is_idempotent_by_page(vault):
+    """A successful flag can be replayed when receipt persistence fails (#397)."""
+    m, root = vault
+    m._create("entities/vendor/acme", "type: entity\nname: Acme", "body")
+    first = m._flag("entities/vendor/acme", "first model wording")
+    second = m._flag("entities/vendor/acme", "retry paraphrased the reason")
+
+    queue = (root / "wiki" / "_review-queue.md").read_text()
+    assert first.startswith("flagged")
+    assert second.startswith("already flagged")
+    assert queue.count("**entities/vendor/acme.md**") == 1
+    assert "first model wording" in queue
+    assert "retry paraphrased the reason" not in queue
+    assert "flag already-queued entities/vendor/acme.md" in _log_text(root)
+    assert "retry paraphrased the reason" in _log_text(root)
 
 
 # --- G2 structural permissions + G3 review FLAGS (not gates) --------------

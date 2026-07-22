@@ -38,6 +38,16 @@ def test_deploy_stages_base_schema_to_config():  # okengine#90 P2
     assert "base-schema deployed" in t                             # the staging echo is present
 
 
+def test_deploy_stages_schema_validator_reference():  # okengine#326 [15]
+    """The baked-only tools/schema_validator.py (write-guard hook + importer_guard/schema_drift_lint)
+    must be staged as a REFERENCE so deployment_validate.check_write_path_libs can compare it against
+    the baked copy and FAIL a stale image — the same drift check base-schema and the write-path libs
+    already get."""
+    t = (S / "deploy-cron-scripts.sh").read_text()
+    assert "schema_validator.py" in t                              # the validator reference is staged
+    assert "schema_validator reference deployed" in t             # the staging echo is present
+
+
 def test_deploy_jobs_targets_pack_runtime_not_host_hermes():  # #18
     t = (S / "deploy-cron-plus-jobs.sh").read_text()
     assert "/opt/data/cron-plus/jobs.json" in t
@@ -75,10 +85,16 @@ def test_install_cron_plus_targets_runtime_and_reads_pin():  # #20
     assert ".hermes-data/plugins/cron-plus" in t
     assert "pinned_sha" in t and "dependencies.cron-plus" not in t.split("\n")[0]  # reads the manifest pin
     assert "cron-plus/job-env.patch" in t and "cron-plus/after-ordering.patch" in t
+    assert "cron-plus/run-receipts.patch" in t and "run_receipts.py" in t and "model_slots.py" in t
+    assert "cron-plus/cli-null-next-run.patch" in t
     assert "after_ordering.py" in t and "apply --reverse --check" in t
     assert (REPO / "patches" / "cron-plus" / "job-env.patch").is_file()
     assert (REPO / "patches" / "cron-plus" / "after-ordering.patch").is_file()
     assert (REPO / "patches" / "cron-plus" / "after_ordering.py").is_file()
+    assert (REPO / "patches" / "cron-plus" / "run-receipts.patch").is_file()
+    assert (REPO / "patches" / "cron-plus" / "run_receipts.py").is_file()
+    assert (REPO / "patches" / "cron-plus" / "model_slots.py").is_file()
+    assert (REPO / "patches" / "cron-plus" / "cli-null-next-run.patch").is_file()
     r = subprocess.run(["bash", "-n", str(S / "install-cron-plus.sh")], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
 
@@ -161,6 +177,16 @@ def test_vault_scripts_have_no_hardcoded_operator_uid():  # invariant-audit #5/#
             f"{name} must fall back to the gateway/image default uid (10000), not a personal one"
 
 
+def test_job_deploy_recovers_root_owned_model_slot_artifacts():
+    text = (S / "deploy-cron-plus-jobs.sh").read_text()
+    assert 'HERMES_GID="$(resolve_hermes_gid "$PACK_DIR")"' in text
+    reconcile = "chown -R '$HERMES_UID:$HERMES_GID' /opt/data/cron-plus/model-slots"
+    assert reconcile in text
+    assert "chmod 700 /opt/data/cron-plus/model-slots" in text
+    assert "find /opt/data/cron-plus/model-slots -type f -exec chmod 600 {} +" in text
+    assert text.index(reconcile) < text.index('docker exec -u "$HERMES_UID" "$CONTAINER" mkdir')
+
+
 def test_install_cron_plus_force_recovers_a_dirty_managed_clone(tmp_path):  # invariant-audit redeploy trap
     """The plugin dir is an engine-MANAGED clone; a plain `git checkout` ABORTS on any local edit —
     a hand-patched jobs.py did exactly this and killed a live redeploy at step 2. install-cron-plus
@@ -211,6 +237,25 @@ def test_install_cron_plus_force_recovers_a_dirty_managed_clone(tmp_path):  # in
         "+AFTER-ORDERING-PATCHED\n"
     )
     (eng / "patches" / "cron-plus" / "after_ordering.py").write_text("# policy overlay\n")
+    (eng / "patches" / "cron-plus" / "run-receipts.patch").write_text(
+        "diff --git a/receipt-hook b/receipt-hook\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/receipt-hook\n"
+        "@@ -0,0 +1 @@\n"
+        "+RUN-RECEIPTS-PATCHED\n"
+    )
+    (eng / "patches" / "cron-plus" / "run_receipts.py").write_text("# receipt overlay\n")
+    (eng / "patches" / "cron-plus" / "model_slots.py").write_text("# model slot overlay\n")
+    (eng / "patches" / "cron-plus" / "cli-null-next-run.patch").write_text(
+        "diff --git a/cli.py b/cli.py\n"
+        "--- a/cli.py\n"
+        "+++ b/cli.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        " # cli\n"
+        " AFTER-ORDERING-PATCHED\n"
+        "+NULL-NEXT-RUN-PATCHED\n"
+    )
 
     pack = tmp_path / "pack"; dest = pack / ".hermes-data" / "plugins" / "cron-plus"
     dest.parent.mkdir(parents=True)
@@ -223,14 +268,19 @@ def test_install_cron_plus_force_recovers_a_dirty_managed_clone(tmp_path):  # in
     assert rev(dest) == new, "did not recover to the pin"
     assert (dest / "jobs.py").read_text() == "NEW-PINNED\nJOB-ENV-PATCHED\n", \
         "local edit was not discarded and replaced by the carried patch"
-    assert (dest / "cli.py").read_text() == "# cli\nAFTER-ORDERING-PATCHED\n"
+    assert (dest / "cli.py").read_text() == \
+        "# cli\nAFTER-ORDERING-PATCHED\nNULL-NEXT-RUN-PATCHED\n"
+    assert (dest / "receipt-hook").read_text() == "RUN-RECEIPTS-PATCHED\n"
     assert (dest / "after_ordering.py").read_text() == "# policy overlay\n"
     assert "discarding LOCAL" in r.stderr, "must surface the discarded change, not silently drop it"
 
     again = subprocess.run(["bash", str(eng / "scripts" / "install-cron-plus.sh"), str(pack)],
                            capture_output=True, text=True, env=genv)
     assert again.returncode == 0, again.stderr
-    assert "already applied" in again.stdout
+    assert "restored pinned cron-plus tree" in again.stdout
+    assert (dest / "jobs.py").read_text() == "NEW-PINNED\nJOB-ENV-PATCHED\n", \
+        "same-pin redeploy accumulated or lost a carried patch"
+    assert (dest / "receipt-hook").read_text() == "RUN-RECEIPTS-PATCHED\n"
 
 
 def test_cron_plus_logs_reads_container_not_host_hermes():  # invariant-audit #15

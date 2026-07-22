@@ -31,6 +31,19 @@ operations:
     schedule: {kind: cron, expr: "40 5 * * *"}   # daily 05:40
     entrypoint: select_dup_candidates.py          # wake-gate: name/alias-collision groups
     prompt_file: prompts/dedupe.md
+    output_contract:
+      api: 1
+      allowed_namespaces: ["*"]
+      allowed_types: ["*"]
+      operations: [update, patch, append, converge, tombstone]
+      required_fields: [type]
+      required_relationships: []
+      body: {required: false, min_non_whitespace: 0}
+      unknown_fields: reject
+      unresolved_links: review
+      placeholder_links: reject
+      completion: per-selected-item
+    adversarial_fixtures: [tests/extensions/test_model_output_contracts.py]
     toolsets: [file, todo, okengine-write, okengine]
     timeout: 1200
   # RENAME NOTE: this extension previously declared a single anonymous `operation:` whose

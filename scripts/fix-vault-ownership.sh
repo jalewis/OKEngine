@@ -16,6 +16,13 @@ GW="$(docker compose --project-directory "$D" ps -q gateway 2>/dev/null | head -
 UIDG="$(grep -oE '^HERMES_UID=[0-9]+' "$D/.env" 2>/dev/null | cut -d= -f2 || true)"
 [ -n "$UIDG" ] || UIDG="$(docker exec "$GW" sh -c 'printf %s "${HERMES_UID:-10000}"' 2>/dev/null || true)"
 UIDG="${UIDG:-10000}"
+# Vault gid: resolve it SEPARATELY — a gateway whose gid != uid (a pack pinning HERMES_GID to a shared
+# group) was half-chowned to the WRONG group when we reused the uid as the group (invariant-audit B8).
+# Mirror the uid resolution exactly: the .env HERMES_GID pin, else the gateway's own HERMES_GID (the
+# running truth), else fall back to the uid (an unpinned deployment keeps the old uid==gid behaviour).
+GIDG="$(grep -oE '^HERMES_GID=[0-9]+' "$D/.env" 2>/dev/null | cut -d= -f2 || true)"
+[ -n "$GIDG" ] || GIDG="$(docker exec "$GW" sh -c 'printf %s "${HERMES_GID:-}"' 2>/dev/null || true)"
+GIDG="${GIDG:-$UIDG}"
 # No -type f: chown foreign-owned DIRECTORIES too (invariant-audit #8). A root-owned dir (from a bare
 # root docker exec) is unwritable by the lane uid, so the atomic-write pattern (tmp + os.replace) can't
 # create pages in it — yet a files-only repair left the dir root-owned and deployment_validate went
@@ -26,5 +33,5 @@ docker exec "$GW" sh -c "
   if [ \"\$N\" = 0 ]; then echo 'ownership clean'; exit 0; fi
   echo \"\$N stray path(s):\"; head -10 /tmp/.strays
   if [ '$DRY' = '--dry-run' ]; then echo '(dry run — not fixing)'; exit 0; fi
-  xargs -r chown $UIDG:$UIDG < /tmp/.strays
-  echo \"chowned \$N path(s) to $UIDG:$UIDG\""
+  xargs -r chown $UIDG:$GIDG < /tmp/.strays
+  echo \"chowned \$N path(s) to $UIDG:$GIDG\""

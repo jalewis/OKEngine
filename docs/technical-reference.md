@@ -205,7 +205,7 @@ small set of carried patches, and overlays its own code. The discipline:
 - Engine changes are **additions** (overlay files) or **carried patches**
   (`patches/*.patch` + `patches/apply.sh`) — never in-place edits of upstream
   files outside the patch set.
-- The patch set is kept minimal and each patch has one job. Currently 7:
+- The patch set is kept minimal and each patch has one job. Currently 11:
 
 | Patch | What it guards |
 |---|---|
@@ -216,6 +216,11 @@ small set of carried patches, and overlays its own code. The discipline:
 | `05-delegate-tool-session-end` | fixes delegate-tool session teardown |
 | `06-cron-per-job-ollama-num-ctx` | per-cron-job context-length override for Ollama-style endpoints |
 | `07-api-server-inference-model` | pins the interactive API-server agent's model independently of the bulk default |
+| `08-web-backend-rotation` | rotates available web-search providers when explicitly configured |
+| `09-cron-scoped-mcp-init` | initializes only the MCP servers authorized for the active cron lane |
+| `10-read-only-file-toolset` | exposes file reads without native file mutation tools |
+| `11-http-status-retry-policy` | enforces opt-in per-status attempt and fallback contracts for model endpoints |
+| `12-mcp-resource-uri-guidance` | distinguishes advertised MCP resource URIs from local file and vault-page reads |
 
 - `scripts/build-engine-image.sh` verifies the pinned SHA, applies patches, and
   builds the deployable gateway image (`hermes-agent:okengine-vX.Y.Z` + `:latest`).
@@ -875,7 +880,7 @@ scripts/build-engine-image.sh  pin-verified image build
 scripts/ensure-runtime.sh      pre-compose runtime seeding + hazard unlocks
 scripts/deploy-cron-*.sh       deploy surfaces
 extensions/okengine.*/         the 15 first-party extensions
-patches/                       the 7 carried Hermes patches + apply.sh
+patches/                       the 10 carried Hermes patches + apply.sh
 docs/                          per-topic depth (overview, guides, design specs,
                                upgrade records, operational lessons)
 tests/                         regressions — every fix ships one

@@ -178,6 +178,24 @@ def test_schema_audit_flags_missing_and_mismatched_fields(tmp_path, monkeypatch)
     assert "good" not in [ln.split("|")[2].strip() for ln in dash.splitlines() if ln.startswith("| ")]
 
 
+def test_schema_drain_derives_horizon_from_dates_not_judgment():  # okengine#326 [24]
+    """The remediation drain must DERIVE the horizon bucket from (resolves_by - made_on) via the
+    sibling audit's `_horizon_for`, not hand the agent a judgment call. Covers missing, drifted, and
+    canonical-but-wrong horizons; falls back to a fuzzy hint only when the dates are unavailable."""
+    d = _load("select_prediction_schema_drain")
+    base = {"made_on": "2026-01-01", "resolves_by": "2026-02-01",   # 31 days -> short
+            "confidence": "0.6", "status": "open", "subject": "x"}
+    issues, _ = d.classify(dict(base), "# body\n")                  # horizon missing but computable
+    assert any("horizon missing -> 'short' (from dates)" in i for i in issues), issues
+    issues, _ = d.classify({**base, "horizon": "medium"}, "# body\n")   # canonical BUT wrong per dates
+    assert any("horizon 'medium' -> 'short' (from dates)" in i for i in issues), issues
+    issues, _ = d.classify({**base, "horizon": "short"}, "# body\n")    # correct -> no horizon issue
+    assert not any("horizon" in i for i in issues), issues
+    issues, _ = d.classify({"confidence": "0.6", "status": "open", "subject": "x",
+                            "horizon": "medium-term"}, "# body\n")      # no dates -> fuzzy hint fallback
+    assert any("horizon drift: 'medium-term' -> 'medium'" in i for i in issues), issues
+
+
 def test_schema_audit_flags_missing_refutation_section(tmp_path, monkeypatch):
     pr = tmp_path / "wiki" / "predictions"
     pr.mkdir(parents=True)
@@ -205,7 +223,9 @@ def test_schema_drain_gate_and_scope(tmp_path, monkeypatch):
     with contextlib.redirect_stdout(buf):
         _load("select_prediction_schema_drain").main()
     out = buf.getvalue()
-    assert "horizon drift" in out and "medium-term" in out
+    # #326 [24]: the dates are present, so the drain surfaces the DETERMINISTIC correction
+    # (medium-term -> short, 31 days) rather than a fuzzy string hint.
+    assert "medium-term" in out and "'short' (from dates)" in out
 
     # `active` is canonical (base-schema open_values) — a fully-canonical active prediction is NOT
     # drift, and a batch-container does NOT drive the wake (human-review only).

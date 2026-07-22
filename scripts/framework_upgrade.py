@@ -193,8 +193,15 @@ def apply_upgrade(pack: Path, plan: Plan, now_iso: str) -> list:
     for m in plan.migrations:
         for c in (m.apply_fn(pack, False) or []):
             changes.append(f"[{m.id}] {c}")
+        # Record each migration's id in `applied` IMMEDIATELY after its side effects land, not once
+        # after the whole batch. plan_upgrade selects pending work by `m.id not in applied` (NOT by
+        # engine_version), so a hard-kill (SIGKILL / power loss) mid-batch now leaves the completed
+        # migrations recorded and only the in-flight one replays — instead of the ENTIRE batch
+        # re-applying, which for a non-idempotent migration (e.g. a partition reshelve, #54) corrupts
+        # the vault. The roll-forward snapshot only unwinds on a raised exception, not a hard-kill, so
+        # this narrows the crash window that the snapshot can't cover (invariant-audit #351).
+        record_state(pack, plan.target, [m.id], now_iso)
     write_pin(pack, plan.target, plan.target_hermes)
-    record_state(pack, plan.target, [m.id for m in plan.migrations], now_iso)
     return changes
 
 

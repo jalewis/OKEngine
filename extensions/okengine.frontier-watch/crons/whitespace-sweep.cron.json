@@ -2,6 +2,8 @@
   "schedule": {"kind": "cron", "expr": "0 7 * * 1"},
   "entrypoint": "select_whitespace.py",
   "prompt_file": "prompts/whitespace-sweep.md",
+  "output_contract": {"api": 1, "allowed_namespaces": ["frontier"], "allowed_types": ["whitespace-thesis"], "operations": ["create", "update", "converge"], "required_fields": ["type", "capability", "thesis", "confidence", "sources"], "required_relationships": ["sources"], "body": {"required": true, "min_non_whitespace": 100}, "unknown_fields": "reject", "unresolved_links": "review", "placeholder_links": "reject", "completion": "per-selected-item"},
+  "adversarial_fixtures": ["tests/extensions/test_model_output_contracts.py"],
   "toolsets": ["hermes-cron", "okengine-write", "okengine"],
   "tier": "analyze"
 }

@@ -15,28 +15,75 @@ def test_no_prompt_instructs_manual_logmd_write():
 
 
 def _fixed_hours(expr: str) -> list[int]:
-    """Numeric hours a cron expr fires at — handles single hours AND comma lists ('3,9,15,21').
-    Non-numeric hour fields (*, */2, ranges) return [] — those aren't fixed-hour jobs."""
+    """Numeric hours a cron expr's HOUR field fires at. Handles a single hour, comma lists
+    ('3,9,15,21'), ranges ('1-5'), and steps over a range or star ('1-23/2', '*/2') — so a range/step
+    expr that fires IN the DST transition window is not silently missed (okengine#326 [28]: the old
+    '[\\d,]+' regex returned [] for '0 1-23/2 * * *', letting a job that fires at 01:00 escape the
+    guard). A BARE '*' (every hour) returns [] — an every-hour job is not a fixed-hour schedule."""
     import re
-    m = re.match(r"^\S+\s+([\d,]+)\s", str(expr or ""))
+    m = re.match(r"^\S+\s+(\S+)\s", str(expr or ""))
     if not m:
         return []
-    return [int(h) for h in m.group(1).split(",") if h.isdigit()]
+    hours: set[int] = set()
+    for part in m.group(1).split(","):
+        part = part.strip()
+        if part == "*":
+            continue                                  # bare '*' = every hour, not a fixed-hour slot
+        step, base = 1, part
+        if "/" in part:
+            base, _, s = part.partition("/")
+            if not (s.isdigit() and int(s) >= 1):
+                continue
+            step = int(s)
+        if base == "*":                               # '*/N'
+            lo, hi = 0, 23
+        elif "-" in base:                             # 'A-B' or 'A-B/N'
+            a, _, b = base.partition("-")
+            if not (a.isdigit() and b.isdigit()):
+                continue
+            lo, hi = int(a), int(b)
+        elif base.isdigit():
+            lo = hi = int(base)
+        else:
+            continue                                  # unrecognized token — skip this part
+        hours.update(range(lo, hi + 1, step))
+    return sorted(h for h in hours if 0 <= h <= 23)
+
+
+def test_fixed_hours_expands_ranges_and_steps():  # okengine#326 [28]
+    """The hour-field parser must expand ranges + steps so a range/step expr firing in the DST window
+    is caught. Regression for the '[\\d,]+'-only parser that returned [] for '1-23/2'."""
+    assert _fixed_hours("0 5 * * *") == [5]
+    assert _fixed_hours("0 3,9,15,21 * * *") == [3, 9, 15, 21]
+    assert _fixed_hours("0 1-5 * * *") == [1, 2, 3, 4, 5]
+    assert _fixed_hours("0 1-23/2 * * *") == [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23]  # includes 1
+    assert _fixed_hours("0 */6 * * *") == [0, 6, 12, 18]
+    assert _fixed_hours("0 */2 * * *") == [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]      # includes 2
+    assert _fixed_hours("0 * * * *") == []        # bare '*' every-hour is not a fixed-hour schedule
+    assert _fixed_hours("") == [] and _fixed_hours(None) == []
 
 
 def test_no_fixed_hour_cron_in_dst_transition_window():
-    """okengine invariant-audit: the deployment default TZ is America/New_York, whose DST transitions
-    fall in 01:00-02:59 (fall-back repeats the 1am hour → a 01:xx job double-fires; spring-forward
-    skips 2am → a 02:xx job is silently missed). Engine-shipped fixed-hour crons must avoid that
-    window so the nightly derived-index chain runs exactly once. Checks EVERY hour in a comma
-    list — the original single-hour regex let '0 1,13 * * *' escape the guard."""
+    """okengine invariant-audit + #326 [28]: the deployment default TZ is America/New_York, whose DST
+    transitions fall in 01:00-02:59 (fall-back repeats the 1am hour → a 01:xx job double-fires;
+    spring-forward skips 2am → a 02:xx job is silently missed).
+
+    The cron-plus scheduler now PREVENTS the fall-back double-fire for every expr (jalewis/hermes-cron-plus,
+    okengine#326 [28]), so the residual risk is a LOW-FREQUENCY job whose single fire is SKIPPED on
+    spring-forward. Flag a job in the window only when it fires infrequently (≤4×/day) — a nightly or
+    few-times lane where a missed run actually matters. The every-2h maintenance lanes (`*/2`,
+    `1-23/2`; 12×/day) inherently span the window (any 2h step hits hour 1 or 2), are idempotent, and
+    are covered by the next run 2h later, so they are exempt. (`_fixed_hours` now expands ranges +
+    steps so those step lanes are visible here at all — the [28] detector gap; checks every hour in a
+    comma list too, so '0 1,13 * * *' can't escape.)"""
     bad = []
     for j in _JOBS:
         sch = j.get("schedule")
         expr = sch.get("expr") if isinstance(sch, dict) else sch
-        if any(h in (1, 2) for h in _fixed_hours(expr)):
+        hours = _fixed_hours(expr)
+        if len(hours) <= 4 and any(h in (1, 2) for h in hours):
             bad.append((j.get("name"), expr))
-    assert not bad, f"fixed-hour crons in the DST transition window (01:xx/02:xx): {bad}"
+    assert not bad, f"low-frequency (≤4×/day) crons in the DST transition window (01:xx/02:xx): {bad}"
 
 
 def test_index_tree_rebuilds_intraday():

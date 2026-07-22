@@ -1,0 +1,46 @@
+diff --git a/tools/mcp_tool.py b/tools/mcp_tool.py
+index cd999f271..949cd42ac 100644
+--- a/tools/mcp_tool.py
++++ b/tools/mcp_tool.py
+@@ -4151,10 +4151,17 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
+             logger.error(
+                 "MCP %s/read_resource failed: %s", server_name, exc,
+             )
++            correction = ""
++            if str(uri).startswith("file://"):
++                correction = (
++                    " Do not retry read_resource with this file URI: MCP resources are "
++                    "only URIs returned verbatim by list_resources. Use the file-reading "
++                    "tool for an explicit local path, or get_page for a vault page."
++                )
+             return json.dumps({
+                 "error": _sanitize_error(
+                     f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
+-                )
++                ) + correction
+             }, ensure_ascii=False)
+ 
+     return _handler
+@@ -4524,13 +4531,20 @@ def _build_utility_schemas(server_name: str) -> List[dict]:
+         {
+             "schema": {
+                 "name": mcp_prefixed_tool_name(server_name, "read_resource"),
+-                "description": f"Read a resource by URI from MCP server '{server_name}'",
++                "description": (
++                    f"Read an MCP resource from server '{server_name}'. The URI must be copied "
++                    "verbatim from this server's list_resources result. This is not a local-file "
++                    "reader: use read_file for an explicit file path and get_page for a vault page."
++                ),
+                 "parameters": {
+                     "type": "object",
+                     "properties": {
+                         "uri": {
+                             "type": "string",
+-                            "description": "URI of the resource to read",
++                            "description": (
++                                "Exact URI returned by list_resources; do not invent a file:// URI "
++                                "from a local path"
++                            ),
+                         },
+                     },
+                     "required": ["uri"],

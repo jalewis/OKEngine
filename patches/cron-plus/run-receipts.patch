@@ -1,0 +1,75 @@
+diff --git a/runner.py b/runner.py
+--- a/runner.py
++++ b/runner.py
+@@ -59,6 +59,8 @@ except Exception as e:
+     sys.stderr.write(f"warning: load_hermes_dotenv failed: {e}\n")
+ 
+ import jobs as jobs_mod  # type: ignore[import]  # noqa: E402
++import run_receipts  # type: ignore[import]  # noqa: E402
++import model_slots  # type: ignore[import]  # noqa: E402
+ 
+ logging.basicConfig(
+     level=os.environ.get("CRON_PLUS_LOG_LEVEL", "INFO").upper(),
+@@ -156,6 +157,40 @@ def _run_via_hermes(job: dict) -> tuple[bool, str, str, str | None]:
+     return run_job(job)
+ 
+ 
++def _verify_receipt(job: dict, response: str) -> Optional[str]:
++    contract = job.get("output_contract") or {}
++    if contract.get("completion") != "per-selected-item":
++        return None
++    # A clean wakeAgent=false gate returns [SILENT] without running an agent.
++    # It has no selected work and therefore owes no completion receipt. A
++    # wakeAgent=true selector writes the manifest before the agent starts, so
++    # SILENT + missing manifest unambiguously identifies the clean no-work path.
++    manifest = job.get("selection_manifest")
++    if response.strip() == "[SILENT]" and (not manifest or not Path(manifest).is_file()):
++        logger.info("no selected items; completion receipt not required")
++        return None
++    mode = str(job.get("receipt_mode") or "report")
++    try:
++        receipt, result = run_receipts.verify_response(
++            job, response, Path(os.environ.get("WIKI_PATH") or "/opt/vault") / "wiki")
++    except run_receipts.ReceiptError as exc:
++        receipt, result = {}, {"valid": False, "state": "failed", "errors": [str(exc)],
++                               "counts": {"selected": 0, "accepted": 0, "rejected": 0,
++                                          "deferred": 0, "undisposed": 0}, "retry": []}
++    receipt_dir = jobs_mod.CRON_PLUS_HOME / "receipts" / str(job["id"])
++    receipt_dir.mkdir(parents=True, exist_ok=True)
++    stamp = _utc_now().strftime("%Y-%m-%d_%H-%M-%S")
++    (receipt_dir / f"{stamp}.json").write_text(json.dumps({"receipt": receipt, **result}, indent=2))
++    if result["valid"]:
++        logger.info("verified completion receipt: %s", result["counts"])
++        return None
++    message = "invalid completion receipt: " + "; ".join(result["errors"])
++    if mode == "enforce":
++        return message
++    logger.warning("%s (report-only)", message)
++    return None
++
++
+ def main() -> int:
+     parser = argparse.ArgumentParser(description="cron-plus subprocess runner")
+     parser.add_argument("--job-id", required=True)
+@@ -196,6 +231,7 @@ def main() -> int:
+         # Run the agent (or skip if wake-gate emits false)
+         try:
+-            success, output_doc, response, error = _run_via_hermes(job)
++            with model_slots.model_slot(job):
++                success, output_doc, response, error = _run_via_hermes(job)
+         except Exception as e:
+             logger.error("agent invocation crashed: %s", e, exc_info=True)
+             jobs_mod.mark_job_run(args.job_id, success=False, error=str(e))
+@@ -228,6 +264,12 @@ def main() -> int:
+         local_path = _save_local_output(job, output_doc)
+         logger.info("output saved to %s", local_path)
+ 
++        receipt_error = _verify_receipt(job, response)
++        if receipt_error:
++            logger.error(receipt_error)
++            jobs_mod.mark_job_run(args.job_id, success=False, error=receipt_error)
++            return 1
++
+         # Honor the [SILENT] marker — agent says "nothing to report,
+         # suppress delivery". Same semantics as upstream Hermes cron.
+         SILENT_MARKER = "[SILENT]"

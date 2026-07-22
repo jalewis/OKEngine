@@ -19,8 +19,8 @@ the next audit auto-resolves the gap. You are closing gaps, not writing essays.
 4. **DRAFT MODE** (the wake-gate marks these): judgment-bearing fixes (e.g. a refutation
    criterion) are proposals — set `needs_review: true` on the subject page in the same
    write, and keep the drafted content clearly attributable (a dated line).
-5. **Log**: append one `wiki/log.md` line per fix:
-   `- YYYY-MM-DD gap-drain <rule> fixed <subject>` (or `skipped <subject>: <reason>`).
+5. **Receipt**: report one status line per selected gap. The writer records successful
+   mutations in the engine log automatically; never edit the log yourself.
 
 ## Constraints
 
@@ -29,3 +29,6 @@ the next audit auto-resolves the gap. You are closing gaps, not writing essays.
 - Skipping honestly beats fixing badly — the gap stays visible either way.
 
 Respond with one line per gap: `<subject>: fixed | drafted (needs_review) | skipped — <reason>`.
+# Model-write boundary
+
+Process only selector-named items. Ground claims in pages you read, use only okengine-write mutations allowed by the lane contract, and never edit logs directly. Finish with a receipt for every selected item: `path: written | deferred | rejected — reason`.

@@ -25,7 +25,7 @@ def _base(**extra):
 
 def test_valid_reader_panels_passes():
     m = _base(reader_panels=[
-        {"type": "whitespace-thesis", "kind": "two-axis", "x": "a", "y": "b", "label": "title"},
+        {"type": "assessment", "kind": "fields", "fields": ["verdict", "confidence"]},
         {"type": "prediction", "kind": "fields", "fields": ["confidence", "status"]}])
     errors, _ = MAN.validate_manifest(m)
     assert not errors, errors
@@ -80,5 +80,15 @@ def test_timeline_binding_rejected_no_renderer():  # invariant-audit #26
     """`timeline` has no renderer on any surface — a reader_panels binding for it validated GREEN then
     produced panel:null on every bound page. It must be rejected at the manifest gate now."""
     e, _ = MAN.validate_manifest(_base(reader_panels=[{"type": "event", "kind": "timeline", "fields": ["date"]}]))
-    assert any("kind" in x and "timeline" not in x.split("one of")[-1] for x in e), e
-    assert "timeline" not in MAN._PANEL_KINDS
+    assert any("kind" in x for x in e), e
+    assert "timeline" not in MAN._BINDABLE_PANEL_KINDS
+
+
+def test_two_axis_binding_rejected_only_self_declared_renders():  # invariant-audit #351
+    """A `kind: two-axis` reader_panels BINDING validated GREEN but the reader's type-bound path
+    (_panel_for) builds a panel only for kind:fields — two-axis needs per-page nodes that exist only
+    when a page SELF-DECLARES `panel:`. So a two-axis binding rendered panel:null on every bound page
+    (the same never-renders class as timeline, #26). It must be rejected as a binding now."""
+    e, _ = MAN.validate_manifest(_base(reader_panels=[{"type": "wardley", "kind": "two-axis", "x": "a", "y": "b"}]))
+    assert any("'kind' must be one of" in x for x in e), e
+    assert "two-axis" not in MAN._BINDABLE_PANEL_KINDS

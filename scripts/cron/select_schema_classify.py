@@ -38,6 +38,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import schema_lib  # noqa: E402
+from selection_manifest import write_selection_manifest  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 ENTITIES_DIR = VAULT / "wiki" / "entities"
@@ -185,6 +186,10 @@ def main() -> int:
         return 0
 
     batch = candidates[:BATCH]
+    manifest = write_selection_manifest(
+        [c["rel"].removeprefix("wiki/").removesuffix(".md") for c in batch],
+        Path(os.environ.get("HERMES_HOME", "/opt/data")) / "cron-plus" / "selections" / "schema-classify-drain.json",
+    )
     print(f"  this batch: {len(batch)} (of {len(candidates)})")
     print()
     if CANONICAL:
@@ -200,6 +205,7 @@ def main() -> int:
         print(f"    current_type={c['current_type']}  hint={c['hint'] or '(none)'}")
         print(f"    tags: {', '.join(c['tags']) or '(none)'}")
         print(f"    excerpt: {c['excerpt']}")
+    print(f"selection input_digest: {manifest['input_digest']}")
     print()
     print(json.dumps({"wakeAgent": True}))
     return 0

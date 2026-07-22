@@ -30,7 +30,7 @@ _SKIP_RE = re.compile(r"^SKIPPED \[\d+\] (\S+?):\d+: (.+)$", re.M)
 
 def main() -> int:
     cmd = [sys.executable, "-m", "pytest", "tests/", "--import-mode=importlib", "-p", "no:warnings",
-           "-rs", "-q", "--ignore=tests/test_post_deploy_verify.py", *sys.argv[1:]]
+           "-rs", "-q", *sys.argv[1:]]
     r = subprocess.run(cmd, capture_output=True, text=True)
     out = r.stdout
     sys.stdout.write(out[-6000:])

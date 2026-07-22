@@ -57,6 +57,7 @@ from tools.schema_validator import schema_reject_reason, governing_policy, drift
     canonicalize_enum_case  # noqa: E402
 from tools import policy_plane  # noqa: E402
 import scope as _scope  # noqa: E402  per-extension token resolution (okengine#132)
+import output_contract_enforce as _output_contract  # noqa: E402
 
 # Converge-on-write (composable okpacks P2) needs the id + schema + merge libs.
 # Optional: if any are absent, converge_entity is disabled but the rest works.
@@ -173,6 +174,11 @@ def _capability_reject(p: Path, operation: str, *, page_type: str = "",
         policy = dict(policy)
         policy["capabilities"] = dict(policy.get("capabilities") or {})
         policy["capabilities"][actor] = declared
+    elif actor not in (policy.get("capabilities") or {}):
+        contract, _lane = _output_contract.resolve(caller)
+        if isinstance(contract, dict) and not contract.get("_missing") \
+                and not contract.get("_invalid_digest"):
+            return None
     result = policy_plane.evaluate_capability(
         policy, actor, operation, _rel(p), page_type,
         changed_fields, body_change)
@@ -183,6 +189,25 @@ def _capability_reject(p: Path, operation: str, *, page_type: str = "",
     except OSError:
         pass
     return policy_plane.finding_message(result)
+
+
+def _contract_reject(p: Path, operation: str, fm: dict, body: str, drift: list[str]) -> Optional[str]:
+    """Evaluate the authenticated lane contract immediately before mutation."""
+    unknown = []
+    for flag in drift:
+        if flag.startswith("unknown field(s)") and ":" in flag:
+            unknown.extend(x.strip() for x in flag.split(":", 1)[1].split(","))
+    findings = _output_contract.evaluate(
+        _caller(), operation=operation, namespace=_namespace(p),
+        page_type=str(fm.get("type") or ""), frontmatter=fm, body=body or "",
+        unknown_fields=unknown, wiki=_wiki())
+    if not findings:
+        return None
+    detail = "; ".join(f"{f['code']}: {f['message']}" for f in findings)
+    _append_log(f"- {_today()} output-contract {'report' if os.environ.get('OKENGINE_OUTPUT_CONTRACT_MODE', 'report') != 'enforce' else 'reject'} {_rel(p)} — {detail}")
+    if os.environ.get("OKENGINE_OUTPUT_CONTRACT_MODE", "report") != "enforce":
+        return None
+    return "output_contract." + detail
 
 
 def _apply_extension_provenance(fm: dict, *, creating: bool,
@@ -367,13 +392,19 @@ def _partitioned_create_path(p: Path, fm: dict) -> Path:
     if not _CONVERGE_OK:
         return p
     try:
-        rel = p.relative_to(_wiki().resolve())
-        namespace = rel.parts[0]
-        if not okf_migrate.is_partitioned(Path(os.environ.get("WIKI_PATH") or str(VAULT)), namespace):
+        # SUB-DOMAIN AWARE (walk-up multipack #173): a page at wiki/<subdomain>/entities/<slug> lives
+        # in namespace 'entities', not '<subdomain>'. Using rel.parts[0] read the CONTAINER as the
+        # namespace, so okf_migrate.is_partitioned('<subdomain>') found no partition config and the
+        # page was written FLAT — while the reshelve drain (reshelve.py walks every sub-domain's
+        # schema and reshards <subdomain>/entities) then sharded it, re-opening the #54 duplicate-
+        # canonical ping-pong for every co-installed vault (invariant-audit #351). write_key preserves
+        # the full prefix, so the page shards WITHIN its sub-domain. A flat vault has no container, so
+        # _qualified_namespace == rel.parts[0] — byte-identical for every single-pack deployment.
+        namespace = _qualified_namespace(p)
+        vault = Path(os.environ.get("WIKI_PATH") or str(VAULT))
+        if not namespace or not okf_migrate.is_partitioned(vault, namespace):
             return p
-        key = okf_migrate.write_key(
-            Path(os.environ.get("WIKI_PATH") or str(VAULT)), namespace, p.stem, fm
-        )
+        key = okf_migrate.write_key(vault, namespace, p.stem, fm)
         return (_wiki() / f"{key}.md").resolve()
     except (OSError, ValueError, IndexError):
         return p
@@ -1097,6 +1128,37 @@ def _namespace(p: Path) -> str:
     return parts[i]
 
 
+def _qualified_namespace(p: Path) -> str:
+    """Like _namespace, but KEEPS the sub-domain container prefix: 'acme/entities' for
+    wiki/acme/entities/foo (walk-up multipack), 'entities' for a flat vault. This is the namespace
+    okf_migrate.write_key / is_partitioned expect — they resolve the governing schema by walking up
+    from wiki/<namespace> (so the leaf 'entities' drives the partition config) yet the returned key
+    preserves the full prefix, so a sub-domain page shards WITHIN its sub-domain. A flat vault has no
+    container prefix, so this equals _namespace / rel.parts[0] exactly (identical to the old path)."""
+    try:
+        rel = p.relative_to(_wiki())
+    except ValueError:
+        return ""
+    parts = rel.parts
+    if not parts:
+        return ""
+    wiki = _wiki()
+    i = 0
+    while i < len(parts) - 1 and (wiki.joinpath(*parts[: i + 1]) / "schema.yaml").is_file():
+        i += 1
+    return "/".join(parts[: i + 1])
+
+
+def _entities_scope(rel: str) -> str:
+    """The sub-domain container prefix of an entities-namespace page rel: '' for a root page
+    (entities/s/x), 'acme' for a walk-up page (acme/entities/s/x). Entity dedup is scoped to a single
+    sub-domain — a co-installed vault's sub-domains are separate knowledge bases and must not
+    cross-merge two same-named entities (invariant-audit #351). The identity index only holds entities
+    pages, so every candidate rel carries the 'entities' segment."""
+    parts = rel.split("/")
+    return "/".join(parts[: parts.index("entities")]) if "entities" in parts else ""
+
+
 _PERM_KEYS = ("create", "update", "delete")
 
 
@@ -1283,28 +1345,49 @@ def _normalize_drift(fm: dict, p: Path) -> tuple[dict, list[str]]:
     return out, flags
 
 
+def _append_review_queue_once(p: Path, reason: str) -> bool:
+    """Ensure one outstanding queue row per canonical page.
+
+    A model tool call and its runner-owned completion receipt are separate
+    transactions.  The call can therefore succeed and be replayed after a
+    crash or invalid receipt.  Serialize the read/append boundary and make the
+    page path the queue identity; later reasons remain available in log.md.
+    """
+    wiki = _wiki()
+    wiki.mkdir(parents=True, exist_ok=True)
+    queue = wiki / "_review-queue.md"
+    lock = wiki.parent / ".okengine" / "review-queue.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("a+", encoding="utf-8") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        if not queue.exists():
+            queue.write_text(
+                "---\ntitle: Review Queue\n---\n\n"
+                "# Review Queue\n\nAgent-flagged pages awaiting human review "
+                "(highlight, not a gate — the writes already landed).\n\n",
+                encoding="utf-8",
+            )
+        identity = f"**{_rel(p)}**"
+        if identity in queue.read_text(encoding="utf-8"):
+            return False
+        with queue.open("a", encoding="utf-8") as f:
+            f.write(f"- {_today()} {identity} — {reason}\n")
+        return True
+
+
 def _queue_review(p: Path, flags: list[str]) -> str:
     """Append a flagged page to wiki/_review-queue.md + log it. Returns a note to
     append to the tool result (empty if no flags). The write itself already
     succeeded — this only highlights, never blocks."""
     if not flags:
         return ""
-    wiki = _wiki()
-    wiki.mkdir(parents=True, exist_ok=True)
-    queue = wiki / "_review-queue.md"
-    if not queue.exists():
-        queue.write_text(
-            "---\ntitle: Review Queue\n---\n\n"
-            "# Review Queue\n\nAgent-flagged pages awaiting human review "
-            "(highlight, not a gate — the writes already landed).\n\n",
-            encoding="utf-8",
-        )
     reason = "; ".join(flags)
-    with queue.open("a", encoding="utf-8") as f:
-        f.write(f"- {_today()} **{_rel(p)}** — {reason}\n")
-    _append_log(f"- {_today()} mcp-write review-flag {_rel(p)} — {reason}")
+    created = _append_review_queue_once(p, reason)
+    action = "review-flag" if created else "review-flag already-queued"
+    _append_log(f"- {_today()} mcp-write {action} {_rel(p)} — {reason}")
     _ensure_review_request(p, flags)
-    return f" — flagged for review ({len(flags)} reason(s))"
+    state = "flagged for review" if created else "already queued for review"
+    return f" — {state} ({len(flags)} reason(s))"
 
 
 # --- plain logic helpers (tested directly) -------------------------------
@@ -1331,14 +1414,22 @@ def _alias_hits(p: Path, incoming_name: str, incoming_aliases: set) -> "list[tup
     artifact with no identity maps, so dedup is never blind in the window before the refresh cron
     rewrites a v2 artifact."""
     self_rel = _rel(p)
+    self_scope = _entities_scope(self_rel)   # '' for a root page, 'acme' for acme/entities/x
     reg = _registry()
     if not reg.name_to_rels and not reg.alias_to_rels:   # pre-v2 artifact -> full scan (old behavior)
-        candidates = [(c, c) for c in (_wiki() / "entities").rglob("*.md")]
+        # Scan the incoming page's OWN sub-domain entities dir (walk-up multipack): root entities/ or
+        # <sub>/entities/. Root-only rglob missed sub-domain entities entirely (invariant-audit #351).
+        scope_dir = (_wiki() / self_scope / "entities") if self_scope else (_wiki() / "entities")
+        candidates = [(c, c) for c in scope_dir.rglob("*.md")]
     else:
         rels = set(reg.alias_to_rels.get(incoming_name, []))          # incoming name == existing alias
         for a in incoming_aliases:
             rels |= set(reg.name_to_rels.get(a, []))                  # existing name == incoming alias
         rels.discard(self_rel)
+        # SAME sub-domain only — a walk-up vault's sub-domains are separate knowledge bases; converging
+        # an 'acme' entity into a root (or 'beta') twin sharing a name would be a cross-domain false
+        # merge. Root pages ('' scope) match only other root pages (invariant-audit #351).
+        rels = {r for r in rels if _entities_scope(r) == self_scope}
         candidates = [(_wiki() / rel, rel) for rel in sorted(rels)]
     hits: list[tuple[Path, dict]] = []
     for candidate, _key in candidates:
@@ -1708,7 +1799,8 @@ def _briefing_link_reject(p: Path, body: Optional[str]) -> Optional[str]:
     return None
 
 
-def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> str:
+def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
+            _contract_operation: str = "create") -> str:
     p = _safe(path)
     if p is None:
         return (f"refused: unsafe wiki path (must stay inside wiki/; basename must contain no "
@@ -1811,6 +1903,9 @@ def _create(path: str, frontmatter_yaml: Union[str, dict], body: str = "") -> st
         return f"rejected: {pol}"
     flags = review_invalidation + drift + _review_flags(p, fm, prev=None) + _identity_contradiction_flags(p, fm) + \
         _unresolvable_link_flags(p, body) + _degeneration_flags(body)
+    contract_reject = _contract_reject(p, _contract_operation, fm, body, drift)
+    if contract_reject:
+        return f"rejected: {contract_reject}"
     if flags:
         fm["needs_review"] = True
     # Stamp the content-derived id before schema validation (the OKF envelope
@@ -1963,6 +2058,9 @@ def _update(path: str, frontmatter_yaml: Union[str, dict, None] = None,
     flags = review_invalidation + drift + _review_flags(p, new_fm, prev=cur_fm) + _identity_contradiction_flags(p, new_fm) + \
         (_unresolvable_link_flags(p, new_body) + _degeneration_flags(new_body) if body is not None else []) + \
         ([f"immutable field change reverted: {', '.join(reverted_immutable)}"] if reverted_immutable else [])
+    contract_reject = _contract_reject(p, "update", new_fm, new_body, drift)
+    if contract_reject:
+        return f"rejected: {contract_reject}"
     if flags:
         new_fm["needs_review"] = True
     content = _compose(new_fm, new_body)
@@ -2015,6 +2113,9 @@ def _tombstone(path: str, reason: str, superseded_by: Optional[str] = None) -> s
     except (TypeError, ValueError):
         new_fm["version"] = 2
     new_fm["last_updated"] = _now()
+    contract_reject = _contract_reject(p, "tombstone", new_fm, cur_body, [])
+    if contract_reject:
+        return f"rejected: {contract_reject}"
     content = _compose(new_fm, cur_body)
     rej = schema_reject_reason(str(p), content)
     if rej:
@@ -2048,20 +2149,23 @@ def _flag(path: str, note: str) -> str:
     _wa = _wauth_refusal(path)
     if _wa:
         return _wa
+    if p.is_file():
+        ferr = _frontmatter_error(p)
+        if ferr:
+            return f"refused: {ferr} — fix the page's frontmatter before flagging"
+        cur_fm, cur_body = _read_page(p)
+    else:
+        cur_fm, cur_body = {}, ""
+    contract_reject = _contract_reject(p, "flag", cur_fm, cur_body, [])
+    if contract_reject:
+        return f"rejected: {contract_reject}"
     clean_note = " ".join((note or "").split())
-    wiki = _wiki()
-    wiki.mkdir(parents=True, exist_ok=True)
-    queue = wiki / "_review-queue.md"
-    if not queue.exists():
-        queue.write_text(
-            "---\ntitle: Review Queue\n---\n\n"
-            "# Review Queue\n\nAgent-flagged pages awaiting human review.\n\n",
-            encoding="utf-8",
-        )
-    with queue.open("a", encoding="utf-8") as f:
-        f.write(f"- {_today()} **{_rel(p)}** — {clean_note}\n")
-    _append_log(f"- {_today()} mcp-write flag {_rel(p)} — {clean_note}")
-    return f"flagged {_rel(p)} for review — queued in {_rel(queue)}"
+    created = _append_review_queue_once(p, clean_note)
+    action = "flag" if created else "flag already-queued"
+    _append_log(f"- {_today()} mcp-write {action} {_rel(p)} — {clean_note}")
+    if created:
+        return f"flagged {_rel(p)} for review — queued in _review-queue.md"
+    return f"already flagged {_rel(p)} for review — queue unchanged"
 
 
 # --- G1.1: body-preserving surgical edits + field-loss guard --------------
@@ -2189,6 +2293,9 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
     flags = review_invalidation + drift + _review_flags(p, new_fm, prev=cur_fm) + _identity_contradiction_flags(p, new_fm) + \
         _unresolvable_link_flags(p, body) + _degeneration_flags(body) + \
         ([f"immutable field change reverted: {', '.join(reverted_immutable)}"] if reverted_immutable else [])
+    contract_reject = _contract_reject(p, "patch", new_fm, body, drift)
+    if contract_reject:
+        return f"rejected: {contract_reject}"
     if flags:
         new_fm["needs_review"] = True
     content = _compose(new_fm, body)
@@ -2335,6 +2442,9 @@ def _append_section(path: str, heading: str, text: str) -> str:
     # newly-appended text — else a degenerate run lands unflagged (invariant-audit).
     flags = _review_flags(p, new_fm, prev=cur_fm) + \
         _unresolvable_link_flags(p, text) + _degeneration_flags(text)
+    contract_reject = _contract_reject(p, "append", new_fm, new_body, [])
+    if contract_reject:
+        return f"rejected: {contract_reject}"
     if flags:
         new_fm["needs_review"] = True
     content = _compose(new_fm, new_body)
@@ -2510,6 +2620,9 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
             # review field) — flag, never block.
             review = review_invalidation + drift + _review_flags(p, merged, prev=cur_fm) + _identity_contradiction_flags(p, merged) + _unresolvable_link_flags(p, new_body) + \
                 (_degeneration_flags(new_body) if body else [])   # degenerate body attributable at write (M15)
+            contract_reject = _contract_reject(p, "converge", merged, new_body, drift)
+            if contract_reject:
+                return f"rejected: {contract_reject}"
             if review:
                 merged["needs_review"] = True
             content = _compose(merged, new_body)
@@ -2533,7 +2646,7 @@ def _converge(path: str, frontmatter_yaml: Union[str, dict], body: str = "",
     if pack:
         fm.setdefault("maintained_by", [pack])
         fm.setdefault("discovered_by", pack)
-    result = _create(path, fm, body)
+    result = _create(path, fm, body, _contract_operation="converge")
     if result.startswith("created"):
         cp = _safe(path)
         if cp is not None:

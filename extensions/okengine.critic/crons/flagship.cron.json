@@ -2,6 +2,8 @@
   "schedule": {"kind": "cron", "expr": "50 6 * * *"},
   "entrypoint": "select_critic.py",
   "prompt_file": "prompts/flagship.md",
+  "output_contract": {"api": 1, "allowed_namespaces": ["dashboards"], "allowed_types": ["dashboard"], "operations": ["create", "converge", "flag"], "required_fields": ["type"], "required_relationships": [], "body": {"required": true, "min_non_whitespace": 100}, "unknown_fields": "reject", "unresolved_links": "review", "placeholder_links": "reject", "completion": "per-selected-item"},
+  "adversarial_fixtures": ["tests/extensions/test_model_output_contracts.py"],
   "toolsets": ["hermes-cron", "okengine-write", "okengine"],
   "tier": "deliver"
 }

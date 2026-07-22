@@ -20,7 +20,9 @@ DRAIN = REPO / "scripts" / "cron" / "select_broken_wikilinks_drain.py"
 
 def _run(vault: Path) -> tuple[bool, str]:
     r = subprocess.run([sys.executable, str(DRAIN)], capture_output=True, text=True,
-                       env={"WIKI_PATH": str(vault), "PATH": "/usr/bin:/bin"})
+                       env={"WIKI_PATH": str(vault), "HERMES_HOME": str(vault / ".hermes"),
+                            "OKENGINE_LANE_ID": "links", "OKENGINE_CONTRACT_DIGEST": "sha256:c",
+                            "PATH": "/usr/bin:/bin"})
     assert r.returncode == 0, r.stderr
     last = r.stdout.strip().splitlines()[-1]
     return bool(json.loads(last)["wakeAgent"]), r.stdout
@@ -45,6 +47,9 @@ def test_single_ref_briefing_link_wakes_the_drain(tmp_path):
     wake, out = _run(tmp_path)
     assert wake, out
     assert "entities/q/quimarat" in out
+    manifest = json.loads((tmp_path / ".hermes/cron-plus/selections/broken-wikilinks-drain.json").read_text())
+    assert manifest["selected"] == ["entities/q/quimarat"]
+    assert manifest["lane_id"] == "links"
 
 
 def test_threshold_still_wakes_for_source_pileups(tmp_path):

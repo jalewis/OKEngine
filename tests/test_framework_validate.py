@@ -734,3 +734,91 @@ def test_unknown_partition_strategy_fails_validate(tmp_path):  # invariant-audit
     v = _load("framework_validate", VAL)
     rows = v.validate(pack).rows
     assert any(s == "FAIL" and "strategy" in c and "by_date" in d for s, c, d in rows), rows
+
+
+def test_cross_tier_duplicate_extension_fails_validate(tmp_path):  # invariant-audit #351
+    """check_enabled_extensions_resolve must surface discover()'s Rule-2 cross-tier duplicate-id
+    error (a hard FAIL per the discovery spec). resolve_enabled() indexes discovered records by bare
+    id, so a duplicate is silently last-wins with NO res_error — before the fix, disc_errors was
+    dropped from `problems` and an ambiguous extension validated CLEAN. Now it must FAIL."""
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    v = _load("framework_validate", VAL)
+    man = {"id": "demo.dup", "kind": "operation", "version": "0.1.0", "name": "demo.dup",
+           "requires": {"engine": ">=0.3.0"}, "trust": "in-gateway",
+           "capabilities": {"read": ["wiki/**"], "write": ["dup/**"]}}
+    for sub in ("extensions", ".okengine/extensions"):        # same id in pack tier AND operator tier
+        d = pack / sub / "demo.dup"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "extension.yaml").write_text(yaml.safe_dump(man), encoding="utf-8")
+    (pack / ".okengine").mkdir(exist_ok=True)
+    (pack / ".okengine" / "extensions.yaml").write_text(
+        yaml.safe_dump({"enabled": {"demo.dup": {}}}), encoding="utf-8")
+    r = v.Report()
+    v.check_enabled_extensions_resolve(pack, r)
+    fails = [d for s, c, d in r.rows if s == "FAIL"]
+    assert any("demo.dup" in d and "multiple tiers" in d for d in fails), r.rows
+
+
+def test_owns_must_cover_non_core_schema_types_and_namespaces(tmp_path):  # invariant-audit #351
+    """compose-preview builds a pack's schema fragment from pack.yaml owns ONLY, so a non-core type
+    or partitioning namespace present in schema.yaml but absent from owns is invisible to the
+    co-install collision gate. check_owns_covers_schema WARNs on that divergence (not FAIL — a
+    standalone pack is harmless and compose-preview is the real collision gate), and is clean once
+    owns covers it. Core (base-schema) types/namespaces need no owns entry."""
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    v = _load("framework_validate", VAL)
+    # a freshly scaffolded pack (core-only schema, empty owns) has NO owns/schema divergence
+    r0 = v.Report()
+    v.check_owns_covers_schema(pack, r0)
+    assert [d for s, c, d in r0.rows if s in ("FAIL", "WARN")] == [], r0.rows
+    # introduce a non-core type + a pack namespace in schema.yaml but NOT in owns -> WARN (never FAIL).
+    # (the scaffold's `types:`/`partitioning:` keys can be null, so coerce before mutating)
+    sch = yaml.safe_load((pack / "schema.yaml").read_text()) or {}
+    types = sch.get("types") if isinstance(sch.get("types"), dict) else {}
+    types["gadget"] = {"required": ["name"]}
+    sch["types"] = types
+    part = sch.get("partitioning") if isinstance(sch.get("partitioning"), dict) else {}
+    nss = part.get("namespaces") if isinstance(part.get("namespaces"), dict) else {}
+    nss["gadgets"] = {"strategy": "by_letter"}
+    part["namespaces"] = nss
+    sch["partitioning"] = part
+    (pack / "schema.yaml").write_text(yaml.safe_dump(sch), encoding="utf-8")
+    r1 = v.Report()
+    v.check_owns_covers_schema(pack, r1)
+    assert not [d for s, c, d in r1.rows if s == "FAIL"], f"must WARN not FAIL: {r1.rows}"
+    warns = " | ".join(d for s, c, d in r1.rows if s == "WARN")
+    assert "gadget" in warns and "owns.types" in warns, r1.rows
+    assert "gadgets" in warns and "owns.namespaces" in warns, r1.rows
+    # declare them in owns -> clean
+    pm = yaml.safe_load((pack / "pack.yaml").read_text()) or {}
+    owns = pm.get("owns") if isinstance(pm.get("owns"), dict) else {}
+    owns["types"] = (owns.get("types") if isinstance(owns.get("types"), list) else []) + ["gadget"]
+    owns["namespaces"] = (owns.get("namespaces") if isinstance(owns.get("namespaces"), list) else []) + ["gadgets"]
+    pm["owns"] = owns
+    (pack / "pack.yaml").write_text(yaml.safe_dump(pm), encoding="utf-8")
+    r2 = v.Report()
+    v.check_owns_covers_schema(pack, r2)
+    assert [d for s, c, d in r2.rows if s in ("FAIL", "WARN")] == [], r2.rows
+
+
+def test_owns_check_honors_schema_exclude(tmp_path):  # invariant-audit #351 / #359 follow-up
+    """A namespace in schema.exclude is intentionally OUTSIDE the pack's OKF scope (a shared render
+    tree like dashboards/operational) — it is NOT owned and must not warn. Excluding it clears the
+    owns.namespaces warning without adding it to owns (the convention for shared trees)."""
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    v = _load("framework_validate", VAL)
+    sch = yaml.safe_load((pack / "schema.yaml").read_text()) or {}
+    part = sch.get("partitioning") if isinstance(sch.get("partitioning"), dict) else {}
+    nss = part.get("namespaces") if isinstance(part.get("namespaces"), dict) else {}
+    nss["dashboards"] = {"strategy": "flat"}
+    part["namespaces"] = nss
+    sch["partitioning"] = part
+    sch["exclude"] = (sch.get("exclude") or []) + ["wiki/dashboards/"]   # shared render tree, not owned
+    (pack / "schema.yaml").write_text(yaml.safe_dump(sch), encoding="utf-8")
+    r = v.Report()
+    v.check_owns_covers_schema(pack, r)
+    assert not any("dashboards" in d for s, c, d in r.rows), \
+        f"an EXCLUDED namespace must not warn: {r.rows}"

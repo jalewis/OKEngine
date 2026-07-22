@@ -45,17 +45,22 @@ _TOP_KEYS = {"id", "kind", "scope", "version", "name", "description",
 # Built-in reader panel KINDS the reader ships (okengine#160). An extension BINDS one to a page
 # type declaratively — it ships no renderer code, so there's no third-party-JS surface in the
 # reader (sidesteps the #124 sandbox concern for this path). New kinds are added to the reader.
-# The binding allowlist must match what a renderer actually implements. `fields` + `two-axis` render
-# (static/app.js panelHtml), but `timeline` has NO renderer on any surface — allowing it validated a
-# binding GREEN that then produced `panel: null` on every bound page (invariant-audit #26). Dropped.
-# Add a kind back only when a renderer for it ships.
-_PANEL_KINDS = {"fields", "two-axis"}
+# The reader_panels BINDING allowlist must match what the reader renders FROM A TYPE BINDING.
+# app.py `_panel_for` builds a type-bound panel only for `kind: fields` (pulling declared frontmatter
+# fields); `two-axis` needs per-page nodes/coords that exist ONLY when a page SELF-DECLARES `panel:`
+# (the viz generated-page path) — a type binding can't synthesize them, so a `kind: two-axis` binding
+# validated GREEN yet rendered `panel: null` on every bound page (same failure mode as `timeline`,
+# #26, and now two-axis — invariant-audit #351). `timeline` has no renderer at all. Bindable = fields
+# ONLY; two-axis stays valid for self-declared page panels (not governed by this manifest check).
+# Add a kind here only when the type-binding path in _panel_for renders it.
+_BINDABLE_PANEL_KINDS = {"fields"}
 _REQUIRED_TOP = ("id", "kind", "version", "requires", "trust", "capabilities")
 # §6: unknown keys under these blocks FAIL (vs unknown descriptive top-level = WARN).
 _REQUIRES_KEYS = {"engine", "schema_refs", "extensions"}
 _CAP_KEYS = {"read", "write", "write_policy", "network", "secrets", "delivery"}
 _OPERATION_KEYS = {"schedule", "entrypoint", "timeout", "prompt", "prompt_file",
-                   "toolsets", "tier", "model", "after", "cost_bearing"}
+                   "toolsets", "tier", "model", "after", "cost_bearing",
+                   "output_contract", "adversarial_fixtures"}
 # cost_bearing: a no_agent op that STILL spends model budget (a deterministic script calling
 # llm_lib directly, e.g. concept-enrich / scope-classify). budget_guard pauses it when over budget —
 # without the marker it looked "free" and burned paid tokens unpausably (invariant-audit #36).
@@ -102,6 +107,11 @@ def _validate_operation(op: dict, trust, errors: list[str], ctx: str) -> None:
         errors.append(f"{ctx}.prompt_file must be a string (a path under the extension dir)")
     if isinstance(prompt, str) and prompt.strip() and isinstance(prompt_file, str) and prompt_file.strip():
         errors.append(f"{ctx}: set either 'prompt' or 'prompt_file', not both")
+    fixtures = op.get("adversarial_fixtures")
+    if fixtures is not None and not (isinstance(fixtures, list) and fixtures and
+                                     all(isinstance(item, str) and item.strip()
+                                         for item in fixtures)):
+        errors.append(f"{ctx}.adversarial_fixtures must be a non-empty list of paths")
     toolsets = op.get("toolsets")
     if toolsets is not None and not (isinstance(toolsets, list)
                                      and all(isinstance(t, str) for t in toolsets)):
@@ -275,8 +285,10 @@ def validate_manifest(manifest: dict) -> tuple[list[str], list[str]]:
                     continue
                 if not isinstance(b.get("type"), str) or not b["type"].strip():
                     errors.append(f"{ctx}: 'type' (page type to bind) is required")
-                if b.get("kind") not in _PANEL_KINDS:
-                    errors.append(f"{ctx}: 'kind' must be one of {sorted(_PANEL_KINDS)}")
+                if b.get("kind") not in _BINDABLE_PANEL_KINDS:
+                    errors.append(
+                        f"{ctx}: 'kind' must be one of {sorted(_BINDABLE_PANEL_KINDS)} for a type "
+                        f"binding (two-axis renders only from a self-declared page panel, not a binding)")
                 if "fields" in b and not (isinstance(b["fields"], list)
                                           and all(isinstance(f, str) for f in b["fields"])):
                     errors.append(f"{ctx}: 'fields' must be a list of frontmatter field names")

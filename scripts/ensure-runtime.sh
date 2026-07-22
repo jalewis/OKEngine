@@ -142,7 +142,20 @@ if mcp_start is None:
     raise SystemExit(0)
 mcp_end = section_end(mcp_start)
 key = "  okengine-write-source-quality:"
-if any(line.rstrip() == key for line in lines[mcp_start + 1:mcp_end]):
+existing = next((i for i in range(mcp_start + 1, mcp_end)
+                 if lines[i].rstrip() == key), None)
+if existing is not None:
+    block_end = next((i for i in range(existing + 1, mcp_end)
+                      if lines[i].strip() and len(lines[i]) - len(lines[i].lstrip()) <= 2),
+                     mcp_end)
+    if not any("OKENGINE_OUTPUT_CONTRACT_MODE:" in line
+               for line in lines[existing:block_end]):
+        actor_line = next((i for i in range(existing, block_end)
+                           if "OKENGINE_WRITE_ACTOR:" in lines[i]), None)
+        if actor_line is not None:
+            lines.insert(actor_line + 1, "      OKENGINE_OUTPUT_CONTRACT_MODE: enforce\n")
+            path.write_text("".join(lines), encoding="utf-8")
+            print(f"reconciled: {path} (enforced source-quality output contract)")
     raise SystemExit(0)
 
 # Repair the short-lived legacy bug that placed this engine-managed entry under
@@ -168,7 +181,8 @@ block = (
     "    args:\n"
     "    - /opt/hermes/okengine-mcp/write_server.py\n"
     "    env:\n"
-    "      OKENGINE_WRITE_ACTOR: cron:source-quality-backfill\n\n"
+    "      OKENGINE_WRITE_ACTOR: cron:source-quality-backfill\n"
+    "      OKENGINE_OUTPUT_CONTRACT_MODE: enforce\n\n"
 )
 lines.insert(mcp_end, block)
 path.write_text("".join(lines), encoding="utf-8")
@@ -178,7 +192,7 @@ PY
 # Reconcile every additional cron capability from the deploy-materialized policy into a dedicated
 # writer process. This turns policy identity into runtime identity without asking packs to commit
 # their secret-bearing .hermes-data/config.yaml. Existing operator entries are never rewritten.
-CFG="$CFG" PACK="$PACK" python3 - <<'PY'
+CFG="$CFG" PACK="$PACK" ENGINE_DIR="$ENGINE_DIR" python3 - <<'PY'
 import json
 import os
 import re
@@ -186,12 +200,18 @@ from pathlib import Path
 
 cfg = Path(os.environ["CFG"])
 policy_path = Path(os.environ["PACK"]) / ".okengine" / "effective-policy.json"
-if not policy_path.is_file():
-    raise SystemExit(0)
 try:
-    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    policy = json.loads(policy_path.read_text(encoding="utf-8")) if policy_path.is_file() else {}
 except (OSError, json.JSONDecodeError):
     raise SystemExit("ERROR: cannot read deploy-materialized effective policy")
+pack = Path(os.environ["PACK"])
+jobs_path = Path(os.environ["ENGINE_DIR"]) / "config" / "cron-plus-jobs.json"
+try:
+    jobs_doc = json.loads(jobs_path.read_text(encoding="utf-8")) \
+        if jobs_path.is_file() and (pack / "crons").is_dir() else []
+    jobs = jobs_doc.get("jobs", []) if isinstance(jobs_doc, dict) else jobs_doc
+except (OSError, json.JSONDecodeError):
+    raise SystemExit("ERROR: cannot read generated cron jobs for writer reconciliation")
 
 lines = cfg.read_text(encoding="utf-8").splitlines(keepends=True)
 mcp_start = next((i for i, line in enumerate(lines)
@@ -203,9 +223,11 @@ mcp_end = next((i for i in range(mcp_start + 1, len(lines))
 existing = {match.group(1) for line in lines[mcp_start + 1:mcp_end]
             if (match := re.match(r"^  ([A-Za-z0-9_.-]+):\s*(?:#.*)?$", line.rstrip("\n")))}
 blocks = []
-for actor in sorted((policy.get("capabilities") or {})):
-    if not actor.startswith("cron:"):
-        continue
+actors = {a: False for a in (policy.get("capabilities") or {}) if a.startswith("cron:")}
+for job in jobs:
+    if isinstance(job, dict) and isinstance(job.get("output_contract"), dict) and not job.get("no_agent"):
+        actors[f"cron:{job.get('name')}"] = True
+for actor in sorted(actors):
     name = "okengine-write-" + re.sub(r"[^a-z0-9]+", "-", actor[5:].lower()).strip("-")
     if name in existing:
         continue
@@ -216,7 +238,9 @@ for actor in sorted((policy.get("capabilities") or {})):
         "    args:\n"
         "    - /opt/hermes/okengine-mcp/write_server.py\n"
         "    env:\n"
-        f"      OKENGINE_WRITE_ACTOR: {actor}\n\n"
+        f"      OKENGINE_WRITE_ACTOR: {actor}\n"
+        + ("      OKENGINE_OUTPUT_CONTRACT_MODE: enforce\n" if actors[actor] else "")
+        + "\n"
     )
 if blocks:
     lines.insert(mcp_end, "".join(blocks))

@@ -7,6 +7,7 @@ stays queued. Driven black-box via the digest the script prints to stdout.
 """
 import subprocess
 import sys
+import json
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent.parent
@@ -17,6 +18,8 @@ COMPANION_EXTS = (".pdf", ".html", ".htm", ".docx", ".pptx", ".xlsx", ".rtf", ".
 
 def _run(vault: Path, batch: str = "100") -> str:
     env = {"WIKI_PATH": str(vault), "BATCH_SIZE": batch, "MIN_YEAR": "2025",
+           "OKENGINE_SELECTION_MANIFEST": str(vault / "raw" / ".selection.json"),
+           "OKENGINE_LANE_ID": "lane-raw", "OKENGINE_CONTRACT_DIGEST": "sha256:contract",
            "PATH": __import__("os").environ.get("PATH", "")}
     r = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True,
                        text=True, env=env, timeout=60)
@@ -37,6 +40,41 @@ def test_batch_is_bounded_with_drain_guidance(tmp_path):
     assert "Remaining after this batch:** 3" in out
     assert "source** pages only" in out and "self-draining" in out
     assert out.count("derived_year=") == 2          # exactly BATCH_SIZE files listed
+    manifest = json.loads((tmp_path / "raw" / ".selection.json").read_text())
+    assert len(manifest["selected"]) == 2 and manifest["input_digest"].startswith("sha256:")
+    assert manifest["lane_id"] == "lane-raw" and manifest["contract_digest"] == "sha256:contract"
+    assert "Verified receipt identity" in out
+
+
+def test_only_valid_compiled_source_consumes_raw_input(tmp_path):
+    sources = tmp_path / "wiki" / "sources"
+    sources.mkdir(parents=True)
+    raw = tmp_path / "raw" / "2026"
+    raw.mkdir(parents=True)
+    for name in ("gold-feather-qilin-agenda-ransomware", "valid"):
+        (raw / f"{name}.txt").write_text("captured input")
+    (sources / "gold-feather-qilin-agenda-ransomware.md").write_text(
+        "---\ntype: source\nraw: raw/2026/gold-feather-qilin-agenda-ransomware.txt\n"
+        "publisher: Example\npublished: 2026-01-01\n---\n")
+    (sources / "valid.md").write_text(
+        "---\ntype: source\nraw: raw/2026/valid.txt\npublisher: Example\npublished: 2026-01-01\n---\n\n"
+        "# Valid\n\n" + "Grounded extracted source content. " * 5)
+    out = _run(tmp_path)
+    assert "`raw/2026/gold-feather-qilin-agenda-ransomware.txt`" in out
+    assert "`raw/2026/valid.txt`" not in out
+
+
+def test_repeated_invalid_item_stays_retryable_and_large_input_is_partial(tmp_path):
+    (tmp_path / "wiki" / "sources").mkdir(parents=True)
+    raw = tmp_path / "raw" / "2026"
+    raw.mkdir(parents=True)
+    target = raw / "large.txt"
+    target.write_text("x" * 210000)
+    (tmp_path / "raw" / ".batch-offered.json").write_text(
+        json.dumps({"raw/2026/large.txt": 99}))
+    out = _run(tmp_path)
+    assert "Retryable" in out and "`raw/2026/large.txt`" in out
+    assert "extraction=partial" in out and "deferred remainder" in out
 
 
 def _build_vault(tmp_path: Path) -> Path:

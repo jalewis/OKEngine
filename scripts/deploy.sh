@@ -18,6 +18,7 @@
 #   --rebuild        force-rebuild the gateway image (default: build only if absent)
 #   --skip-build     never build the image (use an existing hermes-agent:latest)
 #   --skip-validate  skip the pre-deploy validate gate
+#   --no-upgrade     skip the pre-validate engine-pin reconcile (framework upgrade)
 #   --no-crons       bring up containers only; don't deploy crons
 #   --fix-perms      make the pack tree writable by HERMES_UID (local convenience;
 #                    otherwise a non-writable tree fails before compose with remediation)
@@ -28,12 +29,13 @@ set -euo pipefail
 
 ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PACK="$PWD"
-REBUILD=0; SKIP_BUILD=0; SKIP_VALIDATE=0; NO_CRONS=0; FIX_PERMS=0; KICKSTART=0
+REBUILD=0; SKIP_BUILD=0; SKIP_VALIDATE=0; NO_CRONS=0; FIX_PERMS=0; KICKSTART=0; NO_UPGRADE=0
 for a in "$@"; do
     case "$a" in
         --rebuild)       REBUILD=1 ;;
         --skip-build)    SKIP_BUILD=1 ;;
         --skip-validate) SKIP_VALIDATE=1 ;;
+        --no-upgrade)    NO_UPGRADE=1 ;;
         --no-crons)      NO_CRONS=1 ;;
         --fix-perms)     FIX_PERMS=1 ;;
         --kickstart)     KICKSTART=1 ;;
@@ -84,11 +86,26 @@ if ! grep -qE '^HERMES_UID=' "$PACK/.env"; then
     echo "    pinned HERMES_UID:GID=$HERMES_UID:$HERMES_GID -> .env (matches the runtime tree owner)"
 fi
 
+# 0. reconcile the engine pin. A pack that pins an OLDER engine release than the one running this
+#    deploy is brought CURRENT via `framework upgrade` (bumps engine.version + runs any registered
+#    migrations in (pin, target] under a roll-forward gate that AUTO-ROLLS-BACK on failure) BEFORE the
+#    validate gate — so bumping the engine doesn't dead-end every lagging pack's deploy at the
+#    "incompatible release series" FAIL / --skip-validate (okengine#359). Exit codes: 0 = reconciled
+#    or already current; non-zero = an AHEAD pin (downgrade refused) or an upgrade that rolled back —
+#    in both cases the pin is unchanged and the validate gate below surfaces the real, actionable
+#    mismatch. Opt out with --no-upgrade.
+if [ "$NO_UPGRADE" = 0 ] && [ -f "$PACK/engine.version" ]; then
+    echo "==> [0/6] reconcile engine pin (framework upgrade)"
+    "$PYTHON" "$ENGINE_DIR/scripts/framework.py" upgrade "$PACK" --apply \
+        || echo "    note: pin not reconciled (ahead pin, or upgrade rolled back) — validate will report it" >&2
+fi
+
 # 1. validate — don't deploy a broken pack.
 if [ "$SKIP_VALIDATE" = 0 ]; then
     echo "==> [1/6] validate"
     if ! "$PYTHON" "$ENGINE_DIR/scripts/framework.py" validate "$PACK" --quiet; then
-        echo "ERROR: validation failed — fix the FAILs above, or re-run with --skip-validate." >&2
+        echo "ERROR: validation failed. A stale engine.version pin auto-reconciles above (see [0/6]);" >&2
+        echo "       for other FAILs, fix them or re-run with --skip-validate." >&2
         exit 1
     fi
 fi
@@ -119,6 +136,10 @@ if ! OKENGINE_POLICY_CATALOG="$ENGINE_DIR/config/policy/catalog.yaml" \
     exit 1
 fi
 echo "    policy artifact composed from engine + pack + enabled extension policy"
+
+# Generate the authoritative fleet before runtime reconciliation so every contracted
+# lane's dedicated MCP server exists when the gateway first starts.
+CRON_PACK_DIR="$PACK" "$PYTHON" "$ENGINE_DIR/scripts/cron_pack_split.py" regen
 
 # 2. seed the runtime dir + ensure it's writable by HERMES_UID BEFORE compose binds it,
 #    and install the cron-plus scheduler plugin into the runtime (the seeded config

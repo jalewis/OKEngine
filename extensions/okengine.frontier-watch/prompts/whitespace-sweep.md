@@ -43,3 +43,6 @@ If the candidate yields a real whitespace, write ONE page at `frontier/<slug>`
 
 LOCAL-ONLY (no web tools). End with a one-line summary: the capability analyzed and whether a
 thesis was written or the candidate deferred.
+# Model-write boundary
+
+Process only selector-named candidates. Ground every claim in pages and sources you read, mutate only through okengine-write within the lane contract, and never edit logs directly. Finish with one receipt per selected candidate: `path: written | deferred | rejected — reason`.

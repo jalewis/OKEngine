@@ -39,22 +39,22 @@ echo "  cron-plus: $URL @ ${SHA:0:12}"
 gitd() { git -C "$DEST" -c safe.directory="$DEST" "$@"; }
 
 if [ -d "$DEST/.git" ]; then
-    if [ "$(gitd rev-parse HEAD 2>/dev/null)" = "$SHA" ]; then
-        echo "  already at the pinned commit ($DEST) — skipping"
-    else
+    if [ "$(gitd rev-parse HEAD 2>/dev/null)" != "$SHA" ]; then
         gitd fetch --quiet --depth 1 origin "$SHA" 2>/dev/null || gitd fetch --quiet origin
-        # The plugin dir is an engine-MANAGED clone — the pin is authoritative, not a place for
-        # local edits. A plain `checkout` ABORTS on any local modification, which blocks the WHOLE
-        # deploy (this bit a live redeploy: an old-pin jobs.py carried a hand-ported TZ-aware patch,
-        # so `checkout` refused and deploy.sh died at step 2). FORCE the tree to the pin instead,
-        # but SURFACE any discarded change so a real hand-edit isn't lost silently (okengine#178).
-        if [ -n "$(gitd status --porcelain 2>/dev/null)" ]; then
-            echo "  ⚠ discarding LOCAL modification(s) in the managed cron-plus clone (the pin is authoritative):" >&2
-            gitd status --porcelain 2>/dev/null | sed 's/^/        /' >&2
-        fi
-        gitd checkout --quiet --force "$SHA"
-        echo "  updated to the pinned commit"
     fi
+    # The plugin dir is an engine-MANAGED clone and carried patches deliberately
+    # leave tracked modifications behind. Always restore the exact pin before
+    # applying the CURRENT patch set: otherwise an evolved patch cannot apply to
+    # the prior patched form, and non-idempotent patches accumulate duplicate
+    # definitions on every deploy. Surface what is discarded, including helper
+    # overlays copied below, then clean tracked + untracked managed content.
+    if [ -n "$(gitd status --porcelain 2>/dev/null)" ]; then
+        echo "  ⚠ discarding LOCAL/generated modification(s) in the managed cron-plus clone before refreshing the patch set:" >&2
+        gitd status --porcelain 2>/dev/null | sed 's/^/        /' >&2
+    fi
+    gitd checkout --quiet --force "$SHA"
+    gitd clean -fdq
+    echo "  restored pinned cron-plus tree before applying carried patches"
 else
     mkdir -p "$(dirname "$DEST")"
     rm -rf "$DEST"
@@ -88,7 +88,13 @@ apply_carried_patch "$ENGINE_DIR/patches/cron-plus/job-env.patch" \
     "OKEngine per-job environment support"
 apply_carried_patch "$ENGINE_DIR/patches/cron-plus/after-ordering.patch" \
     "OKEngine after: runtime ordering"
+apply_carried_patch "$ENGINE_DIR/patches/cron-plus/run-receipts.patch" \
+    "OKEngine verified model-run receipts"
+apply_carried_patch "$ENGINE_DIR/patches/cron-plus/cli-null-next-run.patch" \
+    "OKEngine null-safe manual run output"
 cp "$ENGINE_DIR/patches/cron-plus/after_ordering.py" "$DEST/after_ordering.py"
+cp "$ENGINE_DIR/patches/cron-plus/run_receipts.py" "$DEST/run_receipts.py"
+cp "$ENGINE_DIR/patches/cron-plus/model_slots.py" "$DEST/model_slots.py"
 echo "  installed OKEngine after: policy overlay"
 
 # Sanity: the CLI the cron helpers invoke must be present.
