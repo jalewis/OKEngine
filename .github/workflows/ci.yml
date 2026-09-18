@@ -54,7 +54,7 @@ jobs:
       - name: framework init -> framework validate (no FAILs)
         run: |
           python scripts/framework_init.py /tmp/pack --domain "CI Scaffold"
-          python scripts/framework_validate.py /tmp/pack --quiet
+          python -m scripts.framework_validate /tmp/pack --quiet
       - name: generated pack's own validator
         run: cd /tmp/pack && python validate.py
       - name: docker compose config (smoke — validates compose without building)

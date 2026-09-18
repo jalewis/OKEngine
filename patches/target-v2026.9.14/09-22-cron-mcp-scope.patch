@@ -70,7 +70,7 @@ index 3d745e136..92a3553ac 100644
  
  
  def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | None:
-@@ -1588,21 +1580,53 @@ def _load_credential_pool(runtime: dict, job_id: str):
+@@ -1588,21 +1580,60 @@ def _load_credential_pool(runtime: dict, job_id: str):
      return None
  
  
@@ -123,7 +123,14 @@ index 3d745e136..92a3553ac 100644
 +        # Discovery returns the physical names, but an already-registered tool in this
 +        # profile may be omitted by a reconnect pass. Check the scoped registry too.
 +        names = set(str(tool) for tool in _mcp_tools)
-+        names.update(name for name in resolve_toolset(server) if registry.get_entry(name))
++        scoped_names = {
++            name for name in resolve_toolset(server) if registry.get_entry(name)
++        }
++        # Hermes shortens provider-facing names longer than 64 characters to a
++        # deterministic hash. Those physical names no longer retain the server
++        # prefix, so the exact server toolset is the authoritative ownership map.
++        if scoped_names:
++            return True
 +        return any(name.startswith(prefix) for name in names)
 +
 +    absent = [name for name in required if not offered_for(name)]
@@ -135,7 +142,7 @@ index 3d745e136..92a3553ac 100644
  
  
  def _open_cron_session_db(job: dict):
-@@ -2131,6 +2155,7 @@ def _reload_dotenv_and_publish_delivery_target(job: dict) -> None:
+@@ -2131,6 +2162,7 @@ def _reload_dotenv_and_publish_delivery_target(job: dict) -> None:
  @dataclass
  class _CronAgentSetup:
      """Everything ``AIAgent(...)`` needs that is resolved from job + config (or a preflight block)."""
@@ -143,7 +150,7 @@ index 3d745e136..92a3553ac 100644
      blocked: Optional[_RunResult] = None
      model: str = ""
      runtime: dict = None
-@@ -2169,8 +2194,17 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
+@@ -2169,8 +2201,17 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
      )
      setup.fallback_model = get_fallback_chain(_cfg) or None
      setup.credential_pool = _load_credential_pool(setup.runtime, job_id)
@@ -162,7 +169,7 @@ index 3d745e136..92a3553ac 100644
      # Only now can a requested MCP toolset be judged: its alias is process-global but its tools live
      # in this profile's registry overlay, and quiet_mode hides the empty resolution (#109050).
      if _cron_preflight_enabled(_cfg):
-@@ -2220,10 +2254,10 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
+@@ -2220,10 +2261,10 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
          providers_order=pr.get("order"),
          provider_sort=pr.get("sort"),
          openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
@@ -179,7 +186,7 @@ new file mode 100644
 index 000000000..58770b1f0
 --- /dev/null
 +++ b/tests/cron/test_okengine_mcp_scope.py
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,104 @@
 +"""Cron's MCP allowlist and required surfaces are verified before agent spend."""
 +
 +from unittest.mock import patch
@@ -194,6 +201,9 @@ index 000000000..58770b1f0
 +CFG = {"mcp_servers": {
 +    "okengine-read": {"url": "http://127.0.0.1:9001"},
 +    "okengine-write": {"url": "http://127.0.0.1:9002"},
++    "okengine-write-domain-enrichment-classification-worker": {
++        "command": "python", "args": ["writer.py"],
++    },
 +    "unrelated": {"url": "http://127.0.0.1:9003"},
 +}}
 +
@@ -228,6 +238,22 @@ index 000000000..58770b1f0
 +        assert _init_cron_mcp_tools("reader", admitted, CFG) == [
 +            "mcp__okengine_read__get_page"]
 +    discover.assert_called_once_with(admitted)
++
++
++def test_hashed_physical_tool_satisfies_its_exact_required_server_toolset():
++    server = "okengine-write-domain-enrichment-classification-worker"
++    physical_name = "mcp__okengine_write_domain_enrichment_classification_wo_371f8f3a"
++    with (
++        patch("tools.mcp_tool_discovery.discover_mcp_tools", autospec=True,
++              return_value=[physical_name]) as discover,
++        patch("toolsets.resolve_toolset", autospec=True,
++              return_value=[physical_name]) as resolve,
++        patch("tools.registry.registry.get_entry", autospec=True,
++              return_value=object()),
++    ):
++        assert _init_cron_mcp_tools("long-writer", [server], CFG) == [physical_name]
++    discover.assert_called_once_with([server])
++    resolve.assert_called_once_with(server)
 +
 +
 +def test_unrelated_connected_server_cannot_satisfy_required_reader():
