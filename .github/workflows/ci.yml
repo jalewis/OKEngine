@@ -59,6 +59,11 @@ jobs:
         run: cd /tmp/pack && python validate.py
       - name: docker compose config (smoke — validates compose without building)
         run: docker compose -f /tmp/pack/docker-compose.yml config -q
+        env:
+          # Disposable values satisfy the scaffold's fail-closed credential
+          # contract while Compose performs interpolation-only validation.
+          OKENGINE_PROJECTION_WRITER_PASSWORD: ci-only-writer
+          OKENGINE_PROJECTION_READER_PASSWORD: ci-only-reader
 
   # NOTE: CI runs on GitHub Actions. All checks also run locally via the matching
   # `make` targets, so they work regardless of CI platform (okengine#54-#58).
