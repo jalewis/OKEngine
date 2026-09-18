@@ -245,16 +245,21 @@ _install_services(
 
 mcp: Any = None
 try:
-    try:
-        # MCP <2.0 exposed the decorator-driven server under ``fastmcp``.
-        from mcp.server.fastmcp import FastMCP
-    except ImportError:
-        # MCP 2.0 removed ``fastmcp`` and renamed the same tool decorator,
-        # removal, run, and HTTP-app surface to MCPServer. Hermes v2026.9.14
-        # ships this layout, so governed writers must support both SDKs.
-        from mcp.server.mcpserver import MCPServer as FastMCP
+    def _resolve_fast_mcp() -> Any:
+        try:
+            # MCP <2.0 exposed the decorator-driven server under ``fastmcp``.
+            from mcp.server.fastmcp import FastMCP
 
-    mcp = FastMCP("okengine-write")
+            return FastMCP
+        except ImportError:
+            # MCP 2.0 removed ``fastmcp`` and renamed the same tool decorator,
+            # removal, run, and HTTP-app surface to MCPServer. Hermes v2026.9.14
+            # ships this layout, so governed writers must support both SDKs.
+            from mcp.server.mcpserver import MCPServer
+
+            return MCPServer
+
+    mcp = _resolve_fast_mcp()("okengine-write")
 
     mcp.tool = _fence_tool_registrations(mcp.tool, _caller, _wiki)
 

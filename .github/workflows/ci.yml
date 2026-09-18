@@ -50,6 +50,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install pyyaml
+      - run: pip install -e .
       - name: framework init -> framework validate (no FAILs)
         run: |
           python scripts/framework_init.py /tmp/pack --domain "CI Scaffold"
@@ -122,7 +123,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: build okengine-reader image
-        run: docker build -t okengine-reader:ci okengine-reader
+        # The reader Dockerfile assembles the engine wheel from repository-root
+        # sources, so its build context must be the repository root.
+        run: docker build -t okengine-reader:ci -f okengine-reader/Dockerfile .
       - name: build okengine-mcp image
         # context = repo root (the Dockerfile COPYs okengine-mcp/* AND scripts/cron/*)
         run: docker build -t okengine-mcp:ci -f okengine-mcp/Dockerfile .

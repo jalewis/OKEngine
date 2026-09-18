@@ -216,10 +216,14 @@ def test_vault_mtime_and_index_maintainer_state_transitions(tmp_path, monkeypatc
 
 
 def test_index_maintainer_catches_errors_then_sleep_ends_loop(tmp_path, monkeypatch):
+    class LoopStopped(Exception):
+        pass
+
     m = _load(tmp_path, monkeypatch, "mcp_index_loop_edges")
     monkeypatch.setattr(m, "_index_maintainer_step", lambda _state: (_ for _ in ()).throw(RuntimeError("boom")))
-    monkeypatch.setattr(m.time, "sleep", lambda _seconds: (_ for _ in ()).throw(StopIteration()))
-    with pytest.raises(StopIteration): m._index_maintainer()
+    monkeypatch.setattr(m.time, "sleep", lambda _seconds: (_ for _ in ()).throw(LoopStopped()))
+    with pytest.raises(LoopStopped):
+        m._index_maintainer()
 
 
 def test_remaining_safe_graph_and_list_loop_branches(tmp_path, monkeypatch):
