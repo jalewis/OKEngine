@@ -192,3 +192,6 @@ def test_review_http_surface_requires_bearer_and_exposes_no_generic_write(review
         "expected_version": version, "expected_hash": digest,
     })
     assert response.status_code == 200 and response.json()["state"] == "approved"
+    assert page.stat().st_mode & 0o777 == 0o644
+    records = list((page.parents[2] / "operational" / "reviews").glob("*.yaml"))
+    assert records and all(record.stat().st_mode & 0o777 == 0o644 for record in records)

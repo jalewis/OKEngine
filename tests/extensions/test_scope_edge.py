@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent.parent
-SCOPE = REPO / "okengine-mcp" / "scope.py"
+SCOPE = REPO / "src" / "okengine" / "mcp" / "scope.py"
 
 pytestmark = pytest.mark.skipif(not SCOPE.is_file(), reason="scope.py absent")
 

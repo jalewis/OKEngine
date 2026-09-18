@@ -169,7 +169,7 @@ def _unmet(rule: dict, rel: str, slug: str, fm: dict, body: str,
         return None
     if kind == "section":
         # gradeability gate (okengine#214): a resolvable proposition must carry a substantive
-        # body section (e.g. "What would refute this") — 31% of cyber-market's expired
+        # body section (e.g. "What would refute this") — 31% of one deployment's expired
         # predictions were ungradeable because nothing machine-checkable required criteria.
         want = str(rule.get("section") or "").strip().lower()
         min_chars = int(rule.get("min_chars") or 20)
@@ -190,7 +190,11 @@ def _unmet(rule: dict, rel: str, slug: str, fm: dict, body: str,
         m = re.match(r"(\d{4})-(\d{2})-(\d{2})", v)
         if not m:
             return f"date field `{f}` is missing/unparseable"
-        age = (date.today() - date(int(m.group(1)), int(m.group(2)), int(m.group(3)))).days
+        try:
+            observed = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return f"date field `{f}` is missing/unparseable"
+        age = (date.today() - observed).days
         return None if age <= max_age else f"`{f}` is {age}d old (max {max_age}d)"
     return None
 

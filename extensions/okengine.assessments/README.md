@@ -43,3 +43,37 @@ observations—not estimative conclusions.
 
 Enable with `framework extensions enable <pack> okengine.assessments`, compose the schema, and
 write assessment pages through the MCP write path.
+
+Assessment authors should set `subject` to the canonical vault path. When the subject also has a
+stable external authority identifier (for example an ATT&CK `G` identifier), set `subject_ref` to
+that identifier. The reader and cockpit use this declared fallback to preserve the assessment link
+across a later entity creation, rename, or reshard.
+
+## The remedy convention (okengine#746)
+
+An assessment normally answers **"is this claim true?"**. With `assessment_kind: remedy` it
+answers the prescriptive question instead: **"would this intervention work, and is it
+tractable?"**
+
+Nothing else changes. A proposed fix has evidence for and against it exactly like a factual
+claim, so `alternatives`, `adversarial_evidence`, `would_increase_confidence` /
+`would_decrease_confidence` and `consequence` all apply unchanged — which is why this is a
+convention on the existing type rather than a second type carrying a duplicate copy of the
+hardest part of this schema.
+
+Three optional fields exist only for remedies:
+
+| field | holds |
+|---|---|
+| `remedy_cost` | rough cost or effort |
+| `remedy_prerequisites` | what must already be true for it to be available (list) |
+| `remedy_decision` | `proposed` / `adopted` / `rejected` / `deferred` |
+
+`remedy_decision` is **not** a confidence scale. `adopted` says someone decided; it says nothing
+about whether the evidence got stronger. A remedy can be well-evidenced and rejected, or adopted
+on thin evidence, and a reader must be able to see which — so the two vocabularies are kept
+disjoint and a test pins that.
+
+The optional `inquiry` field names the `okengine.inquiry` page a remedy answers. It is a soft
+edge with no hard `requires`: inert when that extension is not enabled, and read by its dossier
+when it is.

@@ -34,6 +34,10 @@ if [ ! -d "$RAW_ROOT" ]; then
 fi
 
 if ! command -v pdftotext >/dev/null 2>&1; then
+    if ! find "$RAW_ROOT" -type f -iname '*.pdf' -print -quit | grep -q .; then
+        printf "Total: 0 PDFs scanned\n  extracted: 0\n  skipped (companion newer): 0\n  failed (no text layer / errored): 0\n"
+        exit 0
+    fi
     echo "ERROR: pdftotext not on PATH. Install: apt-get install poppler-utils" >&2
     exit 2
 fi
@@ -83,3 +87,4 @@ printf "Total: %d PDFs scanned\n" "$total"
 printf "  extracted: %d\n" "$extracted"
 printf "  skipped (companion newer): %d\n" "$skipped"
 printf "  failed (no text layer / errored): %d\n" "$failed"
+[ "$failed" -eq 0 ]

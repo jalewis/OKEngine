@@ -7,40 +7,58 @@
 # without vendoring/duplication): build with
 #   docker compose build okengine-mcp     (compose sets context: .)
 #
-# Trixie base (glibc 2.41): the prebuilt IWE binary needs GLIBC >= 2.39.
+# Trixie base, pinned for reproducibility.
 # Base pinned by digest for reproducibility (this also pins the apt snapshot, so
 # package versions don't float). To refresh: see docs/supply-chain.md.
 # python:3.13-slim-trixie as of 2026-06.
-FROM python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f
+ARG PYTHON_BASE_IMAGE=python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f
+# Node comes from the official image, NOT Debian's `nodejs npm`. Debian packages every one of npm's
+# JavaScript dependencies as its own .deb, so `apt-get install npm` pulled 340 node-* packages to
+# deliver a tool used for two `npm install -g` lines -- measured 446 apt packages and a 187s build
+# with it, 77 packages and 67s without. It also installed Node v20.19.2, while @tobilu/qmd@2.5.3
+# declares `engines: node >= 22.0.0` (the build logged EBADENGINE and carried on). This is Node
+# v22.23.2, and qmd builds and runs on it with no engine warning. Pinned by linux/amd64 platform
+# digest; release CI overrides it with the byte-identical copy in the project registry (see
+# OKENGINE_NODE_BASE_IMAGE).
+ARG NODE_BASE_IMAGE=node@sha256:4d676821dff059fd00d277ee4261ef34ea712317fed0737c03941481b5760c96
+FROM ${NODE_BASE_IMAGE} AS node
+
+FROM ${PYTHON_BASE_IMAGE} AS wheel
+WORKDIR /build
+COPY src/ ./src/
+COPY tools/schema_validator.py tools/policy_plane.py ./tools/
+COPY okengine-mcp/output_contract_enforce.py okengine-mcp/converge.py ./okengine-mcp/
+COPY scripts/cron/id_lib.py scripts/cron/schema_lib.py scripts/cron/id_index.py scripts/cron/okf_migrate.py ./scripts/cron/
+COPY scripts/build_engine_wheel.py ./scripts/build_engine_wheel.py
+COPY config/base-schema.yaml ./config/base-schema.yaml
+RUN python scripts/build_engine_wheel.py --out /wheel
+
+FROM ${PYTHON_BASE_IMAGE}
 
 WORKDIR /app
 
-# nodejs/npm — qmd is a node CLI (runtime dep, not just install-time).
-# curl — fetch the IWE binary. ripgrep — fast lexical paths.
+# node + npm — qmd is a node CLI, a RUNTIME dependency, so node stays in this image. The official
+# image links libstdc++ and libgcc_s, which build-essential below provides here.
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+ && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+
+# ripgrep — fast lexical paths.
 # build-essential + python3-setuptools — qmd's better-sqlite3 native module
-# compiles via node-gyp at install (no prebuilt for this node/platform); py3.13
-# dropped distutils, so setuptools provides the shim node-gyp's gyp needs.
+# compiles via node-gyp at install; py3.13 dropped distutils, so setuptools
+# provides the shim node-gyp's gyp needs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        nodejs npm curl ripgrep ca-certificates \
+        ripgrep ca-certificates \
         build-essential python3 python3-setuptools \
     && rm -rf /var/lib/apt/lists/*
 
-# IWE — markdown knowledge-graph CLI (powers find_references). Read-only.
-# Pinned version + sha256-verified download (the release ships no checksums file;
-# the hash is recorded here — see docs/supply-chain.md to bump).
-ARG IWE_VERSION=0.3.2
-ARG IWE_SHA256=7e90a698b0bb2474b7aaf9beab275d6da842dc38c9dd75e323ab1d4eadbce63d
-RUN curl -fsSL --retry 3 -o /tmp/iwe.tgz \
-      "https://github.com/iwe-org/iwe/releases/download/iwe-v${IWE_VERSION}/iwe-v${IWE_VERSION}-x86_64-unknown-linux-gnu.tar.gz" && \
-    echo "${IWE_SHA256}  /tmp/iwe.tgz" | sha256sum -c - && \
-    tar -xzf /tmp/iwe.tgz -C /usr/local/bin iwe && \
-    chmod +x /usr/local/bin/iwe && rm -f /tmp/iwe.tgz && iwe --version
-
 # qmd — local hybrid search (BM25 + vector + rerank). Index + GGUF models live on
 # the mounted /opt/data/qmd (not baked); this installs the CLI only.
-# Debian's nodejs bundles a broken node-gyp (its vendored gyp/ is missing →
-# "No module named 'gyp'"). Install a self-contained node-gyp and point npm AND
-# the env at it, then compile qmd's better-sqlite3 against it.
+# A standalone node-gyp compiles qmd's better-sqlite3. It was originally added because Debian's
+# nodejs shipped a broken node-gyp ("No module named 'gyp'"); that package is no longer used, but
+# the explicit node-gyp is kept because it is the path verified to build qmd -- dropping it is a
+# separate change that needs its own build proof.
 ENV PYTHON=/usr/bin/python3
 RUN npm install -g node-gyp@11 \
  && export npm_config_node_gyp="$(npm root -g)/node-gyp/bin/node-gyp.js" \
@@ -48,13 +66,13 @@ RUN npm install -g node-gyp@11 \
  && qmd --version
 
 COPY okengine-mcp/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY --from=wheel /wheel/ /wheel/
+RUN pip install --no-cache-dir -r requirements.txt /wheel/*.whl
 
 COPY okengine-mcp/server.py .
-# per-extension token resolution (okengine#132)
-COPY okengine-mcp/scope.py .
 # Engine wrappers (source of truth: scripts/cron/) — copied, not vendored.
-COPY scripts/cron/kb_search.py scripts/cron/kb_graph.py scripts/cron/tier_lib.py ./scripts/
+COPY scripts/cron/kb_search.py scripts/cron/tier_lib.py scripts/cron/schema_lib.py ./scripts/
+COPY config/base-schema.yaml ./config/base-schema.yaml
 
 ENV WIKI_PATH=/opt/vault \
     OKENGINE_MCP_SCRIPTS=/app/scripts \

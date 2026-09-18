@@ -71,3 +71,12 @@ def test_compute_for_flags_out_of_vocab_grade():
     assert oov["base_score"] == m.NEUTRAL_FACTOR                    # both neutral -> mean 0.5
     unset = m.compute_for(None, None, "report", date(2026, 6, 1), today)
     assert unset["reliability_oov"] is False and unset["credibility_oov"] is False  # unset != OOV
+
+
+def test_decay_clamps_future_sources_handles_disabled_half_life_and_effective_score(monkeypatch):
+    m = _load()
+    assert m.half_life_for(None) == m.DEFAULT_HALF_LIFE
+    assert m.decay_factor(-10, "report") == 1.0
+    monkeypatch.setattr(m, "half_life_for", lambda _kind: 0)
+    assert m.decay_factor(100, "custom") == 1.0
+    assert m.effective_score("A", 1, "custom", 100) == 1.0

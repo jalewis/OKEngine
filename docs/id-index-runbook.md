@@ -64,8 +64,7 @@ All commands run from the engine repo root; `$D` = a deployment dir; `$GW` = its
 **Rebuild the artifact now** (creates/refreshes `/opt/data/state/id-index.json`):
 
 ```bash
-ID=$(python3 -c "import json;print(next(j['id'] for j in json.load(open('$D/.hermes-data/cron-plus/jobs.json'))['jobs'] if j.get('name')=='id-index-refresh'))")
-CRON_PACK_DIR="$D" bash scripts/cron-plus.sh run "$ID"     # ~one full scan; writes the artifact
+bin/framework jobs run "$D" id-index-refresh --wait       # ~one full scan; writes the artifact
 ```
 
 **Verify the write path is fast** (times the exact call `write_server` makes, via its baked import):

@@ -78,6 +78,27 @@ and `chown` the tree to match:
 export HERMES_UID=10000 HERMES_GID=10000 && sudo chown -R 10000:10000 <pack>
 ```
 
+That fixed identity also governs host-side raw extraction. Run
+`install-extract-cron.sh` from a host account that can create files as UID/GID
+10000 (or grant it explicit ACL/group write access). The installer probes every
+existing source-bearing `raw/` directory and refuses to install a schedule when
+the invoking account cannot publish companions.
+
+Host-side cron regeneration requires PyYAML and the same `croniter` major version
+as the gateway scheduler. Install them into the engine checkout before deploying;
+the cron deploy script refuses to publish jobs when this parser is missing or an
+operator schedule override cannot be scheduled:
+
+```bash
+cd <engine-checkout>
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-host.txt
+```
+
+To use an existing host environment instead, set `OKENGINE_HOST_PYTHON` to its
+Python executable. Do not rely on system Python silently accepting unchecked
+five-token cron overrides.
+
 1. **Get the engine** at a pinned release (the current series is **v0.11.x** — never a
    hardcoded old tag; select the latest release, or the specific one you're targeting):
    ```bash
@@ -150,12 +171,16 @@ export HERMES_UID=10000 HERMES_GID=10000 && sudo chown -R 10000:10000 <pack>
    cd ../my-brain
    # HERMES_UID/HERMES_GID default to your uid (you own the clone) — nothing to export.
    # Only for a portable/shared vault: export a fixed uid AND `sudo chown -R <uid> <pack>`.
-   bash <engine-checkout>/scripts/build-engine-image.sh    # -> hermes-agent:latest (once)
+   bash <engine-checkout>/scripts/build-engine-image.sh    # -> immutable release+git-sha tag
    bash <engine-checkout>/scripts/ensure-runtime.sh        # seed .hermes-data/config.yaml + install the PINNED cron-plus scheduler plugin (REQUIRED — without it nothing schedules) — MUST precede compose
    ENGINE_DIR=<engine-checkout> docker compose up -d --build   # --build rebuilds reader/mcp/cockpit on an engine update (plain up -d only builds when ABSENT — #45)
    CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-scripts.sh       # engine + pack scripts -> /opt/data/scripts; pack data/feeds -> /opt/data/config
    CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-plus-jobs.sh     # regenerated jobs.json -> live (self-heals next_run_at in ~60s)
    ```
+   `deploy.sh` also persists the exact `OKENGINE_GATEWAY_IMAGE` and an engine-managed Compose
+   override in `.env`. If performing the manual sequence, export that exact image reference before
+   Compose. A deployment never follows `hermes-agent:latest`; this permits independent revisions
+   to coexist safely on one host.
 6. **Smoke** (the gauntlet): a no_agent cron succeeds, an LLM agent cron succeeds
    (API calls + tools + prompt-cache), a delivery lands, `okengine-mcp` answers
    (`curl :8730/mcp` → 401 without token), and the conformance gate is green

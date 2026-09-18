@@ -45,6 +45,39 @@ def test_normalize_is_deterministic_and_idempotent():
         assert idl.normalize_key(expected) == expected   # normalizing a key is a no-op
 
 
+def test_slug_identity_is_separator_insensitive_but_not_numeric():
+    assert idl.slug_identity("Agent-Tesla") == "agenttesla"
+    assert idl.slug_identity("agent_tesla") == "agenttesla"
+    assert idl.slug_identity("APT 29 / Cozy Bear") == "apt29cozybear"
+    assert idl.slug_identity("110-37-3-251") == ""
+    assert idl.slug_identity("---") == ""
+
+
+def test_qualified_namespace_keeps_nested_pack_container(tmp_path):
+    wiki = tmp_path / "wiki"
+    flat = wiki / "entities" / "a" / "alpha.md"
+    nested = wiki / "acme" / "entities" / "a" / "alpha.md"
+    flat.parent.mkdir(parents=True)
+    nested.parent.mkdir(parents=True)
+    (wiki / "acme" / "schema.yaml").write_text("types: {}\n")
+
+    assert idl.qualified_namespace(wiki, flat) == "entities"
+    assert idl.qualified_namespace(wiki, nested) == "acme/entities"
+    assert idl.qualified_namespace(wiki, tmp_path / "outside.md") == ""
+
+
+def test_qualified_namespace_consumes_every_leading_schema_container(tmp_path):
+    wiki = tmp_path / "wiki"
+    page = wiki / "acme" / "region" / "division" / "entities" / "alpha.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("---\ntype: entity\n---\n", encoding="utf-8")
+    for container in (wiki / "acme", wiki / "acme" / "region",
+                      wiki / "acme" / "region" / "division"):
+        (container / "schema.yaml").write_text("types: {}\n", encoding="utf-8")
+
+    assert idl.qualified_namespace(wiki, page) == "acme/region/division/entities"
+
+
 def test_empty_or_unicode_only_falls_back_to_hash():
     for raw in ("", "   ", "：（）", "日本語", "Ωμέγα- только"[:6]):
         k = idl.normalize_key(raw)

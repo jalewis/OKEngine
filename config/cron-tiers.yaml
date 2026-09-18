@@ -27,6 +27,9 @@ engine:
   # --- structure / placement (fully config-driven, read from schema.yaml) ---
   - reshelve
   - reshard-oversized
+  - source-normalize             # repairs refs a reshard stranded + lifts body-only citations;
+                                 # runs AFTER reshard-oversized, since repairing pointers before
+                                 # the move that strands them is backwards (okengine#563)
   - build-index-tree
   - backlinks-refresh            # no_agent precompute of wiki/.backlinks.json for the UIs (okengine#168)
   - id-index-refresh             # no_agent precompute of the id->path index so the MCP write path loads it (not a 64k-page live scan)
@@ -34,6 +37,8 @@ engine:
   - build-hot-set
   - tier-refresh
   - usage-rollup
+  - reap-stale-sessions          # no_agent: close session rows a killed worker left open — Hermes closes them only on the normal path, so an inflated "finished vs started" denominator is otherwise permanent (okengine#514)
+  - lane-toolcall-probe          # no_agent: verify each write lane's REAL tool array still yields structured tool calls — a stack that generates a correct call but fails to PARSE it returns prose with finish_reason=stop, so the lane writes nothing and the run still reports success (okengine#518)
   - corpus-indexer
   - ensure-readable              # generic: keep vault files world-readable for the reader
   - canonical-assemble           # generic: fuse per-source observations -> canonical entity (okengine#38)
@@ -57,19 +62,26 @@ engine:
   - policy-audit                # no_agent verification of the composed runtime policy artifact
   - fleet-health
   - collection-health             # no_agent configured-source freshness/yield ledger projection (#274)
+  - reference-integrity          # exact-path missing/moved relationship inventory (#432)
   - grounding-audit
   - review-autoverify          # deterministic evidence-graded needs_review clearing (#313)
+  - condition-recheck         # clears flags whose mechanical defect was repaired (#547)
+  - review-reconcile           # prunes _review-queue.md to one outstanding row per live page
   - review-queue
+  - registry-coverage        # census: why review-autoverify is not clearing (#541)
   - review-drain                 # bounded local-evidence drain for substantive needs_review pages
   - operator-dashboard
   - health-export
+  - observability-validation    # validates live signals agree; a producer unit test is not enough (#587)
   - relink-prose-sources
   - schema-type-drain
   - normalize-entity-schema
   - repair-broken-frontmatter
+  - repair-carried-provenance
   - repair-yaml-apply
   - repair-yaml-propose
   - sanitize-frontmatter-updated
+  - rotate-wiki-log
   - detect-field-loss
   - broken-wikilinks-drain
   - model-write-repair-drain     # guarded, receipt-backed executor for historical contract findings

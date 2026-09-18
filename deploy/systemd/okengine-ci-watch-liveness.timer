@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch the OKEngine CI watcher
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=10m
+Persistent=true
+Unit=okengine-ci-watch-liveness.service
+
+[Install]
+WantedBy=timers.target

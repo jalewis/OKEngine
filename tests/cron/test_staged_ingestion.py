@@ -21,24 +21,43 @@ def test_relationships_propagate_deterministically_from_either_side():
     assert updates["sources/agenda-report"]["mentions"] == ["entities/agenda"]
 
 
+def test_relationship_propagation_ignores_existing_missing_and_nonstring_edges():
+    pages = {
+        "a": {"mentions": "b", "sources": ["missing", 3]},
+        "b": {"sources": ["a"]},
+    }
+    rules = [{"left_field": "mentions", "right_field": "sources"}]
+    assert rp.reconcile(pages, rules) == {}
+    assert rp._values(None) == []
+    assert rp._values(["a", 2]) == ["a"]
+
+
 def test_raw_and_entity_lane_contracts_are_separated():
     import json
     repo = Path(__file__).parents[2]
     jobs = json.loads((repo / "config" / "engine-crons.json").read_text())
     raw = next(j for j in jobs if j["name"] == "raw-backfill")
+    entity = next(j for j in jobs if j["name"] == "entity-backfill")
+    assert raw["receipt_hash_mode"] == "readback"
+    assert entity["receipt_hash_mode"] == "readback"
     assert raw["output_contract"]["allowed_namespaces"] == ["sources"]
     assert raw["output_contract"]["allowed_types"] == ["source"]
     assert raw["output_contract"]["completion"] == "per-selected-item"
     prompts = json.loads((repo / "templates" / "pack" / "skeleton" / "crons" /
                           "engine-template-prompts.json").read_text())
     raw_prompt = prompts["raw-backfill"]
-    assert "SOURCE-ONLY" in raw_prompt["prompt"]
-    assert "MUST NOT create or update entities" in raw_prompt["prompt"]
-    assert "lane_id, contract_digest, and input_digest" in raw_prompt["prompt"]
-    assert "wiki-relative path and sha256" in raw_prompt["prompt"]
+    raw_text = (repo / "templates/pack/skeleton" / raw_prompt["prompt_file"]).read_text()
+    assert "SOURCE-ONLY" in raw_text
+    assert "MUST NOT create or update entities" in raw_text
+    assert "lane_id, contract_digest, and input_digest" in raw_text
+    assert "wiki-relative path and sha256" in raw_text
+    assert "do not call list_prompts/get_prompt/read_resource" in raw_text
+    assert "file:// / okengine:// URIs" in raw_text
     assert raw_prompt["output_contract"] == raw["output_contract"]
-    assert "resolving `sources` relationship" in prompts["entity-backfill"]
-    assert "Consume only accepted" in prompts["entity-backfill"]
+    entity_text = (repo / "templates/pack/skeleton" /
+                   prompts["entity-backfill"]["prompt_file"]).read_text()
+    assert "resolving `sources` relationship" in entity_text
+    assert "Consume only accepted" in entity_text
 
 
 def test_framework_init_renders_staged_contract_and_persona(tmp_path):
@@ -57,7 +76,8 @@ def test_framework_init_renders_staged_contract_and_persona(tmp_path):
     raw = prompts["raw-backfill"]
     assert raw["output_contract"]["allowed_namespaces"] == ["sources"]
     assert raw["output_contract"]["completion"] == "per-selected-item"
-    assert "lane_id, contract_digest, and input_digest" in raw["prompt"]
+    assert "lane_id, contract_digest, and input_digest" in (
+        pack / raw["prompt_file"]).read_text()
     persona = (pack / "CLAUDE.md").read_text()
     assert "Staged ingest workflow (sources, then entities)" in persona
     assert "source lane must not create or update entities" in persona
@@ -79,4 +99,5 @@ def test_shell_quickstart_renders_staged_contract(tmp_path):
     raw = prompts["raw-backfill"]
     assert raw["output_contract"]["allowed_types"] == ["source"]
     assert raw["output_contract"]["completion"] == "per-selected-item"
-    assert "exact lane_id, contract_digest, and input_digest" in raw["prompt"]
+    assert "exact lane_id, contract_digest, and input_digest" in (
+        pack / raw["prompt_file"]).read_text()

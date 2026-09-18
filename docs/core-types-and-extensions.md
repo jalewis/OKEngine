@@ -25,8 +25,11 @@ A pack declares **only its domain**:
 # pack.yaml
 owns:
   types:      [model, lab, researcher, …]   # DOMAIN types only — NOT source/concept/prediction/…
-  namespaces: [dashboards, operational]     # DOMAIN namespaces only — the core ones are inherited
+  namespaces: [research-questions]          # DOMAIN namespaces only — the core ones are inherited
 ```
+
+`dashboards` and `operational` are engine-reserved derived/diagnostic surfaces, not domain
+namespaces. A pack or extension that claims either under `owns.namespaces` fails composition.
 
 ```yaml
 # schema.yaml
@@ -89,8 +92,9 @@ adds is optional. If your domain genuinely needs a field present, enforce it in 
 workflow** (`CLAUDE.md`) + validate the value with a `field_enums` entry — not by tightening the
 gate.
 
-(`framework compose-preview` reports ownership/cron/trust collisions today; tightening-detection is
-a planned addition.)
+`framework compose-preview` reports ownership, cron, trust, alias, and core-type
+tightening conflicts before installation. A pack that adds required fields to a
+core type is a blocking composition error.
 
 ## Namespaces
 

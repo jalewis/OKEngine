@@ -89,6 +89,9 @@ case "${1:-tail}" in
                 exit 1
             fi
             echo "==> $latest" >&2
+            if [ "${3:-}" = "--follow" ]; then
+                exec dx tail -F "$latest"
+            fi
             exec dx tail -100 "$latest"
         fi
         # No filter — list recent runs

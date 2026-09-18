@@ -30,6 +30,11 @@ from pathlib import Path
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 MIN_SOURCES = int(os.environ.get("PCD_MIN_SOURCES", "10"))
 MIN_HITS = int(os.environ.get("PCD_MIN_HITS", "1"))
+# Three independently populated sections are emitted below. Keep the per-section
+# default at three so the aggregate digest contains at most nine items, leaving
+# at least one terminal-accounting turn inside the lane's 12-turn budget.
+MAX_CANDIDATES_PER_SECTION = int(os.environ.get("PCD_MAX_CANDIDATES", "3"))
+MAX_LABEL_CHARS = 160
 
 # Vault CLAUDE.md is the source-of-truth for the canonical list.
 # Parse the inline list under "Canonical names" — one big inline-code
@@ -153,8 +158,8 @@ def main() -> int:
     print("add to vault CLAUDE.md canonical list AND config/publishers.canonical.json")
     print("with empty variants array. Order by source count, descending.")
     print()
-    for pub, cnt in new_publishers[:30]:
-        print(f"  - `{pub}` ({cnt} sources)")
+    for pub, cnt in new_publishers[:MAX_CANDIDATES_PER_SECTION]:
+        print(f"  - `{pub[:MAX_LABEL_CHARS]}` ({cnt} sources)")
     print()
     print(f"=== DRIFT variants: {len(drift_variants)} ===")
     print("Look like variants of existing canonical entries. Recommended action:")
@@ -163,16 +168,17 @@ def main() -> int:
     print("`publisher:` field to the canonical form. Verify the variant→canonical")
     print("mapping is correct before applying — bad merges fragment data.")
     print()
-    for pub, cnt, canon in drift_variants[:30]:
-        print(f"  - `{pub}` ({cnt} sources) → likely canonical: `{canon}`")
+    for pub, cnt, canon in drift_variants[:MAX_CANDIDATES_PER_SECTION]:
+        print(f"  - `{pub[:MAX_LABEL_CHARS]}` ({cnt} sources) → likely canonical: "
+              f"`{canon[:MAX_LABEL_CHARS]}`")
     print()
     print(f"=== DATA-QUALITY FLAGS: {len(data_quality_flags)} ===")
     print("Not real publishers — `Unknown` / `TBD` / etc. Surface for HUMAN review;")
     print("DO NOT auto-add to canonical list. The right action is to investigate the")
     print("source pages and fill in the actual publisher (often recoverable from `url:`).")
     print()
-    for pub, cnt in data_quality_flags:
-        print(f"  - `{pub}` ({cnt} sources)")
+    for pub, cnt in data_quality_flags[:MAX_CANDIDATES_PER_SECTION]:
+        print(f"  - `{pub[:MAX_LABEL_CHARS]}` ({cnt} sources)")
     print()
 
     total_actionable = len(new_publishers) + len(drift_variants)

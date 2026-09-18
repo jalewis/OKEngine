@@ -52,6 +52,7 @@ class CaptureResult:
     final_url: str
     canonical_url: str
     content_hash: str
+    text_hash: str
     content_type: str
     retrieved_at: str
     object_ref: str
@@ -84,8 +85,9 @@ def _validate_url(url: str) -> None:
         raise CaptureError("dns", f"cannot resolve capture host: {exc}") from exc
     for info in infos:
         address = ipaddress.ip_address(info[4][0])
-        if (address.is_private or address.is_loopback or address.is_link_local
-                or address.is_multicast or address.is_reserved):
+        # Positive allow rule: special-use ranges such as carrier-grade NAT (100.64/10) are not
+        # consistently classified as private/reserved, but they are never globally routable.
+        if not address.is_global:
             raise CaptureError("ssrf", f"refusing non-public capture host address: {address}")
 
 
@@ -157,7 +159,7 @@ def fetch_document(url: str, previous: dict | None = None, *, opener=None) -> tu
                 time.sleep(min(MAX_BACKOFF_S, 2 ** attempt))
                 continue
             raise CaptureError("network", str(exc)) from exc
-    raise CaptureError("network", "retry budget exhausted")
+    raise CaptureError("network", "retry budget exhausted")  # pragma: no cover - final attempts raise
 
 
 class _HTMLText(HTMLParser):
@@ -223,6 +225,24 @@ class _HTMLText(HTMLParser):
         self.parts.append(value + " ")
 
 
+def text_fingerprint(text: str) -> str:
+    """Revision identity for a captured document: sha256 over the EXTRACTED text, whitespace
+    normalized.
+
+    Deliberately NOT the hash of the fetched bytes (okengine#748). Markup churns on every
+    fetch for many publishers — a rotating nonce, an ad token, a timestamp comment — while the
+    readable article is untouched. Keying revisions on the byte hash therefore recorded a new
+    revision roughly ten times a day, forever, for any such page: one live vault accumulated
+    82,769 raw files carrying 6,531 distinct articles, with 639 copies of a single blog post
+    whose consecutive captures differed only in `content_hash` and `fetched`.
+
+    The byte hash is still correct for the OBJECT store, which is content addressed and must
+    stay byte addressed so identical responses share one blob. Only *revision identity* moves
+    to the extracted text, because that is what "the document changed" is supposed to mean.
+    """
+    return hashlib.sha256(" ".join(text.split()).encode()).hexdigest()
+
+
 def extract(body: bytes, content_type: str, final_url: str) -> dict:
     text = body.decode("utf-8", errors="replace")
     if content_type == "text/plain":
@@ -265,6 +285,21 @@ def dead_letter(root: Path, url: str, native_id: str, error: CaptureError,
     return rel.as_posix()
 
 
+def _changed(previous: dict, content_hash: str, text_hash: str) -> bool:
+    """Did the DOCUMENT change, as opposed to its markup?
+
+    Compares extracted-text fingerprints. State written before okengine#748 carries no
+    `text_hash`, so that single transition falls back to the byte comparison it was already
+    using — one last revision for a churning page, after which its state carries a text_hash
+    and it goes quiet. Treating absent-as-unchanged instead would suppress a real edit that
+    happened across the upgrade, which is the worse error.
+    """
+    prior_text = previous.get("text_hash")
+    if prior_text:
+        return text_hash != prior_text
+    return content_hash != previous.get("content_hash")
+
+
 def capture(root: Path, url: str, *, native_id: str = "", publisher: str = "",
             previous: dict | None = None, opener=None, observed_at: str | None = None) -> CaptureResult:
     previous = previous or {}
@@ -275,21 +310,28 @@ def capture(root: Path, url: str, *, native_id: str = "", publisher: str = "",
         return CaptureResult(
             requested_url=url, final_url=previous.get("final_url", url),
             canonical_url=previous.get("canonical_url", previous.get("final_url", url)),
-            content_hash=previous.get("content_hash", ""), content_type=previous.get("content_type", ""),
+            content_hash=previous.get("content_hash", ""), text_hash=previous.get("text_hash", ""),
+            content_type=previous.get("content_type", ""),
             retrieved_at=observed_at, object_ref=previous.get("object_ref", ""),
             revision_ref=previous.get("revision_ref", ""), text="", title="", author="",
             language="", license="", tags=[], changed=False, state=previous)
     content_hash = hashlib.sha256(body).hexdigest()
     fields = extract(body, response["content_type"], response["final_url"])
+    text_hash = text_fingerprint(fields["text"])
     suffix = ".html" if response["content_type"] != "text/plain" else ".txt"
+    # The object store stays BYTE addressed — identical responses must share one blob.
     object_rel = Path("objects") / content_hash[:2] / f"{content_hash}{suffix}"
     _write_once(root / object_rel, body)
     url_key = hashlib.sha256(fields["canonical_url"].encode()).hexdigest()
+    # Revision identity is TEXT addressed (okengine#748): re-fetching a page whose markup
+    # churned but whose article did not must resolve to the revision already on disk, so
+    # _write_once is a no-op instead of appending another observation.
     observation_key = hashlib.sha256(
-        f"{native_id}\0{publisher}\0{content_hash}".encode()).hexdigest()[:16]
-    revision_rel = Path("revisions") / url_key[:2] / url_key / f"{content_hash}-{observation_key}.json"
+        f"{native_id}\0{publisher}\0{text_hash}".encode()).hexdigest()[:16]
+    revision_rel = Path("revisions") / url_key[:2] / url_key / f"{text_hash}-{observation_key}.json"
     state = {"requested_url": url, "final_url": response["final_url"],
              "canonical_url": fields["canonical_url"], "content_hash": content_hash,
+             "text_hash": text_hash,
              "content_type": response["content_type"], "etag": response.get("etag", ""),
              "last_modified": response.get("last_modified", ""),
              "object_ref": object_rel.as_posix(), "revision_ref": revision_rel.as_posix(),
@@ -305,7 +347,8 @@ def capture(root: Path, url: str, *, native_id: str = "", publisher: str = "",
                          object_ref=object_rel.as_posix(), revision_ref=revision_rel.as_posix(),
                          text=fields["text"], title=fields["title"], author=fields["author"],
                          language=fields["language"], license=fields["license"], tags=fields["tags"],
-                         changed=content_hash != previous.get("content_hash"), state=state)
+                         text_hash=text_hash, changed=_changed(previous, content_hash, text_hash),
+                         state=state)
 
 
 def result_dict(result: CaptureResult) -> dict:

@@ -39,8 +39,10 @@ common_optional:
   - authority_source_url
   - authority_verified_fields
   - confidence
+  - estimative_probability # likelihood of a proposition; distinct from confidence in the judgment
   - tags
   - aliases          # alternate/legacy ids — the id resolver consults these
+  - actor_identity_validated # governed actor admission passed source-grounded entity-class proof
   - maintained_by    # provenance: packs that maintain the page (composition)
   - discovered_by    # provenance: where the knowledge was first attributed
   # Cross-cutting OPTIONAL fields (okengine#90 P2) — universally useful, validated by the base
@@ -68,13 +70,52 @@ common_optional:
 # standard set (not extensible — it IS the standard).
 enums:
   tlp:        [CLEAR, GREEN, AMBER, "AMBER+STRICT", RED]
-  source_kind: [paper, post, release, news, report]
+  # `reference-data` is an API-imported reference ROW (an ATT&CK technique, a KEV entry, a CVE
+  # record) rather than a piece of reporting: no raw capture, no publisher, no date of its own —
+  # it exists because a machine mirrored an authority. It belongs in the BASE vocabulary because
+  # engine lanes already branch on it: `repair_raw_backlinks` excludes it by construction ("no raw
+  # capture at all, so a missing `raw:` there is correct rather than a gap"). An engine that reads
+  # a value no engine schema declares has a dead field on one side and a conformance violation on
+  # the other — on a pack that re-declares source_kind CLOSED, all 6,481 such pages on one live
+  # vault were values the write path would have rejected (okengine#595). Pinned by
+  # tests/test_source_kind_vocabulary_contract.py.
+  source_kind: [paper, post, release, news, report, reference-data]
   severity:    [info, low, medium, high, critical]
+  # ODNI ICD 203 estimative language, ordered from least to most likely. These labels express the
+  # assessed probability of a proposition; they do NOT express evidence quality or analytic
+  # confidence. Probability bands: 01-05, 05-20, 20-45, 45-55, 55-80, 80-95, and 95-99 percent.
+  estimative_probability:
+    [almost-no-chance, very-unlikely, unlikely, roughly-even-chance, likely, very-likely,
+     almost-certain]
 
 field_enums:
   tlp:         {enum: tlp}
   source_kind: {enum: source_kind, extensible: true}
   severity:    {enum: severity, extensible: true}
+  estimative_probability: {enum: estimative_probability}
+
+# Safe, meaning-preserving spellings from ICD 203's paired vocabulary. Deliberately absent:
+# ambiguous prose (`possible`, `medium`, `maybe`) and bare percentages. The write boundary only
+# canonicalises an explicit alias; it never infers a stronger proposition from loose language.
+value_aliases:
+  estimative_probability:
+    almost no chance: almost-no-chance
+    remote: almost-no-chance
+    highly improbable: very-unlikely
+    highly-improbable: very-unlikely
+    very unlikely: very-unlikely
+    improbable: unlikely
+    roughly even chance: roughly-even-chance
+    roughly even odds: roughly-even-chance
+    roughly-even-odds: roughly-even-chance
+    probable: likely
+    highly probable: very-likely
+    highly-probable: very-likely
+    very likely: very-likely
+    nearly certain: almost-certain
+    nearly-certain: almost-certain
+    almost certain: almost-certain
+    almost-certainly: almost-certain
 
 # Declared frontmatter field SHAPES — the enforced write path coerces/validates each field to its
 # declared shape at the single write chokepoint, so an agent that authors the wrong shape can't land

@@ -1,0 +1,7 @@
+name: web-serper
+version: 1.1.0
+description: "Serper (google.serper.dev) Google SERP web search; OKEngine Hermes v0.21.3 overlay, requiring SERPER_API_KEY."
+author: OKEngine
+kind: backend
+provides_web_providers:
+  - serper

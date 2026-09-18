@@ -35,9 +35,10 @@ def test_real_zone_resolves(monkeypatch):
     assert TZ.deployment_tz() == ZoneInfo("America/New_York")
 
 
-def test_bad_zone_falls_back_to_utc_never_raises(monkeypatch):
+def test_bad_zone_fails_loudly_instead_of_silently_using_utc(monkeypatch):
     monkeypatch.setenv("TZ", "Not/ARealZone")
-    assert TZ.deployment_tz() is timezone.utc  # must not raise
+    with pytest.raises(Exception, match="Not/ARealZone"):
+        TZ.deployment_tz()
 
 
 def test_today_and_now_agree_on_zone(monkeypatch):

@@ -250,7 +250,7 @@ def main() -> int:
 
     open_preds = [(p, fm) for p, fm in P.predictions(v) if P.is_open(fm)]
     # STARVED-FIRST ordering (okengine#216): the old path-sorted [:MAX_PRED] slice fed the same
-    # head-of-list every run — measured on cyber-market: evidence-less rises monotonically by
+    # head-of-list every run — measured on a live deployment: evidence-less rises monotonically by
     # sort position (Q1 32 -> Q4 71; 119 pre-June predictions never regraded). Order by fewest
     # evidence entries, then oldest last-entry date, so coverage rotates instead of starving.
     open_preds.sort(key=_starvation)
@@ -299,7 +299,7 @@ def main() -> int:
         srcs = recent_sources[:MAX_SRC]
         print(f"  legacy batch: {len(preds)} open prediction(s) vs {len(srcs)} recent source(s)\n")
     print("=== open predictions ===")
-    print(
+    print(  # nosec B608 - prose prompt, not a SQL query
         "For each source below that bears on a claim, update that prediction:\n"
         "  1. append a one-line prose entry to the body `## Evidence log` (append_to_section), and\n"
         "  2. append a STRUCTURED record to the frontmatter `evidence:` list and set top-level\n"
@@ -323,7 +323,7 @@ def main() -> int:
         "skeptic pass or an explicit searched-none-found falsification note.\n"
         "No-op is correct when no new source bears. Score direction against the prediction's\n"
         "RESOLUTION CRITERIA, not the topic's importance: topic-relevant-but-outcome-silent =\n"
-        "neutral; serious-but-contained = contradicts/partial, never reinforces (#213).\n")
+        "neutral; serious-but-contained = contradicts/partial, never reinforces (#213).\n")  # nosec B608
     for i, (p, fm) in enumerate(preds, 1):
         rel = p.relative_to(v).as_posix()
         title = str(fm.get("title") or fm.get("name") or p.stem)

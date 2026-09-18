@@ -139,6 +139,9 @@ def load_enabled_state(pack_dir: Path) -> tuple[dict, list[str]]:
     enabled = data.get("enabled", {})
     if not isinstance(enabled, dict):
         return {}, [f"{path}: 'enabled' must be a mapping of id -> settings"]
+    disabled = data.get("disabled", [])
+    if not isinstance(disabled, list) or any(not isinstance(value, str) for value in disabled):
+        return {}, [f"{path}: 'disabled' must be a list of extension id strings"]
     return enabled, []
 
 
@@ -193,7 +196,7 @@ def _load_disabled(pack_dir) -> set[str]:
     except Exception:
         return set()
     d = data.get("disabled", [])
-    return set(d) if isinstance(d, list) else set()
+    return set(d) if isinstance(d, list) and all(isinstance(value, str) for value in d) else set()
 
 
 def is_core(record: dict) -> bool:

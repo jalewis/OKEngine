@@ -11,7 +11,7 @@ Produce a brief that:
 - is honest about confidence (a thin-signal thesis is a lead, not a finding).
 
 Write the brief to `frontier/brief-<YYYY-MM-DD>` (`type: report`) via
-`mcp_okengine_write_create_entity`. Open with a one-line caveat that these are market
+`mcp__okengine_write_okengine_frontier_watch_frontier_brief__create_entity`. Open with a one-line caveat that these are market
 inferences, not verified claims. If there are no whitespace-theses yet, write nothing and say so.
 LOCAL-ONLY. End with a one-line summary (how many theses briefed).
 # Model-write boundary

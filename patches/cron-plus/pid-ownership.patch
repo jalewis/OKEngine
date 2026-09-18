@@ -1,0 +1,23 @@
+diff --git a/runner.py b/runner.py
+--- a/runner.py
++++ b/runner.py
+@@ -61,6 +61,7 @@ except Exception as e:
+ import jobs as jobs_mod  # type: ignore[import]  # noqa: E402
+ import run_receipts  # type: ignore[import]  # noqa: E402
+ import model_slots  # type: ignore[import]  # noqa: E402
+ import run_timeout  # type: ignore[import]  # noqa: E402
++import pid_ownership  # type: ignore[import]  # noqa: E402
+ 
+ logging.basicConfig(
+@@ -279,10 +280,7 @@ def main() -> int:
+         )
+         return 0
+     finally:
+-        try:
+-            pid_file.unlink()
+-        except OSError:
+-            pass
++        pid_ownership.remove_if_owned(pid_file, os.getpid(), logger)
+ 
+ 
+ if __name__ == "__main__":

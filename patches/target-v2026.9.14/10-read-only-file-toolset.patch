@@ -1,0 +1,119 @@
+diff --git a/hermes_cli/tools_config.py b/hermes_cli/tools_config.py
+index afc8fcf26..6a80d98c6 100644
+--- a/hermes_cli/tools_config.py
++++ b/hermes_cli/tools_config.py
+@@ -54,6 +54,8 @@ CONFIGURABLE_TOOLSETS = [
+     ("browser",         "🌐 Browser Automation",       "navigate, click, type, scroll"),
+     ("terminal",        "💻 Terminal & Processes",      "terminal, process"),
+     ("file",            "📁 File Operations",           "read, write, patch, search"),
++    ("file_read",       "📖 Read-only Files",           "read and search; no file write or patch"),
++    ("file_read_exact", "📄 Exact File Read",           "read an explicit file; no search, write, or patch"),
+     ("code_execution",  "⚡ Code Execution",            "execute_code"),
+     ("vision",          "👁️  Vision / Image Analysis",  "vision_analyze"),
+     ("video",           "🎬 Video Analysis",            "video_analyze (requires video-capable model)"),
+diff --git a/toolsets.py b/toolsets.py
+index 24c58b967..9f6a43384 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -122,6 +122,8 @@ TOOLSETS = {
+         "search (content + files)",
+         ["read_file", "write_file", "patch", "search_files"],
+     ),
++    "file_read": _ts("Read and search files without file mutation tools", ["read_file", "search_files"]),
++    "file_read_exact": _ts("Read an explicit file without file discovery or mutation tools", ["read_file"]),
+     "tts": _ts("Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI", ["text_to_speech"]),
+     "todo": _ts("Task planning and tracking for multi-step work", ["todo_list"]),
+     "memory": _ts("Persistent memory across sessions (personal notes + user profile)", ["memory"]),
+@@ -389,6 +391,13 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
+     for included_name in toolset.get("includes", []):
+         tools.update(resolve_toolset(included_name, visited, include_registry=include_registry))
+ 
++    # Plugins and MCP aliases may register additional tools into a built-in
++    # toolset.  These two file subsets are closed capabilities: their names
++    # must never grant a write/patch/delete tool through registry merging.
++    if name == "file_read":
++        tools.intersection_update({"read_file", "search_files"})
++    elif name == "file_read_exact":
++        tools.intersection_update({"read_file"})
+     result = sorted(tools)
+     if external_call:
+         if len(_resolve_toolset_memo) >= 256:  # stale-generation entries are never hit again
+diff --git a/tests/test_read_only_file_toolsets.py b/tests/test_read_only_file_toolsets.py
+new file mode 100644
+index 000000000..edf1bb04a
+--- /dev/null
++++ b/tests/test_read_only_file_toolsets.py
+@@ -0,0 +1,73 @@
++"""The file subsets must stay closed after registry and runtime expansion."""
++
++from types import SimpleNamespace
++
++import pytest
++
++import toolsets
++from hermes_cli.tools_config import CONFIGURABLE_TOOLSETS, _get_platform_tools
++
++
++@pytest.mark.parametrize(
++    ("name", "expected"),
++    [
++        ("file_read", {"read_file", "search_files"}),
++        ("file_read_exact", {"read_file"}),
++    ],
++)
++def test_read_only_file_toolsets_resolve_only_their_declared_tools(name, expected):
++    assert name in {key for key, _, _ in CONFIGURABLE_TOOLSETS}
++    assert set(toolsets.resolve_toolset(name)) == expected
++
++
++@pytest.mark.parametrize(
++    ("name", "expected"),
++    [
++        ("file_read", {"read_file", "search_files"}),
++        ("file_read_exact", {"read_file"}),
++    ],
++)
++def test_registry_and_alias_cannot_inject_mutation_tools(monkeypatch, name, expected):
++    registry = SimpleNamespace(
++        _generation=37,
++        get_tool_names_for_toolset=lambda key: (
++            ["write_file", "patch", "delete_file", "search_files"]
++            if key == name else ["write_file", "delete_file"]
++        ),
++        get_toolset_alias_target=lambda key: "mcp-danger" if key == name else None,
++        current_scope_key=lambda: "injection-fixture",
++    )
++    monkeypatch.setattr(toolsets, "_registry", lambda: registry)
++
++    # The unfiltered registry surface is deliberately hostile; exercise the
++    # same default resolver used by model_tools, not the static-only view.
++    assert "write_file" in toolsets.get_toolset(name)["tools"]
++    assert set(toolsets.resolve_toolset(name)) == expected
++    assert set(toolsets.resolve_toolset(name)) == expected  # memoized path
++
++
++def test_explicit_read_only_platform_selection_does_not_recover_file():
++    enabled = _get_platform_tools({"platform_toolsets": {"cli": ["file_read"]}}, "cli")
++    assert "file_read" in enabled
++    assert "file" not in enabled
++
++
++def test_mixed_file_selection_is_not_a_read_only_policy():
++    from model_tools import _select_tool_names
++
++    selected = _select_tool_names(["file_read", "file"], None, quiet_mode=True)
++    assert {"write_file", "patch"} <= selected
++    assert {"read_file", "search_files"} <= selected
++
++
++@pytest.mark.parametrize("wildcard", ["all", "*"])
++def test_wildcard_includes_new_toolset_and_terminates_include_cycle(monkeypatch, wildcard):
++    monkeypatch.setattr(toolsets, "TOOLSETS", dict(toolsets.TOOLSETS))
++    toolsets.create_custom_toolset("zz-alpha", "fixture", ["read_file"], ["zz-beta"])
++    toolsets.create_custom_toolset("zz-beta", "fixture", ["search_files"], ["zz-alpha"])
++    toolsets.create_custom_toolset("zz-future", "fixture", ["future_read"])
++
++    # Exercise the public external-call path, not just the internal recursive path.
++    resolved = toolsets.resolve_toolset(wildcard, include_registry=False)
++    assert {"read_file", "search_files", "future_read"} <= set(resolved), resolved
++    assert resolved == sorted(set(resolved)), "wildcard resolution must be unique and sorted"

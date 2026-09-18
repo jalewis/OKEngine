@@ -15,7 +15,6 @@ capabilities:
   network: false
 schema:
   - schema/assessments.schema.yaml
-  - schema/qualification-result.schema.yaml
 operations:
   adversarial-evidence-review:
     schedule: {kind: cron, expr: "12 7 * * *"}

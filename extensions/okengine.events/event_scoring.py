@@ -201,8 +201,7 @@ def _source_entities(fm: dict, body: str, cfg: dict) -> set[str]:
     for field in (cfg.get("entity_field") or "entity", "entities", "subject", "subjects", "about"):
         for ref in _refs(fm.get(field)):
             leaf = ref.split("/")[-1].lower()
-            if leaf:
-                out.add(leaf)
+            out.add(leaf)
     return out
 
 

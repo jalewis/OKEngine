@@ -61,3 +61,14 @@ def test_degenerate_equal_range_never_defers(monkeypatch, capsys):  # invariant-
     assert "no valid" in capsys.readouterr().err
     # a MIX of a degenerate part + a real window still honors the real part (no false warning)
     assert offpeak._spec_has_valid_window("9-9,1-4") is True
+
+
+def test_single_hours_empty_parts_out_of_range_and_invalid_tokens(monkeypatch):
+    assert offpeak._spec_has_valid_window(", 5 ,")
+    assert offpeak.in_defer_window(5, ", 5 ,") is True
+    assert offpeak.in_defer_window(6, ", 5 ,") is False
+    assert not offpeak._spec_has_valid_window("24, -1, x, 30-40")
+    assert offpeak.in_defer_window(5, "x, 30-40, ,") is False
+    monkeypatch.setenv("CRON_DEFER_UTC_HOURS", "5")
+    # No explicit `now` exercises the real UTC clock path without asserting its hour.
+    assert isinstance(offpeak.offpeak_defer(), bool)

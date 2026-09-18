@@ -8,17 +8,28 @@ reusable.
 
 ## Dev setup
 
+Always work in a **virtualenv** — the system Python is often minimal or externally-managed
+(PEP 668), so installing into it fails and `make check`/`make audit` won't find their tools.
+
 ```sh
 python -m venv .venv && . .venv/bin/activate
-make dev          # pip install -r requirements-dev.txt (pytest, pyyaml, ruff, + the check tools)
-make test         # python -m pytest
-make lint         # syntax + real-bug lint (no style enforcement)
-make check        # lint + test + scaffold-check (the fast gate CI runs)
+make dev          # pip install -r requirements-dev.txt
+make check        # scrub + lint + full test suite + scaffold-check — the fast gate CI runs
 ```
 
-The test suite runs offline. The tests that exercise the MCP servers **self-skip**
-when the `mcp` package isn't installed; for the full suite also
-`pip install -r okengine-mcp/requirements.txt`.
+`make dev` installs the whole fast-gate **and** deeper-check toolchain from `requirements-dev.txt`:
+`pytest` + `ruff` (test/lint), `pip-audit` + `bandit` (`make audit`), `mypy` (`make typecheck`), and
+`fastapi` + `markdown` + `nh3` so the reader/cockpit tests **run** instead of self-skipping.
+
+The suite is offline. Tests that exercise the MCP servers or the cron scheduler **self-skip** when
+their runtime deps are absent — for the **full** suite (nothing skipped) also install those:
+
+```sh
+pip install -r okengine-mcp/requirements.txt croniter   # MCP servers + croniter (cron/schedule tests)
+```
+
+Run every gate **inside the activated venv** — on a bare/externally-managed system Python `make audit`
+fails with `No module named pip_audit` and the reader/MCP tests silently skip (a skip is not a pass).
 
 Deeper quality checks (separate from the fast `make check` gate; each also a CI job):
 

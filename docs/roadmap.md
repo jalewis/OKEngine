@@ -1,5 +1,10 @@
 # OKEngine roadmap
 
+Roadmap scope follows the accepted
+[`product boundary`](design/product-boundary.md): OKEngine is the governed compilation and
+maintenance plane for evidence-backed knowledge products; Hermes is its execution adapter, while
+reader, cockpit, and analytical applications consume kernel contracts.
+
 OKEngine is an **engine for swappable-topic LLM wikis** — the catalyst is Karpathy's
 LLM-maintained-wiki pattern. A live deployment is OKEngine @ a pinned Hermes + one pack or bundle;
 **security is the first concrete domain profile**. Pages are portable via **OKF** (Open

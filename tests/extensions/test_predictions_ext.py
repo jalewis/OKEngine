@@ -31,6 +31,7 @@ def _manifest():
     return yaml.safe_load((EXT / "extension.yaml").read_text(encoding="utf-8"))
 
 
+@pytest.mark.contract
 def test_manifest_is_valid_and_first_party():
     mod = _load("extension_manifest", MANIFEST)
     m = _manifest()
@@ -40,6 +41,7 @@ def test_manifest_is_valid_and_first_party():
     assert not errors, errors
 
 
+@pytest.mark.contract
 def test_composes_into_agent_and_no_agent_jobs():
     c = _load("extension_compose", COMPOSE)
     rec = {"id": "okengine.predictions", "tier": "engine", "dir": str(EXT), "manifest": _manifest()}
@@ -70,6 +72,7 @@ def test_composes_into_agent_and_no_agent_jobs():
         assert j["script"].endswith(".py")
 
 
+@pytest.mark.contract
 def test_bundled_prompt_files_exist_and_nonempty():
     for op in ("candidate-watch", "grade", "regrade", "base-rates",
                "falsification-search", "output-outcome-eval", "structural-backfill", "schema-drain"):
@@ -77,6 +80,15 @@ def test_bundled_prompt_files_exist_and_nonempty():
         assert f.is_file() and f.read_text(encoding="utf-8").strip(), op
 
 
+@pytest.mark.contract
+def test_schema_drain_transcribes_deterministic_horizon_from_digest():
+    prompt = (EXT / "prompts" / "schema-drain.md").read_text(encoding="utf-8")
+    assert "transcribe" in prompt
+    assert "authoritative" in prompt
+    assert "Do not independently reclassify" in prompt
+
+
+@pytest.mark.contract
 def test_write_capabilities():
     m = _manifest()
     # predictions (the book) + dashboards (derived base-rates / outcome-eval).
@@ -87,4 +99,48 @@ def test_write_capabilities():
     assert m.get("schema") == ["schema/predictions.schema.yaml"]
     import yaml as _y
     frag = _y.safe_load((EXT / "schema" / "predictions.schema.yaml").read_text(encoding="utf-8"))
-    assert set(frag) == {"field_items"}, f"fragment grew beyond the item contract: {set(frag)}"
+    # still ONLY field contracts — the fragment must never grow owns/extends (the prediction TYPE
+    # stays pack-owned). `field_enums` gave way to `field_shapes` in okengine#563.
+    assert set(frag) == {"enums", "field_items", "field_shapes"}, (
+        f"fragment grew beyond field contracts: {set(frag)}")
+    # okengine#563: `confidence` on a prediction is the PROBABILITY this extension's calibration
+    # lane feeds to a Brier score, so it is bound by SHAPE, not by a band vocabulary. The
+    # prediction_confidence enum stays defined for a pack that carries a separate band field.
+    assert "field_enums" not in frag, (
+        "binding `confidence` to a band enum contradicts calibration_refresh's Brier score and 91% "
+        "of the corpus; declare a numeric shape instead")
+    assert frag["field_shapes"]["confidence"]["by_type"]["prediction"] == "number"
+    assert frag["enums"]["prediction_confidence"] == [
+        "very-low", "low", "medium-low", "medium", "medium-high", "high", "very-high",
+    ]
+
+
+def test_confidence_is_declared_numeric_for_predictions():
+    """The contract moved from vocabulary to SHAPE. calibration_refresh computes
+    `sum((confidence - outcome) ** 2) / n`; a band string cannot participate in that, and the
+    corpus is 79-91% numeric on the two live vaults measured."""
+    import yaml as _y
+    frag = _y.safe_load((EXT / "schema" / "predictions.schema.yaml").read_text(encoding="utf-8"))
+    assert frag["field_shapes"]["confidence"]["by_type"] == {"prediction": "number"}
+    validator = _load("predictions_schema_validator", REPO / "tools" / "schema_validator.py")
+    # and no enum governs it any more, on prediction or anywhere else
+    assert validator._enum_reject_reason(frag, "prediction", {"confidence": 0.65}) is None
+    assert validator._enum_reject_reason(frag, "assessment", {"confidence": 0.65}) is None
+
+
+def test_structural_backfill_selection_is_bound_to_prewrite_digest(tmp_path, monkeypatch):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    sys.path.insert(0, str(EXT))
+    sys.path.insert(0, str(REPO / "scripts" / "cron"))
+    selector = _load(
+        "prediction_structural_selector",
+        EXT / "select_prediction_structural_backfill.py",
+    )
+    page = tmp_path / "wiki" / "predictions" / "one.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("# One\n")
+
+    key = selector._selection_key(page, tmp_path)
+
+    assert key.startswith("wiki/predictions/one.md|sha256:")
+    assert len(key.rsplit(":", 1)[1]) == 64

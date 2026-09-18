@@ -29,3 +29,39 @@ def test_grounding(tmp_path, monkeypatch):
     assert "ungrounded: **2**" in dash          # prose-only + no-src
     assert "dangling: **1**" in dash            # cites missing source
     assert "entities/a/cve" not in dash   # reference import excluded from worklists
+
+
+def _load(tmp_path,monkeypatch):
+    monkeypatch.setenv("WIKI_PATH",str(tmp_path));monkeypatch.setenv("GROUNDING_NAMESPACES","entities,missing")
+    spec=importlib.util.spec_from_file_location("grounding_audit_edges",REPO/"scripts/cron/grounding_audit.py")
+    m=importlib.util.module_from_spec(spec);sys.modules[spec.name]=m;spec.loader.exec_module(m);return m
+
+
+def test_grounding_empty_missing_and_filtered_pages(tmp_path,monkeypatch):
+    m=_load(tmp_path,monkeypatch)
+    assert m.main()==1
+    entities=tmp_path/"wiki/entities";entities.mkdir(parents=True)
+    for name,text in {
+      "_skip.md":"plain","INDEX.md":"plain","INDEX-a.md":"plain",
+      "plain.md":"plain","bad.md":"---\n[bad\n---\n",
+    }.items():(entities/name).write_text(text)
+    assert m._stem("[[sources/2026/X.md]]")=="x"
+    assert m._fm(entities/"plain.md")=={}
+    assert m.main()==0
+    dash=(tmp_path/"wiki/dashboards/source-grounding.md").read_text()
+    assert "100%" in dash and "in scope: **0**" in dash
+
+
+def test_grounding_sample_cap_and_partial_band(tmp_path,monkeypatch):
+    sources=tmp_path/"wiki/sources";sources.mkdir(parents=True)
+    (sources/"_skip.md").write_text("x");(sources/"INDEX.md").write_text("x")
+    (sources/"real.md").write_text("---\ntype: source\n---\n")
+    entities=tmp_path/"wiki/entities";entities.mkdir()
+    for i in range(4):
+      src="sources/real" if i<2 else ("sources/missing" if i==2 else None)
+      body=f"---\ntype: entity\n"+(f"sources: [{src}]\n" if src else "")+"---\n"
+      (entities/f"{i}.md").write_text(body)
+    m=_load(tmp_path,monkeypatch);m.SAMPLES=0
+    assert m.main()==0
+    dash=(tmp_path/"wiki/dashboards/source-grounding.md").read_text()
+    assert "🟡 partial" in dash and "## Ungrounded" not in dash and "## Dangling" not in dash

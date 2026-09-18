@@ -54,6 +54,11 @@ def test_clean_markdown_survives_yaml_date_title(tmp_path, monkeypatch):
     assert out.lstrip().startswith("# 2026-07-08")
 
 
+def test_value_text_facade_delegates_to_page_metadata(tmp_path, monkeypatch):
+    m = _load(tmp_path, monkeypatch)
+    assert m._val_text(["alpha", "beta"]) == "['alpha', 'beta']"
+
+
 # ── #21: the unresolved-embed rglob is memoized across renders ──────────────
 class _CountingWiki:
     """Proxy for the WIKI Path that counts rglob() calls (the expensive full-vault walk)."""

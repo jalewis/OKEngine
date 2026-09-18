@@ -17,8 +17,7 @@ tokens this contract injects now exist.
 A sidecar is the extension's own container: the *intended* isolation boundary (§7).
 
 **Implemented:** manifest image-entrypoint validation (digest-pinned; `script` xor
-`image` tied to `trust`); the composer emits a **trigger cron job** for a sidecar
-(script = a generated `…/<id>/trigger.sh`); `extension_compose.sidecar_specs` /
+`image` tied to `trust`); `extension_compose.sidecar_specs` /
 `render_sidecar_service` / `render_trigger_wrapper` / `sidecar_compose_override`; and
 `framework extensions sidecar-generate` writes `<pack>/.okengine/generated/
 sidecars.compose.yml` (a compose override with each sidecar service — host network,
@@ -26,12 +25,13 @@ digest-pinned image, the #132 scoped token + MCP endpoints + `extension_id` inje
 env) plus the per-extension `trigger.sh`. The override holds tokens → written `0600`.
 **Operator-opt-in / not auto-wired:** actually launching the sidecar needs (a) a real
 sidecar image and (b) docker reachable from the host-net gateway (a socket mount — the
-§3.4 trust note), so the deploy does **not** auto-launch sidecars. The operator brings
-them up with `docker compose -f docker-compose.yml -f
-.okengine/generated/sidecars.compose.yml …` and stages the wrappers into the gateway;
+§3.4 trust note), so the deploy does **not** auto-launch or schedule sidecars. It emits
+the compose override and candidate wrapper, but omits the cron job until a supported
+container-runner transport exists. An operator can run a generated service directly with
+`docker compose -f docker-compose.yml -f .okengine/generated/sidecars.compose.yml run …`;
 disable revokes the token (#132) and the sidecar is removed with `docker compose … rm
--f <id>-sidecar`. No first-party sidecar extension ships yet, so live execution is
-unexercised — the in-gateway path (the first slice) is the proven one.
+-f <id>-sidecar`. No first-party sidecar extension ships yet, so live scheduled execution is
+unimplemented — the in-gateway path (the first slice) is the proven one.
 
 ## 1. Current state
 

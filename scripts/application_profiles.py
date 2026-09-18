@@ -76,7 +76,7 @@ def _load_profile(profile_id: str, engine_root: Path, ancestry: tuple[str, ...])
             f"profile {profile_id!r} extends.profile {parent_id!r}: {exc}") from exc
     floor = _floor(extends.get("version"))
     parent_version = _version(parent.get("version"))
-    if floor is None:
+    if floor is None:  # pragma: no cover - manifest validation rejects this before recursion
         raise ApplicationProfileError(
             f"profile {profile_id!r} extends.version must be a semantic-version floor (>=X.Y.Z)")
     if parent_version is None or parent_version < floor:
@@ -85,7 +85,7 @@ def _load_profile(profile_id: str, engine_root: Path, ancestry: tuple[str, ...])
             f"catalog parent version is {parent.get('version')!r}")
     effective = _merge_profiles(parent, profile)
     effective_errors = validate_profile_manifest(effective)
-    if effective_errors:
+    if effective_errors:  # pragma: no cover - merge helpers preserve validated contracts
         raise ApplicationProfileError(
             f"profile {profile_id!r} effective inherited contract: " + "; ".join(effective_errors))
     return effective

@@ -1,11 +1,11 @@
 # Installing OKEngine on Hermes
 
-OKEngine = **a pinned Hermes** + **12 carried patches** + an **overlay** (new
+OKEngine = **a pinned Hermes** + **22 carried patch artifacts** + an **overlay** (new
 files) + **plugins** + **config**, then **one pack or bundle**. This is the procedure
 to take a stock Hermes install and bring it up to OKEngine — i.e. the exact
 stock→OKEngine delta.
 
-**Pinned dependency:** Hermes **v0.18.2** = upstream git tag **`v2026.7.7.2`**
+**Pinned dependency:** Hermes **v0.21.3** = upstream git tag **`v2026.9.14`**
 (`github.com/NousResearch/hermes-agent`). The engine is cut against this version;
 a different Hermes version may require rebasing the patches.
 
@@ -131,14 +131,14 @@ script does, if you prefer to do it by hand.
 ## 1. Pin Hermes
 ```bash
 git clone https://github.com/NousResearch/hermes-agent.git hermes
-cd hermes && git checkout v2026.7.7.2         # == Hermes v0.18.2
+cd hermes && git checkout v2026.9.14           # == Hermes v0.21.3
 ```
 
-## 2. Apply the carried patches (12 core-file patches)
+## 2. Apply the carried patches (22 carried patch artifacts)
 ```bash
 <OKEngine>/patches/apply.sh "$PWD"           # idempotent; fails loudly on drift
 ```
-What each patch is and why: `patches/README.md`. (The schema write-guard is the
+What each patch is and why: `patches/target-v2026.9.14/README.md`. (The schema write-guard is the
 only OKF-specific one; the rest are generic hardening/pricing.)
 
 ## 3. Install the overlay (the engine's new files — no patching)

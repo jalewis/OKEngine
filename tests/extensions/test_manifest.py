@@ -105,3 +105,45 @@ def test_load_manifest_absent_and_parse_error(tmp_path):
     (tmp_path / "extension.yaml").write_text("123\n", encoding="utf-8")
     with pytest.raises(m.ManifestError):
         m.load_manifest(tmp_path)                      # not a mapping
+
+
+def test_iteration_requires_engine_and_write_policy_validation_paths():
+    m = _mod()
+    errors, _ = m.validate_manifest(_valid(
+        requires={},
+        operation={"schedule": "0 * * * *", "prompt": "x", "max_iterations": False},
+        capabilities={"write_policy": "invalid"},
+    ))
+    assert any(error.startswith("requires.engine is required") for error in errors)
+    assert any("max_iterations" in error for error in errors)
+    assert "capabilities.write_policy must be a mapping" in errors
+
+    errors, _ = m.validate_manifest(_valid(capabilities={"write_policy": {
+        "rule_id": "rule", "operations": ["create", "unknown"],
+        "paths": ["wiki/**"], "types": ["entity"], "update_fields": [],
+        "protected_fields": [], "body": "invalid", "extra": True,
+    }}))
+    assert any("unknown keys" in error for error in errors)
+    assert any("unknown values" in error for error in errors)
+    assert any("body must be" in error for error in errors)
+
+    valid_policy = {
+        "rule_id": "rule", "operations": ["create", "update"],
+        "paths": ["wiki/**"], "types": ["entity"], "update_fields": [],
+        "protected_fields": [], "body": "allow",
+    }
+    errors, _ = m.validate_manifest(_valid(capabilities={"write_policy": valid_policy}))
+    assert errors == []
+
+
+def test_agent_operation_requires_explicit_iteration_bound():
+    m = _mod()
+    errors, _ = m.validate_manifest(_valid(operation={
+        "schedule": "0 * * * *", "prompt": "bounded work",
+    }))
+    assert any("max_iterations is required" in error for error in errors)
+
+    errors, _ = m.validate_manifest(_valid(operation={
+        "schedule": "0 * * * *", "prompt": "bounded work", "max_iterations": 8,
+    }))
+    assert errors == []

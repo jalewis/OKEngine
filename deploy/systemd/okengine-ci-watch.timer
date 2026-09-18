@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll OKEngine default-branch and scheduled pipeline health
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=5m
+Persistent=true
+Unit=okengine-ci-watch.service
+
+[Install]
+WantedBy=timers.target

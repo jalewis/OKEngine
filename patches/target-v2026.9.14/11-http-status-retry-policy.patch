@@ -1,0 +1,1091 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index e62cf5179..6113f2198 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1351,6 +1351,31 @@ def _apply_agent_section(agent, _agent_cfg):
+     except (TypeError, ValueError):
+         _api_retries = 3
+     agent._api_max_retries = _api_retries
++    # Local pools can publish status-specific total attempt and fallback
++    # contracts.  The loop ceiling reaches the widest rule, while the error
++    # handler applies each status's own bound (first request counts).
++    _raw_http_policy = _agent_section.get("http_status_policy", {})
++    _http_policy = {}
++    if isinstance(_raw_http_policy, dict):
++        for _status, _rule in _raw_http_policy.items():
++            if not isinstance(_rule, dict) or isinstance(_status, (bool, float)):
++                continue
++            try:
++                _status_int = int(_status)
++                _attempts = int(_rule.get("max_attempts", _api_retries))
++            except (TypeError, ValueError):
++                continue
++            if (not 100 <= _status_int <= 599 or _attempts < 1
++                    or isinstance(_rule.get("max_attempts"), (bool, float))):
++                continue
++            _fallback = _rule.get("fallback", True)
++            if not isinstance(_fallback, bool):
++                continue
++            _http_policy[str(_status_int)] = {"max_attempts": _attempts, "fallback": _fallback}
++    agent._http_status_policy = _http_policy
++    agent._api_retry_loop_ceiling = max(
++        [_api_retries] + [rule["max_attempts"] for rule in _http_policy.values()]
++    )
+ 
+ 
+ def _positive_int(raw: Any, *, reject: tuple = ()) -> Optional[int]:
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 6739c096e..6283903a9 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1525,7 +1525,9 @@ def _run_conversation_turn(
+             continue
+         _run_phase(announce_api_call, agent, s)
+ 
+-        s.api_start_time, s.retry_count, s.max_retries = time.time(), 0, agent._api_max_retries
++        s.api_start_time, s.retry_count, s.max_retries = (
++            time.time(), 0, getattr(agent, "_api_retry_loop_ceiling", agent._api_max_retries)
++        )
+         s._retry, s.finish_reason, s.response, s.api_kwargs = TurnRetryState(), "stop", None, None
+         s.api_request_id = agent._current_api_request_id = f"{s.turn_id}:api:{s.api_call_count}"
+ 
+diff --git a/agent/turn_api_error.py b/agent/turn_api_error.py
+index 27b383f6f..fbb54fe2e 100644
+--- a/agent/turn_api_error.py
++++ b/agent/turn_api_error.py
+@@ -59,6 +59,19 @@ def handle_api_error(
+     the retry loop with ``restart_with_rebuilt_messages`` armed (``"break"``) so the pre-API
+     preflight re-runs against the fallback's context window (#84733)."""
+     _provider_overflow_recovery_pending = False
++    status_code = getattr(api_error, "status_code", None)
++    _status_rule = getattr(agent, "_http_status_policy", {}).get(str(status_code))
++    _status_policy_bound = isinstance(_status_rule, dict)
++    max_retries = (
++        _status_rule["max_attempts"] if _status_policy_bound else agent._api_max_retries
++    )
++    _allow_status_fallback = (
++        _status_rule["fallback"] if _status_policy_bound else True
++    )
++    # retry_count counts failures before this request; the failed request is
++    # attempt retry_count+1. A status bound cannot be refunded by an early
++    # recovery branch, but a permitted fallback remains a separate provider.
++    _status_exhausted = _status_policy_bound and retry_count + 1 >= max_retries
+ 
+     def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> ApiErrorVerdict:
+         return ApiErrorVerdict(
+@@ -77,14 +90,15 @@ def handle_api_error(
+     if agent.thinking_callback:
+         agent.thinking_callback("")
+ 
+-    _recovered, active_system_prompt = recover_before_classification(
+-        agent, api_error, messages=messages, api_messages=api_messages, api_kwargs=api_kwargs,
+-        active_system_prompt=active_system_prompt,
+-    )
++    _recovered = False
++    if not _status_exhausted:
++        _recovered, active_system_prompt = recover_before_classification(
++            agent, api_error, messages=messages, api_messages=api_messages, api_kwargs=api_kwargs,
++            active_system_prompt=active_system_prompt,
++        )
+     if _recovered:
+         return _verdict("continue")
+ 
+-    status_code = getattr(api_error, "status_code", None)
+     error_context = agent._extract_api_error_context(api_error)
+ 
+     # Process is exiting mid-flight: retries/rotation/fallbacks are futile and the
+@@ -125,10 +139,12 @@ def handle_api_error(
+         reason=classified.reason.value,
+     )
+ 
+-    _recovered, recovered_with_pool = recover_after_classification(
+-        agent, api_error, classified, _retry, status_code=status_code, error_context=error_context,
+-        messages=messages, api_messages=api_messages,
+-    )
++    _recovered, recovered_with_pool = False, False
++    if not _status_exhausted:
++        _recovered, recovered_with_pool = recover_after_classification(
++            agent, api_error, classified, _retry, status_code=status_code, error_context=error_context,
++            messages=messages, api_messages=api_messages,
++        )
+     if _recovered:
+         return _verdict("continue")
+ 
+@@ -161,6 +177,9 @@ def handle_api_error(
+         retry_count=retry_count, max_retries=max_retries, compression_attempts=compression_attempts,
+         max_compression_attempts=max_compression_attempts, api_call_count=api_call_count,
+         effective_task_id=effective_task_id,
++        allow_status_fallback=_allow_status_fallback,
++        status_policy_bound=_status_policy_bound,
++        status_exhausted=_status_exhausted,
+     )
+     status_code = _ce.status_code
+     messages = _ce.messages
+@@ -177,25 +196,27 @@ def handle_api_error(
+     if _ce.action != "fallthrough":
+         return _verdict(_ce.action, _ce.result)
+ 
+-    _ov = recover_from_overflow(
+-        agent, api_error, classified, _retry, status_code=status_code, error_msg=error_msg,
+-        wrapped_output_cap_budget=_wrapped_output_cap_budget, messages=messages,
+-        api_messages=api_messages, system_message=system_message,
+-        active_system_prompt=active_system_prompt, conversation_history=conversation_history,
+-        approx_tokens=approx_tokens, compression_attempts=compression_attempts,
+-        max_compression_attempts=max_compression_attempts, api_call_count=api_call_count,
+-        effective_task_id=effective_task_id,
+-    )
+-    messages = _ov.messages
+-    active_system_prompt = _ov.active_system_prompt
+-    conversation_history = _ov.conversation_history
+-    approx_tokens = _ov.approx_tokens
+-    compression_attempts = _ov.compression_attempts
+-    is_context_length_error = _ov.is_context_length_error
+-    if _ov.provider_overflow_recovery_pending:
+-        _provider_overflow_recovery_pending = True
+-    if _ov.action != "fallthrough":
+-        return _verdict(_ov.action, _ov.result)
++    is_context_length_error = False
++    if not _status_exhausted:
++        _ov = recover_from_overflow(
++            agent, api_error, classified, _retry, status_code=status_code, error_msg=error_msg,
++            wrapped_output_cap_budget=_wrapped_output_cap_budget, messages=messages,
++            api_messages=api_messages, system_message=system_message,
++            active_system_prompt=active_system_prompt, conversation_history=conversation_history,
++            approx_tokens=approx_tokens, compression_attempts=compression_attempts,
++            max_compression_attempts=max_compression_attempts, api_call_count=api_call_count,
++            effective_task_id=effective_task_id,
++        )
++        messages = _ov.messages
++        active_system_prompt = _ov.active_system_prompt
++        conversation_history = _ov.conversation_history
++        approx_tokens = _ov.approx_tokens
++        compression_attempts = _ov.compression_attempts
++        is_context_length_error = _ov.is_context_length_error
++        if _ov.provider_overflow_recovery_pending:
++            _provider_overflow_recovery_pending = True
++        if _ov.action != "fallthrough":
++            return _verdict(_ov.action, _ov.result)
+ 
+     _ue = settle_unrecovered_error(
+         agent, api_error=api_error, classified=classified, _retry=_retry, status_code=status_code,
+@@ -206,6 +227,8 @@ def handle_api_error(
+         conversation_history=conversation_history, approx_tokens=approx_tokens,
+         retry_count=retry_count, max_retries=max_retries, compression_attempts=compression_attempts,
+         api_call_count=api_call_count,
++        allow_status_fallback=_allow_status_fallback,
++        status_policy_bound=_status_policy_bound,
+     )
+     active_system_prompt = _ue.active_system_prompt
+     retry_count = _ue.retry_count
+@@ -253,6 +276,7 @@ def settle_unrecovered_error(
+     _provider: Any, _base: Any, _model: Any, messages: Any, api_messages: Any, api_kwargs: Any,
+     active_system_prompt: Any, conversation_history: Any, approx_tokens: Any, retry_count: Any,
+     max_retries: Any, compression_attempts: Any, api_call_count: Any,
++    allow_status_fallback: bool = True, status_policy_bound: bool = False,
+ ) -> UnrecoveredErrorVerdict:
+     """Decide the fate of an API error that every recovery chain declined: local validation /
+     non-retryable client errors (Copilot stale-credential self-heal first, then fallback, then a
+@@ -310,7 +334,7 @@ def settle_unrecovered_error(
+         # the cascade. An UNCLASSIFIED local ValueError/TypeError keeps its historical fallback;
+         # a recognised verdict that opts out wins even when the exception is a ValueError subclass.
+         _unclassified_local = is_local_validation_error and classified.reason == FailoverReason.unknown
+-        if classified.should_fallback or _unclassified_local:
++        if allow_status_fallback and (classified.should_fallback or _unclassified_local):
+             # Announce the fallback only when a chain exists, else "trying fallback..." lies
+             # before a silent abort.
+             if agent._has_pending_fallback():
+@@ -332,7 +356,7 @@ def settle_unrecovered_error(
+     if retry_count >= max_retries:
+         # Before fallback, rebuild the primary client once per API call block for
+         # transient transport errors (stale pool, TCP reset).
+-        if not _retry.primary_recovery_attempted and agent._try_recover_primary_transport(
++        if not status_policy_bound and not _retry.primary_recovery_attempted and agent._try_recover_primary_transport(
+             api_error, retry_count=retry_count, max_retries=max_retries,
+         ):
+             _retry.primary_recovery_attempted = True
+@@ -343,9 +367,9 @@ def settle_unrecovered_error(
+             agent._fallback_index = 0
+             agent._fallback_activated = False
+             return _verdict("continue")
+-        if agent._has_pending_fallback():
++        if allow_status_fallback and agent._has_pending_fallback():
+             agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
+-        if agent._try_activate_fallback():
++        if allow_status_fallback and agent._try_activate_fallback():
+             # Direct ``return _verdict("break")`` is load-bearing: the restart handler
+             # re-runs the pre-API preflight against the fallback's context window.
+             active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
+diff --git a/agent/turn_recovery.py b/agent/turn_recovery.py
+index 910418588..831dbc82b 100644
+--- a/agent/turn_recovery.py
++++ b/agent/turn_recovery.py
+@@ -1314,7 +1314,8 @@ def route_classified_error(
+     messages: List[Dict[str, Any]], api_messages: Any, system_message: Any,
+     active_system_prompt: Any, conversation_history: Any, retry_count: int, max_retries: int,
+     compression_attempts: int, max_compression_attempts: int, api_call_count: int,
+-    effective_task_id: Any,
++    effective_task_id: Any, allow_status_fallback: bool = True,
++    status_policy_bound: bool = False, status_exhausted: bool = False,
+ ) -> ClassifiedErrorVerdict:
+     """Ordered (load-bearing) recovery steps between classification and overflow handling:
+     compaction-disabled overflow → terminal error (output-cap errors exempt); Anthropic
+@@ -1385,7 +1386,7 @@ def route_classified_error(
+ 
+     # Anthropic 429 "Extra usage is required for long context requests" is a
+     # subscription-tier limit, not transient: cap at 200k and compress.
+-    if classified.reason == FailoverReason.long_context_tier:
++    if classified.reason == FailoverReason.long_context_tier and not status_exhausted:
+         old_ctx = _cap_long_context_tier(agent)
+         compression_attempts += 1
+         if compression_attempts <= max_compression_attempts:
+@@ -1434,13 +1435,13 @@ def route_classified_error(
+     # Z.AI overload 429s classify `overloaded`, which `is_rate_limited` excludes. Detect
+     # directly so the long backoff runs, and raise the ceiling to reach it.
+     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
+-    if _is_zai_coding_overload:
++    if _is_zai_coding_overload and not status_policy_bound:
+         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+     _should_fallback = (
+         (is_rate_limited and _wrapped_output_cap_budget is None)
+         or (_is_transport_failure and retry_count >= 2)
+     )
+-    if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
++    if allow_status_fallback and _should_fallback and agent._fallback_index < len(agent._fallback_chain):
+         # No eager fallback while credential pool rotation may recover. Exception: an
+         # upstream-aggregator 429 — the pool can't help, always fall back.
+         # Fixes #11314.
+@@ -1456,7 +1457,8 @@ def route_classified_error(
+     # A 401/403 surviving credential refresh means a broken credential or endpoint:
+     # escalate to the fallback chain once; False -> terminal handling.
+     if (
+-        classified.is_auth
++        allow_status_fallback
++        and classified.is_auth
+         and not _retry.auth_failover_attempted
+         and agent._fallback_index < len(agent._fallback_chain)
+     ):
+@@ -1471,7 +1473,8 @@ def route_classified_error(
+     # Nous Portal: a genuine account-level 429 is recorded to a shared file so ALL
+     # sessions back off; is_genuine_nous_rate_limit excludes upstream 429s.
+     if (
+-        is_rate_limited
++        not status_exhausted
++        and is_rate_limited
+         and agent.provider == "nous"
+         and classified.reason == FailoverReason.rate_limit
+         and not recovered_with_pool
+diff --git a/run_agent.py b/run_agent.py
+index b4aa878422..95472569f3 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -1200,7 +1200,17 @@ class AIAgent:
+     _split_responses_tool_id = staticmethod(_codex_split_responses_tool_id)
+     _derive_responses_function_call_id = staticmethod(_codex_derive_responses_function_call_id)
+ 
+-    _interruptible_api_call = _forward("agent.chat_completion_helpers", "interruptible_api_call")
++    def _interruptible_api_call(self, api_kwargs):
++        """Apply a one-shot output-cap correction on wire modes whose builder has no override."""
++        ephemeral = getattr(self, "_ephemeral_max_output_tokens", None)
++        if ephemeral is not None:
++            self._ephemeral_max_output_tokens = None
++            api_kwargs = dict(api_kwargs)
++            key = "max_output_tokens" if self.api_mode == "codex_responses" else "max_tokens"
++            api_kwargs[key] = ephemeral
++        from agent.chat_completion_helpers import interruptible_api_call
++        return interruptible_api_call(self, api_kwargs)
++
+     _interruptible_streaming_api_call = _forward("agent.chat_completion_helpers", "interruptible_streaming_api_call")
+     _try_activate_fallback = _forward("agent.chat_completion_helpers", "try_activate_fallback")
+ 
+diff --git a/agent/turn_overflow.py b/agent/turn_overflow.py
+index c11f783e0..7e82eb9d1 100644
+--- a/agent/turn_overflow.py
++++ b/agent/turn_overflow.py
+@@ -116,7 +116,9 @@ class _Recovery(OverflowVerdict):
+         result.update(extra)
+         return self.done("return", result)
+ 
+-    def count_attempt(self, *, payload_too_large: bool = False) -> Optional[OverflowVerdict]:
++    def count_attempt(
++        self, *, payload_too_large: bool = False, output_cap_only: bool = False
++    ) -> Optional[OverflowVerdict]:
+         """Bump ``compression_attempts``; the terminal verdict once the cap is exceeded."""
+         self.compression_attempts += 1
+         cap = self.max_compression_attempts
+@@ -131,6 +133,17 @@ class _Recovery(OverflowVerdict):
+                 ),
+                 log=("%s413 compression failed after %d attempts.", self.agent.log_prefix, cap),
+             )
++        if output_cap_only:
++            # An output-cap request-shape error is not evidence that the
++            # transcript is bloated. Do not ask the gateway to reset it after
++            # a request-shape failure, whether compaction was enabled or not.
++            return self.fail_turn(
++                f"Output cap rejected: max adjustment attempts ({cap}) reached.",
++                notices=(f"❌ Max output-cap adjustment attempts ({cap}) reached.", _RETRY_HINT),
++                log=("%sOutput-cap adjustment failed after %d attempts.", self.agent.log_prefix, cap),
++                compression_exhausted=False,
++                output_cap_exhausted=True,
++            )
+         return self.fail_turn(
+             f"Context length exceeded: max compression attempts ({cap}) reached.",
+             notices=(f"❌ Max compression attempts ({cap}) reached.", _RETRY_HINT),
+@@ -293,20 +306,23 @@ def _clamp_output_cap(st: _Recovery, _retry: TurnRetryState, available_out: int,
+         f"context_length unchanged at {old_ctx:,})"
+     )
+     # Still count against compression_attempts so a recurring error can't loop forever.
+-    exhausted = st.count_attempt()
++    compression_enabled = getattr(agent, "compression_enabled", True)
++    exhausted = st.count_attempt(output_cap_only=True)
+     if exhausted is not None:
+         return exhausted
+-    # Also compress history so the retry doesn't spin on max_tokens alone; dropping the
+-    # middle window makes the total fit. Compression must never turn an output-cap error
+-    # fatal — on error, fall through and retry on max_tokens alone.
+-    try:
+-        deferred, _shrank, _new_tokens = st.compress_scored_by_tokens(request_input_estimate)
+-        if deferred is not None:
+-            return deferred
+-    except Exception:
+-        logger.warning(
+-            "%sOutput-cap compression hit an error; retrying on max_tokens only.", agent.log_prefix
+-        )
++    # With compaction enabled, shrinking history may also make the request fit.
++    # With it disabled, only adjust max_tokens; never rewrite the transcript.
++    if compression_enabled:
++        try:
++            deferred, _shrank, _new_tokens = st.compress_scored_by_tokens(request_input_estimate)
++            if deferred is not None:
++                return deferred
++        except Exception:
++            logger.warning(
++                "%sOutput-cap compression hit an error; retrying on max_tokens only.", agent.log_prefix
++            )
++    # The request must be rebuilt with the corrected cap even when messages
++    # were left untouched.
+     _retry.restart_with_compressed_messages = True
+     return st.done("break")
+ 
+diff --git a/tests/agent/test_http_status_policy.py b/tests/agent/test_http_status_policy.py
+new file mode 100644
+index 000000000..f88955512
+--- /dev/null
++++ b/tests/agent/test_http_status_policy.py
+@@ -0,0 +1,717 @@
++"""Local pool HTTP status contracts on the real agent and retry surfaces."""
++
++import json
++import ssl
++
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from run_agent import AIAgent
++
++
++class _HTTPError(Exception):
++    def __init__(self, status):
++        super().__init__(f"Error code: {status} - local pool capacity")
++        self.status_code = status
++        self.response = SimpleNamespace(headers={})
++        self.body = {"error": {"message": "local pool capacity"}}
++
++
++class _ContextOverflowError(Exception):
++    def __init__(self):
++        message = (
++            "This model's maximum context length is 128000 tokens. "
++            "However, you requested 140000 tokens."
++        )
++        super().__init__(message)
++        self.status_code = 400
++        self.response = SimpleNamespace(headers={})
++        self.body = {"error": {"message": message}}
++
++
++class _WrappedOutputCapError(Exception):
++    def __init__(self):
++        message = (
++            "Error code: 429 - [400]: max_tokens (32768) exceeds "
++            "model maximum output tokens (8192)"
++        )
++        super().__init__(message)
++        self.status_code = 429
++        self.response = SimpleNamespace(headers={})
++        self.body = {"error": {"message": message}}
++
++
++def _agent(config, *, fallback_model=None, model="qwen3-coder:30b"):
++    with (
++        patch("hermes_cli.config.load_config_readonly", autospec=True, return_value=config),
++        patch("model_tools.get_tool_definitions", autospec=True, return_value=[]),
++        patch("model_tools.check_toolset_requirements", autospec=True, return_value={}),
++        patch("agent.process_bootstrap.OpenAI", autospec=True),
++    ):
++        return AIAgent(
++            api_key="fixture-key", base_url="http://127.0.0.1:11436/v1",
++            provider="custom", model=model, max_iterations=2,
++            quiet_mode=True, skip_context_files=True, skip_memory=True,
++            fallback_model=fallback_model,
++        )
++
++
++def test_documented_local_pool_policy_sets_total_attempt_ceiling():
++    agent = _agent({"agent": {
++        "api_max_retries": 3,
++        "http_status_policy": {
++            404: {"max_attempts": 1, "fallback": False},
++            500: {"max_attempts": 2, "fallback": False},
++            503: {"max_attempts": 6, "fallback": False},
++            504: {"max_attempts": 1, "fallback": False},
++        },
++    }})
++    assert agent._api_max_retries == 3
++    assert agent._api_retry_loop_ceiling == 6
++    assert agent._http_status_policy == {
++        "404": {"max_attempts": 1, "fallback": False},
++        "500": {"max_attempts": 2, "fallback": False},
++        "503": {"max_attempts": 6, "fallback": False},
++        "504": {"max_attempts": 1, "fallback": False},
++    }
++
++
++@pytest.mark.parametrize(
++    "bad_rule",
++    [
++        {"max_attempts": 0, "fallback": False},
++        {"max_attempts": True, "fallback": False},
++        {"max_attempts": 1.5, "fallback": False},
++        {"max_attempts": "nope", "fallback": False},
++        {"max_attempts": 2, "fallback": "false"},
++    ],
++)
++def test_invalid_status_rule_does_not_expand_or_change_fallback(bad_rule):
++    agent = _agent({"agent": {
++        "api_max_retries": 3,
++        "http_status_policy": {503: bad_rule},
++    }})
++    assert agent._http_status_policy == {}
++    assert agent._api_retry_loop_ceiling == 3
++
++
++@pytest.mark.parametrize(
++    "bad_policy",
++    [None, [], "503", {True: {"max_attempts": 6, "fallback": False}},
++     {99: {"max_attempts": 6, "fallback": False}},
++     {600: {"max_attempts": 6, "fallback": False}},
++     {503.5: {"max_attempts": 6, "fallback": False}},
++     {503: None}],
++)
++def test_invalid_policy_or_status_key_cannot_expand_attempts(bad_policy):
++    agent = _agent({"agent": {
++        "api_max_retries": 3,
++        "http_status_policy": bad_policy,
++    }})
++    assert agent._http_status_policy == {}
++    assert agent._api_retry_loop_ceiling == 3
++
++
++def test_missing_optional_status_fields_keep_generic_attempts_and_default_fallback():
++    agent = _agent({"agent": {
++        "api_max_retries": 3,
++        "http_status_policy": {503: {}},
++    }})
++    assert agent._http_status_policy == {
++        "503": {"max_attempts": 3, "fallback": True},
++    }
++    assert agent._api_retry_loop_ceiling == 3
++
++
++def test_503_retries_six_total_requests_without_paid_fallback():
++    config = {"agent": {
++        "api_max_retries": 3,
++        "http_status_policy": {503: {"max_attempts": 6, "fallback": False}},
++    }}
++    agent = _agent(config, fallback_model=[{"provider": "openrouter", "model": "gpt-4o"}])
++    attempts = []
++
++    def _failed_request(_kwargs):
++        attempts.append(len(attempts) + 1)
++        raise _HTTPError(503)
++
++    def _relay_passthrough(kwargs, call, **_metadata):
++        return call(kwargs)
++
++    with (
++        patch.object(agent, "_interruptible_api_call", autospec=True, side_effect=_failed_request),
++        patch.object(agent, "_try_activate_fallback", autospec=True) as fallback,
++        patch("agent.relay_llm.execute", autospec=True, side_effect=_relay_passthrough),
++        patch("agent.turn_recovery.interruptible_backoff_sleep", autospec=True, return_value=None),
++    ):
++        result = agent.run_conversation("fixture request")
++
++    assert len(attempts) == 6, f"503 contract requires six total attempts, saw {attempts}"
++    fallback.assert_not_called()
++    assert result["failed"] is True
++
++
++@pytest.mark.parametrize(
++    ("status", "max_attempts"),
++    [(404, 1), (500, 2), (504, 1)],
++)
++def test_local_pool_error_obeys_status_bound_and_never_falls_back(status, max_attempts):
++    config = {"agent": {
++        "api_max_retries": 3,
++        "http_status_policy": {status: {"max_attempts": max_attempts, "fallback": False}},
++    }}
++    agent = _agent(config, fallback_model=[{"provider": "openrouter", "model": "gpt-4o"}])
++    attempts = []
++
++    def _failed_request(_kwargs):
++        attempts.append(len(attempts) + 1)
++        raise _HTTPError(status)
++
++    def _relay_passthrough(kwargs, call, **_metadata):
++        return call(kwargs)
++
++    with (
++        patch.object(agent, "_interruptible_api_call", autospec=True, side_effect=_failed_request),
++        patch.object(agent, "_try_activate_fallback", autospec=True) as fallback,
++        patch.object(agent, "_try_recover_primary_transport", autospec=True) as transport_recovery,
++        patch("agent.relay_llm.execute", autospec=True, side_effect=_relay_passthrough),
++        patch("agent.turn_recovery.interruptible_backoff_sleep", autospec=True, return_value=None),
++    ):
++        result = agent.run_conversation("fixture request")
++
++    assert len(attempts) == max_attempts, (
++        f"HTTP {status} contract requires {max_attempts} total attempts, saw {attempts}"
++    )
++    fallback.assert_not_called()
++    transport_recovery.assert_not_called()
++    assert result["failed"] is True
++
++
++@pytest.mark.parametrize(
++    ("statuses", "expected_attempts"),
++    [([503, 500], 2), ([500, 503], 6)],
++)
++def test_mixed_http_statuses_use_the_current_status_total_bound(statuses, expected_attempts):
++    config = {"agent": {
++        "api_max_retries": 3,
++        "http_status_policy": {
++            500: {"max_attempts": 2, "fallback": False},
++            503: {"max_attempts": 6, "fallback": False},
++        },
++    }}
++    agent = _agent(config)
++    attempts = []
++
++    def _failed_request(_kwargs):
++        index = len(attempts)
++        status = statuses[min(index, len(statuses) - 1)]
++        attempts.append(status)
++        raise _HTTPError(status)
++
++    def _relay_passthrough(kwargs, call, **_metadata):
++        return call(kwargs)
++
++    with (
++        patch.object(agent, "_interruptible_api_call", autospec=True, side_effect=_failed_request),
++        patch.object(agent, "_try_activate_fallback", autospec=True) as fallback,
++        patch("agent.relay_llm.execute", autospec=True, side_effect=_relay_passthrough),
++        patch("agent.turn_recovery.interruptible_backoff_sleep", autospec=True, return_value=None),
++    ):
++        result = agent.run_conversation("fixture request")
++
++    assert len(attempts) == expected_attempts, attempts
++    fallback.assert_not_called()
++    assert result["failed"] is True
++
++
++def test_429_no_fallback_policy_blocks_eager_fallback_from_first_attempt():
++    config = {"agent": {
++        "http_status_policy": {429: {"max_attempts": 2, "fallback": False}},
++    }}
++    agent = _agent(config, fallback_model=[{"provider": "openrouter", "model": "gpt-4o"}])
++    attempts = []
++
++    def _failed_request(_kwargs):
++        attempts.append(429)
++        raise _HTTPError(429)
++
++    def _relay_passthrough(kwargs, call, **_metadata):
++        return call(kwargs)
++
++    with (
++        patch.object(agent, "_interruptible_api_call", autospec=True, side_effect=_failed_request),
++        patch.object(agent, "_try_activate_fallback", autospec=True) as fallback,
++        patch("agent.relay_llm.execute", autospec=True, side_effect=_relay_passthrough),
++        patch("agent.turn_recovery.interruptible_backoff_sleep", autospec=True, return_value=None),
++    ):
++        result = agent.run_conversation("fixture request")
++
++    assert len(attempts) == 2, attempts
++    fallback.assert_not_called()
++    assert result["failed"] is True
++
++
++def test_no_status_policy_keeps_generic_retry_budget():
++    agent = _agent({"agent": {"api_max_retries": 3}})
++    assert agent._http_status_policy == {}
++    assert agent._api_retry_loop_ceiling == 3
++    attempts = []
++
++    def _failed_request(_kwargs):
++        attempts.append(503)
++        raise _HTTPError(503)
++
++    def _relay_passthrough(kwargs, call, **_metadata):
++        return call(kwargs)
++
++    with (
++        patch.object(agent, "_interruptible_api_call", autospec=True, side_effect=_failed_request),
++        patch.object(agent, "_try_recover_primary_transport", autospec=True, return_value=False),
++        patch("agent.relay_llm.execute", autospec=True, side_effect=_relay_passthrough),
++        patch("agent.turn_recovery.interruptible_backoff_sleep", autospec=True, return_value=None),
++    ):
++        result = agent.run_conversation("fixture request")
++
++    assert len(attempts) == 3, attempts
++    assert result["failed"] is True
++
++
++def test_generic_primary_transport_recovery_grants_one_fresh_bounded_cycle(
++    monkeypatch, tmp_path
++):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    agent = _agent({"agent": {"api_max_retries": 2}})
++    attempts = []
++
++    def _failed_request(_kwargs):
++        attempts.append(len(attempts) + 1)
++        raise _HTTPError(502)
++
++    def _relay_passthrough(kwargs, call, **_metadata):
++        return call(kwargs)
++
++    with (
++        patch.object(agent, "_interruptible_api_call", autospec=True,
++                     side_effect=_failed_request),
++        patch.object(agent, "_try_recover_primary_transport", autospec=True,
++                     return_value=True) as recovery,
++        patch("agent.relay_llm.execute", autospec=True,
++              side_effect=_relay_passthrough),
++        patch("agent.turn_recovery.interruptible_backoff_sleep", autospec=True,
++              return_value=None),
++    ):
++        result = agent.run_conversation("fixture request")
++
++    assert attempts == [1, 2, 3, 4], (
++        "one successful primary transport rebuild should reopen exactly one bounded cycle"
++    )
++    recovery.assert_called_once()
++    assert result["failed"] is True
++
++
++@pytest.mark.parametrize(
++    ("error", "expected_attempts"),
++    [
++        (ValueError("malformed local request"), 1),
++        (TypeError("missing local argument"), 1),
++        (TypeError("'NoneType' object is not iterable"), 3),
++        (json.JSONDecodeError("bad provider JSON", "{", 0), 3),
++        (ssl.SSLError("temporary TLS failure"), 3),
++        # Two payload-sanitization attempts precede the ordinary three-attempt bound.
++        (UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogate"), 5),
++    ],
++)
++def test_local_validation_fails_fast_but_provider_shape_and_transport_errors_retry(
++    error, expected_attempts,
++):
++    agent = _agent({"agent": {"api_max_retries": 3}})
++    attempts = []
++
++    def _failed_request(_kwargs):
++        attempts.append(len(attempts) + 1)
++        raise error
++
++    def _relay_passthrough(kwargs, call, **_metadata):
++        return call(kwargs)
++
++    with (
++        patch.object(agent, "_interruptible_api_call", autospec=True, side_effect=_failed_request),
++        patch.object(agent, "_try_recover_primary_transport", autospec=True, return_value=False),
++        patch("agent.relay_llm.execute", autospec=True, side_effect=_relay_passthrough),
++        patch("agent.turn_recovery.interruptible_backoff_sleep", autospec=True, return_value=None),
++    ):
++        result = agent.run_conversation("fixture request")
++
++    assert len(attempts) == expected_attempts, (
++        f"{type(error).__name__} should use {expected_attempts} attempts, saw {attempts}"
++    )
++    assert result["failed"] is True
++
++
++def test_status_policy_fallback_true_preserves_eager_route_for_non_qwen_model():
++    config = {"agent": {
++        "http_status_policy": {429: {"max_attempts": 2, "fallback": True}},
++    }}
++    agent = _agent(
++        config, model="local-general-model",
++        fallback_model=[{"provider": "openrouter", "model": "gpt-4o"}],
++    )
++    attempts = []
++
++    def _failed_request(_kwargs):
++        attempts.append(429)
++        raise _HTTPError(429)
++
++    def _relay_passthrough(kwargs, call, **_metadata):
++        return call(kwargs)
++
++    with (
++        patch.object(agent, "_interruptible_api_call", autospec=True, side_effect=_failed_request),
++        patch.object(agent, "_try_activate_fallback", autospec=True, return_value=False) as fallback,
++        patch("agent.relay_llm.execute", autospec=True, side_effect=_relay_passthrough),
++        patch("agent.turn_recovery.interruptible_backoff_sleep", autospec=True, return_value=None),
++    ):
++        result = agent.run_conversation("fixture request")
++
++    assert len(attempts) == 2, attempts
++    assert fallback.call_count >= 1
++    assert result["failed"] is True
++
++
++def test_401_fallback_false_blocks_authentication_failover():
++    config = {"agent": {
++        "http_status_policy": {401: {"max_attempts": 1, "fallback": False}},
++    }}
++    agent = _agent(config, fallback_model=[{"provider": "openrouter", "model": "gpt-4o"}])
++    attempts = []
++
++    def _failed_request(_kwargs):
++        attempts.append(401)
++        raise _HTTPError(401)
++
++    def _relay_passthrough(kwargs, call, **_metadata):
++        return call(kwargs)
++
++    with (
++        patch.object(agent, "_interruptible_api_call", autospec=True, side_effect=_failed_request),
++        patch.object(agent, "_try_activate_fallback", autospec=True) as fallback,
++        patch("agent.relay_llm.execute", autospec=True, side_effect=_relay_passthrough),
++    ):
++        result = agent.run_conversation("fixture request")
++
++    assert attempts == [401]
++    fallback.assert_not_called()
++    assert result["failed"] is True
++
++
++@pytest.mark.parametrize("status", [429, 401])
++def test_rate_limit_or_auth_switches_to_real_fallback_and_completes_turn(
++    monkeypatch, tmp_path, status
++):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    agent = _agent(
++        {"agent": {"api_max_retries": 3}}, model="local-general-model",
++        fallback_model=[{"provider": "custom", "model": "alternate-local-model"}],
++    )
++    attempts = []
++
++    def _request(_kwargs):
++        attempts.append((agent.provider, agent.model))
++        if len(attempts) == 1:
++            raise _HTTPError(status)
++        return SimpleNamespace(
++            id="chatcmpl-fallback", object="chat.completion", model=agent.model,
++            choices=[SimpleNamespace(index=0, finish_reason="stop",
++                                     message=SimpleNamespace(role="assistant",
++                                                             content="Fallback recovered",
++                                                             tool_calls=None))],
++            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2, total_tokens=12),
++        )
++
++    def _relay_passthrough(kwargs, call, **_metadata):
++        return call(kwargs)
++
++    try:
++        with (
++            patch.object(agent, "_interruptible_api_call", autospec=True,
++                         side_effect=_request),
++            patch("agent.auxiliary_client.resolve_provider_client", autospec=True,
++                  return_value=(agent.client, "alternate-local-model")),
++            patch("agent.relay_llm.execute", autospec=True,
++                  side_effect=_relay_passthrough),
++            patch("agent.turn_recovery.interruptible_backoff_sleep", autospec=True,
++                  return_value=None),
++        ):
++            result = agent.run_conversation("fixture request")
++
++        assert attempts == [
++            ("custom", "local-general-model"),
++            ("custom", "alternate-local-model"),
++        ], attempts
++        assert result.get("failed") is not True, result
++        assert result.get("completed") is True, result
++        assert "Fallback recovered" in str(result), result
++    finally:
++        agent.close()
++
++
++def test_unconfigured_status_keeps_generic_bound_when_503_rule_is_wider():
++    config = {"agent": {
++        "api_max_retries": 3,
++        "http_status_policy": {503: {"max_attempts": 6, "fallback": False}},
++    }}
++    agent = _agent(config)
++    attempts = []
++
++    def _failed_request(_kwargs):
++        attempts.append(502)
++        raise _HTTPError(502)
++
++    def _relay_passthrough(kwargs, call, **_metadata):
++        return call(kwargs)
++
++    with (
++        patch.object(agent, "_interruptible_api_call", autospec=True, side_effect=_failed_request),
++        patch.object(agent, "_try_recover_primary_transport", autospec=True, return_value=False),
++        patch("agent.relay_llm.execute", autospec=True, side_effect=_relay_passthrough),
++        patch("agent.turn_recovery.interruptible_backoff_sleep", autospec=True, return_value=None),
++    ):
++        result = agent.run_conversation("fixture request")
++
++    assert len(attempts) == 3, attempts
++    assert result["failed"] is True
++
++
++def test_unclassified_local_error_tries_real_fallback_once_before_terminal_result():
++    agent = _agent(
++        {"agent": {"api_max_retries": 3}},
++        fallback_model=[{"provider": "custom", "model": "alternate-local-model"}],
++    )
++    attempts = []
++
++    def _failed_request(_kwargs):
++        attempts.append((agent.provider, agent.model))
++        raise ValueError("malformed local request")
++
++    def _relay_passthrough(kwargs, call, **_metadata):
++        return call(kwargs)
++
++    with (
++        patch.object(agent, "_interruptible_api_call", autospec=True, side_effect=_failed_request),
++        patch("agent.auxiliary_client.resolve_provider_client", autospec=True,
++              return_value=(agent.client, "alternate-local-model")),
++        patch("agent.relay_llm.execute", autospec=True, side_effect=_relay_passthrough),
++    ):
++        result = agent.run_conversation("fixture request")
++
++    assert attempts == [
++        ("custom", "qwen3-coder:30b"),
++        ("custom", "alternate-local-model"),
++    ], f"local validation should fail fast on each model, saw {attempts}"
++    assert result["failed"] is True
++
++
++def test_hard_interrupt_after_api_failure_aborts_without_retry_or_fallback():
++    agent = _agent(
++        {"agent": {"api_max_retries": 3}},
++        fallback_model=[{"provider": "custom", "model": "alternate-local-model"}],
++    )
++    attempts = []
++
++    def _failed_request(_kwargs):
++        attempts.append(agent.model)
++        agent.hard_interrupt("stop failed request")
++        raise _HTTPError(503)
++
++    def _relay_passthrough(kwargs, call, **_metadata):
++        return call(kwargs)
++
++    with (
++        patch.object(agent, "_interruptible_api_call", autospec=True, side_effect=_failed_request),
++        patch("agent.relay_llm.execute", autospec=True, side_effect=_relay_passthrough),
++    ):
++        result = agent.run_conversation("fixture request")
++
++    assert attempts == ["qwen3-coder:30b"], f"hard stop must not retry: {attempts}"
++    assert result.get("interrupted") is True, result
++
++
++def test_interpreter_shutdown_error_abandons_turn_without_retry_or_fallback(
++    monkeypatch, tmp_path
++):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    agent = _agent(
++        {"agent": {"api_max_retries": 3}},
++        fallback_model=[{"provider": "custom", "model": "alternate-local-model"}],
++    )
++    attempts = []
++
++    def _failed_request(_kwargs):
++        attempts.append(agent.model)
++        raise RuntimeError("cannot schedule new futures after interpreter shutdown")
++
++    def _relay_passthrough(kwargs, call, **_metadata):
++        return call(kwargs)
++
++    try:
++        with (
++            patch.object(agent, "_interruptible_api_call", autospec=True,
++                         side_effect=_failed_request),
++            patch("agent.relay_llm.execute", autospec=True,
++                  side_effect=_relay_passthrough),
++        ):
++            result = agent.run_conversation("fixture request")
++
++        assert attempts == ["qwen3-coder:30b"], attempts
++        assert result.get("failure_reason") == "interpreter_shutdown", result
++        assert result.get("failed") is True, result
++        assert result.get("completed") is False, result
++    finally:
++        agent.close()
++
++
++def test_context_overflow_with_auto_compaction_disabled_fails_without_compressing(
++    monkeypatch, tmp_path
++):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    agent = _agent({"compression": {"enabled": False}, "agent": {"api_max_retries": 3}})
++    attempts = []
++
++    def _failed_request(_kwargs):
++        attempts.append(len(attempts) + 1)
++        raise _ContextOverflowError()
++
++    def _relay_passthrough(kwargs, call, **_metadata):
++        return call(kwargs)
++
++    try:
++        with (
++            patch.object(agent, "_interruptible_api_call", autospec=True,
++                         side_effect=_failed_request),
++            patch.object(agent, "_compress_context", autospec=True) as compress,
++            patch("agent.relay_llm.execute", autospec=True,
++                  side_effect=_relay_passthrough),
++        ):
++            result = agent.run_conversation("fixture request")
++
++        assert attempts == [1], "disabled auto-compaction must not burn the retry budget"
++        compress.assert_not_called()
++        assert result.get("compaction_disabled") is True, result
++        assert result.get("failed") is True, result
++    finally:
++        agent.close()
++
++
++@pytest.mark.parametrize(
++    ("compression_enabled", "expected_compress_calls"),
++    [(False, 0), (True, 3)],
++)
++def test_wrapped_output_cap_is_clamped_without_false_context_reset(
++    monkeypatch, tmp_path, compression_enabled, expected_compress_calls
++):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    agent = _agent({
++        "compression": {"enabled": compression_enabled},
++        "agent": {"api_max_retries": 3},
++    })
++    requested_caps = []
++
++    def _failed_request(_agent_instance, kwargs):
++        requested_caps.append(kwargs.get("max_output_tokens", kwargs.get("max_tokens")))
++        raise _WrappedOutputCapError()
++
++    def _relay_passthrough(kwargs, call, **_metadata):
++        return call(kwargs)
++
++    try:
++        with (
++            patch("agent.chat_completion_helpers.interruptible_api_call", autospec=True,
++                  side_effect=_failed_request),
++            patch.object(agent, "_compress_context", autospec=True,
++                         side_effect=RuntimeError("summary unavailable")) as compress,
++            patch("agent.relay_llm.execute", autospec=True,
++                  side_effect=_relay_passthrough),
++            patch("agent.turn_recovery.interruptible_backoff_sleep", autospec=True,
++                  return_value=None),
++        ):
++            result = agent.run_conversation("fixture request")
++
++        assert len(requested_caps) == 4, (
++            "one initial request plus three bounded output-cap attempts are expected",
++            requested_caps,
++        )
++        assert requested_caps[0] is None, requested_caps
++        corrected_caps = requested_caps[1:]
++        assert len(set(corrected_caps)) == 1, requested_caps
++        assert 0 < corrected_caps[0] <= 8192, requested_caps
++        assert compress.call_count == expected_compress_calls, compress.call_args_list
++        assert result.get("compaction_disabled") is not True, result
++        assert result.get("compression_exhausted") is not True, result
++        assert result.get("output_cap_exhausted") is True, result
++        assert result.get("failed") is True, result
++    finally:
++        agent.close()
++
++
++@pytest.mark.parametrize(
++    ("compression_enabled", "expected_compress_calls"),
++    [(False, 0), (True, 1)],
++)
++def test_wrapped_output_cap_recovers_on_corrected_request_without_reset(
++    monkeypatch, tmp_path, compression_enabled, expected_compress_calls
++):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    agent = _agent({
++        "compression": {"enabled": compression_enabled},
++        "agent": {"api_max_retries": 3},
++    })
++    requested_caps = []
++
++    def _request(_agent_instance, kwargs):
++        requested_caps.append(kwargs.get("max_output_tokens", kwargs.get("max_tokens")))
++        if len(requested_caps) == 1:
++            raise _WrappedOutputCapError()
++        if agent.api_mode == "codex_responses":
++            return SimpleNamespace(
++                id="resp-fixture", status="completed", model=agent.model,
++                output=[SimpleNamespace(
++                    type="message", role="assistant", status="completed",
++                    content=[SimpleNamespace(type="output_text", text="Recovered reply")],
++                )],
++                usage=SimpleNamespace(input_tokens=10, output_tokens=2, total_tokens=12),
++            )
++        return SimpleNamespace(
++            id="chatcmpl-fixture", object="chat.completion", model=agent.model,
++            choices=[SimpleNamespace(
++                index=0, finish_reason="stop",
++                message=SimpleNamespace(role="assistant", content="Recovered reply", tool_calls=None),
++            )],
++            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2, total_tokens=12),
++        )
++
++    def _relay_passthrough(kwargs, call, **_metadata):
++        return call(kwargs)
++
++    try:
++        with (
++            patch("agent.chat_completion_helpers.interruptible_api_call", autospec=True,
++                  side_effect=_request),
++            patch.object(agent, "_compress_context", autospec=True,
++                         side_effect=RuntimeError("summary unavailable")) as compress,
++            patch("agent.relay_llm.execute", autospec=True,
++                  side_effect=_relay_passthrough),
++        ):
++            result = agent.run_conversation("fixture request")
++
++        assert len(requested_caps) == 2, requested_caps
++        assert requested_caps[0] is None, requested_caps
++        assert 0 < requested_caps[1] <= 8192, requested_caps
++        assert compress.call_count == expected_compress_calls, compress.call_args_list
++        assert result.get("failed") is not True, result
++        assert result.get("compression_exhausted") is not True, result
++        assert result.get("output_cap_exhausted") is not True, result
++        assert "Recovered reply" in str(result), result
++    finally:
++        agent.close()

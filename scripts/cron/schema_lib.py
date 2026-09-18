@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import importlib.util
+from importlib.resources import files as package_files
 import sys
 from glob import glob
 from pathlib import Path
@@ -45,7 +46,21 @@ def _add_packaged_dependencies() -> None:
 
 
 _add_packaged_dependencies()
+
+
+def _add_source_checkout_package() -> None:
+    """Make the engine package importable when this helper runs from a source checkout."""
+    source_root = Path(__file__).resolve().parents[2] / "src"
+    if (source_root / "okengine").is_dir() and str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
+
+
+_add_source_checkout_package()
 import yaml
+from okengine.schema_exclusions import (
+    RESERVED_DERIVED_NAMESPACES,
+    excluded_namespaces_from_schema,
+)
 
 # All three are (mtime, data) caches — invalidated when the file changes on disk, so the enforced
 # write path (a long-running process) picks up a hand-edited schema without a restart. Before the
@@ -59,9 +74,16 @@ _COMPOSED_CACHE: dict[str, tuple[float, dict]] = {}
 # layouts: the REPO (scripts/cron/schema_lib.py -> ../../config) or the DEPLOYED cron
 # staging dir (/opt/data/scripts/schema_lib.py -> ../config == /opt/data/config, where
 # deploy-cron-scripts.sh stages it). First existing wins; OKENGINE_BASE_SCHEMA overrides.
+try:
+    _PACKAGE_ROOT = Path(str(package_files("okengine")))
+except ModuleNotFoundError:  # staged host script before its package environment is available
+    _PACKAGE_ROOT = Path("/__okengine_package_not_installed__")
+
 _BASE_CANDIDATES = (
     Path(__file__).resolve().parents[2] / "config" / "base-schema.yaml",   # repo: root/config
     Path(__file__).resolve().parents[1] / "config" / "base-schema.yaml",   # staged: /opt/data/config
+    _PACKAGE_ROOT / "data/base-schema.yaml",                              # installed wheel
+    _PACKAGE_ROOT.parent.parent / "config/base-schema.yaml",              # src checkout
 )
 
 
@@ -70,7 +92,7 @@ _BASE_CANDIDATES = (
 # path for full-vault audits over 10k+ pages (okengine#74). Falls back to the pure loader.
 try:
     from yaml import CSafeLoader as _FAST_LOADER       # noqa: N814
-except Exception:                                       # pragma: no cover
+except Exception:                                       # pragma: no cover - libyaml absent in a minimal PyYAML build
     from yaml import SafeLoader as _FAST_LOADER
 
 def fast_load(text):
@@ -236,19 +258,44 @@ def _merge_base_pack(root: Path, namespace: str = "") -> dict:
         for fname, fdef in ((ext or {}).get("fields") or {}).items():
             t["fields"].setdefault(fname, fdef if isinstance(fdef, dict) else {})
         out["types"][tname] = t
-    # Cross-cutting enums (okengine#90 P2): base vocabularies + the pack's, UNION-ing values per key
-    # so a pack EXTENDS a base enum (adds domain values) rather than replacing it. field_enums merge
-    # with the pack winning on a key.
+    # Cross-cutting enums (okengine#90 P2): base vocabularies + the pack's. Only a field explicitly
+    # marked extensible may add values to an engine vocabulary. A closed universal vocabulary (TLP,
+    # estimative_probability) remains engine-owned; otherwise a pack could silently redefine a
+    # cross-pack contract merely by repeating its enum name.
     b_enums, p_enums = base.get("enums") or {}, pack.get("enums") or {}
     if b_enums or p_enums:
         merged_enums = {k: list(v) for k, v in b_enums.items()}
         for k, vals in p_enums.items():
             cur = merged_enums.get(k, [])
-            merged_enums[k] = cur + [v for v in (vals or []) if v not in cur]
+            base_rules = [rule for rule in (base.get("field_enums") or {}).values()
+                          if isinstance(rule, dict) and rule.get("enum") == k]
+            # Legacy shorthand (`field_enums: {field: enum_name}`) predates the extensibility
+            # marker and keeps its historical union behavior. Only the explicit object grammar can
+            # declare an engine enum closed.
+            if k not in b_enums or not base_rules or all(r.get("extensible") for r in base_rules):
+                merged_enums[k] = cur + [v for v in (vals or []) if v not in cur]
         out["enums"] = merged_enums
     b_fe, p_fe = base.get("field_enums") or {}, pack.get("field_enums") or {}
     if b_fe or p_fe:
-        out["field_enums"] = {**b_fe, **p_fe}
+        merged_fe = {**b_fe, **p_fe}
+        for field, rule in b_fe.items():
+            if isinstance(rule, dict) and not rule.get("extensible"):
+                merged_fe[field] = rule
+        out["field_enums"] = merged_fe
+    # Alias maps compose per field. Closed engine fields retain the engine meaning for aliases they
+    # define; packs may add aliases but cannot redirect `probable` to a different probability band.
+    b_va, p_va = base.get("value_aliases") or {}, pack.get("value_aliases") or {}
+    if b_va or p_va:
+        merged_va = {k: dict(v) for k, v in b_va.items() if isinstance(v, dict)}
+        for field, aliases in p_va.items():
+            if not isinstance(aliases, dict):
+                continue
+            base_rule = b_fe.get(field)
+            if isinstance(base_rule, dict) and not base_rule.get("extensible"):
+                merged_va[field] = {**aliases, **merged_va.get(field, {})}
+            else:
+                merged_va[field] = {**merged_va.get(field, {}), **aliases}
+        out["value_aliases"] = merged_va
     # Field SHAPES (okengine#196 generalized): base declares the universal list fields; a pack ADDS
     # its domain field shapes (pack wins on a key). The enforced write path reads this to coerce a
     # scalar written for a list field into a list, so no such page can enter the vault.
@@ -421,6 +468,10 @@ def compose_schema(root: Path, fragments=None, namespace: str = "") -> tuple[dic
               "enums": {}, "field_enums": {}, "field_shapes": {}}
     for ns in composed["partitioning"]["namespaces"]:
         owners["namespaces"][ns] = "engine" if ns in _core_ns else "pack"
+        if ns in RESERVED_DERIVED_NAMESPACES:
+            errors.append(
+                f"pack: namespace '{ns}' is reserved for engine-derived/operational artifacts"
+            )
     for t in composed["types"]:
         owners["types"][t] = "engine" if t in _core_types else "pack"
     for name in composed.get("enums") or {}:
@@ -430,19 +481,87 @@ def compose_schema(root: Path, fragments=None, namespace: str = "") -> tuple[dic
     for name in composed.get("field_shapes") or {}:
         owners["field_shapes"][name] = "engine" if name in (_base.get("field_shapes") or {}) else "pack"
 
+    fragment_keys = {"owns", "enums", "field_enums", "field_shapes", "extends", "field_items",
+                     "partitioning", "tier"}
     for owner, frag in (fragments or []):
         if not isinstance(frag, dict):
             errors.append(f"{owner}: schema fragment is not a mapping")
             continue
+        unknown_keys = sorted(set(frag) - fragment_keys)
+        if unknown_keys:
+            errors.append(
+                f"{owner}: unknown top-level schema fragment key(s): "
+                + ", ".join(repr(key) for key in unknown_keys)
+                + f"; allowed keys are {sorted(fragment_keys)}"
+            )
         owns = frag.get("owns") or {}
         # --- Own: new namespaces ---
-        for ns in (owns.get("namespaces") or []):
+        namespace_defs = owns.get("namespaces") or []
+        if isinstance(namespace_defs, dict):
+            namespace_items = namespace_defs.items()
+        else:
+            namespace_items = ((ns, {}) for ns in namespace_defs)
+        owned_here = set()
+        for ns, partition in namespace_items:
+            if ns in RESERVED_DERIVED_NAMESPACES:
+                errors.append(
+                    f"{owner}: namespace '{ns}' is reserved for "
+                    "engine-derived/operational artifacts"
+                )
+                continue
             if ns in owners["namespaces"]:
                 errors.append(f"{owner}: namespace '{ns}' already owned by "
                               f"{owners['namespaces'][ns]} (own = new ids only)")
                 continue
-            composed["partitioning"]["namespaces"][ns] = {}
+            if not isinstance(partition, dict):
+                errors.append(f"{owner}: namespace '{ns}' partition must be a mapping")
+                continue
+            composed["partitioning"]["namespaces"][ns] = copy.deepcopy(partition)
             owners["namespaces"][ns] = owner
+            owned_here.add(ns)
+        # Backward compatibility for installed pre-v0.14 fragments, which placed the partition
+        # policy beside `owns` instead of on owns.namespaces.<name>. It may only describe a
+        # namespace this same fragment owns, so it cannot override pack/core policy.
+        legacy_partitioning = frag.get("partitioning") or {}
+        if not isinstance(legacy_partitioning, dict):
+            errors.append(f"{owner}: partitioning must be a mapping")
+            legacy_partitioning = {}
+        legacy_namespaces = legacy_partitioning.get("namespaces") or {}
+        if not isinstance(legacy_namespaces, dict):
+            errors.append(f"{owner}: partitioning.namespaces must be a mapping")
+            legacy_namespaces = {}
+        for ns, policy in legacy_namespaces.items():
+            if ns not in owned_here:
+                errors.append(
+                    f"{owner}: partition policy for namespace '{ns}' requires that namespace "
+                    "to be owned by the same extension"
+                )
+                continue
+            if not isinstance(policy, dict):
+                errors.append(f"{owner}: partitioning.namespaces.{ns} must be a mapping")
+                continue
+            composed["partitioning"]["namespaces"][ns] = copy.deepcopy(policy)
+        # --- Tier policy for namespaces owned by this extension ---
+        tier = frag.get("tier") or {}
+        if not isinstance(tier, dict):
+            errors.append(f"{owner}: tier must be a mapping")
+            tier = {}
+        tier_namespaces = tier.get("namespaces") or {}
+        if not isinstance(tier_namespaces, dict):
+            errors.append(f"{owner}: tier.namespaces must be a mapping")
+            tier_namespaces = {}
+        for ns, policy in tier_namespaces.items():
+            if ns not in owned_here:
+                errors.append(
+                    f"{owner}: tier policy for namespace '{ns}' requires that namespace "
+                    "to be owned by the same extension"
+                )
+                continue
+            if not isinstance(policy, dict):
+                errors.append(f"{owner}: tier.namespaces.{ns} must be a mapping")
+                continue
+            composed.setdefault("tier", {}).setdefault("namespaces", {})[ns] = \
+                copy.deepcopy(policy)
         # --- Own: new types ---
         for tname, tdef in (owns.get("types") or {}).items():
             if tname in owners["types"]:
@@ -463,6 +582,22 @@ def compose_schema(root: Path, fragments=None, namespace: str = "") -> tuple[dic
             owners["enums"][ename] = owner
         for section in ("field_enums", "field_shapes"):
             for fname, rule in (frag.get(section) or {}).items():
+                prior = composed.get(section, {}).get(fname)
+                # A by_type rule is PER-TYPE, so two owners can govern the same field name for
+                # DIFFERENT types without conflicting -- `confidence` is a probability on the
+                # predictions extension's own type and a band on types the pack owns. Merging by
+                # type is the whole point of by_type; only the SAME type twice is a real clash.
+                if (fname in owners[section] and isinstance(rule, dict) and isinstance(prior, dict)
+                        and isinstance(rule.get("by_type"), dict)
+                        and isinstance(prior.get("by_type"), dict)):
+                    dup = set(rule["by_type"]) & set(prior["by_type"])
+                    if dup:
+                        errors.append(f"{owner}: {section} '{fname}' already declared for "
+                                      f"type(s) {sorted(dup)} by {owners[section][fname]}")
+                        continue
+                    prior["by_type"].update(copy.deepcopy(rule["by_type"]))
+                    owners[section][fname] = f"{owners[section][fname]}+{owner}"
+                    continue
                 if fname in owners[section]:
                     errors.append(f"{owner}: {section} '{fname}' already declared by "
                                   f"{owners[section][fname]}")
@@ -476,7 +611,7 @@ def compose_schema(root: Path, fragments=None, namespace: str = "") -> tuple[dic
                 continue
             # enum extension: {add: [values]} against an extensible enum
             if "add" in ext_def and tname in composed["enums"]:
-                if not _is_extensible_enum(composed, tname):
+                if not _is_extensible_enum(composed, tname, owners):
                     errors.append(f"{owner}: enum '{tname}' is not extensible")
                     continue
                 for val in (ext_def.get("add") or []):
@@ -535,16 +670,26 @@ def compose_schema(root: Path, fragments=None, namespace: str = "") -> tuple[dic
     return composed, errors
 
 
-def _is_extensible_enum(schema: dict, enum_name: str) -> bool:
+def _is_extensible_enum(schema: dict, enum_name: str, owners: dict | None = None) -> bool:
     """An enum is extensible if its field_enums entry marks it so (reuses the existing
-    `field_enums.<f>.extensible` marker, schema_validator)."""
+    `field_enums.<f>.extensible` marker, schema_validator).
+
+    During composition, only a declaration owned by the enum's owner may grant this authority.
+    Otherwise a lower-tier extension can invent an unrelated field that points at a closed engine
+    enum, mark that field extensible, and reopen the shared vocabulary for every real consumer.
+    """
     fe = schema.get("field_enums")
     if isinstance(fe, dict):
-        for spec in fe.values():
-            if isinstance(spec, dict) and spec.get("enum") == enum_name and spec.get("extensible"):
-                return True
-            if isinstance(spec, dict) and spec.get("extensible") and enum_name in (
-                    (spec.get("by_type") or {}).values()):
+        enum_owner = (owners or {}).get("enums", {}).get(enum_name)
+        for field, spec in fe.items():
+            if not isinstance(spec, dict) or not spec.get("extensible"):
+                continue
+            if owners is not None and (owners.get("field_enums", {}).get(field) != enum_owner):
+                continue
+            referenced = [spec.get("enum")]
+            for type_rule in (spec.get("by_type") or {}).values():
+                referenced.append(type_rule.get("enum") if isinstance(type_rule, dict) else type_rule)
+            if enum_name in referenced:
                 return True
     # also honor a direct enums.<name>.extensible convention if present
     return False
@@ -653,9 +798,16 @@ def type_id_authority(schema: dict, type_name: str) -> tuple[str | None, str]:
 
 
 def type_owner(schema: dict, type_name: str) -> str | None:
-    """The pack that OWNS a type and its pages (``types.<t>.owner``). None when
-    undeclared — converge-on-write then enforces no ownership (single-pack
-    back-compat). Full pack-metadata ownership arrives with composition (P3)."""
+    """The principal that owns a type and its pages.
+
+    Composed schemas record the authoritative map at ``owners.types``. The
+    nested ``types.<t>.owner`` form remains a compatibility fallback for older
+    hand-authored schemas. None means ownership is undeclared (legacy
+    single-pack behavior).
+    """
+    owners = (schema.get("owners") or {}).get("types")
+    if isinstance(owners, dict) and owners.get(type_name):
+        return str(owners[type_name])
     t = (schema.get("types") or {}).get(type_name)
     return str(t["owner"]) if isinstance(t, dict) and t.get("owner") else None
 
@@ -707,11 +859,4 @@ def type_home_namespace(schema: dict, typ: str) -> "str | None":
 def excluded_dirs(schema: dict) -> set[str]:
     """Namespace names the pack excludes from conformance/indexing (derived from
     schema.yaml `exclude:` paths like `wiki/operational/`). Default empty."""
-    out: set[str] = set()
-    for p in schema.get("exclude") or []:
-        seg = str(p).strip("/").split("/")
-        if seg and seg[0] == "wiki" and len(seg) > 1:
-            out.add(seg[1])
-        elif seg:
-            out.add(seg[-1])
-    return out
+    return excluded_namespaces_from_schema(schema)

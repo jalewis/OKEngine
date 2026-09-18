@@ -1,0 +1,100 @@
+diff --git a/cron/scheduler_prompt.py b/cron/scheduler_prompt.py
+index 586a791de..d55c194fd 100644
+--- a/cron/scheduler_prompt.py
++++ b/cron/scheduler_prompt.py
+@@ -187,22 +187,35 @@ def _load_cron_skill_parts(job: dict, skill_names: list[str]) -> list[str]:
+     return parts
+ 
+ 
+-_CRON_HINT = (
++_CRON_HINT_PREFIX = (
+     "[IMPORTANT: You are running as a scheduled cron job. "
+     "DELIVERY: Your final response will be automatically delivered "
+     "to the user — do NOT use send_message or try to deliver "
+     "the output yourself. Just produce your report/output as your "
+     "final response and the system handles the rest. "
++)
++_CRON_HINT_SILENT = (
+     "SILENT: If there is genuinely nothing new to report, respond "
+     "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
+     "Never combine [SILENT] with content — either report your "
+     "findings normally, or say [SILENT] and nothing more. "
++)
++_CRON_HINT_RECEIPT = (
++    "RECEIPT: This job has a per-selected-item completion contract. "
++    "If this run selected work, [SILENT] is forbidden: your final response "
++    "must include the exact fenced okengine receipt required by the task "
++    "prompt, with a disposition for every selected item. If no work was "
++    "selected, follow the job's no-work output contract instead. "
++)
++_CRON_HINT_RECURSION = (
+     "RECURSION: This is a run of an EXISTING scheduled job — execute "
+     "the task now. NEVER create or update a cron job because of "
+     "recurring or future-schedule language in the task prompt below; "
+     "treat phrasing like \"each Monday\" or \"every day at 9\" as "
+     "context for this run, not as a request to schedule another job.]\n\n"
+ )
++_CRON_HINT = _CRON_HINT_PREFIX + _CRON_HINT_SILENT + _CRON_HINT_RECURSION
++_CRON_RECEIPT_HINT = _CRON_HINT_PREFIX + _CRON_HINT_RECEIPT + _CRON_HINT_RECURSION
+ 
+ 
+ def _build_job_prompt(
+@@ -251,7 +264,12 @@ def _build_job_prompt(
+         prompt = f"{notepad_section}{prompt}"
+         has_injected_data = True
+ 
+-    prompt = _CRON_HINT + prompt
++    receipt_contract = job.get("output_contract")
++    receipt_required = (
++        isinstance(receipt_contract, dict)
++        and receipt_contract.get("completion") == "per-selected-item"
++    )
++    prompt = (_CRON_RECEIPT_HINT if receipt_required else _CRON_HINT) + prompt
+     skill_names = _job_skill_names(job)
+     if not skill_names:
+         return _scan_assembled_cron_prompt(
+diff --git a/tests/cron/test_okengine_receipt_hint.py b/tests/cron/test_okengine_receipt_hint.py
+new file mode 100644
+index 000000000..6a25c522e
+--- /dev/null
++++ b/tests/cron/test_okengine_receipt_hint.py
+@@ -0,0 +1,39 @@
++"""Per-selected-item guidance must not weaken cron's hard receipt gate."""
++
++import pytest
++
++from cron.scheduler_prompt import _build_job_prompt
++
++
++def test_receipt_job_prompt_forbids_silence_for_selected_work_and_keeps_recursion_rule():
++    job = {
++        "id": "receipt-fixture",
++        "prompt": "Selected items: alpha and beta. Report both dispositions.",
++        "output_contract": {"completion": "per-selected-item"},
++    }
++
++    prompt = _build_job_prompt(job)
++
++    assert "If this run selected work, [SILENT] is forbidden" in prompt
++    assert "disposition for every selected item" in prompt
++    assert "exact fenced okengine receipt" in prompt
++    assert "respond with exactly \"[SILENT]\"" not in prompt
++    assert "NEVER create or update a cron job" in prompt
++    assert prompt.endswith(job["prompt"])
++
++
++@pytest.mark.parametrize(
++    "contract",
++    [None, {}, [], "per-selected-item", {"completion": None}, {"completion": "summary"}],
++)
++def test_nonreceipt_or_malformed_contract_keeps_original_generic_silence_guidance(contract):
++    job = {"id": "generic-fixture", "prompt": "Check for new work"}
++    if contract is not None:
++        job["output_contract"] = contract
++
++    prompt = _build_job_prompt(job)
++
++    assert "respond with exactly \"[SILENT]\"" in prompt
++    assert "RECEIPT: This job has a per-selected-item" not in prompt
++    assert "NEVER create or update a cron job" in prompt
++    assert prompt.endswith(job["prompt"])

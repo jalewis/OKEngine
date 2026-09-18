@@ -28,6 +28,12 @@ WIKI = Path(os.environ.get("WIKI_PATH", "/opt/vault")) / "wiki"
 MIN_DENSITY = int(os.environ.get("OKENGINE_LACUNA_MIN_DENSITY", "8"))      # config.min_density
 REANALYZE_DAYS = int(os.environ.get("OKENGINE_LACUNA_REANALYZE_DAYS", "90"))  # config.reanalyze_days
 BATCH = int(os.environ.get("OKENGINE_LACUNA_BATCH_SIZE", "3"))            # config.batch_size
+NOMINATIONS_PATH = os.environ.get(
+    "OKENGINE_LACUNA_NOMINATIONS_PATH", ".okengine/lacuna-nominations.json"
+).strip()
+NOMINATION_MAX_AGE_DAYS = int(
+    os.environ.get("OKENGINE_LACUNA_NOMINATION_MAX_AGE_DAYS", "7")
+)
 # OPERATOR TOPIC OVERRIDE (config.focus): pin lacuna to ONE concept field this run, bypassing the
 # density rank + the reanalyze rotation. Accepts a bare slug, a `concepts/<shard>/<slug>` path, or a
 # `[[concepts/…]]` wikilink (all fold to the slug). UNSET (default) keeps the autonomous behavior:
@@ -159,6 +165,49 @@ def _density_str(counts: Counter) -> str:
     return f"{total} links · " + " · ".join(parts)
 
 
+def _fresh_nominations() -> dict[str, dict[str, str]]:
+    """Return the newest valid nomination for each concept slug.
+
+    Nominations are operational routing hints, not evidence and not permission to weaken the
+    density or review gates.  A pack may write the queue after classifying recent material;
+    Lacuna still independently requires a real, dense, not-recently-analyzed concept field.
+    """
+    if not NOMINATIONS_PATH:
+        return {}
+    path = Path(NOMINATIONS_PATH)
+    if not path.is_absolute():
+        path = WIKI.parent / path
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    rows = payload.get("nominations", []) if isinstance(payload, dict) else []
+    if not isinstance(rows, list):
+        return {}
+    cutoff = date.fromisoformat(_today()) - timedelta(days=NOMINATION_MAX_AGE_DAYS)
+    selected: dict[str, dict[str, str]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        slug = _slug_of(row.get("field", ""))
+        nominated_at = str(row.get("nominated_at", ""))[:10]
+        try:
+            when = date.fromisoformat(nominated_at)
+        except ValueError:
+            continue
+        if not slug or when < cutoff or when > date.fromisoformat(_today()):
+            continue
+        candidate = {
+            "field": slug,
+            "source": str(row.get("source", "")).strip(),
+            "reason": str(row.get("reason", "")).strip(),
+            "nominated_at": nominated_at,
+        }
+        if slug not in selected or nominated_at > selected[slug]["nominated_at"]:
+            selected[slug] = candidate
+    return selected
+
+
 def main() -> int:
     if not WIKI.is_dir():
         print(json.dumps({"wakeAgent": False}))
@@ -166,6 +215,7 @@ def main() -> int:
 
     refs, by_ns = _clusters()
     recently = _recently_analyzed()
+    nominations = _fresh_nominations()
 
     cands = []
     for slug, pages in refs.items():
@@ -177,7 +227,7 @@ def main() -> int:
         if not _has_concept_page(slug):
             continue                       # require a real, named field to map (not a dangling link)
         cands.append((density, slug))
-    cands.sort(key=lambda c: (-c[0], c[1]))
+    cands.sort(key=lambda c: (0 if c[1] in nominations else 1, -c[0], c[1]))
 
     print("=== lacuna field-selection wake-gate ===")
     print(f"  vault: {WIKI}")
@@ -185,6 +235,8 @@ def main() -> int:
           f"{sum(1 for s, p in refs.items() if len(p) >= MIN_DENSITY and _has_concept_page(s))}")
     print(f"  excluded (analyzed since {_cutoff()}): {len(recently)}")
     print(f"  eligible fields: {len(cands)}")
+    eligible_nominations = sum(1 for _, slug in cands if slug in nominations)
+    print(f"  fresh material nominations: {len(nominations)} ({eligible_nominations} eligible)")
 
     # FOCUS override: map an operator-pinned field, bypassing the density rank + rotation. Unset
     # leaves the autonomous "densest unanalyzed field" path below untouched (everything considered).
@@ -231,6 +283,15 @@ def main() -> int:
     for i, (density, slug) in enumerate(chosen, 1):
         print(f"## {i}. concept: {slug}  ({density} referencing pages)")
         print(f"  field anchor: `[[concepts/{slug}]]`  ·  surround_density: `{_density_str(by_ns[slug])}`\n")
+        nomination = nominations.get(slug)
+        if nomination:
+            print("  material-source nomination (routing context only; verify it independently):")
+            print(f"    nominated_at: {nomination['nominated_at']}")
+            if nomination["source"]:
+                print(f"    source: {nomination['source']}")
+            if nomination["reason"]:
+                print(f"    reason: {nomination['reason']}")
+            print()
 
     print(json.dumps({"wakeAgent": True}))
     return 0

@@ -3,15 +3,20 @@
 The policy (reasoning off by default for direct model calls) is only real if it's enforced —
 a decision that lives in one client plus a convention is a blind spot (the gateway lanes were
 protected by the Hermes provider profiles while direct scripts truncated on qwen thinking).
-This gate fails the build when engine/pack automation code makes a raw chat-completions call
+This gate fails the build when engine/pack automation code makes a raw retired-endpoint call
 outside `llm_lib.py` (vendored copies keep that filename — the allowlist is by name)."""
 import re
 from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.invariant
 
 REPO = Path(__file__).resolve().parent.parent
 
 # Endpoint-path signatures of a raw model call. Embeddings endpoints are exempt (no thinking).
 _RAW_CALL = re.compile(r"chat/completions|/api/chat\b|/api/generate\b")
+_RETIRED = ("chat" + "/completions", "/api/" + "generate")
 # Automation code the gate governs. UIs (reader/cockpit) relay to the Hermes gateway, which
 # applies provider profiles server-side — different layer, not governed here.
 _SCOPES = ("scripts", "extensions", "tools")
@@ -57,3 +62,16 @@ def test_vendored_llm_lib_copies_are_byte_identical():  # invariant-audit #52, #
         "vendored llm_lib.py copies have DIVERGED from the canonical scripts/cron/llm_lib.py "
         "(a fix landed in one but not the others, or a NEW copy was added unpinned):\n  "
         + "\n  ".join(f"{p.relative_to(REPO)} ({len(p.read_bytes())} bytes)" for p in diverged))
+
+
+def test_sanctioned_client_uses_responses_not_retired_endpoints():
+    canonical = (REPO / "scripts" / "cron" / "llm_lib.py").read_text()
+    assert 'f"{url}/responses"' in canonical
+    assert all(endpoint not in canonical for endpoint in _RETIRED)
+
+
+def test_skeleton_declares_deployment_identity_separately_from_pack():
+    compose = (REPO / "templates/pack/skeleton/docker-compose.yml").read_text()
+    example = (REPO / "templates/pack/skeleton/.env.example").read_text()
+    assert "OKENGINE_DEPLOYMENT=${OKENGINE_DEPLOYMENT:-{{PACK}}}" in compose
+    assert "OKENGINE_DEPLOYMENT={{PACK}}" in example

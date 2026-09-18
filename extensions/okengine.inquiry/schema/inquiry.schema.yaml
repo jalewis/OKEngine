@@ -1,0 +1,59 @@
+# okengine.inquiry schema fragment — the §5 "Own" case (okengine#133).
+# Folded into the composed schema only when the extension is enabled; owner = ext:okengine.inquiry.
+# A pack that enables inquiry must NOT already own an `inquiry` type or namespace (own = new ids
+# only; the composer fails loud on a collision).
+#
+# The field set IS the declaration this extension exists to create (okengine#746). Before it, a
+# vault's research topic lived in four surfaces that nothing reconciled — the pack mission prose,
+# the feed list, the cron prompts, and the persona file — and adding a topic meant editing all four
+# and hoping they agreed. `terms` is the load-bearing field: it is the single machine-readable
+# statement of what this inquiry collects, and every collection lane derives from it rather than
+# from a second copy kept somewhere else.
+#
+# `terms` is REQUIRED, so the write path rejects an inquiry that declares a question with no way to
+# gather evidence for it. That is the earliest gate; the connector-reachability half cannot be
+# expressed in a schema and is enforced by framework validate (check_inquiries).
+owns:
+  namespaces:
+    inquiry: {strategy: flat}
+  types:
+    inquiry:
+      # A standing research question plus the terms that collect evidence for it.
+      # The four MUSTs make a page that omits the load-bearing parts invalid at the write path.
+      required: [type, question, status, terms]
+      optional: [title, opened, closed_on, summary,
+                 # collection
+                 connector, collection_params, min_source_tier, exclude_domains,
+                 # the evidence this inquiry groups — soft edges, no hard `requires` on the
+                 # extensions that own these types (the lacuna<->predictions convention)
+                 assessments, predictions, solutions,
+                 see_also, sources, needs_review]
+
+tier:
+  namespaces:
+    # An OPEN inquiry is never cold — it is the thing the vault is actively working, so it floors
+    # at hot regardless of when its page was last touched. Same contract as open predictions.
+    inquiry: {date_field: opened, status_field: status, open_values: [open], open_floor: hot}
+
+enums:
+  inquiry_status: [open, paused, closed]
+
+field_enums:
+  status: {by_type: {inquiry: inquiry_status}}
+
+field_shapes:
+  terms:           list
+  exclude_domains: list
+  assessments:     list
+  predictions:     list
+  solutions:       list
+
+field_items:
+  # Each term is a collection query plus the knobs that decide what the connector does with it.
+  # `query` is the only MUST: a bare string term is coerced by the loader into {query: <string>},
+  # so the simple case stays simple and the strict case stays checkable.
+  terms:
+    query:  {shape: str}
+    label:  {shape: str}
+    since:  {shape: date}
+    params: {shape: dict}

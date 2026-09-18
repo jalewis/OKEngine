@@ -1,7 +1,18 @@
 # okengine-reader — standalone read-only vault reader. No hermes coupling.
 # Trixie base pinned by digest for reproducibility (also pins the apt snapshot);
 # the weasyprint PDF stack targets trixie. To refresh: see docs/supply-chain.md.
-FROM python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f
+ARG PYTHON_BASE_IMAGE=python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f
+FROM ${PYTHON_BASE_IMAGE} AS wheel
+WORKDIR /build
+COPY src/ ./src/
+COPY tools/schema_validator.py tools/policy_plane.py ./tools/
+COPY okengine-mcp/output_contract_enforce.py okengine-mcp/converge.py ./okengine-mcp/
+COPY scripts/cron/id_lib.py scripts/cron/schema_lib.py scripts/cron/id_index.py scripts/cron/okf_migrate.py ./scripts/cron/
+COPY scripts/build_engine_wheel.py ./scripts/build_engine_wheel.py
+COPY config/base-schema.yaml ./config/base-schema.yaml
+RUN python scripts/build_engine_wheel.py --out /wheel
+
+FROM ${PYTHON_BASE_IMAGE}
 
 WORKDIR /app
 
@@ -16,11 +27,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # NB: backlinks are built by an in-process link-scanner (okengine#179) — no iwe binary needed.
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY okengine-reader/requirements.txt .
+COPY --from=wheel /wheel/ /wheel/
+RUN pip install --no-cache-dir -r requirements.txt /wheel/*.whl
 
-COPY app.py limits.py .
-COPY static/ ./static/
+COPY okengine-reader/*.py ./
+COPY okengine-reader/static/ ./static/
 
 ENV VAULT_DIR=/vault PORT=9200
 EXPOSE 9200

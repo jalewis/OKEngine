@@ -194,3 +194,129 @@ def test_unknown_partition_strategy_raises(tmp_path):  # invariant-audit #25
     with pytest.raises(ValueError):
         m._new_key("sources", "x", {"type": "source", "published": "2026-06-01"},
                    {"strategy": "by_date", "date_field": "published"}, set())
+
+
+def test_schema_date_and_partition_helper_edges(tmp_path, monkeypatch):
+    m = _mod()
+    m._SCHEMA_CACHE.clear()
+    (tmp_path / "schema.yaml").write_text("[bad")
+    assert m._governing_schema(tmp_path, "entities") == {}
+    assert m._governing_schema(tmp_path / "missing", "entities") == {}
+    assert m._ym("no-date", {}) is None
+    assert m._ym("1999-13-invalid", {}) is None
+    assert m._new_key("x", "slug", {}, {"strategy": "flat"}, set()) is None
+    assert m._new_key("x", "slug", {"type": "unknown"}, {"strategy": "by-type"}, {"known"}) is None
+    assert m._new_key(
+        "x", "slug", {"type": "known"},
+        {"strategy": "by-type", "sharded_types": ["known"]}, {"known"},
+    ) == "x/known/s/slug"
+    assert m._new_key(
+        "x", "slug", {"type": "known"}, {"strategy": "by-type"}, {"known"},
+    ) == "x/known/slug"
+
+
+def test_build_map_skips_structural_malformed_filtered_and_raced_pages(tmp_path, monkeypatch):
+    m = _mod()
+    (tmp_path / "schema.yaml").write_text(
+        "partitioning:\n  namespaces:\n    sources: {strategy: by-date}\n"
+        "types: {source: {}}\n")
+    base = tmp_path / "wiki" / "sources"
+    base.mkdir(parents=True)
+    for name, content in {
+        "INDEX.md": "---\ntype: source\n---\n",
+        "plain.md": "body",
+        "bad.md": "---\n[bad\n---\n",
+        "list.md": "---\n- item\n---\n",
+        "wrong.md": "---\ntype: other\npublished: 2026-01-01\n---\n",
+        "other-year.md": "---\ntype: source\npublished: 2025-01-01\n---\n",
+        "raced.md": "---\ntype: source\npublished: 2026-01-01\n---\n",
+    }.items():
+        (base / name).write_text(content)
+    raced = base / "raced.md"
+    original = m.Path.read_text
+    monkeypatch.setattr(
+        m.Path, "read_text",
+        lambda self, *a, **k: (_ for _ in ()).throw(OSError("race"))
+        if self == raced else original(self, *a, **k),
+    )
+    moves, collisions = m.build_map(tmp_path, "sources", {"source"}, "2026")
+    assert moves == {} and collisions == []
+
+
+def test_main_dry_run_collision_overflow_and_apply_errors(tmp_path, monkeypatch, capsys):
+    m = _mod()
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    note = wiki / "note.md"
+    note.write_text("[[entities/old]]")
+    git_note = wiki / ".git" / "ignored.md"
+    git_note.parent.mkdir()
+    git_note.write_text("[[entities/old]]")
+    raced_note = wiki / "raced.md"
+    raced_note.write_text("[[entities/old]]")
+    unmatched = wiki / "unmatched.md"
+    unmatched.write_text("[[entities/not-in-map]]")
+    collisions = [(f"entities/old-{i}", f"entities/new-{i}") for i in range(41)]
+    monkeypatch.setattr(m, "build_map", lambda *_a: ({"entities/old": "entities/new"}, collisions))
+    assert m.main(["--root", str(tmp_path), "--namespace", "entities"]) == 0
+    out = capsys.readouterr().out
+    assert "and 1 more" in out and "would move: 1" in out
+
+    monkeypatch.setattr(m, "build_map", lambda *_a: ({}, []))
+    assert m.main(["--root", str(tmp_path), "--namespace", "entities"]) == 0
+    capsys.readouterr()
+    monkeypatch.setattr(m, "build_map", lambda *_a: ({"entities/old": "entities/new"}, collisions))
+
+    original_read = m.Path.read_text
+    monkeypatch.setattr(
+        m.Path, "read_text",
+        lambda self, *a, **k: (_ for _ in ()).throw(OSError("race"))
+        if self == raced_note else original_read(self, *a, **k),
+    )
+    original_write = m.Path.write_text
+    monkeypatch.setattr(
+        m.Path, "write_text",
+        lambda self, *a, **k: (_ for _ in ()).throw(PermissionError("denied"))
+        if self == note else original_write(self, *a, **k),
+    )
+    monkeypatch.setattr(m.os, "rename", lambda *_a: (_ for _ in ()).throw(OSError("move denied")))
+    assert m.main(["--root", str(tmp_path), "--namespace", "entities", "--apply"]) == 0
+    out = capsys.readouterr()
+    assert "not writable" in out.out and "move failed" in out.err
+
+
+def test_namespace_discovery_and_frontmatter_edges(tmp_path):
+    m = _mod()
+    (tmp_path / "schema.yaml").write_text(
+        "partitioning:\n  namespaces:\n    entities: {strategy: by-letter}\n",
+        encoding="utf-8")
+    m._SCHEMA_CACHE.clear()
+    assert m.partitioned_namespaces(tmp_path) == ["entities"]
+
+    sub = tmp_path / "wiki" / "domain"
+    sub.mkdir(parents=True)
+    (tmp_path / "wiki" / "no-schema").mkdir()
+    (sub / "schema.yaml").write_text(
+        "partitioning:\n  namespaces:\n    entities: {strategy: by-letter}\n"
+        "    flat: {strategy: flat}\n", encoding="utf-8")
+    assert m.partitioned_namespaces(tmp_path) == ["entities", "domain/entities"]
+
+    malformed = tmp_path / "wiki" / "bad.md"
+    malformed.write_text("---\nx: [\n---\n", encoding="utf-8")
+    scalar = tmp_path / "wiki" / "scalar.md"
+    scalar.write_text("---\nvalue\n---\n", encoding="utf-8")
+    plain = tmp_path / "wiki" / "plain.md"
+    plain.write_text("body", encoding="utf-8")
+    assert m._fm_at(tmp_path, "bad") == {}
+    assert m._fm_at(tmp_path, "scalar") == {}
+    assert m._fm_at(tmp_path, "plain") == {}
+    # Warning is once per namespace.
+    m._UNDECLARED_WARNED.clear()
+    schema = {"partitioning": {"namespaces": {"entities": {"strategy": "by-letter"}}}}
+    assert m._partition_cfg(schema, "sources") == {"strategy": "flat"}
+    assert m._partition_cfg(schema, "sources") == {"strategy": "flat"}
+    empty_pat, unchanged = m.make_path_rewriter({})
+    assert empty_pat.search("anything") is None
+    pat, repl = m.make_path_rewriter({"entities/a/old": "entities/a/new"})
+    assert pat.sub(repl, "entities/a/old entities/a/missing") == \
+        "entities/a/new entities/a/missing"

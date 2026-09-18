@@ -92,9 +92,23 @@ apply_carried_patch "$ENGINE_DIR/patches/cron-plus/run-receipts.patch" \
     "OKEngine verified model-run receipts"
 apply_carried_patch "$ENGINE_DIR/patches/cron-plus/cli-null-next-run.patch" \
     "OKEngine null-safe manual run output"
+apply_carried_patch "$ENGINE_DIR/patches/cron-plus/pid-ownership.patch" \
+    "OKEngine runner PID ownership cleanup"
+apply_carried_patch "$ENGINE_DIR/patches/cron-plus/run-records.patch" \
+    "OKEngine runner-owned execution records"
+# LAST of the runner patches: it depends on _apply_job_env's call site from job-env.patch.
+apply_carried_patch "$ENGINE_DIR/patches/cron-plus/run-deadline-env.patch" \
+    "OKEngine run deadline published to the lane"
+apply_carried_patch "$ENGINE_DIR/patches/cron-plus/slug-identity-guard.patch" \
+    "OKEngine deterministic direct-writer identity guard"
 cp "$ENGINE_DIR/patches/cron-plus/after_ordering.py" "$DEST/after_ordering.py"
 cp "$ENGINE_DIR/patches/cron-plus/run_receipts.py" "$DEST/run_receipts.py"
 cp "$ENGINE_DIR/patches/cron-plus/model_slots.py" "$DEST/model_slots.py"
+cp "$ENGINE_DIR/patches/cron-plus/run_timeout.py" "$DEST/run_timeout.py"
+cp "$ENGINE_DIR/patches/cron-plus/run_records.py" "$DEST/run_records.py"
+cp "$ENGINE_DIR/patches/cron-plus/artifact_records.py" "$DEST/artifact_records.py"
+cp "$ENGINE_DIR/patches/cron-plus/pid_ownership.py" "$DEST/pid_ownership.py"
+cp "$ENGINE_DIR/patches/cron-plus/slug_identity_guard.py" "$DEST/slug_identity_guard.py"
 echo "  installed OKEngine after: policy overlay"
 
 # Sanity: the CLI the cron helpers invoke must be present.

@@ -29,7 +29,7 @@ WIKI = VAULT / "wiki"
 WIN_DAYS = int(os.environ.get("TREND_WINDOW_DAYS", "42"))        # rolling window (6 weeks)
 MIN_THIS = int(os.environ.get("TREND_MIN_THIS", "3"))           # min recent mentions to qualify
 RISE_RATIO = float(os.environ.get("TREND_RISE_RATIO", "2.0"))   # this >= ratio*prior (or prior==0)
-TOP_N = int(os.environ.get("TREND_TOP_N", "12"))
+TOP_N = int(os.environ.get("TREND_TOP_N", "5"))
 MIN_MOVERS_TO_FIRE = int(os.environ.get("TREND_MIN_MOVERS", "3"))
 
 _FM = re.compile(r"\A---\s*\n(.*?)\n---", re.S)

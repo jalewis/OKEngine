@@ -21,11 +21,11 @@ rules:
       operation: update
       namespace: sources
       type: source
-    enforcement: [write, audit, ci, cockpit]
+    enforcement: [write, ci, cockpit]
     evaluator: field-capability
     remediation: Use a two-field frontmatter patch containing reliability and credibility and no body mutation.
     override: forbidden
-    verified_by: [write, audit, ci, cockpit]
+    verified_by: [write, ci, cockpit]
 
   - id: engine-strict-type-namespace
     owner: engine

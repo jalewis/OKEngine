@@ -4,3 +4,4 @@ mcp==1.28.1
 PyYAML==6.0.2
 uvicorn==0.34.0
 fastapi==0.138.0          # review-only governed HTTP surface; keep aligned with Cockpit
+asyncpg==0.31.0           # optional PostgreSQL read projection; Python 3.14 support (okengine#649)

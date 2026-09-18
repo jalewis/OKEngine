@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "entrypoint_budgets": {
+    "okengine-cockpit/app.py": {"maximum_lines": 580, "target_lines": 580},
+    "okengine-mcp/write_server.py": {"maximum_lines": 600, "target_lines": 600},
+    "okengine-reader/app.py": {"maximum_lines": 600, "target_lines": 600},
+    "scripts/framework_validate.py": {"maximum_lines": 405, "target_lines": 400},
+    "scripts/cron/corpus_audit.py": {"maximum_lines": 400, "target_lines": 400}
+  },
+  "module_budgets": {
+    "src/okengine/cockpit_services/assessments.py": {"maximum_lines": 800, "target_lines": 800},
+    "src/okengine/cockpit_services/chat.py": {"maximum_lines": 800, "target_lines": 800},
+    "src/okengine/cockpit_services/configuration.py": {"maximum_lines": 800, "target_lines": 800},
+    "src/okengine/cockpit_services/dataset_views.py": {"maximum_lines": 800, "target_lines": 800},
+    "src/okengine/cockpit_services/datasets.py": {"maximum_lines": 800, "target_lines": 800},
+    "src/okengine/cockpit_services/documents.py": {"maximum_lines": 800, "target_lines": 800},
+    "src/okengine/cockpit_services/drill_ops.py": {"maximum_lines": 800, "target_lines": 800},
+    "src/okengine/cockpit_services/exports.py": {"maximum_lines": 800, "target_lines": 800},
+    "src/okengine/cockpit_services/navigation.py": {"maximum_lines": 800, "target_lines": 800},
+    "src/okengine/cockpit_services/page_metadata.py": {"maximum_lines": 800, "target_lines": 800},
+    "src/okengine/cockpit_services/reviews.py": {"maximum_lines": 800, "target_lines": 800},
+    "src/okengine/cockpit_services/state.py": {"maximum_lines": 800, "target_lines": 800},
+    "src/okengine/cockpit_services/streams.py": {"maximum_lines": 800, "target_lines": 800},
+    "src/okengine/cockpit_services/tid_views.py": {"maximum_lines": 800, "target_lines": 800}
+    ,"src/okengine/write_services/authorization.py": {"maximum_lines": 800, "target_lines": 800}
+    ,"src/okengine/write_services/binding.py": {"maximum_lines": 800, "target_lines": 800}
+    ,"src/okengine/write_services/convergence.py": {"maximum_lines": 800, "target_lines": 800}
+    ,"src/okengine/write_services/deduplication.py": {"maximum_lines": 800, "target_lines": 800}
+    ,"src/okengine/write_services/integrity.py": {"maximum_lines": 800, "target_lines": 800}
+    ,"src/okengine/write_services/patching.py": {"maximum_lines": 800, "target_lines": 800}
+    ,"src/okengine/write_services/policy.py": {"maximum_lines": 800, "target_lines": 800}
+    ,"src/okengine/write_services/review.py": {"maximum_lines": 800, "target_lines": 800}
+    ,"src/okengine/write_services/state.py": {"maximum_lines": 800, "target_lines": 800}
+    ,"src/okengine/write_services/transactions.py": {"maximum_lines": 800, "target_lines": 800}
+    ,"src/okengine/write_services/transport.py": {"maximum_lines": 800, "target_lines": 800}
+    ,"src/okengine/write_services/validation.py": {"maximum_lines": 800, "target_lines": 800}
+  },
+  "layers": ["transport", "rendering", "domain", "authorization", "validation", "storage"],
+  "allowed_dependencies": {
+    "transport": ["rendering", "domain", "authorization", "validation"],
+    "rendering": ["domain"],
+    "domain": ["authorization", "validation", "storage"],
+    "authorization": [],
+    "validation": ["storage"],
+    "storage": []
+  }
+}

@@ -85,6 +85,43 @@ def test_recent_reporting_groups_duplicate_refs_and_skips_stale(tmp_path):
     assert grouped[0]["sources"][0]["path"] == "sources/2026/07/a"
 
 
+def test_entity_page_surfaces_active_assessments_and_excludes_superseded(tmp_path):
+    wiki = tmp_path / "wiki"
+    entity = wiki / "entities/g/qilin.md"
+    entity.parent.mkdir(parents=True)
+    entity.write_text("---\ntype: actor\nid: actor:qilin\ntitle: Qilin\n---\nActor.\n")
+    assessments = wiki / "assessments/q"
+    assessments.mkdir(parents=True)
+    (assessments / "qilin-russia.md").write_text(
+        "---\ntype: assessment\ntitle: Qilin — Russia suspected attribution\n"
+        "assessment_kind: actor-country-linkage\nsubject_ref: actor:qilin\n"
+        "assessed_value: RU\nassessed_label: Russia\nepistemic_status: suspected\n"
+        "claim: Limited reporting tentatively associates Qilin with Russia.\n"
+        "confidence: 0.4\nconfidence_band: low\nneeds_review: true\nstatus: active\n"
+        "last_updated: 2026-07-22T23:00:00Z\n---\nAssessment.\n")
+    (assessments / "qilin-old.md").write_text(
+        "---\ntype: assessment\nsubject: entities/g/qilin\nstatus: superseded\n---\nOld.\n")
+    m = _load(tmp_path)
+    response = m.api_page("entities/g/qilin")
+    assert len(response["assessments"]) == 1
+    assessment = response["assessments"][0]
+    assert assessment["assessed_value"] == "Russia"
+    assert assessment["epistemic_status"] == "suspected"
+    assert assessment["confidence_band"] == "low"
+    assert assessment["needs_review"] is True
+
+
+def test_explicit_sharded_page_path_wins_over_same_basename_in_deeper_shard(tmp_path):
+    """Reader click-through must honor the exact path the writer grounded."""
+    wiki = tmp_path / "wiki"
+    exact = wiki / "entities" / "q" / "qilin.md"
+    deeper = wiki / "entities" / "q" / "archive" / "qilin.md"
+    _mk(exact, "actor")
+    _mk(deeper, "actor")
+    m = _load(tmp_path)
+    assert m._resolve_page("entities/q/qilin") == exact.resolve()
+
+
 def test_browse_rail_surfaces_dashboards_hides_operational(tmp_path):
     m = _load(_build_vault(tmp_path))
     tree = m.api_tree()["dirs"]
@@ -193,6 +230,12 @@ def test_about_panel_wired(tmp_path):
     assert "about-license" in html and "Apache-2.0" in html       # license note
     js = (READER / "static" / "app.js").read_text()
     assert "openAbout" in js and "closeAbout" in js      # open/close behaviour
+    assert "applyReaderIdentity(a)" in js                 # pack identity applied at boot
+    assert '$("#brand-home span")' in js and "document.title" in js
+    compose = (REPO / "templates/pack/skeleton/docker-compose.yml").read_text()
+    env_example = (REPO / "templates/pack/skeleton/.env.example").read_text()
+    assert "OKENGINE_UI_DISPLAY_NAME=${OKENGINE_UI_DISPLAY_NAME:-}" in compose
+    assert "OKENGINE_UI_DISPLAY_NAME=" in env_example
 
 
 def test_about_api_reports_vault_and_versions(tmp_path, monkeypatch):
@@ -206,6 +249,7 @@ def test_about_api_reports_vault_and_versions(tmp_path, monkeypatch):
     m = _load(tmp_path)
     a = m._about_info()
     assert a["vault"] == "okpack-demo" and a["vault_version"] == "1.2.0"
+    assert a["ui_display_name"] == "vault reader"         # pack identity is not deployment identity
     assert a["engine_version"] == "v0.2.0" and a["hermes_pin"] == "v2026.6.19"
     assert a["project_url"] == "https://example.org/okengine"   # pack.yaml fallback
     monkeypatch.setenv("OKENGINE_PROJECT_URL", "https://env.example/repo")
@@ -214,6 +258,21 @@ def test_about_api_reports_vault_and_versions(tmp_path, monkeypatch):
     resp = m.api_about()
     assert m._about_info().items() <= resp.items()
     assert "chat_enabled" in resp
+
+
+def test_ui_display_name_is_deployment_config_not_pack_metadata(tmp_path, monkeypatch):
+    monkeypatch.delenv("OKENGINE_UI_DISPLAY_NAME", raising=False)
+    monkeypatch.delenv("OKENGINE_READER_TITLE", raising=False)
+    (tmp_path / "wiki").mkdir()
+    pack = tmp_path / "pack.yaml"
+    pack.write_text("name: okpack-demo\ndisplay_name: Demo Intelligence\n")
+    m = _load(tmp_path)
+    assert m._about_info()["ui_display_name"] == "vault reader"
+    monkeypatch.setenv("OKENGINE_UI_DISPLAY_NAME", "Operations Knowledge")
+    assert m._about_info()["ui_display_name"] == "Operations Knowledge"
+    monkeypatch.delenv("OKENGINE_UI_DISPLAY_NAME")
+    monkeypatch.setenv("OKENGINE_READER_TITLE", "Legacy Operations")
+    assert m._about_info()["ui_display_name"] == "Legacy Operations"
 
 
 def test_about_api_tolerates_missing_files(tmp_path, monkeypatch):
@@ -225,7 +284,8 @@ def test_about_api_tolerates_missing_files(tmp_path, monkeypatch):
     monkeypatch.delenv("TZ", raising=False)   # tz defaults to UTC when the deployment sets no zone
     (tmp_path / "wiki").mkdir()
     m = _load(tmp_path)
-    assert m._about_info() == {"vault": "", "vault_version": "", "engine_version": "",
+    assert m._about_info() == {"vault": "", "vault_version": "", "ui_display_name": "vault reader",
+                              "engine_version": "",
                               "hermes_pin": "", "project_url": "", "tz": "UTC",
                               "description": "", "mission": "",
                               "installed_domains": [], "sub_domains": [], "extensions": []}
@@ -251,6 +311,20 @@ def test_display_groups_browse_by_kind(tmp_path):
     with pytest.raises(m.HTTPException) as ei:
         m.api_pages(group="Nope")
     assert ei.value.status_code == 404
+
+
+def test_display_groups_hide_tombstoned_pages(tmp_path):
+    (tmp_path / "schema.yaml").write_text(
+        "display_groups:\n  Threat actors: [actor]\n")
+    live = tmp_path / "wiki" / "entities" / "live.md"
+    dead = tmp_path / "wiki" / "entities" / "unsafe.md"
+    _mk(live, "actor")
+    _mk(dead, "actor")
+    dead.write_text(dead.read_text().replace("title: unsafe", "title: Unsafe\nstatus: tombstoned"))
+
+    m = _load(tmp_path)
+
+    assert [p["title"] for p in m.api_pages(group="Threat actors")["pages"]] == ["live"]
 
 
 def test_no_display_groups_is_empty(tmp_path):

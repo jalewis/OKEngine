@@ -79,7 +79,14 @@ def load_opml_sources(path: Path) -> list[dict]:
         url = o.get("xmlUrl") or o.get("xmlurl") or ""
         if url:
             label = o.get("text") or o.get("title") or url
-            kind = o.get("sourceKind") or o.get("source_kind") or "unknown"
+            # ORIGIN CLASS, not the page `source_kind` vocabulary. The OPML attribute and the
+            # ledger row both used the older spelling, so one field NAME carried two unrelated
+            # value sets — primary/secondary/unknown here, paper/post/news/report over on the
+            # pages — and nothing in either direction could complain (okengine#595). The legacy
+            # attribute names stay accepted: they are operator-authored config in every pack's
+            # feeds.opml, and silently dropping a key operators already wrote is not a rename.
+            kind = (o.get("originClass") or o.get("origin_class")
+                    or o.get("sourceKind") or o.get("source_kind") or "unknown")
             kind = kind if kind in ("primary", "secondary") else "unknown"
             raw_independent = (o.get("independentOrigin") or
                                o.get("independent_origin") or "").strip().lower()
@@ -90,7 +97,7 @@ def load_opml_sources(path: Path) -> list[dict]:
                 "source_id": collection_ledger.source_id("okengine.feed", url, label),
                 "label": label,
                 "url": url,
-                "source_kind": kind,
+                "origin_class": kind,
                 "independent_origin": independent,
             })
     return feeds
@@ -161,8 +168,8 @@ def fetch(url: str, validators: dict | None = None) -> tuple[bytes, dict]:
             raise ValueError(f"cannot resolve feed host: {e}") from e
         for info in infos:
             ip = ipaddress.ip_address(info[4][0])
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
-                raise ValueError(f"refusing private/link-local feed host address: {ip}")
+            if not ip.is_global:
+                raise ValueError(f"refusing non-public feed host address: {ip}")
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/atom+xml, application/rss+xml, application/xml;q=0.9, */*;q=0.8",
@@ -206,6 +213,20 @@ def parse_date(s: str | None) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat()
+
+
+def _dedupe_link(link) -> str:
+    """A link normalised enough to identify the same article across fetches.
+
+    Scheme, `www.`, a trailing slash and a trailing `?p=<n>`-style feed cache-buster are all noise
+    for identity purposes; the path is what names the article.
+    """
+    raw = str(link or "").strip().casefold()
+    raw = re.sub(r"^https?://", "", raw)
+    raw = re.sub(r"^www\.", "", raw)
+    raw = raw.split("#", 1)[0]
+    raw = re.sub(r"[?&]p=\d+\b", "", raw)
+    return raw.rstrip("/?&")
 
 
 def _t(elem: ET.Element | None) -> str:
@@ -483,10 +504,20 @@ def main(argv: list[str]) -> int:
         for it in items:
             native_id = it.get("id") or it.get("link") or ""
             seen_key = f"{url}\0{native_id}"
-            # The legacy state used bare native IDs. Honor it for upgrade
-            # compatibility, but write the feed-scoped key so two publishers
-            # reusing a GUID cannot suppress each other going forward.
-            first_seen = bool(native_id and seen_key not in seen and native_id not in seen)
+            # ALSO key on the article LINK, because a feed GUID is not reliably stable. One
+            # publisher re-emits the same article with a rotating `?p=<n>` guid on every fetch, so a
+            # guid-only key made `first_seen` true forever: the same article was re-captured on
+            # every run, into every category directory it matched. One URL reached 555 captures and
+            # the tree held 10,429 redundant files -- inflating every count derived from it, and
+            # making an ingest backlog look ~8x larger than it was.
+            #
+            # The link is publisher-scoped by construction, so this keeps the property the
+            # feed-scoped key was added for (two publishers reusing a GUID cannot suppress each
+            # other) while surviving guid rotation. The legacy bare-native-id lookup is retained
+            # for upgrade compatibility.
+            link_key = f"{url}\0link:{_dedupe_link(it.get('link'))}" if it.get("link") else ""
+            first_seen = bool(native_id and seen_key not in seen and native_id not in seen
+                              and not (link_key and link_key in seen))
             revision = False
             if args.capture_full_text and it.get("link"):
                 previous = captures.get(seen_key) or {}
@@ -520,8 +551,14 @@ def main(argv: list[str]) -> int:
                         it["license"] = captured.license
                     revision = bool(previous and (captured.changed or feed_changed or was_removed))
                     if revision:
+                        # Keyed on the EXTRACTED-TEXT hash, not the byte hash (okengine#748).
+                        # The byte hash churns on every fetch for publishers whose markup
+                        # carries a rotating token or timestamp, which minted a new raw file
+                        # each run forever — 639 copies of one article on a live vault. The
+                        # filename is derived from this, so text identity is what decides
+                        # whether a new raw item exists at all.
                         it["_revision_hash"] = hashlib.sha256(
-                            f"{captured.content_hash}\0{feed_fingerprint}".encode()).hexdigest()
+                            f"{captured.text_hash}\0{feed_fingerprint}".encode()).hexdigest()
                 except web_capture.CaptureError as exc:
                     capture_errors += 1
                     feed_capture_errors += 1
@@ -544,9 +581,12 @@ def main(argv: list[str]) -> int:
                                             or "retraction" in label or "retracted" in label)
             if native_id and (first_seen or revision):
                 it["_seen_key"] = seen_key
+                it["_seen_link_key"] = link_key
                 novel.append(it)
         for it in novel:
             seen[it.get("_seen_key") or it["id"]] = now
+            if it.get("_seen_link_key"):      # so a rotated guid cannot re-capture this article
+                seen[it["_seen_link_key"]] = now
             if out_dir is not None and write_item(out_dir, name, it, args.source_tag):
                 written += 1
         if novel:

@@ -1,0 +1,69 @@
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -108,6 +108,15 @@
+ _novita_metadata_cache: Dict[str, Dict[str, Any]] = {}
+ _novita_metadata_cache_time: float = 0
+ _MODEL_CACHE_TTL = 3600
++# okengine#484: which /props URL a given base actually answers on.
++#
++# llama.cpp builds differ: current ones serve /v1/props, older ones /props. The probe tried the
++# prefixed form FIRST every time and fell back on 404, so every metadata fetch against a /props
++# server generated a guaranteed 404 -- the inference host counted 86 in one sample window, far
++# more than the once-per-process capability ladder. Remembering the URL that worked makes the
++# 404 happen at most once per process instead of once per fetch. A base answering on neither is
++# recorded so it is not re-probed either.
++_props_url_cache: Dict[str, Any] = {}
+ _endpoint_model_metadata_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
+ _endpoint_model_metadata_cache_time: Dict[str, float] = {}
+ _ENDPOINT_MODEL_CACHE_TTL = 300
+@@ -969,13 +978,28 @@
+             )
+             if is_llamacpp:
+                 try:
+-                    # Try /v1/props first (current llama.cpp); fall back to /props for older builds
++                    # Try the URL this base is KNOWN to answer on first (okengine#484); only
++                    # walk both forms when we have not learned it yet. Current llama.cpp serves
++                    # /v1/props, older builds /props.
+                     base = candidate.rstrip("/").replace("/v1", "")
+                     _verify = _resolve_requests_verify()
+-                    props_resp = requests.get(base + "/v1/props", headers=headers, timeout=5, verify=_verify)
+-                    if not props_resp.ok:
+-                        props_resp = requests.get(base + "/props", headers=headers, timeout=5, verify=_verify)
+-                    if props_resp.ok:
++                    _known = _props_url_cache.get(base, "unset")
++                    if _known == "unset":
++                        _order = [base + "/v1/props", base + "/props"]
++                    elif _known:
++                        _order = [_known]
++                    else:
++                        _order = []          # answered on neither before -- do not re-probe
++                    props_resp = None
++                    for _url in _order:
++                        props_resp = requests.get(_url, headers=headers, timeout=5, verify=_verify)
++                        if props_resp.ok:
++                            _props_url_cache[base] = _url
++                            break
++                    else:
++                        if _known == "unset":
++                            _props_url_cache[base] = None
++                    if props_resp is not None and props_resp.ok:
+                         props = props_resp.json()
+                         gen_settings = props.get("default_generation_settings", {})
+                         n_ctx = gen_settings.get("n_ctx")
+@@ -1654,7 +1678,14 @@
+                                     return int(ctx)
+                             break
+ 
+-            # LM Studio / vLLM / llama.cpp: try /v1/models/{model}
++            # LM Studio / vLLM: try /v1/models/{model}.
++            #
++            # okengine#484: llama.cpp serves NO per-model endpoint, so this is a guaranteed
++            # 404 against it -- the inference host counted 9 in one sample window. Skip it
++            # rather than asking a question the server cannot answer.
++            # detect_local_server_type() is memoized (patch 15), so the check is free.
++            if detect_local_server_type(base_url, api_key=api_key) == "llamacpp":
++                return None
+             resp = client.get(f"{server_url}/v1/models/{model}")
+             if resp.status_code == 200:
+                 data = resp.json()

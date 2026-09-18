@@ -66,7 +66,9 @@ def test_manifest_and_schema_ownership_contract():
     schema = yaml.safe_load((EXT / "schema" / "assessments.schema.yaml").read_text())
     assert manifest["id"] == "okengine.assessments" and manifest["core"] is False
     assert manifest["capabilities"]["network"] is False
-    assert schema["owns"]["namespaces"] == ["assessments"]
+    assert schema["owns"]["namespaces"]["assessments"] == {
+        "strategy": "by-letter", "reshard_by": "second-letter",
+    }
     required = set(schema["field_items"]["adversarial_evidence"]["_item"]["required"])
     assert {"observation_confidence", "diagnosticity", "manipulation_susceptibility",
             "evidence_lineage", "source_independence", "deception_possible",
@@ -81,6 +83,11 @@ def test_manifest_and_schema_ownership_contract():
 def test_pack_declared_assessment_subtype_is_consumed(tmp_path):
     (tmp_path / "schema.yaml").write_text("assessment_types: [actor-assessment]\n")
     assert _load_module().assessment_types(tmp_path) == {"assessment", "actor-assessment"}
+
+
+def test_assessment_schema_declares_stable_subject_reference():
+    schema = yaml.safe_load((EXT / "schema/assessments.schema.yaml").read_text())
+    assert "subject_ref" in schema["owns"]["types"]["assessment"]["optional"]
 
 
 def test_composed_extension_enforces_item_shape_and_enums_at_write_boundary(tmp_path, monkeypatch):
@@ -308,3 +315,60 @@ def test_sort_key_breaks_batch_update_ties_by_analytic_as_of():
     older = {**common, "title": "Zed", "as_of": "2026-07-16T04:54:19Z"}
     newer = {**common, "title": "Alpha", "as_of": "2026-07-17T05:08:40Z"}
     assert m._record_sort_key(newer) > m._record_sort_key(older)
+
+
+def test_policy_and_renderer_boundary_paths(tmp_path):
+    m = _load_module()
+    absence = _expected_absence()
+    absence["adversarial_evidence"][0]["expected_under"] = []
+    missing, qualified = m._absence_qualification(absence["adversarial_evidence"][0])
+    assert "expected_under" in missing and qualified is False
+
+    invalid = m.evaluate({"proposed_confidence_change": "not-numeric", "alternatives": ["A"]})
+    assert invalid["outcome"] == "human-review"
+    assert invalid["alternatives"] == ["A"]
+
+    manipulable = _fixture("planted-attribution.yaml")
+    manipulable["consequence"] = "low"
+    result = m.evaluate(manipulable)
+    assert result["outcome"] == "capped-held"
+    assert "highly manipulable" in result["reasons"][0]
+
+    unchanged = _fixture("resistant-corroboration.yaml")
+    unchanged["proposed_confidence_change"] = 0
+    assert "no confidence increase" in m.evaluate(unchanged)["reasons"][0]
+
+    capped = _fixture("syndicated-lineage.yaml")
+    capped["adversarial_evidence"].append("legacy-string")
+    text = m.render_assessment(capped, m.evaluate(capped))
+    assert "Recommended cap" in text
+
+    absence_result = m.evaluate(absence)
+    text = m.render_assessment(absence, absence_result)
+    assert "Expected under competing hypotheses" in text
+    assert "- Not supplied" in text
+
+    malformed = tmp_path / "malformed.md"
+    malformed.write_text("---\nkey: [\n---\n")
+    assert m._load(malformed) is None
+
+
+def test_schema_and_main_tolerate_invalid_and_multiple_records(tmp_path, monkeypatch):
+    m = _load_module()
+    (tmp_path / "schema.yaml").write_text("assessment_types: invalid\n")
+    assert m.assessment_types(tmp_path) == {"assessment"}
+    (tmp_path / "schema.yaml").write_text("assessment_types: [\n")
+    assert m.assessment_types(tmp_path) == {"assessment"}
+
+    adir = tmp_path / "wiki" / "assessments"
+    adir.mkdir(parents=True)
+    for index in range(2):
+        record = _fixture("resistant-corroboration.yaml")
+        record["claim"] = f"Assessment {index}"
+        (adir / f"{index}.md").write_text(
+            "---\n" + yaml.safe_dump(record, sort_keys=False) + "---\n")
+    (adir / "ignored.md").write_text("---\ntype: source\n---\n")
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    assert m.main() == 0
+    dashboard = (tmp_path / "wiki/dashboards/adversarial-evidence-review.md").read_text()
+    assert "Assessment 0" in dashboard and "Assessment 1" in dashboard

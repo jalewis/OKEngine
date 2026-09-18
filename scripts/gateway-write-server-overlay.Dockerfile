@@ -15,3 +15,5 @@
 ARG BASE=hermes-agent:latest
 FROM ${BASE}
 COPY okengine-mcp/write_server.py /opt/hermes/okengine-mcp/write_server.py
+COPY src/okengine/write_services/ /opt/hermes/src/okengine/write_services/
+COPY okengine-mcp/output_contract_enforce.py /opt/hermes/okengine-mcp/output_contract_enforce.py

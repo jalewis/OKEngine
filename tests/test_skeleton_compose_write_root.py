@@ -77,3 +77,16 @@ def test_operation_runner_is_allowlisted_bridge_only_and_cockpit_stays_read_only
 def test_operation_runner_image_contains_engine_extension_tools():
     dockerfile = (REPO / "okengine-operations" / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY extensions/ /engine/extensions/" in dockerfile
+
+
+def test_postgres_projection_is_default_internal_and_read_only_over_vault():
+    text = COMPOSE.read_text(encoding="utf-8")
+    postgres = text.split("  postgres:", 1)[1].split("  okengine-projection:", 1)[0]
+    projection = text.split("  okengine-projection:", 1)[1].split("  gateway:", 1)[0]
+    assert 'profiles: ["projection"]' not in postgres
+    assert 'profiles: ["projection"]' not in projection
+    assert "ports:" not in postgres and "ports:" not in projection
+    assert 'POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"' in postgres
+    assert "OKENGINE_PROJECTION_WRITER_DSN" in projection
+    assert "OKENGINE_PROJECTION_READER_PASSWORD" in projection
+    assert "./:/opt/vault:ro" in projection

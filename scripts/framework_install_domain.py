@@ -565,10 +565,30 @@ def merge_namespaces(host: Path, pack: Path, plan: Plan) -> None:
     hs = _yaml(hschema)
     hns = ((hs.get("partitioning") or {}).get("namespaces") or {})
     add_part, add_perm, add_tier = {}, {}, {}
+    pname = pack_name(pack)
+    manifest = _load_mod("composed_pack_state.py").load(host, pname)
+    prior_owned = manifest.get("owned_namespaces") or {}
+    try:
+        legacy_owned = f"# co-installed ({pname}, framework install-domain)" in hschema.read_text()
+    except OSError:
+        legacy_owned = False
     for ns in owned:
         if ns in hns:
-            plan.warn(f"namespace '{ns}' already declared by the host — host wins; "
-                      "verify the partitioning/permission contract matches the pack's")
+            if ns not in prior_owned and not legacy_owned:
+                plan.fail(f"namespace '{ns}' is already owned by the host or another pack; "
+                          f"partitioning shape equality does not prove identity for {pname}")
+                continue
+            expected_part = ((ps.get("partitioning") or {}).get("namespaces") or {}).get(ns) or {
+                "strategy": "flat"}
+            expected_perm = ((ps.get("permissions") or {}).get("namespaces") or {}).get(ns)
+            expected_tier = ((ps.get("tier") or {}).get("namespaces") or {}).get(ns)
+            actual_perm = ((hs.get("permissions") or {}).get("namespaces") or {}).get(ns)
+            actual_tier = ((hs.get("tier") or {}).get("namespaces") or {}).get(ns)
+            if hns.get(ns) != expected_part or actual_perm != expected_perm or actual_tier != expected_tier:
+                plan.fail(f"namespace '{ns}' is recorded as owned by {pname}, but its host "
+                          "partitioning/permission/tier contract has drifted; reconcile explicitly")
+            else:
+                plan.info(f"namespace '{ns}' is already installed and owned by {pname}")
             continue
         add_part[ns] = ((ps.get("partitioning") or {}).get("namespaces") or {}).get(ns) or {"strategy": "flat"}
         pperm = (((ps.get("permissions") or {}).get("namespaces") or {}).get(ns))
@@ -1071,8 +1091,8 @@ def install_taxonomy(host: Path, pack: Path, slug: str, plan: Plan, *, refresh: 
                        scope=(set((source_manifest.get("lane_scripts") or {}).keys()) |
                               set((source_manifest.get("shared_support_scripts") or {}).keys())))
     merge_cockpit(host, pack, plan, refresh=refresh)
-    if not refresh:
-        append_persona(host, pack, slug, plan)
+    # The refresh corridor returns above; reaching here always means an initial/non-refresh install.
+    append_persona(host, pack, slug, plan)
 
 
 def _checklist(shape: str, slug: str) -> str:

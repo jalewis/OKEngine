@@ -1,25 +1,46 @@
 # Reusable assessment substrate. Domain packs supply question taxonomies and rubrics;
 # this fragment owns only the generic ledger and adversarial-evidence contract.
 owns:
-  namespaces: [assessments]
+  namespaces:
+    assessments: {strategy: by-letter, reshard_by: second-letter}
   types:
     assessment:
       required: [type, subject, question, claim, status, as_of, confidence,
                  confidence_band, proposed_confidence_change, consequence,
                  alternatives, adversarial_evidence]
-      optional: [assessment_kind, confidence_rationale, assumptions,
+      optional: [assessment_kind, subject_ref, confidence_rationale, assumptions,
                  would_increase_confidence, would_decrease_confidence,
                  needs_review, reviewed_by, reviewed_on, review_method, review_policy,
-                 assessed_value, assessed_label, epistemic_status, sources]
+                 assessed_value, assessed_label, epistemic_status, sources,
+                 # okengine#746 — the REMEDY convention. An assessment normally answers
+                 # "is this claim true?". With `assessment_kind: remedy` it answers the
+                 # prescriptive question instead: "would this intervention work, and is it
+                 # tractable?" The whole adversarial-evidence apparatus applies unchanged —
+                 # a proposed fix has evidence for and against exactly like a factual claim,
+                 # and `alternatives` already carries the competing options.
+                 #
+                 # Only the three things a remedy has that a factual claim does not are added,
+                 # all OPTIONAL so no existing assessment page is affected and composition
+                 # stays safe. A remedy that omits them is still valid, just less decidable.
+                 remedy_cost, remedy_prerequisites, remedy_decision,
+                 # The inquiry this assessment answers (okengine.inquiry slug). Soft edge:
+                 # no hard `requires` on that extension — the field is inert without it.
+                 inquiry]
 
 field_shapes:
   alternatives: list
+  remedy_prerequisites: list   # what must already be true for the remedy to be available
   assumptions: list
   would_increase_confidence: list
   would_decrease_confidence: list
   adversarial_evidence: list
 
 enums:
+  # Where a remedy stands with the people who would have to act on it. Deliberately NOT a
+  # confidence scale: `adopted` says someone decided, not that the evidence got stronger.
+  # Keeping the two apart is the point — a remedy can be well-evidenced and rejected, or
+  # adopted on thin evidence, and a reader must be able to see which.
+  remedy_decision: [proposed, adopted, rejected, deferred]
   evidence_kind: [observed, expected-absence]
   observation_confidence: [low, medium, high]
   diagnosticity: [none, low, medium, high]
@@ -33,6 +54,7 @@ enums:
 
 field_enums:
   epistemic_status: {enum: epistemic_status}
+  remedy_decision: {enum: remedy_decision}
 
 field_items:
   adversarial_evidence:

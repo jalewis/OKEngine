@@ -111,3 +111,18 @@ def test_build_index_survives_integer_alias():
     assert "charmingkitten" in idx.keys      # the good alias still indexes
     assert "10768" in idx.keys               # the int is coerced, not fatal
     assert idx.keys["charmingkitten"] == {"apt35"}
+
+
+def test_empty_and_duplicate_index_inputs_are_ignored():
+    m = _load()
+    idx = m.CanonicalIndex()
+    idx.add("", "ignored", ["alias"])
+    idx.add("kept", "", ["", "Alias"])
+    assert idx.primary == {}
+    assert idx.keys == {"alias": {"kept"}}
+
+    # Empty normalized input takes the explicit no-evidence path; repeated aliases
+    # exercise the de-duplication path without inflating overlap evidence.
+    assert m.resolve(idx, None, [None]).evidence == "none"
+    result = m.resolve(idx, "Alias", [" alias "])
+    assert result.evidence == "single-alias"

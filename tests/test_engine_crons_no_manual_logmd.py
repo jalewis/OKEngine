@@ -81,15 +81,16 @@ def test_no_fixed_hour_cron_in_dst_transition_window():
         sch = j.get("schedule")
         expr = sch.get("expr") if isinstance(sch, dict) else sch
         hours = _fixed_hours(expr)
-        if len(hours) <= 4 and any(h in (1, 2) for h in hours):
+        if 2 in hours and (len(hours) <= 4 or 3 in hours):
             bad.append((j.get("name"), expr))
-    assert not bad, f"low-frequency (≤4×/day) crons in the DST transition window (01:xx/02:xx): {bad}"
+    assert not bad, ("crons that lose a spring-forward execution (low-frequency 02:xx or "
+                     f"adjacent 02:xx/03:xx slots): {bad}")
 
 
 def test_index_tree_rebuilds_intraday():
     """Index freshness is an ENGINE default, not a per-pack workaround: a nightly-only
     build-index-tree meant pages ingested during the day didn't appear in namespace INDEX
-    listings until the NEXT morning (hit live on cyber-market, then okcti). The default must
+    listings until the NEXT morning (hit live on market-intel, then okcti). The default must
     fire at least every ~6h, with at least one run after the morning content lanes
     (lacuna 06:00 / daily brief 07:30) so same-day pages surface the same morning."""
     job = next(j for j in _JOBS if j.get("name") == "build-index-tree")

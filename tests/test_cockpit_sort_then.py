@@ -77,3 +77,16 @@ def test_then_breaks_batch_tie_by_rfc3339_timestamp(monkeypatch, tmp_path):
     out = [r["title"] for r in m._ds_sorted(
         rows, {"field": "last_updated", "desc": True, "then": "as_of"})]
     assert out == ["newer", "older"], out
+
+
+def test_explicit_date_mode_honors_safe_lexical_tie_break(monkeypatch, tmp_path):
+    m = _mod(monkeypatch, tmp_path)
+    rows = [
+        {"title": "Zulu", "seen": "2026-08-26", "recent_news": 99},
+        {"title": "Alpha", "seen": "2026-08-26", "recent_news": 1},
+        {"title": "Newest", "seen": "2026-08-27", "recent_news": 0},
+    ]
+    out = [row["title"] for row in m._ds_sorted(
+        rows, {"field": "seen", "date": True, "desc": True, "then": "title"}
+    )]
+    assert out == ["Newest", "Zulu", "Alpha"]

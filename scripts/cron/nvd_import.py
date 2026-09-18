@@ -3,7 +3,7 @@
 
 The engine owns this transport/normalization implementation; packs select a page
 model instead of forking it. Supported models are the public ``cve`` catalog
-(``wiki/cves``) and the cyber-market ``vulnerability`` entity catalog
+(``wiki/cves``) and a market-intel pack's ``vulnerability`` entity catalog
 (``wiki/entities``). Both use the same fetch, CVSS selection, merge, boundary,
 backfill, and failure semantics.
 
@@ -28,6 +28,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import importer_guard  # noqa: E402
 import okf_migrate  # noqa: E402
+import schema_lib  # noqa: E402
 
 NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 _CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$")
@@ -218,7 +219,7 @@ def apply_observation(vault: Path, rec: dict, *, all_severities: bool,
         return "skip"
     reliability, credibility = "A", "2"
     try:
-        schema = yaml.safe_load((vault / "schema.yaml").read_text(encoding="utf-8")) or {}
+        schema = schema_lib.merged_schema(vault)
         source = (schema.get("source_registry") or {}).get("nvd") or {}
         reliability = str(source.get("reliability") or reliability)
         credibility = str(source.get("credibility_default") or credibility)

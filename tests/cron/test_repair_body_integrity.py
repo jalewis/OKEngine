@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "cron" / "repair_body_integrity.py"
@@ -94,3 +95,81 @@ def test_fenced_headings_and_bullets_are_preserved_verbatim():
         "duplicate_sections": 0,
         "duplicate_entries": 0,
     }
+
+
+def test_bullet_blocks_prose_and_tilde_fences_cover_boundary_paths():
+    module = _load()
+    lines = [
+        "- same item",
+        "  continuation",
+        "- SAME   ITEM",
+        "",
+        "Prose after list",
+        "~~~text",
+        "- repeated-looking fenced item",
+        "~~~",
+        "* final",
+    ]
+    result = module._dedupe_bullets(lines)
+    assert result.count("- same item") == 1
+    assert "Prose after list" in result
+    assert "- repeated-looking fenced item" in result
+    assert module._bullet_count(result) == 3
+
+
+def test_heading_cleanup_preamble_spacing_and_duplicate_merge():
+    module = _load()
+    assert module._clean_heading("###   Name ") == "Name"
+    repaired, stats = module.repair_body(
+        "\nPreamble\n\n## One\ntext\n\n## one\nmore\n\n## Two\n- x\n"
+    )
+    assert repaired.startswith("\nPreamble\n\n## One")
+    assert "text\n\nmore" in repaired
+    assert stats["duplicate_sections"] == 1
+
+
+def test_repair_page_rejects_unreadable_missing_frontmatter_and_unchanged(tmp_path, monkeypatch):
+    module = _load()
+    no_fm = tmp_path / "no.md";no_fm.write_text("# no frontmatter\n")
+    assert module.repair_page(no_fm) == (None, {})
+    clean = tmp_path / "clean.md";_page(clean, "# Clean\n\n## Notes\ntext\n")
+    repaired, stats = module.repair_page(clean)
+    assert repaired is None and stats == {
+        "malformed_headings": 0, "duplicate_sections": 0, "duplicate_entries": 0
+    }
+    original = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: (_ for _ in ()).throw(OSError()) if self == clean else original(self, *a, **k))
+    assert module.repair_page(clean) == (None, {})
+
+
+def test_candidates_missing_wiki_and_skipped_namespaces(tmp_path):
+    module = _load()
+    assert module.candidates(tmp_path) == []
+    keep = tmp_path/"wiki/entities/keep.md";_page(keep, "## ## Notes\n")
+    skip = tmp_path/"wiki/dashboards/skip.md";_page(skip, "## ## Notes\n")
+    assert module.candidates(tmp_path) == [keep]
+
+
+def test_main_skips_clean_page_and_reports_zero(tmp_path, capsys):
+    module = _load()
+    _page(tmp_path/"wiki/entities/clean.md", "# Clean\n\n## Notes\ntext\n")
+    assert module.main(["--vault", str(tmp_path)]) == 0
+    assert "would repair 0 page(s)" in capsys.readouterr().out
+
+
+def test_unterminated_and_mismatched_fences_and_compact_duplicate_sections():
+    module = _load()
+    assert module._dedupe_bullets(["```", "- fenced"]) == ["```", "- fenced"]
+    assert module._bullet_count(["```", "- fenced"]) == 0
+    repaired, stats = module.repair_body(
+        "## One\ntext\n## one\nmore\n## Two\n```\n~~~\n## not-a-heading\n"
+    )
+    assert "text\n\nmore" in repaired
+    assert "## not-a-heading" in repaired
+    assert stats["duplicate_sections"] == 1
+
+
+def test_limit_must_be_positive():
+    module = _load()
+    with pytest.raises(SystemExit):
+        module.main(["--limit", "0"])

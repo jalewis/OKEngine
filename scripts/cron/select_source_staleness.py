@@ -284,6 +284,18 @@ def _band(score: float) -> str:
     return "0.00-0.10 (very stale)"
 
 
+def _dashboard_stamp() -> str:
+    """The dashboard's own build timestamp, as a seam a caller can freeze.
+
+    `main()` rewrites the dashboard only when the rendered bytes CHANGE, and this stamp
+    has second resolution — so two consecutive runs that straddle a second tick differ
+    and the second reports "updated" instead of "unchanged". That made the idempotence
+    test a race: it passed locally and failed on slower CI. This mirrors the existing
+    `tz_lib.deployment_today` date seam, which the same test already freezes.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def render_dashboard(scores: dict[str, SourceScore], anchors: list[Anchor], today: date) -> str:
     n_total = len(scores)
     n_stale = sum(1 for s in scores.values() if s.is_stale)
@@ -310,7 +322,7 @@ def render_dashboard(scores: dict[str, SourceScore], anchors: list[Anchor], toda
     L.append("type: dashboard")
     L.append("title: Source staleness — effective-score decay")
     L.append(f"created: {today.isoformat()}")
-    L.append(f"updated: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
+    L.append(f"updated: {_dashboard_stamp()}")
     L.append("---")
     L.append("")
     L.append("# Source staleness — effective-score decay")

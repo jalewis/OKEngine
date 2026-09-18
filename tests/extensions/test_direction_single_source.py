@@ -23,11 +23,16 @@ from pathlib import Path
 
 import yaml
 
+import pytest
+
+pytestmark = pytest.mark.contract
+
 REPO = Path(__file__).resolve().parents[2]
 FRAGMENT = REPO / "extensions" / "okengine.predictions" / "schema" / "predictions.schema.yaml"
 EXT_YAML = REPO / "extensions" / "okengine.predictions" / "extension.yaml"
 SELECTOR = REPO / "extensions" / "okengine.predictions" / "select_regrade_batch.py"
 COCKPIT = REPO / "okengine-cockpit" / "app.py"
+COCKPIT_STATE = REPO / "src" / "okengine" / "cockpit_services" / "state.py"
 SCHEMA_LIB = REPO / "scripts" / "cron" / "schema_lib.py"
 
 
@@ -47,7 +52,7 @@ def _cockpit_const(name: str):
     """Evaluate a module-level constant from app.py SOURCE without importing it (no fastapi
     needed). Handles literals and frozenset({...}) calls. Raises if absent — a renamed
     constant must break this test, not silently pass."""
-    tree = ast.parse(COCKPIT.read_text(encoding="utf-8"))
+    tree = ast.parse(COCKPIT_STATE.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and any(
             isinstance(t, ast.Name) and t.id == name for t in node.targets
@@ -56,7 +61,7 @@ def _cockpit_const(name: str):
             if isinstance(v, ast.Call) and getattr(v.func, "id", "") == "frozenset":
                 return frozenset(ast.literal_eval(v.args[0]))
             return ast.literal_eval(v)
-    raise AssertionError(f"constant {name} not found in okengine-cockpit/app.py — "
+    raise AssertionError(f"constant {name} not found in cockpit state service — "
                          f"renamed? update this contract test alongside it")
 
 
@@ -136,6 +141,7 @@ def test_cockpit_runtime_loader_reads_composed_artifact(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     sys.modules.pop("app", None)
+    sys.path.insert(0, str(COCKPIT.parent))
     app = _load("app", COCKPIT)
     assert app._ev_direction_enum() == frozenset({"reinforces", "contradicts", "up"})
     assert app._ev_bucket("up") == "up"                # schema-sanctioned passes through

@@ -121,3 +121,26 @@ def test_gate_stays_quiet_below_threshold_or_when_defined(tmp_path):
         _page(tmp_path, f"entities/b{i}.md", "[[glossary/throughput]]\n")
     _page(tmp_path, "glossary/throughput.md", "---\ntype: term\nterm: Throughput\n---\nx\n")
     assert "throughput" not in _run_gate(tmp_path)
+
+
+def test_gate_missing_vault_and_read_race(tmp_path, monkeypatch, capsys):
+    selector = EXT / "select_undefined_terms.py"
+    mod = _load("glossary_selector_edges", selector)
+    monkeypatch.setattr(mod, "WIKI", tmp_path / "missing")
+    assert mod.main() == 0
+    assert '"wakeAgent": false' in capsys.readouterr().out
+
+    wiki = tmp_path / "wiki"
+    page = wiki / "entities/a.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("[[glossary/raced]]")
+    original = Path.read_text
+
+    def moved(path, *args, **kwargs):
+        if path == page:
+            raise OSError("vanished")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(mod, "WIKI", wiki)
+    monkeypatch.setattr(Path, "read_text", moved)
+    assert mod._undefined_terms() == {}

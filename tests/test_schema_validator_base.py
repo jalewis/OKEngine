@@ -45,6 +45,21 @@ def test_base_floors_required_type_when_pack_omits_okf(tmp_path):
     assert r and "type" in r
 
 
+def test_schema_checks_link_replacement_at_vault_name_not_old_external_target(tmp_path):
+    m = _load()
+    wiki = _vault(tmp_path / "vault", "types:\n  entity: {required: [type, id]}\n")
+    external = tmp_path / "external.md"
+    external.write_text("outside\n", encoding="utf-8")
+    link = wiki / "entities" / "a.md"
+    link.symlink_to(external)
+    invalid = "---\ntype: entity\n---\ninvalid\n"
+    valid = "---\ntype: entity\nid: entity:a\n---\nvalid\n"
+    assert m.schema_reject_reason(str(link), invalid) is None  # normal write follows the link
+    reason = m.schema_reject_reason_for_link_replacement(str(link), invalid)
+    assert reason and "id" in reason
+    assert m.schema_reject_reason_for_link_replacement(str(link), valid) is None
+
+
 def test_id_required_after_promotion_should_tier_empty(tmp_path):
     """`id` was promoted WARN->MUST after the P1 id backfill stamped every page: a
     page missing `id` now HARD-rejects (it was a should/WARN flag), and the engine

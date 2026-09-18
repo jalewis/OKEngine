@@ -45,7 +45,7 @@ def _rec(op):
 def test_tier_is_stamped_on_the_job():
     c = _load("extension_compose", COMPOSE)
     jobs, errors, _ = c.synthesize_ops(_rec({
-        "schedule": {"kind": "cron", "expr": "0 4 * * *"}, "entrypoint": "score.py", "tier": "score"}))
+        "schedule": {"kind": "cron", "expr": "@jitter:daily@4"}, "entrypoint": "score.py", "tier": "score"}))
     assert not errors, errors
     assert jobs[0]["tier"] == "score"
 
@@ -55,7 +55,7 @@ def test_model_override_stamped_on_job():
     on a free/cheap model while paid work uses the config default."""
     c = _load("extension_compose", COMPOSE)
     jobs, errors, _ = c.synthesize_ops(_rec({
-        "schedule": {"kind": "cron", "expr": "0 4 * * *"}, "entrypoint": "s.py",
+        "schedule": {"kind": "cron", "expr": "@jitter:daily@4"}, "entrypoint": "s.py",
         "prompt": "x", "model": "vendor/small-model:free"}))
     assert not errors, errors
     assert jobs[0]["model"] == "vendor/small-model:free"
@@ -64,28 +64,28 @@ def test_model_override_stamped_on_job():
 def test_no_model_means_no_field():
     c = _load("extension_compose", COMPOSE)
     jobs, _, _ = c.synthesize_ops(_rec({
-        "schedule": {"kind": "cron", "expr": "0 4 * * *"}, "entrypoint": "s.py"}))
+        "schedule": {"kind": "cron", "expr": "@jitter:daily@4"}, "entrypoint": "s.py"}))
     assert "model" not in jobs[0]
 
 
 def test_manifest_rejects_non_string_model():
     mod = _load("extension_manifest", MANIFEST)
     errors, _ = mod.validate_manifest(_rec({
-        "schedule": {"kind": "cron", "expr": "0 4 * * *"}, "entrypoint": "s.py", "model": 5})["manifest"])
+        "schedule": {"kind": "cron", "expr": "@jitter:daily@4"}, "entrypoint": "s.py", "model": 5})["manifest"])
     assert any("model must be a non-empty model id" in e for e in errors), errors
 
 
 def test_no_tier_means_no_field():
     c = _load("extension_compose", COMPOSE)
     jobs, _, _ = c.synthesize_ops(_rec({
-        "schedule": {"kind": "cron", "expr": "0 4 * * *"}, "entrypoint": "score.py"}))
+        "schedule": {"kind": "cron", "expr": "@jitter:daily@4"}, "entrypoint": "score.py"}))
     assert "tier" not in jobs[0]
 
 
 def test_manifest_rejects_non_string_tier():
     mod = _load("extension_manifest", MANIFEST)
     errors, _ = mod.validate_manifest(_rec({
-        "schedule": {"kind": "cron", "expr": "0 4 * * *"}, "entrypoint": "s.py", "tier": 3})["manifest"])
+        "schedule": {"kind": "cron", "expr": "@jitter:daily@4"}, "entrypoint": "s.py", "tier": 3})["manifest"])
     assert any("tier must be a non-empty stage name" in e for e in errors), errors
 
 

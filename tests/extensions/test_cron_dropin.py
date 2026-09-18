@@ -28,7 +28,7 @@ def _manifest(ext_id, with_ops=False):
          "requires": {"engine": ">=0.6.0"},
          "capabilities": {"read": ["wiki/**"], "write": ["x/**"]}}
     if with_ops:
-        m["operations"] = {"manual": {"schedule": {"kind": "cron", "expr": "0 5 * * *"},
+        m["operations"] = {"manual": {"schedule": {"kind": "cron", "expr": "@jitter:daily@5"},
                                       "entrypoint": "manual.py"}}
     return m
 
@@ -90,7 +90,7 @@ def test_dropin_after_dependency_passes_through(tmp_path):
     c = _load()
     (tmp_path / "crons").mkdir()
     (tmp_path / "crons" / "score.cron.json").write_text(json.dumps(
-        {"schedule": {"kind": "cron", "expr": "0 6 * * *"}, "entrypoint": "score.py",
+        {"schedule": {"kind": "cron", "expr": "@jitter:daily@6"}, "entrypoint": "score.py",
          "after": ["okengine.ex:ledger"]}))
     jobs, errors, _ = c.synthesize_ops(_rec("okengine.ex", tmp_path))
     assert not errors, errors

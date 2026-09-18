@@ -28,7 +28,9 @@ GIDG="${GIDG:-$UIDG}"
 # create pages in it — yet a files-only repair left the dir root-owned and deployment_validate went
 # green. Matches check_ownership, which now flags stray dirs as well.
 docker exec "$GW" sh -c "
-  find /opt/vault/wiki /opt/vault/raw /opt/vault/config -not -uid $UIDG 2>/dev/null | head -200 > /tmp/.strays
+  set -- /opt/vault/wiki /opt/vault/raw /opt/vault/config /opt/vault/.okengine
+  find \"\$@\" \( -path /opt/vault/.okengine/snapshots -o -path /opt/vault/.okengine/backups \) \\
+    -prune -o -not -uid $UIDG -print 2>/dev/null | head -200 > /tmp/.strays
   N=\$(wc -l < /tmp/.strays)
   if [ \"\$N\" = 0 ]; then echo 'ownership clean'; exit 0; fi
   echo \"\$N stray path(s):\"; head -10 /tmp/.strays

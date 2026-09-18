@@ -70,3 +70,10 @@ def test_adversarial_assessments_have_explicit_record_boundaries():
     heading = re.search(r"\.ddoc \.assessment-review-separator\+h2\{[^}]*\}", CSS)
     assert marker and "margin:34px" in marker.group(0)
     assert heading and "border-left:5px" in heading.group(0) and "background:" in heading.group(0)
+
+
+def test_responsive_shell_and_visible_focus_contract():
+    assert "@media (max-width:760px)" in CSS
+    assert "#tabs.open" in CSS and ".nav-toggle" in CSS
+    assert ":focus-visible" in CSS
+    assert ".overlay{width:100vw" in CSS

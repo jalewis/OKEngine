@@ -1,20 +1,56 @@
 # Root project metadata + tool config for OKEngine.
 #
-# OKEngine is NOT a pip-installable library (it is an engine layered on a pinned
-# Hermes-Agent + deployed packs), so there is intentionally no [build-system].
-# This file exists for project metadata and to configure pytest + ruff.
+# OKEngine ships one wheel per engine revision. Runtime images install that same
+# package contract; compatibility wrappers remain only while legacy scripts are
+# migrated into src/okengine in risk-ordered tranches.
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
 
 [project]
 name = "okengine"
-version = "0.13.5"
+version = "0.14.4"
 description = "OKEngine (Open Knowledge Engine) — a domain-agnostic engine for swappable-topic LLM wikis: it turns a pinned agent into a wiki maintainer driven by declarative packs (OKF is a portability floor)."
 readme = "README.md"
 requires-python = ">=3.11.4"
 license = { text = "Apache-2.0" }
 
+[project.scripts]
+okengine-framework = "okengine.cli:framework"
+okengine-cron = "okengine.cli:cron"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/okengine"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"tools/schema_validator.py" = "tools/schema_validator.py"
+"tools/policy_plane.py" = "tools/policy_plane.py"
+"okengine-mcp/output_contract_enforce.py" = "output_contract_enforce.py"
+"okengine-mcp/converge.py" = "converge.py"
+"scripts/cron/id_lib.py" = "id_lib.py"
+"scripts/cron/schema_lib.py" = "schema_lib.py"
+"scripts/cron/id_index.py" = "id_index.py"
+"scripts/cron/okf_migrate.py" = "okf_migrate.py"
+"config/base-schema.yaml" = "okengine/data/base-schema.yaml"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q --import-mode=importlib"
+addopts = "-q --import-mode=importlib --timeout=30 --timeout-method=thread"
+markers = [
+  "unit: isolated logic with no network, database, filesystem, or subprocess I/O",
+  "integration: real interactions across filesystem, database, process, API, or service boundaries",
+  "contract: one side of a versioned component/service interface promise",
+  "e2e: production-like deployed-stack critical workflow",
+  "smoke: minimal deterministic startup and critical-path check",
+  "resilience: running-stack fault injection and recovery behavior",
+  "invariant: repository-wide architecture, configuration, or code-structure guarantee",
+  "security: authentication, authorization, validation, secrets, and dependency boundaries",
+  "performance: bounded latency, memory, or throughput regression",
+  "slow: deliberately long-running test",
+  "external: requires an external service or host capability",
+]
+timeout = 30
 
 [tool.ruff]
 target-version = "py311"
@@ -34,19 +70,67 @@ files = [
     "tools/schema_validator.py",
     "okengine-mcp/write_server.py",
     "scripts/cron/canonical_assemble.py",
+    # Live service boundary: every production module in these service trees is typed.
+    "okengine-operations/app.py",
+    "okengine-projection/service.py",
 ]
 python_version = "3.11"
 ignore_missing_imports = true
+explicit_package_bases = true
+follow_imports = "silent"
 warn_unused_ignores = true
 no_implicit_optional = true
 
-# Coverage (okengine#56): `make coverage` -> term report. No gate threshold yet — the
-# first goal is visibility into which cron/service paths are untested.
+[tool.okengine.typing]
+fully_typed_service_roots = ["okengine-operations", "okengine-projection"]
+
+# Coverage (okengine#56/#460): `make coverage` reports branch-aware coverage and CI
+# enforces the ratchet below. Never lower this floor to merge a change: add tests.
+# Every measured file and category is held at complete coverage.
 [tool.coverage.run]
 branch = true
-source = ["scripts", "tools", "okengine-mcp", "okengine-reader"]
-omit = ["*/tests/*", "*/__pycache__/*"]
+source = [
+  "src",
+  "scripts",
+  "tools",
+  "okengine-mcp",
+  "okengine-reader",
+  "okengine-cockpit",
+  # okengine#600: both are LIVE services baked into deployed images, and neither was in this
+  # list — so they reported no coverage number at all rather than a low one, and a written claim
+  # that service.py was fully covered went unchallenged through three merge requests. A tree
+  # absent from here is invisible, not clean. tests/test_coverage_boundary.py is the standing
+  # detector: a tree of Python that is neither measured nor exempted-with-a-reason fails it.
+  "okengine-projection",
+  "okengine-operations",
+  "extensions",
+  "plugins",
+  "migrations",
+  # CI is executable release/control-plane code. It is covered at the same 100% statement and
+  # branch floor as runtime code, but is deliberately not mutation-production code: mutation of
+  # the gate that launches mutation campaigns would make the measurement self-referential.
+  "ci",
+]
+omit = [
+  "*/tests/*",
+  "*/__pycache__/*",
+  "ci/cosmic_http_exec.py",
+  "ci/postgres_projection_integration.py",
+]
 
 [tool.coverage.report]
 show_missing = true
 skip_covered = true
+# Script entry guards contain no behavioral decision: CLI behavior is tested
+# through main(argv), while process dispatch itself is Python interpreter glue.
+exclude_also = [
+  "if __name__ == [\"']__main__[\"']:",
+]
+# 81 -> 86 -> 91 -> 100 after behavioral coverage was completed across all
+# 151 measured files. This is an intentional minimum: never lower it.
+fail_under = 100
+
+[tool.okengine.coverage]
+# coverage.py's fail_under is aggregate (statements + branches), so enforce the
+# branch ratchet separately from its JSON report. Never lower this floor.
+branch_fail_under = 100

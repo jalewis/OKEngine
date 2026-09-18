@@ -73,7 +73,7 @@ def main() -> int:
     print("=== forecast-review wake-gate ===")
     print(f"  window: {since} .. {week_ending}  |  {len(resolved_this_week)} resolved, "
           f"{len(reevaluated_this_week)} re-evaluated")
-    print(f"  write via mcp_okengine_write_create_entity to: {out_path}")
+    print(f"  write via mcp__okengine_write__create_entity to: {out_path}")
     print(f"  frontmatter: type: dashboard, title: \"Forecast review — {week_ending}\", "
           f"updated: {week_ending}")
     print()

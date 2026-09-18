@@ -102,7 +102,9 @@ def process(root: Path, apply: bool) -> int:
             rel = p.relative_to(root).as_posix()
             t = _decide_type(rel, fm, tag_to_type)
             if t is None:
-                if rel.startswith("wiki/entities/"):
+                # ``t is None`` can only occur for an entity here: the outer loop scans
+                # only sources/entities and sources are assigned unconditionally.
+                if rel.startswith("wiki/entities/"):  # pragma: no branch
                     skipped_entity += 1
                 continue
             new = m.group(1) + f"type: {t}\n" + m.group(2) + m.group(3) + content[m.end():]

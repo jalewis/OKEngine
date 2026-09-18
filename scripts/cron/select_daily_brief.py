@@ -47,8 +47,43 @@ def _fm(p: Path) -> dict:
         return {}
 
 
-def _d(v) -> str:
-    return str(v or "")[:10]
+def _date_value(v) -> date | None:
+    """Return a real ISO date, never a sortable fragment of arbitrary text.
+
+    Frontmatter may be loaded as ``date``/``datetime`` by PyYAML or as an ISO
+    string.  Reject placeholders, prose, malformed offsets, and other model
+    debris instead of letting their first ten characters participate in a
+    lexicographic freshness comparison.
+    """
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    if not isinstance(v, str):
+        return None
+    raw = v.strip()
+    if not raw:
+        return None
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            return date.fromisoformat(raw)
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def _fresh_date(v, since: date, today: date) -> tuple[date | None, str | None]:
+    # An absent optional lifecycle field is not corrupt and must not inflate telemetry.
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None, None
+    parsed = _date_value(v)
+    if parsed is None:
+        return None, "invalid"
+    if parsed > today:
+        return None, "future"
+    if parsed < since:
+        return None, None
+    return parsed, None
 
 
 def _open_prediction_values() -> set:
@@ -80,6 +115,10 @@ def _knowledge_namespaces():
         import schema_lib
         ms = schema_lib.merged_schema(VAULT)
         nss = schema_lib.knowledge_namespaces(ms) - schema_lib.excluded_dirs(ms)
+        # These have dedicated digest sections or are generated products. Counting them again as
+        # "entity/concept movement" makes source rewrites and yesterday's brief look like knowledge
+        # movement and lets maintenance traffic dominate the bounded context.
+        nss -= {"sources", "briefings", "predictions", "gaps", "dashboards", "operational"}
         if nss:
             return tuple(sorted(nss))
     except Exception:
@@ -94,11 +133,13 @@ def main() -> int:
         print(json.dumps({"wakeAgent": False}))
         return 0
     now = datetime.now(timezone.utc)
-    since = (now - timedelta(hours=WINDOW_H)).strftime("%Y-%m-%d")
+    today = now.date()
+    since = (now - timedelta(hours=WINDOW_H)).date()
     due_by = (date.today() + timedelta(days=DUE_DAYS)).isoformat()
 
     # 1. fresh sources — path-bounded: current + previous month dirs
     srcs = []
+    skipped_source_dates = {"invalid": 0, "future": 0}
     for base in {(now.year, now.month),
                  ((now - timedelta(days=27)).year, (now - timedelta(days=27)).month)}:
         d = WIKI / "sources" / f"{base[0]:04d}" / f"{base[1]:02d}"
@@ -107,14 +148,18 @@ def main() -> int:
                 if p.name.startswith(("_", "INDEX")):
                     continue
                 fm = _fm(p)
-                pd = _d(fm.get("published") or fm.get("ingested"))
-                if pd >= since:
-                    srcs.append((pd, p.relative_to(WIKI).as_posix()[:-3],
+                pd, rejected = _fresh_date(fm.get("published") or fm.get("ingested"),
+                                           since, today)
+                if rejected:
+                    skipped_source_dates[rejected] += 1
+                if pd is not None:
+                    srcs.append((pd.isoformat(), p.relative_to(WIKI).as_posix()[:-3],
                                  str(fm.get("title") or p.stem)[:90]))
     srcs.sort(reverse=True)
 
     # 2. knowledge-namespace movement
     moved = []
+    skipped_movement_dates = {"invalid": 0, "future": 0}
     for ns in _knowledge_namespaces():
         d = WIKI / ns
         if not d.is_dir():
@@ -123,12 +168,19 @@ def main() -> int:
             if p.name.startswith(("_", "INDEX")):
                 continue
             fm = _fm(p)
+            if str(fm.get("type") or "").lower() in {"source", "briefing", "prediction", "gap",
+                                                      "dashboard"}:
+                continue
             # OKF's envelope carries `last_updated`, not `updated` — reading only `updated` left the
             # movement section permanently empty. Mirror tier_lib's fallback chain.
-            up = _d(fm.get("updated") or fm.get("last_updated") or fm.get("created"))
-            if up >= since:
-                kind = "new" if _d(fm.get("created")) >= since else "updated"
-                moved.append((up, kind, p.relative_to(WIKI).as_posix()[:-3],
+            up, rejected = _fresh_date(
+                fm.get("updated") or fm.get("last_updated") or fm.get("created"), since, today)
+            if rejected:
+                skipped_movement_dates[rejected] += 1
+            if up is not None:
+                created, _ = _fresh_date(fm.get("created"), since, today)
+                kind = "new" if created is not None else "updated"
+                moved.append((up.isoformat(), kind, p.relative_to(WIKI).as_posix()[:-3],
                               str(fm.get("type") or "")))
     moved.sort(reverse=True)
 
@@ -141,9 +193,9 @@ def main() -> int:
                 continue
             fm = _fm(p)
             if str(fm.get("status") or "open").lower() in open_vals:
-                rb = _d(fm.get("resolves_by"))
-                if rb and rb <= due_by:
-                    due.append((rb, p.relative_to(WIKI).as_posix()[:-3],
+                rb = _date_value(fm.get("resolves_by"))
+                if rb and rb.isoformat() <= due_by:
+                    due.append((rb.isoformat(), p.relative_to(WIKI).as_posix()[:-3],
                                 str(fm.get("confidence") or "")))
     due.sort()
 
@@ -155,13 +207,17 @@ def main() -> int:
             if p.name.startswith(("_", "INDEX")):
                 continue
             fm = _fm(p)
-            if str(fm.get("status")) == "open" and _d(fm.get("first_seen")) >= since:
+            first_seen, _ = _fresh_date(fm.get("first_seen"), since, today)
+            if str(fm.get("status")) == "open" and first_seen is not None:
                 gaps.append((str(fm.get("severity") or ""), str(fm.get("rule") or ""),
                              str(fm.get("subject") or "")))
 
     print(f"=== daily-brief digest (engine-template, okengine#169) — window {WINDOW_H}h ===")
     print(f"  sources: {len(srcs)} · entity/concept movement: {len(moved)} · "
           f"predictions due ≤{DUE_DAYS}d: {len(due)} · new gaps: {len(gaps)}")
+    skipped_invalid = skipped_source_dates["invalid"] + skipped_movement_dates["invalid"]
+    skipped_future = skipped_source_dates["future"] + skipped_movement_dates["future"]
+    print(f"  freshness records skipped: invalid={skipped_invalid} · future={skipped_future}")
     print()
     if srcs:
         print(f"## Fresh sources ({len(srcs)}, showing {min(len(srcs), MAX_ITEMS)})")

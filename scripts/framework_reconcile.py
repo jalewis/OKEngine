@@ -33,16 +33,45 @@ import sys
 from pathlib import Path
 
 ENGINE_ROOT = Path(__file__).resolve().parent.parent
+_PENDING_EXCLUDES = {".git", ".hermes-data", "raw", "wiki"}
+_PENDING_EXCLUDED_SUBTREES = {
+    (".okengine", "snapshots"),
+    (".okengine", "rolled-back"),
+}
+_RECOMPOSE_MARKER = Path(".okengine/recompose-required")
+
+
+def _mark_recompose_required(pack: Path) -> None:
+    """Durably establish the retry signal before any reconciled input is mutated."""
+    marker = pack / _RECOMPOSE_MARKER
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    for path, content in (
+        (marker, "composed schema regeneration must succeed\n"),
+        (marker.with_name(marker.name + ".upstream"), "retry composed schema regeneration\n"),
+    ):
+        with path.open("w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+    directory_fd = os.open(marker.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def pending(pack: Path) -> list[Path]:
     if not pack.is_dir():
         return []
-    return sorted(
-        path.relative_to(pack)
-        for path in pack.rglob("*.upstream")
-        if path.is_file()
-    )
+    found = []
+    for path in pack.rglob("*.upstream"):
+        relative = path.relative_to(pack)
+        if not path.is_file() or relative.parts[0] in _PENDING_EXCLUDES:
+            continue
+        if tuple(relative.parts[:2]) in _PENDING_EXCLUDED_SUBTREES:
+            continue
+        found.append(relative)
+    return sorted(found)
 
 
 def _pair(pack: Path, value: str) -> tuple[Path, Path, Path]:
@@ -82,6 +111,7 @@ def accept(pack: Path, value: str) -> Path:
     temp = local.with_name(local.name + ".reconcile.tmp")
     try:
         shutil.copy2(upstream, temp)
+        _mark_recompose_required(pack)
         os.replace(temp, local)
         upstream.unlink()
     finally:
@@ -91,6 +121,7 @@ def accept(pack: Path, value: str) -> Path:
 
 def keep(pack: Path, value: str) -> Path:
     rel, _local, upstream = _pair(pack, value)
+    _mark_recompose_required(pack)
     upstream.unlink()
     return rel
 
@@ -101,6 +132,7 @@ def merge(pack: Path, value: str, tool: str) -> tuple[Path | None, str | None]:
     if not command:
         return None, "merge needs --merge-tool or OKENGINE_MERGE_TOOL"
     before = local.read_bytes()
+    _mark_recompose_required(pack)
     try:
         result = subprocess.run([*command, str(local), str(upstream)], check=False)
     except OSError as exc:
@@ -109,7 +141,9 @@ def merge(pack: Path, value: str, tool: str) -> tuple[Path | None, str | None]:
         return None, f"merge tool exited {result.returncode}; pending copy retained"
     if not local.is_file() or local.read_bytes() == before:
         return None, "merge tool did not change the local file; pending copy retained"
-    upstream.unlink()
+    # A merge tool may consume/move its upstream input after using it. The observable contract is
+    # a changed LOCAL plus a zero exit; an already-absent pending copy is therefore resolved.
+    upstream.unlink(missing_ok=True)
     return rel, None
 
 
@@ -121,49 +155,86 @@ def _validate(pack: Path) -> int:
     return module.main([str(pack), "--quiet"])
 
 
+def _recompose_schema(pack: Path) -> list[str]:
+    """Refresh the generated taxonomy after reconciling any upstream definition file."""
+    source_root = str(ENGINE_ROOT / "src")
+    if source_root not in sys.path:
+        sys.path.insert(0, source_root)
+    spec = importlib.util.spec_from_file_location(
+        "extension_compose_reconcile", ENGINE_ROOT / "scripts" / "extension_compose.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return [str(error) for error in (module.write_composed_schema(pack) or [])]
+
+
 def _finish(pack: Path, changed: bool, no_validate: bool) -> int:
-    remaining = pending(pack)
+    marker = pack / _RECOMPOSE_MARKER
+    marker_upstream = marker.with_name(marker.name + ".upstream")
+    retrying_recompose = marker.is_file() or marker_upstream.is_file()
+    if changed or retrying_recompose:
+        try:
+            errors = _recompose_schema(pack)
+        except (Exception, KeyboardInterrupt) as exc:
+            errors = [str(exc)]
+        if errors:
+            _mark_recompose_required(pack)
+            for error in errors:
+                print(f"ERROR: composed-schema regeneration failed: {error}", file=sys.stderr)
+            return 1
+        print("  → regenerated composed schema from reconciled inputs")
+    remaining = [path for path in pending(pack)
+                 if path != _RECOMPOSE_MARKER.with_name(_RECOMPOSE_MARKER.name + ".upstream")]
     if remaining:
         print(f"  pending: {len(remaining)} file(s); validation waits until all are resolved")
         return 0
     print("  ✓ no pending .upstream files")
-    if changed and not no_validate:
+    if (changed or retrying_recompose) and not no_validate:
         print("  → validating reconciled pack")
-        return _validate(pack)
+        result = _validate(pack)
+        if result != 0:
+            return result
+    if (changed or retrying_recompose) and not no_validate:
+        marker.unlink(missing_ok=True)
+        marker_upstream.unlink(missing_ok=True)
     return 0
 
 
 def _interactive(pack: Path, tool: str, no_validate: bool) -> int:
     changed = False
-    for rel_upstream in pending(pack):
-        rel = rel_upstream.with_name(rel_upstream.name.removesuffix(".upstream"))
-        print(f"\n=== {rel.as_posix()} ===")
-        print(diff(pack, rel.as_posix()) or "(files differ only in undecodable/binary content)")
-        while True:
-            action = input("[a]ccept upstream / [k]eep local / [m]erge / [s]kip / [q]uit: ").strip().lower()
-            if action in {"a", "accept"}:
-                accept(pack, rel.as_posix())
-                print(f"  accepted: {rel}")
-                changed = True
-                break
-            if action in {"k", "keep"}:
-                keep(pack, rel.as_posix())
-                print(f"  kept local: {rel}")
-                changed = True
-                break
-            if action in {"m", "merge"}:
-                merged, error = merge(pack, rel.as_posix(), tool)
-                if error:
-                    print(f"  ERROR: {error}", file=sys.stderr)
-                    continue
-                print(f"  merged: {merged}")
-                changed = True
-                break
-            if action in {"s", "skip"}:
-                break
-            if action in {"q", "quit"}:
-                return _finish(pack, changed, no_validate)
-            print("  choose a, k, m, s, or q")
+    try:
+        for rel_upstream in pending(pack):
+            rel = rel_upstream.with_name(rel_upstream.name.removesuffix(".upstream"))
+            print(f"\n=== {rel.as_posix()} ===")
+            print(diff(pack, rel.as_posix()) or "(files differ only in undecodable/binary content)")
+            while True:
+                action = input("[a]ccept upstream / [k]eep local / [m]erge / [s]kip / [q]uit: ").strip().lower()
+                if action in {"a", "accept"}:
+                    accept(pack, rel.as_posix())
+                    print(f"  accepted: {rel}")
+                    changed = True
+                    break
+                if action in {"k", "keep"}:
+                    keep(pack, rel.as_posix())
+                    print(f"  kept local: {rel}")
+                    changed = True
+                    break
+                if action in {"m", "merge"}:
+                    merged, error = merge(pack, rel.as_posix(), tool)
+                    if error:
+                        print(f"  ERROR: {error}", file=sys.stderr)
+                        continue
+                    print(f"  merged: {merged}")
+                    changed = True
+                    break
+                if action in {"s", "skip"}:
+                    break
+                if action in {"q", "quit"}:
+                    return _finish(pack, changed, no_validate)
+                print("  choose a, k, m, s, or q")
+    except (OSError, ValueError, EOFError, KeyboardInterrupt):
+        if changed:
+            _finish(pack, changed, no_validate)
+        raise
     return _finish(pack, changed, no_validate)
 
 
@@ -212,6 +283,9 @@ def main(argv: list[str]) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
+    marker = pack / _RECOMPOSE_MARKER
+    if marker.is_file() or marker.with_name(marker.name + ".upstream").is_file():
+        return _finish(pack, False, args.no_validate)
     files = pending(pack)
     print(f"pending upstream changes: {len(files)}")
     for rel in files:

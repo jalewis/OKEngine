@@ -219,6 +219,21 @@ def render_index() -> str:
         out.extend(body)
         out.append("")
 
+    # glob-ok: weekly lint reports are intentionally top-level operational files.
+    lint_reports = sorted(
+        (p for p in (VAULT / "wiki").glob("lint-*.md") if p.is_file()),  # glob-ok: top-level reports
+        key=lambda p: (p.stat().st_mtime, p.name),
+        reverse=True,
+    )
+    if lint_reports:
+        latest = lint_reports[0].stem
+        out.extend([
+            "## Operational health",
+            "",
+            f"- Latest weekly audit: [[{latest}]]",
+            "",
+        ])
+
     return "\n".join(out) + "\n"
 
 

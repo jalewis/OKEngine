@@ -1,0 +1,644 @@
+diff --git a/tools/file_operations.py b/tools/file_operations.py
+index 6884dad5d..a800a7b87 100644
+--- a/tools/file_operations.py
++++ b/tools/file_operations.py
+@@ -30,6 +30,12 @@ from tools.file_operations_common import (
+     _strip_terminal_fence_leaks, normalize_read_pagination, normalize_search_pagination)
+ from tools.file_operations_lint import LINTERS_INPROC, LintMixin, _FAIL_CLOSED_INPROC_EXTS
+ from tools.file_operations_search import SearchMixin
++from tools.file_operations_okengine_guard import (
++    delete_reject as _okengine_delete_reject,
++    move_reject as _okengine_move_reject,
++    replace_reject as _okengine_replace_reject,
++    write_reject as _okengine_write_reject,
++)
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -1036,6 +1042,9 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
+         denied = get_write_denied_error(path, verb="Delete")
+         if denied:
+             return WriteResult(error=denied)
++        guard = _okengine_delete_reject(self, path)
++        if guard:
++            return WriteResult(error=f"Delete denied: {guard}")
+         # Path baked in via repr() for shell-independent quoting; no
+         # ``unlink(missing_ok=True)`` (a 3.7 remote interpreter lacks it).
+         snippet = (
+@@ -1066,6 +1075,9 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
+             denied = get_write_denied_error(p, verb="Move")
+             if denied:
+                 return WriteResult(error=denied)
++        guard = _okengine_move_reject(self, src, dst)
++        if guard:
++            return WriteResult(error=f"Move denied: {guard}")
+         result = self._exec(f"mv {self._escape_shell_arg(src)} {self._escape_shell_arg(dst)}")
+         if result.exit_code != 0:
+             return WriteResult(error=f"Failed to move {src} -> {dst}: {result.stdout}")
+@@ -1233,6 +1245,9 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
+         denied = get_write_denied_error(path)
+         if denied:
+             return WriteResult(error=denied)
++        guard = _okengine_write_reject(self, path, content)
++        if guard:
++            return WriteResult(error=f"Write rejected: {guard}")
+         refused = self._reject_unencodable(path, content)
+         if refused is not None:
+             return refused
+@@ -1329,6 +1344,9 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
+         denied = get_write_denied_error(path)
+         if denied:
+             return PatchResult(error=denied)
++        guard = _okengine_replace_reject(self, path, new_string)
++        if guard:
++            return PatchResult(error=f"Patch rejected: {guard}")
+         read_result = self._cat(path)
+         if read_result.exit_code != 0:
+             return PatchResult(error=f"Failed to read file: {path}")
+diff --git a/tools/file_operations_okengine_guard.py b/tools/file_operations_okengine_guard.py
+new file mode 100644
+index 000000000..4beebe764
+--- /dev/null
++++ b/tools/file_operations_okengine_guard.py
+@@ -0,0 +1,164 @@
++"""OKEngine's vault boundary for Hermes file operations.
++
++The terminal backend, not the controller host, owns path resolution and symlinks.
++Probe there before mutating. The enforced okengine-write MCP remains the creation
++and structural-update path for Markdown pages in WIKI_PATH.
++"""
++
++import json
++import os
++import re
++from pathlib import Path
++from typing import Optional
++
++
++_READ_ECHO_CATN_RE = re.compile(r"^\s*\d+\|")
++_READ_ECHO_PIPE_FM_RE = re.compile(r"^\ufeff?\|+(?:---|[A-Za-z_][\w-]*:)")
++
++
++def read_echo_reject(content: str) -> Optional[str]:
++    if not content:
++        return None
++    lines = content.split("\n")
++    numbered = sum(1 for line in lines[:80] if _READ_ECHO_CATN_RE.match(line))
++    if numbered >= 2:
++        return "Read-tool line-number prefixes were echoed into the write; remove the NN| gutters"
++    if lines and _READ_ECHO_PIPE_FM_RE.match(lines[0]):
++        return "Read-tool pipe-prefixed frontmatter was echoed into the write; remove the leading |"
++    return None
++
++
++_PROBE = r'''
++import json, os, re, sys
++
++p = json.load(sys.stdin)
++path = p["path"]
++cwd = p["cwd"]
++root = p["root"]
++literal = os.path.abspath(path if os.path.isabs(path) else os.path.join(cwd, path))
++# Writes follow a final symlink; unlink/mv replace the link itself. In both
++# cases parent symlinks are resolved by the backend filesystem.
++target = (os.path.join(os.path.realpath(os.path.dirname(literal)), os.path.basename(literal))
++          if not p.get("follow_final_symlink", True) and os.path.islink(literal)
++          else os.path.realpath(literal))
++vault = os.path.realpath(root) if root else ""
++in_vault = bool(vault and (target == vault or target.startswith(vault + os.sep)))
++out = {"path": target, "in_vault": in_vault, "exists": os.path.exists(target),
++       "is_dir": os.path.isdir(target), "reserved": False,
++       "tombstoned": False, "schema_reason": None, "validator_unavailable": False}
++if in_vault and target.lower().endswith(".md"):
++    base = os.path.basename(target)
++    low = base.lower()
++    out["reserved"] = (low in {"log.md", "index.md", "agents.md", "hot.md",
++                               "readme.md", "health.md", "bundle.md"}
++                       or low.startswith("index-") or base.startswith(("_", ".")))
++    if os.path.isfile(target):
++        try:
++            with open(target, "r", encoding="utf-8", errors="replace") as fh:
++                head = fh.read(1000000)
++            fm = re.match(r"^\ufeff?---\r?\n(.*?)\r?\n---", head, re.DOTALL)
++            out["tombstoned"] = bool(fm and re.search(
++                r"(?im)^status:\s*[\"']?tombstoned\b", fm.group(1)))
++        except OSError:
++            out["validator_unavailable"] = True
++    try:
++        sys.path.insert(0, p["module_root"])
++        from tools.schema_validator import (
++            reserved_files_for, schema_reject_reason,
++            schema_reject_reason_for_link_replacement)
++        out["reserved"] = out["reserved"] or low in reserved_files_for(target)
++        if p.get("content") is not None:
++            check = (schema_reject_reason if p.get("follow_final_symlink", True)
++                     else schema_reject_reason_for_link_replacement)
++            out["schema_reason"] = check(target, p["content"])
++    except Exception:
++        out["validator_unavailable"] = True
++print(json.dumps(out))
++'''
++
++
++def _inspect(ops, path: str, content: Optional[str] = None, *,
++             follow_final_symlink: bool = True) -> tuple[Optional[dict], Optional[str]]:
++    root = os.environ.get("WIKI_PATH") or ""
++    if not root:
++        return {"in_vault": False, "is_dir": False}, None
++    payload = json.dumps({"path": path, "cwd": getattr(ops.env, "cwd", None) or ops.cwd,
++                          "root": root, "module_root": str(Path(__file__).resolve().parents[1]),
++                          "content": content, "follow_final_symlink": follow_final_symlink})
++    command = "python3" if ops._has_command("python3") else "python"
++    result = ops._exec(f"{command} -c {ops._escape_shell_arg(_PROBE)}", stdin_data=payload)
++    if result.exit_code != 0:
++        return None, "Vault write guard could not inspect the terminal backend target"
++    try:
++        state = json.loads(result.stdout.strip())
++    except (ValueError, TypeError):
++        return None, "Vault write guard received an invalid backend inspection"
++    required_bool = ("in_vault", "exists", "is_dir", "reserved",
++                     "tombstoned", "validator_unavailable")
++    if (not isinstance(state, dict)
++            or not isinstance(state.get("path"), str)
++            or any(not isinstance(state.get(key), bool) for key in required_bool)
++            or (state.get("schema_reason") is not None
++                and not isinstance(state.get("schema_reason"), str))):
++        return None, "Vault write guard received an incomplete backend inspection"
++    return state, None
++
++
++def _scoped_reject(ops, path: str, *, content: Optional[str] = None,
++                   creating: bool = False, follow_final_symlink: bool = True) -> Optional[str]:
++    state, error = _inspect(ops, path, content, follow_final_symlink=follow_final_symlink)
++    if error:
++        return error if os.environ.get("WIKI_PATH") else None
++    if not state["in_vault"] or not state["path"].lower().endswith(".md"):
++        return None
++    if state["reserved"]:
++        return "engine- or pack-reserved vault file is not agent-writable via the file tool"
++    if state["tombstoned"]:
++        return "tombstoned vault page is not agent-writable via the file tool"
++    if creating and not state["exists"]:
++        return "NEW vault page must be created through the okengine-write MCP, not the file tool"
++    if state["validator_unavailable"]:
++        return "Vault schema/reserved-file validator is unavailable on the terminal backend"
++    if state["schema_reason"]:
++        return f"Vault schema rejects the write: {state['schema_reason']}"
++    return None
++
++
++def write_reject(ops, path: str, content: str) -> Optional[str]:
++    return read_echo_reject(content) or _scoped_reject(ops, path, content=content, creating=True)
++
++
++def replace_reject(ops, path: str, new_string: str) -> Optional[str]:
++    return read_echo_reject(new_string) or _scoped_reject(ops, path)
++
++
++def delete_reject(ops, path: str) -> Optional[str]:
++    return _scoped_reject(ops, path, follow_final_symlink=False)
++
++
++def move_reject(ops, src: str, dst: str) -> Optional[str]:
++    source_error = _scoped_reject(ops, src, follow_final_symlink=False)
++    if source_error:
++        return source_error
++    destination, error = _inspect(ops, dst, follow_final_symlink=False)
++    if error:
++        return error if os.environ.get("WIKI_PATH") else None
++    effective_dst = (
++        os.path.join(dst, os.path.basename(os.path.normpath(src)))
++        if destination["is_dir"] else dst)
++    destination, error = _inspect(ops, effective_dst, follow_final_symlink=False)
++    if error:
++        return error if os.environ.get("WIKI_PATH") else None
++    content = None
++    if destination["in_vault"] and destination["path"].lower().endswith(".md") and destination["exists"]:
++        # Replacing an existing page via mv is a write, not merely a rename:
++        # validate the source bytes against the destination's governing schema.
++        read_result = ops._cat(src)
++        if read_result.exit_code != 0:
++            return "Vault move guard could not read the source page before replacement"
++        content = read_result.stdout
++        echo = read_echo_reject(content)
++        if echo:
++            return echo
++    return _scoped_reject(ops, effective_dst, content=content, creating=True,
++                          follow_final_symlink=False)
+diff --git a/tests/tools/test_okengine_file_operations_guard.py b/tests/tools/test_okengine_file_operations_guard.py
+new file mode 100644
+index 000000000..55fcbd8dc
+--- /dev/null
++++ b/tests/tools/test_okengine_file_operations_guard.py
+@@ -0,0 +1,411 @@
++"""OKEngine vault-file guards at real ShellFileOperations boundaries."""
++
++import json
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from tools.file_operations import ShellFileOperations
++from tools.file_operations_okengine_guard import read_echo_reject
++
++
++class RealBackend:
++    def __init__(self, cwd):
++        self.cwd = str(cwd)
++
++    def execute(self, command, *, cwd=None, stdin_data=None, **_kwargs):
++        result = subprocess.run(command, shell=True, cwd=cwd or self.cwd,
++                                input=stdin_data.encode("utf-8") if stdin_data is not None else None,
++                                capture_output=True, check=False)
++        return {"output": result.stdout.decode("utf-8"), "returncode": result.returncode}
++
++
++class MalformedProbeBackend(RealBackend):
++    def execute(self, command, *, cwd=None, stdin_data=None, **kwargs):
++        if command.startswith("python3 -c "):
++            return {"output": '{"in_vault": true}', "returncode": 0}
++        return super().execute(command, cwd=cwd, stdin_data=stdin_data, **kwargs)
++
++
++class FailedProbeBackend(RealBackend):
++    def execute(self, command, *, cwd=None, stdin_data=None, **kwargs):
++        if command.startswith(("python3 -c ", "python -c ")):
++            return {"output": "", "returncode": 7}
++        return super().execute(command, cwd=cwd, stdin_data=stdin_data, **kwargs)
++
++
++class InvalidJsonProbeBackend(RealBackend):
++    def execute(self, command, *, cwd=None, stdin_data=None, **kwargs):
++        if command.startswith(("python3 -c ", "python -c ")):
++            return {"output": "{not-json", "returncode": 0}
++        return super().execute(command, cwd=cwd, stdin_data=stdin_data, **kwargs)
++
++
++class ValidatorUnavailableBackend(RealBackend):
++    def execute(self, command, *, cwd=None, stdin_data=None, **kwargs):
++        result = super().execute(command, cwd=cwd, stdin_data=stdin_data, **kwargs)
++        if command.startswith(("python3 -c ", "python -c ")) and result["returncode"] == 0:
++            state = json.loads(result["output"])
++            state["validator_unavailable"] = True
++            result["output"] = json.dumps(state)
++        return result
++
++
++class FailNthProbeBackend(RealBackend):
++    def __init__(self, cwd, nth):
++        super().__init__(cwd)
++        self.nth = nth
++        self.seen = 0
++
++    def execute(self, command, *, cwd=None, stdin_data=None, **kwargs):
++        if command.startswith(("python3 -c ", "python -c ")):
++            self.seen += 1
++            if self.seen == self.nth:
++                return {"output": "", "returncode": 7}
++        return super().execute(command, cwd=cwd, stdin_data=stdin_data, **kwargs)
++
++
++class CatFailureBackend(RealBackend):
++    def execute(self, command, *, cwd=None, stdin_data=None, **kwargs):
++        if command.startswith("cat "):
++            return {"output": "", "returncode": 1}
++        return super().execute(command, cwd=cwd, stdin_data=stdin_data, **kwargs)
++
++
++@pytest.fixture
++def vault_ops(tmp_path, monkeypatch):
++    vault = tmp_path / "vault"
++    wiki = vault / "wiki"
++    wiki.mkdir(parents=True)
++    monkeypatch.setenv("WIKI_PATH", str(vault))
++    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
++    monkeypatch.setenv("OKENGINE_BASE_SCHEMA", str(Path(__file__).parents[2] / "config" / "base-schema.yaml"))
++    ops = ShellFileOperations(RealBackend(wiki))
++    return vault, wiki, ops
++
++
++def test_new_vault_page_is_not_created_by_file_tool(vault_ops):
++    _vault, wiki, ops = vault_ops
++    target = wiki / "concepts" / "new.md"
++    result = ops.write_file(str(target), "---\ntype: concept\n---\n")
++    assert result.error and "NEW vault page" in result.error
++    assert not target.exists()
++
++
++def test_engine_reserved_page_cannot_be_deleted_or_moved(vault_ops):
++    _vault, wiki, ops = vault_ops
++    page = wiki / "HOT.md"
++    page.write_text("dashboard\n", encoding="utf-8")
++    delete_result = ops.delete_file(str(page))
++    move_result = ops.move_file(str(page), str(wiki / "other.md"))
++    assert delete_result.error and "reserved" in delete_result.error
++    assert move_result.error and "reserved" in move_result.error
++    assert page.exists() and not (wiki / "other.md").exists()
++
++
++def test_symlink_alias_uses_backend_resolved_reserved_target(vault_ops):
++    vault, wiki, ops = vault_ops
++    page = wiki / "HOT.md"
++    page.write_text("dashboard\n", encoding="utf-8")
++    alias = vault.parent / "innocent.txt"
++    alias.symlink_to(page)
++    result = ops.write_file(str(alias), "overwrite\n")
++    assert result.error and "reserved" in result.error
++    assert page.read_text(encoding="utf-8") == "dashboard\n"
++
++
++def test_pack_reserved_and_tombstoned_pages_are_not_agent_writable(vault_ops):
++    _vault, wiki, ops = vault_ops
++    (wiki / "schema.yaml").write_text("reserved_files: [secret.md]\n", encoding="utf-8")
++    reserved = wiki / "secret.md"
++    reserved.write_text("protected\n", encoding="utf-8")
++    tombstone = wiki / "old.md"
++    tombstone.write_text("---\ntype: entity\nstatus: tombstoned\n---\nold\n", encoding="utf-8")
++    assert "reserved" in (ops.write_file(str(reserved), "new\n").error or "")
++    assert "tombstoned" in (ops.patch_replace(str(tombstone), "old", "new").error or "")
++    assert tombstone.read_text(encoding="utf-8").endswith("old\n")
++
++
++def test_schema_rejection_preserves_existing_page_and_valid_edit_succeeds(vault_ops):
++    _vault, wiki, ops = vault_ops
++    (wiki / "schema.yaml").write_text(
++        "types:\n  entity: {required: [type, id]}\n", encoding="utf-8")
++    page = wiki / "item.md"
++    original = "---\ntype: entity\nid: entity:item\n---\nold\n"
++    page.write_text(original, encoding="utf-8")
++    rejected = ops.write_file(str(page), "---\ntype: entity\n---\nbad\n")
++    assert rejected.error and "schema" in rejected.error.lower()
++    assert page.read_text(encoding="utf-8") == original
++    accepted = ops.write_file(str(page), original.replace("old", "new"))
++    assert accepted.error is None and page.read_text(encoding="utf-8").endswith("new\n")
++
++
++def test_read_echo_is_rejected_but_markdown_table_is_safe(vault_ops):
++    vault, _wiki, ops = vault_ops
++    outside = vault.parent / "report.txt"
++    result = ops.write_file(str(outside), "1|line\n2|line\n")
++    assert result.error and "line-number" in result.error
++    assert not outside.exists()
++    good = ops.write_file(str(outside), "| col | value |\n| --- | --- |\n")
++    assert good.error is None
++
++
++def test_empty_read_echo_content_is_not_a_false_positive():
++    assert read_echo_reject("") is None
++
++
++def test_pipe_frontmatter_echo_is_rejected_without_false_positive_on_one_gutter(vault_ops):
++    vault, _wiki, ops = vault_ops
++    outside = vault.parent / "scratch.txt"
++    pipe = ops.write_file(str(outside), "|---\n|type: entity\n")
++    assert pipe.error and "pipe-prefixed" in pipe.error
++    assert not outside.exists()
++    one = ops.write_file(str(outside), "1|just one numbered example\nordinary line\n")
++    assert one.error is None
++
++
++def test_move_into_new_vault_page_is_refused_at_effective_destination(vault_ops):
++    vault, wiki, ops = vault_ops
++    source = vault.parent / "draft.md"
++    source.write_text("draft\n", encoding="utf-8")
++    result = ops.move_file(str(source), str(wiki))
++    assert result.error and "NEW vault page" in result.error
++    assert source.exists() and not (wiki / "draft.md").exists()
++
++
++def test_relative_path_uses_backend_cwd_not_controller_cwd(vault_ops, monkeypatch, tmp_path):
++    _vault, wiki, ops = vault_ops
++    (wiki / "HOT.md").write_text("dashboard\n", encoding="utf-8")
++    decoy = tmp_path / "controller-cwd"
++    decoy.mkdir()
++    monkeypatch.chdir(decoy)
++    result = ops.write_file("HOT.md", "overwrite\n")
++    assert result.error and "reserved" in result.error
++    assert (wiki / "HOT.md").read_text(encoding="utf-8") == "dashboard\n"
++
++
++def test_incomplete_backend_probe_fails_closed_without_mutation(vault_ops):
++    _vault, wiki, _ops = vault_ops
++    ops = ShellFileOperations(MalformedProbeBackend(wiki))
++    target = wiki / "item.md"
++    target.write_text("old\n", encoding="utf-8")
++    result = ops.write_file(str(target), "new\n")
++    assert result.error and "incomplete backend inspection" in result.error
++    assert target.read_text(encoding="utf-8") == "old\n"
++
++
++def test_backend_probe_nonzero_exit_blocks_existing_vault_write(vault_ops):
++    _vault, wiki, _ops = vault_ops
++    ops = ShellFileOperations(FailedProbeBackend(wiki))
++    target = wiki / "item.md"
++    target.write_text("old\n", encoding="utf-8")
++    result = ops.write_file(str(target), "new\n")
++    assert result.error and "could not inspect" in result.error
++    assert target.read_text(encoding="utf-8") == "old\n"
++
++
++def test_backend_probe_invalid_json_blocks_existing_vault_write(vault_ops):
++    _vault, wiki, _ops = vault_ops
++    ops = ShellFileOperations(InvalidJsonProbeBackend(wiki))
++    target = wiki / "item.md"
++    target.write_text("old\n", encoding="utf-8")
++    result = ops.write_file(str(target), "new\n")
++    assert result.error and "invalid backend inspection" in result.error
++    assert target.read_text(encoding="utf-8") == "old\n"
++
++
++def test_backend_validator_unavailable_blocks_existing_vault_write(vault_ops):
++    _vault, wiki, _ops = vault_ops
++    ops = ShellFileOperations(ValidatorUnavailableBackend(wiki))
++    target = wiki / "item.md"
++    target.write_text("old\n", encoding="utf-8")
++    result = ops.write_file(str(target), "new\n")
++    assert result.error and "validator is unavailable" in result.error
++    assert target.read_text(encoding="utf-8") == "old\n"
++
++
++@pytest.mark.parametrize("failed_probe", [2, 3])
++def test_move_probe_failure_preserves_source_and_effective_destination(vault_ops, failed_probe):
++    vault, wiki, _ops = vault_ops
++    source = vault.parent / "draft.md"
++    source.write_text("retain\n", encoding="utf-8")
++    ops = ShellFileOperations(FailNthProbeBackend(wiki, failed_probe))
++    result = ops.move_file(str(source), str(wiki))
++    assert result.error and "Vault write guard" in result.error
++    assert source.read_text(encoding="utf-8") == "retain\n"
++    assert not (wiki / "draft.md").exists()
++
++
++def test_no_configured_vault_keeps_native_file_write_behavior(vault_ops, monkeypatch):
++    _vault, wiki, ops = vault_ops
++    monkeypatch.delenv("WIKI_PATH")
++    target = wiki / "ordinary.md"
++    result = ops.write_file(str(target), "ordinary\n")
++    assert result.error is None and target.read_text(encoding="utf-8") == "ordinary\n"
++
++
++def test_nonvault_move_and_delete_use_real_backend_on_disposable_files(vault_ops):
++    vault, _wiki, ops = vault_ops
++    source = vault.parent / "move-source.txt"
++    destination = vault.parent / "move-destination.txt"
++    source.write_text("disposable content\n", encoding="utf-8")
++    moved = ops.move_file(str(source), str(destination))
++    assert moved.error is None
++    assert not source.exists() and destination.read_text(encoding="utf-8") == "disposable content\n"
++    deleted = ops.delete_file(str(destination))
++    assert deleted.error is None and not destination.exists()
++
++
++def test_nonvault_delete_refuses_directory_but_missing_file_is_idempotent(vault_ops):
++    vault, _wiki, ops = vault_ops
++    directory = vault.parent / "disposable-directory"
++    directory.mkdir()
++    refused = ops.delete_file(str(directory))
++    assert refused.error and directory.is_dir(), (
++        "native delete must not recursively remove a directory")
++    missing = vault.parent / "missing-disposable.txt"
++    assert ops.delete_file(str(missing)).error is None
++    assert not missing.exists()
++
++
++def test_safe_root_denies_write_move_and_delete_without_touching_outside(
++    monkeypatch, tmp_path
++):
++    allowed = tmp_path / "allowed"
++    allowed.mkdir()
++    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(allowed))
++    monkeypatch.delenv("WIKI_PATH", raising=False)
++    ops = ShellFileOperations(RealBackend(tmp_path))
++    source = allowed / "source.txt"
++    source.write_text("retain source\n", encoding="utf-8")
++    outside = tmp_path / "outside.txt"
++
++    write = ops.write_file(str(outside), "must not appear\n")
++    moved = ops.move_file(str(source), str(outside))
++    deleted = ops.delete_file(str(outside))
++
++    assert write.error and "safe" in write.error.lower(), write
++    assert moved.error and "safe" in moved.error.lower(), moved
++    assert deleted.error and "safe" in deleted.error.lower(), deleted
++    assert source.read_text(encoding="utf-8") == "retain source\n"
++    assert not outside.exists()
++
++
++def test_nonvault_move_failure_preserves_missing_source_state(vault_ops):
++    vault, _wiki, ops = vault_ops
++    source = vault.parent / "missing-move-source.txt"
++    destination = vault.parent / "uncreated-move-destination.txt"
++    moved = ops.move_file(str(source), str(destination))
++    assert moved.error and "Failed to move" in moved.error
++    assert not source.exists() and not destination.exists()
++
++
++def test_nonvault_patch_replace_persists_exact_disposable_edit(vault_ops):
++    vault, _wiki, ops = vault_ops
++    page = vault.parent / "patch-target.txt"
++    page.write_text("before\nafter\n", encoding="utf-8")
++    result = ops.patch_replace(str(page), "before", "changed-value")
++    assert result.success is True and result.error is None
++    assert result.files_modified == [str(page)]
++    assert page.read_text(encoding="utf-8") == "changed-value\nafter\n"
++    repeated = ops.patch_replace(str(page), "before", "changed-value")
++    assert repeated.success is True and repeated.no_change is True
++    assert repeated.error is None and page.read_text(encoding="utf-8") == "changed-value\nafter\n"
++
++
++def test_nonvault_patch_replace_missing_source_never_creates_file(vault_ops):
++    vault, _wiki, ops = vault_ops
++    missing = vault.parent / "missing-patch-target.txt"
++    result = ops.patch_replace(str(missing), "old", "new")
++    assert result.error and "Failed to read file" in result.error
++    assert not missing.exists()
++
++
++def test_nonvault_patch_replace_preserves_bom_and_crlf(vault_ops):
++    vault, _wiki, ops = vault_ops
++    page = vault.parent / "crlf-patch-target.txt"
++    page.write_bytes(b"\xef\xbb\xbffirst\r\nsecond\r\n")
++    result = ops.patch_replace(str(page), "first", "changed")
++    assert result.success is True and result.error is None
++    assert page.read_bytes() == b"\xef\xbb\xbfchanged\r\nsecond\r\n"
++
++
++def test_v4a_add_file_cannot_bypass_vault_creation_guard(vault_ops):
++    _vault, wiki, ops = vault_ops
++    target = wiki / "new.md"
++    patch = f"*** Begin Patch\n*** Add File: {target}\n+new\n*** End Patch"
++    result = ops.patch_v4a(patch)
++    assert result.error and "NEW vault page" in result.error
++    assert not target.exists()
++
++
++def test_move_over_existing_vault_page_cannot_bypass_schema(vault_ops):
++    vault, wiki, ops = vault_ops
++    (wiki / "schema.yaml").write_text(
++        "types:\n  entity: {required: [type, id]}\n", encoding="utf-8")
++    destination = wiki / "item.md"
++    original = "---\ntype: entity\nid: entity:item\n---\nold\n"
++    destination.write_text(original, encoding="utf-8")
++    source = vault.parent / "bad.md"
++    source.write_text("---\ntype: entity\n---\ninvalid\n", encoding="utf-8")
++    result = ops.move_file(str(source), str(destination))
++    assert result.error and "schema" in result.error.lower()
++    assert source.exists() and destination.read_text(encoding="utf-8") == original
++
++
++def test_move_over_existing_vault_page_fails_closed_when_source_read_fails(vault_ops):
++    vault, wiki, _ops = vault_ops
++    source = vault.parent / "draft.md"
++    source.write_text("retain source\n", encoding="utf-8")
++    destination = wiki / "item.md"
++    destination.write_text("retain destination\n", encoding="utf-8")
++    ops = ShellFileOperations(CatFailureBackend(wiki))
++    result = ops.move_file(str(source), str(destination))
++    assert result.error and "could not read the source page" in result.error
++    assert source.read_text(encoding="utf-8") == "retain source\n"
++    assert destination.read_text(encoding="utf-8") == "retain destination\n"
++
++
++def test_move_over_existing_vault_page_rejects_read_echo_in_source(vault_ops):
++    vault, wiki, ops = vault_ops
++    source = vault.parent / "draft.md"
++    source.write_text("1|first\n2|second\n", encoding="utf-8")
++    destination = wiki / "item.md"
++    destination.write_text("retain destination\n", encoding="utf-8")
++    result = ops.move_file(str(source), str(destination))
++    assert result.error and "line-number prefixes were echoed" in result.error
++    assert source.read_text(encoding="utf-8") == "1|first\n2|second\n"
++    assert destination.read_text(encoding="utf-8") == "retain destination\n"
++
++
++def test_move_or_delete_reserved_symlink_checks_link_not_external_target(vault_ops):
++    vault, wiki, ops = vault_ops
++    external = vault.parent / "external.md"
++    external.write_text("external\n", encoding="utf-8")
++    link = wiki / "HOT.md"
++    link.symlink_to(external)
++    source = vault.parent / "draft.md"
++    source.write_text("draft\n", encoding="utf-8")
++    moved = ops.move_file(str(source), str(link))
++    deleted = ops.delete_file(str(link))
++    assert moved.error and "reserved" in moved.error
++    assert deleted.error and "reserved" in deleted.error
++    assert link.is_symlink() and source.exists()
++    assert external.read_text(encoding="utf-8") == "external\n"
++
++
++def test_move_over_vault_symlink_validates_replacement_at_link_name(vault_ops):
++    vault, wiki, ops = vault_ops
++    (wiki / "schema.yaml").write_text(
++        "types:\n  entity: {required: [type, id]}\n", encoding="utf-8")
++    external = vault.parent / "external.md"
++    external.write_text("outside\n", encoding="utf-8")
++    link = wiki / "item.md"
++    link.symlink_to(external)
++    source = vault.parent / "bad.md"
++    source.write_text("---\ntype: entity\n---\ninvalid\n", encoding="utf-8")
++    result = ops.move_file(str(source), str(link))
++    assert result.error and "schema" in result.error.lower()
++    assert link.is_symlink() and source.exists()
++    assert external.read_text(encoding="utf-8") == "outside\n"

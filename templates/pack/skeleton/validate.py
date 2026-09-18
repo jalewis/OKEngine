@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the {{PACK}} domain pack — parse + cross-consistency checks.
+"""Validate this OKF domain pack — parse + cross-consistency checks.
 
 Runs with no engine checkout and no Docker: it only reads this repo. Catches the
 class of bug that ships silently in a config/data pack — a YAML/JSON/OPML parse
@@ -29,9 +29,18 @@ from pathlib import Path
 
 import yaml
 
-VALIDATE_VERSION = "2026.07.3"  # vintage stamp — framework validate flags drift vs the skeleton
+# Vintage stamp. It is a LABEL, not the drift detector: four distinct contents shipped under
+# "2026.07.3" across the engine skeleton and both pack repos, each carrying a fix the others
+# lacked, because the stamp is hand-maintained and nobody bumped it. Content identity is what
+# is actually enforced now (check_vendored_validators.py / framework_validate).
+VALIDATE_VERSION = "2026.08.1"
 
 ROOT = Path(__file__).resolve().parent
+# Derived, never templated: this file is byte-identical in every pack and in the
+# engine skeleton, which is what lets check_vendored_validators.py prove they have not
+# drifted. A per-pack literal here would make every copy legitimately different and
+# the identity check impossible -- which is how four vintages came to share one stamp.
+PACK_NAME = ROOT.name
 
 # wiki/<file>.md sitting at the vault root are engine-managed files, not namespaces.
 ROOT_WIKI_FILES = {"index", "HOT", "log", "_review-queue"}
@@ -87,7 +96,7 @@ def _parse_opml(rel: str) -> tuple[list[str] | None, str]:
     if not path.exists():
         return None, ""
     try:
-        tree = ET.parse(path)
+        tree = ET.parse(path)  # local repo-controlled pack file, not network input  # nosec B314
     except Exception as e:  # noqa: BLE001
         fail(f"{rel}: invalid XML — {e}")
         return None, ""
@@ -136,7 +145,7 @@ def fix_feed_count() -> bool:
     if not path.exists():
         return False
     try:
-        tree = ET.parse(path)
+        tree = ET.parse(path)  # local repo-controlled pack file, not network input  # nosec B314
     except Exception:  # noqa: BLE001  (parse errors are reported by check_feeds)
         return False
     n = sum(1 for o in tree.iter("outline") if o.get("xmlUrl"))
@@ -173,7 +182,7 @@ def check_crons_jittered() -> None:
             # sync; tests/cron/test_cron_jitter guards the agreement). An unsupported base like
             # @jitter:3h would sail through here yet never expand -> cron-plus errors every tick
             # and the lane silently never fires (okengine#178). Reject it at this earliest gate.
-            base = expr[len("@jitter:"):]
+            base = expr[len("@jitter:"):].split("@", 1)[0]
             if base not in {"hourly", "2h", "4h", "6h", "12h", "daily", "weekly"}:
                 fail(f"domain cron '{name}' uses an unsupported @jitter base '{expr}' — "
                      "supported: hourly, 2h, 4h, 6h, 12h, daily, weekly")
@@ -315,9 +324,13 @@ def probe_feeds(urls: list[str]) -> None:
     import urllib.request
 
     for u in urls:
+        if not u.lower().startswith("https://"):
+            warn(f"feed probe: non-https URL skipped — {u}")
+            continue
         try:
-            req = urllib.request.Request(u, method="GET", headers={"User-Agent": "{{PACK}}-validate"})
-            with urllib.request.urlopen(req, timeout=15) as r:  # noqa: S310
+            req = urllib.request.Request(u, method="GET",
+                                         headers={"User-Agent": f"{PACK_NAME}-validate"})
+            with urllib.request.urlopen(req, timeout=15) as r:  # noqa: S310  # nosec B310 (https enforced above; URLs from the pack's own OPML)
                 if r.status != 200:
                     warn(f"feed probe: HTTP {r.status} — {u}")
         except Exception as e:  # noqa: BLE001

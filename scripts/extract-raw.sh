@@ -45,16 +45,30 @@ fi
 
 echo "$(ts) extract-raw start (raw=$RAW)"
 
-# Run each extractor independently so a failure (or a missing host tool) in one
-# still lets the others proceed. extract-pdfs.sh exits non-zero when pdftotext is
-# absent; that is a warning here, not a hard stop.
-bash "$REPO/scripts/extract-pdfs.sh" "$RAW"   || echo "$(ts) WARN: extract-pdfs.sh exited non-zero"
-"$PY" "$REPO/scripts/extract-html.py" "$RAW"  || echo "$(ts) WARN: extract-html.py exited non-zero"
+# Run every extractor even when one fails, but retain a non-zero aggregate
+# verdict so cron/monitoring cannot mistake systemic permission or extraction
+# failures for a healthy pass.
+extract_failed=0
+bash "$REPO/scripts/extract-pdfs.sh" "$RAW" || {
+    echo "$(ts) WARN: extract-pdfs.sh exited non-zero"
+    extract_failed=1
+}
+"$PY" "$REPO/scripts/extract-html.py" "$RAW" || {
+    echo "$(ts) WARN: extract-html.py exited non-zero"
+    extract_failed=1
+}
 
 # Office/legacy docs (docx/pptx/xlsx/rtf/doc): optional per-format deps — the script
 # no-ops gracefully if none are present. Guarded by -f so a trimmed deployment runs.
 if [ -f "$REPO/scripts/extract-docs.py" ]; then
-    "$PY" "$REPO/scripts/extract-docs.py" "$RAW" || echo "$(ts) WARN: extract-docs.py exited non-zero"
+    "$PY" "$REPO/scripts/extract-docs.py" "$RAW" || {
+        echo "$(ts) WARN: extract-docs.py exited non-zero"
+        extract_failed=1
+    }
 fi
 
+if [ "$extract_failed" -ne 0 ]; then
+    echo "$(ts) ERROR: extract-raw completed with extractor failures" >&2
+    exit 1
+fi
 echo "$(ts) extract-raw done"

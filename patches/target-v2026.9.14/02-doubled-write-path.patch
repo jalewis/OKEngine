@@ -1,0 +1,133 @@
+diff --git a/tools/file_tools.py b/tools/file_tools.py
+index 8eb75324..1e116ed3 100644
+--- a/tools/file_tools.py
++++ b/tools/file_tools.py
+@@ -660,6 +660,19 @@ def _resolve_or_none(filepath: str, task_id: str) -> str | None:
+         return None
+ 
+ 
++def _doubled_path_segment(resolved_path: str) -> str | None:
++    """Find adjacent equal directory names in the task-resolved write path.
++
++    The path is already anchored to the agent's task cwd. Do not resolve it
++    again against the host: a container path or symlink may live elsewhere.
++    """
++    parts = Path(resolved_path).parts
++    for left, right in zip(parts, parts[1:]):
++        if left not in ("/", ".", "..") and not left.startswith(".") and left == right:
++            return f"{left}/{right}"
++    return None
++
++
+ def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: str,
+                           cross_profile: bool) -> str | None:
+     """Run the shared write/patch guards in order; return the first error string.
+@@ -777,6 +790,12 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
+         # Resolution failure falls back to the legacy unlocked path (the write
+         # still proceeds; the per-task staleness check still runs).
+         _resolved = _resolve_or_none(path, task_id)
++        doubled = _doubled_path_segment(_resolved or path)
++        if doubled:
++            return tool_error(
++                f"Refusing to write to a path with a doubled directory segment: `{doubled}`. "
++                "This usually means CWD confusion: verify the agent's working directory "
++                f"and retry with a corrected path. Path attempted: {path}")
+         path_to_resolved = {path: _resolved}
+         with ExitStack() as _lock:
+             if _resolved:
+diff --git a/tests/tools/test_okengine_doubled_write_path.py b/tests/tools/test_okengine_doubled_write_path.py
+new file mode 100644
+index 00000000..d49844c1
+--- /dev/null
++++ b/tests/tools/test_okengine_doubled_write_path.py
+@@ -0,0 +1,90 @@
++"""Reject a CWD-confused write before it creates a rogue nested workspace."""
++
++import json
++from unittest.mock import create_autospec
++
++import tools.file_tools as ft
++import tools.terminal_tool as terminal_tool
++from tools.file_operations import ShellFileOperations
++from tools.file_operations_common import WriteResult
++from tools.environments.local import LocalEnvironment
++
++
++def _write_from_workspace(monkeypatch, tmp_path, relative_path):
++    workspace = tmp_path / "vault" / "wiki"
++    workspace.mkdir(parents=True)
++    decoy = tmp_path / "decoy"
++    decoy.mkdir()
++    monkeypatch.chdir(decoy)
++    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
++    terminal_tool.record_session_cwd("doubled-fixture", str(workspace))
++    ops = create_autospec(ShellFileOperations, instance=True)
++    ops.write_file.return_value = WriteResult(bytes_written=5, verified=True)
++    monkeypatch.setattr(ft, "_get_file_ops", lambda _task: ops)
++    result = json.loads(ft.write_file_tool(relative_path, "hello", task_id="doubled-fixture"))
++    return workspace, result, ops
++
++
++def test_agent_relative_doubled_segment_is_denied_before_write(monkeypatch, tmp_path):
++    workspace, result, ops = _write_from_workspace(monkeypatch, tmp_path, "wiki/index.md")
++    assert "doubled directory segment" in result.get("error", "")
++    assert "wiki/wiki" in result["error"]
++    ops.write_file.assert_not_called()
++    assert not (workspace / "wiki" / "index.md").exists()
++
++
++def test_normal_sibling_path_is_written_at_agent_cwd_not_process_cwd(monkeypatch, tmp_path):
++    workspace, result, ops = _write_from_workspace(monkeypatch, tmp_path, "reports/index.md")
++    assert "error" not in result
++    ops.write_file.assert_called_once_with(str(workspace / "reports" / "index.md"), "hello")
++
++
++def test_read_file_status_text_cannot_be_persisted_as_file_content(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
++    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
++    monkeypatch.delenv("WIKI_PATH", raising=False)
++    task_id = f"status-display-{tmp_path.name}"
++    target = tmp_path / "status-copy.txt"
++    ops = ShellFileOperations(LocalEnvironment(cwd=str(tmp_path), timeout=5))
++    with ft._file_ops_lock:
++        ft._file_ops_cache[task_id] = ops
++
++    try:
++        result = json.loads(ft.write_file_tool(
++            str(target), ft._READ_DEDUP_STATUS_MESSAGE, task_id=task_id,
++        ))
++        assert "internal read_file display text" in result.get("error", ""), result
++        assert not target.exists(), "client-visible denial must precede any backend write"
++    finally:
++        ft.clear_file_ops_cache(task_id)
++
++
++def test_successful_file_write_is_visible_on_late_client_read(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
++    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
++    monkeypatch.delenv("WIKI_PATH", raising=False)
++    task_id = f"write-read-{tmp_path.name}"
++    target = tmp_path / "durable.txt"
++    target.write_text("before\n", encoding="utf-8")
++    ops = ShellFileOperations(LocalEnvironment(cwd=str(tmp_path), timeout=5))
++    with ft._file_ops_lock:
++        ft._file_ops_cache[task_id] = ops
++
++    try:
++        before = json.loads(ft.read_file_tool(str(target), task_id=task_id))
++        assert "before" in before.get("content", ""), before
++
++        written = json.loads(ft.write_file_tool(
++            str(target), "after\n", task_id=task_id, session_id="disposable-session",
++        ))
++        assert written.get("error") is None, written
++        assert written.get("verified") is True, written
++        assert written.get("resolved_path") == str(target), written
++        assert written.get("files_modified") == [str(target)], written
++
++        after = json.loads(ft.read_file_tool(str(target), task_id=task_id))
++        assert "after" in after.get("content", ""), after
++        assert "before" not in after.get("content", ""), after
++        assert target.read_bytes() == b"after\n", "tool response must reflect durable file bytes"
++    finally:
++        ft.clear_file_ops_cache(task_id)

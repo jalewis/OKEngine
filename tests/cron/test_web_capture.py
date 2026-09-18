@@ -174,3 +174,219 @@ def test_dead_letter_is_idempotent(monkeypatch, tmp_path):
     two = m.dead_letter(tmp_path, "https://news.example/a", "n", error, observed_at="second")
     assert one == two
     assert json.loads((tmp_path / one).read_text())["observed_at"] == "first"
+
+
+def test_real_url_validator_scheme_dns_private_and_public_paths(monkeypatch):
+    m = _load(monkeypatch)
+    monkeypatch.undo()
+    with pytest.raises(m.CaptureError, match="scheme/host"):
+        m._validate_url("file:///tmp/a")
+
+    monkeypatch.setattr(m, "ALLOW_PRIVATE", True)
+    m._validate_url("http://localhost/a")
+    monkeypatch.setattr(m, "ALLOW_PRIVATE", False)
+    monkeypatch.setattr(
+        m.socket, "getaddrinfo",
+        lambda *_a, **_k: (_ for _ in ()).throw(m.socket.gaierror("missing")),
+    )
+    with pytest.raises(m.CaptureError) as exc:
+        m._validate_url("https://missing.example/a")
+    assert exc.value.category == "dns"
+
+    monkeypatch.setattr(
+        m.socket, "getaddrinfo",
+        lambda *_a, **_k: [(None, None, None, None, ("127.0.0.1", 443))],
+    )
+    with pytest.raises(m.CaptureError) as exc:
+        m._validate_url("https://private.example/a")
+    assert exc.value.category == "ssrf"
+    monkeypatch.setattr(
+        m.socket, "getaddrinfo",
+        lambda *_a, **_k: [(None, None, None, None, ("8.8.8.8", 443))],
+    )
+    m._validate_url("https://public.example/a")
+
+
+def test_redirect_default_open_and_retry_delay_edges(monkeypatch):
+    m = _load(monkeypatch)
+    validated = []
+    monkeypatch.setattr(m, "_validate_url", lambda url: validated.append(url))
+
+    class Parent:
+        def redirect_request(self, *_args):
+            return "redirected"
+
+    monkeypatch.setattr(urllib.request.HTTPRedirectHandler, "redirect_request", Parent.redirect_request)
+    assert m._SafeRedirect().redirect_request(None, None, 302, "", {}, "https://next") == "redirected"
+    assert validated == ["https://next"]
+
+    opened = []
+    monkeypatch.setattr(
+        urllib.request, "build_opener",
+        lambda *_a: type("Opener", (), {"open": lambda _self, req, timeout: opened.append((req, timeout)) or "ok"})(),
+    )
+    assert m._default_open("request", 3) == "ok"
+    assert opened == [("request", 3)]
+    error = urllib.error.HTTPError("u", 503, "", {"Retry-After": "not-a-number"}, None)
+    assert m._retry_after(error, 2) == 4.0
+
+
+def test_fetch_fatal_http_and_network_retry_paths(monkeypatch):
+    m = _load(monkeypatch)
+    with pytest.raises(m.CaptureError) as exc:
+        m.fetch_document(
+            "https://news.example/a",
+            opener=lambda req, _timeout: (_ for _ in ()).throw(
+                urllib.error.HTTPError(req.full_url, 400, "Bad", {}, None)),
+        )
+    assert exc.value.category == "http"
+
+    calls = []
+    def eventually(req, _timeout):
+        calls.append(req)
+        if len(calls) < m.MAX_RETRIES:
+            raise TimeoutError("slow")
+        return Response(b"plain", content_type="text/plain")
+    assert m.fetch_document("https://news.example/a", opener=eventually)[0] == b"plain"
+
+    with pytest.raises(m.CaptureError) as exc:
+        m.fetch_document(
+            "https://news.example/a",
+            opener=lambda *_a: (_ for _ in ()).throw(OSError("offline")),
+        )
+    assert exc.value.category == "network"
+
+
+def test_extraction_plain_metadata_and_parser_failure(monkeypatch):
+    m = _load(monkeypatch)
+    assert m.extract(b"  plain text  ", "text/plain", "https://x")["text"] == "plain text"
+    html = b"""<html><head><meta property='og:locale' content='fr_FR'>
+    <meta property='article:author' content='Author'><meta property='article:tag' content='one,two'>
+    <meta name='description' content='ignored'>
+    </head><body><div>text</div></body></html>"""
+    fields = m.extract(html, "text/html", "https://x")
+    assert fields["author"] == "Author" and fields["language"] == "fr_FR"
+    assert fields["tags"] == ["one", "two"]
+
+    monkeypatch.setattr(m._HTMLText, "feed", lambda *_a: (_ for _ in ()).throw(RuntimeError("parse")))
+    with pytest.raises(m.CaptureError) as exc:
+        m.extract(b"<p>x</p>", "text/html", "https://x")
+    assert exc.value.category == "extraction"
+
+
+def test_result_dict_returns_dataclass_fields(monkeypatch, tmp_path):
+    m = _load(monkeypatch)
+    result = m.capture(
+        tmp_path, "https://news.example/a",
+        opener=lambda *_a: Response(b"plain", content_type="text/plain"),
+    )
+    assert m.result_dict(result)["content_hash"] == result.content_hash
+
+
+# ── okengine#748: revision identity is the extracted TEXT, not the fetched bytes ──────────
+#
+# A live vault accumulated 82,769 raw files carrying 6,531 distinct articles — 639 copies of
+# one blog post — because `content_hash` covered the whole fetched document. Publishers whose
+# markup carries a rotating token or timestamp therefore looked "changed" on every fetch, about
+# ten times a day, forever. Consecutive captures of the worst offender differed only in
+# `content_hash` and `fetched`; the extracted article was byte-identical.
+
+CHURN_TEMPLATE = b"""<html lang="en"><head><title>Stable Article</title>
+<link rel="canonical" href="https://news.example/stable"></head>
+<body><!-- build-token: %s --><p>The article body never changes.</p>
+<span class="sidebar">%s</span></body></html>"""
+
+
+def _churn(token: bytes, sidebar: bytes = b"unchanging furniture"):
+    return CHURN_TEMPLATE % (token, sidebar)
+
+
+def test_markup_churn_with_an_unchanged_article_is_not_a_revision(tmp_path, monkeypatch):
+    """THE REGRESSION. Same article, different markup token: `changed` must be False so no new
+    raw item is minted."""
+    m = _load(monkeypatch)
+    first = _churn(b"aaaa")
+    second = _churn(b"bbbb")
+    assert first != second, "the fixture must actually differ in bytes"
+
+    monkeypatch.setattr(m, "_default_open", lambda *_a, **_k: Response(first))
+    one = m.capture(tmp_path, "https://news.example/stable")
+    assert one.changed is True                      # nothing prior -> a first capture
+
+    monkeypatch.setattr(m, "_default_open", lambda *_a, **_k: Response(second))
+    two = m.capture(tmp_path, "https://news.example/stable", previous=one.state)
+
+    assert two.content_hash != one.content_hash, "the bytes did change"
+    assert two.text_hash == one.text_hash, "the article did not"
+    assert two.changed is False, "a markup-only difference must not count as a revision"
+
+
+def test_a_real_body_edit_is_still_a_revision(tmp_path, monkeypatch):
+    """The gate must not have been loosened into uselessness."""
+    m = _load(monkeypatch)
+    monkeypatch.setattr(m, "_default_open",
+                        lambda *_a, **_k: Response(_churn(b"aaaa", b"original text")))
+    one = m.capture(tmp_path, "https://news.example/stable")
+    monkeypatch.setattr(m, "_default_open",
+                        lambda *_a, **_k: Response(_churn(b"aaaa", b"rewritten text")))
+    two = m.capture(tmp_path, "https://news.example/stable", previous=one.state)
+    assert two.text_hash != one.text_hash
+    assert two.changed is True
+
+
+def test_markup_churn_does_not_append_a_new_revision_artifact(tmp_path, monkeypatch):
+    """The store-level half: 100 fetches of a churning page leave ONE revision record.
+
+    Before the fix each fetch wrote its own revisions/ entry, which is what let a single
+    article reach 639 of them."""
+    m = _load(monkeypatch)
+    for i in range(100):
+        monkeypatch.setattr(m, "_default_open",
+                            lambda *_a, _b=f"tok{i}".encode(), **_k: Response(_churn(_b)))
+        m.capture(tmp_path, "https://news.example/stable")
+    revisions = list((tmp_path / "revisions").rglob("*.json"))
+    assert len(revisions) == 1, f"expected one revision, found {len(revisions)}"
+
+
+def test_byte_identical_responses_still_share_one_object(tmp_path, monkeypatch):
+    """The object store must stay BYTE addressed — moving revision identity to text must not
+    make identical responses stop sharing a blob."""
+    m = _load(monkeypatch)
+    body = _churn(b"fixed")
+    monkeypatch.setattr(m, "_default_open", lambda *_a, **_k: Response(body))
+    m.capture(tmp_path, "https://news.example/stable")
+    m.capture(tmp_path, "https://news.example/stable")
+    assert len(list((tmp_path / "objects").rglob("*.html"))) == 1
+
+
+def test_differing_markup_keeps_its_own_object_blob(tmp_path, monkeypatch):
+    """Two distinct responses are two distinct blobs even when they extract to one article —
+    the raw bytes remain recoverable for audit."""
+    m = _load(monkeypatch)
+    for token in (b"aaaa", b"bbbb"):
+        monkeypatch.setattr(m, "_default_open", lambda *_a, _t=token, **_k: Response(_churn(_t)))
+        m.capture(tmp_path, "https://news.example/stable")
+    assert len(list((tmp_path / "objects").rglob("*.html"))) == 2
+    assert len(list((tmp_path / "revisions").rglob("*.json"))) == 1
+
+
+def test_text_fingerprint_normalizes_whitespace(monkeypatch):
+    """Reflow and indentation churn must not read as an edit either."""
+    m = _load(monkeypatch)
+    assert m.text_fingerprint("a  b\n c") == m.text_fingerprint("a b c")
+    assert m.text_fingerprint("a b") != m.text_fingerprint("a c")
+
+
+def test_state_without_a_text_hash_falls_back_to_the_byte_comparison(tmp_path, monkeypatch):
+    """Upgrade path. State written before the fix carries no text_hash; that one transition
+    uses the old comparison, after which the page's state carries a text_hash and goes quiet.
+    Treating absent-as-unchanged would swallow a real edit made across the upgrade."""
+    m = _load(monkeypatch)
+    monkeypatch.setattr(m, "_default_open", lambda *_a, **_k: Response(_churn(b"new")))
+    legacy = {"content_hash": "0" * 64}             # pre-fix shape: no text_hash
+    result = m.capture(tmp_path, "https://news.example/stable", previous=legacy)
+    assert result.changed is True
+    assert result.state["text_hash"], "state must carry a text_hash going forward"
+
+    quiet = m.capture(tmp_path, "https://news.example/stable", previous=result.state)
+    assert quiet.changed is False, "the very next fetch must already be stable"

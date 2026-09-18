@@ -1,0 +1,52 @@
+# Engine-managed compatibility overlay for deployments created before PostgreSQL projection
+# became part of the standard compose topology. deploy.sh copies this into .hermes-data/ and sets
+# COMPOSE_FILE; newer deployments carry the same services directly in docker-compose.yml.
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: okengine
+      POSTGRES_USER: okengine
+      POSTGRES_PASSWORD: ${OKENGINE_PROJECTION_WRITER_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: ${TZ:-UTC}
+    volumes:
+      - projection-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U okengine -d okengine"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources: {limits: {cpus: "2.0", memory: 2048M}}
+
+  okengine-projection:
+    build:
+      context: ${ENGINE_DIR:-../engine}
+      dockerfile: okengine-projection/Dockerfile
+    image: okengine-projection
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      WIKI_PATH: /opt/vault
+      OKENGINE_PROJECTION_WRITER_DSN: postgresql://okengine:${OKENGINE_PROJECTION_WRITER_PASSWORD}@postgres:5432/okengine
+      OKENGINE_PROJECTION_READER_PASSWORD: ${OKENGINE_PROJECTION_READER_PASSWORD}
+      OKENGINE_PROJECTION_INTERVAL_SECONDS: ${OKENGINE_PROJECTION_INTERVAL_SECONDS:-3600}
+      OKENGINE_PROJECTION_MAX_DELETE_PCT: ${OKENGINE_PROJECTION_MAX_DELETE_PCT:-2}
+      OKENGINE_PROJECTION_MAX_DELETE_ABS: ${OKENGINE_PROJECTION_MAX_DELETE_ABS:-50}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./:/opt/vault:ro
+    deploy:
+      resources: {limits: {cpus: "2.0", memory: 2048M}}
+
+  okengine-mcp:
+    environment:
+      - OKENGINE_PROJECTION_READER_DSN=${OKENGINE_PROJECTION_READER_DSN}
+      - OKENGINE_PROJECTION_MAX_AGE_HOURS=${OKENGINE_PROJECTION_MAX_AGE_HOURS:-6}
+
+volumes:
+  projection-data:

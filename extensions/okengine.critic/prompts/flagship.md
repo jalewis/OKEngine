@@ -15,10 +15,10 @@ Be specific and fair: critique the CONTENT, not its existence. A defensible clai
 citation is a sourcing fix, not a wrong claim — say which it is.
 
 Write ONE critic report to `dashboards/critic-<YYYY-MM-DD>` (`type: dashboard`) via
-`mcp_okengine_write_create_entity`: per flagged page, a short section with the specific issues
+`mcp__okengine_write_okengine_critic_flagship__create_entity`: per flagged page, a short section with the specific issues
 (quoted claims, missing coverage) ranked by severity, each linking `[[<the page>]]`. For a page
 with genuinely serious problems, ALSO flag it for human review via
-`mcp_okengine_write_flag_for_review` (a note naming the top issue) — don't flag a merely-thin
+`mcp__okengine_write_okengine_critic_flagship__flag_for_review` (a note naming the top issue) — don't flag a merely-thin
 page that's otherwise sound.
 
 LOCAL-ONLY (no web tools). Open the report with a one-line note that this is an editorial

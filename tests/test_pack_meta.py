@@ -50,6 +50,14 @@ def test_port_offset_parsed_and_coerced(tmp_path):
     assert pm.load_pack_meta(_pack(tmp_path, "c", base + "port_offset: nope\n"))["port_offset"] == 0  # bad -> 0
 
 
+def test_load_rejects_unparseable_and_non_mapping_metadata(tmp_path):
+    broken = _pack(tmp_path, "broken", "[unterminated\n")
+    scalar = _pack(tmp_path, "scalar", "a string\n")
+    assert pm.load_pack_meta(broken) is None
+    assert pm.load_pack_meta(scalar) is None
+    assert pm._satisfies("anything", "") is True
+
+
 def _meta(name, version="1.0.0", trust="public", types=(), namespaces=(), requires=()):
     return {"name": name, "version": version, "trust": trust,
             "owns_types": set(types), "owns_namespaces": set(namespaces),
@@ -68,6 +76,15 @@ def test_overlapping_type_and_namespace_ownership_fail():
     errs = " ".join(pm.validate_composition(metas))
     assert "type 'shared' is owned by both" in errs
     assert "namespace 'nsx' is owned by both" in errs
+
+
+@pytest.mark.parametrize("namespace", ["dashboards", "operational"])
+def test_reserved_derived_namespace_cannot_be_owned(namespace):
+    errors = pm.validate_composition([_meta("pack", namespaces=[namespace])])
+    assert errors == [
+        f"namespace '{namespace}' is reserved for engine-derived/operational artifacts "
+        "and cannot be owned by pack"
+    ]
 
 
 def test_requires_presence_and_version():
@@ -137,6 +154,12 @@ def test_bundle_recipe_rejects_malformed():
     # a member not declared in requires
     assert any("does not declare it in requires" in e
                for e in pm.validate_bundle_recipe(_bundle_meta(requires=["host"])))  # g1/g2 missing
+    assert any("duplicate entries" in e
+               for e in pm.validate_bundle_recipe(_bundle_meta(compose=["g", "g"],
+                                                               requires=["host", "g"])))
+    assert any("cannot compose itself" in e
+               for e in pm.validate_bundle_recipe(_bundle_meta(name="self", host="self",
+                                                               compose=["g"], requires=["self", "g"])))
     # a non-bundle meta yields no recipe errors
     assert pm.validate_bundle_recipe(_meta("plain", types=["t"])) == []
 

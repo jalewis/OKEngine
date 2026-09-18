@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
+from pathlib import Path
 
 #: Bump when the normalization algorithm changes (forces a re-derivation/migration).
 NORM_VERSION = 1
@@ -60,6 +61,47 @@ def normalize_key(raw: str) -> str:
     if len(slug) > _MAX_KEY_LEN:
         slug = slug[:_MAX_KEY_LEN].rstrip("-") + "-" + _short_hash(s, 6)
     return slug
+
+
+def slug_identity(raw: str) -> str:
+    """Return a separator-insensitive human identity for a filename slug.
+
+    This is deliberately stricter than :func:`normalize_key`: ``agent-tesla``,
+    ``agent_tesla``, and ``agenttesla`` are spelling variants of one subject.
+    An all-digit result is excluded because punctuation can carry the identity
+    of numeric indicators. This key detects collisions; it never authorizes an
+    automatic merge.
+    """
+    folded = (
+        unicodedata.normalize("NFKD", str(raw or ""))
+        .encode("ascii", "ignore")
+        .decode("ascii")
+        .lower()
+    )
+    identity = re.sub(r"[^a-z0-9]", "", folded)
+    return "" if not identity or identity.isdigit() else identity
+
+
+def qualified_namespace(wiki: Path, page: Path) -> str:
+    """Return the schema-qualified namespace for a page below ``wiki``.
+
+    A nested directory carrying ``schema.yaml`` is a pack/subdomain container,
+    so it remains in the qualified key while the following directory is the
+    governed namespace. Flat vaults retain their first path component.
+    """
+    try:
+        parts = page.resolve().relative_to(wiki.resolve()).parts
+    except (OSError, ValueError):
+        return ""
+    if not parts:
+        return ""
+    index = 0
+    while (
+        index < len(parts) - 1
+        and (wiki.joinpath(*parts[: index + 1]) / "schema.yaml").is_file()
+    ):
+        index += 1
+    return "/".join(parts[: index + 1])
 
 
 def make_id(scope: str, key: str) -> str:

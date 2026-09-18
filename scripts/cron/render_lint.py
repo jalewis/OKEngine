@@ -121,14 +121,14 @@ def _lint_one(reader_url: str, path: str, retries: int = 2) -> tuple[str, list[s
     # occasionally time out a request, which is a crawler artifact, NOT a page defect. Only a page
     # that fails EVERY attempt is a real fetch-error (a genuinely un-renderable page).
     url = f"{reader_url}/api/page?path={urllib.parse.quote(path)}"
-    for attempt in range(retries + 1):
+    for attempt in range(retries + 1):  # pragma: no branch - success or final failure always returns
         try:
             d = _get_json(url, timeout=60)
             return path, lint_html(path, d.get("html", "") or "")
         except Exception:
             if attempt == retries:
                 return path, ["fetch-error"]
-    return path, ["fetch-error"]
+    return path, ["fetch-error"]  # pragma: no cover - loop above is non-empty and exhaustive
 
 
 def crawl(reader_url: str, paths: list[str], workers: int = 16) -> dict[str, list[str]]:

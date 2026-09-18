@@ -40,6 +40,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "cron"))
+import artifact_contract
 import output_contract
 
 REPO = Path(__file__).resolve().parent.parent
@@ -68,6 +69,28 @@ RUNTIME_FIELDS = {"next_run_at", "last_run_at", "last_run_success", "last_comple
 # {enabled: false, paused_at: ...}. `paused_at` is the marker that distinguishes a pause from an
 # intentional source-level `enabled: false` (a ship-disabled placeholder).
 PAUSE_MARKERS = {"paused_at", "paused_reason", "paused_by"}
+
+_MCP_DISCOVERY_CONTRACT = (
+    "\n\nMCP DISCOVERY CONTRACT: OKEngine's connected MCP servers expose named tools; "
+    "they do not expose prompt templates or arbitrary filesystem resources. Do not call "
+    "`list_prompts` or `get_prompt`, and never request guessed names such as `preflight`, "
+    "`schema`, or `source-scoring-rubric`. Use the instructions already present in this "
+    "prompt. Read explicit local paths with `file_read`/`read_file`, not `read_resource`. "
+    "If a future prompt explicitly requires an MCP resource, call `list_resources` first "
+    "and pass only a URI returned verbatim; never invent `file://`, `okengine://`, or any "
+    "other resource URI."
+)
+
+_SOURCE_QUALITY_RUBRIC = (
+    "\n\nSOURCE QUALITY RUBRIC: Apply this complete Admiralty baseline directly; do "
+    "not look up another rubric. Reliability grades the publishing channel: "
+    "A=completely reliable, B=usually reliable, C=fairly reliable, D=not usually "
+    "reliable, E=unreliable, F=reliability cannot be judged. Credibility grades the "
+    "reported information: 1=confirmed by other independent sources, 2=probably "
+    "true, 3=possibly true, 4=doubtful, 5=improbable, 6=truth cannot be judged. Use "
+    "the publisher, source kind, provenance, and locally supplied page metadata; do "
+    "not browse."
+)
 
 
 def sanitize(jobs: list[dict]) -> list[dict]:
@@ -149,9 +172,46 @@ def _stamp_output_contract(job: dict) -> dict:
         manifest = str(job.get("selection_manifest") or
                        f"/opt/data/cron-plus/selections/{job.get('name')}.json")
         job["selection_manifest"] = manifest
+        # Per-item completion is not meaningful unless the runner actually
+        # verifies a receipt against the selector-owned manifest. Keep these
+        # coupled at the deployment choke point so extension-composed jobs
+        # cannot silently advertise per-item completion while running in the
+        # legacy, unverified "run" mode.
+        job.setdefault("receipt_mode", "enforce")
+        job.setdefault("receipt_hash_mode", "readback")
         env["OKENGINE_SELECTION_MANIFEST"] = manifest
     job["env"] = env
     return job
+
+
+def _stamp_mcp_discovery_contract(job: dict) -> dict:
+    """Make the no-guessed-MCP rule systemic for every generated model lane."""
+    prompt = job.get("prompt")
+    if job.get("no_agent") or not isinstance(prompt, str) or not prompt.strip():
+        return job
+    stamped = dict(job)
+    additions = ""
+    if (
+        job.get("name") == "source-quality-backfill"
+        and "A=completely reliable" not in prompt
+    ):
+        additions += _SOURCE_QUALITY_RUBRIC
+    if "MCP DISCOVERY CONTRACT:" not in prompt:
+        additions += _MCP_DISCOVERY_CONTRACT
+    if not additions:
+        return job
+    stamped["prompt"] = prompt.rstrip() + additions
+    return stamped
+
+
+def _stamp_prompt_metrics(job: dict) -> dict:
+    prompt = job.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return job
+    stamped = dict(job)
+    size = len(prompt.encode("utf-8"))
+    stamped["prompt_metrics"] = {"bytes": size, "estimated_tokens": (size + 3) // 4}
+    return stamped
 
 
 def _dump_jobs(jobs: list[dict]) -> str:
@@ -161,7 +221,8 @@ def _dump_jobs(jobs: list[dict]) -> str:
     every tick and log 'invalid cron expr' noise (#27). They stay in the SOURCE
     (the pack's domain-crons.json); flip enabled:true + set a real expr to deploy
     one. The in-memory merge keeps them, so split/compose stay lossless."""
-    live = [_stamp_output_contract(_ensure_id(_normalize_schedule(j)))
+    live = [_stamp_prompt_metrics(_stamp_mcp_discovery_contract(
+                _stamp_output_contract(_ensure_id(_normalize_schedule(j)))))
             for j in jobs if j.get("enabled", True)]
     return json.dumps({"jobs": _by_name(live)}, indent=2, ensure_ascii=False) + "\n"
 
@@ -176,7 +237,40 @@ def _dump_prompts(prompts: dict) -> str:
 
 def _load_jobs(path: Path) -> list[dict]:
     d = json.loads(path.read_text(encoding="utf-8"))
-    return d["jobs"] if isinstance(d, dict) else d
+    jobs = d["jobs"] if isinstance(d, dict) else d
+    base = REPO if path.resolve() == ENGINE_CRONS_FILE.resolve() else path.parent.parent
+    out = []
+    for job in jobs:
+        job = dict(job)
+        reference = job.get("prompt_file")
+        if isinstance(reference, str) and "prompt" not in job:
+            prompt_path = (base / reference).resolve()
+            try:
+                prompt_path.relative_to(base.resolve())
+            except ValueError as exc:
+                raise ValueError(f"prompt_file escapes source root: {reference}") from exc
+            job["prompt"] = prompt_path.read_text(encoding="utf-8").rstrip()
+        out.append(job)
+    return out
+
+
+def _load_prompts(path: Path) -> dict:
+    values = json.loads(path.read_text(encoding="utf-8"))
+    base = path.parent.parent
+    out = {}
+    for name, value in values.items():
+        if not isinstance(value, dict) or not isinstance(value.get("prompt_file"), str):
+            out[name] = value
+            continue
+        prompt_path = (base / value["prompt_file"]).resolve()
+        try:
+            prompt_path.relative_to(base.resolve())
+        except ValueError as exc:
+            raise ValueError(f"prompt_file escapes pack root: {value['prompt_file']}") from exc
+        resolved = dict(value)
+        resolved["prompt"] = prompt_path.read_text(encoding="utf-8").rstrip()
+        out[name] = resolved
+    return out
 
 
 def _tier_map(path: Path) -> dict[str, str]:
@@ -216,12 +310,26 @@ def split(jobs: list[dict], tier_of: dict[str, str]) -> dict[str, object]:
             continue                          # marker is how split routes a pack's own crons
         tier = tier_of.get(name)
         if tier == "engine":
-            engine.append(j)
+            source = dict(j)
+            if isinstance(source.get("prompt_file"), str):
+                source.pop("prompt", None)
+            engine.append(source)
         elif tier == "engine-template":
-            stub = {k: v for k, v in j.items() if k != "prompt"}
+            stub = {k: v for k, v in j.items() if k not in {"prompt", "prompt_file"}}
             engine.append(stub)               # engine ships the script/schedule
-            if "prompt" in j:
-                prompts[name] = j["prompt"]   # pack supplies the prompt
+            if isinstance(j.get("prompt_file"), str):
+                value = {"prompt_file": j["prompt_file"]}
+                if isinstance(j.get("output_contract"), dict):
+                    value["output_contract"] = j["output_contract"]
+                prompts[name] = value
+            elif "prompt" in j:
+                if isinstance(j.get("output_contract"), dict):
+                    prompts[name] = {
+                        "prompt": j["prompt"],
+                        "output_contract": j["output_contract"],
+                    }
+                else:
+                    prompts[name] = j["prompt"]   # pack supplies the prompt
         elif tier == "domain":
             domain.append(j)
         else:
@@ -231,12 +339,15 @@ def split(jobs: list[dict], tier_of: dict[str, str]) -> dict[str, object]:
 
 
 def _prompt_parts(value, jobname: str) -> tuple[str, dict | None]:
-    """Accept the legacy string or v1 {prompt, output_contract} pack shape."""
+    """Accept legacy inline prompts and resolved prompt-file objects."""
     if isinstance(value, str):
         return value, None
     if not isinstance(value, dict) or not isinstance(value.get("prompt"), str):
-        raise ValueError(f"engine-template prompt {jobname!r} must be a string or an object with prompt")
-    unknown = sorted(set(value) - {"prompt", "output_contract"})
+        raise ValueError(
+            f"engine-template prompt {jobname!r} must be a string or an object "
+            "with a resolved prompt"
+        )
+    unknown = sorted(set(value) - {"prompt", "prompt_file", "output_contract"})
     if unknown:
         raise ValueError(f"engine-template prompt {jobname!r} has unknown key(s): {unknown}")
     return value["prompt"], value.get("output_contract")
@@ -252,6 +363,40 @@ def validate_output_contracts(jobs: list[dict], *, require_declared: bool = Fals
             errors.extend(output_contract.validate(contract, f"job {name!r} output_contract"))
         elif require_declared and is_model_writer and not job.get("output_contract_exempt"):
             errors.append(f"job {name!r} is model-writing but has no output_contract or explicit exemption")
+    return errors
+
+
+def validate_artifact_contracts(jobs: list[dict]) -> list[str]:
+    errors: list[str] = []
+    for job in jobs:
+        contract = job.get("artifact_contract")
+        if contract is not None:
+            if job.get("no_agent") is not True:
+                errors.append(
+                    f"job {job.get('name')!r} artifact_contract is only valid for no_agent jobs")
+            errors.extend(artifact_contract.validate(
+                contract, f"job {job.get('name')!r} artifact_contract"))
+    return errors
+
+
+def validate_agent_bounds(jobs: list[dict]) -> list[str]:
+    """Every model-bearing job must declare its own finite turn budget.
+
+    Inheriting Hermes's interactive default makes a selector-bounded lane
+    operationally unbounded: one bad item can occupy a model slot for up to 90
+    turns. Validate the final composed fleet so engine, extension, and pack jobs
+    are held to the same deploy-time contract.
+    """
+    errors = []
+    for job in jobs:
+        if job.get("no_agent") is True:
+            continue
+        value = job.get("max_iterations")
+        if not isinstance(value, int) or isinstance(value, bool) or value < 2:
+            errors.append(
+                f"job {job.get('name')!r}: cost-bearing agent lane requires "
+                "integer max_iterations >= 2 (work plus terminal accounting)"
+            )
     return errors
 
 
@@ -296,6 +441,10 @@ def merge(engine: list[dict], domain: list[dict], prompts: dict[str, object],
         if name in prompts:                   # re-attach engine-template prompt + tighten contract
             prompt, policy = _prompt_parts(prompts[name], name)
             j["prompt"] = prompt
+            if isinstance(prompts[name], dict) and isinstance(
+                prompts[name].get("prompt_file"), str
+            ):
+                j["prompt_file"] = prompts[name]["prompt_file"]
             j["output_contract"] = output_contract.compose(j.get("output_contract"), policy,
                                                               f"job {name!r} output_contract")
         out.append(j)
@@ -363,6 +512,10 @@ def merge_packs(engine: list[dict], packs: list[dict],
             try:
                 prompt, policy = _prompt_parts(prompt_value, jobname)
                 inst["prompt"] = prompt
+                if isinstance(prompt_value, dict) and isinstance(
+                    prompt_value.get("prompt_file"), str
+                ):
+                    inst["prompt_file"] = prompt_value["prompt_file"]
                 inst["output_contract"] = output_contract.compose(
                     inst.get("output_contract"), policy, f"job {jobname!r} output_contract")
             except ValueError as exc:
@@ -421,7 +574,7 @@ def discover_packs(packs_dir: Path) -> list[dict]:
         out.append({
             "name": meta["name"], "meta": meta,
             "domain": _load_jobs(dc) if dc.is_file() else [],
-            "prompts": json.loads(dp.read_text(encoding="utf-8")) if dp.is_file() else {},
+            "prompts": _load_prompts(dp) if dp.is_file() else {},
         })
     return out
 
@@ -431,7 +584,7 @@ def compose(packs_dir: Path) -> tuple[list[dict], list[str]]:
     come from composition validation (disjoint ownership / requires / single trust)
     AND the N-way job merge. A non-empty error list means DO NOT deploy."""
     pm = _pack_meta()
-    engine = json.loads(ENGINE_CRONS_FILE.read_text())
+    engine = _load_jobs(ENGINE_CRONS_FILE)
     packs = discover_packs(packs_dir)
     errors = pm.validate_composition([p["meta"] for p in packs])
     jobs, merge_errors = merge_packs(engine, packs, _tier_map(TIERS))
@@ -451,8 +604,12 @@ def regen_composed(packs_dir: Path) -> list[dict]:
     if id_errors:
         raise SystemExit("cron id/name collisions (not deploying):\n  " + "\n  ".join(id_errors))
     contract_errors = validate_output_contracts(jobs)
+    contract_errors.extend(validate_artifact_contracts(jobs))
     if contract_errors:
         raise SystemExit("cron output-contract errors (not deploying):\n  " + "\n  ".join(contract_errors))
+    bound_errors = validate_agent_bounds(jobs)
+    if bound_errors:
+        raise SystemExit("cron agent-bound errors (not deploying):\n  " + "\n  ".join(bound_errors))
     JOBS.write_text(_dump_jobs(jobs), encoding="utf-8")
     return jobs
 
@@ -487,7 +644,7 @@ def _extension_pass(pack_dir: Path, existing: list[dict]) -> tuple[list[dict], l
 def regen() -> list[dict]:
     """Generate config/cron-plus-jobs.json from the engine half + the domain pack +
     any enabled extensions (#113). Fail-loud before writing on a composition error."""
-    engine = json.loads(ENGINE_CRONS_FILE.read_text())
+    engine = _load_jobs(ENGINE_CRONS_FILE)
     # A pack with ONLY engine crons has no crons/ dir; tolerate its absence (empty domain set) so
     # regen can run for EVERY pack. Otherwise the deploy skipped regen for such packs and shipped a
     # stale leftover — possibly another pack's job set on a multi-pack host (invariant-audit #12).
@@ -496,7 +653,7 @@ def regen() -> list[dict]:
     pname = _pack_name(PACK_DIR)
     for j in domain:                          # provenance marker (okengine#143) so split/dump
         j.setdefault("pack", pname)           # can route a pack's own crons back to domain
-    prompts = json.loads(_dp.read_text()) if _dp.is_file() else []
+    prompts = _load_prompts(_dp) if _dp.is_file() else []
     merged = merge(engine, domain, prompts, tier_of=_tier_map(TIERS))
     ext_jobs, ext_errors = _extension_pass(PACK_DIR, merged)
     if ext_errors:
@@ -509,6 +666,9 @@ def regen() -> list[dict]:
     id_errors = validate_unique_ids(merged)            # M37: fail-loud on a colliding deployed id/name
     if id_errors:
         raise SystemExit("cron id/name collisions (not deploying):\n  " + "\n  ".join(id_errors))
+    bound_errors = validate_agent_bounds(merged)
+    if bound_errors:
+        raise SystemExit("cron agent-bound errors (not deploying):\n  " + "\n  ".join(bound_errors))
     JOBS.write_text(_dump_jobs(merged), encoding="utf-8")
     print(f"regen: {len(engine)} engine-half + {len(domain)} domain + {len(prompts)} "
           f"prompts + {len(ext_jobs)} extension -> {JOBS.name} ({len(merged)} jobs)")
@@ -687,7 +847,8 @@ def main(argv: list[str]) -> int:
             ap.error("compose requires --packs DIR (or CRON_PACKS_DIR)")
         jobs, errors = compose(Path(pdir))
         _, order_errors = validate_ordering(jobs)          # same gates as regen_composed — the CLI
-        errors = errors + order_errors + validate_unique_ids(jobs)   # subcommand bypassed both (re-verify)
+        errors = (errors + order_errors + validate_unique_ids(jobs)
+                  + validate_agent_bounds(jobs))   # final composed cost boundary
         if errors:
             print("composition errors (not writing):")
             for e in errors:
@@ -750,7 +911,7 @@ def main(argv: list[str]) -> int:
           f"merged={len(merged)} jobs")
     order, order_errors = validate_ordering(jobs)      # okengine#129: after: graph soundness
     id_errors = validate_unique_ids(jobs)              # M37: the self-test guarding the committed
-    order_errors = order_errors + id_errors            # artifact must catch a colliding id/name too
+    order_errors = order_errors + id_errors + validate_agent_bounds(jobs)
     if order_errors:
         print("✗ ORDERING", file=sys.stderr)
         for e in order_errors:

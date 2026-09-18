@@ -47,6 +47,10 @@ _CANONICAL_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 _CANONICAL_NAME_RE = re.compile(r"`([^`]+)`")
+_QUALIFICATION_TARGET_RE = re.compile(
+    r"(?:^|/)(?:qualification[-/]|qwen-(?:final|qualification|readiness|page-quality))",
+    re.IGNORECASE,
+)
 
 OPERATIONAL_NO_FM = {"index.md", "log.md", "README.md"}
 OPERATIONAL_NO_FM_PREFIXES = ("lint-", "log-")
@@ -185,6 +189,11 @@ def scan_queues(details: dict | None = None):
     publisher_counts = {}
 
     for p in pages:
+        rel = p.relative_to(VAULT / "wiki")
+        derived_surface = (
+            is_operational_path(p)
+            or bool(rel.parts and rel.parts[0] in {"dashboards", "operational"})
+        )
         try:
             txt = p.read_text(errors="replace")
         except OSError:
@@ -260,6 +269,16 @@ def scan_queues(details: dict | None = None):
         # ever linked from reference-catalog pages is catalog scaffolding noise.
         for wm in _WIKILINK_RE.finditer(txt):
             tgt = wm.group(1).strip()
+            # Generated dashboards/reports are observations, not knowledge assertions.
+            # Their links must not recursively create content debt. Likewise, controlled
+            # qualification targets and literal template placeholders are deliberately
+            # ephemeral/non-resolvable and should never enter a production drain queue.
+            if (
+                derived_surface
+                or "<" in tgt or ">" in tgt
+                or _QUALIFICATION_TARGET_RE.search(tgt)
+            ):
+                continue
             all_targets.add(tgt)
             if not is_ref:
                 synth_targets.add(tgt)
@@ -268,7 +287,6 @@ def scan_queues(details: dict | None = None):
 
         # "missing from index" check — knowledge namespaces only (sources/
         # operational/dashboards excluded via knowledge_namespaces()).
-        rel = p.relative_to(VAULT / "wiki")
         if rel.parts and rel.parts[0] in knowledge_ns:
             slug_paths = (str(rel.with_suffix("")), p.stem)
             if not any(s in index_links for s in slug_paths):
@@ -285,6 +303,7 @@ def scan_queues(details: dict | None = None):
 
     # Orphans: knowledge-namespace pages with 0 inbound references
     orphans = 0
+    orphan_samples: list[str] = []
     for p in pages:
         rel = p.relative_to(VAULT / "wiki")
         if rel.parts and rel.parts[0] in knowledge_ns:
@@ -292,6 +311,8 @@ def scan_queues(details: dict | None = None):
                 continue                    # reference-catalog data isn't an orphan to fix
             if inbound_count.get(p.stem, 0) == 0:
                 orphans += 1
+                if len(orphan_samples) < 20:
+                    orphan_samples.append(rel.as_posix())
 
     # Publisher drift: publishers used ≥10 times not in canonical list
     for pub, cnt in publisher_counts.items():
@@ -299,6 +320,31 @@ def scan_queues(details: dict | None = None):
             publisher_drift += 1
 
     if details is not None:
+        unresolved_synth = sorted(
+            (target for target in broken_all if target in synth_targets),
+            key=lambda target: (-inbound_count.get(target.split("/")[-1], 0), target),
+        )
+        details["broken-wikilinks"] = {
+            "top_missing": [
+                {
+                    "target": target,
+                    "inbound": inbound_count.get(target.split("/")[-1], 0),
+                }
+                for target in unresolved_synth[:10]
+            ],
+        }
+        details["orphans"] = {"examples": orphan_samples}
+        details["publisher-drift"] = {
+            "candidates": [
+                {"publisher": pub, "sources": count}
+                for pub, count in sorted(
+                    publisher_counts.items(), key=lambda item: (-item[1], item[0])
+                )
+                if count >= 10
+                and pub not in canonical_publishers
+                and pub not in {"Unknown", "TBD", "N/A"}
+            ][:20],
+        }
         details["schema-drift"] = {
             "by_type": dict(sorted(drift_by_type.items(), key=lambda item: (-item[1], item[0]))),
             "examples": drift_examples,

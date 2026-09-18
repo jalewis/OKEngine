@@ -11,3 +11,7 @@ services:
     ports: !override ["8880:8730"]
   cockpit:
     ports: !override ["9881:9200"]
+  review-write:
+    ports: !override ["8881:8731"]
+  responses-gateway:
+    ports: !override ["8882:8080"]

@@ -8,6 +8,9 @@ REAL source_connector runtime in fixture mode (no mocked connector).
 import importlib.util
 import json
 import re
+import runpy
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -40,8 +43,14 @@ def _fm(p: Path) -> dict:
 
 
 def _run(m, vault, tmp_path, *extra):
+    # --health-root must be passed, not just state/ledger. MANIFEST and FIXTURE point at
+    # the real repo, and without this the connector's health record resolved against the
+    # CURRENT WORKING DIRECTORY — so running this test from a checkout wrote
+    # .okengine/connectors/health/reference.ror-organizations.json into the REPO and left
+    # a tracked file modified after every suite run (okengine#509).
     return m.main(["--manifest", str(MANIFEST), "--fixture", str(FIXTURE),
                    "--state-root", str(tmp_path / "state"),
+                   "--health-root", str(tmp_path / "health"),
                    "--ledger-root", str(tmp_path / "ledger.jsonl"), *extra])
 
 
@@ -149,3 +158,249 @@ def test_manifest_validation_rejects_bad_enrich_blocks():
     bad3 = yaml.safe_load(MANIFEST.read_text())
     del bad3["enrich"]["targets"]
     assert any("targets" in e for e in sc.validate_manifest(bad3))
+
+
+def test_helpers_split_resolve_flag_and_connector_failures(tmp_path, monkeypatch, capsys):
+    m = _load(tmp_path)
+    assert m._split("plain") == (None, "plain")
+    assert m._split("---\n[\n---\nbody") == (None, "---\n[\n---\nbody")
+    assert m._split("---\n- one\n---\nbody") == (None, "body")
+    payload = {"rows": [{"names": [{"value": "A"}, {"value": "B"}]},
+                        {"names": ["C"]}], "none": None}
+    assert set(m._resolve(payload, "rows.names")) == {"A", "B", "C"}
+    assert m._resolve(payload, "missing") == []
+    assert m._resolve({"x": {"other": 1}}, "x") == []
+    assert m._resolve({"x": None}, "x") == []
+    assert m._norm(" A   B ") == "a b"
+    fm = {"conflicts": "bad"}
+    m._flag(fm, "ror", "detail")
+    m._flag(fm, "ror", "detail")
+    assert len(fm["conflicts"]) == 1 and fm["needs_review"]
+
+    args = type("Args", (), {
+        "fixture": tmp_path / "f", "state_root": tmp_path / "s",
+        "ledger_root": tmp_path / "l", "health_root": tmp_path / "h",
+    })()
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        lambda *a, **k: type("P", (), {
+            "stdout": "noise\n{\"ok\": true}\n", "stderr": "", "returncode": 0,
+        })(),
+    )
+    assert m._run_connector(tmp_path / "m", "q", "v", args) == {"ok": True}
+    empty_args = type("Args", (), {
+        "fixture": None, "state_root": None, "ledger_root": None, "health_root": None,
+    })()
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        lambda *a, **k: type("P", (), {
+            "stdout": '{"ok": true}\ntrailing noise\n', "stderr": "", "returncode": 0,
+        })(),
+    )
+    assert m._run_connector(tmp_path / "m", "q", "v", empty_args) == {"ok": True}
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        lambda *a, **k: type("P", (), {
+            "stdout": "noise only\n", "stderr": "bad", "returncode": 2,
+        })(),
+    )
+    assert m._run_connector(tmp_path / "m", "q", "v", empty_args) is None
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        lambda *a, **k: type("P", (), {
+            "stdout": "{bad}\n", "stderr": "bad", "returncode": 2,
+        })(),
+    )
+    assert m._run_connector(tmp_path / "m", "q", "v", args) is None
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("x", 1)),
+    )
+    assert m._run_connector(tmp_path / "m", "q", "v", args) is None
+    assert "ERROR" in capsys.readouterr().err
+
+
+def test_main_rejects_manifest_and_missing_wiki(tmp_path, capsys):
+    m = _load(tmp_path)
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("mode: poll\n")
+    assert m.main(["--manifest", str(bad)]) == 1
+    assert '"wakeAgent": false' in capsys.readouterr().out
+
+    manifest = tmp_path / "manifest.yaml"
+    manifest.write_text(yaml.safe_dump({
+        "mode": "enrichment", "id": "x",
+        "enrich": {
+            "authority": "ror", "id_path": "id",
+            "match": {"page_field": "name", "query_input": "q",
+                      "candidate_paths": ["name"]},
+            "targets": {"types": ["lab"], "namespaces": ["entities"]},
+        },
+    }))
+    assert m.main(["--manifest", str(manifest)]) == 1
+    assert "wiki not found" in capsys.readouterr().err
+
+
+def test_main_ambiguous_unmatched_failed_and_convergence_sweep(
+    tmp_path, monkeypatch, capsys
+):
+    m = _load(tmp_path)
+    manifest = tmp_path / "manifest.yaml"
+    manifest.write_text(yaml.safe_dump({
+        "mode": "enrichment", "id": "reference.test",
+        "enrich": {
+            "authority": "test", "id_path": "id",
+            "match": {"page_field": "name", "query_input": "query",
+                      "candidate_paths": ["name"]},
+            "targets": {"types": ["lab"], "namespaces": ["entities"]},
+        },
+    }))
+    root = tmp_path / "wiki" / "entities"
+    _page(root / "_skip.md", {"type": "lab", "name": "skip"})
+    _page(root / "INDEX.md", {"type": "lab", "name": "skip"})
+    _page(root / "wrong.md", {"type": "actor", "name": "wrong"})
+    _page(root / "tomb.md", {"type": "lab", "name": "t", "status": "tombstoned"})
+    _page(root / "empty.md", {"type": "lab"})
+    _page(root / "failed.md", {"type": "lab", "name": "Failed"})
+    _page(root / "unmatched.md", {"type": "lab", "name": "Unmatched"})
+    _page(root / "ambiguous.md", {"type": "lab", "name": "Ambiguous"})
+    for name in ("owner-a", "owner-b"):
+        _page(root / f"{name}.md", {
+            "type": "lab", "name": name, "authority_ids": {"test": "dup"},
+        })
+
+    def connector(_manifest, _query, value, _args):
+        if value == "Failed":
+            return None
+        if value == "Unmatched":
+            return {"ok": True, "items": [{"payload": {"name": "other", "id": "x"}}]}
+        return {"ok": True, "items": [
+            {"payload": {"name": value, "id": "a"}},
+            {"payload": {"name": value, "id": "b"}},
+        ]}
+
+    monkeypatch.setattr(m, "_run_connector", connector)
+    assert m.main(["--manifest", str(manifest)]) == 0
+    out = capsys.readouterr().out
+    assert "unmatched" in out and "ambiguous" in out and "duplicates" in out
+    assert _fm(root / "ambiguous.md")["needs_review"] is True
+    assert _fm(root / "owner-a.md")["needs_review"] is True
+
+
+def test_entrypoint(tmp_path, monkeypatch):
+    manifest = tmp_path / "bad.yaml"
+    manifest.write_text("mode: poll\n")
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", [str(MOD), "--manifest", str(manifest)])
+    with pytest.raises(SystemExit) as exc:
+        runpy.run_path(str(MOD), run_name="__main__")
+    assert exc.value.code == 1
+
+
+def test_live_races_conflict_and_convergence_read_edges(tmp_path, monkeypatch, capsys):
+    m = _load(tmp_path)
+    manifest = tmp_path / "manifest.yaml"
+    manifest.write_text(yaml.safe_dump({
+        "mode": "enrichment", "id": "reference.test",
+        "enrich": {
+            "authority": "test", "id_path": "id",
+            "match": {"page_field": "name", "query_input": "query",
+                      "candidate_paths": ["name"]},
+            "targets": {"types": ["lab"], "namespaces": ["entities"]},
+        },
+    }))
+    root = tmp_path / "wiki/entities"
+    outside = tmp_path / "wiki/concepts/outside.md"
+    _page(outside, {"type": "lab", "name": "Outside"})
+    unreadable_scan = root / "scan-race.md"
+    _page(unreadable_scan, {"type": "lab", "name": "Scan Race"})
+    conflict = root / "conflict.md"
+    vanished = root / "vanished.md"
+    invalid = root / "invalid.md"
+    for path, name in ((conflict, "Conflict"), (vanished, "Vanished"), (invalid, "Invalid")):
+        _page(path, {"type": "lab", "name": name})
+    owner_a, owner_b = root / "owner-a.md", root / "owner-b.md"
+    for path in (owner_a, owner_b):
+        _page(path, {"type": "lab", "name": path.stem,
+                     "authority_ids": {"test": "shared"}})
+
+    original_read = Path.read_text
+    reads = {}
+    def raced_read(self, *args, **kwargs):
+        reads[self] = reads.get(self, 0) + 1
+        if self == unreadable_scan:
+            raise OSError("scan race")
+        if self == owner_a and reads[self] > 1:
+            raise OSError("sweep race")
+        if self == owner_b and reads[self] > 1:
+            return "plain"
+        return original_read(self, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", raced_read)
+
+    def connector(_manifest, _query, value, _args):
+        target = {"Conflict": conflict, "Vanished": vanished, "Invalid": invalid}[value]
+        if value == "Conflict":
+            _page(target, {"type": "lab", "name": value,
+                           "authority_ids": {"test": "old"}})
+        elif value == "Vanished":
+            target.unlink()
+        else:
+            target.write_text("plain")
+        return {"ok": True, "items": [{"payload": {"name": value, "id": "new"}}]}
+
+    monkeypatch.setattr(m, "_run_connector", connector)
+    assert m.main(["--manifest", str(manifest)]) == 0
+    output = capsys.readouterr().out
+    assert "conflict" in output
+    assert _fm(conflict)["authority_ids"]["test"] == "old"
+
+
+def test_convergence_existing_detail_is_idempotent(tmp_path, monkeypatch):
+    m = _load(tmp_path)
+    manifest = tmp_path / "manifest.yaml"
+    manifest.write_text(yaml.safe_dump({
+        "mode": "enrichment", "id": "reference.test",
+        "enrich": {"authority": "test", "id_path": "id",
+                   "match": {"page_field": "name", "query_input": "query",
+                             "candidate_paths": ["name"]},
+                   "targets": {"types": ["lab"], "namespaces": ["entities"]}},
+    }))
+    root = tmp_path / "wiki/entities"
+    paths = [root / "a.md", root / "b.md"]
+    detail = ("test id 'shared' appears on 2 pages "
+              "(entities/a.md, entities/b.md); duplicate identity needs human convergence")
+    for path in paths:
+        _page(path, {"type": "lab", "name": path.stem,
+                     "authority_ids": {"test": "shared"},
+                     "conflicts": [{"field": "authority_ids.test", "detail": detail}]})
+    monkeypatch.setattr(m, "_run_connector", lambda *_a: None)
+    before = [path.read_text() for path in paths]
+    assert m.main(["--manifest", str(manifest)]) == 0
+    assert [path.read_text() for path in paths] == before
+
+
+def test_missing_authority_id_candidate_and_dry_convergence(tmp_path, monkeypatch):
+    m = _load(tmp_path)
+    manifest = tmp_path / "manifest.yaml"
+    manifest.write_text(yaml.safe_dump({
+        "mode": "enrichment", "id": "reference.test",
+        "enrich": {"authority": "test", "id_path": "id",
+                   "match": {"page_field": "name", "query_input": "query",
+                             "candidate_paths": ["name"]},
+                   "targets": {"types": ["lab"], "namespaces": ["entities"]}},
+    }))
+    root = tmp_path / "wiki/entities"
+    candidate = root / "candidate.md"
+    _page(candidate, {"type": "lab", "name": "Candidate"})
+    for name in ("owner-a", "owner-b"):
+        _page(root / f"{name}.md", {"type": "lab", "name": name,
+                                    "authority_ids": {"test": "shared"}})
+    monkeypatch.setattr(m, "_run_connector", lambda *_a: {
+        "ok": True, "items": [
+            {"payload": {"name": "Candidate", "id": None}},
+            {"payload": {"name": "Candidate", "id": "new"}},
+        ],
+    })
+    before = {p: p.read_text() for p in root.glob("*.md")}
+    assert m.main(["--manifest", str(manifest), "--dry-run"]) == 0
+    assert {p: p.read_text() for p in root.glob("*.md")} == before

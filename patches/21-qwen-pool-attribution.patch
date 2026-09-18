@@ -1,0 +1,35 @@
+diff --git a/agent/codex_runtime.py b/agent/codex_runtime.py
+index 44dd2f2..07de8e1 100644
+--- a/agent/codex_runtime.py
++++ b/agent/codex_runtime.py
+@@ -824,6 +824,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+     the terminal event's ``output`` field.
+     """
+     import httpx as _httpx
++    import os as _os
+
+     # This is the common wire boundary for every Responses request, including
+     # the max-iteration summary path, which reconstructs history and calls
+@@ -832,6 +833,22 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+     # from leaking untyped role-bearing items to strict llama.cpp servers.
+     api_kwargs = agent._get_transport().preflight_kwargs(api_kwargs)
+
++    # Shared inference pools cannot attribute NAT'd OKEngine traffic by IP.
++    # Attach the deployment identity and a stable per-agent conversation key
++    # at the common Responses wire boundary so retries and summary turns keep
++    # the same routing identity.
++    _headers = dict(api_kwargs.get("extra_headers") or {})
++    _pack = _os.environ.get("OKENGINE_PACK", "").strip() or "unknown"
++    _component = _os.environ.get("OKENGINE_LLM_COMPONENT", "").strip()
++    _client_id = f"okengine/{_pack}" + (f"/{_component}" if _component else "")
++    _headers.setdefault("X-Client-Id", _client_id[:96])
++    _conversation_id = str(getattr(agent, "session_id", "") or "").strip()
++    if _conversation_id:
++        _headers.setdefault("X-Conversation-Id", _conversation_id[:96])
++    else:
++        _headers.setdefault("X-Oneshot", "1")
++    api_kwargs["extra_headers"] = _headers
++
+     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
+     max_stream_retries = 1
+     # Accumulate streamed text so callers / compat shims can read it.

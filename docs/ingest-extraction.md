@@ -95,9 +95,10 @@ extraction ahead of ingest matters. Regression: `tests/cron/test_select_raw_batc
 The first feed-fetch can drop a lot of files (e.g. 120). Ingestion is **bounded
 per run and self-draining** — you don't babysit or kill it:
 
-- **Bounded.** `select_raw_batch.py` selects at most **`BATCH_SIZE`** files per run
-  (default 30; set it lower to take smaller bites). The digest states the bound
-  explicitly: *"N of M unprocessed (bounded by `BATCH_SIZE=N`)"*.
+- **Bounded.** `select_raw_batch.py` selects at most **`RAW_BATCH_SIZE`** files per run
+  (default 8; set it lower to take smaller bites), with each raw input capped at
+  16,000 context bytes by default. The digest states the bound explicitly:
+  *"N of M unprocessed (bounded by `RAW_BATCH_SIZE=N`)"*.
 - **Self-draining.** The `raw-backfill` cron processes the next batch each run and
   **stops waking the agent once 0 remain** (it prints "Backfill complete → pause
   the cron"). A large backlog just takes a few runs; nothing to stop manually.
@@ -110,8 +111,8 @@ To run **one bounded pass on demand** (e.g. first-run "ingest a batch, inspect,
 repeat") instead of waiting for the schedule:
 
 ```sh
-bash $ENGINE_DIR/scripts/cron-plus.sh list                  # find the raw-backfill job id
-bash $ENGINE_DIR/scripts/cron-plus.sh run <raw-backfill-id> # fires once on the next tick (~60s)
+$ENGINE_DIR/bin/framework jobs list "$DEPLOYMENT"          # browse stable job names
+$ENGINE_DIR/bin/framework jobs run "$DEPLOYMENT" raw-backfill --wait
 ```
 
 ## Scheduling: host cron, **not** cron-plus
@@ -119,9 +120,11 @@ bash $ENGINE_DIR/scripts/cron-plus.sh run <raw-backfill-id> # fires once on the 
 The extractors run as a **host crontab** job, not a Hermes cron-plus job, for two
 hard reasons rooted in the deployment topology:
 
-1. **Ownership.** `raw/` is owned by the **host user**. The gateway container
-   runs as a different (unprivileged) uid and **cannot write companions** into
-   `raw/`. The job has to run as the host user that owns the tree.
+1. **Ownership.** The cron identity must be able to create companions throughout
+   `raw/`. In the common single-operator deployment that is the host user. In a
+   fixed-UID portable/shared deployment, run the cron as that fixed identity or
+   grant the operator equivalent ACL/group write access; do not install it as an
+   unrelated login user.
 2. **Tooling.** `pdftotext` (and the DOCX/PPTX libraries) live on the **host**;
    the gateway image ships none of them.
 
@@ -141,7 +144,11 @@ WIKI_PATH=/path/to/vault bash scripts/install-extract-cron.sh
 ```
 
 The installer carries `WIKI_PATH` / `EXTRACT_PYTHON` into the cron environment so
-the scheduled run resolves the same raw/ root and interpreter, greps for an
+the scheduled run resolves the same raw/ root and interpreter. Before touching
+crontab it performs a real create/remove probe in the root and every existing
+source-bearing directory; an ownership mismatch fails installation. Individual
+extractor failures are aggregated into a non-zero wrapper exit, so the cron log
+cannot report a healthy completion when companions were not written. It greps for an
 existing `extract-raw.sh` entry before appending (re-runnable, never duplicated),
 and honours `SCHEDULE` to override the cadence. Default cadence is every 15 min —
 cheap once caught up (companion mtime-skip) and stays ahead of the raw-backfill

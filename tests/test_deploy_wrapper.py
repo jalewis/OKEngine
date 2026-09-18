@@ -9,10 +9,12 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "deploy.sh"
 
 
-def _run(args, cwd=None):
+def _run(args, cwd=None, env=None):
+    child_env = {"PYTHON": sys.executable, "PATH": __import__("os").environ["PATH"]}
+    child_env.update(env or {})
     return subprocess.run(["bash", str(SCRIPT), *args], capture_output=True,
                           text=True, timeout=60, cwd=cwd,
-                          env={"PYTHON": sys.executable, "PATH": __import__("os").environ["PATH"]})
+                          env=child_env)
 
 
 def test_script_exists_and_parses():
@@ -52,6 +54,8 @@ def test_deploy_recomposes_schema_artifact():  # invariant-audit #12
     dp = SCRIPT.read_text()
     assert "write_composed_schema" in dp, \
         "deploy.sh no longer recomposes the schema artifact — schema.yaml edits won't reach the write path"
+    assert "'$ENGINE_DIR/src'" in dp, \
+        "deploy.sh recompose cannot import the source-layout okengine package on an application host"
 
 
 def test_deploy_recompose_error_is_fatal():  # invariant-audit HIGH #4
@@ -102,6 +106,13 @@ def test_deploy_rebuilds_sibling_images():  # invariant-audit #8/#23
         "deploy.sh step 4 must use --build, or the sibling images run stale baked code after deploy 1"
 
 
+def test_deploy_reconciles_projection_before_live_verification():
+    dp = SCRIPT.read_text()
+    reconcile = dp.index("python /app/service.py --reconcile")
+    verify = dp.index("post_deploy_verify.sh", reconcile)
+    assert reconcile < verify
+
+
 def test_image_provenance_and_staleness_wired():
     """build-engine-image stamps version/sha/hermes labels; deploy.sh compares the
     image's git_sha label to the current checkout to detect a stale image (#14)."""
@@ -112,12 +123,16 @@ def test_image_provenance_and_staleness_wired():
     assert 'org.okengine.git_sha' in dp and "STALE" in dp
 
 
-def test_default_image_tag_tracks_release_not_a_literal():
-    """okengine#101: the default OKENGINE_TAG must derive from the manifest's engine_release,
-    never a hardcoded vX.Y.Z literal (which goes stale and mis-tags images on every bump)."""
+def test_default_image_tag_tracks_release_and_revision_not_a_literal():
+    """#627: the default tag identifies both release and source revision.
+
+    A release-only alias is still mutable between release cuts and recreates the same staged-roll
+    hazard as latest.
+    """
     import re
     bi = (REPO / "scripts" / "build-engine-image.sh").read_text()
-    assert 'OKENGINE_TAG:-okengine-$RELEASE' in bi, "default tag should be okengine-$RELEASE"
+    assert 'OKENGINE_TAG:-okengine-$RELEASE-$ENG_SHA' in bi
+    assert '[ "${TAG_LATEST:-0}" = "1" ]' in bi
     # no hardcoded okengine-vX.Y.Z literal as a tag default anywhere in the script
     assert not re.search(r'OKENGINE_TAG:-okengine-v[0-9]', bi), "default tag still hardcodes a version literal"
 
@@ -142,13 +157,18 @@ def test_default_uid_is_invoking_user_not_fixed_10000():
 
 
 def test_skip_validate_proceeds_past_gate(tmp_path):
-    """--skip-validate bypasses the gate; the run then proceeds to seeding (step 2)
-    even for an otherwise-incomplete dir (it'll fail later at docker, not here)."""
+    """--skip-validate bypasses the gate and reaches schema composition.
+
+    Stop there with a deterministic Python sentinel. Letting this test continue
+    through runtime seeding, image inspection, Compose, and post-deploy sleeps made
+    a unit test depend on the runner's real Docker daemon and exceed its timeout.
+    """
     (tmp_path / "docker-compose.yml").write_text("services: {}\n")
-    r = _run(["--skip-validate", "--skip-build", "--no-crons", str(tmp_path)])
-    # We can't assert success (docker may be absent), but it must get PAST validate
-    # to the seed step — proving the gate was skipped.
-    assert "[2/" in r.stdout and "seed runtime" in r.stdout   # past the gate, at the seed step
+    r = _run(["--skip-validate", "--skip-build", "--no-crons", str(tmp_path)],
+             env={"PYTHON": "/bin/false"})
+    assert r.returncode == 1
+    assert "[1/" not in r.stdout
+    assert "[1b/6] FAILED" in r.stderr
 
 
 def test_deploy_reconciles_engine_pin_before_validate():  # okengine#359

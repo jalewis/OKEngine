@@ -11,6 +11,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 LIB = REPO / "scripts" / "lib" / "hermes_uid.sh"
 FIXOWN = REPO / "scripts" / "fix-vault-ownership.sh"
+RECONCILE = REPO / "scripts" / "reconcile-fleet-ownership.sh"
 VAULTEXEC = REPO / "scripts" / "vault-exec.sh"
 DUMP = REPO / "scripts" / "dump-cron-plus-jobs.sh"
 VERIFY = REPO / "scripts" / "post_deploy_verify.sh"
@@ -31,6 +32,10 @@ def _func_body(text: str, name: str) -> str:
 
 # --- B7: resolve_hermes_gid must warn before its 10000 fallback (mirrors resolve_hermes_uid) -------
 def test_resolve_hermes_gid_warns_before_fallback():
+    """
+    CANNOT DETECT: whether the fallback branch is ever REACHED, or whether the warning is emitted
+    at runtime. The strings could sit in a branch made unreachable by an earlier `return`.
+    """
     body = _func_body(LIB.read_text(), "resolve_hermes_gid")
     assert "HERMES_GID unresolved" in body, "resolve_hermes_gid falls back to 10000 SILENTLY (B7)"
     assert ">&2" in body, "the gid fallback warning must go to stderr like the uid twin"
@@ -40,6 +45,10 @@ def test_resolve_hermes_gid_warns_before_fallback():
 
 # --- B8: fix-vault-ownership + vault-exec must resolve a SEPARATE gid, not reuse the uid ----------
 def test_fix_vault_ownership_resolves_separate_gid():
+    """
+    CANNOT DETECT: whether GIDG is assigned a correct gid, or whether the chown line executes. A
+    COMMENT containing `chown $UIDG:$GIDG` satisfies this test exactly as well as the code does.
+    """
     t = FIXOWN.read_text()
     assert "HERMES_GID" in t, "fix-vault-ownership.sh must resolve HERMES_GID separately (B8)"
     assert "GIDG" in t, "expected a distinct GIDG variable for the group"
@@ -47,7 +56,34 @@ def test_fix_vault_ownership_resolves_separate_gid():
     assert "chown $UIDG:$UIDG" not in t, "chown still reuses the uid as the group (B8 not fixed)"
 
 
+def test_fix_vault_ownership_matches_runtime_okengine_scope():
+    """
+    CANNOT DETECT: whether that path is actually chowned. The substring appears whether the path
+    is in the chown list, in a comment, or in an `echo` of a path it then skips.
+    """
+    text = FIXOWN.read_text()
+    assert "set -- /opt/vault/wiki /opt/vault/raw /opt/vault/config /opt/vault/.okengine" in text
+    assert "-path /opt/vault/.okengine/snapshots" in text
+    assert "-path /opt/vault/.okengine/backups" in text
+    assert "-prune" in text
+
+
+def test_fleet_ownership_reconciler_is_host_scoped_and_serialized():
+    """
+    CANNOT DETECT: whether the lock is acquired, whether a failed acquisition aborts, or whether
+    the reconcile actually runs per compose dir — only that three tokens are present somewhere.
+    """
+    text = RECONCILE.read_text()
+    assert "flock -n" in text
+    assert "fix-vault-ownership.sh" in text
+    assert "docker-compose.yml" in text
+
+
 def test_vault_exec_resolves_separate_gid():
+    """
+    CANNOT DETECT: whether the exec runs at all, nor that $GIDG holds a group rather than a
+    repeat of the uid — a `GIDG=$UIDG` assignment upstream would pass this test unchanged.
+    """
     t = VAULTEXEC.read_text()
     assert "HERMES_GID" in t, "vault-exec.sh must resolve HERMES_GID separately (B8)"
     assert 'docker exec -u "$UIDG:$GIDG"' in t, "docker exec must run as uid:gid, not uid:uid"
@@ -56,6 +92,10 @@ def test_vault_exec_resolves_separate_gid():
 
 # --- B9: dump-cron-plus-jobs must resolve the gateway uid, not hardcode `--user hermes` -----------
 def test_dump_cron_plus_jobs_resolves_uid():
+    """
+    CANNOT DETECT: whether resolve_hermes_uid SUCCEEDS. It may fall back to 10000 and exec as the
+    wrong uid; the sourcing and the call site look identical either way.
+    """
     t = DUMP.read_text()
     assert "--user hermes" not in t, "dump-cron-plus-jobs.sh still hardcodes --user hermes (B9)"
     assert "resolve_hermes_uid" in t, "must resolve the gateway uid via the shared resolver"
@@ -65,6 +105,10 @@ def test_dump_cron_plus_jobs_resolves_uid():
 
 # --- B2: post_deploy_verify must check baked-vs-staged drift of the write-path libs ----------------
 def test_post_deploy_verify_checks_write_path_lib_drift():
+    """
+    CANNOT DETECT: whether the sha256 comparison is reached, whether its result is compared, or
+    whether a mismatch calls bad(). It proves the section's text exists, not that it can FAIL.
+    """
     t = VERIFY.read_text()
     assert "/opt/hermes/scripts/cron" in t, (
         "post_deploy_verify.sh must compare the BAKED write-path libs at /opt/hermes/scripts/cron (B2)"

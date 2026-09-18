@@ -106,6 +106,25 @@ def _domain_slug(pack: Path) -> str:
     return name[len("okpack-"):] if name.startswith("okpack-") else name
 
 
+def _namespace_owned_by_incoming_pack(host: Path, pack: Path, namespace: str) -> bool:
+    meta = _yaml(pack / "pack.yaml")
+    name = str(meta.get("name") or pack.name)
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "-", name).strip("-") or "pack"
+    manifest = host / ".okengine" / "installed-domains" / f"{safe}.json"
+    try:
+        state = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    if namespace in (state.get("owned_namespaces") or {}):
+        return True
+    # Conservative migration for manifests written before namespace ownership was recorded: the
+    # install-domain merge leaves an exact pack-name marker adjacent to its schema entries.
+    try:
+        return f"# co-installed ({name}, framework install-domain)" in (host / "schema.yaml").read_text()
+    except OSError:
+        return False
+
+
 def check_namespaces(host: Path, pack: Path, subtree: bool = False) -> None:
     sub_schema = pack / "subdomain" / "schema.yaml"
     if subtree:
@@ -144,7 +163,8 @@ def check_namespaces(host: Path, pack: Path, subtree: bool = False) -> None:
         # idempotency (taxonomy shape): the host schema already declares this
         # namespace with the pack's exact partitioning def — a previous
         # install-domain merge, not a conflict.
-        if ns in host_part and host_part.get(ns) == pack_part.get(ns):
+        if (ns in host_part and host_part.get(ns) == pack_part.get(ns)
+                and _namespace_owned_by_incoming_pack(host, pack, ns)):
             add("INFO", "namespaces", f"'wiki/{ns}/' already installed (host partitioning "
                                       "matches the pack's) — no action")
             continue
@@ -288,7 +308,8 @@ def check_trust(host: Path, pack: Path) -> None:
             f"reader. Raise the guest's declared exposure, or don't co-install it here.")
 
 
-def check_extension_collisions(host: Path, pack: Path, subtree: bool = False) -> None:
+def check_extension_collisions(host: Path, pack: Path, additions: Path | None = None,
+                               subtree: bool = False) -> None:
     """okengine#326 [10]: a pack type/namespace that collides with an ENABLED EXTENSION's owned id
     was INVISIBLE — every other check compares against the host ROOT schema.yaml, never the enabled
     extensions that also contribute ids. The composed artifact records an `owners` map tagging each
@@ -306,9 +327,20 @@ def check_extension_collisions(host: Path, pack: Path, subtree: bool = False) ->
               if isinstance(o, str) and o.startswith("ext:")}
     if not ext_types and not ext_ns:
         return
-    psch = _yaml(pack / "schema.yaml")
+    psch = _yaml(additions) if additions and additions.is_file() else _yaml(pack / "schema.yaml")
     ptypes = set(psch.get("types") or {})
-    pns = set((psch.get("partitioning") or {}).get("namespaces") or {})
+    pack_meta = _yaml(pack / "pack.yaml")
+    owned_namespaces = (pack_meta.get("owns") or {}).get("namespaces") or []
+    # Compare the exact namespace set the selected installer will land. Taxonomy installs merge
+    # only pack-owned namespaces (list or mapping keys); an empty owns block lands none. Subtree
+    # installs copy the supplied subdomain schema, so its partitioning declaration is authoritative.
+    namespace_source = ((psch.get("partitioning") or {}).get("namespaces") or {}) \
+        if subtree else owned_namespaces
+    if isinstance(namespace_source, dict):
+        namespace_source = namespace_source.keys()
+    elif not isinstance(namespace_source, list):
+        namespace_source = []
+    pns = {str(namespace).strip() for namespace in namespace_source if str(namespace).strip()}
     lvl = "WARN" if subtree else "FAIL"      # subtree keeps contracts separate (walk-up) -> awareness
     for t in sorted(ptypes & set(ext_types)):
         add(lvl, "types", f"type '{t}' collides with an EXTENSION-owned type ({ext_types[t]}) enabled "
@@ -338,7 +370,7 @@ def main(argv) -> int:
     check_trust(host, pack)
     check_types(host, pack, additions, subtree=a.subtree)
     check_namespaces(host, pack, subtree=a.subtree)
-    check_extension_collisions(host, pack, subtree=a.subtree)
+    check_extension_collisions(host, pack, additions, subtree=a.subtree)
     check_crons(host, pack)
     check_configs(host, pack)
     check_feeds(host, pack)

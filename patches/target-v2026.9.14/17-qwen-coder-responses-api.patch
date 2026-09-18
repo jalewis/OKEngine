@@ -1,0 +1,337 @@
+diff --git a/run_agent.py b/run_agent.py
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -639,9 +639,14 @@
+         """Return True when this provider/model pair should use Responses API."""
+         from hermes_cli.providers import is_actual_route
+         normalized_provider = (provider or "").strip().lower()
+-        # Nous serves GPT-5.x via chat completions (its /v1/responses returns 404); generic custom endpoints
+-        # may relay GPT-5 without full Responses semantics — only direct OpenAI/xAI URLs auto-upgrade.
+-        if normalized_provider in ("nous", "custom") or is_actual_route(provider):
++        # OKEngine's custom Qwen Coder gateways retain their Responses wire contract
++        # until canary evidence supports a transport change. Other custom models
++        # remain conservative, since a generic endpoint may not implement Responses.
++        if normalized_provider == "custom":
++            normalized_model = model.lower().rsplit("/", 1)[-1]
++            return normalized_model.startswith(("qwen3-coder", "qwen-coder"))
++        # Nous serves GPT-5.x via chat completions (its /v1/responses returns 404).
++        if normalized_provider == "nous" or is_actual_route(provider):
+             return False
+         if normalized_provider == "copilot":
+             try:
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -374,7 +374,12 @@
+     """Set ``agent.api_mode`` (and provider rewrites) — ordered ladder, first match wins."""
+     from hermes_cli.providers import is_actual_route
+     host, url = agent._base_url_hostname, agent._base_url_lower
+-    if is_actual_route(agent.provider, base_url):
++    # OKEngine keeps custom Qwen Coder on Responses even when an endpoint profile
++    # explicitly asks for Chat Completions; do not migrate its live wire route here.
++    if (agent.provider == "custom"
++            and agent._provider_model_requires_responses_api(agent.model, provider=agent.provider)):
++        agent.api_mode = "codex_responses"
++    elif is_actual_route(agent.provider, base_url):
+         agent.api_mode = "chat_completions"
+     elif api_mode in _EXPLICIT_API_MODES:
+         agent.api_mode = api_mode
+diff --git a/agent/codex_responses_adapter.py b/agent/codex_responses_adapter.py
+--- a/agent/codex_responses_adapter.py
++++ b/agent/codex_responses_adapter.py
+@@ -662,36 +662,54 @@
+ 
+ 
+ def _preflight_message(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) -> Dict[str, Any]:
+-    if item.get("role") != "assistant":
+-        raise ValueError(f"Codex Responses input[{idx}] message items must have role='assistant'.")
+-    content = item.get("content")
++    role = item.get("role")
++    if role not in {"user", "assistant", "system", "developer"}:
++        raise ValueError(f"Codex Responses input[{idx}] message item has unsupported role {role!r}.")
++    content = item.get("content", "")
++    text_type = _text_type_for(role)
++    if isinstance(content, str):
++        content = [{"type": text_type, "text": content}]
+     if not isinstance(content, list):
+-        raise ValueError(f"Codex Responses input[{idx}] message item must have content list.")
++        raise ValueError(f"Codex Responses input[{idx}] message item content must be a string or list.")
+     normalized_content = []
+     for part_idx, part in enumerate(content):
++        if isinstance(part, str):
++            normalized_content.append({"type": text_type, "text": ctx.sanitize_text(part)})
++            continue
+         if not isinstance(part, dict):
+-            raise ValueError(f"Codex Responses input[{idx}] message content[{part_idx}] must be an object.")
++            raise ValueError(f"Codex Responses input[{idx}] message content[{part_idx}] must be an object or string.")
+         part_type = part.get("type")
+-        if part_type not in _OUTPUT_TEXT_TYPES:
++        if part_type in _TEXT_PART_TYPES:
++            normalized_content.append({"type": text_type, "text": ctx.sanitize_text(_str_or_empty(part.get("text", "")))})
++        elif role != "assistant" and part_type in _IMAGE_PART_TYPES:
++            normalized_content.append(_input_image_part(part, role, keep_empty_url=True))
++        else:
+             raise ValueError(
+                 f"Codex Responses input[{idx}] message content[{part_idx}] has unsupported type {part_type!r}."
+             )
+-        normalized_content.append({"type": "output_text", "text": ctx.sanitize_text(_str_or_empty(part.get("text", "")))})
+     if not normalized_content:
+-        raise ValueError(f"Codex Responses input[{idx}] message item must contain at least one text part.")
+-    return _assistant_message_item(item, normalized_content, is_github_responses=ctx.is_github_responses)
++        raise ValueError(f"Codex Responses input[{idx}] message item must contain at least one part.")
++    if role == "assistant":
++        return _assistant_message_item(item, normalized_content, is_github_responses=ctx.is_github_responses)
++    normalized_item = {"type": "message", "role": role, "content": normalized_content}
++    if _nonblank(item.get("id")):
++        normalized_item["id"] = item["id"].strip()
++    return normalized_item
+ 
+ 
+ def _preflight_role_message(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) -> Dict[str, Any]:
+-    """Untyped ``user``/``assistant`` role message — the only legal shape besides typed items."""
++    """Turn legacy role-bearing input into typed Responses message items."""
+     role = item.get("role")
+-    if role not in {"user", "assistant"}:
++    if role not in {"user", "assistant", "system", "developer"}:
+         raise ValueError(
+             f"Codex Responses input[{idx}] has unsupported item shape (type={item.get('type')!r}, role={role!r})."
+         )
+     content = item.get("content", "")
+     if not isinstance(content, list):
+-        return {"role": role, "content": ctx.sanitize_text(_str_or_empty(content))}
++        text = ctx.sanitize_text(_str_or_empty(content))
++        parts = [{"type": _text_type_for(role), "text": text}]
++        return (_assistant_message_item(item, parts, is_github_responses=ctx.is_github_responses)
++                if role == "assistant" else {"type": "message", "role": role, "content": parts})
+     # Parts are already Responses-shaped; validate and re-type text for the role.
+     # Unlike history conversion, empty text / empty image urls are kept, not dropped.
+     text_type = _text_type_for(role)
+@@ -712,7 +730,8 @@
+             raise ValueError(
+                 f"Codex Responses input[{idx}].content[{part_idx}] has unsupported type {part.get('type')!r}."
+             )
+-    return {"role": role, "content": validated}
++    return (_assistant_message_item(item, validated, is_github_responses=ctx.is_github_responses)
++            if role == "assistant" else {"type": "message", "role": role, "content": validated})
+ 
+ 
+ _PREFLIGHT_ITEM_HANDLERS: Dict[str, Callable[..., Optional[Dict[str, Any]]]] = {
+diff --git a/agent/codex_runtime.py b/agent/codex_runtime.py
+--- a/agent/codex_runtime.py
++++ b/agent/codex_runtime.py
+@@ -966,4 +966,7 @@
+ 
++    last_wire_input: dict[str, Any] = {"items": []}
++
+     def _open_codex_stream(next_api_kwargs: dict[str, Any]):
+         from hermes_cli.providers import is_actual_route
++        from agent.codex_responses_adapter import classify_responses_route, _preflight_codex_api_kwargs
+ 
+@@ -976,2 +979,22 @@
+             )
++        # Re-check at the final wire boundary: direct summary/retry callers and
++        # Relay middleware can otherwise leak untyped role items to strict Qwen
++        # Responses gateways after the main-loop preflight already ran.
++        route = classify_responses_route(agent)
++        requires_responses = getattr(agent, "_provider_model_requires_responses_api", None)
++        if not callable(requires_responses):
++            from run_agent import AIAgent
++            requires_responses = AIAgent._provider_model_requires_responses_api
++        strict_qwen = (
++            getattr(agent, "provider", None) == "custom"
++            and requires_responses(model, provider="custom")
++        )
++        if strict_qwen:
++            next_api_kwargs = _preflight_codex_api_kwargs(
++                next_api_kwargs, allow_stream=True,
++                is_github_responses=route.is_github_responses,
++                sanitize_harmony_tokens=route.is_codex_backend,
++            )
++        wire_items = next_api_kwargs.get("input", [])
++        last_wire_input["items"] = wire_items if isinstance(wire_items, list) else []
+         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
+@@ -1078,2 +1101,17 @@
+                 raise
++            except Exception as exc:
++                if getattr(exc, "status_code", None) == 400:
++                    # Shape-only diagnostics; never log prompt text or tool arguments.
++                    items = last_wire_input["items"]
++                    logger.error(
++                        "Codex Responses HTTP 400: input_items=%d item_types=%s roles=%s "
++                        "missing_type_indexes=%s model=%s provider=%s",
++                        len(items),
++                        [item.get("type") for item in items if isinstance(item, dict)],
++                        [item.get("role") for item in items if isinstance(item, dict)],
++                        [idx for idx, item in enumerate(items)
++                         if isinstance(item, dict) and item.get("role") and not item.get("type")],
++                        model, getattr(agent, "provider", None),
++                    )
++                raise
+             if not agent._interrupt_requested:
+diff --git a/tests/agent/test_codex_responses_adapter.py b/tests/agent/test_codex_responses_adapter.py
+--- a/tests/agent/test_codex_responses_adapter.py
++++ b/tests/agent/test_codex_responses_adapter.py
+@@ -66,9 +66,10 @@
+             "image_url": "https://example.invalid/p.png",
+         }],
+     }]
+-
+     assert _preflight_codex_input_items(raw) == [{
++        "type": "message",
+         "role": "assistant",
++        "status": "completed",
+         "content": [{
+             "type": "output_text",
+             "text": "[Assistant image omitted during replay]",
+@@ -76,6 +77,41 @@
+     }]
+ 
+ 
++@pytest.mark.parametrize("role,text_type", [
++    ("user", "input_text"),
++    ("system", "input_text"),
++    ("developer", "input_text"),
++    ("assistant", "output_text"),
++])
++def test_preflight_types_legacy_role_messages_for_strict_responses(role, text_type):
++    item = {"role": role, "content": "hello"}
++    actual = _preflight_codex_input_items([item])
++    expected = {"type": "message", "role": role,
++                "content": [{"type": text_type, "text": "hello"}]}
++    if role == "assistant":
++        expected["status"] = "completed"
++    assert actual == [expected], "strict Responses gateways need typed role-bearing items"
++
++
++@pytest.mark.parametrize("role", ["user", "system", "developer"])
++def test_preflight_types_non_assistant_message_items_with_images(role):
++    item = {"type": "message", "role": role, "content": [
++        {"type": "text", "text": "see"},
++        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA", "detail": "high"}},
++    ]}
++    assert _preflight_codex_input_items([item]) == [{
++        "type": "message", "role": role, "content": [
++            {"type": "input_text", "text": "see"},
++            {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "high"},
++        ],
++    }]
++
++
++def test_preflight_rejects_unknown_typed_message_role():
++    with pytest.raises(ValueError, match="unsupported role"):
++        _preflight_codex_input_items([{"type": "message", "role": "tool", "content": "bad"}])
++
++
+ def _harmony_token(name: str) -> str:
+     """Build a literal Harmony token without spelling it contiguously here."""
+     return f"<\x7c{name}\x7c>"
+@@ -634,4 +670,4 @@
+                 summary=[SimpleNamespace(text=reasoning_text)],
+             )
+         ],
+-    )
+\ No newline at end of file
++    )
+diff --git a/tests/agent/test_okengine_qwen_responses_transport.py b/tests/agent/test_okengine_qwen_responses_transport.py
+new file mode 100644
+--- /dev/null
++++ b/tests/agent/test_okengine_qwen_responses_transport.py
+@@ -0,0 +1,57 @@
++"""OKEngine's custom Qwen Coder wire route remains Responses until canary."""
++
++import sys
++import types
++from types import SimpleNamespace
++
++import pytest
++
++sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
++sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
++sys.modules.setdefault("fal_client", types.SimpleNamespace())
++
++import run_agent
++from agent.agent_init import _resolve_api_mode
++from agent.codex_responses_adapter import _preflight_codex_input_items
++
++
++def _routing_probe(model, provider, requested_mode):
++    """Exercise the real model rule and ordered resolver without network bootstrap."""
++    base_url = "http://127.0.0.1:18080/v1"
++    agent = SimpleNamespace(
++        model=model,
++        provider=provider,
++        _base_url_hostname="127.0.0.1",
++        _base_url_lower=base_url,
++        _provider_model_requires_responses_api=run_agent.AIAgent._provider_model_requires_responses_api,
++    )
++    _resolve_api_mode(agent, requested_mode, provider, base_url)
++    return agent
++
++
++@pytest.mark.parametrize("model", ["qwen3-coder", "qwen-coder-32b", "vendor/qwen3-coder-next"])
++def test_custom_qwen_coder_forces_responses_despite_explicit_chat(model):
++    agent = _routing_probe(model, "custom", "chat_completions")
++    assert agent.api_mode == "codex_responses", (
++        "custom Qwen Coder must preserve /v1/responses until canary, even with explicit Chat"
++    )
++
++
++@pytest.mark.parametrize("model,provider", [
++    ("qwen3-coder", "nous"),
++    ("other-custom-model", "custom"),
++    ("gpt-5.4", "custom"),
++])
++def test_non_custom_qwen_routes_respect_explicit_chat(model, provider):
++    agent = _routing_probe(model, provider, "chat_completions")
++    assert agent.api_mode == "chat_completions", (
++        "Qwen override must not change non-custom or non-Qwen endpoint profiles"
++    )
++
++
++def test_custom_qwen_user_history_preflights_to_typed_message():
++    actual = _preflight_codex_input_items([{"role": "user", "content": "question"}])
++    assert actual == [{
++        "type": "message", "role": "user",
++        "content": [{"type": "input_text", "text": "question"}],
++    }], "strict /v1/responses gateways reject untyped role-bearing history"
+diff --git a/tests/agent/test_okengine_codex_ttfb_watchdog.py b/tests/agent/test_okengine_codex_ttfb_watchdog.py
+new file mode 100644
+index 0000000000..450735c662
+--- /dev/null
++++ b/tests/agent/test_okengine_codex_ttfb_watchdog.py
+@@ -0,0 +1,35 @@
++"""Run the native TTFB contracts under OKEngine's strict Responses preflight."""
++from __future__ import annotations
++
++import runpy
++from pathlib import Path
++
++import pytest
++
++
++_NATIVE = runpy.run_path(Path(__file__).with_name("test_codex_ttfb_watchdog.py"))
++_ADAPTED = "test_event_stale_phase_is_scoped_to_physical_stream_attempt"
++
++# Preserve the complete native contract file. Only the one lower-level test
++# that deliberately builds a partial wire request needs an OKEngine adapter;
++# production requests already carry instructions before this boundary.
++for _name, _value in _NATIVE.items():
++    if _name.startswith("test_") and _name != _ADAPTED:
++        globals()[_name] = _value
++
++
++@pytest.mark.parametrize("mode", ["initial_gap", "stall", "retry_gap", "retry_no_event"])
++def test_event_stale_phase_is_scoped_to_physical_stream_attempt(
++    tmp_path, monkeypatch, mode,
++):
++    from agent import chat_completion_helpers as helpers
++
++    native_call = helpers.interruptible_api_call
++
++    def strict_call(agent, api_kwargs):
++        request = dict(api_kwargs)
++        request.setdefault("instructions", "Exercise the stream watchdog contract.")
++        return native_call(agent, request)
++
++    monkeypatch.setattr(helpers, "interruptible_api_call", strict_call)
++    return _NATIVE[_ADAPTED](tmp_path, monkeypatch, mode)

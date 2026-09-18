@@ -53,7 +53,7 @@ _ACQUIRED_BY = re.compile(
 _GA = re.compile(r"\b(general availability|going ga|ga (?:today|now)|now available)\b", re.I)
 _BETA = re.compile(r"\b(beta|preview|early access|limited release)\b", re.I)
 _SURVEY_N = re.compile(
-    r"\b(?:surveyed|polled|n\s*=\s*|of\s+|across\s+)(\d{2,6})\s+"
+    r"\b(?:(?:surveyed|polled)\s+|n\s*=\s*|of\s+|across\s+)(\d{2,6})\s+"
     r"(?:respondents|leaders|professionals|practitioners|enterprises|buyers)", re.I)
 _PERCENT = re.compile(r"\b(\d+(?:\.\d+)?)\s*%")
 _ISO_DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")

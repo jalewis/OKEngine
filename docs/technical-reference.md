@@ -377,15 +377,35 @@ config/engine-crons.json         (engine half — source of truth)
 ```
 
 Deploy-time transforms (applied to a temp copy by `deploy-cron-plus-jobs.sh`,
-never to the generated source): `@jitter:*` sentinels expand to concrete
-schedules for per-install jitter; `@<profile>` model references resolve against
-the pack's `model-profiles.yaml` (§11.1); per-lane model overrides from
-`.okengine/cron-models.json` apply; `after:` ordering is validated (fail-loud on
-cycles). The result lands in the container at `/opt/data/cron-plus/jobs.json`.
+never to the generated source): per-lane **schedule** overrides from
+`.okengine/cron-schedules.json` apply FIRST; `@jitter:*` sentinels expand to
+concrete schedules for per-install jitter; `@<profile>` model references resolve
+against the pack's `model-profiles.yaml` (§11.1); per-lane **model** overrides
+from `.okengine/cron-models.json` apply; `after:` ordering is validated
+(fail-loud on cycles). The result lands in the container at
+`/opt/data/cron-plus/jobs.json`.
+
+`cron-schedules.json` is a `{job_name: cron_expr}` map covering any
+non-extension lane (engine / engine-template / domain) — the counterpart to
+`cron-models.json`, and to `extension-schedules.json` on the extension side. It
+runs before the expanders, so an override may itself be a `@jitter:*`/`@morning`
+sentinel; a concrete expression passes through untouched. A key naming no lane,
+or an expression that is neither 5 fields nor a supported sentinel, FAILS the
+deploy rather than leaving the lane silently where it was.
+
+It exists because schedule and cost are not independent. Cron expressions are
+read in the deployment's `TZ` while a provider's peak-price window is fixed in
+UTC, so whether a lane is expensive depends on a mapping only the deployment
+knows — and the engine's own defaults are right for what they are (the overnight
+maintenance band exists so heavy lanes run while nobody is reading) without
+being right for every timezone's billing.
 
 Scheduling is timezone-aware (`CRON_TZ`/`TZ`, DST-safe; engine default UTC), and
-lanes can defer into cheap model hours (`CRON_DEFER_UTC_HOURS`) for providers
-with peak pricing.
+high-frequency drains can additionally defer into cheap model hours
+(`CRON_DEFER_UTC_HOURS`) for providers with peak pricing. Note the two solve
+different shapes: deferral suits a lane that fires many times a day and can skip
+some runs; a once-daily or weekly lane should be **moved** with
+`cron-schedules.json` instead, since deferring it just means it does not run.
 
 ---
 

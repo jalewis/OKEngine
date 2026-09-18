@@ -106,7 +106,9 @@ def _schema_declares_source_rating() -> bool:
 
 _FM_RE = re.compile(r"\A---\s*\n(.*?\n)---\s*(?:\n|\Z)", re.S)
 _DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
-CONF_ORDER = {"low": 0, "medium": 1, "medium-high": 2, "high": 3}
+CONF_ORDER = {"very-low": 0, "low": 1, "medium-low": 2, "medium": 3,
+              "medium-high": 4, "high": 5, "very-high": 6}
+REVIEW_CONFIDENCE = {"very-low", "low", "medium-low", "medium"}
 
 
 def _parse_date(s) -> "date | None":
@@ -222,9 +224,9 @@ def dash_pages_by_confidence(pages, ts) -> Path:
     L.append(_table(["Type", "Count"],
                     [[t, n] for t, n in sorted(by_type.items(), key=lambda x: -x[1])]))
     review = sorted(
-        [e for e in pages if str(e.get("confidence") or "").lower() in ("low", "medium")
+        [e for e in pages if str(e.get("confidence") or "").lower() in REVIEW_CONFIDENCE
          or _n_sources(e) <= 1],
-        key=lambda e: (CONF_ORDER.get(str(e.get("confidence") or "").lower(), 4), _n_sources(e)))
+        key=lambda e: (CONF_ORDER.get(str(e.get("confidence") or "").lower(), -1), _n_sources(e)))
     L.append(f"## Low-confidence / single-source review ({len(review)})\n")
     L.append(_table(["Page", "Type", "Conf", "Sources", "Updated"],
                     [[_wl(e), _esc(e.get("type")), _esc(e.get("confidence")),

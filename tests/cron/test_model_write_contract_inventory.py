@@ -26,5 +26,5 @@ def test_deterministic_core_jobs_never_wake_an_agent():
     jobs = {job["name"]: job for job in json.loads(
         (ROOT / "config/engine-crons.json").read_text(encoding="utf-8"))}
     for name in {"corpus-indexer", "index-rebuild-daily", "lint-watcher",
-                 "source-portfolio-refresh"}:
+                 "source-portfolio-refresh", "wiki-health-audit"}:
         assert jobs[name].get("no_agent") is True

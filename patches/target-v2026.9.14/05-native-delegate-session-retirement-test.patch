@@ -1,0 +1,90 @@
+diff --git a/tests/tools/test_okengine_delegate_native_retirement.py b/tests/tools/test_okengine_delegate_native_retirement.py
+new file mode 100644
+index 000000000..946ca4e83
+--- /dev/null
++++ b/tests/tools/test_okengine_delegate_native_retirement.py
+@@ -0,0 +1,84 @@
++"""The native delegate close path must durably end child sessions."""
++
++from concurrent.futures import Future
++
++from hermes_state import SessionDB
++from run_agent import AIAgent
++from tools import delegate_tool as delegate
++from tools.delegate_tool_child_run import _close_child, _defer_close_after_timeout
++
++
++def _spawn(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(delegate, "_load_config", lambda: {})
++    db_path = tmp_path / "state.db"
++    parent_db = SessionDB(db_path=db_path)
++    parent = AIAgent(
++        session_id="parent-native-retirement",
++        session_db=parent_db,
++        api_key="fixture-key",
++        base_url="https://openrouter.ai/api/v1",
++        provider="openrouter",
++        api_mode="chat_completions",
++        model="anthropic/claude-sonnet-4.6",
++        platform="cli",
++        quiet_mode=True,
++        skip_context_files=True,
++        skip_memory=True,
++        save_trajectories=False,
++        enabled_toolsets=["file"],
++    )
++    child = delegate._build_child_agent(
++        task_index=0,
++        goal="fixture goal",
++        context=None,
++        toolsets=["file"],
++        model=None,
++        max_iterations=1,
++        task_count=1,
++        parent_agent=parent,
++    )
++    child._session_db.create_session(child.session_id, "subagent", model=child.model)
++    return db_path, parent_db, parent, child
++
++
++def _row(db_path, sid):
++    reader = SessionDB(db_path=db_path)
++    try:
++        return reader.get_session(sid)
++    finally:
++        reader.close()
++
++
++def test_normal_delegate_close_ends_owned_child_row(tmp_path, monkeypatch):
++    db_path, parent_db, parent, child = _spawn(tmp_path, monkeypatch)
++    sid = child.session_id
++    try:
++        assert child._session_db is not parent_db
++        assert child._owns_session_db is True
++        assert _row(db_path, sid)["ended_at"] is None
++        _close_child(child, "fixture normal child close")
++        row = _row(db_path, sid)
++        assert row["ended_at"] is not None, "normal delegate close left the child session open"
++        assert row["end_reason"] == "agent_close"
++    finally:
++        child.close()
++        parent.close()
++        parent_db.close()
++
++
++def test_deferred_delegate_close_waits_for_worker_then_ends_row(tmp_path, monkeypatch):
++    db_path, parent_db, parent, child = _spawn(tmp_path, monkeypatch)
++    sid = child.session_id
++    try:
++        future = Future()
++        _defer_close_after_timeout(child, future)
++        assert _row(db_path, sid)["ended_at"] is None, "timeout closed a live worker's row too early"
++        future.set_result(None)
++        row = _row(db_path, sid)
++        assert row["ended_at"] is not None, "completed timeout worker left its child session open"
++        assert row["end_reason"] == "agent_close"
++    finally:
++        child.close()
++        parent.close()
++        parent_db.close()

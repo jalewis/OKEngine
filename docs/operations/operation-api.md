@@ -44,6 +44,49 @@ The service invokes the same command builder used by `framework operations run`,
 `OKENGINE_OPERATION_SOURCE=cockpit`. Domain receipts and locks remain authoritative. Scheduler jobs
 continue to call the same pack entrypoint and create the same receipt type.
 
+## Operation manifest
+
+A pack/extension contributes an operation as `operations/<dir>/operation.yaml`. The engine validates
+the manifest **fail-closed** at discovery (`scripts/framework_operations.py`); an invalid manifest
+removes the operation from the registry rather than running with an unenforced contract.
+
+| field | required | validation |
+|---|---|---|
+| `operation_api` | yes | must be `1` |
+| `name` | yes | `^[a-z][a-z0-9-]{1,79}$` |
+| `owner` | yes | non-empty (contributing pack/extension) |
+| `entrypoint` | yes | safe deployment-relative path to an existing file (no `..`, not absolute) |
+| `execution` | no | one of `deterministic`, `model`, `mixed` |
+| `mutates` | no | boolean |
+| `supports` | no | mapping; `plan`/`resume`/`cancel` are booleans |
+| `arguments` | no | mapping `{name: {type, repeatable, …}}`; `type` ∈ `boolean,string,int,float,page-ref,enum`; `repeatable` boolean |
+| `locks` | no | list of resource ids `^[a-z0-9][a-z0-9/_.-]{0,120}$` — acquired before mutation (okengine#402) |
+| `inputs` | no | list of safe deployment-relative globs — feed the engine snapshot digest (okengine#402) |
+| `outputs` | no | list of safe deployment-relative globs — validated to exist before a run may report `succeeded` |
+| `permissions.capability` | no | non-empty string — the authorization the runner checks before starting |
+| `receipt_schema` | no | safe deployment-relative path |
+| `timeout` | no | positive number of seconds |
+
+Unknown top-level keys are preserved (forward compatibility); known fields are enforced strictly.
+
+## Run lifecycle (engine-owned)
+
+The **engine** owns the run — the entrypoint is a worker (`scripts/operation_run.py`, okengine#402):
+
+- The engine allocates the run id (`<name>-<utcstamp>-<rand>`) and passes it as
+  `OKENGINE_OPERATION_RUN_ID`. The entrypoint must NOT choose its own id or write the receipt.
+- Before a mutating run, the engine acquires the declared `locks:` (flock under
+  `.okengine/operations/locks/`); a conflicting run whose holder is alive is refused, a stale lock
+  (dead holder) is recovered.
+- The engine computes the input snapshot digest from the declared `inputs:` — a run cannot claim a
+  plan digest it did not derive.
+- The engine writes the authoritative receipt (`running` → `succeeded`|`degraded`|`failed`) under
+  `.okengine/operations/runs/<op>/<run_id>.json`. A worker's own status can only DOWNGRADE the
+  result, never upgrade it, and a `succeeded` claim with an absent declared `outputs:` is recorded as
+  `degraded` — a partial result can never be reported as complete.
+
+`plan` runs the entrypoint with `--dry-run`, writes no receipt, and mutates nothing.
+
 ## Enabling a pack operation
 
 The pack installer adds its operation name to `OKENGINE_OPERATION_ALLOW` without modifying tokens.

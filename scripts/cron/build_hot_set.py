@@ -34,6 +34,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # scripts/cron, for sibling libs
 import tz_lib  # noqa: E402
+import schema_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
@@ -56,14 +57,9 @@ _DEFAULT_HOT_SET = {
 
 
 def _hot_set_cfg() -> dict:
-    sp = VAULT / "schema.yaml"
-    if sp.is_file():
-        try:
-            sch = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}
-            if isinstance(sch.get("hot_set"), dict):
-                return sch["hot_set"]
-        except Exception:
-            pass
+    sch = schema_lib.merged_schema(VAULT)
+    if isinstance(sch.get("hot_set"), dict):
+        return sch["hot_set"]
     return _DEFAULT_HOT_SET
 
 

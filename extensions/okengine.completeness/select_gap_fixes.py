@@ -61,9 +61,12 @@ def main() -> int:
         print(json.dumps({"wakeAgent": False}))
         return 0
     try:
-        rules = {r["id"]: r for r in (yaml.safe_load(f.read_text()) or {}).get("rules", [])
+        document = yaml.safe_load(f.read_text()) or {}
+        if not isinstance(document, dict) or not isinstance(document.get("rules", []), list):
+            raise ValueError("rules document must be a mapping with a rules list")
+        rules = {r["id"]: r for r in document.get("rules", [])
                  if isinstance(r, dict) and r.get("id")}
-    except yaml.YAMLError:
+    except (yaml.YAMLError, ValueError):
         print("# rules file unparseable — refusing to drain")
         print(json.dumps({"wakeAgent": False}))
         return 0

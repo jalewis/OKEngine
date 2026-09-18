@@ -231,12 +231,11 @@ def main() -> int:
     print()
 
     batch = high_impact[:BATCH_SIZE]
-    manifest = None
-    if batch:
-        manifest = write_selection_manifest(
-            [target for target, _ in batch],
-            Path(os.environ.get("HERMES_HOME", "/opt/data")) / "cron-plus" / "selections" / "broken-wikilinks-drain.json",
-        )
+    manifest = write_selection_manifest(
+        [target for target, _ in batch],
+        Path(os.environ.get("HERMES_HOME", "/opt/data"))
+        / "cron-plus" / "selections" / "broken-wikilinks-drain.json",
+    )
     print(f"=== batch ({len(batch)} of {total_high_impact}, max {BATCH_SIZE} per run) ===")
     print("Process IN ORDER. For each target: inspect 2-3 inbound source pages")
     print("to understand context, then classify (create-stub / rewrite-link / defer).")
@@ -265,7 +264,7 @@ def main() -> int:
         print("(deferred for future passes once high-impact queue drains)")
         print()
 
-    if manifest:
+    if batch:
         print(f"selection input_digest: {manifest['input_digest']}")
 
     wake = bool(batch)

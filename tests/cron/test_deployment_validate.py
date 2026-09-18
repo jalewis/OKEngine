@@ -7,6 +7,7 @@ contract from BOTH sides: the parser against a stamp in ensure-runtime's exact f
 and drift in either direction FAILing.
 """
 import importlib.util
+import os
 import re
 import sys
 from pathlib import Path
@@ -17,7 +18,11 @@ import yaml
 pytest.importorskip("yaml")
 
 REPO = Path(__file__).resolve().parent.parent.parent
-MOD = REPO / "scripts" / "cron" / "deployment_validate.py"
+# okengine#405: the 13 check_* functions were extracted into the shared checks library; these tests
+# drive them there. deployment_validate.py is now a thin wrapper (its main() writes the dashboard),
+# exercised via VALIDATE_MOD in the one report-write test below.
+MOD = REPO / "scripts" / "cron" / "deployment_checks.py"
+VALIDATE_MOD = REPO / "scripts" / "cron" / "deployment_validate.py"
 
 
 def _run_check(tmp_path, monkeypatch, pin: dict, stamp: str | None):
@@ -30,9 +35,9 @@ def _run_check(tmp_path, monkeypatch, pin: dict, stamp: str | None):
         (data / "engine-runtime.yaml").write_text(stamp)
     monkeypatch.setenv("WIKI_PATH", str(vault))
     monkeypatch.setenv("OKENGINE_DATA_DIR", str(data))
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["deployment_validate"] = m
+    sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear()
     m.VAULT, m.DATA = vault, data
@@ -51,6 +56,51 @@ def test_matching_pins_pass(tmp_path, monkeypatch):
                    {"engine": "okengine", "version": "v0.9.0", "hermes_pin": "v2026.7.1"},
                    _stamp())
     assert f == [], f
+
+
+def test_cron_plus_installed_revision_must_match_staged_manifest_pin(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    data = tmp_path / "data"
+    hermes = tmp_path / "hermes"
+    vault.mkdir(); hermes.mkdir()
+    (data / "config").mkdir(parents=True)
+    (data / "plugins" / "cron-plus" / ".git").mkdir(parents=True)
+    (vault / "engine.version").write_text("version: v0.9.0\nhermes_pin: v2026.7.1\n")
+    (data / "engine-runtime.yaml").write_text(_stamp())
+    expected = "a" * 40
+    (data / "config" / "cron-plus.pin").write_text(expected + "\n")
+    (data / "plugins" / "cron-plus" / ".git" / "HEAD").write_text("b" * 40 + "\n")
+
+    spec = importlib.util.spec_from_file_location("deployment_checks_cron_pin", MOD)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    m.F.clear(); m.VAULT, m.DATA, m.HERMES = vault, data, hermes
+    m.check_pins()
+
+    assert any(level == "FAIL" and "cron-plus installed HEAD" in msg
+               for level, _, msg in m.F), m.F
+
+
+def test_cron_plus_installed_revision_matching_staged_pin_is_clean(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    data = tmp_path / "data"
+    hermes = tmp_path / "hermes"
+    vault.mkdir(); hermes.mkdir()
+    (data / "config").mkdir(parents=True)
+    (data / "plugins" / "cron-plus" / ".git").mkdir(parents=True)
+    (vault / "engine.version").write_text("version: v0.9.0\nhermes_pin: v2026.7.1\n")
+    (data / "engine-runtime.yaml").write_text(_stamp())
+    expected = "a" * 40
+    (data / "config" / "cron-plus.pin").write_text(expected + "\n")
+    (data / "plugins" / "cron-plus" / ".git" / "HEAD").write_text(expected + "\n")
+
+    spec = importlib.util.spec_from_file_location("deployment_checks_cron_pin_ok", MOD)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    m.F.clear(); m.VAULT, m.DATA, m.HERMES = vault, data, hermes
+    m.check_pins()
+
+    assert not any(level == "FAIL" for level, _, _ in m.F), m.F
 
 
 def test_engine_series_drift_fails(tmp_path, monkeypatch):
@@ -108,9 +158,9 @@ def _run_crons_check(tmp_path, monkeypatch, jobs):
         if s and not s.startswith("/"):
             (data / "scripts" / s).write_text("# stub\n")
     (data / "cron-plus" / "jobs.json").write_text(_json.dumps({"jobs": jobs}))
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["deployment_validate"] = m
+    sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear()
     m.VAULT, m.DATA = vault, data
@@ -148,9 +198,9 @@ def _run_tz_check(tmp_path, monkeypatch, jobs, tz, plugin_tz_aware=None):
     monkeypatch.delenv("TZ", raising=False)
     if tz is not None:
         monkeypatch.setenv("TZ", tz)
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["deployment_validate"] = m
+    sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear()
     m.VAULT, m.DATA = vault, data
@@ -174,6 +224,12 @@ def test_tz_unset_with_daily_brief_warns(tmp_path, monkeypatch):
 def test_tz_utc_literal_with_daily_brief_warns(tmp_path, monkeypatch):
     f = _run_tz_check(tmp_path, monkeypatch, [_daily("daily-brief")], tz="UTC")
     assert any(lvl == "WARN" for lvl, _, msg in f), f
+
+
+def test_tz_unset_with_weekly_fixed_hour_lane_warns(tmp_path, monkeypatch):
+    """Weekly and @jitter:weekly schedules carry the same local-hour intent as daily lanes."""
+    f = _run_tz_check(tmp_path, monkeypatch, [_daily("weekly-audit", "0 20 * * 0")], tz=None)
+    assert any(lvl == "WARN" and "weekly-audit" in msg for lvl, _, msg in f), f
 
 
 def test_real_tz_with_daily_brief_is_clean(tmp_path, monkeypatch):
@@ -247,9 +303,9 @@ def _run_runtime_ownership(tmp_path, monkeypatch, dirs, euid, plant_jobs_json=Fa
         (data / "cron-plus").mkdir(parents=True, exist_ok=True)
         (data / "cron-plus" / "jobs.json").write_text('{"jobs": []}')
     monkeypatch.setattr("os.geteuid", lambda: euid)
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["deployment_validate"] = m
+    sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear()
     m.VAULT, m.DATA = tmp_path / "vault", data
@@ -307,9 +363,9 @@ def _run_schema_check(tmp_path, vault_schema, artifact):
     (data / "scripts").mkdir(parents=True)
     (vault / "schema.yaml").write_text(vault_schema, encoding="utf-8")
     (vault / ".okengine" / "composed-schema.yaml").write_text(artifact, encoding="utf-8")
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["deployment_validate"] = m
+    sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear()
     m.VAULT, m.DATA = vault, data
@@ -327,9 +383,9 @@ def test_stale_composed_schema_artifact_fails(tmp_path):  # invariant-audit #12
 
 
 def test_schema_document_comparison_is_exact_and_ignores_generated_metadata(tmp_path, monkeypatch):
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["deployment_validate"] = m
+    sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     fresh = {"types": {"source": {}}, "field_enums": {"status": {"enum": "status"}}}
     same = {**fresh, "_generated": "test", "_fragments": [["ext:x", {}]]}
@@ -357,9 +413,9 @@ def test_in_sync_composed_schema_artifact_is_clean(tmp_path):
     live = sl.compose_schema(vault)[0]
     (vault / ".okengine" / "composed-schema.yaml").write_text(yaml.safe_dump(live), encoding="utf-8")
     (tmp_path / "data" / "scripts").mkdir(parents=True)
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["deployment_validate"] = m
+    sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear()
     m.VAULT, m.DATA = vault, tmp_path / "data"
@@ -378,9 +434,9 @@ def _run_partition_check(tmp_path, monkeypatch, schema: str, pages: dict):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(f"---\ntype: {typ}\n---\n")
     monkeypatch.setenv("WIKI_PATH", str(vault))
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["deployment_validate"] = m
+    sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear()
     m.VAULT = vault
@@ -430,9 +486,9 @@ def test_partition_tombstoned_copy_not_a_dup(tmp_path, monkeypatch):
     (vault / "wiki" / "cves" / "2026" / "CVE-2026-45659.md").write_text(
         "---\ntype: cve\nstatus: tombstoned\nsuperseded_by: cves/2026/07/CVE-2026-45659\n---\n# dead\n")
     monkeypatch.setenv("WIKI_PATH", str(vault))
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["deployment_validate"] = m
+    sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear()
     m.VAULT = vault
@@ -457,8 +513,8 @@ def test_stale_stamp_selfheals_against_running_engine(tmp_path, monkeypatch):
         "engine_release: v0.9.1\nhermes_pin: v2026.7.1\nhermes_sha: abc\nengine_sha: def\n")
     (hermes / ".okengine_release").write_text("v0.10.3\n")  # the RUNNING engine, baked in the image
 
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
-    m = importlib.util.module_from_spec(spec); sys.modules["deployment_validate"] = m
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
+    m = importlib.util.module_from_spec(spec); sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear(); m.VAULT, m.DATA, m.HERMES = vault, data, hermes
     m.check_pins()
@@ -485,8 +541,8 @@ def test_stale_hermes_pin_selfheals_against_baked_marker(tmp_path, monkeypatch):
     (hermes / ".okengine_release").write_text("v0.10.9\n")
     (hermes / ".hermes_pin").write_text("v2026.7.7.2\n")    # the RUNNING Hermes, baked in the image
 
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
-    m = importlib.util.module_from_spec(spec); sys.modules["deployment_validate"] = m
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
+    m = importlib.util.module_from_spec(spec); sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear(); m.VAULT, m.DATA, m.HERMES = vault, data, hermes
     m.check_pins()
@@ -508,8 +564,8 @@ def test_no_hermes_pin_marker_is_silent(tmp_path, monkeypatch):
     (vault / "engine.version").write_text("engine: okengine\nversion: v0.10.9\nhermes_pin: v2026.7.1\n")
     (data / "engine-runtime.yaml").write_text("engine_release: v0.10.9\nhermes_pin: v2026.7.1\n")
     (hermes / ".okengine_release").write_text("v0.10.9\n")   # no .hermes_pin baked
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
-    m = importlib.util.module_from_spec(spec); sys.modules["deployment_validate"] = m
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
+    m = importlib.util.module_from_spec(spec); sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear(); m.VAULT, m.DATA, m.HERMES = vault, data, hermes
     m.check_pins()
@@ -524,8 +580,8 @@ def test_stamp_matching_running_engine_is_silent(tmp_path, monkeypatch):
     (vault / "engine.version").write_text("engine: okengine\nversion: v0.10.3\nhermes_pin: v2026.7.1\n")
     (data / "engine-runtime.yaml").write_text("engine_release: v0.10.3\nhermes_pin: v2026.7.1\n")
     (hermes / ".okengine_release").write_text("v0.10.3\n")
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
-    m = importlib.util.module_from_spec(spec); sys.modules["deployment_validate"] = m
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
+    m = importlib.util.module_from_spec(spec); sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear(); m.VAULT, m.DATA, m.HERMES = vault, data, hermes
     m.check_pins()
@@ -608,9 +664,9 @@ def _run_extensions_check(tmp_path, enabled, jobs, staged_dirs):
     (data / "cron-plus" / "jobs.json").write_text(_json.dumps({"jobs": jobs}))
     for sd in staged_dirs:
         (data / "scripts" / sd).mkdir(parents=True, exist_ok=True)
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["deployment_validate"] = m
+    sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear()
     m.VAULT, m.DATA = vault, data
@@ -652,9 +708,9 @@ def test_extension_with_lane_and_staged_dir_is_clean(tmp_path):
 def _load(tmp_path, monkeypatch):
     """Import deployment_validate to exercise its pure helpers (env set so module import succeeds)."""
     monkeypatch.setenv("WIKI_PATH", str(tmp_path))
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["deployment_validate"] = m
+    sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     return m
 
@@ -686,9 +742,9 @@ def test_staleness_subset_catches_real_drift(tmp_path, monkeypatch):
 
 def _load_dv(monkeypatch, vault, data, hermes):
     monkeypatch.setenv("WIKI_PATH", str(vault))
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["deployment_validate"] = m
+    sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear()
     m.VAULT, m.DATA, m.HERMES = vault, data, hermes
@@ -822,7 +878,7 @@ def test_write_path_libs_pins_write_server_imports():  # invariant-audit M1/M23
                 continue
             if any((d / f"{mod}.py").is_file() for d in local_dirs):
                 imported.add(f"{mod}.py")
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     dv = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(dv)
     tracked = set(dv._WRITE_PATH_LIBS)
@@ -853,10 +909,46 @@ def test_report_write_failure_delivers_diagnosis_not_crash(tmp_path, monkeypatch
     vault = tmp_path / "v"; (vault / "wiki" / "operational").mkdir(parents=True)
     data = tmp_path / "d"; data.mkdir()
     (vault / "wiki" / "operational" / "deployment-validation.md").mkdir()   # a dir -> write_text raises
-    m = _load_dv(monkeypatch, vault, data, tmp_path / "h")
-    rc = m.main()                                        # must NOT raise
+    # main() lives in the thin wrapper (okengine#405); load it and point its shared checks at the fixture
+    spec = importlib.util.spec_from_file_location("deployment_validate", VALIDATE_MOD)
+    dv = importlib.util.module_from_spec(spec); sys.modules["deployment_validate"] = dv
+    spec.loader.exec_module(dv)
+    dv.C.configure(vault, data=data, hermes=tmp_path / "h")
+    rc = dv.main()                                       # must NOT raise
     assert isinstance(rc, int)
     assert "fix-vault-ownership.sh" in capsys.readouterr().err
+
+
+def test_deployment_validate_writes_a_clean_empty_report(tmp_path, monkeypatch, capsys):
+    vault = tmp_path / "v"
+    (vault / "wiki").mkdir(parents=True)
+    spec = importlib.util.spec_from_file_location("deployment_validate_clean", VALIDATE_MOD)
+    dv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dv)
+    dv.C.configure(vault, data=tmp_path / "d", hermes=tmp_path / "h")
+    monkeypatch.setattr(dv.C, "run", lambda: [])
+    assert dv.main() == 0
+    report = vault / "wiki" / "operational" / "deployment-validation.md"
+    assert report.is_file() and "**PASS**" in report.read_text()
+    assert '"wakeAgent": false' in capsys.readouterr().out
+
+
+def test_deployment_validate_backward_compat_facade(tmp_path):
+    """okengine#405 cross-repo contract: okpacks-library/scripts/bundle-compose-check.sh loads THIS
+    module, sets .VAULT/.DATA, and calls .check_schema()/.check_partition_dups() over .F. The #405
+    extraction moved the checks to deployment_checks; the facade must keep that exact surface working
+    (a refactor that drops it silently reds the engine's pack-parity gate, as it did once)."""
+    host = tmp_path / "host"; data = tmp_path / "data"
+    (host / "wiki").mkdir(parents=True); data.mkdir()
+    (host / "schema.yaml").write_text("types: {actor: {}}\ntype_aliases: {actor: actor}\n")  # shadow
+    spec = importlib.util.spec_from_file_location("bundle_deployment_validate", VALIDATE_MOD)
+    dv = importlib.util.module_from_spec(spec); sys.modules["bundle_deployment_validate"] = dv
+    spec.loader.exec_module(dv)
+    dv.VAULT, dv.DATA = host, data                        # caller sets the module globals
+    dv.F.clear(); dv.check_schema(); dv.check_partition_dups()
+    assert any(r[0] == "FAIL" and r[1] == "schema" and "SHADOWS" in r[2] for r in dv.F), list(dv.F)
+    dv.F.clear(); dv.check_partition_dups()               # a second call over the same .F still works
+    assert not [r for r in dv.F if r[1] == "partition-dups"]
 
 
 def test_check_auth_fails_private_exposed_without_password(tmp_path, monkeypatch):
@@ -992,8 +1084,8 @@ def test_staged_but_not_folded_warns_even_for_a_core_extension(tmp_path):  # inv
     (data / "cron-plus" / "jobs.json").write_text(_json.dumps({"jobs": []}))                 # nothing folded
     extd = data / "scripts" / "okengine.contradictions"; extd.mkdir(parents=True)
     (extd / "contradictions_scan.py").write_text("# a core lane script\n")                   # staged lane present
-    spec = _il.spec_from_file_location("deployment_validate", MOD)
-    m = _il.module_from_spec(spec); _sys.modules["deployment_validate"] = m
+    spec = _il.spec_from_file_location("deployment_checks", MOD)
+    m = _il.module_from_spec(spec); _sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m); m.F.clear(); m.VAULT, m.DATA = vault, data
     m.check_extensions()
     assert any(lvl == "WARN" and "okengine.contradictions" in msg and "NO lane" in msg
@@ -1015,9 +1107,9 @@ def _run_cron_check(tmp_path, monkeypatch, *, owner_uid=None, sentinel=None):
     if sentinel is not None:
         (cp / ".scheduler-stalled").write_text(_json197.dumps(sentinel))
     monkeypatch.setenv("WIKI_PATH", str(vault))
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["deployment_validate"] = m
+    sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear()
     m.VAULT, m.DATA = vault, data
@@ -1035,9 +1127,17 @@ def _run_cron_check(tmp_path, monkeypatch, *, owner_uid=None, sentinel=None):
 
 def test_cron_store_foreign_owner_fails(tmp_path, monkeypatch):
     """okengine#197: jobs.json owned by root (a docker-exec write) silently kills every lane —
-    the validator must go RED, not rely on an operator noticing frozen last_run_at."""
-    f = _run_cron_check(tmp_path, monkeypatch, owner_uid=0)
-    assert any(l == "FAIL" and "owned by uid 0" in msg for l, c, msg in f), f
+    the validator must go RED, not rely on an operator noticing frozen last_run_at.
+
+    The uid must be FOREIGN to whoever is running, which uid 0 is not when the runner IS root.
+    The suites run as ci-runner so 0 is foreign there, but the mutation campaign's test_command
+    runs as root, where hardcoding 0 asserts "root-owned is foreign to root" and fails every time
+    (#535/#558: guaranteed-red target). Pick a uid that is foreign to the ACTUAL euid so the
+    contract is exercised in both environments rather than passing in one and lying in the other.
+    """
+    foreign = 0 if os.geteuid() != 0 else 65534  # 65534 = nobody
+    f = _run_cron_check(tmp_path, monkeypatch, owner_uid=foreign)
+    assert any(l == "FAIL" and f"owned by uid {foreign}" in msg for l, c, msg in f), f
 
 
 def test_cron_store_own_uid_passes(tmp_path, monkeypatch):
@@ -1054,9 +1154,9 @@ def test_scheduler_stalled_sentinel_fails(tmp_path, monkeypatch):
 
 
 def _run_provenance_check(monkeypatch, pack):
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["deployment_validate"] = m
+    sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear()
     if pack is None:
@@ -1082,9 +1182,9 @@ def test_provenance_env_set_is_clean(monkeypatch):
 # --- invariant-audit v0.11.5 batch-5 (cron scripts) --------------------------------------------
 
 def _load_dv5(tmp_path, vault):
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["deployment_validate"] = m
+    sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear()
     m.VAULT = vault
@@ -1153,9 +1253,9 @@ def test_check_ownership_scans_okengine_composed_schema(tmp_path, monkeypatch): 
     (vault / ".okengine" / "composed-schema.yaml").write_text("types: {}\n")
     (vault / ".okengine" / "snapshots" / "s1").mkdir(parents=True)
     (vault / ".okengine" / "snapshots" / "s1" / "old.yaml").write_text("x\n")
-    spec = importlib.util.spec_from_file_location("deployment_validate", MOD)
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["deployment_validate"] = m
+    sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear()
     m.VAULT = vault
@@ -1166,3 +1266,192 @@ def test_check_ownership_scans_okengine_composed_schema(tmp_path, monkeypatch): 
     blob = " ".join(str(x) for x in m.F)
     assert "composed-schema.yaml" in blob, "check_ownership must now scan .okengine"
     assert "snapshots" not in blob, "transient .okengine/snapshots must be skipped"
+
+
+# --- one endpoint, one slot count -------------------------------------------
+
+def _crons_with_config(tmp_path, monkeypatch, jobs, model_cfg):
+    """_run_crons_check, plus a config.yaml so default-model lanes resolve an identity."""
+    import json as _json
+    import yaml as _yaml
+    vault = tmp_path / "vault"
+    data = tmp_path / "data"
+    (vault / "wiki").mkdir(parents=True, exist_ok=True)
+    (data / "cron-plus").mkdir(parents=True, exist_ok=True)
+    (data / "scripts").mkdir(exist_ok=True)
+    (data / "config.yaml").write_text(_yaml.safe_dump({"model": model_cfg}), encoding="utf-8")
+    (data / "cron-plus" / "jobs.json").write_text(_json.dumps({"jobs": jobs}))
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["deployment_checks"] = m
+    spec.loader.exec_module(m)
+    m.F.clear()
+    m.VAULT, m.DATA = vault, data
+    m.check_crons()
+    return list(m.F)
+
+
+_CFG = {"provider": "custom", "base_url": "http://gpu:11436/v1", "default": "qwen3-coder:30b"}
+
+
+def test_disagreeing_model_concurrency_on_one_endpoint_fails(tmp_path, monkeypatch):
+    """A limit=1 lane does not throttle itself -- it probes lock index 0 ALONE and never looks
+    at index 1 even while that sits free. So it starves against spare capacity on the very
+    endpoint its neighbours are using at limit=2. Live: 8 lanes at 1 vs 9 at 2 on one endpoint,
+    and a limit=1 lane burned its whole slot-wait budget queuing on index 0."""
+    jobs = [
+        {"id": "a", "name": "entity-backfill", "enabled": True, "model_concurrency": 2},
+        {"id": "b", "name": "source-quality-backfill", "enabled": True},   # defaults to 1
+    ]
+    f = _crons_with_config(tmp_path, monkeypatch, jobs, _CFG)
+    bad = [x for x in f if x[0] == "FAIL" and "model_concurrency disagrees" in x[2]]
+    assert bad, f
+    assert "source-quality-backfill" in bad[0][2]      # names who starves
+    assert "qwen3-coder:30b" in bad[0][2]              # names the endpoint
+
+
+def test_agreeing_model_concurrency_is_clean(tmp_path, monkeypatch):
+    jobs = [
+        {"id": "a", "name": "entity-backfill", "enabled": True, "model_concurrency": 2},
+        {"id": "b", "name": "raw-backfill", "enabled": True, "model_concurrency": 2},
+    ]
+    f = _crons_with_config(tmp_path, monkeypatch, jobs, _CFG)
+    assert not [x for x in f if "model_concurrency disagrees" in x[2]], f
+
+
+def test_different_endpoints_may_hold_different_slot_counts(tmp_path, monkeypatch):
+    """The rule is per-ENDPOINT. Two genuinely different endpoints disagreeing is correct --
+    flagging that would make the check cry wolf on every mixed-provider deployment."""
+    jobs = [
+        {"id": "a", "name": "local-lane", "enabled": True, "model_concurrency": 2},
+        {"id": "b", "name": "paid-lane", "enabled": True,
+         "provider": "deepseek", "model": "deepseek-flash", "model_concurrency": 1},
+    ]
+    f = _crons_with_config(tmp_path, monkeypatch, jobs, _CFG)
+    assert not [x for x in f if "model_concurrency disagrees" in x[2]], f
+
+
+def test_disabled_and_no_agent_lanes_are_excluded(tmp_path, monkeypatch):
+    """A disabled lane never runs, and a no_agent lane takes no slot at all -- neither can
+    starve, so neither may manufacture a failure."""
+    jobs = [
+        {"id": "a", "name": "entity-backfill", "enabled": True, "model_concurrency": 2},
+        {"id": "b", "name": "off-lane", "enabled": False},                  # disabled
+        {"id": "c", "name": "script-lane", "enabled": True, "no_agent": True},  # no slot
+    ]
+    f = _crons_with_config(tmp_path, monkeypatch, jobs, _CFG)
+    assert not [x for x in f if "model_concurrency disagrees" in x[2]], f
+
+
+def test_unparseable_model_concurrency_is_treated_as_one(tmp_path, monkeypatch):
+    """Garbage must resolve the way the runner resolves it (max(1, int(...)) -> 1), so the
+    check agrees with the behaviour it is validating rather than skipping the lane."""
+    jobs = [
+        {"id": "a", "name": "entity-backfill", "enabled": True, "model_concurrency": 2},
+        {"id": "b", "name": "junk-lane", "enabled": True, "model_concurrency": "two"},
+    ]
+    f = _crons_with_config(tmp_path, monkeypatch, jobs, _CFG)
+    bad = [x for x in f if "model_concurrency disagrees" in x[2]]
+    assert bad, f
+    assert "junk-lane" in bad[0][2]
+
+
+def test_missing_config_yaml_does_not_crash_the_check(tmp_path, monkeypatch):
+    """No config.yaml means identities fall back to 'default' -- the check must still run
+    rather than take check_crons down with it."""
+    import json as _json
+    vault = tmp_path / "vault"; data = tmp_path / "data"
+    (vault / "wiki").mkdir(parents=True, exist_ok=True)
+    (data / "cron-plus").mkdir(parents=True, exist_ok=True)
+    (data / "scripts").mkdir(exist_ok=True)
+    (data / "cron-plus" / "jobs.json").write_text(_json.dumps({"jobs": [
+        {"id": "a", "name": "x", "enabled": True, "model_concurrency": 2},
+        {"id": "b", "name": "y", "enabled": True},
+    ]}))
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["deployment_checks"] = m
+    spec.loader.exec_module(m)
+    m.F.clear(); m.VAULT, m.DATA = vault, data
+    m.check_crons()                                   # must not raise
+    assert [x for x in m.F if "model_concurrency disagrees" in x[2]]
+
+
+# --- model routing: a lane must not claim one model and be served by another ---
+
+_RCFG = {"provider": "custom", "base_url": "http://gpu:11436/v1", "default": "local-model:30b"}
+
+
+def test_a_provider_override_without_an_endpoint_override_fails(tmp_path, monkeypatch):
+    """Declaring a different provider while inheriting the default base_url addresses that
+    provider's request to the DEFAULT provider's host. Live: 30 lanes whose profile named a
+    provider but no base_url inherited the local one."""
+    jobs = [
+        {"id": "a", "name": "remote-lane", "enabled": True, "provider": "hosted",
+         "model": "hosted-model"},                       # provider set, base_url inherited
+        {"id": "b", "name": "local-lane", "enabled": True},
+    ]
+    f = _crons_with_config(tmp_path, monkeypatch, jobs, _RCFG)
+    bad = [x for x in f if x[0] == "FAIL" and "inherit the default `base_url`" in x[2]]
+    assert bad, f
+    assert "remote-lane" in bad[0][2]
+
+
+def test_a_provider_override_WITH_an_endpoint_override_is_clean(tmp_path, monkeypatch):
+    jobs = [
+        {"id": "a", "name": "remote-lane", "enabled": True, "provider": "hosted",
+         "base_url": "https://api.hosted.example/v1", "model": "hosted-model"},
+        {"id": "b", "name": "local-lane", "enabled": True},
+    ]
+    f = _crons_with_config(tmp_path, monkeypatch, jobs, _RCFG)
+    assert not [x for x in f if "inherit the default `base_url`" in x[2]], f
+
+
+def test_one_model_claimed_by_two_providers_fails(tmp_path, monkeypatch):
+    """The deployment is its own authority on who owns a model name. A lane naming a model
+    without a provider inherits the local one and is served the local weights, while its receipt
+    still records the model it asked for -- invisible at runtime. Live: a lane ran on local
+    weights for five runs while its config and cost attribution named a paid hosted model."""
+    jobs = [
+        {"id": "a", "name": "proper-lane", "enabled": True, "provider": "hosted",
+         "base_url": "https://api.hosted.example/v1", "model": "hosted-model"},
+        {"id": "b", "name": "stray-lane", "enabled": True, "model": "hosted-model"},  # no provider
+    ]
+    f = _crons_with_config(tmp_path, monkeypatch, jobs, _RCFG)
+    bad = [x for x in f if x[0] == "FAIL" and "is claimed by 2 providers" in x[2]]
+    assert bad, f
+    assert "stray-lane" in bad[0][2] and "hosted-model" in bad[0][2]
+
+
+def test_a_model_used_by_one_provider_is_clean(tmp_path, monkeypatch):
+    jobs = [
+        {"id": "a", "name": "l1", "enabled": True, "provider": "hosted",
+         "base_url": "https://api.hosted.example/v1", "model": "hosted-model"},
+        {"id": "b", "name": "l2", "enabled": True, "provider": "hosted",
+         "base_url": "https://api.hosted.example/v1", "model": "hosted-model"},
+        {"id": "c", "name": "l3", "enabled": True},          # the local default model
+    ]
+    f = _crons_with_config(tmp_path, monkeypatch, jobs, _RCFG)
+    assert not [x for x in f if "claimed by" in x[2]], f
+
+
+def test_routing_check_names_no_vendors(tmp_path, monkeypatch):
+    """The engine ships no domain knowledge, so this check may not carry a list of known
+    providers. Both rules must key off the deployment's OWN declarations, which also keeps them
+    correct for providers that did not exist when they were written."""
+    src = (REPO / "scripts" / "cron" / "deployment_checks.py").read_text(encoding="utf-8")
+    start = src.index("def _check_model_routing(")
+    body = src[start:src.index("\ndef ", start + 10)]
+    for vendor in ("deepseek", "openai", "anthropic", "gemini", "mistral", "cohere", "ollama"):
+        assert vendor not in body.lower(), f"vendor name {vendor!r} leaked into the engine check"
+
+
+def test_disabled_and_no_agent_lanes_are_excluded_from_routing(tmp_path, monkeypatch):
+    jobs = [
+        {"id": "a", "name": "off", "enabled": False, "provider": "hosted", "model": "hosted-model"},
+        {"id": "b", "name": "script", "enabled": True, "no_agent": True,
+         "provider": "hosted", "model": "hosted-model"},
+        {"id": "c", "name": "local-lane", "enabled": True},
+    ]
+    f = _crons_with_config(tmp_path, monkeypatch, jobs, _RCFG)
+    assert not [x for x in f if "inherit the default `base_url`" in x[2] or "claimed by" in x[2]], f

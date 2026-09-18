@@ -1,0 +1,249 @@
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 3d745e136..ee8b117f3 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2141,6 +2141,25 @@ class _CronAgentSetup:
+     credential_pool: Any = None
+ 
+ 
++def _resolve_okengine_cron_turn_limit(job: dict, cfg: dict) -> int:
++    """Bound a governed cron lane; explicit per-job limits must be valid integers."""
++    safe_default = 90
++    if "max_iterations" in job:
++        raw = job["max_iterations"]
++        if isinstance(raw, bool) or not isinstance(raw, int) or not 1 <= raw <= safe_default:
++            raise ValueError(
++                "cron max_iterations must be a positive integer no greater than 90"
++            )
++        return raw
++    from hermes_cli.config import resolve_turn_limit
++
++    agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
++    global_raw = agent_cfg.get("max_turns")
++    if global_raw is None:
++        global_raw = cfg.get("max_turns")
++    return min(resolve_turn_limit(global_raw, default=safe_default), safe_default)
++
++
+ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _CronAgentSetup:
+     """Resolve model/runtime/reasoning/pool for the run, in the original gate order: exfil guard ->
+     preflight (may block) -> runtime (+ fallback chain) -> credential pool -> MCP."""
+@@ -2148,12 +2167,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
+     setup = _CronAgentSetup(model=jc.model)
+     setup.prefill_messages = _load_prefill_messages(_cfg, job_id)
+ 
+-    # resolve_turn_limit() honors none/unlimited (sys.maxsize) and explicit 0 / null.
+-    from hermes_cli.config import resolve_turn_limit as _resolve_turn_limit
+-    _mt = _cfg.get("agent", {}).get("max_turns")
+-    if _mt is None:
+-        _mt = _cfg.get("max_turns")
+-    setup.max_iterations = _resolve_turn_limit(_mt)
++    setup.max_iterations = _resolve_okengine_cron_turn_limit(job, _cfg)
+ 
+     # Runtime backstop (CWE-200/522): fail closed BEFORE resolution on a provider/base_url pair
+     # that would ship a stored credential off-host; hand-written jobs bypass create-time checks.
+diff --git a/tests/cron/test_okengine_turn_limit.py b/tests/cron/test_okengine_turn_limit.py
+new file mode 100644
+index 000000000..c2d707480
+--- /dev/null
++++ b/tests/cron/test_okengine_turn_limit.py
+@@ -0,0 +1,73 @@
++"""Behavioral fixtures for OKEngine's bounded cron iteration contract."""
++
++import sys
++from unittest.mock import patch
++
++import pytest
++
++from cron.scheduler import (
++    _CronJobConfig,
++    _resolve_cron_agent_setup,
++    _resolve_okengine_cron_turn_limit,
++)
++
++
++@pytest.mark.parametrize("cap", [4, 6, 10, 12, 16, 90])
++def test_explicit_job_cap_precedes_global_turn_limit(cap):
++    assert _resolve_okengine_cron_turn_limit(
++        {"max_iterations": cap}, {"agent": {"max_turns": sys.maxsize}}
++    ) == cap
++
++
++@pytest.mark.parametrize("bad", [None, False, True, 0, -1, "4", 4.0, 91, sys.maxsize, []])
++def test_malformed_or_unbounded_explicit_cap_fails_closed(bad):
++    with pytest.raises(ValueError, match="max_iterations must be a positive integer"):
++        _resolve_okengine_cron_turn_limit({"max_iterations": bad}, {})
++
++
++@pytest.mark.parametrize(
++    ("cfg", "expected"),
++    [
++        ({}, 90),
++        ({"agent": {"max_turns": 7}}, 7),
++        ({"max_turns": 8}, 8),
++        ({"agent": {"max_turns": 0}}, 90),
++        ({"agent": {"max_turns": "unlimited"}}, 90),
++        ({"agent": {"max_turns": 200}}, 90),
++        ({"agent": {"max_turns": 7}, "max_turns": 8}, 7),
++    ],
++)
++def test_uncapped_job_inherits_only_a_bounded_global_cap(cfg, expected):
++    assert _resolve_okengine_cron_turn_limit({}, cfg) == expected
++
++
++def test_real_cron_agent_setup_passes_job_cap_to_constructor_inputs():
++    job = {"id": "capped", "model": "local-probe", "max_iterations": 6}
++    jc = _CronJobConfig({"cron": {"preflight": False}}, "local-probe", {}, "")
++    runtime = {"provider": "", "api_key": "fixture-key", "base_url": None}
++
++    with patch(
++        "hermes_cli.runtime_provider.resolve_runtime_provider",
++        autospec=True,
++        return_value=runtime,
++    ) as provider, patch(
++        "tools.mcp_tool_discovery.discover_mcp_tools", autospec=True, return_value=[]
++    ):
++        setup = _resolve_cron_agent_setup(job, job["id"], "Capped job", jc)
++
++    provider.assert_called_once()
++    assert setup.blocked is None
++    assert setup.max_iterations == 6
++
++
++def test_real_cron_agent_setup_rejects_invalid_cap_before_provider_resolution():
++    job = {"id": "invalid-cap", "model": "local-probe", "max_iterations": 0}
++    jc = _CronJobConfig({"cron": {"preflight": False}}, "local-probe", {}, "")
++
++    with patch(
++        "hermes_cli.runtime_provider.resolve_runtime_provider", autospec=True
++    ) as provider:
++        with pytest.raises(ValueError, match="max_iterations must be a positive integer"):
++            _resolve_cron_agent_setup(job, job["id"], "Invalid cap", jc)
++
++    provider.assert_not_called()
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index ad60058..496ef52 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -613,12 +613,9 @@ def _ensure_default_soul_md(home: Path) -> None:
+     A SOUL.md the user actually customized is never touched."""
+     soul_path = home / "SOUL.md"
+     if soul_path.exists():
+-        try:
+-            existing = soul_path.read_text(encoding="utf-8")
+-        except (OSError, UnicodeDecodeError):
+-            return
+-        if not is_legacy_template_soul(existing):
+-            return
++        # OKEngine treats every deployment's current voice as operator-owned,
++        # including a byte-for-byte match for an older auto-seeded template.
++        return
+     soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
+     _secure_file(soul_path)
+ 
+diff --git a/hermes_cli/config_migrations.py b/hermes_cli/config_migrations.py
+index 9b102c7..0ac7c3c 100644
+--- a/hermes_cli/config_migrations.py
++++ b/hermes_cli/config_migrations.py
+@@ -107,6 +107,11 @@ def _lower_is(word: str) -> Callable[[Any], bool]:
+     return lambda cur: isinstance(cur, str) and cur.strip().lower() == word
+ 
+ 
++def _okengine_keep_existing_policy(_raw: Dict[str, Any]) -> bool:
++    """OKEngine keeps the pre-v0.21.3 delegation and curator operating bounds."""
++    return False
++
++
+ def _migrate_to_12(results: Dict[str, Any], quiet: bool) -> None:
+     # 11 → 12: custom_providers list → providers dict.
+     _custom_provider_entry_to_provider_config = _cfg()._custom_provider_entry_to_provider_config
+@@ -607,7 +612,8 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
+             "  ✓ Raised delegation.max_iterations from 50 to 250 — subagents "
+             "now get a larger per-child tool-call budget so delegated work "
+             "finishes instead of truncating. Set delegation.max_iterations "
+-            "back to 50 to restore the old cap."))),
++            "back to 50 to restore the old cap."),
++        extra_guard=_okengine_keep_existing_policy)),
+     # 36 → 37: delegation concurrency 3 → 10 (stays at/below the high-cost warning threshold).
+     (37, _rewrite_stale_default(
+         section="delegation", key="max_concurrent_children", old=3, new=10,
+@@ -616,7 +622,8 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
+             "  ✓ Raised delegation.max_concurrent_children from 3 to 10 — "
+             "independent delegated children now fan out wider in parallel. "
+             "Each child consumes API tokens independently; set "
+-            "delegation.max_concurrent_children back to 3 to restore the old cap."))),
++            "delegation.max_concurrent_children back to 3 to restore the old cap."),
++        extra_guard=_okengine_keep_existing_policy)),
+     (38, _migrate_to_38),
+     (39, _migrate_to_39),
+     # 39 → 40: model_catalog.ttl_hours → ttl_minutes (default 20). Only the OLD default
+@@ -653,13 +660,15 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
+     (44, _rewrite_stale_default(
+         section="curator", key="stale_after_days", old=30, new=14,
+         added="curator.stale_after_days=14 (was: 30)",
+-        message="  ✓ curator.stale_after_days 30→14 — unused skills are flagged stale after two weeks.")),
++        message="  ✓ curator.stale_after_days 30→14 — unused skills are flagged stale after two weeks.",
++        extra_guard=_okengine_keep_existing_policy)),
+     (44, _rewrite_stale_default(
+         section="curator", key="archive_after_days", old=90, new=30,
+         added="curator.archive_after_days=30 (was: 90)",
+         message=(
+             "  ✓ curator.archive_after_days 90→30 — skills unused for a month are archived to "
+-            "skills/.archive/ (recoverable with `hermes curator restore`). Set it back to 90 to keep the old window."))),
++            "skills/.archive/ (recoverable with `hermes curator restore`). Set it back to 90 to keep the old window."),
++        extra_guard=_okengine_keep_existing_policy)),
+ )
+ 
+ 
+diff --git a/tests/hermes_cli/test_okengine_policy_preservation.py b/tests/hermes_cli/test_okengine_policy_preservation.py
+new file mode 100644
+index 0000000..74e2fa1
+--- /dev/null
++++ b/tests/hermes_cli/test_okengine_policy_preservation.py
+@@ -0,0 +1,46 @@
++"""OKEngine preserves explicitly selected pre-v0.21.3 operating policy."""
++
++from types import SimpleNamespace
++
++from hermes_cli import config, config_migrations
++from hermes_cli.default_soul import _LEGACY_TEMPLATE_SOULS
++
++
++def test_policy_default_migrations_do_not_expand_limits_or_shorten_windows(monkeypatch):
++    raw = {
++        "delegation": {"max_iterations": 50, "max_concurrent_children": 3},
++        "curator": {"stale_after_days": 30, "archive_after_days": 90},
++    }
++    persisted = []
++    fake = SimpleNamespace(
++        read_raw_config=lambda: raw,
++        _persist_migration=lambda value: persisted.append(value.copy()),
++    )
++    monkeypatch.setattr(config_migrations, "_cfg", lambda: fake)
++    results = {"config_added": [], "warnings": []}
++
++    for target, migration in config_migrations.MIGRATIONS:
++        if target in {36, 37, 44}:
++            migration(results, True)
++
++    assert raw == {
++        "delegation": {"max_iterations": 50, "max_concurrent_children": 3},
++        "curator": {"stale_after_days": 30, "archive_after_days": 90},
++    }
++    assert persisted == []
++
++
++def test_existing_legacy_template_soul_is_retained_byte_for_byte(tmp_path):
++    old_voice = _LEGACY_TEMPLATE_SOULS[0]
++    soul = tmp_path / "SOUL.md"
++    soul.write_text(old_voice, encoding="utf-8")
++
++    config._ensure_default_soul_md(tmp_path)
++
++    assert soul.read_text(encoding="utf-8") == old_voice
++
++
++def test_missing_soul_still_seeds_current_default(tmp_path):
++    config._ensure_default_soul_md(tmp_path)
++
++    assert (tmp_path / "SOUL.md").read_text(encoding="utf-8") == config.DEFAULT_SOUL_MD

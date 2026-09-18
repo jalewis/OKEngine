@@ -45,7 +45,9 @@ CFG="$RT/config.yaml"
 . "$ENGINE_DIR/scripts/lib/hermes_uid.sh"
 HUID="$(resolve_hermes_uid "$PACK")"; HGID="$(resolve_hermes_gid "$PACK")"
 ENVF="$PACK/.env"
-[ -f "$ENVF" ] || : > "$ENVF"
+# host-only secrets file: owner-only from birth, tightened if inherited (okengine#665)
+[ -f "$ENVF" ] || ( umask 077; : > "$ENVF" )
+chmod 600 "$ENVF" 2>/dev/null || echo "WARN: could not chmod 600 $ENVF (not the owner?) — secrets may be readable by others" >&2
 grep -qE '^[[:space:]]*HERMES_UID[[:space:]]*=' "$ENVF" || printf 'HERMES_UID=%s\n' "$HUID" >> "$ENVF"
 grep -qE '^[[:space:]]*HERMES_GID[[:space:]]*=' "$ENVF" || printf 'HERMES_GID=%s\n' "$HGID" >> "$ENVF"
 
@@ -180,8 +182,12 @@ block = (
     "    command: /opt/hermes/.venv/bin/python\n"
     "    args:\n"
     "    - /opt/hermes/okengine-mcp/write_server.py\n"
+    "    tools:\n"
+    "      resources: false\n"
+    "      prompts: false\n"
     "    env:\n"
     "      OKENGINE_WRITE_ACTOR: cron:source-quality-backfill\n"
+    "      OKENGINE_CRON_JOBS: /opt/data/cron-plus/jobs.json\n"
     "      OKENGINE_OUTPUT_CONTRACT_MODE: enforce\n\n"
 )
 lines.insert(mcp_end, block)
@@ -224,9 +230,17 @@ existing = {match.group(1) for line in lines[mcp_start + 1:mcp_end]
             if (match := re.match(r"^  ([A-Za-z0-9_.-]+):\s*(?:#.*)?$", line.rstrip("\n")))}
 blocks = []
 actors = {a: False for a in (policy.get("capabilities") or {}) if a.startswith("cron:")}
+# A pack lane may narrow its MCP tool surface with `write_tools: [...]` on its cron def; it is
+# forwarded as OKENGINE_WRITE_TOOLS so the engine never carries pack lane names (okengine#664).
+write_tools: dict[str, str] = {}
 for job in jobs:
     if isinstance(job, dict) and isinstance(job.get("output_contract"), dict) and not job.get("no_agent"):
         actors[f"cron:{job.get('name')}"] = True
+    if isinstance(job, dict) and isinstance(job.get("write_tools"), list) and job.get("write_tools"):
+        tools = ",".join(str(t).strip() for t in job["write_tools"] if str(t).strip())
+        if tools:
+            write_tools[f"cron:{job.get('name')}"] = tools
+            actors.setdefault(f"cron:{job.get('name')}", False)
 for actor in sorted(actors):
     name = "okengine-write-" + re.sub(r"[^a-z0-9]+", "-", actor[5:].lower()).strip("-")
     if name in existing:
@@ -237,15 +251,157 @@ for actor in sorted(actors):
         "    command: /opt/hermes/.venv/bin/python\n"
         "    args:\n"
         "    - /opt/hermes/okengine-mcp/write_server.py\n"
+        "    tools:\n"
+        "      resources: false\n"
+        "      prompts: false\n"
         "    env:\n"
         f"      OKENGINE_WRITE_ACTOR: {actor}\n"
+        "      OKENGINE_POLICY_CATALOG: /opt/hermes/config/policy/catalog.yaml\n"
+        "      OKENGINE_CRON_JOBS: /opt/data/cron-plus/jobs.json\n"
         + ("      OKENGINE_OUTPUT_CONTRACT_MODE: enforce\n" if actors[actor] else "")
+        + (f"      OKENGINE_WRITE_TOOLS: {write_tools[actor]}\n" if actor in write_tools else "")
         + "\n"
     )
 if blocks:
     lines.insert(mcp_end, "".join(blocks))
     cfg.write_text("".join(lines), encoding="utf-8")
     print(f"reconciled: {cfg} (added {len(blocks)} policy-bound cron writer(s))")
+PY
+
+# Hermes intentionally gives stdio MCP servers only their declared `env:` mapping. Image-level
+# ENV therefore reaches the gateway shell but not these child processes. Every governed writer
+# imports policy_plane and must receive the baked catalog path explicitly; otherwise an installed-
+# wheel import derives the nonexistent site-packages/config/policy/catalog.yaml path (#544).
+# Reconcile old generated entries as well as the baseline writer, without replacing any operator
+# value that is already explicit.
+CFG="$CFG" python3 - <<'PY'
+import os
+import re
+from pathlib import Path
+
+import yaml
+
+path = Path(os.environ["CFG"])
+lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+starts = [i for i, line in enumerate(lines)
+          if re.match(r"^  okengine-write(?:-[A-Za-z0-9_.-]+)?:\s*(?:#.*)?$",
+                      line.rstrip("\n"))]
+changed = 0
+for start in reversed(starts):
+    end = next((i for i in range(start + 1, len(lines))
+                if lines[i].strip()
+                and len(lines[i]) - len(lines[i].lstrip()) <= 2), len(lines))
+    block = lines[start:end]
+    policy_line = next((i for i in range(start + 1, end)
+                        if re.match(r"^      OKENGINE_POLICY_CATALOG:\s*", lines[i])), None)
+    if policy_line is not None:
+        expected = "      OKENGINE_POLICY_CATALOG: /opt/hermes/config/policy/catalog.yaml\n"
+        if lines[policy_line] != expected:
+            lines[policy_line] = expected
+            changed += 1
+        continue
+    env_line = next((i for i in range(start + 1, end)
+                     if re.match(r"^    env:\s*(?:#.*)?$", lines[i].rstrip("\n"))), None)
+    if env_line is None:
+        inline_env = next((i for i in range(start + 1, end)
+                           if re.match(r"^    env:\s*\S", lines[i].rstrip("\n"))), None)
+        if inline_env is None:
+            lines[end:end] = [
+                "    env:\n",
+                "      OKENGINE_POLICY_CATALOG: /opt/hermes/config/policy/catalog.yaml\n",
+            ]
+        else:
+            raw = lines[inline_env].split(":", 1)[1].strip()
+            try:
+                values = yaml.safe_load(raw)
+            except yaml.YAMLError as exc:
+                raise SystemExit(f"ERROR: invalid inline env for {lines[start].strip()}: {exc}")
+            if not isinstance(values, dict) or not all(
+                    isinstance(key, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                    and (value is None or isinstance(value, (str, int, float, bool)))
+                    for key, value in values.items()):
+                raise SystemExit(f"ERROR: inline env for {lines[start].strip()} must be a scalar mapping")
+            rendered = ["    env:\n"]
+            rendered.extend(
+                f"      {key}: {yaml.safe_dump(value, default_flow_style=True).splitlines()[0]}\n"
+                for key, value in values.items()
+            )
+            rendered.append(
+                "      OKENGINE_POLICY_CATALOG: /opt/hermes/config/policy/catalog.yaml\n")
+            lines[inline_env:inline_env + 1] = rendered
+    else:
+        lines.insert(env_line + 1,
+                     "      OKENGINE_POLICY_CATALOG: /opt/hermes/config/policy/catalog.yaml\n")
+    changed += 1
+if changed:
+    path.write_text("".join(lines), encoding="utf-8")
+    print(f"reconciled: {path} (bound policy catalog into {changed} stdio writer env(s))")
+PY
+
+# Actor-scoped write servers are tools-only. Hiding MCP resource/prompt utility
+# wrappers removes an unrelated action surface that local models repeatedly
+# explored instead of completing their bounded write/receipt task.
+CFG="$CFG" python3 - <<'PY'
+import os
+import re
+from pathlib import Path
+
+path = Path(os.environ["CFG"])
+lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+starts = [i for i, line in enumerate(lines)
+          if re.match(r"^  okengine-write-[A-Za-z0-9_.-]+:\s*(?:#.*)?$", line.rstrip("\n"))]
+changed = 0
+for start in reversed(starts):
+    end = next((i for i in range(start + 1, len(lines))
+                if lines[i].strip()
+                and len(lines[i]) - len(lines[i].lstrip()) <= 2), len(lines))
+    block = lines[start:end]
+    if not any("OKENGINE_WRITE_ACTOR:" in line for line in block):
+        continue
+    if any(re.match(r"^    tools:\s*(?:#.*)?$", line.rstrip("\n")) for line in block):
+        continue
+    env_line = next((i for i in range(start + 1, end)
+                     if re.match(r"^    env:\s*(?:#.*)?$", lines[i].rstrip("\n"))), None)
+    if env_line is None:
+        continue
+    lines[env_line:env_line] = [
+        "    tools:\n",
+        "      resources: false\n",
+        "      prompts: false\n",
+    ]
+    changed += 1
+if changed:
+    path.write_text("".join(lines), encoding="utf-8")
+    print(f"reconciled: {path} (disabled MCP resource/prompt utilities on {changed} actor writer(s))")
+PY
+
+# Domain contracts live in the deploy-generated cron store rather than the
+# engine-only image catalog. Bind all actor writers to the live store, including
+# entries created by an older deployment that predate this setting.
+CFG="$CFG" python3 - <<'PY'
+import os
+import re
+from pathlib import Path
+
+path = Path(os.environ["CFG"])
+lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+starts = [i for i, line in enumerate(lines)
+          if re.match(r"^  okengine-write-[A-Za-z0-9_.-]+:\s*(?:#.*)?$", line.rstrip("\n"))]
+changed = 0
+for start in reversed(starts):
+    end = next((i for i in range(start + 1, len(lines))
+                if lines[i].strip()
+                and len(lines[i]) - len(lines[i].lstrip()) <= 2), len(lines))
+    block = lines[start:end]
+    actor_line = next((i for i in range(start + 1, end)
+                       if "OKENGINE_WRITE_ACTOR:" in lines[i]), None)
+    if actor_line is None or any("OKENGINE_CRON_JOBS:" in line for line in block):
+        continue
+    lines.insert(actor_line + 1, "      OKENGINE_CRON_JOBS: /opt/data/cron-plus/jobs.json\n")
+    changed += 1
+if changed:
+    path.write_text("".join(lines), encoding="utf-8")
+    print(f"reconciled: {path} (bound {changed} actor writer(s) to live cron contracts)")
 PY
 
 # okengine#257: OKENGINE_EDITING is the UI-editing switch. The reader Chat writes back to the vault
@@ -311,8 +467,8 @@ if [ -f "$MANIFEST" ]; then
     echo "stamped: $RT/engine-runtime.yaml  (engine ${_rel:-?} · Hermes ${_htag:-?})"
 fi
 
-# NB: no iwe binary is staged for the gateway anymore — backlinks-refresh builds the graph with an
-# in-process link-scanner (okengine#179). iwe is now used only by the MCP, which bakes its own.
+# No IWE binary is staged anywhere. Backlinks-refresh builds the graph with the bounded in-process
+# scanner and all serving paths consume its artifact.
 
 # --- MCP auth: keep the gateway's read-MCP client header in sync with the token ---
 # The read server requires `Bearer <OKENGINE_MCP_TOKEN>`, falling back to the
@@ -409,7 +565,6 @@ fi
 # way). It is deploy-time runtime (NOT vendored, NOT baked into the gateway image): it lives at
 # <pack>/.hermes-data/plugins/cron-plus (= /opt/data/plugins/cron-plus in the gateway). Install it
 # here, pinned to the manifest SHA, so the documented quickstart cannot produce a dead scheduler.
-CP_DIR="$RT/plugins/cron-plus"
 if [ "${OKENGINE_CRON_PLUS_SKIP:-0}" = "1" ]; then
     echo "  cron-plus: install skipped (OKENGINE_CRON_PLUS_SKIP=1 — host-run hermes keeps the plugin at ~/.hermes/plugins; tests run hermetic)"
 else
@@ -446,12 +601,20 @@ _writable_by() {  # <dir> <uid> <gid> — true if uid/gid can write <dir>
 if _writable_by "$RT" "$HUID" "$HGID"; then
     : # the container uid can write the runtime — good
 elif [ "$FIX_PERMS" = "1" ]; then
-    chmod -R a+rwX "$PACK"
-    echo "fix-perms: made $PACK group/other-writable so uid $HUID can write it"
-    echo "  (local-deploy convenience — the tree is now world-writable; for a shared host"
-    echo "   prefer running the whole stack as your own uid:"
-    echo "   export HERMES_UID=\$(id -u) HERMES_GID=\$(id -g) — avoids both world-write and the"
-    echo "   chown-vs-deploy.sh conflict, see okengine#33)"
+    # Only the trees the CONTAINER writes are opened (okengine#665): the runtime dir, the corpus,
+    # raw captures and engine state. Pack sources (pack.yaml, schema.yaml, crons/) stay as they
+    # are, and .env is host-only so it never opens. `chmod -R a+rwX "$PACK"` used to make .env and
+    # the Bearer token in config.yaml world-readable and say only "world-writable".
+    for _t in "$RT" "$PACK/wiki" "$PACK/raw" "$PACK/.okengine"; do
+        [ -e "$_t" ] && chmod -R a+rwX "$_t"
+    done
+    chmod 600 "$ENVF" 2>/dev/null || true
+    echo "fix-perms: made $RT, wiki/, raw/ and .okengine/ group/other-writable so uid $HUID can write them"
+    echo "  WARNING: $CFG carries the read-MCP Bearer token and is now world-readable, because uid"
+    echo "           $HUID must read it and is not its owner. .env stays 0600 (host-only)."
+    echo "  (local-deploy convenience only; for a shared host prefer running the whole stack as"
+    echo "   your own uid: export HERMES_UID=\$(id -u) HERMES_GID=\$(id -g) — avoids world-write,"
+    echo "   the world-readable token and the chown-vs-deploy.sh conflict, see okengine#33)"
 else
     cat >&2 <<MSG
 ERROR: the gateway runs as uid $HUID:$HGID, but $PACK is owned by $(id -un) (uid $(id -u))

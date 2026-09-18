@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "required_pages": 100000,
+  "command_timeout_seconds": 3600,
+  "backup_restore": true,
+  "commands": [
+    {"name": "startup", "samples": 1, "command": ["docker", "compose", "up", "-d", "--build"], "ready_http": {"url": "http://127.0.0.1:19200/healthz", "status": 200}},
+    {"name": "projection_rebuild", "samples": 1, "command": ["docker", "compose", "exec", "-T", "okengine-projection", "python", "/app/service.py", "--once"]},
+    {"name": "projection_incremental_catchup", "samples": 3, "command": ["docker", "compose", "exec", "-T", "okengine-projection", "python", "/app/service.py", "--once"]},
+    {"name": "maintenance_cycle", "samples": 1, "command": ["python3", "{engine}/scripts/framework.py", "audit", "{deployment}", "--all"]},
+    {"name": "steady_state_memory", "samples": 3, "measure": "memory", "command": ["docker", "stats", "--no-stream", "--format", "{{json .}}"]},
+    {"name": "service_restart_recovery", "samples": 3, "command": ["docker", "compose", "restart", "gateway", "okengine-reader", "okengine-mcp", "okengine-cockpit", "okengine-projection"], "ready_http": {"url": "http://127.0.0.1:19200/healthz", "status": 200}}
+  ],
+  "overlap": [
+    {"name": "governed_write", "operation": "governed_write", "path": "entities/q/qualification-entity-000001.md"},
+    {"name": "deterministic_mutation", "command": ["docker", "compose", "exec", "-T", "gateway", "python", "/opt/data/scripts/backlinks_refresh.py", "--dry-run"]},
+    {"name": "audit", "command": ["python3", "{engine}/scripts/framework.py", "audit", "{deployment}", "--all"]},
+    {"name": "projection", "command": ["docker", "compose", "exec", "-T", "okengine-projection", "python", "/app/service.py", "--once"]}
+  ],
+  "http": [
+    {"name": "reader", "url": "http://127.0.0.1:19200/healthz", "samples": 20, "status": 200},
+    {"name": "cockpit", "url": "http://127.0.0.1:19201/api/dashboards", "samples": 20, "status": 200}
+  ],
+  "mcp": [
+    {"name": "mcp_exact", "url": "http://127.0.0.1:18730/mcp", "token": "okengine-qualification-local", "tool": "get_page", "arguments": {"path": "entities/0/0/qualification-entity-000001"}, "samples": 20},
+    {"name": "mcp_lexical", "url": "http://127.0.0.1:18730/mcp", "token": "okengine-qualification-local", "tool": "search", "arguments": {"query": "qualification entity", "mode": "search", "limit": 8}, "samples": 20}
+  ],
+  "budgets": {
+    "phase_p95_seconds": {"startup": 600, "projection_rebuild": 3600, "projection_incremental_catchup": 300, "maintenance_cycle": 1800, "service_restart_recovery": 300},
+    "endpoint_p95_seconds": {"reader": 2, "cockpit": 3, "mcp_exact": 3, "mcp_lexical": 5},
+    "steady_state_memory_bytes": 8589934592,
+    "disk_growth_bytes": 10737418240
+  }
+}

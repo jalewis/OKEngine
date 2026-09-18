@@ -48,7 +48,7 @@ def _add_ext(pack, ext_id, version="0.1.0"):
         "id": ext_id, "kind": "operation", "version": version, "trust": "in-gateway",
         "requires": {"engine": ">=0.4.0"},
         "capabilities": {"read": ["wiki/**"], "write": ["x/**"]},
-        "operation": {"schedule": {"kind": "cron", "expr": "0 4 * * *"}, "entrypoint": "r.py"}}),
+        "operation": {"schedule": {"kind": "cron", "expr": "@jitter:daily@4"}, "entrypoint": "r.py"}}),
         encoding="utf-8")
     (d / "r.py").write_text("print('{}')\n", encoding="utf-8")
     return d

@@ -13,6 +13,10 @@ data, the offpeak defer window) is fine and NOT flagged — only the human-visib
 import re
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.invariant
+
 CRON = Path(__file__).resolve().parents[2] / "scripts" / "cron"
 
 # a strftime(...) call whose format-string literal contains a bare "UTC" token

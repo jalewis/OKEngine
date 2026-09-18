@@ -51,19 +51,40 @@ function buildTabs(tabs) {
     if (TAB_LABELS[tname] || $("#view-" + tname)) return;
     const sec = document.createElement("section");
     sec.id = "view-" + tname; sec.className = "view";
+    sec.setAttribute("role", "tabpanel");
     sec.innerHTML = `<div class="pane dgrid" id="dpane-${tname}"><div class="empty">Loading…</div></div>`;
     document.querySelector("main").appendChild(sec);
   });
   TABS.forEach((t, i) => {
     const b = el("button", i === 0 ? "active" : "", esc(TAB_LABELS[t] || TAB_DEF_LABELS[t] || t));
     b.dataset.tab = t;
+    b.id = "tab-" + t;
+    b.setAttribute("role", "tab");
+    b.setAttribute("aria-controls", "view-" + t);
+    b.setAttribute("aria-selected", i === 0 ? "true" : "false");
+    b.tabIndex = i === 0 ? 0 : -1;
+    const panel = $("#view-" + t);
+    if (panel) { panel.setAttribute("role", "tabpanel"); panel.setAttribute("aria-labelledby", b.id); }
     if (t === "predictions") b.insertAdjacentHTML("beforeend", '<span id="due-badge" class="badge" hidden></span>');
     b.onclick = () => showTab(t);
     nav.appendChild(b);
   });
+  nav.onkeydown = e => {
+    const buttons = $$("button[role=tab]", nav);
+    const current = buttons.indexOf(document.activeElement);
+    if (current < 0 || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+    let next = e.key === "Home" ? 0 : e.key === "End" ? buttons.length - 1
+      : (current + (e.key === "ArrowRight" ? 1 : -1) + buttons.length) % buttons.length;
+    buttons[next].focus(); buttons[next].click(); e.preventDefault();
+  };
 }
 function showTab(name) {
-  $$("#tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+  $$("#tabs button").forEach(b => {
+    const selected = b.dataset.tab === name;
+    b.classList.toggle("active", selected);
+    b.setAttribute("aria-selected", selected ? "true" : "false");
+    b.tabIndex = selected ? 0 : -1;
+  });
   $$(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + name));
   if (name === "home" && !homeLoaded) loadHome();
   if (name === "dashboards" && !dashLoaded) loadDashboards();
@@ -74,6 +95,8 @@ function showTab(name) {
   if (name === "browse" && !browseLoaded) loadBrowse();
   if (TAB_DEF_LABELS[name] && !DTAB_LOADED[name]) loadDataTab(name);
   if (name === "chat") { const ci = $("#chat-input"); if (ci) ci.focus(); }
+  $("#tabs").classList.remove("open");
+  $("#nav-toggle").setAttribute("aria-expanded", "false");
   if (location.hash.slice(1) !== name) location.hash = name;
 }
 
@@ -159,15 +182,18 @@ async function loadOps() {
   opsLoaded = true;
   const pane = $("#ops-pane");
   try {
-    const { groups } = await j("/api/ops");
+    const { summary, groups } = await j("/api/ops");
     if (!groups || !groups.length) { pane.innerHTML = `<div class="empty">no operational pages</div>`; return; }
-    pane.innerHTML = groups.map(g =>
+    const status = summary ? `<section class="ops-summary ops-${esc(summary.state)}"><header>System status <strong>${esc(summary.state)}</strong></header>` +
+      `<div class="bignums">${(summary.metrics || []).map(m => `<div class="bn-item${m.path ? " drill" : ""}"${m.path ? ` role="button" tabindex="0" data-drill data-dpage="${esc(m.path)}"` : ""}>` +
+      `<div class="bn-v t-${esc(m.tone)}">${esc(m.value)}</div><div class="bn-l">${esc(m.label)}</div></div>`).join("")}</div></section>` : "";
+    pane.innerHTML = status + groups.map(g =>
       `<div class="dash-group">${g.group ? `<div class="dash-h">${esc(g.group)}</div>` : ""}` +
       `<div class="dash-grid">` + (g.items || []).map(it =>
         `<a class="dash-card" ${it.action ? `data-action="${esc(it.action)}"` : `data-page="${esc(it.path)}"`}>` +
         `<span class="dash-t">${esc(it.title || it.path)}</span>` +
         (it.desc ? `<span class="dash-d">${esc(it.desc)}</span>` : "") +
-        (it.updated ? `<span class="dash-d dim">updated ${esc(it.updated)}</span>` : "") + `</a>`).join("") +
+        `<span class="ops-fresh ops-${esc(it.freshness || "unknown")}">${esc(it.freshness || "unknown")}${it.updated ? ` · ${esc(it.updated)}` : " · no timestamp"}</span></a>`).join("") +
       `</div></div>`).join("");
     $$(".dash-card", pane).forEach(a => a.onclick = () =>
         a.dataset.action === "application" ? openApplicationContract() :
@@ -395,12 +421,18 @@ async function loadDataTab(name) {
       const prov = (b.provenance && b.provenance.label)
         ? `<span class="prov-badge" title="${esc(b.provenance.note || "Measures our reporting/collection, not threat level.")}">◷ ${esc(b.provenance.label)}</span>`
         : "";
-      const section = b.section && b.section !== lastSection
-        ? `<h2 class="dsection">${esc(b.section)}</h2>` : "";
-      if (b.section) lastSection = b.section;
+      const section = b.layout_section && b.layout_section !== lastSection
+        ? `<h2 class="dsection">${esc(b.layout_section)}</h2>` : "";
+      if (b.layout_section) lastSection = b.layout_section;
       return section + `<section class="dbox s${Math.min(12, Math.max(3, b.span || 6))}">` +
         `<header><span class="eb">${esc(b.title)}${prov}</span>` +
-        `<span class="dmeta">${um}${esc(b.meta || "")}</span></header>` +
+        // A truncated table/cards box opens its FULL row list from the very meta line that names
+        // the total ("showing 8 of 83"). No data-dval/data-ditem: a table drill has no bucket to
+        // filter on, and the existing [data-drill] handler already covers click + Enter/Space.
+        `<span class="dmeta${b.meta_drill ? " drill" : ""}"${b.meta_drill
+          ? ` role="button" tabindex="0" title="show all" data-drill`
+            + ` data-dtab="${esc(b.meta_drill.tab)}" data-dbox="${b.meta_drill.box}"` : ""}>` +
+        `${um}${esc(b.meta || "")}${b.meta_drill ? " ⤢" : ""}</span></header>` +
         `<div class="db">${b.html}</div></section>`;
     }).join("")
       || `<div class="empty">nothing to show yet — boxes appear as their lanes produce data</div>`;
@@ -782,9 +814,10 @@ function provenanceHtml(p) {
   return chips.length ? `<div class="provenance">${chips.join("")}</div>` : "";
 }
 
-// Page quality/status badges: a problem-only flag row at the very top of the overlay (needs-review,
-// no-sources, ungrounded, conflicting, stale, thin, missing-required). Server computes them from
-// data already present; a clean page yields none (no row). level -> colour.
+// Page quality/status badges: a flag row at the very top of the overlay (needs-review, no-sources,
+// ungrounded, conflicting, stale, thin, missing-required) plus neutral `info` context such as
+// "N graded sources". Server computes them from data already present; a clean page yields none (no
+// row). level -> colour; only `bad` + the server's `blocking` set quarantine a page.
 function qualityHtml(badges) {
   if (!badges || !badges.length) return "";
   return `<div class="qbadges">` + badges.map(b =>
@@ -918,7 +951,7 @@ function provPanel(d) {
     conflicts.forEach(c => {
       h += `<div class="cf"><div class="cf-field">${esc(c.field)}</div>` +
         c.values.map(v =>
-          `<div class="cf-val${v.is_headline ? " cf-head" : ""}" data-rank="${v.rank}">` +
+          `<div class="cf-val${v.is_headline ? " cf-head" : ""}" data-rank="${v.rank}" data-rank-known="${v.rank_known === true}" data-reliability-oov="${v.reliability_oov === true}">` +
           `<span class="cf-v">${esc(v.value)}</span>` +
           `<span class="cf-srcs">` + (v.sources.map(s => `<span class="cf-src">${esc(s.name)}${relBadge(s)}</span>`).join("") || "—") + `</span>` +
           (v.is_headline ? `<span class="cf-pick">chosen</span>` : "") + `</div>`).join("") + `</div>`;
@@ -935,7 +968,8 @@ function provPanel(d) {
 function wireProvFilter(root) {
   const cb = $("#prov-bfilter", root); if (!cb) return;
   cb.onchange = () => $$(".cf-val", root).forEach(el =>
-    el.classList.toggle("dim", cb.checked && (+el.dataset.rank) < 4));
+    el.classList.toggle("dim", cb.checked && el.dataset.rankKnown === "true" &&
+      el.dataset.reliabilityOov !== "true" && (+el.dataset.rank) < 4));
 }
 
 // Evidence section: the page's cited sources as graded, dated citations (not a bare list) —
@@ -955,13 +989,49 @@ function citationsHtml(cites) {
     `<div class="cite-list">${rows}</div></div>`;
 }
 
+function asList(label, items) {
+  if (!items || !items.length) return "";
+  return `<div class="as-block"><span class="as-label">${esc(label)}</span><ul>` +
+    items.map(x => `<li>${esc(x)}</li>`).join("") + `</ul></div>`;
+}
+
+function asEvidence(items) {
+  if (!items || !items.length) return "";
+  return `<div class="as-block"><span class="as-label">Claim-specific evidence</span><ul>` +
+    items.map(e => {
+      const host = (e.source || "").replace(/^https?:\/\//, "").split("/")[0];
+      const link = e.source ? ` <a class="as-src" href="${esc(e.source)}" target="_blank" rel="noopener">${esc(host)}</a>` : "";
+      return `<li>${esc(e.observation || "")}${link}` +
+        `${e.confidence ? ` <span class="as-meta">obs ${esc(e.confidence)}</span>` : ""}` +
+        `${e.lineage ? ` <span class="as-meta">${esc(e.lineage)}</span>` : ""}</li>`;
+    }).join("") + `</ul></div>`;
+}
+
+// An entity page used to show only a one-line claim, so the REASONING behind an assessment — why
+// this confidence, what else could explain it, what would move it — sat one click away and was
+// never read. Rendered here FROM the assessment, never copied into the entity: the assessment
+// stays the single source of truth and states its own scope (okengine#563).
 function assessmentPanel(rows) {
   if (!rows || !rows.length) return "";
-  return `<section class="actor-assessments"><div class="prov-head">CHE actor assessments <span class="bl-n">${rows.length}</span></div>` +
-    rows.map(row => `<a class="actor-assessment wl" data-page="${esc(row.path)}">` +
-      `<span><b>${esc(row.title)}</b><small>${esc(row.claim || "")}</small></span>` +
-      `<span class="assessment-state">${esc(row.status || "—")} · ${row.confidence == null ? "—" : row.confidence.toFixed(2)}${row.confidence_band ? ` (${esc(row.confidence_band)})` : ""}` +
-      `${row.needs_review ? ` · <em>needs review</em>` : ""}</span></a>`).join("") + `</section>`;
+  return `<section class="actor-assessments"><div class="prov-head">Assessments <span class="bl-n">${rows.length}</span></div>` +
+    rows.map(row => {
+      const conf = row.confidence == null ? "—" : row.confidence.toFixed(2);
+      const scope = [row.assessed_label, row.relationship_level].filter(Boolean).map(esc).join(" · ");
+      return `<article class="actor-assessment">` +
+        `<div class="as-head"><a class="wl" data-page="${esc(row.path)}"><b>${esc(row.title)}</b></a>` +
+        `<span class="assessment-state">${esc(row.status || "—")} · ${conf}` +
+        `${row.confidence_band ? ` (${esc(row.confidence_band)})` : ""}` +
+        `${row.needs_review ? ` · <em>needs review</em>` : ""}</span></div>` +
+        (row.claim ? `<p class="as-claim">${esc(row.claim)}</p>` : "") +
+        (scope ? `<p class="as-scope">${scope}` +
+          `${row.evidence_state ? ` · evidence ${esc(row.evidence_state)}` : ""}</p>` : "") +
+        (row.confidence_rationale ? `<p class="as-why">${esc(row.confidence_rationale)}</p>` : "") +
+        asEvidence(row.evidence) +
+        asList("Competing alternatives", row.alternatives) +
+        asList("Would increase confidence", row.would_increase_confidence) +
+        asList("Would decrease confidence", row.would_decrease_confidence) +
+        `</article>`;
+    }).join("") + `</section>`;
 }
 
 async function openPage(path, push = true) {
@@ -1030,18 +1100,63 @@ async function openDrill(tab, box, qs) {
     const d = await j(`/api/drill/${encodeURIComponent(tab)}/${encodeURIComponent(box)}?${qs}`);
     pageStack.length = 0;
     $("#ov-title").textContent = d.title || "Matches";
-    $("#ov-path").textContent = `${d.count} page${d.count === 1 ? "" : "s"}`;
+    // never let a capped list read as a complete one — say what was withheld (okengine#564)
+    const sections = Array.isArray(d.sections) ? d.sections.filter(s => Array.isArray(s.pages)) : [];
+    const shown = sections.length
+      ? Math.max(0, ...sections.map(s => s.pages.length))
+      : d.pages.length;
+    $("#ov-path").textContent = (d.count_label || `${d.count} page${d.count === 1 ? "" : "s"}`)
+      + (d.truncated ? ` — showing the first ${shown}` : "");
     $("#ov-dl").innerHTML = "";
     $("#ov-back").style.visibility = "hidden";
-    c.innerHTML = d.pages.length
-      ? `<div class="drill-list">` + d.pages.map(p =>
-          `<a class="wl drow" data-page="${esc(p.path)}"><span class="drow-t">${esc(p.title)}</span>` +
-          (p.type ? `<span class="drow-ty">${esc(p.type)}</span>` : "") + `</a>`).join("") + `</div>`
-      : `<div class="empty">no matching pages</div>`;
+    const allPages = sections.length ? sections.flatMap(s => s.pages) : d.pages;
+    const rows = pages => `<div class="drill-list">` + pages.map(p => {
+      const facts = Array.isArray(p.facts) ? p.facts.filter(f => f && f.value) : [];
+      const searchable = [p.title, p.type, p.summary, p.path,
+        ...facts.flatMap(f => [f.label, f.value])].filter(Boolean).join(" ").toLowerCase();
+      return `<article class="dresult" data-drill-result data-search="${esc(searchable)}">` +
+        `<header><a class="wl dresult-title" data-page="${esc(p.path)}">${esc(p.title)}</a>` +
+        (p.type ? `<span class="drow-ty">${esc(p.type)}</span>` : "") + `</header>` +
+        (p.summary ? `<p class="dresult-summary">${esc(p.summary)}</p>` : "") +
+        (facts.length ? `<dl class="dresult-facts">${facts.map(f =>
+          `<div><dt>${esc(f.label)}</dt><dd>${esc(f.value)}</dd></div>`).join("")}</dl>` : "") +
+        `<footer><a class="wl" data-page="${esc(p.path)}">Open record →</a>` +
+        `<button type="button" data-copy-path="${esc(p.path)}">Copy path</button></footer></article>`;
+    }).join("") + `</div>`;
+    const toolbar = allPages.length
+      ? `<div class="drill-tools"><label>Filter results<input type="search" data-drill-filter ` +
+        `placeholder="name, date, status, source…" autocomplete="off"></label>` +
+        `<span data-drill-visible>${allPages.length} shown</span></div>` : "";
+    c.innerHTML = toolbar + (sections.length
+      ? sections.map(s => `<section class="drill-section"><h3>${esc(s.title)}` +
+          `<span>${s.count}</span></h3>${rows(s.pages)}</section>`).join("")
+      : (d.pages.length ? rows(d.pages) : `<div class="empty">no matching pages</div>`));
+    const filter = c.querySelector("[data-drill-filter]");
+    if (filter) filter.oninput = () => {
+      const query = filter.value.trim().toLowerCase();
+      let visible = 0;
+      c.querySelectorAll("[data-drill-result]").forEach(row => {
+        row.hidden = !!query && !row.dataset.search.includes(query);
+        if (!row.hidden) visible++;
+      });
+      c.querySelectorAll(".drill-section").forEach(section => {
+        section.hidden = !section.querySelector("[data-drill-result]:not([hidden])");
+      });
+      const count = c.querySelector("[data-drill-visible]");
+      if (count) count.textContent = `${visible} shown`;
+    };
     c.scrollTop = 0;
   } catch (e) { c.innerHTML = `<div class='empty'>drilldown failed: ${esc(e.message)}</div>`; }
 }
 document.addEventListener("click", e => {
+  const copy = e.target.closest("[data-copy-path]");
+  if (copy) {
+    e.preventDefault();
+    navigator.clipboard?.writeText(copy.dataset.copyPath);
+    const prior = copy.textContent; copy.textContent = "Copied";
+    setTimeout(() => { copy.textContent = prior; }, 1200);
+    return;
+  }
   const el = e.target.closest("[data-drill]");
   if (!el) return;
   e.preventDefault();
@@ -1050,6 +1165,10 @@ document.addEventListener("click", e => {
     ? "item=" + encodeURIComponent(el.dataset.ditem)
     : "value=" + encodeURIComponent(el.dataset.dval || "");
   openDrill(el.dataset.dtab, el.dataset.dbox, qs);
+});
+document.addEventListener("keydown", e => {
+  const drill = e.target.closest && e.target.closest("[data-drill]");
+  if (drill && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); drill.click(); }
 });
 
 // ── global search ──────────────────────────────────────────────────────────
@@ -1105,7 +1224,9 @@ async function bootstrap() {
   REVIEW_ENABLED = !!cfg.review_enabled;
   if (cfg.tz) { CLOCK_TZ = cfg.tz; tick(); }   // clock -> deployment timezone (okengine#301)
   document.title = cfg.title || "cockpit";
-  $("#brand").innerHTML = `⬢ <span>${esc(cfg.short_title || cfg.title || "cockpit")}</span>`;
+  const brand = $("#brand");
+  brand.innerHTML = `⬢ <span>${esc(cfg.short_title || cfg.title || "cockpit")}</span>`;
+  brand.title = cfg.title || "cockpit";
   // the cockpit's function tabs (pack-driven) + the two general-purpose tabs from
   // okengine-reader: Browse is always present; Chat only when an agent is configured.
   const tabs = (cfg.tabs && cfg.tabs.length ? cfg.tabs.slice() : ["briefings"]);
@@ -1126,6 +1247,12 @@ async function bootstrap() {
   if (_streamParam) { showTab("briefings"); selectDoc(_streamParam, _q.get("date") || "__latest__", null); }
 }
 bootstrap();
+
+const navToggle = $("#nav-toggle");
+navToggle.onclick = () => {
+  const open = $("#tabs").classList.toggle("open");
+  navToggle.setAttribute("aria-expanded", open ? "true" : "false");
+};
 
 /* ── Text-size control (A−/A+ header) ── the cockpit's content (dashboards, ledger,
    detail panes) is styled in px, not rem, so scaling the root font-size only grew the

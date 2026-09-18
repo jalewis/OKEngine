@@ -42,7 +42,8 @@ def _lineages(items: list[dict]) -> set[str]:
     return {
         str(e.get("evidence_lineage") or "").strip()
         for e in items
-        if e.get("source_independence") in ("primary-direct", "independent-origin")
+        if isinstance(e, dict)
+        and e.get("source_independence") in ("primary-direct", "independent-origin")
         and str(e.get("evidence_lineage") or "").strip()
     }
 

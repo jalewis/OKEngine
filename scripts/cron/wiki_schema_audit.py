@@ -83,6 +83,7 @@ TYPE_RE = re.compile(r"^type:\s*(.+?)\s*$", re.M)
 # `cat -n file.md` output into a Write call. Repaired by stripping the prefix
 # per line; the audit just needs to detect and surface it.
 CAT_N_PREFIX_RE = re.compile(r"^\s*\d+\|")
+GLUED_CLOSE_RE = re.compile(r"^[A-Za-z_][\w-]*:[ \t]+.+?---[ \t]*$", re.MULTILINE)
 
 
 def parse_frontmatter(text: str) -> str | None:
@@ -104,6 +105,8 @@ def categorize_fm_failure(text: str) -> str:
     # FM but might use `---` as a horizontal rule mid-body.
     if not text.lstrip().startswith("---"):
         return "no-fm-block"
+    if GLUED_CLOSE_RE.search(text):
+        return "glued-close"
     # Starts with `---` but only one delimiter line found — FM opened, never closed
     delim_count = sum(1 for line in text.split("\n") if line.rstrip() == "---")
     if delim_count < 2:
@@ -186,7 +189,9 @@ def scan_wiki(wiki_dir: Path):
             continue
         # Skip backup / archive directories (e.g. wiki/entities.bak.YYYYMMDD-HHMMSS/)
         # so an in-tree snapshot doesn't pollute the live audit.
-        if any(".bak." in part or part.startswith(".") for part in path.parts):
+        # `_`-prefixed dirs are the same class this already excludes — `_logs/` archives,
+        # `predictions/_archive`, `entities/_` — and are skipped by every other corpus walker.
+        if any(".bak." in part or part.startswith((".", "_")) for part in path.parts):
             continue
         try:
             text = path.read_text(errors="replace")
@@ -231,6 +236,7 @@ def scan_wiki(wiki_dir: Path):
 _FM_FAILURE_NOTES = {
     "empty": "0-byte file. Either delete (check inbound `[[wikilinks]]` first) or stub with minimal `type:` + 1-line description.",
     "cat-n-prefix": "Cat-n line-number prefix (`     1|---`) baked into file content. Cause: a prior session pasted `cat -n` output into a Write call. Repair: strip `^\\s*\\d+\\|` per line — recursive if the prefix was applied twice.",
+    "glued-close": "Closing delimiter is glued to a scalar value (`tlp: CLEAR---`). Detach it onto a standalone `---` line after confirming the resulting YAML parses.",
     "unclosed-fm": "Frontmatter opened with `---` but never closed. Insert closing `---` before the body H1 (or at EOF if no body).",
     "no-fm-block": "No `---` delimiters at all. Likely a stray draft or incomplete page — add full frontmatter or remove.",
     "yaml-invalid": "Frontmatter delimiters present but YAML body fails `yaml.safe_load`. Page is invisible to every downstream that parses YAML (dashboards, wake-gates, the page catalog). Most common cause: `sources:` field with unquoted `[[wikilinks]]` in a JSON-style array, or mid-line truncation. Repair: rewrite the offending field as a multi-line YAML list (`sources:\\n  - \"[[sources/...]]\"`), or quote each wikilink in the inline array.",
@@ -253,7 +259,7 @@ def render_report(type_counts: Counter, type_files: dict, conformance_gaps: dict
             f"the schema audit and to wake-gates that filter by `type:` "
             f"(various ingest crons).**\n"
         )
-        for category in ("empty", "cat-n-prefix", "unclosed-fm", "yaml-invalid", "no-fm-block", "other"):
+        for category in ("empty", "cat-n-prefix", "glued-close", "unclosed-fm", "yaml-invalid", "no-fm-block", "other"):
             paths = fm_failures.get(category, [])
             if not paths:
                 continue

@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 yaml = pytest.importorskip("yaml")
+pytestmark = pytest.mark.integration
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -103,6 +104,106 @@ def test_multi_step_span_applies_in_order(tmp_path):
     assert _state(v)["pack_versions"]["okpack-mig"] == "0.3.0"
 
 
+def test_pack_migrations_checkpoint_each_completed_step_before_hard_kill(tmp_path):
+    m = _load("framework_upgrade")
+    v = _vault(tmp_path)
+    _migration(v, id_="stepA", frm="0.1.0", to="0.2.0")
+    d = v / "migrations"
+    (d / "m_0_2_0_0_3_0_stepB.py").write_text(
+        'ID = "stepB"\nFROM = "0.2.0"\nTO = "0.3.0"\nDESCRIPTION = "kill"\n'
+        'def apply(pack, dry_run):\n    raise SystemExit("simulated hard kill")\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match="hard kill"):
+        m.run_pack_migrations(v, "okpack-mig", "0.1.0", "0.3.0", apply=True)
+    state = _state(v)
+    assert state["pack_versions"]["okpack-mig"] == "0.2.0"
+    assert state["pack_applied"]["okpack-mig"] == ["stepA"]
+    assert "stepB" not in state["applied"]
+
+
+def test_pack_migration_resume_finishes_siblings_with_same_target(tmp_path):
+    """A crash between migrations for one release must not advance beyond its sibling."""
+    m = _load("framework_upgrade")
+    m.VALIDATOR = lambda p: (True, "ok (test)")
+    v = _vault(tmp_path)
+    _migration(v, id_="stepA", frm="0.1.0", to="0.2.0")
+    d = v / "migrations"
+    sibling = d / "m_0_1_0_0_2_0_stepB.py"
+    sibling.write_text(
+        'ID = "stepB"\nFROM = "0.1.0"\nTO = "0.2.0"\nDESCRIPTION = "kill"\n'
+        'def apply(pack, dry_run):\n    raise SystemExit("simulated hard kill")\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match="hard kill"):
+        m.run_pack_migrations(v, "okpack-mig", "0.1.0", "0.2.0", apply=True)
+    state = _state(v)
+    assert state["pack_versions"]["okpack-mig"] == "0.1.0"
+    assert state["pack_applied"]["okpack-mig"] == ["stepA"]
+
+    sibling.write_text(
+        'ID = "stepB"\nFROM = "0.1.0"\nTO = "0.2.0"\nDESCRIPTION = "resume"\n'
+        'def apply(pack, dry_run):\n'
+        '    if not dry_run: (pack / "MIGRATED-stepB.txt").write_text("done")\n'
+        '    return []\n',
+        encoding="utf-8",
+    )
+    assert m.run_pack_migrations(
+        v, "okpack-mig", m.installed_pack_version(v, "okpack-mig"), "0.2.0", apply=True
+    ) == 0
+    assert (v / "MIGRATED-stepB.txt").read_text() == "done"
+    state = _state(v)
+    assert state["pack_versions"]["okpack-mig"] == "0.2.0"
+    assert state["pack_applied"]["okpack-mig"] == ["stepA", "stepB"]
+
+
+def test_pack_migration_checkpoint_groups_semantically_equal_version_spellings(tmp_path):
+    """0.2.0 and v0.2.0 are one release target; a crash before the sibling must not advance."""
+    m = _load("framework_upgrade")
+    v = _vault(tmp_path)
+    _migration(v, id_="stepA", frm="0.1.0", to="0.2.0")
+    d = v / "migrations"
+    (d / "m_0_1_0_v0_2_0_stepB.py").write_text(
+        'ID = "stepB"\nFROM = "0.1.0"\nTO = "v0.2.0"\nDESCRIPTION = "kill"\n'
+        'def apply(pack, dry_run):\n    raise SystemExit("simulated hard kill")\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit, match="hard kill"):
+        m.run_pack_migrations(v, "okpack-mig", "0.1.0", "0.2.0", apply=True)
+    state = _state(v)
+    assert state["pack_versions"]["okpack-mig"] == "0.1.0"
+    assert state["pack_applied"]["okpack-mig"] == ["stepA"]
+
+
+def test_same_migration_id_in_two_packs_runs_both_transforms(tmp_path):
+    """IDs are unique within a pack, not globally across independently authored packs."""
+    m = _load("framework_upgrade")
+    m.VALIDATOR = lambda p: (True, "ok (test)")
+    v = _vault(tmp_path)
+    dirs = {}
+    for pack in ("pack-a", "pack-b"):
+        d = tmp_path / pack / "migrations"
+        d.mkdir(parents=True)
+        (d / "m_0_1_0_0_2_0_shared.py").write_text(
+            'ID = "shared-id"\nFROM = "0.1.0"\nTO = "0.2.0"\nDESCRIPTION = "test"\n'
+            f'def apply(vault, dry_run):\n'
+            f'    if not dry_run: (vault / "MIGRATED-{pack}.txt").write_text("done")\n'
+            f'    return []\n', encoding="utf-8")
+        dirs[pack] = d
+
+    for pack in ("pack-a", "pack-b"):
+        assert m.run_pack_migrations(v, pack, "0.1.0", "0.2.0", apply=True,
+                                     migrations_dir=dirs[pack]) == 0
+
+    assert (v / "MIGRATED-pack-a.txt").exists()
+    assert (v / "MIGRATED-pack-b.txt").exists()
+    state = _state(v)
+    assert state["pack_applied"] == {
+        "pack-a": ["shared-id"], "pack-b": ["shared-id"],
+    }
+
+
 def test_failing_migration_rolls_back_via_snapshot(tmp_path, capsys):
     m = _load("framework_upgrade")
     m.VALIDATOR = lambda p: (True, "ok (test)")
@@ -128,6 +229,189 @@ def test_validation_failure_rolls_back_and_keeps_span_pending(tmp_path, capsys):
     st = _state(v)
     assert (st.get("pack_versions") or {}).get("okpack-mig") != "0.2.0"
     assert "mig1" not in (st.get("applied") or [])
+
+
+def test_pack_migration_recomposes_schema_before_validation(tmp_path, monkeypatch):
+    m = _load("framework_upgrade")
+    v = _vault(tmp_path)
+    _migration(v, id_="mig1", frm="0.1.0", to="0.2.0")
+    marker = v / ".okengine" / "schema-recomposed"
+
+    def recompose(candidate):
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("fresh", encoding="utf-8")
+
+    monkeypatch.setattr(m, "RECOMPOSE_SCHEMA", recompose)
+    monkeypatch.setattr(
+        m,
+        "VALIDATOR",
+        lambda candidate: (marker.read_text(encoding="utf-8") == "fresh", "fresh schema"),
+    )
+    assert m.run_pack_migrations(v, "okpack-mig", "0.1.0", "0.2.0", apply=True) == 0
+
+
+def test_final_checkpoint_waits_for_recompose_and_retry_finishes_gates(tmp_path, monkeypatch):
+    m = _load("framework_upgrade")
+    v = _vault(tmp_path)
+    _migration(v, id_="mig1", frm="0.1.0", to="0.2.0")
+
+    def hard_kill(_candidate):
+        raise SystemExit("killed during recompose")
+
+    monkeypatch.setattr(m, "RECOMPOSE_SCHEMA", hard_kill)
+    with pytest.raises(SystemExit, match="recompose"):
+        m.run_pack_migrations(v, "okpack-mig", "0.1.0", "0.2.0", apply=True)
+    state = _state(v)
+    assert state["pack_versions"]["okpack-mig"] == "0.1.0"
+    assert state["pack_applied"]["okpack-mig"] == ["mig1"]
+
+    calls = []
+    monkeypatch.setattr(m, "RECOMPOSE_SCHEMA", lambda _candidate: calls.append("recompose"))
+    monkeypatch.setattr(m, "VALIDATOR", lambda _candidate: (calls.append("validate") or True, "ok"))
+    assert m.run_pack_migrations(v, "okpack-mig", "0.1.0", "0.2.0", apply=True) == 0
+    assert calls == ["recompose", "validate"]
+    assert _state(v)["pack_versions"]["okpack-mig"] == "0.2.0"
+
+
+def test_rollback_plan_is_durable_before_recompose(tmp_path, monkeypatch):
+    m = _load("framework_upgrade")
+    v = _vault(tmp_path)
+    _migration(v, id_="mig1", frm="0.1.0", to="0.2.0")
+
+    def inspect_plan(_candidate):
+        snapshots = list((v / ".okengine" / "snapshots").glob("*/rollback-plan.json"))
+        assert snapshots and snapshots[0].is_file()
+
+    monkeypatch.setattr(m, "RECOMPOSE_SCHEMA", inspect_plan)
+    monkeypatch.setattr(m, "VALIDATOR", lambda _candidate: (True, "ok"))
+    assert m.run_pack_migrations(v, "okpack-mig", "0.1.0", "0.2.0", apply=True) == 0
+
+
+def test_keyboard_interrupt_during_validation_rolls_back(tmp_path, monkeypatch):
+    m = _load("framework_upgrade")
+    v = _vault(tmp_path)
+    _migration(v, id_="mig1", frm="0.1.0", to="0.2.0")
+    monkeypatch.setattr(m, "VALIDATOR", lambda _candidate: (_ for _ in ()).throw(KeyboardInterrupt()))
+
+    assert m.run_pack_migrations(v, "okpack-mig", "0.1.0", "0.2.0", apply=True) == 1
+    assert not (v / "MIGRATED-mig1.txt").exists()
+    assert (_state(v).get("pack_versions") or {}).get("okpack-mig") != "0.2.0"
+
+
+def test_intermediate_only_hard_kill_retry_finishes_gates(tmp_path, monkeypatch):
+    m = _load("framework_upgrade")
+    v = _vault(tmp_path)
+    _migration(v, id_="mig1", frm="0.1.0", to="0.1.5")
+    monkeypatch.setattr(
+        m, "RECOMPOSE_SCHEMA",
+        lambda _candidate: (_ for _ in ()).throw(SystemExit("killed during recompose")),
+    )
+    with pytest.raises(SystemExit, match="recompose"):
+        m.run_pack_migrations(v, "okpack-mig", "0.1.0", "0.2.0", apply=True)
+    assert _state(v)["pack_versions"]["okpack-mig"] == "0.1.5"
+
+    calls = []
+    monkeypatch.setattr(m, "RECOMPOSE_SCHEMA", lambda _candidate: calls.append("recompose"))
+    monkeypatch.setattr(m, "VALIDATOR", lambda _candidate: (calls.append("validate") or True, "ok"))
+    assert m.run_pack_migrations(v, "okpack-mig", "0.1.5", "0.2.0", apply=True) == 0
+    assert calls == ["recompose", "validate"]
+    assert _state(v)["pack_versions"]["okpack-mig"] == "0.2.0"
+
+
+def test_intermediate_checkpoint_before_plan_is_recovered(tmp_path, monkeypatch):
+    m = _load("framework_upgrade")
+    v = _vault(tmp_path)
+    _migration(v, id_="mig1", frm="0.1.0", to="0.1.5")
+    original_added = m.added_since_snapshot
+    monkeypatch.setattr(
+        m, "added_since_snapshot",
+        lambda *_args: (_ for _ in ()).throw(SystemExit("killed before rollback plan")),
+    )
+    with pytest.raises(SystemExit, match="rollback plan"):
+        m.run_pack_migrations(v, "okpack-mig", "0.1.0", "0.2.0", apply=True)
+    assert _state(v)["pack_versions"]["okpack-mig"] == "0.1.5"
+
+    calls = []
+    monkeypatch.setattr(m, "added_since_snapshot", original_added)
+    monkeypatch.setattr(m, "RECOMPOSE_SCHEMA", lambda _candidate: calls.append("recompose"))
+    monkeypatch.setattr(m, "VALIDATOR", lambda _candidate: (calls.append("validate") or True, "ok"))
+    assert m.run_pack_migrations(v, "okpack-mig", "0.1.5", "0.2.0", apply=True) == 0
+    assert calls == ["recompose", "validate"]
+    assert _state(v)["pack_versions"]["okpack-mig"] == "0.2.0"
+
+
+@pytest.mark.parametrize("finding", ["conformance", "unknown"])
+def test_recovery_gate_failure_restores_unfinished_snapshot(tmp_path, monkeypatch, finding):
+    m = _load("framework_upgrade")
+    v = _vault(tmp_path)
+    _migration(v, id_="mig1", frm="0.1.0", to="0.1.5")
+    monkeypatch.setattr(
+        m, "RECOMPOSE_SCHEMA",
+        lambda _candidate: (_ for _ in ()).throw(SystemExit("kill")),
+    )
+    with pytest.raises(SystemExit):
+        m.run_pack_migrations(v, "okpack-mig", "0.1.0", "0.2.0", apply=True)
+    monkeypatch.setattr(m, "RECOMPOSE_SCHEMA", lambda _candidate: None)
+    monkeypatch.setattr(m, "VALIDATOR", lambda _candidate: (True, "ok"))
+    monkeypatch.setattr(
+        m, "_conformance_regressions", lambda *_args, **_kwargs: ["bad"]
+        if finding == "conformance" else [],
+    )
+    monkeypatch.setattr(
+        m, "_unknown_type_regressions", lambda *_args, **_kwargs: ["unknown"]
+        if finding == "unknown" else [],
+    )
+    assert m.run_pack_migrations(v, "okpack-mig", "0.1.5", "0.2.0", apply=True) == 1
+    assert not (v / "MIGRATED-mig1.txt").exists()
+    assert (_state(v).get("pack_versions") or {}).get("okpack-mig") != "0.2.0"
+
+
+def test_recovery_exception_restores_unfinished_snapshot(tmp_path, monkeypatch):
+    m = _load("framework_upgrade")
+    v = _vault(tmp_path)
+    _migration(v, id_="mig1", frm="0.1.0", to="0.1.5")
+    monkeypatch.setattr(
+        m, "RECOMPOSE_SCHEMA",
+        lambda _candidate: (_ for _ in ()).throw(SystemExit("kill")),
+    )
+    with pytest.raises(SystemExit):
+        m.run_pack_migrations(v, "okpack-mig", "0.1.0", "0.2.0", apply=True)
+    monkeypatch.setattr(
+        m, "RECOMPOSE_SCHEMA",
+        lambda _candidate: (_ for _ in ()).throw(RuntimeError("recompose failed")),
+    )
+    assert m.run_pack_migrations(v, "okpack-mig", "0.1.5", "0.2.0", apply=True) == 1
+    assert not (v / "MIGRATED-mig1.txt").exists()
+
+
+@pytest.mark.parametrize("gate_result", ["exception", "failed"])
+def test_checkpoint_only_recovery_failure_needs_no_snapshot_rollback(
+        tmp_path, monkeypatch, gate_result):
+    """A checkpoint can survive without a snapshot; recovery still fails cleanly."""
+    m = _load("framework_upgrade")
+    v = _vault(tmp_path)
+    _migration(v, id_="mig1", frm="0.1.0", to="0.2.0")
+    state_path = v / ".okengine" / "migrations-state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({
+        "pack_versions": {"okpack-mig": "0.1.0"},
+        "pack_applied": {"okpack-mig": ["mig1"]},
+    }))
+    monkeypatch.setattr(m, "_unfinished_pack_snapshot", lambda *_args: None)
+    if gate_result == "exception":
+        monkeypatch.setattr(
+            m,
+            "RECOMPOSE_SCHEMA",
+            lambda _candidate: (_ for _ in ()).throw(RuntimeError("recompose failed")),
+        )
+    else:
+        monkeypatch.setattr(m, "RECOMPOSE_SCHEMA", lambda _candidate: None)
+        monkeypatch.setattr(m, "VALIDATOR", lambda _candidate: (False, "invalid"))
+
+    assert m.run_pack_migrations(
+        v, "okpack-mig", "0.1.0", "0.2.0", apply=True,
+    ) == 1
+    assert _state(v)["pack_versions"]["okpack-mig"] == "0.1.0"
 
 
 def test_unknown_installed_version_baselines_never_replays(tmp_path, capsys):

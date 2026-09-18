@@ -24,7 +24,7 @@ from typing import Optional
 
 try:
     import yaml
-except Exception:  # pragma: no cover
+except Exception:  # pragma: no cover - yaml is a runtime dep; the guard is belt-and-braces
     yaml = None
 
 _FM_RE = re.compile(r"\A---[ \t]*\n(.*?\n)---", re.S)
@@ -54,7 +54,7 @@ _DEFAULT_TIER = {
 _TIERS = ("hot", "warm", "cold")
 
 
-def load_cfg(vault: Path) -> dict:
+def load_cfg(vault: Path, namespace: str = "") -> dict:
     """The COMPOSED `tier:` block (engine base-schema ⊕ pack schema.yaml), read through the SAME
     composer select_daily_brief / pred_lib.OPEN_VALUES / the write path / the cockpit consume
     (schema_lib.merged_schema) — so a pack that OMITS `tier:` inherits the engine-core tier instead of
@@ -63,13 +63,16 @@ def load_cfg(vault: Path) -> dict:
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import schema_lib
-        tier = (schema_lib.merged_schema(Path(vault)) or {}).get("tier")
+        merged = (schema_lib.merged_schema(Path(vault), namespace=namespace)
+                  if namespace else schema_lib.merged_schema(Path(vault)))
+        tier = (merged or {}).get("tier")
         if isinstance(tier, dict) and tier:
             return tier
     except Exception:
         pass
     if yaml is not None:
-        sp = Path(vault) / "schema.yaml"
+        sp = (Path(vault) / "wiki" / namespace / "schema.yaml"
+              if namespace else Path(vault) / "schema.yaml")
         if sp.is_file():
             try:
                 sch = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}

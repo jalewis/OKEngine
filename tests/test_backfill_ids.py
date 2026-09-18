@@ -2,6 +2,7 @@
 is idempotent, never recomputes, and disambiguates slug collisions.
 """
 import importlib.util
+import runpy
 import sys
 from pathlib import Path
 
@@ -88,3 +89,48 @@ def test_dry_run_writes_nothing(tmp_path):
     res = m.run(tmp_path, apply=False)
     assert res["stamped"] == 1
     assert _id_of(ve) is None                          # nothing written in dry run
+
+
+def test_parse_skip_missing_vault_and_authority_collision(tmp_path):
+    m = _load()
+    assert m.run(tmp_path, apply=True)["stamped"] == 0
+    assert m._parse_fm("plain") == (None, None)
+    fm, match = m._parse_fm("---\n[\n---\n")
+    assert fm is None and match is not None
+    fm, _ = m._parse_fm("---\n- one\n---\n")
+    assert fm == {}
+    for name in ("index.md", "README.md", "_private.md", ".hidden.md", "x.bak.1.md", "schema.yaml"):
+        assert m._skip(Path(name))
+    assert not m._skip(Path("page.md"))
+
+    _schema(tmp_path)
+    (tmp_path / "wiki" / "_private.md").write_text("ignored")
+    a = _page(tmp_path, "attack-pattern/a.md",
+              "type: attack-pattern\ntechnique_id: T1059")
+    b = _page(tmp_path, "attack-pattern/b.md",
+              "type: attack-pattern\ntechnique_id: T1059")
+    invalid = tmp_path / "wiki" / "entities" / "invalid.md"
+    invalid.parent.mkdir(parents=True)
+    invalid.write_text("plain")
+    result = m.run(tmp_path, apply=True)
+    assert result["skipped"] == 1
+    assert len(result["authority_collisions"]) == 1
+    assert _id_of(a) == _id_of(b) == "mitre:t1059"
+
+
+def test_main_reports_collision_kinds_and_entrypoint(monkeypatch, tmp_path, capsys):
+    m = _load()
+    monkeypatch.setattr(m, "run", lambda *_a: {
+        "stamped": 2, "skipped": 1,
+        "authority_collisions": [("mitre:x", "a", "b")],
+        "slug_collisions": [("entities:x-abc", "c", "")],
+    })
+    assert m.main(["--vault", str(tmp_path), "--apply"]) == 0
+    out = capsys.readouterr().out
+    assert "APPLIED" in out and "AUTHORITY-ID DUPLICATE" in out
+    assert "slug collision disambiguated" in out
+
+    monkeypatch.setattr(sys, "argv", [str(MOD), "--vault", str(tmp_path)])
+    with pytest.raises(SystemExit) as exc:
+        runpy.run_path(str(MOD), run_name="__main__")
+    assert exc.value.code == 0

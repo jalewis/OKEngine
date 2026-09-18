@@ -8,7 +8,7 @@ beyond the evidence shown.
 are already fetched and printed; do not re-fetch each prediction page individually unless you
 need to read a specific page's `## Evidence log` to explain what changed on it this week.
 
-Write via mcp_okengine_write_create_entity to the wiki-relative path the wake-gate specified,
+Write via mcp__okengine_write_okengine_predictions_forecast_review__create_entity to the wiki-relative path the wake-gate specified,
 frontmatter `type: dashboard, title: "Forecast review — <date>", updated: <date>`. Body:
 
 ```

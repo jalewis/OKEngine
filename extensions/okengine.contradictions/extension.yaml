@@ -32,6 +32,6 @@ capabilities:
   delivery: false
 
 operation:
-  schedule: {kind: cron, expr: "0 4 * * *"}   # daily 04:00 (was the contradictions-refresh engine cron)
+  schedule: {kind: cron, expr: "@jitter:daily@4"}   # daily near 04:00, per-install minute
   entrypoint: {script: select_contradictions.py}
   timeout: 600

@@ -26,6 +26,7 @@ def test_cosine_bounds():
     assert m.cosine(a, m.vectorize("delta epsilon")) == 0.0      # disjoint
     mid = m.cosine(a, m.vectorize("alpha beta delta"))
     assert 0.0 < mid < 1.0                                       # partial overlap
+    assert m.cosine(m.vectorize(""), a) == 0.0
 
 
 def test_find_similar_pairs_threshold_and_order():
@@ -55,3 +56,26 @@ def test_manifest_generates_hardened_service():
     svc = c.render_sidecar_service(spec, "u", "u", "R", "W")
     assert "network_mode" not in svc and svc["cap_drop"] == ["ALL"]
     assert svc["read_only"] is True and "no-new-privileges:true" in svc["security_opt"]
+
+
+def test_reference_sidecar_env_publish_and_main(monkeypatch, capsys):
+    m = _run()
+    monkeypatch.delenv("OKENGINE_MCP_URL", raising=False)
+    assert m._require_env("OKENGINE_MCP_URL") == ""
+    assert "absent" in capsys.readouterr().err
+    monkeypatch.setenv("OKENGINE_MCP_URL", "http://read")
+    monkeypatch.setenv("OKENGINE_READ_TOKEN", "r")
+    assert m.fetch_entities() == []
+
+    monkeypatch.setenv("OKENGINE_WRITE_MCP_URL", "http://write")
+    monkeypatch.setenv("OKENGINE_WRITE_TOKEN", "w")
+    m.publish([("a", "b", 0.999)] * 51)
+    output = capsys.readouterr().out
+    assert "51 semantic" in output and output.count("a  ~  b") == 50
+
+    monkeypatch.setenv("OKENGINE_CONFIG_THRESHOLD", "0.75")
+    monkeypatch.setenv("OKENGINE_EXTENSION_ID", "demo.embedding")
+    monkeypatch.setattr(m, "fetch_entities", lambda: [("a", "same"), ("b", "same")])
+    assert m.main() == 0
+    output = capsys.readouterr().out
+    assert "[demo.embedding]" in output and "threshold=0.75" in output

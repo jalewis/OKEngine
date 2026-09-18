@@ -36,7 +36,7 @@ def _manifest(ext_id, trust):
     return {"id": ext_id, "kind": "operation", "version": "0.1.0", "trust": trust,
             "requires": {"engine": ">=0.3.0"},
             "capabilities": {"read": ["wiki/**"], "write": [ext_id.split(".")[-1] + "/**"]},
-            "operation": {"schedule": {"kind": "cron", "expr": "0 4 * * *"}, "entrypoint": ep}}
+            "operation": {"schedule": {"kind": "cron", "expr": "@jitter:daily@4"}, "entrypoint": ep}}
 
 
 def _operator_ext(pack, ext_id, trust="in-gateway"):

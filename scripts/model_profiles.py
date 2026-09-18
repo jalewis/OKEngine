@@ -10,15 +10,15 @@ A profile is a fully-specified endpoint:
 
     # <pack>/.okengine/model-profiles.yaml   (operator/deployment tier, like extension-prompts.json)
     profiles:
-      reasoning: {provider: custom, base_url: http://host-a:11436/v1, model: qwen3.5:27b, ollama_num_ctx: 65536}
-      bulk:      {provider: custom, base_url: http://host-b:11436/v1, model: qwen3.5:9b,  ollama_num_ctx: 65536}
-      light:     {provider: custom, base_url: http://host-b:11436/v1, model: qwen3.5:4b,  ollama_num_ctx: 32768}
+      reasoning: {provider: custom, base_url: http://host-a:11436/v1, model: qwen3-coder:30b, ollama_num_ctx: 81920}
+      bulk:      {provider: custom, base_url: http://host-b:11436/v1, model: qwen3-coder:30b, ollama_num_ctx: 81920}
+      light:     {provider: custom, base_url: http://host-b:11436/v1, model: local-small,      ollama_num_ctx: 32768}
 
 A lane opts in with an `@`-sigil reference, e.g. `model: "@reasoning"`. At deploy the reference
 is expanded into the concrete `model` / `provider` / `base_url` (+ `ollama_num_ctx`) fields the
 cron-plus scheduler forwards to Hermes' `run_job()`.
 
-The `@` sigil disambiguates intent from a literal model name: a *bare* string (`qwen3.5:9b`,
+The `@` sigil disambiguates intent from a literal model name: a *bare* string (`qwen3-coder:30b`,
 `openai/gpt-oss-120b:free`) is a literal model — passed through UNCHANGED (backward compatible).
 An `@name` that no profile defines is a fail-loud error (a typo'd/stale reference must not
 silently fall back to the default model).
@@ -36,8 +36,52 @@ from __future__ import annotations
 from pathlib import Path
 
 # Fields a profile may set on a job. `model` is required; the rest are optional.
-PROFILE_FIELDS = ("provider", "base_url", "model", "ollama_num_ctx")
+# okengine#478: model_concurrency belongs on the PROFILE, not just the job.
+# cron-plus serialises agent jobs sharing one provider|base_url|model identity, defaulting
+# to ONE slot. That default protects a single-slot LOCAL server. For a CLOUD endpoint it is
+# arbitrary and needlessly serialising: two lanes pinned to the same hosted model queued
+# behind each other for 40s+ with no capacity reason. Declaring concurrency once, next to
+# the endpoint it describes, is the right home for it — every lane referencing the profile
+# inherits it.
+PROFILE_FIELDS = ("provider", "base_url", "model", "ollama_num_ctx", "model_concurrency")
 SIGIL = "@"
+
+
+def is_qwen_coder(model) -> bool:
+    """Whether a model id is a Qwen Coder family model.
+
+    Keep this deliberately narrow: the P0 no-fallback policy applies to the local
+    coding/agentic pool, not every model whose name happens to contain ``qwen``.
+    """
+    return isinstance(model, str) and "qwen" in model.lower() and "coder" in model.lower()
+
+
+def validate_qwen_no_fallback(config: dict, jobs: list[dict] | None = None) -> list[str]:
+    """Reject an effective fallback chain on any Qwen Coder execution path.
+
+    Hermes' fallback list is global. Consequently a fallback configured for some
+    other lane is still reachable by a job that explicitly selects a local Qwen
+    profile. Until model-scoped fallback chains exist, Qwen Coder plus any global
+    fallback is unsafe and must fail before deployment.
+    """
+    if not isinstance(config, dict):
+        return []
+    fallbacks = config.get("fallback_providers") or []
+    if not fallbacks:
+        return []
+    primary = config.get("model") or {}
+    qwen_paths = []
+    if isinstance(primary, dict) and is_qwen_coder(primary.get("default")):
+        qwen_paths.append("config model.default")
+    for job in jobs or []:
+        if isinstance(job, dict) and is_qwen_coder(job.get("model")):
+            qwen_paths.append(f"job {job.get('name')!r}")
+    if not qwen_paths:
+        return []
+    return [
+        "Qwen Coder must run with fallback_providers: [] (no fallback for now); "
+        f"configured fallback chain is reachable from {', '.join(qwen_paths[:5])}"
+    ]
 
 
 def is_ref(model) -> bool:
@@ -112,6 +156,11 @@ def validate_profiles(profiles: dict) -> list[str]:
             errors.append(f"model profile {name!r}: missing required 'model'")
         if spec.get("provider") == "custom" and not spec.get("base_url"):
             errors.append(f"model profile {name!r}: provider 'custom' requires 'base_url'")
+        ctx = spec.get("ollama_num_ctx")
+        if ctx is not None and (
+            isinstance(ctx, bool) or not isinstance(ctx, int) or ctx <= 0
+        ):
+            errors.append(f"model profile {name!r}: ollama_num_ctx must be a positive integer")
         unknown = [k for k in spec if k not in PROFILE_FIELDS]
         if unknown:
             errors.append(f"model profile {name!r}: unknown field(s) {unknown} "

@@ -1,6 +1,7 @@
 """framework upgrade — pin reconciliation + migration registry + state (okengine#66 Phase 1)."""
 import importlib.util
 import json
+import os
 import pytest
 from pathlib import Path
 
@@ -108,6 +109,17 @@ def test_broken_migration_fails_loud(tmp_path):
         assert False, "expected RuntimeError"
     except RuntimeError as e:
         assert "m_bad.py" in str(e)
+
+
+def test_migration_without_stable_id_fails_before_it_can_be_renamed_and_replayed(tmp_path):
+    m = _mod()
+    md = tmp_path / "migs"; md.mkdir()
+    (md / "m_rename_me.py").write_text(
+        "FROM='v0.4.0'\nTO='v0.5.0'\ndef apply(pack, dry): return []\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="stable non-empty ID"):
+        m.load_migrations(md)
 
 
 # --- apply + state idempotency ----------------------------------------------
@@ -254,6 +266,47 @@ def test_pack_migration_overrides_engine_by_id(tmp_path):
     assert (pack / "PACK.txt").exists() and not (pack / "ENGINE.txt").exists()   # pack won
 
 
+def test_removed_pack_override_fails_loud_on_engine_provenance_change(tmp_path):
+    """An applied pack override must never make the engine implementation look applied forever."""
+    m, meta = _mod(), _meta()
+    pack = _pack(tmp_path, "v0.4.0")
+    eng = _transform_migration(
+        tmp_path / "eng", id_="dup", frm="v0.4.0", to="v0.5.0", target="ENGINE.txt"
+    )
+    pack_dir = m.pack_migrations_dir(pack)
+    _transform_migration(
+        pack_dir, id_="dup", frm="v0.4.0", to="v0.5.0", target="PACK.txt"
+    )
+    selected = m.load_all_migrations(eng, pack)
+    plan = m.plan_upgrade(pack, "v0.5.0", None, selected, meta)
+    m.apply_upgrade(pack, plan, "t0")
+    state = json.loads((pack / m.STATE_REL).read_text())
+    assert state["applied_provenance"]["dup"]["tier"] == "pack-override"
+    assert state["applied_provenance"]["dup"]["sha256"].startswith("sha256:")
+
+    (pack_dir / "m_dup.py").unlink()
+    (pack / "engine.version").write_text("version: v0.4.0\n", encoding="utf-8")
+    engine_only = m.load_all_migrations(eng, pack)
+
+    with pytest.raises(ValueError, match="provenance changed.*pack-override.*engine"):
+        m.plan_upgrade(pack, "v0.5.0", None, engine_only, meta)
+
+
+def test_legacy_id_only_migration_state_remains_compatible(tmp_path):
+    m, meta = _mod(), _meta()
+    pack = _pack(tmp_path, "v0.4.0")
+    (pack / m.STATE_REL).parent.mkdir(parents=True)
+    (pack / m.STATE_REL).write_text('{"applied": ["legacy"]}\n', encoding="utf-8")
+    eng = _transform_migration(
+        tmp_path / "eng", id_="legacy", frm="v0.4.0", to="v0.5.0"
+    )
+
+    plan = m.plan_upgrade(pack, "v0.5.0", None, m.load_all_migrations(eng, pack), meta)
+
+    assert plan.migrations == []
+    assert plan.already_applied == ["legacy"]
+
+
 def test_pack_migration_diff_toversion_id_collision_fails_loud(tmp_path):  # invariant-audit B5.2
     """A pack migration reusing an ENGINE migration's id but with a DIFFERENT to_version is an
     accidental collision that would silently suppress the engine migration forever. Fail loud."""
@@ -263,6 +316,18 @@ def test_pack_migration_diff_toversion_id_collision_fails_loud(tmp_path):  # inv
     _transform_migration(m.pack_migrations_dir(pack), id_="dup", frm="v0.5.0", to="v0.6.0", target="PACK.txt")
     with pytest.raises(SystemExit, match="collides with the ENGINE"):
         m.load_all_migrations(eng, pack)
+
+
+def test_duplicate_pack_local_migration_id_fails_loud(tmp_path):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    pack_dir = m.pack_migrations_dir(pack)
+    _transform_migration(pack_dir, id_="duplicate", frm="v0.4.0", to="v0.5.0")
+    first = pack_dir / "m_duplicate.py"
+    (pack_dir / "m_duplicate_second.py").write_text(
+        first.read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(SystemExit, match="duplicate pack migration id 'duplicate'"):
+        m.load_all_migrations(tmp_path / "no-engine-migrations", pack)
 
 
 def test_roll_forward_gate_samples_page_conformance(tmp_path, monkeypatch):  # invariant-audit B5.3
@@ -294,6 +359,50 @@ def test_main_apply_gate_passes_returns_zero(tmp_path, monkeypatch):
     assert m.main([str(pack), "--apply", "--migrations-dir", str(tmp_path / "none")]) == 0
 
 
+def test_main_recomposes_schema_before_roll_forward_validation(tmp_path, monkeypatch):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.1.0")
+    marker = pack / ".okengine" / "schema-recomposed"
+
+    def recompose(candidate):
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("fresh", encoding="utf-8")
+
+    monkeypatch.setattr(m, "RECOMPOSE_SCHEMA", recompose)
+    monkeypatch.setattr(
+        m,
+        "VALIDATOR",
+        lambda candidate: (marker.read_text(encoding="utf-8") == "fresh", "fresh schema"),
+    )
+    assert m.main([str(pack), "--apply", "--migrations-dir", str(tmp_path / "none")]) == 0
+
+
+def test_main_recompose_failure_rolls_back_upgrade(tmp_path, monkeypatch):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+
+    def fail_recompose(candidate):
+        raise RuntimeError("composed schema is invalid")
+
+    monkeypatch.setattr(m, "RECOMPOSE_SCHEMA", fail_recompose)
+    rc = m.main([str(pack), "--apply", "--migrations-dir", str(tmp_path / "none")])
+    assert rc == 1
+    assert m.read_pin(pack)[0] == "v0.4.0", "failed recomposition must restore the old pin"
+
+
+def test_recompose_removes_stale_artifact_when_no_schema_extensions_remain(tmp_path):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    (pack / "schema.yaml").write_text("types: {}\n", encoding="utf-8")
+    artifact = pack / ".okengine" / "composed-schema.yaml"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("types:\n  stale: {}\n", encoding="utf-8")
+
+    m._recompose_schema(pack)
+
+    assert not artifact.exists(), "upgrade must not leave a stale generated taxonomy in force"
+
+
 def test_main_no_validate_skips_gate(tmp_path, monkeypatch):
     m = _mod()
     pack = _pack(tmp_path, "v0.1.0")
@@ -312,14 +421,68 @@ def test_snapshot_copies_source_excludes_runtime(tmp_path):
     (pack / "data").mkdir(); (pack / "data" / "reference.json").write_text('{"version": 1}\n')
     (pack / ".git").mkdir(); (pack / ".git" / "HEAD").write_text("ref")
     (pack / ".hermes-data").mkdir(); (pack / ".hermes-data" / "big.log").write_text("noise")
+    (pack / ".hermes-data" / "config.yaml").write_text("model: deepseek-v4-pro\n")
     snap = m.snapshot(pack, "snap1", {"to": "v0.5.0"})
     tree = snap / "tree"
     assert (tree / "schema.yaml").read_text() == "x: 1\n"
     assert (tree / "data" / "reference.json").read_text() == '{"version": 1}\n'
     assert (tree / "engine.version").exists()
     assert not (tree / ".git").exists()                  # VCS excluded
-    assert not (tree / ".hermes-data").exists()          # runtime excluded
+    assert (tree / ".hermes-data" / "config.yaml").read_text() == "model: deepseek-v4-pro\n"
+    assert not (tree / ".hermes-data" / "big.log").exists()  # other runtime remains excluded
     assert json.loads((snap / "manifest.json").read_text())["to"] == "v0.5.0"
+
+
+def test_runtime_config_migration_is_rollback_scoped(tmp_path):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.13.8")
+    config = pack / ".hermes-data" / "config.yaml"
+    config.parent.mkdir()
+    config.write_text("model: deepseek-v4-pro\n")
+    snap = m.snapshot(pack, "deepseek-config")
+
+    config.write_text("model: deepseek-flash\n")
+    modified = m.changed_since_snapshot(pack, snap)
+    m.restore(pack, snap, added=m.added_since_snapshot(pack, snap), modified=modified)
+
+    assert config.read_text() == "model: deepseek-v4-pro\n"
+
+
+def test_snapshot_preserves_dangling_and_external_symlinks_without_following(tmp_path):
+    """Runtime links must not make a safe upgrade impossible or copy external target bytes."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    external = tmp_path / "outside-secret"
+    external.write_text("must not be copied")
+    links = pack / ".okengine" / "demo"
+    links.mkdir(parents=True)
+    (links / "SingletonCookie").symlink_to("/missing/chromium-cookie")
+    (links / "external").symlink_to(external)
+
+    snap = m.snapshot(pack, "symlinks")
+    dangling = snap / "tree" / ".okengine" / "demo" / "SingletonCookie"
+    external_copy = snap / "tree" / ".okengine" / "demo" / "external"
+    assert dangling.is_symlink()
+    assert os.readlink(dangling) == "/missing/chromium-cookie"
+    assert external_copy.is_symlink()
+    assert os.readlink(external_copy) == str(external)
+    assert not (snap / "tree" / "outside-secret").exists()
+
+
+def test_restore_recreates_dangling_symlink_without_following_target(tmp_path):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    link = pack / "SingletonCookie"
+    link.symlink_to("/missing/original")
+    snap = m.snapshot(pack, "symlink-restore")
+    link.unlink()
+    link.symlink_to("/missing/changed")
+
+    modified = m.changed_since_snapshot(pack, snap)
+    assert Path("SingletonCookie") in modified
+    m.restore(pack, snap, added=set(), modified=modified)
+    assert link.is_symlink()
+    assert os.readlink(link) == "/missing/original"
 
 
 def test_restore_reverts_pack_data_source(tmp_path):
@@ -334,7 +497,8 @@ def test_restore_reverts_pack_data_source(tmp_path):
     source.write_text('{"version": 2}\n')
     added = pack / "data" / "migration-added.json"
     added.write_text('{"new": true}\n')
-    m.restore(pack, snap)
+    m.restore(pack, snap, added=m.added_since_snapshot(pack, snap),
+              modified=m.changed_since_snapshot(pack, snap))
 
     assert source.read_text() == '{"version": 1}\n'
     assert not added.exists()
@@ -349,10 +513,67 @@ def test_restore_reverts_modify_add_delete(tmp_path):
     (pack / "keep.txt").write_text("CHANGED")            # modify
     (pack / "added.txt").write_text("new")               # add
     (pack / "gone.txt").unlink()                         # delete
-    m.restore(pack, snap)
+    m.restore(pack, snap, added=m.added_since_snapshot(pack, snap),
+              modified=m.changed_since_snapshot(pack, snap))
     assert (pack / "keep.txt").read_text() == "orig"     # reverted
     assert not (pack / "added.txt").exists()             # added file removed
     assert (pack / "gone.txt").read_text() == "present"  # deleted file recreated
+
+
+def test_restore_without_frozen_scope_is_refused(tmp_path):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    snap = m.snapshot(pack, "unsafe-default")
+    (pack / "live-write.md").write_text("later MCP content")
+
+    with pytest.raises(ValueError, match="requires explicit migration added/modified sets"):
+        m.restore(pack, snap)
+
+    assert (pack / "live-write.md").read_text() == "later MCP content"
+
+
+def test_manual_snapshot_restore_uses_persisted_post_image_and_quarantines_additions(tmp_path):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    original = pack / "schema.yaml"
+    original.write_text("before\n")
+    snap = m.snapshot(pack, "manual-safe")
+    original.write_text("migrated\n")
+    added = pack / "migration-added.txt"
+    added.write_text("migration output\n")
+    added_set = m.added_since_snapshot(pack, snap)
+    modified_set = m.changed_since_snapshot(pack, snap)
+    m.record_rollback_plan(pack, snap, added_set, modified_set)
+
+    assert m.main([str(pack), "--restore-snapshot", "manual-safe"]) == 0
+
+    assert original.read_text() == "before\n"
+    assert not added.exists()
+    assert (pack / ".okengine/rolled-back/manual-safe/migration-added.txt").read_text() \
+        == "migration output\n"
+
+
+def test_manual_snapshot_restore_refuses_all_changes_when_post_image_drifted(
+        tmp_path, capsys):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    original = pack / "schema.yaml"
+    original.write_text("before\n")
+    snap = m.snapshot(pack, "manual-conflict")
+    original.write_text("migrated\n")
+    added = pack / "migration-added.txt"
+    added.write_text("migration output\n")
+    m.record_rollback_plan(
+        pack, snap, m.added_since_snapshot(pack, snap),
+        m.changed_since_snapshot(pack, snap),
+    )
+    original.write_text("later cron write\n")
+
+    assert m.main([str(pack), "--restore-snapshot", "manual-conflict"]) == 1
+
+    assert original.read_text() == "later cron write\n"
+    assert added.read_text() == "migration output\n", "restore must be all-or-nothing"
+    assert "safe restore refused" in capsys.readouterr().err
 
 
 def test_prune_keeps_newest_n(tmp_path):
@@ -360,9 +581,36 @@ def test_prune_keeps_newest_n(tmp_path):
     pack = _pack(tmp_path, "v0.4.0")
     base = pack / m.SNAPSHOTS_REL; base.mkdir(parents=True)
     for ts in ["20260101T000000", "20260102T000000", "20260103T000000", "20260104T000000"]:
-        (base / ts).mkdir()
+        snap = base / ts
+        (snap / "tree").mkdir(parents=True)
+        (snap / "manifest.json").write_text(
+            '{"confirmed_good_at": "2026-01-05T00:00:00Z"}\n', encoding="utf-8"
+        )
     assert m.prune_snapshots(pack, keep=2) == 2
     assert sorted(d.name for d in base.iterdir()) == ["20260103T000000", "20260104T000000"]
+
+
+def test_prune_never_removes_unconfirmed_recovery_point(tmp_path):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    unconfirmed = m.snapshot(pack, "20260101T000000", {"to": "v0.5.0"})
+    confirmed = m.snapshot(pack, "20260102T000000", {"to": "v0.6.0"})
+    m.confirm_snapshot_good(confirmed, "2026-01-03T00:00:00Z")
+
+    assert m.prune_snapshots(pack, keep=0) == 1
+    assert unconfirmed.is_dir(), "count retention must not delete an unconfirmed recovery point"
+    assert not confirmed.exists()
+
+
+def test_confirm_snapshot_good_cli_marks_manifest(tmp_path):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    snap = m.snapshot(pack, "observed", {"to": "v0.5.0"})
+
+    assert m.main([str(pack), "--confirm-snapshot-good", "observed"]) == 0
+
+    metadata = json.loads((snap / "manifest.json").read_text())
+    assert metadata["confirmed_good_at"]
 
 
 def test_main_apply_gate_fail_auto_rolls_back(tmp_path, monkeypatch):
@@ -824,3 +1072,128 @@ def test_duplicate_engine_migration_id_fails_loud(tmp_path):
     import pytest as _pytest
     with _pytest.raises(SystemExit):
         m.load_all_migrations(d, pack)
+
+
+def test_rollback_identity_handles_symlink_missing_and_read_error(tmp_path, monkeypatch):
+    m = _mod()
+    target = tmp_path / "target"
+    target.write_text("payload", encoding="utf-8")
+    link = tmp_path / "link"
+    link.symlink_to("target")
+    assert m._path_identity(link) == "symlink:target"
+    assert m._path_identity(tmp_path / "missing") is None
+    monkeypatch.setattr(m.os, "readlink", lambda _path: (_ for _ in ()).throw(OSError("denied")))
+    assert m._path_identity(link) is None
+
+
+@pytest.mark.parametrize(
+    "payload, expected",
+    [
+        (None, "no valid rollback-plan.json"),
+        ({"schema_version": 2}, "unsupported schema"),
+        ({"schema_version": 1, "added": [], "modified": {}, "deleted": []}, "malformed"),
+        ({"schema_version": 1, "added": {"../escape": None}, "modified": {}, "deleted": []},
+         "unsafe path"),
+    ],
+)
+def test_restore_saved_snapshot_rejects_invalid_plans(tmp_path, payload, expected):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    snap = tmp_path / "snapshot"
+    snap.mkdir()
+    if payload is not None:
+        (snap / m.ROLLBACK_PLAN).write_text(json.dumps(payload), encoding="utf-8")
+    changed, errors = m.restore_saved_snapshot(pack, snap)
+    assert changed == 0
+    assert expected in errors[0]
+
+
+def test_restore_saved_snapshot_rejects_recreated_deleted_path(tmp_path):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    recreated = pack / "wiki" / "restored.md"
+    recreated.parent.mkdir()
+    recreated.write_text("new", encoding="utf-8")
+    snap = tmp_path / "snapshot"
+    snap.mkdir()
+    (snap / m.ROLLBACK_PLAN).write_text(json.dumps({
+        "schema_version": 1, "added": {}, "modified": {}, "deleted": ["wiki/restored.md"],
+    }), encoding="utf-8")
+    changed, errors = m.restore_saved_snapshot(pack, snap)
+    assert changed == 0
+    assert "recreated after migration" in errors[0]
+
+
+@pytest.mark.parametrize("manifest, expected", [(None, "complete retained snapshot"),
+                                                   ("not-json", "invalid manifest"),
+                                                   ("[]", "not an object")])
+def test_confirm_snapshot_good_rejects_incomplete_or_invalid_snapshot(tmp_path, manifest, expected):
+    m = _mod()
+    snap = tmp_path / "snapshot"
+    (snap / "tree").mkdir(parents=True)
+    if manifest is not None:
+        (snap / "manifest.json").write_text(manifest, encoding="utf-8")
+    with pytest.raises(ValueError, match=expected):
+        m.confirm_snapshot_good(snap, "2026-09-16T00:00:00Z")
+
+
+def test_prune_snapshots_ignores_non_snapshots_and_invalid_manifests(tmp_path):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    base = pack / m.SNAPSHOTS_REL
+    base.mkdir(parents=True)
+    (base / "plain-file").write_text("x", encoding="utf-8")
+    (base / "no-manifest").mkdir()
+    invalid = base / "invalid"
+    invalid.mkdir()
+    (invalid / "manifest.json").write_text("not-json", encoding="utf-8")
+    assert m.prune_snapshots(pack, keep=0) == 0
+
+
+def test_snapshot_cli_rejects_conflicts_flags_ids_and_missing_snapshot(tmp_path, capsys):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    cases = [
+        ["--restore-snapshot", "a", "--confirm-snapshot-good", "b"],
+        ["--confirm-snapshot-good", "a", "--apply"],
+        ["--confirm-snapshot-good", "../bad"],
+        ["--confirm-snapshot-good", "missing"],
+        ["--restore-snapshot", "a", "--no-snapshot"],
+        ["--restore-snapshot", "../bad"],
+        ["--restore-snapshot", "missing"],
+    ]
+    for args in cases:
+        assert m.main([str(pack), *args]) == 2
+    assert "ERROR:" in capsys.readouterr().err
+
+
+def test_matching_applied_migration_provenance_remains_skipped(tmp_path):
+    m, meta = _mod(), _meta()
+    pack = _pack(tmp_path, "v0.4.0")
+    migration = m.load_migrations(
+        _migration(tmp_path / "migs", id_="m1", frm="v0.4.0", to="v0.5.0")
+    )[0]
+    state = pack / m.STATE_REL
+    state.parent.mkdir(parents=True)
+    state.write_text(json.dumps({
+        "applied": ["m1"], "applied_provenance": {"m1": m.migration_provenance(migration)},
+    }), encoding="utf-8")
+    plan = m.plan_upgrade(pack, "v0.5.0", None, [migration], meta)
+    assert plan.migrations == []
+    assert plan.already_applied == ["m1"]
+
+
+def test_record_state_without_provenance_and_deleted_absence_restore(tmp_path):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    m.record_state(pack, "v0.5.0", ["m1"], "now")
+    state = json.loads((pack / m.STATE_REL).read_text())
+    assert "applied_provenance" not in state
+
+    snap = tmp_path / "snapshot"
+    (snap / "tree").mkdir(parents=True)
+    (snap / m.ROLLBACK_PLAN).write_text(json.dumps({
+        "schema_version": 1, "added": {}, "modified": {}, "deleted": ["wiki/gone.md"],
+    }), encoding="utf-8")
+    changed, errors = m.restore_saved_snapshot(pack, snap)
+    assert (changed, errors) == (0, [])

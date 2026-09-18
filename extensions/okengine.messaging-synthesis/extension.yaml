@@ -42,9 +42,10 @@ config:
       Env: OKENGINE_MESSAGING_SYNTHESIS_PRODUCT_ANCHOR_PATH. See README for the format.
 operations:
   content-pegs:
-    schedule: {kind: cron, expr: "0 14 * * 5"}        # weekly (Fri) — cheap, drift-gated
+    schedule: {kind: cron, expr: "@jitter:weekly@14,5"} # weekly Fri near 14:00, per-install minute
     entrypoint: select_content_pegs.py
     prompt_file: prompts/content-pegs.md
+    max_iterations: 12
     output_contract: &messaging_contract
       api: 1
       allowed_namespaces: [briefings]
@@ -56,30 +57,33 @@ operations:
       unknown_fields: reject
       unresolved_links: review
       placeholder_links: reject
-      completion: per-selected-item
+      completion: run
     adversarial_fixtures: &model_fixtures [tests/extensions/test_model_output_contracts.py]
-    toolsets: [file, todo, okengine-write, okengine]
+    toolsets: [todo, okengine-write, okengine]
   positioning-battle-cards:
     schedule: {kind: cron, expr: "@morning:0"}         # daily @ the deployment brief hour (#177); drift-gated (only refreshes a card
                                                         # when its competitor has new activity)
     entrypoint: select_positioning_battle_cards.py
     prompt_file: prompts/battle-cards.md
+    max_iterations: 12
     output_contract: *messaging_contract
     adversarial_fixtures: *model_fixtures
-    toolsets: [file, todo, okengine-write, okengine]
+    toolsets: [todo, okengine-write, okengine]
   value-prop-gap-refresh:
-    schedule: {kind: cron, expr: "0 14 * * 5"}        # weekly (Fri) — same slot as content-pegs;
+    schedule: {kind: cron, expr: "@jitter:weekly@14,5"} # weekly Fri near 14:00, per-install minute;
                                                         # both are cheap+drift-gated, fine to co-fire
     entrypoint: select_value_prop_refresh.py
     prompt_file: prompts/value-prop-refresh.md
+    max_iterations: 12
     output_contract: *messaging_contract
     adversarial_fixtures: *model_fixtures
-    toolsets: [file, todo, okengine-write, okengine]
+    toolsets: [todo, okengine-write, okengine]
   messaging-synthesis:
     schedule: {kind: cron, expr: "@morning:15"}        # daily @ brief hour +15 (after positioning); meta-layer; drift-gated on the
                                                         # 3 upstream artifacts, rarely actually wakes
     entrypoint: select_messaging_synthesis.py
     prompt_file: prompts/messaging-synthesis.md
+    max_iterations: 12
     output_contract: *messaging_contract
     adversarial_fixtures: *model_fixtures
-    toolsets: [file, todo, okengine-write, okengine]
+    toolsets: [todo, okengine-write, okengine]

@@ -111,6 +111,12 @@ def _run_connector(manifest_path: Path, query_input: str, value: str, args) -> d
         cmd += ["--state-root", str(args.state_root)]
     if args.ledger_root:
         cmd += ["--collection-ledger", str(args.ledger_root)]
+    # Forward the health root for the same reason state-root is forwarded. Without it
+    # source_connector falls back to its own default, which resolved against the CURRENT
+    # WORKING DIRECTORY — so running this lane from a checkout wrote the connector health
+    # record into the repo and left a tracked file permanently modified (okengine#509).
+    if args.health_root:
+        cmd += ["--health-root", str(args.health_root)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -145,6 +151,9 @@ def main(argv=None) -> int:
     ap.add_argument("--fixture", type=Path)
     ap.add_argument("--state-root", type=Path)
     ap.add_argument("--ledger-root", type=Path)
+    ap.add_argument("--health-root", type=Path,
+                    help="where the connector writes its health record; forwarded to "
+                         "source_connector so it never falls back to a cwd-relative path")
     args = ap.parse_args(argv)
 
     manifest = yaml.safe_load(args.manifest.read_text(encoding="utf-8")) or {}

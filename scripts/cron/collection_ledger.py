@@ -14,9 +14,24 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 COUNT_FIELDS = ("fetched", "extracted", "accepted", "rejected", "deduped", "dead_letter")
 OUTCOMES = {"success", "partial", "failure"}
+
+# Whether a configured source is where a claim ORIGINATES or somewhere that repeats it. This was
+# called `source_kind` — the same name the OKF page vocabulary uses for something entirely
+# different (paper / post / news / report / reference-data), so one field name carried two
+# unrelated value sets and nothing in either direction would ever have complained. Renamed to
+# `origin_class` at SCHEMA_VERSION 2 (okengine#595); a v1 row's `source_kind` is read forward
+# once and rewritten under the new name, so no ledger has to be rebuilt.
+ORIGIN_CLASSES = {"primary", "secondary", "unknown"}
+_LEGACY_ORIGIN_KEY = "source_kind"
+
+
+def origin_class_of(row: dict) -> str:
+    """The declared origin class of one source row, reading a v1 row forward."""
+    value = row.get("origin_class", row.get(_LEGACY_ORIGIN_KEY))
+    return value if value in ORIGIN_CLASSES else "unknown"
 
 
 def _utc(value=None) -> datetime:
@@ -75,9 +90,7 @@ def register_sources(root: Path, sources: list[dict], *, connector_id: str | Non
             connector = str(item.get("connector_id") or "").strip()
             if not sid or not connector:
                 raise ValueError("configured source requires source_id and connector_id")
-            kind = item.get("source_kind") if item.get("source_kind") in {
-                "primary", "secondary", "unknown"
-            } else "unknown"
+            origin = origin_class_of(item)
             independent = item.get("independent_origin")
             if independent not in (True, False):
                 independent = None
@@ -85,7 +98,7 @@ def register_sources(root: Path, sources: list[dict], *, connector_id: str | Non
                 "source_id": sid,
                 "connector_id": connector,
                 "label": str(item.get("label") or sid),
-                "source_kind": kind,
+                "origin_class": origin,
                 "independent_origin": independent,
                 "configured_at": str((rows.get(sid) or {}).get("configured_at") or now),
                 "observed_configured_at": now,

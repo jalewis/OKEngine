@@ -1,20 +1,20 @@
 # OKEngine extension system
 
-**Status:** design — canonical
+**Status:** shipped architecture — canonical (reviewed against v0.13.7 on 2026-07-23)
 **Supersedes:** `plugin-system-prd.md`, `extension-manifest-spec.md`,
 `extension-runtime-composition-spec.md`, and the `plugin-system-review-plan.md`
 draft (all removed; ideas carried forward in §14).
 **Related issues:** #63, #90, #109, #112, #113, #121–#130; build items
 #132 (scoped MCP), #133 (composed schema), #134 (discovery), #135 (sidecar
 contract) under the #131 architecture gate
-**Implementation specs:** [`scoped-mcp-spec.md`](scoped-mcp-spec.md) (#132),
-[`composed-schema-spec.md`](composed-schema-spec.md) (#133, implemented),
+**Implemented specs:** [`scoped-mcp-spec.md`](scoped-mcp-spec.md) (#132),
+[`composed-schema-spec.md`](composed-schema-spec.md) (#133),
 [`discovery-spec.md`](discovery-spec.md) (#134),
-[`sidecar-contract.md`](sidecar-contract.md) (#135),
-[`extension-lifecycle.md`](extension-lifecycle.md) (#113, implemented).
-Cross-cutting: the write-path
-**provenance stamp** is built in #132 (per-extension identity arrives there) and consumed
-by #133 (orphan detection) and #135 (attribution) — it does not exist today (§4).
+[`sidecar-contract.md`](sidecar-contract.md) (#135), and
+[`extension-lifecycle.md`](extension-lifecycle.md) (#113). The write path derives
+and preserves the `extension_id` provenance stamp from scoped identity; lifecycle
+and purge operations consume that stamp. OS sandboxing/signing for untrusted
+third-party extensions remains open in #124.
 
 ## 1. Summary
 
@@ -93,16 +93,13 @@ A consequence we exploit: because writes go through `okengine-write`, the engine
 path — which makes disable/purge and orphan detection tractable (§9), closing
 okengine#127 for free.
 
-**Surface reality — the isolation is a build target, not a current property.** Today
-the read MCP is a single coarse bearer token (full-read or nothing — no per-extension
-scope), and `okengine-write` runs as a local **stdio** server the gateway spawns, so a
-separate sidecar container cannot reach it. The MCP-client model is the right
-*boundary*, but the isolation it can **enforce** requires building a network-reachable
-write surface plus per-extension read/write scopes with authorization in both MCPs.
-Until that lands, extensions are **trusted first-party** (§7): the contract is honored,
-not enforced. Scoped MCP is the hardening milestone that gates untrusted/third-party
-extensions — the build item is okengine#132 (sandboxing/signing is the separate
-okengine#124), tracked under the #131 architecture gate.
+**Surface reality.** Scoped MCP is implemented: enablement mints one token per
+extension, read and write servers resolve that identity and enforce declared path
+scopes, the networked write transport lets a sidecar use the governed write path,
+and the server stamps `extension_id`. The trusted local stdio caller remains an
+administrative full-access path. Scoped MCP limits vault access; it does not provide
+an OS sandbox or artifact signing, so untrusted third-party execution remains gated
+on #124.
 
 ## 5. Schema model — bring-your-own, layered and additive
 
@@ -138,7 +135,9 @@ owns:
         confidence: {type: enum, enum: [low, medium, high]}
 ```
 
-Rule: owned ids must not collide with any engine/pack/other-extension owner.
+Rule: owned ids must not collide with any engine/pack/other-extension owner. The
+`dashboards` and `operational` namespaces are reserved for engine-derived and
+diagnostic artifacts and cannot be owned by an extension.
 
 ### Level 2 — Reuse (typed references to existing content)
 
@@ -268,6 +267,7 @@ extension with several lanes (#multi-op). Per-operation keys:
 | `adversarial_fixtures` | required non-empty list of repository-relative tests for an agent operation's truncation, scope, grounding, and malformed-output boundaries. |
 | `toolsets` | agent toolsets (default `[okengine, okengine-write]`). |
 | `timeout` | seconds; bounds a runaway op. |
+| `max_iterations` | optional positive integer limiting an agent operation's model/tool turns before terminal handling; use a small bounded value for write lanes. |
 | `tier` | optional kickstart-stage hint (#129) — slot the job into that stage's order instead of guessing a clock time. |
 | `model` | optional per-operation model id. The cron scheduler honors `job["model"]` over the deployment's `config.yaml` default — so a low-stakes lane (e.g. glossary) can run on a small/free model while reasoning lanes use a stronger one. Pick by task profile, not brand — see [docs/model-selection.md](../model-selection.md). Omit to inherit the default. |
 | `cost_bearing` | `true` on a **`no_agent`** op that still SPENDS model budget — a deterministic script that calls `llm_lib` directly (e.g. `concept-enrich`, `scope-classify`). `budget_guard` pauses it with the agent lanes when over budget; without the marker a no_agent lane looks free and burns paid tokens unpausably. Omit for a truly free maintenance script (zero model calls). |
@@ -307,7 +307,7 @@ drafts, okengine#121).
 |---|---|
 | `declarative` | no extension-owned code (schema + reader nav + config only) |
 | `in-gateway` | a local script in the gateway cron runtime. **Trusted first-party only** — it shares the gateway filesystem/process, so the §3 rules are a contract, not enforced. |
-| `sidecar` | the extension's own process/container. The *intended* isolation boundary — enforced only once scoped, network-reachable MCP exists (okengine#132); until then it too runs trusted. Its operational contract (image ref, env/MCP injection, trigger, timeout, logs, cleanup) is okengine#135. |
+| `sidecar` | the extension's own process/container. Vault access is isolated through scoped, network-reachable MCP (#132); its image/env/trigger/timeout/log/cleanup contract is implemented by #135. OS sandboxing and signing remain separate work in #124. |
 
 **Capabilities** (granted by the operator at enable, independent of trust):
 `read` scopes, `write` namespaces, `network`, `secrets`, `delivery`.
@@ -317,14 +317,11 @@ namespaces must be covered by the extension's owned/extended schema; `network`,
 `secrets`, `delivery` are explicit grants surfaced in the enable summary; a
 broad `write: [wiki/**]` is allowed only with operator override and always warns.
 
-**v1 is trusted-first-party, not a sandbox.** We validate the manifest, schema
-composition, capabilities, and paths, and print an operator capability summary at
-enable/deploy — but in v1 those declarations are a *contract*, not enforced at runtime.
-As the surface stands (§4), neither mode is isolated: `in-gateway` shares the gateway's
-filesystem/process, and `sidecar` cannot reach a scoped write path that does not exist
-yet. The plan is for **`sidecar` + scoped MCP to become the enforced boundary** — a
-private image holding only per-extension read/write scopes, the API as the wall; that
-scoped, network-reachable MCP is the build item in okengine#132 (landed).
+**v1 scopes vault access but is not an OS sandbox.** We validate the manifest,
+schema composition, capabilities, and paths, print an operator capability summary,
+and enforce sidecar read/write scopes through MCP. `in-gateway` still shares the
+gateway filesystem and process. A sidecar has a separate container and scoped vault
+APIs, but image signing and stronger host-level sandboxing remain #124.
 
 **Trust gate (okengine#124, enforced).** Until OS sandboxing/signing exist, `enable`
 refuses an **operator-tier** (the third-party/paid drop-in home) extension with
@@ -492,21 +489,17 @@ third-party packages; OS sandboxing; arbitrary in-process import of untrusted co
 cross-extension data-dependency
 ordering beyond declared `requires.extensions`.
 
-**Isolation milestone (okengine#132):** per-extension **scoped MCP** — a
-network-reachable `okengine-write` surface plus per-extension read/write scopes with
-authorization in both MCPs — is the work that turns the `sidecar` model from a
-contract into an enforced boundary (§4, §7). Required before untrusted third-party
-extensions. (Schema-composition ownership is now decided — §5: it lands with #90,
-specced for extensions in #133.) These build items sit under the #131 architecture gate.
+**Completed isolation milestone (#132):** per-extension scoped MCP provides a
+network-reachable write surface and token-derived read/write authorization. Schema
+composition ownership (#90/#133), discovery (#134), and sidecar triggering (#135)
+are also implemented. These controls protect the vault boundary; #124 still gates
+unattended execution of untrusted third-party code.
 
 **Open questions:**
 
 1. Raw-ingest stable surface for the future `importer` kind — what does it look like?
-2. Sidecar trigger mechanics — does cron-plus invoke the container, or does the
-   extension self-schedule against a deploy-provided token? (okengine#135)
-3. Provenance stamp location — OKF envelope field vs. a sidecar index.
-4. Discovery roots + precedence — exact engine/pack/operator paths, cross-tier
-   shadowing, and duplicate-id-across-tiers behavior (okengine#134, sharpening #113).
+2. What signing, provenance verification, and OS-level restrictions are required
+   before unattended third-party extension execution? (#124)
 
 ## 14. Carried forward from the superseded drafts
 

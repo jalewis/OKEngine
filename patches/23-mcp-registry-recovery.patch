@@ -1,0 +1,162 @@
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index 9688f5d3d..7deb5a5d2 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -74,6 +74,27 @@ _MAX_TOOL_WORKERS = 8
+ _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
+ 
+ 
++def _record_mcp_registry_loss(agent, function_name: str, function_result: Any) -> None:
++    """Make an unrecovered MCP registry miss durable beyond context compression."""
++    if not str(function_name).startswith("mcp__"):
++        return
++    text = _multimodal_text_summary(function_result)
++    if f"Unknown tool: {function_name}" not in text:
++        return
++    losses = getattr(agent, "_okengine_mcp_registry_losses", None)
++    if losses is None:
++        losses = []
++        agent._okengine_mcp_registry_losses = losses
++    if function_name not in losses:
++        losses.append(function_name)
++        if hasattr(agent, "interrupt"):
++            try:
++                agent.interrupt(f"MCP registry integrity lost: {function_name}")
++            except Exception:
++                logger.exception("Failed to interrupt agent after MCP registry loss")
++    logger.error("MCP registry integrity lost for advertised tool %s", function_name)
++
++
+ def _resolve_concurrent_tool_timeout() -> float | None:
+     raw = os.getenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "").strip()
+     if not raw:
+@@ -856,6 +877,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
+                     failed=is_error,
+                 )
+ 
++            if not blocked:
++                _record_mcp_registry_loss(agent, function_name, function_result)
++
+             if is_error:
+                 _err_text = _multimodal_text_summary(function_result)
+                 result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
+@@ -1491,6 +1515,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
+         # Log tool errors to the persistent error log so [error] tags
+         # in the UI always have a corresponding detailed entry on disk.
+         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
++        if not _execution_blocked:
++            _record_mcp_registry_loss(agent, function_name, function_result)
+         # The agent-runtime tools above (todo, session_search, memory,
+         # context-engine, memory-manager, clarify, delegate_task) are
+         # dispatched inline — they never reach handle_function_call, so the
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index d5a19952f..9eb09b7 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2465,6 +2465,18 @@ def _guard_job_credential_exfil(job: dict) -> None:
+         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
+ 
+ 
++def _enforce_mcp_registry_integrity(agent, job: dict) -> None:
++    """Prevent an advertised-tool loss from becoming a clean cron outcome."""
++    losses = sorted(set(
++        getattr(agent, "_okengine_mcp_registry_losses", []) or []
++    ))
++    job["_okengine_mcp_registry_losses"] = losses
++    if losses:
++        raise RuntimeError(
++            "MCP tool registry loss after bounded recovery: " + ", ".join(losses)
++        )
++
++
+ def run_job(
+     job: dict, *, defer_agent_teardown: Optional[list] = None
+ ) -> tuple[bool, str, str, Optional[str]]:
+@@ -3204,6 +3216,7 @@ def run_job(
+             job["_okengine_executed_tool_calls"] = (
+                 agent._okengine_executed_tool_call_turns
+             )
++        _enforce_mcp_registry_integrity(agent, job)
+         _write_result = re.compile(
+             r"\b(?:(?P<operation>created|updated|patched|tombstoned)\s+(?P<path>\S+?)"
+             r"|(?P<append>appended)\s+to\s+'.*?'\s+in\s+(?P<append_path>\S+?)"
+diff --git a/tools/mcp_tool.py b/tools/mcp_tool.py
+index 949cd42ac..68f64ad0a 100644
+--- a/tools/mcp_tool.py
++++ b/tools/mcp_tool.py
+@@ -4491,6 +4491,52 @@ def mcp_prefixed_tool_name(server_name: str, tool_name: str) -> str:
+     return f"{MCP_TOOL_NAME_PREFIX}{safe_server}{_MCP_NAME_DELIM}{safe_tool}"
+ 
+ 
++def recover_missing_mcp_tool(tool_name: str, timeout: float = 5.0) -> bool:
++    """Republish a tool removed while its MCP transport reconnects.
++
++    Outage parking deliberately removes stale handlers from the registry. A
++    reconnect normally republishes them after tools/list, but a model can call
++    a formerly advertised tool in the interval between those two events. Give
++    that call one bounded recovery opportunity instead of returning an
++    immediate, permanent-looking ``Unknown tool`` result.
++    """
++    if not str(tool_name).startswith(MCP_TOOL_NAME_PREFIX):
++        return False
++    from tools.registry import registry
++
++    if registry.get_entry(tool_name) is not None:
++        return True
++    remainder = str(tool_name)[len(MCP_TOOL_NAME_PREFIX):]
++    safe_server, separator, _safe_tool = remainder.partition(_MCP_NAME_DELIM)
++    if not separator or not safe_server:
++        return False
++    with _lock:
++        server = next(
++            (candidate for name, candidate in _servers.items()
++             if sanitize_mcp_name_component(name) == safe_server),
++            None,
++        )
++    if server is None:
++        return False
++
++    # A completed reconnect may already have fresh discovery data but have
++    # missed its publication edge. Repair that state synchronously first.
++    if getattr(server, "session", None) is not None and getattr(server, "_tools", None):
++        server._register_discovered_tools_if_needed()
++        if registry.get_entry(tool_name) is not None:
++            logger.warning("MCP tool '%s' was republished on demand", tool_name)
++            return True
++
++    _signal_reconnect(server)
++    deadline = time.monotonic() + max(0.0, float(timeout))
++    while time.monotonic() < deadline:
++        if registry.get_entry(tool_name) is not None:
++            logger.warning("MCP tool '%s' recovered after reconnect", tool_name)
++            return True
++        time.sleep(0.05)
++    return False
++
++
+ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
+     """Convert an MCP tool listing to the Hermes registry schema format.
+ 
+diff --git a/tools/registry.py b/tools/registry.py
+index 35589bd2c..fd552a37f 100644
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -579,6 +579,18 @@ class ToolRegistry:
+           for consistent error format.
+         """
+         entry = self.get_entry(name)
++        if not entry and name.startswith("mcp__"):
++            # A parked MCP transport deregisters stale handlers. Its reconnect
++            # normally republishes them, but a call can race that publication.
++            # Attempt one bounded re-registration before declaring the tool
++            # unknown; the executor still records a failed recovery as a fatal
++            # cron integrity signal.
++            try:
++                from tools.mcp_tool import recover_missing_mcp_tool
++                if recover_missing_mcp_tool(name):
++                    entry = self.get_entry(name)
++            except Exception as exc:
++                logger.warning("MCP tool recovery failed for %s: %s", name, exc)
+         if not entry:
+             return json.dumps({"error": f"Unknown tool: {name}"})
+         try:

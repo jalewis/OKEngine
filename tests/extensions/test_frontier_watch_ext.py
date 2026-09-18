@@ -7,6 +7,7 @@ capabilities.
 """
 import importlib.util
 import os
+import ast
 import re
 import subprocess
 import sys
@@ -151,12 +152,72 @@ def test_gate_excludes_recently_thesised(tmp_path):
     assert '"wakeAgent": false' in _run_gate(tmp_path)    # thesised 3 days ago -> quiet
 
 
+def test_selector_defensive_frontmatter_scan_and_missing_vault_edges(tmp_path, monkeypatch, capsys):
+    module = _load("frontier_selector_edges", SELECTOR)
+    monkeypatch.setattr(module, "WIKI", tmp_path / "missing")
+    assert module.main() == 0
+    assert '"wakeAgent": false' in capsys.readouterr().out
+    assert module._read_fm(tmp_path / "missing.md") == {}
+    plain = tmp_path / "plain.md"
+    plain.write_text("body")
+    assert module._read_fm(plain) == {}
+    plain.write_text("---\n[broken\n---\n")
+    assert module._read_fm(plain) == {}
+    plain.write_text("---\n- list\n---\n")
+    assert module._read_fm(plain) == {}
+
+    wiki = tmp_path / "wiki"
+    frontier = wiki / "frontier"
+    sources = wiki / "sources"
+    entities = wiki / "entities"
+    for directory in (frontier, sources, entities):
+        directory.mkdir(parents=True)
+    (frontier / "other.md").write_text("---\ntype: report\n---\n")
+    (frontier / "old.md").write_text(
+        "---\ntype: whitespace-thesis\nupdated: 2020-01-01\ncapability: '[[concepts/old]]'\n---\n"
+    )
+    legacy = frontier / "legacy.md"
+    legacy.write_text("---\ntype: whitespace-thesis\nupdated: 2099-01-01\n---\n[[concepts/a]]\n")
+    raced = sources / "raced.md"
+    raced.write_text("[[concepts/a]]")
+    (wiki / "dashboards").mkdir()
+    (wiki / "dashboards/ignored.md").write_text("[[concepts/a]]")
+    original = Path.read_text
+    legacy_reads = 0
+
+    def flaky(path, *args, **kwargs):
+        nonlocal legacy_reads
+        if path == legacy:
+            legacy_reads += 1
+            if legacy_reads == 2:
+                raise OSError("vanished")
+        if path == raced:
+            raise OSError("vanished")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+    monkeypatch.setattr(module, "WIKI", wiki)
+    assert module._recently_thesised() == set()
+    assert module._demand_supply() == ({}, {})
+
+
 # --- isolation ------------------------------------------------------------
 
 def test_selector_is_self_contained():
     src = SELECTOR.read_text(encoding="utf-8")
-    imports = re.findall(r"^\s*(?:from|import)\s+([a-zA-Z_][\w.]*)", src, re.M)
-    allowed = {"__future__", "json", "os", "re", "sys", "collections", "dataclasses",
-               "datetime", "pathlib", "yaml", "typing", "itertools", "math", "functools"}
+    # PARSE the imports, do not grep for them. A text regex matched the word "its" out of a
+    # docstring sentence beginning "from its own knowledge of the vendors" and reported it as a
+    # sibling import. Any prose line starting `from` or `import` defeated the check — including,
+    # eventually, one that hid a real import.
+    tree = ast.parse(src)
+    imports = [n.names[0].name for n in ast.walk(tree) if isinstance(n, ast.Import)]
+    imports += [n.module for n in ast.walk(tree)
+                if isinstance(n, ast.ImportFrom) and n.module]
+    # Ask the interpreter what stdlib is rather than maintaining a list of it. The hand-written
+    # allowlist omitted `hashlib`, so inlining a manifest writer to KEEP this selector
+    # self-contained tripped the very test enforcing that property. The rule is "no SIBLING
+    # imports" — stdlib and the one declared third-party dep are fine, and only the sibling case
+    # actually breaks a standalone-staged extension.
+    allowed = set(sys.stdlib_module_names) | {"__future__", "yaml"}
     foreign = [i for i in imports if i.split(".")[0] not in allowed]
     assert not foreign, f"selector imports non-stdlib siblings: {foreign}"

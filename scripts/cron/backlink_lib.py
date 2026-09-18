@@ -26,7 +26,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import schema_lib  # noqa: E402
 
 _H1_RE = re.compile(r"^# (.+)$", re.MULTILINE)
 _FM_HEAD_BYTES = 8192
@@ -66,18 +70,12 @@ def excluded_top_dirs(vault_root: Path) -> frozenset[str]:
     sources), else the default _BACKLINK_DROPPED ({sources})."""
     out: set[str] = set(_SURFACED_DERIVED)
     drop: set[str] = set(_BACKLINK_DROPPED)
-    sp = vault_root / "schema.yaml"
-    if sp.is_file():
-        try:
-            import yaml
-            sch = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}
-            if "backlink_drop" in sch:   # explicit pack override (incl. [] to re-include sources)
-                drop = {s for s in (_first_seg(x) for x in (sch.get("backlink_drop") or [])) if s}
-            for e in (sch.get("exclude") or []):
-                if (seg := _first_seg(e)):
-                    out.add(seg)
-        except Exception:
-            pass
+    sch = schema_lib.merged_schema(vault_root)
+    if "backlink_drop" in sch:   # explicit pack override (incl. [] to re-include sources)
+        drop = {s for s in (_first_seg(x) for x in (sch.get("backlink_drop") or [])) if s}
+    for e in (sch.get("exclude") or []):
+        if (seg := _first_seg(e)):
+            out.add(seg)
     out |= drop
     return frozenset(out)
 
@@ -96,6 +94,15 @@ def skip_source(key: str, excluded: frozenset[str]) -> bool:
     if not name.endswith(".md"):
         name += ".md"
     if skip_name(name) or name in _RESERVED_ROOT_NAMES:
+        return True
+    # A `_`/`.` prefix marks the DIRECTORY as machinery, and skip_name only ever saw the final
+    # filename — so every page under `entities/_`, `concepts/_`, `predictions/_archive` and
+    # `_logs/` seeded backlink edges, while the projection scanner, index builders, corpus
+    # indexer and write path all skipped them by the same convention. Measured 2026-08-18:
+    # 119 such files on one live vault, 68 on another. An exclusion honoured at one walker and
+    # not the next is not an exclusion.
+    if any(len(part) > 1 and part.startswith(("_", "."))
+           for part in key.split("/")[:-1]):
         return True
     ns = key.split("/")[0] if "/" in key else ""
     return bool(ns) and ns in excluded

@@ -1,10 +1,9 @@
-"""find_references / retrieve_context must serve the cron-precomputed backlink artifact, not rebuild
-the IWE graph live per call.
+"""Graph tools serve the cron-precomputed backlink artifact without a live graph subprocess.
 
 Regression: the read-MCP shelled out to kb_graph -> iwe on every call, rebuilding the whole graph —
-O(vault size). On cyber-market's 60k-page vault that blew past the MCP call timeout (recurring
-find_references timeouts). Now it reads wiki/.backlinks.json (O(dict lookup)); live IWE is the
-fallback only when the artifact is absent/stale.
+O(vault size). On market-intel's 60k-page vault that blew past the MCP call timeout (recurring
+find_references timeouts). Now it reads wiki/.backlinks.json (O(dict lookup)) and fails explicitly
+when graph evidence is unavailable or a target cannot be resolved.
 """
 import importlib.util
 import json
@@ -80,8 +79,12 @@ def test_retrieve_context_serves_artifact(tmp_path, monkeypatch):
     assert "Incoming backlinks (2)" in out and "Outbound references (2)" in out
 
 
-def test_falls_back_to_iwe_when_artifact_absent(tmp_path, monkeypatch):
+def test_absent_artifact_and_unknown_target_never_spawn_graph_process(tmp_path, monkeypatch):
     (tmp_path / "wiki").mkdir(parents=True)
     m = _load(tmp_path, monkeypatch)
-    m._run = lambda *a, **k: "IWE-FALLBACK"
-    assert m.find_references("anything") == "IWE-FALLBACK"      # no artifact -> live IWE fallback
+    m._run = lambda *a, **k: (_ for _ in ()).throw(AssertionError("graph subprocess launched"))
+    assert "graph unavailable" in m.find_references("anything")
+    _mk_vault(tmp_path)
+    m._BL_CACHE = {"map": None, "mtime": None, "doc": None}
+    assert "not found or ambiguous" in m.find_references("anything")
+    assert "not found or ambiguous" in m.retrieve_context("anything")

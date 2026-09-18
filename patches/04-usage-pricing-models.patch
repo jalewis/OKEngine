@@ -1,22 +1,49 @@
 diff --git a/agent/usage_pricing.py b/agent/usage_pricing.py
-index 32338caff..21caec0f3 100644
+index d7b56a9..16a066a 100644
 --- a/agent/usage_pricing.py
 +++ b/agent/usage_pricing.py
-@@ -561,6 +561,18 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
+@@ -418,16 +418,21 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
+         source_url="https://api-docs.deepseek.com/quick_start/pricing",
+         pricing_version="deepseek-pricing-2026-03-16",
+     ),
++    # DeepSeek bills PEAK and OFF-PEAK at a 2x ratio (peak = 01:00-04:00 + 06:00-10:00 UTC).
++    # This table carries ONE rate per model and so cannot express both; the PEAK rate is recorded
++    # deliberately, because a cost report that UNDER-states is the dangerous direction. Off-peak
++    # is exactly half of every figure below. The 2026-05 snapshot replaced here was wrong in both
++    # directions at once: input over-stated against off-peak, cache-read under-stated ~3x.
+     (
+         "deepseek",
+         "deepseek-v4-pro",
+     ): PricingEntry(
+-        input_cost_per_million=Decimal("1.74"),
+-        output_cost_per_million=Decimal("3.48"),
+-        cache_read_cost_per_million=Decimal("0.0145"),
++        input_cost_per_million=Decimal("1.32"),
++        output_cost_per_million=Decimal("3.96"),
++        cache_read_cost_per_million=Decimal("0.044"),
+         source="official_docs_snapshot",
+         source_url="https://api-docs.deepseek.com/quick_start/pricing",
+-        pricing_version="deepseek-pricing-2026-05-12",
++        pricing_version="deepseek-pricing-2026-08-peak",
+     ),
+     # Google Gemini
+     (
+@@ -561,6 +566,19 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
          source="official_docs_snapshot",
          pricing_version="minimax-pricing-2026-04",
      ),
-+    # ── deepseek-v4-flash (upstream lacks this model) ──
++    # -- deepseek-v4-flash (upstream lacks this model) --
++    # PEAK rates, for the reason recorded on deepseek-v4-pro above; off-peak is half of each.
 +    (
 +        "deepseek",
 +        "deepseek-v4-flash",
 +    ): PricingEntry(
-+        input_cost_per_million=Decimal("0.14"),
-+        output_cost_per_million=Decimal("0.28"),
-+        cache_read_cost_per_million=Decimal("0.0028"),
++        input_cost_per_million=Decimal("0.44"),
++        output_cost_per_million=Decimal("1.32"),
++        cache_read_cost_per_million=Decimal("0.014"),
 +        source="official_docs_snapshot",
 +        source_url="https://api-docs.deepseek.com/quick_start/pricing",
-+        pricing_version="deepseek-pricing-2026-04",
++        pricing_version="deepseek-pricing-2026-08-peak",
 +    ),
  }
  

@@ -58,8 +58,9 @@ def panel_hash(panel: dict) -> str:
     # raises TypeError on a perfectly VALID panel carrying an `as_of: 2026-07-10` field, and (since
     # this runs after render) the exception escaped svg_block's render-only guard and aborted the
     # whole panel-svg refresh lane. _hash_default serializes them DETERMINISTICALLY (invariant-audit B6.1).
-    return hashlib.sha1(f"r{_RENDERER_REV}:".encode()
-                        + json.dumps(panel, sort_keys=True, default=_hash_default).encode()).hexdigest()[:8]
+    payload = (f"r{_RENDERER_REV}:".encode()
+               + json.dumps(panel, sort_keys=True, default=_hash_default).encode())
+    return hashlib.sha1(payload, usedforsecurity=False).hexdigest()[:8]
 
 
 def render_panel_svg(panel: dict) -> str | None:
@@ -103,8 +104,6 @@ def render_panel_svg(panel: dict) -> str | None:
     # edges beneath the dots
     by_slug = {n.get("slug"): n for n in nodes if n.get("slug")}
     for e in edges:
-        if len(e) < 2:
-            continue
         a, b = by_slug.get(e[0]), by_slug.get(e[1])
         if a and b:
             parts.append(f'<line x1="{px(a.get("x")):.1f}" y1="{py(a.get("y")):.1f}" x2="{px(b.get("x")):.1f}" '

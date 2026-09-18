@@ -129,9 +129,41 @@ def test_orphaned_guard_pause_self_heals_but_spares_operator_pause(tmp_path, mon
     monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "1000000")   # budget high -> under budget
     monkeypatch.setattr(m, "time", type("T", (), {"time": staticmethod(lambda: 1_000_000.0)}))
     calls = []
+    markers = []
     monkeypatch.setattr(m, "_cronplus", lambda action, jid: calls.append((action, jid)) or True)
+    monkeypatch.setattr(m, "_set_pause_marker", lambda enabled, detail=None: markers.append(enabled))
     assert m.main([]) == 0
     assert calls == [("resume", "a")]                        # guard-owned healed; operator 'c' untouched
+    assert markers == [False]
+    state = json.loads((tmp_path / "budget-guard-state.json").read_text())
+    assert state["paused"] is False and state["paused_ids"] == []
+
+
+def test_orphan_self_heal_retains_failed_pause_and_marker(tmp_path, monkeypatch):
+    m = _load()
+    db = tmp_path / "state.db"
+    _make_db(db, [(1_000_000.0 - 10, 10, 0)])
+    jobs = tmp_path / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [
+        {"id": "a", "name": "heals", "enabled": False},
+        {"id": "b", "name": "still-paused", "enabled": False},
+    ]}))
+    (tmp_path / "budget-guard-state.json").write_text(json.dumps({
+        "paused": False, "pausing_ids": ["a", "b"],
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_STATE_DB", str(db))
+    monkeypatch.setenv("OKENGINE_CRON_PLUS_JOBS", str(jobs))
+    monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "1000000")
+    monkeypatch.setattr(m, "time", type("T", (), {"time": staticmethod(lambda: 1_000_000.0)}))
+    monkeypatch.setattr(m, "_cronplus", lambda _action, jid: jid == "a")
+    markers = []
+    monkeypatch.setattr(m, "_set_pause_marker", lambda enabled, detail=None: markers.append(enabled))
+
+    assert m.main([]) == 0
+    state = json.loads((tmp_path / "budget-guard-state.json").read_text())
+    assert state["paused"] is True and state["paused_ids"] == ["b"]
+    assert markers == [], "reader kill-switch stays armed until every owned pause is healed"
 
 
 def test_pause_retry_keeps_prior_tick_paused_ids_owned(tmp_path, monkeypatch):  # invariant-audit HIGH (re-verify)
@@ -217,6 +249,8 @@ def test_main_warns_on_unknown_window(tmp_path, monkeypatch, capsys):  # invaria
     _make_db(db, [(1_000_000.0 - 10, 10, 0)])               # usage far UNDER budget -> no pause
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("OKENGINE_STATE_DB", str(db))
+    jobs = tmp_path / "jobs.json"; jobs.write_text('{"jobs": []}')
+    monkeypatch.setenv("OKENGINE_CRON_PLUS_JOBS", str(jobs))
     monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "1000000")
     monkeypatch.setenv("OKENGINE_BUDGET_WINDOW", "moth")    # typo for "month"
     monkeypatch.setattr(m, "time", type("T", (), {"time": staticmethod(lambda: 1_000_000.0)}))
@@ -230,6 +264,8 @@ def test_main_no_window_warning_for_valid_window(tmp_path, monkeypatch, capsys):
     _make_db(db, [(1_000_000.0 - 10, 10, 0)])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("OKENGINE_STATE_DB", str(db))
+    jobs = tmp_path / "jobs.json"; jobs.write_text('{"jobs": []}')
+    monkeypatch.setenv("OKENGINE_CRON_PLUS_JOBS", str(jobs))
     monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "1000000")
     monkeypatch.setenv("OKENGINE_BUDGET_WINDOW", "month")
     monkeypatch.setattr(m, "time", type("T", (), {"time": staticmethod(lambda: 1_000_000.0)}))
@@ -325,6 +361,8 @@ def test_usd_budget_without_price_warns_inert(tmp_path, monkeypatch, capsys):  #
     _make_db(db, [])
     monkeypatch.setenv("OKENGINE_STATE_DB", str(db))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    jobs = tmp_path / "jobs.json"; jobs.write_text('{"jobs": []}')
+    monkeypatch.setenv("OKENGINE_CRON_PLUS_JOBS", str(jobs))
     monkeypatch.setenv("OKENGINE_BUDGET_USD", "10")
     monkeypatch.delenv("OKENGINE_BUDGET_PRICE_PER_MTOK", raising=False)
     monkeypatch.delenv("OKENGINE_BUDGET_TOKENS", raising=False)
@@ -461,3 +499,130 @@ def test_pause_marker_written_and_cleared_in_vault(tmp_path, monkeypatch):  # in
     assert marker.is_file()
     m._set_pause_marker(False)
     assert not marker.exists()
+    m._set_pause_marker(False)  # clearing an absent marker is idempotent
+    monkeypatch.setattr(m, "_vault_pause_marker", lambda: (_ for _ in ()).throw(OSError("disk")))
+    m._set_pause_marker(True)   # marker I/O is best-effort; never crash the guard tick
+
+
+def test_token_database_schema_and_error_edges(tmp_path, monkeypatch):
+    m = _load()
+    db = tmp_path / "state.db"
+    sqlite3.connect(db).close()
+    assert m.tokens_in_window(db, 10, 20) == 0
+
+    con = sqlite3.connect(db)
+    con.execute("create table sessions (unrelated integer)")
+    con.commit()
+    con.close()
+    assert m.tokens_in_window(db, 10, 20) == 0
+
+    db.unlink()
+    con = sqlite3.connect(db)
+    con.execute("create table sessions (input_tokens integer, output_tokens integer)")
+    con.execute("insert into sessions values (2, 3)")
+    con.commit()
+    con.close()
+    assert m.tokens_in_window(db, 10, 20) == 5
+
+    monkeypatch.setattr(
+        m.sqlite3, "connect", lambda *_a, **_k: (_ for _ in ()).throw(sqlite3.Error("no db")),
+    )
+    assert m.tokens_in_window(db, 10, 20) == 0
+
+    class BrokenQuery:
+        def execute(self, sql, *_args):
+            if sql.startswith("PRAGMA"):
+                return [(0, "input_tokens"), (1, "started_at")]
+            raise sqlite3.Error("query failed")
+        def close(self):
+            pass
+
+    monkeypatch.setattr(m.sqlite3, "connect", lambda *_a, **_k: BrokenQuery())
+    assert m.tokens_in_window(db, 10, 20) == 0
+
+
+def test_budget_guard_io_and_cronplus_edges(tmp_path, monkeypatch, capsys):
+    m = _load()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert m.cost_bearing_ids([{"id": "self", "name": m.SELF_NAME}]) == []
+    assert m.reconcile_pause({}, [{"id": "a", "name": "lane"}]) == []
+
+    monkeypatch.setattr(m, "_state_path", lambda: tmp_path / "missing" / "state.json")
+    m._save_state({"paused": True})
+    assert "could not write state" in capsys.readouterr().err
+
+    missing = tmp_path / "missing-cli.py"
+    monkeypatch.setenv("OKENGINE_CRON_PLUS_CLI", str(missing))
+    assert not m._cronplus("pause", "a")
+    cli = tmp_path / "cli.py"
+    cli.write_text("pass\n")
+    monkeypatch.setenv("OKENGINE_CRON_PLUS_CLI", str(cli))
+    calls = []
+    monkeypatch.setattr(m.subprocess, "run", lambda args, **_k: calls.append(args))
+    assert m._cronplus("pause", "a")
+    assert calls
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("failed")),
+    )
+    assert not m._cronplus("pause", "a")
+
+
+def test_main_auto_resume_and_widened_pause_state(tmp_path, monkeypatch):
+    m = _load()
+    monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "10")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(m, "tokens_in_window", lambda *_a: 0)
+    monkeypatch.setattr(m, "_load_state", lambda: {"paused": True, "paused_ids": ["old"]})
+    monkeypatch.setattr(m, "_load_jobs", lambda: [])
+    resumed = []
+    monkeypatch.setattr(m, "resume", lambda reason: resumed.append(reason) or 1)
+    assert m.main([]) == 0
+    assert resumed == ["auto"]
+
+    state = {"paused": True, "paused_ids": ["old"], "paused_names": ["old-lane"]}
+    monkeypatch.setattr(m, "tokens_in_window", lambda *_a: 20)
+    monkeypatch.setattr(m, "_load_state", lambda: state)
+    monkeypatch.setattr(m, "_load_jobs", lambda: [
+        {"id": "old", "name": "old-lane", "enabled": False},
+        {"id": "new", "name": "new-lane", "enabled": True},
+    ])
+    monkeypatch.setattr(m, "_cronplus", lambda *_a: True)
+    saved = []
+    monkeypatch.setattr(m, "_save_state", lambda value: saved.append(dict(value)))
+    assert m.main([]) == 0
+    assert "new" in state["paused_ids"]
+    assert saved
+
+
+def test_over_budget_unreadable_jobs_never_records_vacuous_pause(tmp_path, monkeypatch, capsys):
+    """A missing/torn jobs.json is unknown, not an empty fleet whose pause succeeded 0/0."""
+    m = _load()
+    monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "10")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(m, "tokens_in_window", lambda *_a: 20)
+    monkeypatch.setattr(m, "_load_state", lambda: {"paused": False})
+    saved = []
+    monkeypatch.setattr(m, "_save_state", lambda value: saved.append(value))
+
+    assert m.main([]) == 1
+    assert saved == []
+    err = capsys.readouterr().err
+    assert "jobs.json is unreadable" in err and "NOT enforced" in err
+
+
+def test_unreadable_jobs_fail_pause_reconcile_and_orphan_recovery(tmp_path, monkeypatch, capsys):
+    m = _load()
+    monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "10")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(m, "_load_jobs", lambda: None)
+
+    monkeypatch.setattr(m, "tokens_in_window", lambda *_a: 20)
+    monkeypatch.setattr(m, "_load_state", lambda: {"paused": True, "paused_ids": ["a"]})
+    assert m.main([]) == 1
+    assert "pause reconciliation" in capsys.readouterr().err
+
+    monkeypatch.setattr(m, "tokens_in_window", lambda *_a: 0)
+    monkeypatch.setattr(m, "_load_state", lambda: {"paused": False})
+    assert m.main([]) == 1
+    assert "orphan recovery" in capsys.readouterr().err

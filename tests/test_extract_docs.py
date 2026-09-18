@@ -5,11 +5,16 @@ optional office libs (no hard dep — the core contract of issue #5), and when t
 libs ARE present it must actually extract body + table + notes text and honour the
 idempotency / empty-output rules. The lib-dependent half importorskips."""
 import importlib.util
+import builtins
 import os
+import runpy
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
+
+pytestmark = pytest.mark.integration
 
 REPO = Path(__file__).resolve().parent.parent
 ED = REPO / "scripts" / "extract-docs.py"
@@ -90,6 +95,7 @@ def test_pptx_extracts_shape_and_notes(tmp_path):
     slide = pr.slides.add_slide(pr.slide_layouts[5])  # title-only layout has a title ph
     slide.shapes.title.text = "Slide Title Text"
     slide.notes_slide.notes_text_frame.text = "Speaker note body."
+    pr.slides.add_slide(pr.slide_layouts[6])  # blank slide: no text and no notes path
     src = tmp_path / "deck.pptx"
     pr.save(str(src))
 
@@ -97,6 +103,18 @@ def test_pptx_extracts_shape_and_notes(tmp_path):
     text = (tmp_path / "deck.pptx.txt").read_text()
     assert "Slide Title Text" in text
     assert "[notes] Speaker note body." in text
+
+
+def test_pptx_ignores_a_notes_slide_without_a_text_frame(tmp_path, monkeypatch):
+    pptx = pytest.importorskip("pptx")
+    m = _load()
+    backends, _ = m._build_backends()
+    slide = SimpleNamespace(
+        shapes=[], has_notes_slide=True,
+        notes_slide=SimpleNamespace(notes_text_frame=None),
+    )
+    monkeypatch.setattr(pptx, "Presentation", lambda _path: SimpleNamespace(slides=[slide]))
+    assert backends[".pptx"](tmp_path / "synthetic.pptx") == ""
 
 
 def test_force_reextracts(tmp_path):
@@ -135,6 +153,8 @@ def test_xlsx_extracts_cells(tmp_path):
     ws.title = "Data"
     ws.append(["Header-A", "Header-B"])
     ws.append(["v1", "v2"])
+    ws.append([None, "", None])
+    wb.create_sheet("Empty")
     wb.save(str(tmp_path / "book.xlsx"))
     assert m.main([str(tmp_path)]) == 0
     text = (tmp_path / "book.xlsx.txt").read_text()
@@ -149,3 +169,112 @@ def test_rtf_extracts_text(tmp_path):
         r"{\rtf1\ansi\deff0{\fonttbl{\f0 Times;}}\f0\fs24 Hello RTF body text here.\par}")
     assert m.main([str(tmp_path)]) == 0
     assert "Hello RTF body text here." in (tmp_path / "note.rtf.txt").read_text()
+
+
+def test_main_dry_run_missing_backends_and_ignores_other_files(tmp_path, monkeypatch, capsys):
+    m = _load()
+    src = tmp_path / "report.fake"
+    src.write_text("content")
+    (tmp_path / "ignore.txt").write_text("ignore")
+    monkeypatch.setattr(m, "_build_backends",
+                        lambda: ({".fake": lambda _p: "text"}, ["optional-lib"]))
+    assert m.main(["--dry-run", str(tmp_path)]) == 0
+    output = capsys.readouterr().out
+    assert "optional-lib not installed" in output
+    assert "DRY:" in output
+    assert not (tmp_path / "report.fake.txt").exists()
+
+
+def test_main_counts_extractor_exception_and_empty_output(tmp_path, monkeypatch, capsys):
+    m = _load()
+    (tmp_path / "bad.err").write_text("x")
+    (tmp_path / "empty.nil").write_text("x")
+    (tmp_path / "good.ok").write_text("x")
+
+    def boom(_path):
+        raise ValueError("corrupt")
+
+    monkeypatch.setattr(m, "_build_backends", lambda: ({
+        ".err": boom,
+        ".nil": lambda _p: "  ",
+        ".ok": lambda _p: "usable",
+    }, []))
+    assert m.main([str(tmp_path)]) == 1
+    captured = capsys.readouterr()
+    assert "extract failed (ValueError)" in captured.err
+    assert "empty output" in captured.err
+    assert "failed (no text / errored): 2" in captured.out
+    assert (tmp_path / "good.ok.txt").read_text() == "usable\n"
+
+
+def test_main_progress_message_at_hundred(tmp_path, monkeypatch, capsys):
+    m = _load()
+    for i in range(100):
+        (tmp_path / f"{i:03}.ok").write_text("x")
+    monkeypatch.setattr(m, "_build_backends", lambda: ({".ok": lambda p: p.stem}, []))
+    assert m.main([str(tmp_path)]) == 0
+    assert "... 100 extracted" in capsys.readouterr().out
+
+
+def test_doc_backend_invokes_available_host_tool(tmp_path, monkeypatch):
+    m = _load()
+    monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/fake" if name == "antiword" else None)
+    result = type("Result", (), {"stdout": b"legacy text\\xff"})()
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: result)
+    backends, _ = m._build_backends()
+    assert "legacy text" in backends[".doc"](tmp_path / "legacy.doc")
+
+
+def test_pptx_shape_recursion_table_and_defensive_shape_type(tmp_path, monkeypatch):
+    m = _load()
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+    text_shape = SimpleNamespace(
+        shape_type=None, has_text_frame=True,
+        text_frame=SimpleNamespace(text="nested text"), has_table=False)
+    table_shape = SimpleNamespace(
+        shape_type=None, has_text_frame=False, has_table=True,
+        table=SimpleNamespace(rows=[
+            SimpleNamespace(cells=[SimpleNamespace(text="A"), SimpleNamespace(text="B")])
+        ]))
+
+    class BrokenShape:
+        @property
+        def shape_type(self):
+            raise RuntimeError("unsupported shape")
+        has_text_frame = False
+        has_table = False
+
+    group = SimpleNamespace(
+        shape_type=MSO_SHAPE_TYPE.GROUP,
+        shapes=[text_shape, table_shape, BrokenShape()])
+    slide = SimpleNamespace(shapes=[group], has_notes_slide=False)
+    fake_pptx = SimpleNamespace(
+        Presentation=lambda _path: SimpleNamespace(slides=[slide]))
+    monkeypatch.setitem(sys.modules, "pptx", fake_pptx)
+    backends, _ = m._build_backends()
+    assert backends[".pptx"](tmp_path / "fake.pptx") == "nested text\nA | B"
+
+
+def test_all_optional_imports_can_be_missing(monkeypatch):
+    m = _load()
+    original_import = builtins.__import__
+    optional = {"docx", "pptx", "openpyxl", "striprtf"}
+
+    def without_optional(name, *args, **kwargs):
+        if name.split(".", 1)[0] in optional:
+            raise ImportError(name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_optional)
+    monkeypatch.setattr(m.shutil, "which", lambda _name: None)
+    backends, missing = m._build_backends()
+    assert backends == {}
+    assert len(missing) == 5
+
+
+def test_extract_docs_entrypoint(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "argv", [str(ED), str(tmp_path / "missing")])
+    with pytest.raises(SystemExit) as exc:
+        runpy.run_path(str(ED), run_name="__main__")
+    assert exc.value.code == 1

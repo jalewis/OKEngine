@@ -16,6 +16,10 @@ import time
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
+_REVIEW_SPEC = importlib.util.spec_from_file_location("okengine_review_context", _HERE / "review_context.py")
+review_context = importlib.util.module_from_spec(_REVIEW_SPEC)
+assert _REVIEW_SPEC.loader
+_REVIEW_SPEC.loader.exec_module(review_context)
 
 
 def _load(name, rel):
@@ -52,40 +56,49 @@ def _time(label, fn) -> float:
 
 
 def main(argv) -> int:
+    context = review_context.collect(_HERE.parent)
+    print(review_context.render(context, review_context.problems(context)))
     n = int(argv[0]) if argv and not argv[0].startswith("-") else 5000
     target = 48000
     if "--target" in argv:
         target = int(argv[argv.index("--target") + 1])
     import tempfile
     root = Path(tempfile.mkdtemp(prefix="bench-vault-"))
-    print(f"generating {n} pages in {root} …")
-    tg = _time("gen", lambda: gen_vault(root, n))
-    pages = sum(1 for _ in (root / "wiki").rglob("*.md"))
-    print(f"  generated {pages} pages in {tg:.1f}s\n")
-    os.environ["WIKI_PATH"] = str(root)
+    try:
+        print(f"generating {n} pages in {root} …")
+        tg = _time("gen", lambda: gen_vault(root, n))
+        pages = sum(1 for _ in (root / "wiki").rglob("*.md"))
+        print(f"  generated {pages} pages in {tg:.1f}s\n")
+        os.environ["WIKI_PATH"] = str(root)
 
-    ops = [
-        ("conformance_audit", "cron/conformance_audit.py"),
-        ("grounding_audit", "cron/grounding_audit.py"),
-        ("review_queue", "cron/review_queue.py"),
-    ]
-    print(f"{'op':22} {'sec':>8} {'ms/page':>9} {'proj@' + str(target):>12}")
-    print("-" * 54)
-    for name, rel in ops:
-        try:
-            mod = _load(name, rel)
-            # silence the audit's own stdout
-            import io
-            import contextlib
-            buf = io.StringIO()
-            dt = _time(name, lambda: contextlib.redirect_stdout(buf).__enter__() or mod.main())
-            mspp = dt / pages * 1000
-            proj = mspp * target / 1000
-            print(f"{name:22} {dt:8.2f} {mspp:9.3f} {proj:10.1f}s")
-        except Exception as e:
-            print(f"{name:22} ERROR: {e}")
-    import shutil
-    shutil.rmtree(root, ignore_errors=True)
+        ops = [
+            ("conformance_audit", "cron/conformance_audit.py"),
+            ("grounding_audit", "cron/grounding_audit.py"),
+            ("review_queue", "cron/review_queue.py"),
+        ]
+        print(f"{'op':22} {'sec':>8} {'ms/page':>9} {'proj@' + str(target):>12}")
+        print("-" * 54)
+        for name, rel in ops:
+            try:
+                mod = _load(name, rel)
+                # Silence only the audit's own stdout; always restore the benchmark stream.
+                import io
+                import contextlib
+                buf = io.StringIO()
+
+                def run_silently():
+                    with contextlib.redirect_stdout(buf):
+                        return mod.main()
+
+                dt = _time(name, run_silently)
+                mspp = dt / pages * 1000
+                proj = mspp * target / 1000
+                print(f"{name:22} {dt:8.2f} {mspp:9.3f} {proj:10.1f}s")
+            except Exception as e:
+                print(f"{name:22} ERROR: {e}")
+    finally:
+        import shutil
+        shutil.rmtree(root, ignore_errors=True)
     return 0
 
 

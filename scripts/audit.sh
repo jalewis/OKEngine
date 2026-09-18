@@ -5,7 +5,7 @@
 # no accepted-findings baseline: a new finding must be fixed or justified at the
 # exact line with a narrow, reviewed ``# nosec B...`` annotation.
 set -uo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT" || exit 1
 fail=0
 
 echo "==> pip-audit (dependency CVE scan)"
@@ -23,7 +23,9 @@ echo
 
 echo "==> bandit (Python SAST, medium+; zero accepted findings)"
 if command -v bandit >/dev/null 2>&1; then
-  bandit -ll -q -r scripts okengine-mcp tools -x '*/__pycache__/*' || fail=1
+  bandit -ll -q -r scripts tools okengine-mcp okengine-reader okengine-cockpit \
+    okengine-operations okengine-projection extensions plugins \
+    -x '*/__pycache__/*' || fail=1
 else
   echo "ERROR: bandit not installed — pip install bandit"; fail=1
 fi

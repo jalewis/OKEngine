@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -25,11 +26,17 @@ def test_page_quality_selector_writes_exact_manifest(tmp_path):
     src = tmp_path / "wiki/sources/report.md"
     src.parent.mkdir(parents=True)
     src.write_text("---\ntype: source\n---\nEvidence about [[entities/actor]] and activity.")
+    target = tmp_path / "wiki/entities/a/actor.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("---\ntype: actor\n---\n# Actor\n")
     manifest = tmp_path / "selection.json"
     run = _run("select_page_quality_enrich.py", tmp_path, manifest,
                {"PQ_ENRICH_BATCH": "1", "ENRICH_COOLDOWN_DAYS": "0"})
     assert run.returncode == 0, run.stderr
-    assert json.loads(manifest.read_text())["selected"] == ["entities/a/actor"]
+    revision = hashlib.sha256(target.read_bytes()).hexdigest()
+    assert json.loads(manifest.read_text())["selected"] == [
+        f"wiki/entities/a/actor.md|sha256:{revision}"
+    ]
 
 
 def test_schema_classifier_writes_exact_manifest(tmp_path):
@@ -42,3 +49,15 @@ def test_schema_classifier_writes_exact_manifest(tmp_path):
                {"SCHEMA_CLASSIFY_BATCH": "1", "SCHEMA_CLASSIFY_MIN_AGE": "0"})
     assert run.returncode == 0, run.stderr
     assert json.loads(manifest.read_text())["selected"] == ["entities/a/actor"]
+
+
+def test_schema_classifier_replaces_stale_manifest_when_no_work(tmp_path):
+    (tmp_path / "schema.yaml").write_text("types:\n  actor: {}\n")
+    manifest = tmp_path / "selection.json"
+    manifest.write_text(json.dumps({"selected": ["stale/item"]}))
+
+    run = _run("select_schema_classify.py", tmp_path, manifest)
+
+    assert run.returncode == 0, run.stderr
+    assert json.loads(manifest.read_text())["selected"] == []
+    assert '"wakeAgent": false' in run.stdout

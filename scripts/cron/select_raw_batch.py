@@ -36,7 +36,23 @@ def normalize_path(p: str) -> str:
     return unicodedata.normalize("NFKC", p).translate(_QUOTE_FOLD)
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
-N = int(os.environ.get("BATCH_SIZE", "30"))
+# okengine#486: namespaced, because `BATCH_SIZE` is far too generic for a variable set in a
+# gateway's shared environment — every cron lane in the container sees it, so an operator tuning
+# "the batch size" could silently reach this selector, or a future script could collide with it.
+# Its siblings below are already RAW_*-prefixed; this one was the odd one out.
+#
+# The legacy name is still honoured so a deployment that already sets it does not silently revert
+# to the safe default of 1 on upgrade -- which, given this knob bounds the context a run accumulates,
+# would reintroduce the "Cannot compress further" failure it was set to avoid.
+_legacy_batch = os.environ.get("BATCH_SIZE")
+if _legacy_batch and not os.environ.get("RAW_BATCH_SIZE"):
+    # stderr, NEVER stdout: this script's stdout IS the model's prompt.
+    print("select_raw_batch: BATCH_SIZE is deprecated — rename it to RAW_BATCH_SIZE",
+          file=sys.stderr)
+N = int(os.environ.get("RAW_BATCH_SIZE") or _legacy_batch or "1")
+CONTROLLED_TARGET = normalize_path(
+    os.environ.get("RAW_BACKFILL_TARGET", "").strip().lstrip("/")
+)
 MIN_YEAR = int(os.environ.get("MIN_YEAR", "2025"))
 LEAF_EXTS = {".md", ".pdf", ".txt", ".html", ".htm", ".json",
              ".pptx", ".docx", ".xlsx", ".rtf", ".doc"}
@@ -51,6 +67,17 @@ YEAR_INDEX_PATH = VAULT / "raw" / ".year_index.json"
 #   BULK_DIR     — bulk auto-archived web pages (high volume, uneven signal)
 CURATED_DIR = os.environ.get("CURATED_DIR", "clippings")
 BULK_DIR = os.environ.get("BULK_DIR", "bulk")
+# The web-capture STORE, not ingestable content. feed_fetch writes it to
+# `<out_dir>/../captures` by default, i.e. `raw/captures`, holding three storage subtrees:
+# `objects/` (raw response blobs), `revisions/` (provenance JSON) and `dead-letter/` (failure
+# records). The compilable artifact is the `raw/ai/*.md` feed item, which CARRIES refs into
+# this store — the store itself is never a source page.
+#
+# Nothing excluded it, so the selector was offering every blob and provenance record as an
+# ingest candidate: 158,877 of 162,180 unprocessed items on one live vault, 98% of the queue.
+# At the default one-item batch that is years of agent invocations spent on storage internals
+# before the actual articles drain. 141 such paths had already been marked processed.
+CAPTURE_DIR = os.environ.get("CAPTURE_DIR", "captures")
 
 # Bulk-import mtime clusters: epoch-second timestamps shared by many files from
 # a single sync/restore operation. When derive_year falls back to mtime and the
@@ -94,11 +121,22 @@ _YEAR_INDEX = _load_year_index()
 OFFER_MANIFEST = VAULT / "raw" / ".batch-offered.json"
 STUCK_AFTER = int(os.environ.get("RAW_STUCK_AFTER", "4"))
 ACCEPT_MIN_CHARS = int(os.environ.get("RAW_ACCEPT_MIN_CHARS", "80"))
-MAX_CONTEXT_BYTES = int(os.environ.get("RAW_MAX_CONTEXT_BYTES", "200000"))
+MAX_CONTEXT_BYTES = int(os.environ.get("RAW_MAX_CONTEXT_BYTES", "16000"))
 SELECTION_MANIFEST = Path(os.environ.get(
     "OKENGINE_SELECTION_MANIFEST", str(VAULT / "raw" / ".selection.json")))
+COMPLETION_LEDGER = SELECTION_MANIFEST.with_name(
+    SELECTION_MANIFEST.stem + ".completed.json")
 ACCEPT_REQUIRED_FIELDS = tuple(x.strip() for x in os.environ.get(
     "RAW_ACCEPT_REQUIRED_FIELDS", "type,raw,publisher,published").split(",") if x.strip())
+
+
+def _clear_selection_manifest() -> None:
+    """A no-work wake gate must not leave a previous batch eligible for replay."""
+    try:
+        SELECTION_MANIFEST.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"WARNING: cannot clear stale selection manifest {SELECTION_MANIFEST}: {exc}",
+              file=sys.stderr)
 
 
 def _load_offered() -> dict[str, int]:
@@ -116,6 +154,22 @@ def _save_offered(d: dict[str, int]) -> None:
         OFFER_MANIFEST.write_text(json.dumps(d))
     except OSError:
         pass
+
+
+def _load_terminal_completions() -> set[str]:
+    try:
+        value = json.loads(COMPLETION_LEDGER.read_text())
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(value, dict):
+        return set()
+    return {
+        normalize_path(key)
+        for key, record in value.items()
+        if isinstance(key, str)
+        and isinstance(record, dict)
+        and record.get("disposition") in {"duplicate", "skipped"}
+    }
 
 
 def extract_processed_paths(text: str) -> set[str]:
@@ -143,6 +197,61 @@ def extract_processed_paths(text: str) -> set[str]:
     if isinstance(raw, list):
         return {normalize_path(item.strip()) for item in raw if isinstance(item, str)}
     return set()
+
+
+
+# okengine#748 — revision siblings collapse to their newest member before selection.
+#
+# feed_fetch writes `<date>-<slug>-revision-<hash>.md` per captured revision (plus an optional
+# `-<identity>` suffix on a name collision). When revision identity was keyed on the FETCHED
+# BYTES, any publisher whose markup carried a rotating token minted a new sibling roughly ten
+# times a day forever: one live vault reached 82,769 raw files carrying 6,531 distinct
+# articles, 639 of them copies of a single blog post.
+#
+# web_capture now keys revisions on the extracted text, so the churn stops at the source. This
+# is the consumer-side half, and it is needed for two reasons that outlive that fix: the
+# existing trees still hold the duplicates, and a genuine multi-revision article should cost
+# ONE ingest of its newest text, not one per revision. Selecting files rather than articles
+# made model spend track file count instead of information — the completion ledger on that
+# vault held 253 entries covering only 163 distinct articles.
+_REVISION_RE = re.compile(r"-revision-[0-9a-f]{8}(?:-[0-9a-f]{8})?(?=\.[^.]+$)")
+COLLAPSE_REVISIONS = os.environ.get("OKENGINE_RAW_COLLAPSE_REVISIONS", "1") != "0"
+
+
+def revision_group(rel: str) -> str:
+    """The article a raw path belongs to: its path with any `-revision-<hash>` token removed.
+
+    A path with no such token is its own group, so non-revisioned trees are untouched. Leading
+    `/opt/vault/` or a bare leading slash is stripped, because older lanes recorded absolute
+    paths in a page's `raw:` field and a group that does not match across both spellings
+    re-admits an article that is already compiled.
+    """
+    rel = _REVISION_RE.sub("", rel)
+    for prefix in ("/opt/vault/", "/"):
+        if rel.startswith(prefix):
+            rel = rel[len(prefix):]
+            break
+    return rel
+
+
+def collapse_revisions(
+    entries: list[tuple[str, str, int, float]],
+) -> tuple[list[tuple[str, str, int, float]], int]:
+    """Keep the NEWEST entry per revision group. Returns (kept, collapsed_count).
+
+    Newest by mtime, breaking ties on the path so the choice is deterministic — the digest is
+    a contract and the same vault state must always produce the same selection.
+    """
+    if not COLLAPSE_REVISIONS:
+        return entries, 0
+    best: dict[str, tuple[str, str, int, float]] = {}
+    for entry in entries:
+        key = revision_group(entry[0])
+        current = best.get(key)
+        if current is None or (entry[3], entry[0]) > (current[3], current[0]):
+            best[key] = entry
+    kept = sorted(best.values(), key=lambda e: e[0])
+    return kept, len(entries) - len(kept)
 
 
 def derive_year(rel_path: str, mtime: float) -> int:
@@ -194,10 +303,68 @@ def path_tier(rel_path: str) -> int:
 # source page (okengine#194 — it rewrote frontmatter to the schema and silently dropped these, so
 # a vault could not be filtered/attributed by ingest source). Kept in ONE place; the base schema
 # lists the same keys under common_optional (cross-checked by tests/cron/test_select_raw_batch.py).
-PROVENANCE_KEYS = ("source_feed", "source_channel", "matched_query", "watch_lane", "quality_score")
+#
+# `source_kind` is CARRIED, not re-derived. The ingest lanes already know it — feed_fetch reads
+# it off the feed item, the API importers stamp their own — and it is common_optional, so it is
+# schema-legal on every type exactly like the rest of this list. It was simply never added here,
+# so the compile agent had to INVENT a value nobody gave it.
+#
+# That passed unnoticed for as long as the model guessed plausibly. When the compile model
+# changed on 2026-07-26 the guess became a constant: from 2026-07-28 EVERY source page on a live
+# vault was written with the same single kind, ~30/day across four unrelated publishers on two
+# independent ingest channels, while the raw files beside them still carried four different
+# kinds. Unrelated channels do not change vocabulary on the same day; the classifier did,
+# because there was never supposed to be one.
+#
+# Downstream, a lane selecting the news firehose on `source_kind == "news"` matched nothing from
+# that day on, and the actor board it feeds froze on 2026-07-25 while reporting success.
+PROVENANCE_KEYS = ("source_feed", "source_channel", "source_kind", "matched_query",
+                   "watch_lane", "quality_score")
+
+
+def quarantine_reason(path: Path) -> str | None:
+    """Return the fail-closed admission reason declared by a raw Markdown input.
+
+    Operators may retain evidence under ``raw/`` while declaring that it is not an ingest
+    candidate. Promoting such an input would turn an explicitly quarantined association into an
+    ordinary canonical source. Inspect only the bounded frontmatter prefix; malformed or
+    non-Markdown inputs retain the existing selector behaviour.
+    """
+    if path.suffix.lower() != ".md":
+        return None
+    try:
+        prefix = path.read_text(encoding="utf-8", errors="replace")[:65536]
+    except OSError:
+        return None
+    match = FRONTMATTER_RE.match(prefix)
+    if not match:
+        return None
+    try:
+        data = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return None
+    if isinstance(data, dict):
+        disposition = str(data.get("ingest_disposition") or "").strip().casefold()
+        if disposition in {"quarantine", "quarantined"}:
+            return "declared-quarantine"
+    return None
 
 
 def main() -> int:
+    lane_id = os.environ.get("OKENGINE_LANE_ID", "").strip()
+    contract_digest = os.environ.get("OKENGINE_CONTRACT_DIGEST", "").strip()
+    if not lane_id or not contract_digest:
+        missing = [
+            name for name, value in (
+                ("OKENGINE_LANE_ID", lane_id),
+                ("OKENGINE_CONTRACT_DIGEST", contract_digest),
+            ) if not value
+        ]
+        print(
+            "ERROR: receipt contract unavailable; missing " + ", ".join(missing),
+            file=sys.stderr,
+        )
+        return 1
     if not VAULT.exists():
         print(f"ERROR: vault not found at {VAULT}", file=sys.stderr)
         print(f"# Batch selection failed: vault not found at `{VAULT}`")
@@ -206,8 +373,9 @@ def main() -> int:
     sources_dir = VAULT / "wiki" / "sources"
     raw_dir = VAULT / "raw"
     if not raw_dir.exists():
-        print(f"# Batch selection failed: `{raw_dir}` does not exist")
-        return 1
+        _clear_selection_manifest()
+        print('{"wakeAgent": false}')
+        return 0
 
     processed: set[str] = set()
     if sources_dir.exists():
@@ -218,7 +386,9 @@ def main() -> int:
                 continue  # page moved/deleted by a concurrent lane mid-scan
 
     all_raw: list[tuple[str, str, int, float]] = []
+    capture_store_skipped = 0
     bogus_paths: list[str] = []
+    quarantined_raw: list[tuple[str, str]] = []
     # Walk raw/ (the bulk ingest tree) AND the vault-root curated tree (where
     # some clipping tools write by default — operator-curated tier-0 content
     # that may sit outside raw/). itertools.chain lets one loop handle both.
@@ -258,6 +428,13 @@ def main() -> int:
         if p.name.lower() == "link.md" and not (p.parent / "content.txt").is_file():
             continue
         rel = str(p.relative_to(VAULT))
+        if rel.startswith(f"raw/{CAPTURE_DIR}/"):
+            capture_store_skipped += 1
+            continue
+        reason = quarantine_reason(p)
+        if reason:
+            quarantined_raw.append((rel, reason))
+            continue
         norm = normalize_path(rel)
         try:
             mtime = p.stat().st_mtime
@@ -265,7 +442,34 @@ def main() -> int:
             continue  # file removed/moved by a concurrent lane mid-scan
         all_raw.append((rel, norm, derive_year(rel, mtime), mtime))
 
-    unprocessed_all = [(rel, year, mtime) for (rel, norm, year, mtime) in all_raw if norm not in processed]
+    # Collapse revision siblings BEFORE the completed filter, not after: filtering first and
+    # grouping second would re-offer an older revision whenever the newest was already
+    # processed, which is the opposite of what this is for.
+    all_raw, collapsed_revisions = collapse_revisions(all_raw)
+
+    terminal_completions = _load_terminal_completions()
+    completed = processed | terminal_completions
+    # Compare on the revision GROUP, not the exact path (okengine#748).
+    #
+    # A source page records the raw path it was compiled from. When a NEW revision of that
+    # article later arrives, its path differs by the revision token alone, so an exact-path
+    # check calls it unprocessed and the agent compiles a SECOND page — at a slug of its own
+    # invention, since the slug is derived per run. One live article had four pages
+    # (`import-ai-454-aligned-safety`, `import-ai-454-automating-alignment`,
+    # `import-ai-454-alignmentsafety`, plus one named after the raw file), two of them months
+    # apart. That is the okengine#54 loop reached through the revision token instead of a
+    # hand-built path.
+    #
+    # Collapsing siblings is not enough on its own: it dedupes revisions present in the SAME
+    # scan, not a revision that arrives after its article was already compiled. Both halves are
+    # required, and the group is also normalized on the completed side so an absolute
+    # `/opt/vault/raw/...` recorded by an older lane still matches.
+    completed_groups = {revision_group(entry) for entry in completed}
+    unprocessed_all = [
+        (rel, year, mtime)
+        for (rel, norm, year, mtime) in all_raw
+        if norm not in completed and revision_group(norm) not in completed_groups
+    ]
     # Year-deferral keeps the older bulk archive out of the priority queue.
     # But tier-0 content (the curated tree) is operator-curated — saved with
     # deliberate intent, regardless of when the underlying event happened. A
@@ -276,11 +480,16 @@ def main() -> int:
         (rel, year, mtime) for (rel, year, mtime) in unprocessed_all
         if year >= MIN_YEAR or path_tier(rel) == 0
     ]
+    if CONTROLLED_TARGET:
+        unprocessed = [
+            item for item in unprocessed
+            if normalize_path(item[0]) == CONTROLLED_TARGET
+        ]
     deferred_older = len(unprocessed_all) - len(unprocessed)
 
     # Offer counts are visibility, never completion. Invalid/empty compiled pages and rejected writes
     # remain retryable regardless of how many times they were offered.
-    offered = {k: v for k, v in _load_offered().items() if k not in processed}
+    offered = {k: v for k, v in _load_offered().items() if k not in completed}
     repeatedly_rejected = [t for t in unprocessed
                            if offered.get(normalize_path(t[0]), 0) >= STUCK_AFTER]
     unprocessed_live = unprocessed
@@ -298,9 +507,12 @@ def main() -> int:
         print()
 
     if not unprocessed_live:
+        _clear_selection_manifest()
         print(f"# Raw-backfill batch — {datetime.now(timezone.utc).isoformat()}\n")
         _emit_bogus_warning()
         msg = f"# Backfill complete\n\n0 ingestable files remaining at MIN_YEAR={MIN_YEAR} ({len(all_raw)} total in raw/, all priority files indexed in wiki/sources/)."
+        if quarantined_raw:
+            msg += f"\n\n{len(quarantined_raw)} quarantined raw files were excluded from admission."
         if deferred_older:
             msg += f"\n\n{deferred_older} pre-{MIN_YEAR} files are deferred — lower MIN_YEAR env var to ingest them."
         msg += "\n\nAction: run `hermes cron pause raw-backfill` and append a final log entry to $WIKI_PATH/wiki/log.md."
@@ -324,19 +536,31 @@ def main() -> int:
     _emit_bogus_warning()
     print(f"**Vault:** `{VAULT}`")
     print(f"**Total raw files:** {len(all_raw)}")
-    print(f"**Already processed:** {len(processed)}")
+    if quarantined_raw:
+        print(f"**Quarantined raw files excluded:** {len(quarantined_raw)}")
+    print(
+        f"**Already processed:** {len(processed)} source-backed + "
+        f"{len(terminal_completions)} receipt-terminal"
+    )
     print(f"**Unprocessed (in scope, year>={MIN_YEAR}):** {len(unprocessed)}")
     if repeatedly_rejected:
         print(f"**Retryable (offered >={STUCK_AFTER}x without an accepted source):** "
               f"{len(repeatedly_rejected)} — still selected; inspect receipt rejection codes")
     if deferred_older:
         print(f"**Unprocessed (deferred, year<{MIN_YEAR}):** {deferred_older}")
+    if capture_store_skipped:
+        print(f"**Capture-store files excluded (storage, not content):** {capture_store_skipped}")
+    if collapsed_revisions:
+        # Visibility, not a warning: this is the lane working. A large number here means the
+        # capture layer is minting revisions for unchanged articles (okengine#748) and is
+        # worth chasing upstream, but the selection itself is correct either way.
+        print(f"**Revision siblings collapsed to newest:** {collapsed_revisions}")
     remaining = len(unprocessed_live) - len(chosen)
     print(f"**This batch:** {len(chosen)} of {len(unprocessed_live)} ingestable "
-          f"(bounded by `BATCH_SIZE={N}`, newest-first within scope)")
+          f"(bounded by `RAW_BATCH_SIZE={N}`, newest-first within scope)")
     if remaining > 0:
         print(f"**Remaining after this batch:** {remaining} — they drain on the next runs "
-              f"automatically; no need to wait or stop the job. Raise `BATCH_SIZE` to do more per run.")
+              f"automatically; no need to wait or stop the job. Raise `RAW_BATCH_SIZE` to do more per run.")
     print()
 
     print("**Unprocessed by year:**")
@@ -371,11 +595,9 @@ def main() -> int:
           "`source_feed`, `source_channel`, or `matched_query`.\n")
     print("If a raw file DUPLICATES a story that already has a source page (different slug), do NOT "
           "create a second page — instead APPEND this raw path to that existing source's `raw:` list "
-          "(via `mcp_okengine_write_update_entity`). That records it as processed so it stops being "
+          "(via `mcp__okengine_write__update_entity`). That records it as processed so it stops being "
           "re-queued; leaving it unmarked is what made the lane loop on duplicates.\n")
     selected_keys = [rel for rel, _, _ in chosen]
-    lane_id = os.environ.get("OKENGINE_LANE_ID", "")
-    contract_digest = os.environ.get("OKENGINE_CONTRACT_DIGEST", "")
     manifest = {"api": 1, "selected": selected_keys,
                 "input_digest": "sha256:" + hashlib.sha256(
                     json.dumps(selected_keys, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest(),
@@ -393,12 +615,55 @@ def main() -> int:
     print(f"- `contract_digest`: `{contract_digest}`")
     print(f"- `input_digest`: `{manifest['input_digest']}`")
     print("Use these exact runner-owned values in the final `okengine-receipt` JSON block.\n")
+    receipt_template = {
+        "api": 1,
+        "lane_id": lane_id,
+        "contract_digest": contract_digest,
+        "input_digest": manifest["input_digest"],
+        "items": [
+            {
+                "key": key,
+                "disposition": None,
+                "writes": [],
+                "reason": None,
+            }
+            for key in selected_keys
+        ],
+    }
+    print("## Runner-owned completion receipt template\n")
+    print(
+        "Copy this object exactly for the final receipt. Keep every `key` and all "
+        "identity fields unchanged. Replace each null `disposition` with exactly one "
+        "terminal value (`accepted`, `duplicate`, `skipped`, `rejected`, `failed`, or "
+        "`deferred`). For accepted items, replace `writes` with every confirmed "
+        "wiki-relative path; leave `sha256` null because the runner supplies the "
+        "authoritative post-write hash. For every other item, keep `writes: []` and "
+        "replace `reason` with a concrete explanation. Do not omit any item.\n"
+    )
+    print("```okengine-receipt")
+    print(json.dumps(receipt_template, indent=2))
+    print("```\n")
     for i, (rel, year, mtime) in enumerate(chosen, 1):
         mtime_iso = datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
-        size = (VAULT / rel).stat().st_size
+        raw_path = VAULT / rel
+        try:
+            size = raw_path.stat().st_size
+        except OSError as exc:
+            print(f"{i}. `{rel}` — derived_year={year}, mtime={mtime_iso}, evidence unavailable: {exc}")
+            print("\nThe raw item changed or disappeared after selection; disposition it as deferred "
+                  "without a write and retry from a fresh selector digest.\n")
+            continue
         limit = (f", extraction=partial(first {MAX_CONTEXT_BYTES} bytes of {size}; receipt must "
                  "declare deferred remainder)" if size > MAX_CONTEXT_BYTES else ", extraction=complete")
         print(f"{i}. `{rel}` — derived_year={year}, mtime={mtime_iso}, bytes={size}{limit}")
+        if raw_path.suffix.lower() in {".md", ".txt", ".html", ".htm", ".json", ".rtf"}:
+            evidence = raw_path.read_bytes()[:MAX_CONTEXT_BYTES].decode("utf-8", errors="replace")
+            print("\n```raw-evidence")
+            print(evidence)
+            print("```\n")
+        else:
+            print("\nEmbedded extraction is unavailable for this binary format; disposition "
+                  "this item as deferred without a write.\n")
     print()
 
     print("## After this batch\n")

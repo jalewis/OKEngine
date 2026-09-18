@@ -5,8 +5,12 @@ resolution (highest reliability wins, recency tiebreak), conflict surfacing, and
 shape-based defaulting. Pure-function tests — no vault I/O.
 """
 import importlib.util
+import runpy
 import sys
+import types
 from pathlib import Path
+
+import pytest
 
 CRON = Path(__file__).resolve().parents[2] / "scripts" / "cron"
 
@@ -352,3 +356,172 @@ def test_non_int_version_does_not_crash_assembler(tmp_path):  # invariant-audit 
                       ["nvd"], POLICY, "2026-06-21")
     fm, _ = m.read_fm(p)
     assert isinstance(fm["version"], int) and fm["version"] == 1   # reset from non-int, then bumped
+
+
+def test_helper_empty_schema_and_frontmatter_edges(tmp_path, monkeypatch):
+    m = _load("canonical_assemble")
+    assert m._as_list(None) == [] and m._as_list("x") == ["x"]
+    assert m.fuse([{"fields": {"empty": None}}], {}) == {"fields": {}, "conflicts": []}
+    assert m.load_schema(tmp_path) == {}
+    (tmp_path / "schema.yaml").write_text(
+        "merge_policy:\n  union: [aliases]\nsource_registry:\n  feed:\n    reliability: B\n"
+    )
+    schema = m.load_schema(tmp_path)
+    assert m.merge_policy(schema)["union"] == {"aliases"}
+    assert m.source_reliability(schema) == {"feed": "B"}
+    (tmp_path / "schema.yaml").write_text("[")
+    assert m.load_schema(tmp_path) == {}
+
+    page = tmp_path / "page.md"
+    page.write_text("plain")
+    assert m.read_fm(page) == ({}, "")
+    page.write_text("---\n[\n---\nbody")
+    assert m.read_fm(page) == ({}, "body")
+    page.write_text("---\n- one\n---\nbody")
+    assert m.read_fm(page) == ({}, "body")
+    monkeypatch.setattr(Path, "read_text", lambda *_a, **_k: (_ for _ in ()).throw(OSError()))
+    assert m.read_fm(page) == ({}, "")
+
+
+def test_collect_observation_scan_filters_and_registry_fallback(tmp_path):
+    m = _load("canonical_assemble")
+    assert m.collect_observations(tmp_path, {}) == {}
+    root = tmp_path / "wiki" / "observations" / "feed"
+    root.mkdir(parents=True)
+    (root / "_skip.md").write_text("---\ntype: actor\n---\n")
+    (root / ".skip.md").write_text("---\ntype: actor\n---\n")
+    (root / "blank.md").write_text("---\ncanonical: ''\nsource: ''\n---\n")
+    (root / "actor.md").write_text(
+        "---\ntype: actor\ncanonical: Actor-X\nname: Actor X\nupdated: 2026-01-01\n---\n"
+    )
+    obs = m.collect_observations(tmp_path, {"feed": "C"})
+    assert set(obs) == {"actor-x", "blank"}
+    assert obs["actor-x"][0]["source"] == "feed"
+    assert obs["actor-x"][0]["reliability"] == "C"
+    assert obs["actor-x"][0]["observed"] == "2026-01-01"
+
+
+def test_collect_observations_rejects_record_without_source(tmp_path, monkeypatch):
+    m = _load("canonical_assemble")
+    root = tmp_path / "wiki" / "observations"
+    root.mkdir(parents=True)
+
+    class SourceLess:
+        name = "record.md"
+        stem = "record"
+        def relative_to(self, _root):
+            return Path(".")
+
+    monkeypatch.setattr(Path, "rglob", lambda *_a, **_k: [SourceLess()])
+    monkeypatch.setattr(m, "read_fm", lambda *_a: ({"type": "actor"}, ""))
+    assert m.collect_observations(tmp_path, {}) == {}
+
+
+def test_canonical_index_filters_and_alias_shapes(tmp_path):
+    m = _load("canonical_assemble")
+    empty = m._canonical_index(tmp_path)
+    assert empty is not None
+    root = tmp_path / "wiki" / "entities"
+    root.mkdir(parents=True)
+    (root / "_meta.md").write_text("x")
+    (root / "INDEX.md").write_text("x")
+    (root / "dead.md").write_text("---\nstatus: tombstoned\n---\n")
+    (root / "string.md").write_text("---\nname: String\naliases: 'A, B, '\n---\n")
+    (root / "odd.md").write_text("---\ntitle: Odd\naliases: {x: y}\n---\n")
+    idx = m._canonical_index(tmp_path)
+    assert idx is not None
+
+
+def test_resolution_and_misc_rendering_edge_routes(tmp_path, monkeypatch):
+    m = _load("canonical_assemble")
+    fused = m.fuse([
+        _obs("", "A", "2026-01-01", category="same"),
+        _obs("a", "B", "2026-01-02", category="same"),
+        _obs("a", "C", "2026-01-03", category="same"),
+    ], {"consensus": {"category"}})
+    assert fused["fields"]["category"] == "same"
+    groups = {
+        "empty": [{"source": "x", "type": "", "reliability": "", "fields": {}}],
+        "scalar-alias": [{"source": "x", "type": "actor", "reliability": "A",
+                          "fields": {"title": "Nobody", "aliases": "Alias"}}],
+    }
+    routed, decisions = m.resolve_observation_groups(tmp_path, groups)
+    assert set(routed) == set(groups)
+    assert all(d["target"] == d["proposed"] for d in decisions)
+    assert m._canonical_type(groups["empty"]) == "entity"
+    assert m._canonical_type(groups["scalar-alias"]) == "actor"
+    assert m._assoc_section([]) == ""
+    assert m._assoc_section(["bad", {"p": "unknown"}]) == ""
+    section = m._assoc_section([{"p": "unknown", "t": "x"}])
+    assert "**Related**" in section and "|x]]" in section
+    assert m._set_managed_section("body\n\n## Old\nx", "## Old", "") == "body\n"
+
+    # Existing-slug bypasses resolver entirely.
+    existing = tmp_path / "wiki" / "entities" / "e" / "existing.md"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("---\nname: Existing\n---\n")
+    monkeypatch.setattr(
+        m.entity_resolve, "resolve",
+        lambda *_a: (_ for _ in ()).throw(AssertionError("must not resolve existing slug")),
+    )
+    routed, decisions = m.resolve_observation_groups(
+        tmp_path, {"existing": [{"source": "x", "fields": {}}]}
+    )
+    assert decisions[0]["evidence"] == "existing-slug"
+
+
+def test_write_canonical_dry_run_empty_fields_and_empty_relationships(tmp_path):
+    m = _load("canonical_assemble")
+    _shard_schema(tmp_path)
+    text, wrote = m.write_canonical(
+        tmp_path, "dry", "", {"name": "", "empty": None, "mitre_rels": []},
+        [], [], {"union": {"empty"}}, "2026-01-01", dry_run=True,
+    )
+    assert wrote is True and "type: entity" in text
+    assert not (tmp_path / "wiki" / "entities").exists()
+
+
+def test_main_reports_all_routes_and_entrypoint(tmp_path, monkeypatch, capsys):
+    m = _load("canonical_assemble")
+    groups = {
+        "multi": [
+            _obs("a", "A", "2026-01-01", aliases=["x"], category="one"),
+            _obs("b", "B", "2026-01-02", aliases=["y"], category="two"),
+        ],
+        "single": [_obs("a", "A", "2026-01-01", name="Single")],
+        "error": [_obs("a", "A", "2026-01-01", name="Error")],
+    }
+    for values in groups.values():
+        for value in values:
+            value["type"] = "actor"
+    decisions = [
+        {"proposed": "old", "target": "multi", "evidence": "exact-name", "ambiguous": None},
+        {"proposed": "maybe", "target": "maybe", "evidence": "single-alias",
+         "ambiguous": "known"},
+        {"proposed": "same", "target": "same", "evidence": "none", "ambiguous": None},
+    ]
+    monkeypatch.setattr(m, "collect_observations", lambda *_a: groups)
+    monkeypatch.setattr(m, "resolve_observation_groups", lambda *_a: (groups, decisions))
+    writes = iter([(None, True), (None, False)])
+
+    def write(_vault, slug, *_a, **_k):
+        if slug == "error":
+            raise OSError("race")
+        return next(writes)
+
+    monkeypatch.setattr(m, "write_canonical", write)
+    assert m.main(["--vault", str(tmp_path), "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "CONFLICTS" in out and "old -> multi" in out and "lone-alias" in out
+    assert "would assemble 1 canonical" in out
+
+    monkeypatch.setattr(m, "collect_observations", lambda *_a: {})
+    monkeypatch.setattr(m, "resolve_observation_groups", lambda *_a: ({}, []))
+    assert m.main(["--vault", str(tmp_path), "--only", " NONE "]) == 0
+    assert "no observations" in capsys.readouterr().out
+
+    monkeypatch.setattr(sys, "argv", [str(CRON / "canonical_assemble.py"),
+                                      "--vault", str(tmp_path)])
+    with pytest.raises(SystemExit) as exc:
+        runpy.run_path(str(CRON / "canonical_assemble.py"), run_name="__main__")
+    assert exc.value.code == 0

@@ -1,0 +1,155 @@
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index 6bf58e06..b6e26f02 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -692,6 +692,20 @@ def _localhost_to_ipv4(url: str) -> str:
+     return re.sub(r"^(https?://)localhost(?=[:/]|$)", r"\g<1>127.0.0.1", url, count=1)
+ 
+ 
++def _server_type_probe_cache_key(server_url: str, api_key: object) -> Optional[str]:
++    """Keep a local capability verdict scoped to the credential that observed it.
++
++    A callable key can mint different values per call, so it has no safe stable
++    cache identity. String keys use only a non-reversible digest, never the
++    credential itself, in either the in-memory or disk memo.
++    """
++    if not isinstance(api_key, str):
++        return None
++    from agent.credential_persistence import fingerprint_secret_value
++    fingerprint = fingerprint_secret_value(api_key)
++    return server_url if not fingerprint else f"{server_url}|auth={fingerprint}"
++
++
+ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
+     """Probe known endpoints: "ollama", "lm-studio", "vllm", "llamacpp", or None (TTL-cached)."""
+     import httpx
+@@ -699,16 +713,17 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
+     normalized = _localhost_to_ipv4(_normalize_base_url(base_url))
+     server_url = _server_root(normalized)
+     lmstudio_url = _lmstudio_server_root(normalized)
+-    cached = _endpoint_probe_path_cache.get(server_url)
++    cache_key = _server_type_probe_cache_key(server_url, api_key)
++    cached = _endpoint_probe_path_cache.get(cache_key) if cache_key is not None else None
+     if cached is not None and (time.monotonic() - cached[1]) < (_ENDPOINT_PROBE_TTL_SECONDS if cached[0] is not None else _ENDPOINT_PROBE_FAILURE_TTL_SECONDS):
+         return cached[0]
+     # Blackholed host: skip the waterfall. Deliberately NOT written to the
+     # hour-long verdict cache, which would pin "undetected" after it comes back.
+     if _endpoint_blackholed(server_url):
+         return None
+-    disk_hit = _local_probe_disk_get("server_type", server_url)
++    disk_hit = _local_probe_disk_get("server_type", cache_key) if cache_key is not None else None
+     if isinstance(disk_hit, str):
+-        _endpoint_probe_path_cache[server_url] = (disk_hit, time.monotonic())
++        _endpoint_probe_path_cache[cache_key] = (disk_hit, time.monotonic())
+         return disk_hit
+     # Most specific first: (name, paths tried until one answers 200, body check). LM Studio answers /api/tags
+     # with {"error": ...} and 200, so Ollama's body must carry "models"; older llama.cpp builds have no /v1 prefix.
+@@ -738,9 +753,10 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
+     except Exception:
+         pass
+     # Negative verdict in memory only (never on disk — failures are often transient).
+-    _endpoint_probe_path_cache[server_url] = (result, time.monotonic())
+-    if result is not None:
+-        _local_probe_disk_put("server_type", server_url, result)
++    if cache_key is not None:
++        _endpoint_probe_path_cache[cache_key] = (result, time.monotonic())
++        if result is not None:
++            _local_probe_disk_put("server_type", cache_key, result)
+     return result
+ 
+ 
+diff --git a/tests/agent/test_okengine_server_type_auth_scope.py b/tests/agent/test_okengine_server_type_auth_scope.py
+new file mode 100644
+index 00000000..e12fc609
+--- /dev/null
++++ b/tests/agent/test_okengine_server_type_auth_scope.py
+@@ -0,0 +1,89 @@
++"""A failed local probe under one API key cannot hide another key's server."""
++
++import httpx
++
++from agent import model_metadata as metadata
++
++
++def test_negative_server_type_cache_is_key_scoped_across_profiles(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    metadata._endpoint_probe_path_cache.clear()
++    metadata._endpoint_blackhole_cache.clear()
++    requests = []
++
++    def respond(request):
++        requests.append((request.url.path, request.headers.get("authorization")))
++        if request.headers.get("authorization") != "Bearer good-key":
++            return httpx.Response(401)
++        if request.url.path == "/api/tags":
++            return httpx.Response(200, json={"models": []})
++        return httpx.Response(404)
++
++    real_client = httpx.Client
++    monkeypatch.setattr(
++        httpx, "Client",
++        lambda **kwargs: real_client(transport=httpx.MockTransport(respond), **kwargs),
++    )
++    endpoint = "http://localserver:8123/v1"
++    assert metadata.detect_local_server_type(endpoint, api_key="bad-key") is None
++    calls_after_bad = len(requests)
++    assert metadata.detect_local_server_type(endpoint + "/", api_key="good-key") == "ollama", (
++        "a 401 under one profile must not be reused as the next profile's capability verdict")
++    assert len(requests) > calls_after_bad
++
++
++def test_positive_disk_server_type_cache_is_key_scoped_and_contains_no_secret(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    metadata._endpoint_probe_path_cache.clear()
++    metadata._endpoint_blackhole_cache.clear()
++    requests = []
++
++    def respond(request):
++        requests.append(request.headers.get("authorization"))
++        if request.headers.get("authorization") == "Bearer good-key":
++            if request.url.path == "/api/tags":
++                return httpx.Response(200, json={"models": []})
++            return httpx.Response(404)
++        return httpx.Response(401)
++
++    real_client = httpx.Client
++    monkeypatch.setattr(
++        httpx, "Client",
++        lambda **kwargs: real_client(transport=httpx.MockTransport(respond), **kwargs),
++    )
++    endpoint = "http://localserver:8124/v1"
++    assert metadata.detect_local_server_type(endpoint, api_key="good-key") == "ollama"
++    calls_after_good = len(requests)
++    metadata._endpoint_probe_path_cache.clear()  # simulate a fresh worker using the disk L2
++    assert metadata.detect_local_server_type(endpoint, api_key="bad-key") is None
++    assert len(requests) > calls_after_good, "the good-key disk result must not serve bad-key"
++    assert "good-key" not in str(metadata._endpoint_probe_path_cache)
++    disk = metadata._local_probe_disk_cache_path()
++    assert "good-key" not in disk.read_text(encoding="utf-8")
++
++
++def test_callable_probe_key_is_not_cached_across_token_rotation(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    metadata._endpoint_probe_path_cache.clear()
++    metadata._endpoint_blackhole_cache.clear()
++    requests = []
++
++    def respond(request):
++        requests.append(request.headers.get("authorization"))
++        if request.headers.get("authorization") == "Bearer good-key":
++            return (httpx.Response(200, json={"models": []})
++                    if request.url.path == "/api/tags" else httpx.Response(404))
++        return httpx.Response(401)
++
++    real_client = httpx.Client
++    monkeypatch.setattr(
++        httpx, "Client",
++        lambda **kwargs: real_client(transport=httpx.MockTransport(respond), **kwargs),
++    )
++    tokens = iter(("bad-key", "good-key"))
++    endpoint = "http://localserver:8125/v1"
++    assert metadata.detect_local_server_type(endpoint, api_key=lambda: next(tokens)) is None
++    before = len(requests)
++    assert metadata.detect_local_server_type(endpoint, api_key=lambda: next(tokens)) == "ollama"
++    assert len(requests) > before
++    assert not metadata._endpoint_probe_path_cache, "callable credentials have no stable cache identity"

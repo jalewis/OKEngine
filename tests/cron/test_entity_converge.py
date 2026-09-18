@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -71,3 +72,88 @@ def test_bridge_component_is_not_auto_merged(tmp_path):
         "c": {"name": "C", "aliases": ["other-one", "other-two"]},
     }
     assert m.clusters(records) == []
+
+
+def test_read_and_rewrite_tolerate_malformed_and_raced_pages(tmp_path, monkeypatch):
+    m = _load()
+    missing = tmp_path / "missing.md"
+    assert m._read(missing) == ({}, "")
+    plain = tmp_path / "plain.md"
+    plain.write_text("body only")
+    assert m._read(plain) == ({}, "")
+    malformed = tmp_path / "malformed.md"
+    malformed.write_text("---\n[bad\n---\nbody")
+    assert m._read(malformed)[0] == {}
+
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    raced = wiki / "raced.md"
+    raced.write_text("[[entities/a/old]]")
+    original = m.Path.read_text
+    monkeypatch.setattr(
+        m.Path, "read_text",
+        lambda self, *a, **k: (_ for _ in ()).throw(OSError("race"))
+        if self == raced else original(self, *a, **k),
+    )
+    assert m._rewrite(tmp_path, {"entities/a/old": "entities/a/new"}, False) == 0
+
+    visible = wiki / "visible.md"
+    visible.write_text("See [[entities/a/old]].\n")
+    assert m._rewrite(tmp_path, {"entities/a/old": "entities/a/new"}, False) == 1
+    assert "entities/a/old" in visible.read_text(), "dry-run must not mutate"
+
+    merged = m._union(
+        {"merged_from": ["entities/a/old"]}, [], ["entities/a/old"],
+    )
+    assert merged["merged_from"] == ["entities/a/old"]
+
+
+def test_run_skips_structural_empty_and_tombstoned_entities(tmp_path):
+    m = _load()
+    _page(tmp_path, "entities/INDEX", "type: entity\nname: Same Entity\n")
+    _page(tmp_path, "entities/_template", "type: entity\nname: Same Entity\n")
+    _page(tmp_path, "entities/empty", "- not-a-map\n")
+    _page(tmp_path, "entities/tomb", "type: entity\nname: Same Entity\nstatus: tombstoned\n")
+    assert m.run(tmp_path)["clusters"] == []
+
+
+def test_apply_rejects_approval_that_does_not_match_candidates(tmp_path):
+    m = _load()
+    _page(tmp_path, "entities/a/one", "type: entity\nname: Same Entity\n")
+    _page(tmp_path, "entities/a/two", "type: entity\nname: Same Entity\n")
+    try:
+        m.run(tmp_path, apply=True, approved={"entities/a/two": "entities/a/not-winner"})
+    except ValueError as exc:
+        assert "does not match" in str(exc)
+    else:
+        raise AssertionError("mismatched approval must fail closed")
+
+
+def test_main_dry_run_apply_and_approval_shape_errors(tmp_path, capsys):
+    m = _load()
+    _page(tmp_path, "entities/a/one", "type: entity\nname: Same Entity\n")
+    _page(tmp_path, "entities/a/two", "type: entity\nname: Same Entity\n")
+    assert m.main(["--vault", str(tmp_path)]) == 0
+    assert "DRY-RUN" in capsys.readouterr().out
+
+    approval = tmp_path / "approval.yaml"
+    candidates = m.run(tmp_path)["mapping"]
+    approval.write_text(__import__("yaml").safe_dump(candidates))
+    assert m.main(["--vault", str(tmp_path), "--apply", "--approve", str(approval)]) == 0
+    assert "APPLY" in capsys.readouterr().out
+
+    bad = tmp_path / "bad-approval.yaml"
+    bad.write_text("- not\n- a mapping\n")
+    try:
+        m.main(["--vault", str(tmp_path), "--approve", str(bad)])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("non-mapping approval must be a CLI error")
+
+    try:
+        m.main(["--vault", str(tmp_path), "--apply"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("apply without approval must be a CLI error")

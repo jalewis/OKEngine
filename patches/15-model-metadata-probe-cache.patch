@@ -1,0 +1,39 @@
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -623,7 +623,35 @@
+     return False
+ 
+ 
++# okengine#478: memoize the server-type probe.
++#
++# detect_local_server_type() walks a capability ladder — LM Studio /api/v1/models, then
++# ollama /api/tags, then llama.cpp /v1/props (falling back to /props), then vLLM /version.
++# Against any one server, all but the matching rung necessarily 404. That is correct
++# behaviour, but the function had NO cache and is reached from five call sites including
++# per-request paths (agent/image_routing.py), so every agent init re-walked the whole
++# ladder. The inference host measured ~150 failed probes/hour from this fleet, arriving as
++# bursts of 4 within ~40ms on each lane start.
++#
++# A server does not change type without a restart, and this process is spawned per cron
++# job, so a per-process memo is safe and collapses the burst to one ladder walk per run.
++# Cached on the NORMALIZED base_url so trailing-slash variants share an entry, and the
++# negative result (None — nothing matched) is cached too: re-probing an unrecognized
++# endpoint on every call was the most wasteful case of all.
++_local_server_type_cache: Dict[str, Optional[str]] = {}
++
++
+ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
++    """Cached wrapper — see _detect_local_server_type_uncached for the probe ladder."""
++    cache_key = (base_url or "").rstrip("/")
++    if cache_key in _local_server_type_cache:
++        return _local_server_type_cache[cache_key]
++    detected = _detect_local_server_type_uncached(base_url, api_key=api_key)
++    _local_server_type_cache[cache_key] = detected
++    return detected
++
++
++def _detect_local_server_type_uncached(base_url: str, api_key: str = "") -> Optional[str]:
+     """Detect which local server is running at base_url by probing known endpoints.
+ 
+     Returns one of: "ollama", "lm-studio", "vllm", "llamacpp", or None.

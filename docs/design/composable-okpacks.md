@@ -1,12 +1,13 @@
-# Design note (RFC): composable okpacks
+# Composable okpacks architecture
 
 **Status:** **Shipped** — multipack composition is live (this began as an RFC; see [design/README.md](README.md) for the authoritative status index).
 **Scope:** how multiple okpacks combine to build one compounding vault.
-**Relationship to current code:** the engine is domain-agnostic (it reads
-types/namespaces/aliases from `schema.yaml`, hardcodes no domain). That is a
-*prerequisite* for composition, but the engine has **no pack-merge layer
-today** — `cron_pack_split` takes one pack, schema is one file per vault (+
-walk-up for sub-trees). Composition is a new subsystem.
+**Relationship to current code:** the engine is domain-agnostic and multipack
+composition is implemented. `framework compose-preview` performs the conflict
+preflight; `framework install-domain` installs compatible packs;
+`extension_compose` and the schema composer produce the active artifacts; and
+`cron_pack_split` assembles engine, pack, and extension jobs for deployment.
+Walk-up schemas remain available for deliberately isolated subtrees.
 
 ---
 
@@ -422,11 +423,12 @@ and engine versions, or convergence silently breaks.
 **Resolution + dedup-on-write.** The engine keeps an **`id → path` index**; the
 write path resolves `id` and **claims it atomically** on create (not via the
 eventually-consistent batch index, or concurrent same-id creates race into
-duplicates). Convergence is **authority-id only**: a write to an existing
-authority id **merges** (provenance union + the field rule below). **Minted-slug
-pages never auto-merge** — a slug collision with materially different declared
-fields is a **create-time review-flag**, and name variants are surfaced as
-**candidates** to the existing dedup drains. *(This revives the deferred
+duplicates). An authority-id create **merges** (provenance union + the field rule
+below). **Minted-slug pages never auto-merge on create** — a collision returns the
+existing canonical identity without creating a phantom page or human-review row.
+An explicit converge request may merge it under the same ownership and conflict
+rules, and name variants are surfaced as **candidates** to the existing dedup drains.
+*(This revives the deferred
 identifier→path manifest — no longer optional.)*
 
 **Ownership + conflict rule (page + field scoped — NOT declared-field scoped).**

@@ -37,7 +37,7 @@ def test_verbose_runon_below_threshold_is_not_flagged():
     assert cl.lint_text("x", FM + "# X\n\n" + run + ".\n") == []
 
 
-# ── legitimate content must NOT be flagged (the cyber-market false positives) ─
+# ── legitimate content must NOT be flagged (the market-intel false positives) ─
 
 def test_clean_prose_is_clean():
     assert cl.lint_text("x", FM + "# X\n\nA normal concept page. It has sentences. They end.\n") == []
@@ -132,3 +132,38 @@ def test_explicit_and_env_thresholds_still_alarm(tmp_path, monkeypatch):
     assert cl.main(["--wiki", str(wiki), "--max-offenders", "-1"]) == 1    # env 3 < 5 -> alarm
     monkeypatch.setenv("CONTENT_LINT_MAX_OFFENDERS", "10")
     assert cl.main(["--wiki", str(wiki), "--max-offenders", "-1"]) == 0    # env 10 >= 5 -> clear
+
+
+def test_scan_report_and_cli_edge_paths(tmp_path, monkeypatch, capsys):
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    hidden = wiki / "_hidden.md"
+    hidden.write_text(SALAD)
+    unreadable = wiki / "unreadable.md"
+    unreadable.write_text(SALAD)
+    original = Path.read_text
+    monkeypatch.setattr(
+        Path, "read_text",
+        lambda self, *a, **k: (_ for _ in ()).throw(OSError("race"))
+        if self == unreadable else original(self, *a, **k),
+    )
+    assert cl.scan_vault(wiki) == {}
+    monkeypatch.setattr(Path, "read_text", original)
+
+    offenders = {f"page-{i}": ["long-unpunctuated-run"] for i in range(501)}
+    report = cl.render_report(501, offenders, "now")
+    assert "+1 more" in report
+
+    monkeypatch.delenv("WIKI_PATH", raising=False)
+    assert cl.main([]) == 2
+    assert "pass --vault" in capsys.readouterr().err
+    assert cl.main(["--vault", str(tmp_path / "absent")]) == 2
+    assert "no wiki dir" in capsys.readouterr().err
+
+    # Exercise --vault resolution, JSON output, and the >20 console truncation.
+    for i in range(21):
+        (wiki / f"bad-{i}.md").write_text(FM + SALAD + ".\n")
+    assert cl.main(["--vault", str(tmp_path), "--json", "--max-offenders", "30"]) == 0
+    assert '"offenders"' in capsys.readouterr().out
+    assert cl.main(["--wiki", str(wiki), "--max-offenders", "30"]) == 0
+    assert "more" in capsys.readouterr().out

@@ -1,0 +1,493 @@
+{
+  "schema_version": 1,
+  "target": {
+    "version": "v0.21.3",
+    "tag": "v2026.9.14",
+    "sha": "345cd2b057a452236de401d3534b8502a7465e8d"
+  },
+  "upstream_contract_tests": [
+    "tests/agent/test_error_classifier.py",
+    "tests/agent/test_error_surface.py",
+    "tests/agent/test_jsondecodeerror_retryable.py",
+    "tests/agent/test_nonretryable_error_html_summary.py",
+    "tests/agent/test_outer_error_retry_bound.py",
+    "tests/agent/test_run_agent_codex_responses.py",
+    "tests/agent/test_summarize_api_error.py",
+    "tests/agent/test_turn_recovery_retry_notice.py",
+    "tests/agent/test_turn_retry_state.py",
+    "tests/cron/test_scheduler_mcp_init.py",
+    "tests/cron/test_scheduler_shutdown_guard.py",
+    "tests/tools/test_mcp_transport_group_reconnect.py"
+  ],
+  "policy": {
+    "maximum_patch_count": 24,
+    "maximum_touched_upstream_files": 32,
+    "adapter_issue": 630,
+    "adapter_decision": "Keep the maintained-runtime patch set for v0.14.0: the two additional config surfaces enforce explicit operator decisions that cannot be implemented by an external adapter before Hermes mutates mounted state.",
+    "measured_existing_upstream_files": [
+    "agent/agent_init.py",
+    "agent/agent_runtime_helpers.py",
+    "agent/codex_responses_adapter.py",
+    "agent/codex_runtime.py",
+      "agent/conversation_loop.py",
+      "agent/insights.py",
+      "agent/model_metadata.py",
+      "agent/tool_executor.py",
+    "agent/turn_api_error.py",
+    "agent/turn_overflow.py",
+    "agent/turn_recovery.py",
+    "agent/usage_pricing.py",
+      "cron/scheduler.py",
+      "cron/scheduler_prompt.py",
+    "gateway/platforms/api_server.py",
+    "hermes_cli/config.py",
+    "hermes_cli/config_migrations.py",
+    "hermes_cli/tools_config.py",
+      "model_tools.py",
+    "run_agent.py",
+    "tests/agent/test_codex_responses_adapter.py",
+    "tests/cron/test_scheduler_completion_verification.py",
+      "tests/tools/test_cronjob_tools.py",
+      "tools/cronjob_prompt_scan.py",
+      "tools/file_operations.py",
+      "tools/file_tools.py",
+      "tools/mcp_tool_discovery.py",
+      "tools/mcp_tool_handlers.py",
+      "tools/mcp_tool_schema.py",
+      "tools/registry.py",
+      "tools/web_tools.py",
+      "toolsets.py"
+    ]
+  },
+  "dispositions": [
+    {
+      "original_id": "01",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/01-file-operations-vault-guard.patch",
+      "owner": "okengine-maintainers",
+      "classification": "permanent-product-differentiation",
+      "purpose": "Enforce OKF write authorization and reserved/tombstone invariants in native file operations.",
+      "rationale": "Backend-resolved vault write, replacement, move and delete guard; structural and schema enforcement retained.",
+      "upstream_surfaces": [
+        "tools/file_operations.py",
+        "tools/file_operations_okengine_guard.py"
+      ],
+      "tests": [
+        "tests/tools/test_okengine_file_operations_guard.py"
+      ],
+      "retirement_criteria": "Retire only when all Hermes file mutations support an equivalent external policy hook.",
+      "conflict_risk": "high"
+    },
+    {
+      "original_id": "02",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/02-doubled-write-path.patch",
+      "owner": "okengine-maintainers",
+      "classification": "upstream-candidate",
+      "purpose": "Reject doubled wiki path segments caused by confused working directories.",
+      "rationale": "Task-resolved doubled-path refusal retained.",
+      "upstream_surfaces": [
+        "tools/file_tools.py"
+      ],
+      "tests": [
+        "tests/tools/test_okengine_doubled_write_path.py"
+      ],
+      "retirement_criteria": "Retire when upstream validates canonicalized write paths equivalently.",
+      "conflict_risk": "low"
+    },
+    {
+      "original_id": "03",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/03-script-failure-report-only.patch",
+      "owner": "okengine-maintainers",
+      "classification": "upstream-candidate",
+      "purpose": "Strip mutating tools from failure-report agents.",
+      "rationale": "Failed script receives an empty report-only toolset.",
+      "upstream_surfaces": [
+        "cron/scheduler.py",
+        "cron/scheduler_prompt.py"
+      ],
+      "tests": [
+        "tests/cron/test_scheduler_completion_verification.py",
+        "tests/cron/test_okengine_script_failure_report_only.py"
+      ],
+      "retirement_criteria": "Retire when upstream failure agents are report-only by contract.",
+      "conflict_risk": "high"
+    },
+    {
+      "original_id": "04",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/04-usage-pricing-models.patch",
+      "owner": "okengine-maintainers",
+      "classification": "temporary-compatibility",
+      "purpose": "Supply corrected DeepSeek v4 peak pricing metadata.",
+      "rationale": "Native DeepSeek rows retained; add direct-provider peak policy and unknown historical bucket.",
+      "upstream_surfaces": [
+        "agent/insights.py",
+        "agent/usage_pricing.py"
+      ],
+      "tests": [
+        "tests/agent/test_okengine_deepseek_pricing.py"
+      ],
+      "retirement_criteria": "Retire after the pinned upstream pricing table contains verified equivalent entries.",
+      "conflict_risk": "medium"
+    },
+    {
+      "original_id": "05",
+      "status": "retired",
+      "artifact": "patches/target-v2026.9.14/05-native-delegate-session-retirement-test.patch",
+      "owner": "okengine-maintainers",
+      "classification": "upstream-candidate",
+      "purpose": "Close delegated session rows instead of leaking active state.",
+      "rationale": "Native child close and session-row finalization replace carried cleanup; real-builder normal/deferred test artifact supplies negative-gate evidence, while CI/canary proof remains required.",
+      "upstream_surfaces": [],
+      "tests": ["tests/tools/test_okengine_delegate_native_retirement.py"],
+      "retirement_criteria": "Retire when upstream always stamps delegated session completion.",
+      "conflict_risk": "medium"
+    },
+    {
+      "original_id": "06",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/06-cron-per-job-ollama-num-ctx.patch",
+      "owner": "okengine-maintainers",
+      "classification": "permanent-product-differentiation",
+      "purpose": "Thread a lane-specific Ollama context limit through agent initialization.",
+      "rationale": "Per-job context size threaded through split agent init with early validation.",
+      "upstream_surfaces": [
+        "cron/scheduler.py",
+        "run_agent.py",
+        "agent/agent_init.py"
+      ],
+      "tests": [
+        "tests/cron/test_okengine_per_job_ollama_num_ctx.py"
+      ],
+      "retirement_criteria": "Retire if upstream exposes an equivalent per-job context configuration contract.",
+      "conflict_risk": "high"
+    },
+    {
+      "original_id": "07",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/07-api-server-default-runtime.patch",
+      "owner": "okengine-maintainers",
+      "classification": "permanent-product-differentiation",
+      "purpose": "Select the interactive API model independently from gateway defaults.",
+      "rationale": "API-only provider/model runtime tuple resolved independently and fail closed.",
+      "upstream_surfaces": [
+        "gateway/platforms/api_server.py"
+      ],
+      "tests": [
+        "tests/gateway/test_okengine_api_server_default_model.py"
+      ],
+      "retirement_criteria": "Retire if upstream supports independent API-server model routing.",
+      "conflict_risk": "medium"
+    },
+    {
+      "original_id": "08",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/08-web-search-rotation.patch",
+      "owner": "okengine-maintainers",
+      "classification": "permanent-product-differentiation",
+      "purpose": "Rotate available web-search backends to distribute rate-limit load.",
+      "rationale": "Search-only rotation ported to split provider registry with extraction capability separation.",
+      "upstream_surfaces": [
+        "tools/web_tools.py"
+      ],
+      "tests": [
+        "tests/tools/test_okengine_web_rotation.py"
+      ],
+      "retirement_criteria": "Retire if provider rotation becomes an upstream policy extension.",
+      "conflict_risk": "medium"
+    },
+    {
+      "original_id": "09",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/09-22-cron-mcp-scope.patch",
+      "owner": "okengine-maintainers",
+      "classification": "permanent-product-differentiation",
+      "purpose": "Initialize only MCP servers explicitly enabled for a cron lane.",
+      "rationale": "Native scoped MCP discovery plus explicit required-surface gate.",
+      "upstream_surfaces": [
+        "cron/scheduler.py"
+      ],
+      "tests": [
+        "tests/cron/test_okengine_mcp_scope.py"
+      ],
+      "retirement_criteria": "Retire if upstream makes toolset-scoped MCP initialization mandatory.",
+      "conflict_risk": "high"
+    },
+    {
+      "original_id": "10",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/10-read-only-file-toolset.patch",
+      "owner": "okengine-maintainers",
+      "classification": "permanent-product-differentiation",
+      "purpose": "Expose file reads without a parallel native write path.",
+      "rationale": "Read-only file subsets closed to hostile plugin and MCP alias resolution.",
+      "upstream_surfaces": [
+        "hermes_cli/tools_config.py",
+        "toolsets.py"
+      ],
+      "tests": [
+        "tests/test_read_only_file_toolsets.py"
+      ],
+      "retirement_criteria": "Retire if upstream ships an equivalent stable read-only toolset.",
+      "conflict_risk": "medium"
+    },
+    {
+      "original_id": "11",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/11-http-status-retry-policy.patch",
+      "owner": "okengine-maintainers",
+      "classification": "temporary-compatibility",
+      "purpose": "Apply status-specific retry and fallback behavior for local inference pools.",
+      "rationale": "Per-status total-attempt and fallback contract ported across split retry recovery; output-cap correction respects disabled auto-compaction and classifies repeated request-shape rejection without a false gateway context-reset signal in either mode.",
+      "upstream_surfaces": [
+        "agent/agent_init.py",
+        "agent/conversation_loop.py",
+        "agent/turn_api_error.py",
+        "agent/turn_recovery.py",
+        "agent/turn_overflow.py",
+        "run_agent.py"
+      ],
+      "tests": [
+        "tests/agent/test_http_status_policy.py"
+      ],
+      "retirement_criteria": "Retire when upstream retry policy supports equivalent per-status configuration.",
+      "conflict_risk": "high"
+    },
+    {
+      "original_id": "12",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/12-mcp-resource-uri-guidance.patch",
+      "owner": "okengine-maintainers",
+      "classification": "upstream-candidate",
+      "purpose": "Clarify MCP resource URI constraints in schemas and errors.",
+      "rationale": "Resource URI guidance distinguishes advertised file URI from host-local file.",
+      "upstream_surfaces": [
+        "tools/mcp_tool_handlers.py",
+        "tools/mcp_tool_schema.py"
+      ],
+      "tests": [
+        "tests/tools/test_okengine_mcp_resource_uri_guidance.py"
+      ],
+      "retirement_criteria": "Retire when upstream schemas and errors provide equivalent guidance.",
+      "conflict_risk": "low"
+    },
+    {
+      "original_id": "13",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/13-cron-completed-tool-handlers.patch",
+      "owner": "okengine-maintainers",
+      "classification": "permanent-product-differentiation",
+      "purpose": "Expose actual tool-call counts to completion receipt verification.",
+      "rationale": "Handler-completion count replaces synthetic tool-call rows.",
+      "upstream_surfaces": [
+        "agent/agent_runtime_helpers.py",
+        "agent/tool_executor.py",
+        "cron/scheduler.py",
+        "model_tools.py",
+        "tools/registry.py",
+        "tools/tool_execution_telemetry.py"
+      ],
+      "tests": [
+        "tests/cron/test_okengine_completed_tool_receipt.py",
+        "tests/cron/test_scheduler_completion_verification.py",
+        "tests/tools/test_okengine_completed_tool_telemetry.py"
+      ],
+      "retirement_criteria": "Retire if upstream emits authoritative per-run tool-call evidence.",
+      "conflict_risk": "high"
+    },
+    {
+      "original_id": "14",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/14-cron-executed-writes.patch",
+      "owner": "okengine-maintainers",
+      "classification": "permanent-product-differentiation",
+      "purpose": "Expose canonical executed write identities to receipt verification.",
+      "rationale": "Canonical OKEngine write receipts captured at handler dispatch.",
+      "upstream_surfaces": [
+        "cron/scheduler.py",
+        "tools/okengine_write_telemetry.py",
+        "tools/registry.py"
+      ],
+      "tests": [
+        "tests/cron/test_okengine_completed_tool_receipt.py",
+        "tests/tools/test_okengine_write_telemetry.py"
+      ],
+      "retirement_criteria": "Retire if upstream emits canonical write receipts after tool execution.",
+      "conflict_risk": "high"
+    },
+    {
+      "original_id": "15",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/15-server-type-auth-cache.patch",
+      "owner": "okengine-maintainers",
+      "classification": "upstream-candidate",
+      "purpose": "Cache local server capability detection per normalized endpoint.",
+      "rationale": "Native TTL cache retained; credential-scoped keying replaces unsafe URL-only sharing.",
+      "upstream_surfaces": [
+        "agent/model_metadata.py"
+      ],
+      "tests": [
+        "tests/agent/test_okengine_server_type_auth_scope.py"
+      ],
+      "retirement_criteria": "Retire when upstream caches positive and negative capability probes.",
+      "conflict_risk": "medium"
+    },
+    {
+      "original_id": "16",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/16-llamacpp-props-path-policy.patch",
+      "owner": "okengine-maintainers",
+      "classification": "upstream-candidate",
+      "purpose": "Avoid unsupported metadata endpoints based on detected server type.",
+      "rationale": "llama.cpp props route memo learns successful endpoint with bounded expiry.",
+      "upstream_surfaces": [
+        "agent/model_metadata.py"
+      ],
+      "tests": [
+        "tests/agent/test_okengine_llamacpp_props_paths.py"
+      ],
+      "retirement_criteria": "Retire when upstream probes only server-supported endpoint shapes.",
+      "conflict_risk": "medium"
+    },
+    {
+      "original_id": "17",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/17-qwen-coder-responses-api.patch",
+      "owner": "okengine-maintainers",
+      "classification": "temporary-compatibility",
+      "purpose": "Route Qwen Coder custom providers through the Responses transport.",
+      "rationale": "Preserve the carried model-name Responses force even against explicit Chat api_mode; keep non-Qwen custom routes conservative. Target port retypes legacy role items and scopes the final-wire Relay preflight to forced custom Qwen routes so native Codex string input remains valid. Endpoint/profile migration and Chat wire switch are superseded; observed HTTP wire and negative mutation gates remain before promotion.",
+      "upstream_surfaces": [
+        "agent/agent_init.py",
+        "agent/codex_responses_adapter.py",
+        "agent/codex_runtime.py",
+        "run_agent.py"
+      ],
+      "tests": [
+        "tests/agent/test_okengine_codex_ttfb_watchdog.py",
+        "tests/agent/test_codex_responses_adapter.py",
+        "tests/agent/test_okengine_qwen_responses_transport.py"
+      ],
+      "retirement_criteria": "Retire when upstream custom-provider routing negotiates Responses semantics equivalently.",
+      "conflict_risk": "high"
+    },
+    {
+      "original_id": "18",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/18-cron-max-iterations.patch",
+      "owner": "okengine-maintainers",
+      "classification": "upstream-candidate",
+      "purpose": "Honor a bounded per-job maximum agent iteration count.",
+      "rationale": "Per-job cron iteration cap retained with malformed-value rejection. The same governed artifact prevents upstream config/SOUL migrations from overriding the explicitly selected 50/3 delegation limits, 30/90 curator windows, and existing deployment voice.",
+      "upstream_surfaces": [
+        "cron/scheduler.py",
+        "hermes_cli/config.py",
+        "hermes_cli/config_migrations.py"
+      ],
+      "tests": [
+        "tests/cron/test_okengine_turn_limit.py",
+        "tests/hermes_cli/test_okengine_policy_preservation.py"
+      ],
+      "retirement_criteria": "Retire when upstream supports and enforces per-job iteration ceilings.",
+      "conflict_risk": "high"
+    },
+    {
+      "original_id": "19",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/19-cron-receipt-hint.patch",
+      "owner": "okengine-maintainers",
+      "classification": "permanent-product-differentiation",
+      "purpose": "Require explicit terminal receipts for selected-item jobs.",
+      "rationale": "Selected-item terminal receipt prompt fork retained.",
+      "upstream_surfaces": [
+        "cron/scheduler_prompt.py"
+      ],
+      "tests": [
+        "tests/cron/test_okengine_receipt_hint.py"
+      ],
+      "retirement_criteria": "Retire if receipt guidance moves into a stable upstream extension hook.",
+      "conflict_risk": "high"
+    },
+    {
+      "original_id": "20",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/20-cron-evidence-scan-context.patch",
+      "owner": "okengine-maintainers",
+      "classification": "upstream-candidate",
+      "purpose": "Distinguish runtime evidence text from operator prompt overrides.",
+      "rationale": "Skill evidence provenance split retained without disabling prompt hardening.",
+      "upstream_surfaces": [
+        "cron/scheduler_prompt.py",
+        "tools/cronjob_prompt_scan.py"
+      ],
+      "tests": [
+        "tests/tools/test_cronjob_tools.py"
+      ],
+      "retirement_criteria": "Retire when upstream scans prompt directives with equivalent provenance context.",
+      "conflict_risk": "medium"
+    },
+    {
+      "original_id": "21",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/21-responses-attribution.patch",
+      "owner": "okengine-maintainers",
+      "classification": "permanent-product-differentiation",
+      "purpose": "Attach deployment and conversation attribution to Responses traffic.",
+      "rationale": "Responses wire attribution retained at physical request boundary.",
+      "upstream_surfaces": [
+        "agent/codex_runtime.py"
+      ],
+      "tests": [
+        "tests/agent/test_okengine_responses_attribution.py"
+      ],
+      "retirement_criteria": "Retire if upstream provides configurable equivalent attribution headers.",
+      "conflict_risk": "high"
+    },
+    {
+      "original_id": "22",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/09-22-cron-mcp-scope.patch",
+      "owner": "okengine-maintainers",
+      "classification": "permanent-product-differentiation",
+      "purpose": "Fail cron runs whose required MCP surface resolves to zero tools.",
+      "rationale": "Combined with 09: fail closed on absent job-authorized MCP surfaces.",
+      "upstream_surfaces": [
+        "cron/scheduler.py"
+      ],
+      "tests": [
+        "tests/cron/test_okengine_mcp_scope.py"
+      ],
+      "retirement_criteria": "Retire if upstream validates required tool surfaces before agent construction.",
+      "conflict_risk": "high"
+    },
+    {
+      "original_id": "23",
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/23-mcp-registry-recovery.patch",
+      "owner": "okengine-maintainers",
+      "classification": "upstream-candidate",
+      "purpose": "Recover MCP tools lost during reconnect publication races and make unrecovered loss fatal to cron integrity.",
+      "rationale": "Registry recovery and structural terminal transport failure telemetry make scheduled fires and audits fail closed without interpreting tool prose.",
+      "upstream_surfaces": [
+        "agent/conversation_loop.py",
+        "cron/scheduler.py",
+        "tools/mcp_registry_loss_telemetry.py",
+        "tools/mcp_tool_discovery.py",
+        "tools/mcp_tool_handlers.py",
+        "tools/mcp_transport_failure_telemetry.py",
+        "tools/registry.py"
+      ],
+      "tests": [
+        "tests/agent/test_okengine_mcp_registry_loss_turn.py",
+        "tests/cron/test_okengine_mcp_registry_run_status.py",
+        "tests/cron/test_okengine_mcp_transport_run_status.py",
+        "tests/cron/test_okengine_cron_prompt_gates.py",
+        "tests/tools/test_okengine_mcp_registry_recovery.py"
+      ],
+      "retirement_criteria": "Retire when upstream atomically preserves or republishes advertised MCP tools across transport reconnects and scheduled runs fail on unrecovered registry loss.",
+      "conflict_risk": "high"
+    }
+  ]
+}

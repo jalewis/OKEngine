@@ -2,7 +2,7 @@ The select_content_pegs.py wake-gate above has surfaced sources published this w
 the configured product's watchlist competitors/segments. Turn the strongest 3-7 into outbound
 content angles (blog post / LinkedIn / podcast pitch / newsletter item) — not a news roundup.
 
-**Trust the digest above — it already has what you need.** The wake-gate has already fetched and printed the relevant competitor/capability page summaries; do not re-fetch each one individually via mcp_okengine_get_page — that burns turns without adding information and risks running out of budget before you write the actual output. Read what's already in the digest, then go straight to writing.
+**Trust the digest above — it already has what you need.** The wake-gate has already fetched and printed the relevant competitor/capability page summaries; do not re-fetch each one individually via mcp__okengine__get_page — that burns turns without adding information and risks running out of budget before you write the actual output. Read what's already in the digest, then go straight to writing.
 
 For each peg:
 - **Hook** — the one-sentence angle a reader would click on.
@@ -15,7 +15,7 @@ For each peg:
 Drop a candidate rather than force an angle that doesn't actually connect to a real capability.
 7 max — quality over volume.
 
-Write via mcp_okengine_write_create_entity to the wiki-relative path the wake-gate specified,
+Write via mcp__okengine_write_okengine_messaging_synthesis_content_pegs__create_entity to the wiki-relative path the wake-gate specified,
 frontmatter `type: marketing-pulse, title: "Content pegs — week of <date>", published: <date>,
 updated: <date>`. Body: `# Content pegs — week of <date>` then one subsection per peg (`## <Hook>`
 with Signal/Our angle/Suggested format as bullets). If nothing survives filtering, write the page

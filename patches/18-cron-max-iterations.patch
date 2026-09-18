@@ -1,0 +1,17 @@
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 4c764bd13..6d240ef6a 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2798,8 +2798,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
+                     prefill_messages = None
+
+         # Max iterations
+-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
++        # A bounded cron lane must not inherit the interactive 90-turn default.
++        max_iterations = (
++            job.get("max_iterations") or _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
++        )
+
+         # Provider routing
+         pr = _cfg.get("provider_routing") or {}

@@ -80,9 +80,23 @@ def source_manifest(pack: Path, shape: str) -> dict:
             if candidate in all_scripts and candidate not in entrypoints and candidate not in support:
                 support.add(candidate); pending.append(candidate)
     scripts = {name: digest for name, digest in all_scripts.items() if name in entrypoints}
-    return {"manifest_version": 1, "pack": name, "pack_version": str(meta.get("version") or ""),
+    try:
+        schema = yaml.safe_load((pack / "schema.yaml").read_text(encoding="utf-8")) or {}
+    except OSError:
+        schema = {}
+    owned = [str(value) for value in ((meta.get("owns") or {}).get("namespaces") or [])]
+    partitioning = ((schema.get("partitioning") or {}).get("namespaces") or {})
+    permissions = ((schema.get("permissions") or {}).get("namespaces") or {})
+    tiers = ((schema.get("tier") or {}).get("namespaces") or {})
+    namespace_contracts = {
+        ns: {"partitioning": partitioning.get(ns) or {"strategy": "flat"},
+             "permissions": permissions.get(ns), "tier": tiers.get(ns)}
+        for ns in owned
+    }
+    return {"manifest_version": 2, "pack": name, "pack_version": str(meta.get("version") or ""),
             "shape": shape, "lane_scripts": scripts, "cron_jobs": jobs,
             "shared_support_scripts": {name: all_scripts[name] for name in sorted(support)},
+            "owned_namespaces": namespace_contracts,
             "scope": "deployable-runtime-assets"}
 
 

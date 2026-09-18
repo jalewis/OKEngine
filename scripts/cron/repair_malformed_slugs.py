@@ -39,10 +39,8 @@ def repair(vault: Path, apply: bool = False) -> tuple[list[tuple[str, str]], lis
     moves, errors = [], []
     pages = list(wiki.rglob("*.md"))
     for old in pages:
-        try:
-            rel_parts = old.relative_to(wiki).parts
-        except ValueError:
-            continue
+        # Every candidate comes from wiki.rglob(), so it is necessarily relative to wiki.
+        rel_parts = old.relative_to(wiki).parts
         if not rel_parts or rel_parts[0] != "entities" or not malformed(old):
             continue
         try:

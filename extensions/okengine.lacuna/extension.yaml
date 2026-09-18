@@ -33,9 +33,10 @@ schema:
   - schema/lacuna.schema.yaml     # OWNS the `lacuna` type + namespace (#133) — wires the fragment
                                   #   into the composer; without this the file is orphaned (never composed)
 operation:
-  schedule: {kind: cron, expr: "0 6 * * *"}   # daily (06:00) — drift-gated, cheap, one field per run
+  schedule: {kind: cron, expr: "@jitter:daily@6"}   # daily near 06:00 — per-install minute
   entrypoint: select_lacuna_field.py          # wake-gate: densest concept cluster not analyzed lately
   prompt_file: prompts/lacuna.md
+  max_iterations: 16
   output_contract:
     api: 1
     allowed_namespaces: [lacuna, predictions]
@@ -43,13 +44,14 @@ operation:
     operations: [create, update, converge]
     required_fields: [type]
     required_relationships: []
+    optional_relationships: [prediction_candidate]
     body: {required: true, min_non_whitespace: 80}
     unknown_fields: reject
     unresolved_links: review
     placeholder_links: reject
-    completion: per-selected-item
+    completion: run
   adversarial_fixtures: [tests/extensions/test_model_output_contracts.py]
-  toolsets: [file, todo, okengine-write, okengine]
+  toolsets: [todo, okengine-write, okengine]
   tier: analyze                   # okengine#129 hint: run AFTER ingest/compile so the graph is fresh
 config:
   # The composer maps these values to per-job `OKENGINE_LACUNA_*` env vars. Operators may still
@@ -63,6 +65,12 @@ config:
   # How many of the densest unanalyzed clusters to surface to the agent per run (it produces at
   # most one lacuna per field, deferring when no real force can be named — coverage is not a goal).
   batch_size: {type: integer, default: 3}
+  # Optional operational queue written by a pack-specific material-source router. Relative paths
+  # resolve from the vault root. Nominations only reorder otherwise eligible dense fields; they do
+  # not bypass min_density, rotation, named-force, confidence, or human-review requirements.
+  nominations_path: {type: string, default: ".okengine/lacuna-nominations.json"}
+  # Ignore old routing hints so a once-material source cannot pin the discovery agenda forever.
+  nomination_max_age_days: {type: integer, default: 7}
   # OPERATOR TOPIC OVERRIDE. Empty (default) = autonomous: the densest unanalyzed field, everything
   # considered. Set to a concept slug (or `concepts/<shard>/<slug>` / `[[concepts/…]]`) to PIN lacuna
   # to that one field this run, bypassing the density rank + reanalyze rotation. The field still needs

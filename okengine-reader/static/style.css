@@ -241,6 +241,7 @@ a.wl:hover{border-bottom-style:solid}
 
 /* ── reader extension panels (okengine#160): reader-owned renderers for declarative kinds ──── */
 .ext-panel{margin:0 0 16px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--panel2)}
+.assessment-list{display:grid;gap:8px}.assessment-item{display:grid;grid-template-columns:auto 1fr;gap:3px 8px;padding:9px 10px;border:1px solid var(--border);border-radius:7px;text-decoration:none;color:inherit}.assessment-item:hover{border-color:var(--accent)}.assessment-label{font-size:11px;text-transform:uppercase;color:var(--muted)}.assessment-label.suspected{color:var(--warn)}.assessment-claim{grid-column:1/-1;color:var(--muted);font-size:13px}
 .ep-title{font:0.8rem var(--mono);color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
 .ep-field{display:inline-block;margin:0 14px 5px 0;font-size:0.9rem}
 .ep-field b{color:var(--dim);font-weight:600;margin-right:4px}

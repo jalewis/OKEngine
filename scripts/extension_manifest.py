@@ -59,7 +59,7 @@ _REQUIRED_TOP = ("id", "kind", "version", "requires", "trust", "capabilities")
 _REQUIRES_KEYS = {"engine", "schema_refs", "extensions"}
 _CAP_KEYS = {"read", "write", "write_policy", "network", "secrets", "delivery"}
 _OPERATION_KEYS = {"schedule", "entrypoint", "timeout", "prompt", "prompt_file",
-                   "toolsets", "tier", "model", "after", "cost_bearing",
+                   "toolsets", "tier", "model", "max_iterations", "after", "cost_bearing",
                    "output_contract", "adversarial_fixtures"}
 # cost_bearing: a no_agent op that STILL spends model budget (a deterministic script calling
 # llm_lib directly, e.g. concept-enrich / scope-classify). budget_guard pauses it when over budget —
@@ -116,6 +116,18 @@ def _validate_operation(op: dict, trust, errors: list[str], ctx: str) -> None:
     if toolsets is not None and not (isinstance(toolsets, list)
                                      and all(isinstance(t, str) for t in toolsets)):
         errors.append(f"{ctx}.toolsets must be a list of toolset names")
+    elif toolsets is not None and "okengine-write" in toolsets and "file" in toolsets:
+        errors.append(
+            f"{ctx}.toolsets cannot combine okengine-write with the mutable file toolset; "
+            "raw file writes bypass policy, review, output-contract, and receipt enforcement")
+    max_iterations = op.get("max_iterations")
+    if has_prompt and max_iterations is None:
+        errors.append(f"{ctx}.max_iterations is required for every agent operation")
+    elif max_iterations is not None and (
+            not isinstance(max_iterations, int)
+            or isinstance(max_iterations, bool)
+            or max_iterations <= 0):
+        errors.append(f"{ctx}.max_iterations must be a positive integer")
     tier = op.get("tier")               # okengine#129 hint: slot into a kickstart stage
     if tier is not None and not (isinstance(tier, str) and tier.strip()):
         errors.append(f"{ctx}.tier must be a non-empty stage name (a kickstart-order hint)")

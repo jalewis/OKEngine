@@ -1,0 +1,43 @@
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2207,15 +2207,28 @@
+
+     # Always prepend cron execution guidance so the agent knows how
+     # delivery works and can suppress delivery when appropriate.
+-    cron_hint = (
+-        "[IMPORTANT: You are running as a scheduled cron job. "
+-        "DELIVERY: Your final response will be automatically delivered "
+-        "to the user — do NOT use send_message or try to deliver "
+-        "the output yourself. Just produce your report/output as your "
+-        "final response and the system handles the rest. "
+-        "SILENT: If there is genuinely nothing new to report, respond "
+-        "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
+-        "Never combine [SILENT] with content — either report your "
+-        "findings normally, or say [SILENT] and nothing more.]\n\n"
+-    )
++    _receipt_required = (
++        isinstance(job.get("output_contract"), dict)
++        and job["output_contract"].get("completion") == "per-selected-item"
++    )
++    if _receipt_required:
++        cron_hint = (
++            "[IMPORTANT: You are running as a scheduled receipt job. "
++            "DELIVERY: Your final response will be automatically processed. "
++            "This run selected work, so [SILENT] is forbidden. Your final "
++            "response MUST contain the exact fenced okengine receipt required "
++            "by the prompt, including a disposition for every selected item.]\n\n"
++        )
++    else:
++        cron_hint = (
++            "[IMPORTANT: You are running as a scheduled cron job. "
++            "DELIVERY: Your final response will be automatically delivered "
++            "to the user — do NOT use send_message or try to deliver "
++            "the output yourself. Just produce your report/output as your "
++            "final response and the system handles the rest. "
++            "SILENT: If there is genuinely nothing new to report, respond "
++            "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
++            "Never combine [SILENT] with content — either report your "
++            "findings normally, or say [SILENT] and nothing more.]\n\n"
++        )
+     prompt = cron_hint + prompt

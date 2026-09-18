@@ -51,7 +51,7 @@ def indexed_namespaces() -> dict[str, tuple[str, str]]:
     `exclude:` dirs. If the pack declares no namespaces, fall back to the
     on-disk top-level wiki directories (minus excluded + dot/underscore dirs).
     The engine ships no hardcoded namespace list."""
-    schema = schema_lib.governing_schema(VAULT)
+    schema = schema_lib.merged_schema(VAULT)
     excluded = schema_lib.excluded_dirs(schema) | {"operational", "dashboards"}
     names = schema_lib.knowledge_namespaces(schema) - excluded
     if not names:

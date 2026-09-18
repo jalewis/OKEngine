@@ -100,8 +100,19 @@ shape first).
 - **Reader:** `okengine-reader/` is a read-only web UI for the wiki.
 - **MCP query surface:** `okengine-mcp/` exposes read-only tools such as search,
   page fetch, references, and page listing.
-- **Framework CLI:** `scripts/framework.py` manages pack lifecycle and discovers, plans,
+- **Framework CLI:** `bin/framework` manages pack lifecycle and discovers, plans,
   executes, resumes, cancels, and inspects durable operations contributed by packs/extensions.
+  `python scripts/framework.py` remains supported for invocation compatibility.
+  See the [supported operator CLI](docs/operator-cli.md) for the public command and internal-tool
+  boundary.
+  Scheduled jobs are managed by stable name with `bin/framework jobs`; cron-plus hashes are
+  intentionally kept internal.
+  Deterministic checks and canonical fixes use the receipted, plan-before-mutation
+  [`framework audit` / `framework repair`](docs/audit-and-repair.md) workflow.
+  Declarative ingestion and disposable artifact regeneration use the bounded
+  [`framework ingest`, `sources`, and `rebuild`](docs/ingest-and-rebuild.md) commands.
+  Read-only provenance explanations and bounded analytical evidence artifacts use
+  [`framework explain`, `snapshot`, and `export`](docs/explain-and-export.md).
 - **OKF-compatible floor:** markdown + YAML pages with the minimal `type` field
   baseline where conformance is enabled.
 
@@ -123,15 +134,15 @@ shape first).
    Use a catalog pack:
 
    ```bash
-   python scripts/framework.py list
-   python scripts/framework.py pull <pack> ../my-brain
+   bin/framework list
+   bin/framework pull <pack> ../my-brain
    ```
 
    Or scaffold a new one:
 
    ```bash
-   python scripts/framework.py init ../my-brain --domain "..."
-   python scripts/framework.py validate ../my-brain
+   bin/framework init ../my-brain --domain "..."
+   bin/framework validate ../my-brain
    ```
 
    The engine checkout and vault are separate sibling directories:
@@ -159,6 +170,8 @@ Controls:
 
 ## Docs
 
+- [`docs/executive-guide.md`](docs/executive-guide.md) — executive system guide:
+  product model, architecture, concepts, governance, and the current pack map.
 - [`docs/overview.md`](docs/overview.md) — start here: concept, packs, and
   architecture.
 - [`docs/operating-cost.md`](docs/operating-cost.md) — token/cost model and budget

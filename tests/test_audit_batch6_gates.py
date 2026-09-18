@@ -15,7 +15,7 @@ def test_skeleton_mcp_forwards_index_refresh_hours():  # invariant-audit #35
 def test_cockpit_today_prefix_uses_utc_not_local():  # invariant-audit #61
     """published/created are UTC ISO timestamps; the today_prefix filter must bucket by UTC today, not
     the container's LOCAL date (drops rows between UTC midnight and local midnight on a non-UTC host)."""
-    app = (REPO / "okengine-cockpit" / "app.py").read_text()
+    app = (REPO / "src/okengine/cockpit_services/datasets.py").read_text()
     i = app.index("today_prefix")
     block = app[i:i + 700]
     assert "timezone.utc" in block, "today_prefix must compute today in UTC"
@@ -26,9 +26,10 @@ def test_reader_chat_gated_on_budget_marker():  # invariant-audit #37
     """The reader /api/chat must refuse to relay while budget_guard's vault pause-marker exists, so
     chat spend honors the same budget trip that pauses the crons."""
     app = (REPO / "okengine-reader" / "app.py").read_text()
+    app += (REPO / "okengine-reader" / "chat.py").read_text()
     assert "_budget_tripped" in app and "budget-paused" in app
-    chat = app[app.index("async def api_chat"):app.index("async def api_chat") + 900]
-    assert "_budget_tripped()" in chat, "/api/chat must check the budget trip before relaying"
+    assert "budget_tripped=_budget_tripped" in app
+    assert "budget_tripped()" in app, "/api/chat must check the budget trip before relaying"
 
 
 def test_manual_bringup_sequences_use_build():  # invariant-audit #45

@@ -30,5 +30,13 @@ def test_malformed_expr_fails(tmp_path):
     assert errs and "5-field" in errs[0]
 
 
+def test_out_of_range_five_field_expr_fails_without_mutating_job(tmp_path):
+    _wl(tmp_path, {"okengine.lacuna": "99 99 * * *"})
+    jobs = [{"name": "okengine.lacuna", "schedule": {"kind": "cron", "expr": "0 6 * * 1"}}]
+    errs = ec._apply_schedule_overrides(jobs, tmp_path)
+    assert errs and "croniter" in errs[0]
+    assert jobs[0]["schedule"]["expr"] == "0 6 * * 1"
+
+
 def test_absent_file_is_noop(tmp_path):
     assert ec._apply_schedule_overrides([], tmp_path) == []

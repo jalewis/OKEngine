@@ -9,6 +9,7 @@ this, then tears down). Standalone: bring the stack up with docker-compose.smoke
 stack is unreachable the module SKIPS (undetectable, not a vacuous pass) rather than failing.
 """
 import importlib.util
+import hashlib
 import json
 import os
 import re
@@ -27,6 +28,10 @@ READER = os.environ.get("SMOKE_READER_URL", "http://127.0.0.1:9880")
 COCKPIT = os.environ.get("SMOKE_COCKPIT_URL", "http://127.0.0.1:9881")
 MCP = os.environ.get("SMOKE_MCP_URL", "http://127.0.0.1:8880")
 MCP_TOKEN = os.environ.get("SMOKE_MCP_TOKEN", "okengine-local")   # matches docker-compose.smoke.yml
+REVIEW = os.environ.get("SMOKE_REVIEW_URL", "http://127.0.0.1:8881")
+REVIEW_TOKEN = os.environ.get("SMOKE_REVIEW_TOKEN", "okengine-smoke-review-secret")
+
+pytestmark = pytest.mark.e2e
 
 
 def _get(url, timeout=60):
@@ -44,6 +49,8 @@ def _require_stack():
     try:
         _get(f"{READER}/healthz", timeout=8)
     except (urllib.error.URLError, OSError) as e:
+        if os.environ.get("SMOKE_RELEASE") == "1":
+            pytest.fail(f"release stack not reachable at {READER}: {e}")
         pytest.skip(f"smoke stack not reachable at {READER} ({e}) — run smoke-e2e.sh")
 
 
@@ -90,6 +97,32 @@ def test_mcp_endpoint_answers():  # invariant-audit B7.6 (+ re-verify)
     auth = _mcp_status(headers={"Authorization": f"Bearer {MCP_TOKEN}"})
     assert auth != 401, f"MCP rejected the smoke token on /mcp (got {auth}) — wrong token or not the MCP"
     assert auth != 404, f"/mcp route missing (got {auth}) — the port may point at a non-MCP server"
+
+
+def test_safe_review_write_is_immediately_visible_through_reader():
+    """Exercise the real authenticated write service against only the disposable seed vault."""
+    subject = _VAULT / "wiki" / "sources" / "review-smoke.md"
+    # The harness copied the seed to SMOKE_VAULT; hash the deployed disposable subject, never the
+    # tracked fixture, so version locking proves that the request targets the same bytes readers see.
+    deployed = Path(os.environ["SMOKE_VAULT"]) / "wiki" / "sources" / "review-smoke.md"
+    assert subject.is_file() and deployed.is_file()
+    payload = json.dumps({
+        "path": "sources/review-smoke",
+        "decision": "approve",
+        "reviewer": "release-e2e",
+        "expected_version": 1,
+        "expected_hash": hashlib.sha256(deployed.read_bytes()).hexdigest(),
+        "service": "release-e2e",
+    }).encode()
+    req = urllib.request.Request(
+        f"{REVIEW}/review/resolve", data=payload, method="POST",
+        headers={"Authorization": f"Bearer {REVIEW_TOKEN}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as response:
+        result = json.loads(response.read())
+    assert response.status == 200 and result["state"] == "approved"
+    assert deployed.stat().st_mode & 0o777 == 0o644
+    _, rendered = _json(f"{READER}/api/page?path=sources/review-smoke")
+    assert rendered["needs_review"] is False
 
 
 # ── render-surface regressions ───────────────────────────────────────────────

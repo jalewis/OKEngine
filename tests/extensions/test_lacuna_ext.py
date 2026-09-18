@@ -6,6 +6,7 @@ that it ships well-formed (discovers, validates, owns its schema, gates correctl
 isolated selector stays self-contained.
 """
 import importlib.util
+import json
 import os
 import re
 import subprocess
@@ -85,7 +86,7 @@ def test_composes_into_one_agent_job_in_analyze_tier():
     # ships DAILY by default (drift-gated, so a no-op day is cheap) — a deployment can still
     # override per-pack via .okengine/extension-schedules.json. Guard against a silent regression
     # back to the old weekly cadence.
-    assert (j.get("schedule") or {}).get("expr") == "0 6 * * *", j.get("schedule")
+    assert (j.get("schedule") or {}).get("expr") == "@jitter:daily@6", j.get("schedule")
 
 
 def test_config_block_present():
@@ -94,6 +95,8 @@ def test_config_block_present():
     assert cfg["min_density"]["default"] == 8
     assert cfg["reanalyze_days"]["default"] == 90
     assert cfg["batch_size"]["default"] == 3
+    assert cfg["nominations_path"]["default"] == ".okengine/lacuna-nominations.json"
+    assert cfg["nomination_max_age_days"]["default"] == 7
     assert cfg["focus"]["default"] == "" and cfg["focus"]["type"] == "string"   # unset = autonomous
 
 
@@ -217,6 +220,109 @@ def test_gate_stays_quiet_when_field_is_thin(tmp_path):
     assert '"wakeAgent": false' in _run_gate(tmp_path)
 
 
+def _nominate(vault: Path, field: str, *, nominated_at="2026-06-26"):
+    path = vault / ".okengine" / "lacuna-nominations.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"nominations": [{
+        "field": field,
+        "source": "sources/2026/06/26/material-source",
+        "reason": "Material evidence may change the field boundary.",
+        "nominated_at": nominated_at,
+    }]}), encoding="utf-8")
+
+
+def _write_nomination_payload(vault: Path, payload):
+    path = vault / ".okengine" / "lacuna-nominations.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_fresh_material_nomination_precedes_denser_rotation_candidate(tmp_path):
+    _dense_field(tmp_path, slug="latency", n=12)
+    _dense_field_sharded(tmp_path, slug="agentic-ai-security", n=8)
+    _nominate(tmp_path, "[[concepts/a/agentic-ai-security]]")
+
+    out = _run_gate(tmp_path, OKENGINE_LACUNA_BATCH_SIZE="1")
+
+    assert '"wakeAgent": true' in out
+    assert "concept: agentic-ai-security" in out
+    assert "material-source nomination" in out
+    assert "concept: latency" not in out
+
+
+def test_nomination_cannot_bypass_density_gate(tmp_path):
+    """Negative gate: a routed story must not turn a thin field into confident inference."""
+    _dense_field_sharded(tmp_path, slug="agentic-ai-security", n=7)
+    _nominate(tmp_path, "concepts/a/agentic-ai-security")
+
+    out = _run_gate(tmp_path)
+
+    assert '"wakeAgent": false' in out
+    assert "0 eligible" in out
+
+
+@pytest.mark.parametrize("nominated_at", ["2026-06-18", "invalid", "2026-06-27"])
+def test_stale_malformed_or_future_nomination_does_not_change_rotation(tmp_path, nominated_at):
+    _dense_field(tmp_path, slug="latency", n=10)
+    _dense_field_sharded(tmp_path, slug="agentic-ai-security", n=8)
+    _nominate(tmp_path, "concepts/a/agentic-ai-security", nominated_at=nominated_at)
+
+    out = _run_gate(tmp_path, OKENGINE_LACUNA_BATCH_SIZE="1")
+
+    assert "concept: latency" in out
+    assert "material-source nomination" not in out
+
+
+@pytest.mark.parametrize(
+    ("payload", "path_override"),
+    [
+        ({"nominations": {}}, None),
+        ({"nominations": ["not-an-object"]}, None),
+        ({"nominations": []}, ""),
+    ],
+)
+def test_missing_or_structurally_invalid_nomination_queue_is_ignored(
+        tmp_path, payload, path_override):
+    _dense_field(tmp_path)
+    _write_nomination_payload(tmp_path, payload)
+    env = {}
+    if path_override is not None:
+        env["OKENGINE_LACUNA_NOMINATIONS_PATH"] = path_override
+
+    out = _run_gate(tmp_path, **env)
+
+    assert '"wakeAgent": true' in out
+    assert "fresh material nominations: 0" in out
+
+
+def test_absolute_queue_keeps_newest_duplicate_and_omits_empty_context(tmp_path):
+    _dense_field(tmp_path)
+    path = _write_nomination_payload(tmp_path, {"nominations": [
+        {
+            "field": "concepts/latency",
+            "source": "",
+            "reason": "",
+            "nominated_at": "2026-06-26",
+        },
+        {
+            "field": "concepts/latency",
+            "source": "older-source-must-not-win",
+            "reason": "older-reason-must-not-win",
+            "nominated_at": "2026-06-25",
+        },
+    ]})
+
+    out = _run_gate(tmp_path, OKENGINE_LACUNA_NOMINATIONS_PATH=str(path))
+
+    assert "material-source nomination" in out
+    assert "nominated_at: 2026-06-26" in out
+    assert "older-source-must-not-win" not in out
+    assert "older-reason-must-not-win" not in out
+    assert "    source:" not in out
+    assert "    reason:" not in out
+
+
 def test_gate_excludes_recently_analyzed_but_refreshes_old(tmp_path):
     _dense_field(tmp_path)
     _page(tmp_path, "lacuna/tail-latency.md",
@@ -234,6 +340,57 @@ def test_gate_requires_a_real_concept_page(tmp_path):
     for i in range(10):
         _page(tmp_path, f"entities/x{i}.md", "Links [[concepts/ghost]].\n")
     assert '"wakeAgent": false' in _run_gate(tmp_path)
+
+
+def test_selector_defensive_frontmatter_rotation_and_scan_edges(tmp_path, monkeypatch, capsys):
+    module = _load("lacuna_selector_edges", SELECTOR)
+    monkeypatch.setattr(module, "WIKI", tmp_path / "missing")
+    assert module.main() == 0
+    assert '"wakeAgent": false' in capsys.readouterr().out
+    assert module._read_fm(tmp_path / "missing.md") == {}
+    plain = tmp_path / "plain.md"
+    plain.write_text("body")
+    assert module._read_fm(plain) == {}
+    plain.write_text("---\n[broken\n---\n")
+    assert module._read_fm(plain) == {}
+    plain.write_text("---\n- list\n---\n")
+    assert module._read_fm(plain) == {}
+
+    wiki = tmp_path / "wiki"
+    lacuna = wiki / "lacuna"
+    sources = wiki / "sources"
+    concepts = wiki / "concepts"
+    for directory in (lacuna, sources, concepts):
+        directory.mkdir(parents=True)
+    unreadable = lacuna / "unreadable.md"
+    unreadable.write_text("x")
+    other = lacuna / "other.md"
+    other.write_text("---\ntype: report\n---\n")
+    undated = lacuna / "undated.md"
+    undated.write_text(
+        "---\ntype: lacuna\nfield_mapped: ['', '[[concepts/a]]']\n---\n"
+    )
+    raced = sources / "raced.md"
+    raced.write_text("[[concepts/a]]")
+    own = concepts / "a.md"
+    own.write_text("[[concepts/a]]")
+    original_read = Path.read_text
+    original_stat = Path.stat
+
+    def flaky_read(path, *args, **kwargs):
+        if path in {unreadable, raced}:
+            raise OSError("vanished")
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read)
+    monkeypatch.setattr(
+        Path, "stat",
+        lambda path, *args, **kwargs: (_ for _ in ()).throw(OSError("vanished"))
+        if path == undated else original_stat(path, *args, **kwargs),
+    )
+    monkeypatch.setattr(module, "WIKI", wiki)
+    assert module._recently_analyzed() == {"a"}
+    assert module._clusters() == ({}, {})
 
 
 # --- isolation ------------------------------------------------------------

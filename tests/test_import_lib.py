@@ -74,3 +74,113 @@ def test_import_report_runs_readonly(tmp_path, capsys):
     assert "NOT IN PACK" not in out.split("company")[0]   # company resolves via type_aliases
     # read-only: nothing rewritten
     assert "type: company" in (vault / "wiki/entities/a/globex.md").read_text()
+
+
+def test_page_filters_split_rewrite_and_scan_plain_pages(tmp_path):
+    wiki=tmp_path/"wiki";wiki.mkdir()
+    for name in ("_skip.md",".hidden.md","INDEX.md","INDEX-a.md","x.bak.md"):
+        (wiki/name).write_text("plain")
+    (wiki/"plain.md").write_text("plain")
+    (wiki/"scalar.md").write_text("---\n- x\n---\nbody")
+    assert {p.name for p in IL._iter_pages(wiki)}=={"plain.md","scalar.md"}
+    assert IL._split_fm("plain")== (None,None,None)
+    assert IL._fm_get("name: Acme\n","missing") is None
+    assert IL._rewrite_type("plain","vendor")=="plain"
+    rewritten=IL._rewrite_type("---\nname: Acme\n---\nbody","vendor")
+    assert "type: vendor\nname: Acme" in rewritten
+    inv=IL.scan(wiki);assert inv["pages"]==2 and inv["untyped"]==2
+
+
+def test_transform_skip_and_idempotency_paths(tmp_path):
+    wiki=_vault(tmp_path)
+    assert IL.retype_by_type(wiki,{"vendor":"vendor"},True)==[]
+    assert IL.retype_by_type(wiki,{"missing":"x"},True)==[]
+    assert IL.set_type_for_slugs(wiki,{"missing":"x","acme":"vendor"},True)==[]
+    assert IL.remap_fields(wiki,{"missing":{"default":{"x":"y"}}},True)==[]
+    first=IL.remap_fields(wiki,{"vendor":{"default":{"tlp":"clear"}}},True)
+    assert first and IL.remap_fields(wiki,{"vendor":{"default":{"tlp":"clear"}}},True)==[]
+
+
+def test_namespace_map_shards_and_layout_report(tmp_path):
+    assert IL.derive_ns_map({"types":{},"type_aliases":{"unknown":"nope"}}).get("unknown") is None
+    assert IL._shard("")=="_" and IL._shard("!x")=="_" and IL._shard("9x")=="9"
+    assert IL._canonical_path(Path("x/no-date.md"),"sources","slug")=="sources/slug"
+    assert IL._canonical_path(Path("x/a.md"),"briefings","a")=="briefings/a"
+    wiki=tmp_path/"wiki"
+    p=wiki/"wrong/a.md";p.parent.mkdir(parents=True);p.write_text("---\ntype: concept\n---\n")
+    q=wiki/"concepts/c.md";q.parent.mkdir(parents=True);q.write_text("---\ntype: concept\n---\n")
+    assert IL.layout_misplaced(wiki,{"concept":"concepts"})=={"wrong -> concepts":1}
+
+
+def test_collapse_missing_sources_and_noncanonical_depth(tmp_path):
+    wiki=tmp_path/"wiki";wiki.mkdir()
+    assert IL.collapse_source_dates(wiki,False)==[]
+    p=wiki/"sources/2026/06/x.md";p.parent.mkdir(parents=True);p.write_text("---\ntype: source\n---\n")
+    assert "0 day-dir" in IL.collapse_source_dates(wiki,False)[-1]
+
+
+def test_plain_frontmatter_skips_transform_loops_and_filtered_sources(tmp_path):
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    (wiki / "plain.md").write_text("body")
+    typed = wiki / "typed.md"
+    typed.write_text("---\ntype: old\na: one\n---\nbody")
+    typed2 = wiki / "typed2.md"
+    typed2.write_text("---\ntype: old\na: two\n---\nbody")
+    assert IL.retype_by_type(wiki, {"old": "new"}, apply=True)
+    assert IL.set_type_for_slugs(wiki, {"typed": "curated"}, apply=False)
+    assert IL.set_type_for_slugs(wiki, {"typed": "curated", "typed2": "curated"}, apply=True)
+    assert IL.remap_fields(
+        wiki, {"curated": {"rename": {"a": "renamed"}}}, apply=False,
+    )
+    assert IL.remap_fields(
+        wiki,
+        {"curated": {"rename": {"a": "renamed", "absent": "unused"}}},
+        apply=True,
+    )
+    assert IL.remap_fields(
+        wiki, {"curated": {"default": {"reviewed": "true"}}}, apply=True,
+    )
+    assert IL.layout_misplaced(wiki, {"curated": "entities"}) == {
+        "typed.md -> entities": 1, "typed2.md -> entities": 1,
+    }
+    assert "rehome" in IL.rehome_by_type(wiki, {"curated": "entities"}, apply=False)[0]
+
+    src = wiki / "sources"
+    src.mkdir()
+    for name in ("_skip.md", ".hidden.md", "INDEX.md", "INDEX-a.md"):
+        (src / name).write_text("ignored")
+    assert "0 day-dir" in IL.collapse_source_dates(wiki, apply=False)[-1]
+
+
+class _ChangingLinks:
+    """Behave like the link regex but report a post-rewrite count change."""
+    def __init__(self, real):
+        self.real = real
+        self.changed = False
+
+    def findall(self, text):
+        return ["synthetic"] if self.changed else []
+
+    def sub(self, repl, text):
+        self.changed = True
+        return self.real.sub(repl, text)
+
+
+def test_rehome_and_collapse_detect_link_count_invariant(tmp_path, monkeypatch):
+    wiki = tmp_path / "wiki"
+    misplaced = wiki / "wrong" / "x.md"
+    misplaced.parent.mkdir(parents=True)
+    misplaced.write_text("---\ntype: concept\n---\nbody")
+    monkeypatch.setattr(IL, "_LINK", _ChangingLinks(IL._LINK))
+    with pytest.raises(RuntimeError, match="rehome-by-type INVARIANT"):
+        IL.rehome_by_type(wiki, {"concept": "concepts"}, apply=True)
+
+    wiki2 = tmp_path / "wiki2"
+    dated = wiki2 / "sources/2026/01/02/x.md"
+    dated.parent.mkdir(parents=True)
+    dated.write_text("---\ntype: source\n---\nbody")
+    import re
+    monkeypatch.setattr(IL, "_LINK", _ChangingLinks(re.compile(r"\[\[([^\]|#\n]+)([\]#|])")))
+    with pytest.raises(RuntimeError, match="collapse-source-dates INVARIANT"):
+        IL.collapse_source_dates(wiki2, apply=True)

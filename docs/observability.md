@@ -54,6 +54,11 @@ periods) so a single skipped run doesn't page. Deployments without a textfile co
 `node_textfile_mtime_seconds` should instead alert on `absent()` alone, or add a self-timestamp
 gauge to the export.
 
+Every newly scaffolded pack also gives the gateway a Docker healthcheck that is independent of
+cron-plus. It marks the container unhealthy when `.tick.lock` is older than three scheduler ticks
+or `.scheduler-stalled` is non-empty. Monitor `docker compose ps`/container health from the host;
+the healthcheck remains live even when every in-scheduler dashboard and exporter has stopped.
+
 ## Alerts (standalone)
 For deployments without Prometheus, `health-export` is **transition-based** (no fatigue): when the
 overall goes red, or a lane newly errors / falls off-model, it appends a timestamped line to

@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -94,6 +95,86 @@ def test_ledger_parses_year_month_dates(tmp_path):
     _run(tmp_path)
     led = (w / "dashboards" / "event-ledger.md").read_text()
     assert "2025-10-01" in led and "2026-06-27" not in led   # year-month padded, not the fallback
+
+
+def test_ledger_date_schema_and_frontmatter_edges(tmp_path, monkeypatch):
+    module = _load("event_ledger_edges", LEDGER)
+    assert module._norm_date("seen 2026-08-04") == "2026-08-04"
+    assert module._norm_date("2026-08") == "2026-08-01"
+    assert module._norm_date("during 2026") == "2026-01-01"
+    assert module._norm_date("unknown") is None
+
+    monkeypatch.setattr(module, "VAULT", tmp_path)
+    monkeypatch.setattr(module, "WIKI", tmp_path / "wiki")
+    assert module._schema() == {}
+    composed = tmp_path / ".okengine/composed-schema.yaml"
+    composed.parent.mkdir()
+    composed.write_text("- not-a-mapping\n")
+    (tmp_path / "schema.yaml").write_text("event_types: [incident]\n")
+    assert module._schema()["event_types"] == ["incident"]
+    composed.write_text("[broken")
+    assert module._schema()["event_types"] == ["incident"]
+
+    absent = tmp_path / "absent.md"
+    assert module._fm(absent) == {}
+    for content in ("body", "---\n- list\n---\n", "---\n[broken\n---\n"):
+        page = tmp_path / "page.md"
+        page.write_text(content)
+        assert module._fm(page) == {}
+    assert module._event_date({"published": "2026-08"}, "custom") == "2026-08-01"
+    assert module._event_date({"custom": "unknown", "created": "2025"}, "custom") == "2025-01-01"
+    assert module._event_date({}, "custom") is None
+
+
+def test_ledger_main_filters_limits_and_replaces_daily_snapshot(tmp_path, monkeypatch, capsys):
+    wiki = tmp_path / "wiki"
+    events = wiki / "events"
+    events.mkdir(parents=True)
+    (tmp_path / "schema.yaml").write_text(
+        "event_types: [incident]\nevent_date_field: occurred\nevent_score_weights: []\n"
+    )
+    (events / "dated.md").write_text(
+        "---\ntype: incident\nname: Dated\noccurred: 2026-08-03\n---\n"
+    )
+    (events / "undated.md").write_text("---\ntype: incident\n---\n")
+    (events / "other.md").write_text("---\ntype: concept\n---\n")
+    (events / ".hidden.md").write_text("---\ntype: incident\ndate: 2026-09-01\n---\n")
+    (events / "old.bak.copy.md").write_text("---\ntype: incident\ndate: 2026-09-01\n---\n")
+    snapshot = wiki / "operational/event-ledger-snapshots.md"
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-08-04")
+    module = _load("event_ledger_main_edges", LEDGER)
+    monkeypatch.setattr(module, "MAX_EVENTS", 1)
+    assert module.main() == 0
+    snapshot.write_text(snapshot.read_text() + "| 2026-08-04 | 99 |\n| 2026-08-03 | 1 |\n")
+    assert module.main() == 0
+    dashboard = (wiki / "dashboards/event-ledger.md").read_text()
+    assert "**2 events** (showing newest 1)" in dashboard
+    assert "[[events/dated]]" in dashboard and "[[events/undated]]" not in dashboard
+    text = snapshot.read_text()
+    assert text.count("| 2026-08-04 |") == 1 and "| 2026-08-04 | 2 |" in text
+    assert "compiled 2 event" in capsys.readouterr().out
+
+
+def test_ledger_no_vault_and_snapshot_write_failure_are_nonfatal(tmp_path, monkeypatch):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    no_vault = _load("event_ledger_no_vault", LEDGER)
+    assert no_vault.main() == 0
+
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    (tmp_path / "schema.yaml").write_text("event_types: [incident]\n")
+    module = _load("event_ledger_snapshot_failure", LEDGER)
+    monkeypatch.setattr(module, "SNAP", tmp_path / "blocked/snapshot.md")
+    original_mkdir = Path.mkdir
+
+    def mkdir(path, *args, **kwargs):
+        if path == module.SNAP.parent:
+            raise OSError("read-only")
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+    assert module.main() == 0
 
 
 def _run_scoring(vault: Path, data: Path):
@@ -237,3 +318,93 @@ def test_collect_sources_computes_independent_corroboration(tmp_path, monkeypatc
         encoding="utf-8")
     rows2 = {r["source"].split("/")[-1]: r for r in m.collect_sources(m.config({}))}
     assert rows2["s6"]["corroboration_count"] == 5
+
+
+def test_event_scoring_helper_and_collection_boundaries(tmp_path, monkeypatch):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    module = _load("event_scoring_boundaries", SCORING)
+    assert module._schema() == {}
+    composed = tmp_path / ".okengine/composed-schema.yaml"
+    composed.parent.mkdir()
+    composed.write_text("[broken")
+    (tmp_path / "schema.yaml").write_text("- list\n")
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    (wiki / "schema.yaml").write_text("event_types: [incident]\n")
+    assert module._schema()["event_types"] == ["incident"]
+
+    assert module._page(tmp_path / "missing.md") == ({}, "")
+    plain = tmp_path / "plain.md"
+    plain.write_text("body")
+    assert module._page(plain) == ({}, "body")
+    malformed = tmp_path / "malformed.md"
+    malformed.write_text("---\nkey: [\n---\nbody")
+    assert module._page(malformed) == ({}, "body")
+    assert module._date(datetime(2026, 7, 15, 12)) == date(2026, 7, 15)
+    assert module._date("invalid") is None
+    assert module._num_map({"good": "1", "bad": "x"}) == {"good": 1.0}
+
+    cfg = module.config({})
+    assert module._source({}, cfg) == ({}, "")
+    assert module._source({"source": "sources/missing"}, cfg) == ({}, "")
+    assert module._entity_tier("", {}, cfg) == ""
+    assert module._entity_tier("acme", {"competitor_tier": "priority"}, cfg) == "priority"
+    entity = wiki / "entities/a/acme.md"
+    entity.parent.mkdir(parents=True)
+    entity.write_text("---\ntype: vendor\ncompetitor_tier: tracked\n---\n")
+    assert module._entity_tier("acme", {}, cfg) == "tracked"
+    assert module._entity_tier("absent", {}, cfg) == ""
+
+    assert module._source_entities(
+        {"entity": ["[[entities/frontmatter.md]]", "[[entities/second]]", ""]},
+        "[[entities/body.md]] [[concepts/ignored]]", cfg,
+    ) == {"frontmatter", "second", "body"}
+
+
+def test_event_scoring_collects_malformed_sources_and_no_vault(tmp_path, monkeypatch):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    module = _load("event_scoring_collection_edges", SCORING)
+    cfg = module.config({"event_types": ["incident"], "event_scoring": {
+        "typed_extractors": {"incident": "unsupported"}
+    }})
+    assert module.collect(cfg) == []
+    assert module.collect_sources(cfg) == []
+    assert module.main() == 0
+
+    source_dir = tmp_path / "wiki/sources"
+    source_dir.mkdir(parents=True)
+    (source_dir / "INDEX.md").write_text("ignored")
+    (source_dir / "other.md").write_text("---\ntype: concept\n---\n")
+    (source_dir / "bad-count.md").write_text(
+        "---\ntype: source\nindependent_corroboration_count: invalid\n"
+        "entities: ['[[entities/acme]]']\n---\n"
+    )
+    rows = module.collect_sources(cfg)
+    assert len(rows) == 1 and rows[0]["corroboration_count"] == 0
+
+    event_dir = tmp_path / "wiki/events"
+    event_dir.mkdir()
+    (event_dir / ".hidden.md").write_text("---\ntype: incident\n---\n")
+    (event_dir / "event.md").write_text("---\ntype: incident\n---\n")
+    (event_dir / "dated.md").write_text(
+        "---\ntype: incident\ndate: 2026-07-15\nentity: entities/acme\n---\nraised $2M"
+    )
+    collected = module.collect(cfg)
+    assert len(collected) == 2 and any(row["date"] is None for row in collected)
+    scored, typed = module.score(collected, date.today(), cfg)
+    assert len(scored) == 2 and typed == {}
+
+    supported = {**cfg, "typed_extractors": {"incident": "funding"}}
+    scored, typed = module.score(collected, date.today(), supported)
+    assert len(scored) == 2 and len(typed["incident"]) == 2
+
+    monkeypatch.setattr(module, "_schema", lambda: {
+        "event_types": ["incident"],
+        "event_scoring": {"typed_extractors": {"incident": "unsupported"}},
+    })
+    assert module.main() == 0
+    monkeypatch.setattr(module, "_schema", lambda: {
+        "event_types": ["incident"],
+        "event_scoring": {"typed_extractors": {"incident": "funding"}},
+    })
+    assert module.main() == 0

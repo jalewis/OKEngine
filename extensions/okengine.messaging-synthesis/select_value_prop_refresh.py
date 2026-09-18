@@ -90,7 +90,7 @@ def main() -> int:
     print("=== value-prop-gap-refresh wake-gate ===")
     print(f"  product: {product}  |  {new_signals} new competitor source(s) in {LOOKBACK_DAYS}d, "
           f"prior snapshot age: {age if age is not None else 'none yet'}")
-    print(f"  write via mcp_okengine_write_create_entity to: {out_path}")
+    print(f"  write via mcp__okengine_write__create_entity to: {out_path}")
     print(f"  frontmatter: type: value-prop-snapshot, title: \"Value-prop gap snapshot — "
           f"{today}\", published: {today}, updated: {today}")
     print()

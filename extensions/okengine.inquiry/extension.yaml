@@ -1,0 +1,81 @@
+# okengine.inquiry — a research topic as a DECLARED OBJECT (okengine#746).
+#
+# The problem it fixes: a vault had no first-class way to say "this is what I am researching."
+# The topic lived in four surfaces nothing reconciled — the pack's `mission:` prose (read by
+# humans only), feeds.opml (read by feed_fetch), the cron prompts (read by the model lanes), and
+# the persona CLAUDE.md (read by the model lanes). Adding a topic meant editing all four and
+# hoping they agreed, with no gate enforcing the agreement: exactly the multi-surface-contract
+# class this repo treats as a defect everywhere else.
+#
+# An `inquiry` page IS the declaration. Its `terms` drive collection; its `assessments` /
+# `predictions` / `solutions` group the evidence. Adding another research question is dropping
+# another page, with no engine change and no cron edit — the #63 drop-in property applied to
+# topics instead of lanes.
+#
+# BOUNDARY (the relevance-gate pattern): the engine ships the MECHANISM — the type, the bounded
+# collection driver, the dossier renderer, the reachability gate. The pack/operator ships the
+# QUESTIONS and the TERMS. This extension contains no domain knowledge and no source: which
+# connector an inquiry runs against is the inquiry's own `connector:` field, so a deployment
+# points it at whatever it already has.
+#
+# DELIBERATELY NOT a server-side watchlist. Several collection services offer a saved-query
+# object with a delta cursor, which looks like the natural home for an inquiry's terms. It is
+# not: storing the terms in the service's database puts the declaration outside git, outside the
+# pack, and outside every engine gate — re-creating the very split this extension exists to
+# close. The terms live in the page; the lane keeps its own cursor.
+id: okengine.inquiry
+kind: operation
+version: 0.1.0
+name: Inquiry
+description: >-
+  Research topics as declared objects: an inquiry page states a standing question and the terms
+  that collect evidence for it, drives bounded collection through a pack-declared source
+  connector, and renders a per-inquiry dossier that groups the assessments, predictions and
+  solutions answering it. Adding a topic is dropping a page.
+trust: in-gateway
+core: false                  # opt-in: collection volume and topic choice are operator decisions
+requires:
+  engine: ">=0.6.0"          # schema-owning extension grammar (#133) + the #63 cron drop-in model
+capabilities:
+  read: [wiki/**]
+  write: [dashboards/**]     # the dossier is a derived L1 `dashboard`; the inquiry PAGES are
+                             # human/agent-authored through the normal write path, never by a lane
+  network: false             # collection is delegated to source_connector.py, which holds its own
+                             # allowed_hosts / private-network contract. This extension opens no
+                             # socket of its own.
+schema:
+  - schema/inquiry.schema.yaml   # OWNS the `inquiry` type + namespace (#133)
+operations:
+  inquiry-collect:
+    # no_agent: reads open inquiries, runs each term through the declared connector, records the
+    # per-term outcome. Deterministic, bounded, idempotent. Zero model budget.
+    schedule: {kind: cron, expr: "35 4 * * *"}    # before the backfills that compile raw -> wiki
+    entrypoint: inquiry_collect.py
+    tier: ingest
+  inquiry-dossier:
+    # no_agent: renders the per-inquiry dossier + index. The dossier is where a declared-but-dry
+    # term becomes VISIBLE — see `unreachable terms` in the README.
+    schedule: {kind: cron, expr: "45 5 * * *"}    # after collection + the nightly index rebuild
+    entrypoint: inquiry_dossier.py
+    tier: analyze
+config:
+  max_inquiries:
+    type: string
+    default: "20"
+    description: >-
+      Open inquiries processed per collect run (oldest `opened` first; the rest wait for the next
+      run rather than being dropped). Env: OKENGINE_INQUIRY_MAX_INQUIRIES.
+  max_terms_per_inquiry:
+    type: string
+    default: "12"
+    description: >-
+      Terms run per inquiry per collect run. Bounds an inquiry that grows a long tail of terms
+      from monopolising a run. Env: OKENGINE_INQUIRY_MAX_TERMS_PER_INQUIRY.
+  dry_term_days:
+    type: string
+    default: "14"
+    description: >-
+      A term that has returned zero records for this many consecutive days is reported as DRY on
+      the dossier. This is the continuous half of the reachability gate: framework validate
+      catches a term whose connector does not exist, and this catches a term whose connector
+      exists but never answers. Env: OKENGINE_INQUIRY_DRY_TERM_DAYS.

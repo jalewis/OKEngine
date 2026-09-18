@@ -7,9 +7,18 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+import yaml
+
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "ensure-runtime.sh"
 TEMPLATE = REPO / "config" / "config.yaml.template"
+
+# Deployment-tool orchestration exercises real shell/filesystem/process
+# boundaries. Token, ownership, and security-baseline words in individual test
+# names describe the data under test; they do not turn these into security
+# property tests with the security lane's runtime contract.
+pytestmark = pytest.mark.integration
 
 # Run as the current uid so the writability check passes (the gateway-uid mismatch
 # path is exercised separately below).
@@ -103,11 +112,64 @@ def test_existing_mcp_config_gains_server_bound_source_quality_writer(tmp_path):
     after = cfg.read_text()
     assert after.count("okengine-write-source-quality:") == 1
     assert "OKENGINE_WRITE_ACTOR: cron:source-quality-backfill" in after
+    assert after.count("OKENGINE_POLICY_CATALOG: /opt/hermes/config/policy/catalog.yaml") == 2
+    assert "OKENGINE_CRON_JOBS: /opt/data/cron-plus/jobs.json" in after
     assert "OKENGINE_OUTPUT_CONTRACT_MODE: enforce" in after
     assert "command: /custom/python" in after, "operator configuration must be preserved"
     second = _run([str(tmp_path)])
     assert second.returncode == 0
     assert cfg.read_text() == after
+
+
+def test_existing_writer_repairs_stale_policy_catalog_path(tmp_path):
+    rt = tmp_path / ".hermes-data"
+    rt.mkdir()
+    cfg = rt / "config.yaml"
+    cfg.write_text(
+        "mcp_servers:\n"
+        "  okengine-write:\n"
+        "    command: /custom/python\n"
+        "    env:\n"
+        "      OKENGINE_POLICY_CATALOG: /obsolete/catalog.yaml\n"
+        "platform_toolsets:\n"
+        "  cron: [no_mcp]\n"
+    )
+
+    first = _run([str(tmp_path)])
+    assert first.returncode == 0, first.stderr
+    after = cfg.read_text()
+    assert "/obsolete/catalog.yaml" not in after
+    assert after.count(
+        "OKENGINE_POLICY_CATALOG: /opt/hermes/config/policy/catalog.yaml"
+    ) == 2
+
+    second = _run([str(tmp_path)])
+    assert second.returncode == 0, second.stderr
+    assert cfg.read_text() == after
+
+
+def test_existing_writer_expands_inline_env_without_losing_operator_values(tmp_path):
+    rt = tmp_path / ".hermes-data"
+    rt.mkdir()
+    cfg = rt / "config.yaml"
+    cfg.write_text(
+        "mcp_servers:\n"
+        "  okengine-write-custom:\n"
+        "    command: /custom/python\n"
+        "    env: {OKENGINE_WRITE_ACTOR: 'cron:custom', CUSTOM_FLAG: keep}\n"
+        "platform_toolsets:\n"
+        "  cron: [no_mcp]\n"
+    )
+
+    result = _run([str(tmp_path)])
+    assert result.returncode == 0, result.stderr
+    after = cfg.read_text()
+    assert after.count("    env:") == 2
+    parsed = yaml.safe_load(after)
+    env = parsed["mcp_servers"]["okengine-write-custom"]["env"]
+    assert env["OKENGINE_WRITE_ACTOR"] == "cron:custom"
+    assert env["CUSTOM_FLAG"] == "keep"
+    assert env["OKENGINE_POLICY_CATALOG"] == "/opt/hermes/config/policy/catalog.yaml"
 
 
 def test_materialized_cron_capabilities_gain_distinct_server_bound_writers(tmp_path):
@@ -135,7 +197,9 @@ def test_materialized_cron_capabilities_gain_distinct_server_bound_writers(tmp_p
     after = cfg.read_text()
     assert after.count("okengine-write-tid-procedure-candidate:") == 1
     assert after.count("OKENGINE_WRITE_ACTOR: cron:tid-procedure-candidate") == 1
+    assert after.count("OKENGINE_CRON_JOBS: /opt/data/cron-plus/jobs.json") >= 2
     assert after.count("okengine-write-tid-gap-priority-candidate:") == 1
+    assert after.count("OKENGINE_POLICY_CATALOG: /opt/hermes/config/policy/catalog.yaml") == 4
     assert "extension:not-a-cron" not in after
     assert "command: /custom/python" in after
     second = _run([str(tmp_path)])
@@ -158,7 +222,40 @@ def test_generated_contracted_lane_gains_enforcing_bound_writer(tmp_path):
         after = cfg.read_text()
         assert "okengine-write-compile:" in after
         assert "OKENGINE_WRITE_ACTOR: cron:compile" in after
+        assert after.count("OKENGINE_POLICY_CATALOG: /opt/hermes/config/policy/catalog.yaml") == 3
+        assert "OKENGINE_CRON_JOBS: /opt/data/cron-plus/jobs.json" in after
         assert "OKENGINE_OUTPUT_CONTRACT_MODE: enforce" in after
+    finally:
+        if original is None:
+            jobs_path.unlink(missing_ok=True)
+        else:
+            jobs_path.write_bytes(original)
+
+
+def test_pack_lane_write_tools_are_forwarded_to_its_bound_writer(tmp_path):
+    """okengine#664: a pack lane narrows its MCP surface with `write_tools` on its cron def; the
+    generated server-bound writer carries it as OKENGINE_WRITE_TOOLS. The engine table in
+    write_server.py never learns the lane's name."""
+    (tmp_path / "crons").mkdir()
+    rt = tmp_path / ".hermes-data"
+    rt.mkdir()
+    cfg = rt / "config.yaml"
+    cfg.write_text("mcp_servers:\n  okengine-write:\n    command: /custom/python\n")
+    jobs_path = REPO / "config" / "cron-plus-jobs.json"
+    original = jobs_path.read_bytes() if jobs_path.exists() else None
+    try:
+        jobs_path.write_text(json.dumps({"jobs": [
+            {"name": "vendor-frontmatter-backfill", "output_contract": {},
+             "write_tools": ["update_entity", " append_to_section "]},
+            {"name": "no-agent-lane", "no_agent": True, "write_tools": ["update_entity"]},
+        ]}))
+        r = _run([str(tmp_path)])
+        assert r.returncode == 0, r.stderr
+        after = cfg.read_text()
+        assert "okengine-write-vendor-frontmatter-backfill:" in after
+        assert "OKENGINE_WRITE_TOOLS: update_entity,append_to_section" in after
+        assert "okengine-write-no-agent-lane:" in after, "write_tools alone binds a writer"
+        assert after.count("OKENGINE_WRITE_TOOLS:") == 2
     finally:
         if original is None:
             jobs_path.unlink(missing_ok=True)
@@ -344,17 +441,14 @@ def test_no_offset_keeps_default_mcp_url(tmp_path):
     assert "http://localhost:8730/mcp" in cfg
 
 
-def test_iwe_only_in_mcp():
-    """okengine#179: backlinks are built by an in-process link-scanner, so iwe is used ONLY by
-    the MCP's graph tools (kb_graph). It must stay sha-pinned in the MCP image, and must NOT be
-    fetched anywhere it's no longer needed (reader/cockpit images, ensure-runtime staging)."""
-    import re
-    mcp = (REPO / "okengine-mcp" / "Dockerfile").read_text()
-    assert re.search(r'ARG IWE_VERSION=[0-9.]+', mcp) and re.search(r'ARG IWE_SHA256=[0-9a-f]{64}', mcp), \
-        "MCP must keep iwe pinned + sha-verified — it's the sole remaining iwe user"
-    for f in ("okengine-reader/Dockerfile", "okengine-cockpit/Dockerfile", "scripts/ensure-runtime.sh"):
-        assert "iwe-org/iwe/releases" not in (REPO / f).read_text(), \
-            f"{f} still downloads iwe, but it no longer needs it (backlinks are in-process, #179)"
+def test_iwe_absent_from_runtime_images_and_staging():
+    """A graph lookup must never install or stage the retired whole-corpus IWE runtime."""
+    for f in ("okengine-mcp/Dockerfile", "okengine-reader/Dockerfile",
+              "okengine-cockpit/Dockerfile", "scripts/ensure-runtime.sh",
+              "scripts/deploy-cron-scripts.sh"):
+        body = (REPO / f).read_text().lower()
+        assert "iwe-org/iwe/releases" not in body
+        assert "kb_graph.py" not in body
 
 
 def test_template_api_server_toolset_is_locked():

@@ -4,13 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>OKEngine · cockpit</title>
+<link rel="icon" href="/favicon.ico" type="image/svg+xml">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header id="topbar">
   <div class="brand" id="brand">⬢ <span>cockpit</span></div>
+  <button id="nav-toggle" class="nav-toggle" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="tabs">Menu</button>
   <!-- tabs are built at runtime from /api/config (pack-driven, domain-agnostic) -->
-  <nav id="tabs"></nav>
+  <nav id="tabs" role="tablist" aria-label="Cockpit sections"></nav>
   <div class="gsearch-wrap">
     <input id="gsearch" class="gsearch" type="search" autocomplete="off" placeholder="search all pages…  ( / )">
     <div id="gresults" class="gresults" hidden></div>

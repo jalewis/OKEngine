@@ -1,15 +1,15 @@
-# KB Tooling — qmd (search) + IWE (graph)
+# KB Tooling — qmd search + bounded backlink graph
 
-Local, on-device knowledge-base tooling wired into the agent. Both run **inside
-the gateway container** (where the vault is mounted at `/opt/vault`) and are exposed
-to the agent via thin terminal-tool wrappers.
+Local, on-device knowledge-base tooling wired into the agent. qmd runs in the MCP
+container; the gateway periodically builds a bounded backlink artifact consumed by
+the MCP, reader, and cockpit.
 
 ## What's wired
 
 | Tool | What | Wrapper (agent calls via `terminal`) |
 |---|---|---|
 | **qmd** 2.5.3 (`@tobilu/qmd`) | local hybrid search over `wiki/`: BM25 + vector + LLM rerank, all on-device | `scripts/cron/kb_search.py` |
-| **IWE** 0.3.2 (`iwe-org/iwe`) | markdown knowledge-graph; parses the vault's native `[[wikilinks]]` | `scripts/cron/kb_graph.py` |
+| **Backlink scanner** | bounded markdown graph over native `[[wikilinks]]` and Markdown links | `scripts/cron/backlink_lib.py` + `backlinks_refresh.py` |
 
 ### Usage
 
@@ -18,10 +18,8 @@ to the agent via thin terminal-tool wrappers.
 python /opt/data/scripts/kb_search.py "ransomware targeting healthcare"
 python /opt/data/scripts/kb_search.py --mode search "CISA ICS advisory"   # BM25, instant
 
-# graph navigation (READ-ONLY — wrapper refuses normalize/squash/extract/rename/delete/update)
-python /opt/data/scripts/kb_graph.py stats
-python /opt/data/scripts/kb_graph.py find "ransomware"
-python /opt/data/scripts/kb_graph.py retrieve concepts/ransomware
+# refresh the static graph artifact (normally scheduled)
+python /opt/data/scripts/backlinks_refresh.py
 ```
 
 ## Behavior at scale
@@ -32,17 +30,16 @@ python /opt/data/scripts/kb_graph.py retrieve concepts/ransomware
   (no GPU in the container); the full embed is a long batch job, so BM25 is the
   default fast path and the vector index builds in the background.
 
-**IWE** — `iwe stats` over `wiki/`:
-- Parses the vault's native `[[...]]` wikilink graph and resolves backlinks across
-  the corpus.
-- Reports orphaned-document counts — a useful KB-health signal.
-- The CLI rebuilds the graph per call; the `iwes`/`iwec` server keeps it warm for
-  repeated queries.
+**Backlink scanner** over `wiki/`:
+- Parses native `[[...]]` and Markdown links and resolves backlinks across the corpus.
+- Writes page, target, edge, and hub evidence to `wiki/.backlinks.json`.
+- Scans once per refresh rather than rebuilding the corpus on a query. On the measured
+  large vault it used about 104 MiB/14 seconds versus IWE's 4.2 GiB/530 seconds.
 
 ## Search index — setup, performance & tuning (deployment reality)
 
 > The sections above describe the original terminal-wrapper design. In a deployment that
-> exposes the **`okengine` read MCP** (`okengine-mcp/server.py`), the agent reaches qmd/IWE
+> exposes the **`okengine` read MCP** (`okengine-mcp/server.py`), the agent reaches qmd and the graph
 > through that MCP server, which runs in the **mcp container** (`okpack-cti-*-mcp`) — that is
 > where qmd is installed and where `/opt/data/qmd/` lives. The **gateway** runs cron-plus but
 > does **not** have qmd installed. This topology has real consequences below.
@@ -116,6 +113,15 @@ vector `qmd embed` stays manual (heavy; off the default search path). Recreating
 container preserves the index (it lives on the `/opt/data` volume) and the maintainer
 re-runs on the next start.
 
+**Load shedding.** Search and index maintenance share
+`OKENGINE_MCP_QMD_CONCURRENCY` slots (default `2`). A search waits at most
+`OKENGINE_MCP_SEARCH_QUEUE_SECONDS` (default `10`) for capacity, then returns an explicit
+`search saturated` result that clients should retry with backoff. Once admitted, a search is
+bounded by `OKENGINE_MCP_SEARCH_TIMEOUT_SECONDS` (default `120`). Client cancellation or timeout
+kills and reaps the whole helper process group, including qmd descendants; abandoned searches do
+not continue consuming CPU or memory. Index refresh requests are coalesced so only one refresh can
+run at a time. Fleet health reports saturation separately from execution timeout.
+
 **Chat latency knobs (reader → agent).** A chat answer is a multi-turn agent loop over the
 (remote) model — each tool decision is a model round-trip — so latency = turns × (model +
 tool). Tune via: the search default (lexical, above); the MCP tool output caps in `server.py`
@@ -126,49 +132,32 @@ not a blank stream.
 
 ## Architecture / persistence (code in image, data on the volume)
 
-- **Binaries ship in the image** (`Dockerfile`): `npm i -g @tobilu/qmd` + the IWE
-  release binaries (`iwe`/`iwes`/`iwec`) to `/usr/local/bin`. Survive rebuild +
-  recreate; reproducible on a fresh deploy.
+- **Search binaries ship in the image** (`Dockerfile`): `npm i -g @tobilu/qmd`.
 - **Data lives on the `/opt/data` volume** (`~/.hermes`), NOT in the image:
   - qmd index + ~2 GB GGUF models → `/opt/data/qmd/` (`XDG_CACHE_HOME`/`XDG_CONFIG_HOME`).
     Set once; a recreate does not re-download or re-index.
-  - IWE config → `wiki/.iwe/config.toml` (`wiki_link_path = "preserve"`; tracked).
-- The wrappers set the env (qmd: `XDG_*` + `QMD_FORCE_CPU=1`; IWE: project root =
-  `wiki/`) so callers don't have to.
+- The search wrapper sets `XDG_*` + `QMD_FORCE_CPU=1`; the graph producer resolves
+  `WIKI_PATH` and atomically publishes `wiki/.backlinks.json`.
 
-## Why wrappers, not MCP (for now)
+## Why the graph is an artifact
 
-Both tools ship MCP servers (`qmd mcp`, `iwec`), but wrappers were chosen first:
-1. **`iwec` is fragile on this corpus** — it panics (Rust) parsing markdown with
-   embedded HTML when run from the wrong root (it scanned the Hermes install's
-   `node_modules/react-colorful`). The **CLI is stable** when scoped to `wiki/`.
-2. **qmd-MCP cold-start** loads ~2 GB of models per stdio spawn; cron is
-   subprocess-per-job, so every job would pay it. The wrapper uses the warm index.
-3. **Pattern match** — the project already exposes tools to the agent via terminal
-   wrappers (`np_intelligence_query.py`).
+Graph reads vastly outnumber graph rebuilds. A scheduled, atomically published artifact
+makes every lookup O(1), gives all three consumers the same snapshot, and prevents a typo
+or stale cache from initiating multi-gigabyte work. Missing or stale evidence is reported
+explicitly; it is never repaired synchronously on the request path.
 
-MCP is a viable later enhancement: run `qmd mcp --http --daemon` (warm) + a
-`wiki/`-scoped `iwec` as long-lived servers and register them in `config.yaml`
-`mcp_servers`. Deferred until the warm-daemon + iwec-robustness story is worth it.
-
-## UI integration — okengine-reader backlinks panel (IWE)
+## UI integration — okengine-reader backlinks panel
 
 The reader UI shows a **"↩ Backlinks — what links here"** panel on every wiki
 page opened in the overlay (entities/concepts/sources/predictions), powered by the
-IWE graph — each backlink clickable to navigate.
+static backlink graph — each backlink clickable to navigate.
 
-Design (keeps the reader **standalone** — no hermes coupling):
-- The reader ships its own `iwe` binary (`okengine-reader/Dockerfile`). Base bumped
-  to `python:3.13-slim-trixie` because the IWE binary needs GLIBC ≥ 2.39
-  (bookworm-slim has 2.36). wkhtmltopdf isn't in trixie, so PDF export moved to
-  **weasyprint** (md/docx via pandoc unchanged).
-- `GET /api/backlinks?path=<key>` builds the full backlink map ONCE per hour
-  (`iwe find -f json -l 0` → invert), caches it, and serves per-page lookups
-  instantly. A **startup prewarm thread** builds it off the request path; a
-  single-flight lock prevents concurrent builds.
-- Reader resource limits are sized to host the periodic build off the request path.
-- Read-only safe: IWE writes nothing to `.iwe/`, so it works on the `/vault:ro`
-  mount. Requires `wiki/.iwe/config.toml` (tracked in the vault repo).
+Design (keeps the reader **standalone** — no Hermes coupling):
+- `GET /api/backlinks?path=<key>` reads `wiki/.backlinks.json` and serves per-page
+  lookups instantly.
+- A bounded in-process scan is available to the UI as an asynchronous compatibility
+  fallback; request handling never waits for it.
+- The vault remains mounted read-only in the UI containers.
 
 The qmd semantic search bar (replacing the ripgrep `/api/search`) is the planned
 next step — it needs the warm qmd HTTP daemon (see MCP upgrade path above).
@@ -179,6 +168,6 @@ next step — it needs the warm qmd HTTP daemon (see MCP upgrade path above).
   runs incremental `qmd update` on a timer (`OKENGINE_MCP_INDEX_REFRESH_HOURS`, default 6).
   Vector `qmd embed` is still manual (heavy) — run it mcp-side off-hours if you want hybrid.
   See [Search index — setup, performance & tuning](#search-index--setup-performance--tuning-deployment-reality).
-- IWE is stateless (rebuilds the graph per call) — no refresh needed.
-- Bump `IWE_VERSION` in the `Dockerfile` to upgrade IWE; `npm i -g @tobilu/qmd@<v>`
-  for qmd.
+- The `backlinks-refresh` lane publishes the graph artifact daily; stale/missing
+  evidence is a health condition rather than permission to rebuild during a request.
+- Bump `npm i -g @tobilu/qmd@<v>` in the Dockerfile to upgrade qmd.

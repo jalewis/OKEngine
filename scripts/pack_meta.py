@@ -29,6 +29,8 @@ from pathlib import Path
 
 import yaml
 
+from okengine.schema_exclusions import RESERVED_DERIVED_NAMESPACES
+
 
 # The top-level keys an author writes in pack.yaml (the closed pack grammar). Source of
 # truth for the authoring-a-pack.md doc-parity guard (tests/test_pack_doc_parity.py).
@@ -157,6 +159,12 @@ def validate_composition(metas: list[dict]) -> list[str]:
                 errors.append(f"type '{t}' is owned by both {owners_t[t]} and {m['name']}")
             owners_t[t] = m["name"]
         for ns in sorted(m["owns_namespaces"]):
+            if ns in RESERVED_DERIVED_NAMESPACES:
+                errors.append(
+                    f"namespace '{ns}' is reserved for engine-derived/operational artifacts "
+                    f"and cannot be owned by {m['name']}"
+                )
+                continue
             if ns in owners_ns and owners_ns[ns] != m["name"]:
                 errors.append(f"namespace '{ns}' is owned by both {owners_ns[ns]} and {m['name']}")
             owners_ns[ns] = m["name"]

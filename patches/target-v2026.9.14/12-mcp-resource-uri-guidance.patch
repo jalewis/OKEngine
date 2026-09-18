@@ -1,0 +1,222 @@
+diff --git a/tests/tools/test_okengine_mcp_resource_uri_guidance.py b/tests/tools/test_okengine_mcp_resource_uri_guidance.py
+new file mode 100644
+index 000000000..a38e04302
+--- /dev/null
++++ b/tests/tools/test_okengine_mcp_resource_uri_guidance.py
+@@ -0,0 +1,111 @@
++"""MCP resource guidance must not turn valid file:// resources into local paths."""
++
++import asyncio
++import json
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from tools.mcp_tool_handlers import _make_read_resource_handler
++from tools.mcp_tool_schema import _build_utility_schemas
++
++
++class _ResourceNotFound(Exception):
++    def __init__(self):
++        super().__init__("Resource not found")
++        self.error = SimpleNamespace(code=-32002)
++
++
++class _Session:
++    def __init__(self, result):
++        self.result = result
++        self.uris = []
++
++    async def read_resource(self, uri):
++        self.uris.append(uri)
++        if isinstance(self.result, BaseException):
++            raise self.result
++        return self.result
++
++
++class _Server:
++    def __init__(self, session):
++        self.session = session
++        self._rpc_lock = asyncio.Lock()
++
++
++def _invoke(uri, result):
++    session = _Session(result)
++    server = _Server(session)
++
++    def _run_on_loop(factory, timeout):
++        return asyncio.run(factory())
++
++    with (
++        patch("tools.mcp_tool_discovery._get_connected_server_for_call", autospec=True, return_value=server),
++        patch("tools.mcp_tool_loop._run_on_mcp_loop", autospec=True, side_effect=_run_on_loop),
++    ):
++        response = json.loads(_make_read_resource_handler("fixture", 5)({"uri": uri}))
++    assert session.uris == [uri], "the handler must pass the MCP URI through unchanged"
++    return response
++
++
++def test_schema_distinguishes_mcp_resource_from_local_file_and_preserves_templates():
++    entry = next(s for s in _build_utility_schemas("fixture") if s["handler_key"] == "read_resource")
++    schema = entry["schema"]
++    assert schema["parameters"]["required"] == ["uri"]
++    assert "list_resources" in schema["description"]
++    assert "template" in schema["description"]
++    assert "read_file" in schema["description"]
++    assert "file://" in schema["parameters"]["properties"]["uri"]["description"]
++
++
++@pytest.mark.parametrize("uri", [
++    "file:///server/advertised/report.txt",
++    "file:///server/templates/generated.txt",
++])
++def test_advertised_or_template_file_uri_is_read_successfully_without_correction(uri):
++    result = _invoke(uri, SimpleNamespace(contents=[SimpleNamespace(text="server content", blob=None)]))
++    assert result == {"result": "server content"}
++
++
++def test_missing_file_uri_receives_conditional_local_path_correction():
++    result = _invoke("file:///invented/local/path.txt", _ResourceNotFound())
++    assert "error" in result
++    assert "If this file:// URI was invented" in result["error"]
++    assert "read_file" in result["error"]
++    assert "get_page" in result["error"]
++
++
++@pytest.mark.parametrize("exc", [ConnectionError("transport down"), TimeoutError("RPC timed out")])
++def test_transport_failure_does_not_claim_file_uri_is_invalid(exc):
++    result = _invoke("file:///server/advertised/report.txt", exc)
++    assert "error" in result
++    assert "invented" not in result["error"]
++
++
++def test_non_file_resource_failure_does_not_suggest_local_file_tool():
++    result = _invoke("vault://missing-page", _ResourceNotFound())
++    assert "error" in result
++    assert "read_file" not in result["error"]
++
++
++def test_disconnected_server_fails_before_reading_an_advertised_uri():
++    with patch("tools.mcp_tool_discovery._get_connected_server_for_call",
++               autospec=True, return_value=None):
++        response = json.loads(_make_read_resource_handler("fixture", 5)(
++            {"uri": "file:///server/advertised/report.txt"}))
++    assert "not connected" in response["error"]
++    assert "invented" not in response["error"]
++
++
++def test_missing_uri_fails_before_mcp_transport_and_without_local_path_advice():
++    session = _Session(SimpleNamespace(contents=[]))
++    server = _Server(session)
++    with patch("tools.mcp_tool_discovery._get_connected_server_for_call",
++               autospec=True, return_value=server):
++        response = json.loads(_make_read_resource_handler("fixture", 5)({}))
++    assert "Missing required parameter 'uri'" in response["error"]
++    assert "invented" not in response["error"]
++    assert session.uris == [], "missing input must not make an MCP transport call"
+diff --git a/tools/mcp_tool_handlers.py b/tools/mcp_tool_handlers.py
+index e8df28d9a..9c2294dfc 100644
+--- a/tools/mcp_tool_handlers.py
++++ b/tools/mcp_tool_handlers.py
+@@ -267,7 +267,8 @@ def _handle_stdio_child_exited_and_retry(server_name: str, exc: Exception, retry
+ 
+ 
+ def _dispatch(server_name: str, server: Any, op: str, call, tool_timeout: float, recoverers,
+-              on_final_failure: Callable[[BaseException], None], record_outcome: bool = False) -> str:
++              on_final_failure: Callable[[BaseException], None], record_outcome: bool = False,
++              error_suffix: Optional[Callable[[BaseException], str]] = None) -> str:
+     """Mark the call started on *server* (doubles may lack ``mark_tool_call``), run coroutine function *call*
+     on the MCP loop and, on failure, walk ``recoverers`` (``(server_name, exc, retry_call, op) -> Optional[str]``,
+     None = not its kind; order matters). Unrecovered exceptions go through ``on_final_failure`` and become the
+@@ -289,7 +290,10 @@ def _dispatch(server_name: str, server: Any, op: str, call, tool_timeout: float,
+             if recovered is not None:
+                 return recovered
+         on_final_failure(exc)
+-        return tool_error(_sanitize_error(f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"))
++        message = _sanitize_error(f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}")
++        if error_suffix is not None:
++            message += error_suffix(exc)
++        return tool_error(message)
+ 
+ 
+ @asynccontextmanager
+@@ -509,7 +513,29 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+     return _handler
+ 
+ 
+-def _make_utility_handler(op: str, log_label: str, rpc, render, required: Optional[str] = None):
++def _resource_uri_failure_guidance(exc: BaseException) -> str:
++    """Suggest the right read surface only for an actual URI rejection.
++
++    `file://` is a legitimate MCP resource scheme, including for advertised
++    templates. A transport/session error does not prove the URI was invented.
++    """
++    error = getattr(exc, "error", None)
++    code = getattr(error, "code", getattr(exc, "code", None))
++    text = _exc_str(exc).lower()
++    if code != -32002 and not any(
++        phrase in text for phrase in ("resource not found", "invalid resource uri", "unknown resource")
++    ):
++        return ""
++    return (
++        " If this file:// URI was invented from a local path, do not repeat it: "
++        "use a URI advertised by this MCP server (a listed resource or a valid "
++        "resource-template instance). Use read_file for an explicit local path, "
++        "or the server's get_page tool for a vault page when available."
++    )
++
++
++def _make_utility_handler(op: str, log_label: str, rpc, render, required: Optional[str] = None,
++                          *, resource_uri_guidance: bool = False):
+     """``(server_name, tool_timeout) -> sync handler`` for one utility tool: ``rpc(session, args,
+     server_name)`` awaited under ``_rpc_lock``, ``render(result, server_name)`` -> JSON-able
+     payload, ``required`` validated before any transport work."""
+@@ -526,10 +552,14 @@ def _make_utility_handler(op: str, log_label: str, rpc, render, required: Option
+                 async with server._rpc_lock:
+                     result = await rpc(server.session, args, server_name)
+                 return json.dumps(render(result, server_name), ensure_ascii=False)
++            suffix = None
++            if resource_uri_guidance and str(args.get("uri", "")).startswith("file://"):
++                suffix = _resource_uri_failure_guidance
+             return _dispatch(
+                 server_name, server, op, _call, tool_timeout,
+                 (_handle_auth_error_and_retry, _handle_session_expired_and_retry),
+-                lambda exc: logger.error("MCP %s/%s failed: %s", server_name, log_label, exc))
++                lambda exc: logger.error("MCP %s/%s failed: %s", server_name, log_label, exc),
++                error_suffix=suffix)
+         return _handler
+     return _factory
+ 
+@@ -595,7 +625,8 @@ _make_list_resources_handler = _make_utility_handler(
+     lambda session, args, sn: _core._paginate_full_list(session.list_resources, "resources", sn), _render_resource_list)
+ _make_read_resource_handler = _make_utility_handler(
+     "resources/read", "read_resource",
+-    lambda session, args, sn: session.read_resource(args["uri"]), _render_read_resource, required="uri")
++    lambda session, args, sn: session.read_resource(args["uri"]), _render_read_resource,
++    required="uri", resource_uri_guidance=True)
+ _make_list_prompts_handler = _make_utility_handler(
+     "prompts/list", "list_prompts",
+     lambda session, args, sn: _core._paginate_full_list(session.list_prompts, "prompts", sn), _render_prompt_list)
+diff --git a/tools/mcp_tool_schema.py b/tools/mcp_tool_schema.py
+index e0967b012..6e3500b55 100644
+--- a/tools/mcp_tool_schema.py
++++ b/tools/mcp_tool_schema.py
+@@ -175,8 +175,15 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
+ # ``_build_utility_schemas`` must not change.
+ _UTILITY_TOOL_SPECS = (
+     ("list_resources", "List available resources from MCP server '{server}'", {}, None),
+-    ("read_resource", "Read a resource by URI from MCP server '{server}'",
+-     {"uri": {"type": "string", "description": "URI of the resource to read"}}, ["uri"]),
++    ("read_resource",
++     "Read an MCP resource from server '{server}' by its server-advertised URI. "
++     "For listed resources, copy the URI verbatim from this server's list_resources result; "
++     "a server-advertised resource template can also yield a valid URI. This is not a local "
++     "file reader: use read_file for an explicit local path, or the server's get_page tool "
++     "for a vault page when available.",
++     {"uri": {"type": "string", "description":
++        "MCP resource URI advertised by this server (listed URI or valid resource-template "
++        "instance); do not invent a file:// URI from a local path"}}, ["uri"]),
+     ("list_prompts", "List available prompts from MCP server '{server}'", {}, None),
+     ("get_prompt", "Get a prompt by name from MCP server '{server}'",
+      {

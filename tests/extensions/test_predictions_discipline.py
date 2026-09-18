@@ -2,6 +2,7 @@
 buckets) and date-audit, both deterministic no_agent ops."""
 import importlib.util
 import sys
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -11,10 +12,10 @@ REPO = Path(__file__).resolve().parent.parent.parent
 EXT = REPO / "extensions" / "okengine.predictions"
 
 
-def _load(name):
+def _load(name, source=None):
     # pred_lib must import as a sibling
     sys.path.insert(0, str(EXT))
-    spec = importlib.util.spec_from_file_location(name, EXT / f"{name}.py")
+    spec = importlib.util.spec_from_file_location(name, EXT / f"{source or name}.py")
     m = importlib.util.module_from_spec(spec); sys.modules[name] = m
     spec.loader.exec_module(m); return m
 
@@ -37,6 +38,47 @@ def test_confidence_prob():
     assert cal.confidence_prob("0.8", s) == 0.8
     assert cal.confidence_prob("70%", s) == 0.7
     assert cal.confidence_prob("nonsense", s) is None
+    cockpit_source = (
+        REPO / "src" / "okengine" / "cockpit_services" / "state.py"
+    ).read_text(encoding="utf-8")
+    for label, probability in cal._DEFAULT_SCALE.items():
+        assert f'"{label}": {probability}' in cockpit_source
+
+
+def test_pred_lib_defensive_page_reference_and_date_edges(tmp_path):
+    p = _load("pred_lib_edges", "pred_lib")
+    assert p.read_fm(tmp_path / "missing.md") == {}
+    plain = tmp_path / "plain.md"
+    plain.write_text("body")
+    assert p.read_fm(plain) == {}
+    plain.write_text("---\n[broken\n---\n")
+    assert p.read_fm(plain) == {}
+    plain.write_text("---\n- list\n---\n")
+    assert p.read_fm(plain) == {}
+    assert list(p.iter_pages(tmp_path, "predictions")) == []
+
+    pred_dir = tmp_path / "wiki/predictions"
+    pred_dir.mkdir(parents=True)
+    for name in ("_hidden.md", ".dot.md", "INDEX.md", "item.bak.md"):
+        (pred_dir / name).write_text("---\ntype: prediction\n---\n")
+    (pred_dir / "other.md").write_text("---\ntype: note\n---\n")
+    (pred_dir / "live.md").write_text("---\ntype: prediction\nstatus: open\n---\n")
+    assert [path.name for path, _fm in p.predictions(tmp_path)] == ["live.md"]
+    assert p.fm_date({}, "missing") == ""
+    assert p._date_from_path(tmp_path / "sources/undated.md") == ""
+    assert p.is_resolved({"status": "confirmed"})
+
+    sources = tmp_path / "wiki/sources/2026/08/04"
+    sources.mkdir(parents=True)
+    (sources / "path-dated.md").write_text("---\ntype: source\n---\n")
+    (sources / "old.md").write_text("---\ntype: source\ncreated: 2020-01-01\n---\n")
+    assert p.recent_source_slugs(tmp_path, "2026-08-01") == {"path-dated"}
+    assert p.entity_source_slugs({
+        "sources": "sources/a.md", "related": ["entities/x", "sources/b.md", ""],
+    }) == {"a", "b"}
+    assert p.subject_slugs({"subject": [None, "", "///", "[[entities/a/Alpha|A]]", "Bare"]}) == {
+        "alpha", "bare",
+    }
 
 
 def test_calibration_brier(tmp_path, monkeypatch):
@@ -127,11 +169,16 @@ def test_date_audit_flags(tmp_path, monkeypatch):
     _pred(pr, "no-date", "open")                                  # missing
     _pred(pr, "overdue", "open", resolves_by="2020-01-01")        # open + overdue
     _pred(pr, "fine", "open", resolves_by="2099-01-01")           # > horizon (~5y) -> flagged too
+    _pred(pr, "healthy-closed", "confirmed", resolves_by="2026-08-04")
     monkeypatch.setenv("WIKI_PATH", str(tmp_path))
     da = _load("prediction_date_audit")
     assert da.main() == 0
     dash = (tmp_path / "wiki" / "dashboards" / "prediction-date-audit.md").read_text()
     assert "missing/unparseable" in dash and "overdue" in dash
+    assert da._parse("2026-99-99") is None
+    monkeypatch.setattr(da.P, "predictions", lambda vault: [])
+    assert da.main() == 0
+    assert "flagged: **0**" in (tmp_path / "wiki/dashboards/prediction-date-audit.md").read_text()
 
 
 def test_manifest_has_three_no_agent_ops():
@@ -196,6 +243,31 @@ def test_schema_drain_derives_horizon_from_dates_not_judgment():  # okengine#326
     assert any("horizon drift: 'medium-term' -> 'medium'" in i for i in issues), issues
 
 
+def test_schema_drain_defensive_confidence_body_and_drift_edges(tmp_path):
+    d = _load("select_prediction_schema_drain_edges", "select_prediction_schema_drain")
+    assert not d._confidence_valid(None)
+    assert not d._confidence_valid("not-a-confidence")
+    assert d._body(tmp_path / "missing.md") == ""
+    issues, is_batch = d.classify(
+        {"status": "bespoke", "subject": "x", "confidence": "bad"}, "# body\n"
+    )
+    assert not is_batch
+    assert "status drift: 'bespoke' (read body)" in issues
+    assert "missing horizon (no made_on/resolves_by to derive it)" in issues
+    assert "unparseable confidence: 'bad'" in issues
+    issues, _ = d.classify(
+        {"status": "resolved", "subject": "x", "confidence": "high", "horizon": "unknown"},
+        "# body\n",
+    )
+    assert "status drift: 'resolved' -> 'confirmed'" in issues
+    assert "horizon drift: 'unknown'" in issues
+    issues, _ = d.classify(
+        {"status": "open", "subject": "x", "confidence": "high", "horizon": "short"},
+        "# body\n",
+    )
+    assert not any("horizon" in issue for issue in issues)
+
+
 def test_schema_audit_flags_missing_refutation_section(tmp_path, monkeypatch):
     pr = tmp_path / "wiki" / "predictions"
     pr.mkdir(parents=True)
@@ -207,6 +279,48 @@ def test_schema_audit_flags_missing_refutation_section(tmp_path, monkeypatch):
     assert sa.main() == 0
     dash = (tmp_path / "wiki" / "dashboards" / "prediction-schema-audit.md").read_text()
     assert "missing '## What would refute this'" in dash
+
+
+def test_schema_audit_helper_boundaries_and_clean_dashboard(tmp_path, monkeypatch):
+    sa = _load("prediction_schema_audit")
+    from datetime import date
+    assert sa._parse_date(None) is None
+    assert sa._parse_date("bad") is None
+    assert sa._parse_date("2026-02-31") is None
+    assert sa._parse_date("2026-02-28T12:00:00Z") == date(2026, 2, 28)
+    assert [sa._horizon_for(days) for days in (90, 91, 365, 366, 1825, 1826)] == [
+        "short", "medium", "medium", "long", "long", "strategic"
+    ]
+    assert not sa._confidence_valid(None)
+    assert sa._confidence_valid("VERY-HIGH")
+    assert sa._confidence_valid("75%") and sa._confidence_valid("0.25")
+    assert not sa._confidence_valid("101") and not sa._confidence_valid("unknown")
+    assert not sa._has_refutation_section(tmp_path / "missing.md")
+
+    _pred_full(
+        tmp_path / "wiki/predictions", "clean", status="open", subject="x", confidence="medium",
+        made_on="2026-01-01", resolves_by="2026-02-01", horizon="short",
+    )
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    clean = _load("prediction_schema_audit")
+    assert clean.main() == 0
+    assert "_No schema issues found._" in (
+        tmp_path / "wiki/dashboards/prediction-schema-audit.md"
+    ).read_text()
+
+
+def test_schema_audit_flags_missing_subject_confidence_and_horizon(tmp_path, monkeypatch):
+    pr = tmp_path / "wiki/predictions"
+    _pred_full(pr, "missing", status="open", made_on="2026-01-01", resolves_by="2027-01-02")
+    _pred_full(pr, "bad-confidence", status="open", subject="x", confidence="many",
+               made_on="2026-01-01", resolves_by="2032-01-01", horizon="strategic")
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    module = _load("prediction_schema_audit")
+    assert module.main() == 0
+    dash = (tmp_path / "wiki/dashboards/prediction-schema-audit.md").read_text()
+    assert "missing subject" in dash and "missing confidence" in dash
+    assert "missing horizon (should be 'long')" in dash
+    assert "unparseable confidence='many'" in dash
 
 
 def test_schema_drain_gate_and_scope(tmp_path, monkeypatch):
@@ -258,6 +372,21 @@ def test_structural_backfill_gate_and_scope(tmp_path, monkeypatch):
     assert _run("select_prediction_structural_backfill", tmp_path, monkeypatch) is False
 
 
+def test_structural_backfill_read_race_and_controlled_target(tmp_path, monkeypatch):
+    pr = tmp_path / "wiki/predictions"
+    _pred(pr, "target", "open", "0.6", "2026-09-01")
+    _pred(pr, "other", "open", "0.6", "2026-10-01")
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    mod = _load("select_prediction_structural_backfill_edges",
+                "select_prediction_structural_backfill")
+    assert mod._has_refutation(tmp_path / "missing.md") is False
+    mod.CONTROLLED_TARGET = "wiki/predictions/target.md"
+    mod.SELECTION_MANIFEST = tmp_path / "selection.json"
+    assert mod.main() == 0
+    output = (tmp_path / "selection.json").read_text()
+    assert "predictions/target.md" in output and "predictions/other.md" not in output
+
+
 def test_forecast_review_gate(tmp_path, monkeypatch):
     pr = tmp_path / "wiki" / "predictions"
     _pred(pr, "old-open", "open", "0.6", "2099-01-01")   # not touched recently -> no wake
@@ -266,6 +395,30 @@ def test_forecast_review_gate(tmp_path, monkeypatch):
     _pred_full(pr, "resolved-this-week", status="confirmed", subject="x", confidence="0.8",
                updated=date.today().isoformat())
     assert _run("select_forecast_review", tmp_path, monkeypatch) is True
+
+
+def test_forecast_review_surfaces_open_reevaluation_and_dashboard_context(tmp_path, monkeypatch, capsys):
+    from datetime import date
+    pr = tmp_path / "wiki/predictions"
+    _pred_full(pr, "open-touched", status="open", subject="Market", confidence="0.7",
+               updated=date.today().isoformat())
+    _pred_full(pr, "old-resolved", status="confirmed", subject="Old", confidence="0.8",
+               updated="2000-01-01")
+    _pred_full(pr, "ignored-status", status="draft", subject="Draft", confidence="0.5",
+               updated=date.today().isoformat())
+    dashboards = tmp_path / "wiki/dashboards"
+    dashboards.mkdir(parents=True)
+    for name in ("calibration.md", "prediction-date-audit.md", "prediction-schema-audit.md"):
+        (dashboards / name).write_text(f"context from {name}\n")
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    module = _load("select_forecast_review")
+    assert module.main() == 0
+    output = capsys.readouterr().out
+    assert "0 resolved, 1 re-evaluated" in output
+    assert "[[predictions/open-touched]]" in output
+    assert "context from calibration.md" in output
+    assert "old-resolved" not in output
+    assert '"wakeAgent": true' in output
 
 
 # --- P2 wake-gates: defer when there's nothing to do, fire when there is ---
@@ -293,13 +446,34 @@ def test_base_rates_gate(tmp_path, monkeypatch):
     assert _run("select_base_rates", tmp_path, monkeypatch) is True
 
 
+def test_base_rates_reports_event_coverage_without_overall_row(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    module = _load("select_base_rates")
+    monkeypatch.setattr(module, "compute_base_rates", lambda _vault: ([{
+        "rate_kind": "event-coverage", "class_label": "incident", "value": 0.25,
+        "n_observations": 4,
+    }], tmp_path / "state.json", tmp_path / "dashboard.md"))
+    assert module.main() == 0
+    output = capsys.readouterr().out
+    assert "incident=25.0% (N=4)" in output
+    assert "overall resolved hit rate" not in output
+
+
 def test_falsification_gate(tmp_path, monkeypatch):
     pr = tmp_path / "wiki" / "predictions"
     _pred(pr, "hi-open", "open", "high", "2099-01-01")
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    helper = _load("select_falsification")
+    assert helper._is_high({"confidence": "60%"})
+    assert helper._is_high({"confidence": "0.6"})
+    assert not helper._is_high({"confidence": "0.59"})
+    assert not helper._is_high({"confidence": "unknown"})
     assert _run("select_falsification", tmp_path, monkeypatch) is False   # no recent sources
     src = tmp_path / "wiki" / "sources" / "2026" / "06"
     src.mkdir(parents=True)
     from datetime import date
+    (src / "undated.md").write_text("---\ntype: source\n---\n# old\n")
+    (src / "old.md").write_text("---\ntype: source\npublished: 2000-01-01\n---\n# old\n")
     (src / "s.md").write_text(f"---\ntype: source\npublished: {date.today().isoformat()}\n---\n# s\n")
     assert _run("select_falsification", tmp_path, monkeypatch) is True
 
@@ -309,6 +483,9 @@ def test_output_outcome_gate(tmp_path, monkeypatch):
     from datetime import date
     for i in range(3):
         _pred(pr, f"o{i}", "confirmed", "high", date.today().isoformat())
+    _pred(pr, "not-graded", "open", "high", date.today().isoformat())
+    _pred(pr, "graded-old", "confirmed", "high", "2000-01-01")
+    _pred(pr, "graded-undated", "confirmed", "high", None)
     assert _run("select_output_outcome", tmp_path, monkeypatch) is False  # no briefings
     b = tmp_path / "wiki" / "briefings"; b.mkdir(parents=True)
     (b / "2026-06-28.md").write_text("---\ntype: dashboard\ntitle: brief\n---\n# brief\n")
@@ -407,3 +584,103 @@ def test_numeric_base_rates_family_d_without_event_sidecar(tmp_path, monkeypatch
     assert any(row["rate_kind"] == "outcome-rate" for row in rows)
     assert not any(row["rate_kind"] == "event-frequency" for row in rows)
     assert "families A–C and E are empty" in dashboard.read_text()
+
+
+def test_numeric_metrics_malformed_and_empty_boundaries(tmp_path):
+    metrics = _load("numeric_metrics")
+    jsonl = tmp_path / "rows.jsonl"
+    jsonl.write_text('{"ok":1}\nnot-json\n[]\n{"again":2}\n')
+    assert metrics._jsonl(jsonl) == [{"ok": 1}, {"again": 2}]
+    assert metrics._date(datetime(2026, 7, 15, 12)) == date(2026, 7, 15)
+    assert metrics._date("not-a-date") is None
+    assert metrics._refs(["[[sources/example.md]]", "", "plain.md"]) == [
+        "sources/example", "plain"
+    ]
+    assert metrics._quantile([], .5) is None
+
+    missing = tmp_path / "missing.md"
+    assert metrics._page(missing) == ({}, "")
+    plain = tmp_path / "plain.md"
+    plain.write_text("body only")
+    assert metrics._page(plain) == ({}, "body only")
+    malformed = tmp_path / "malformed.md"
+    malformed.write_text("---\nkey: [\n---\nbody")
+    assert metrics._page(malformed) == ({}, "body")
+
+    rows = metrics.base_rate_rows(
+        [{"date": "2026-07-15", "event_type": "x", "entity": "e"}],
+        [{"outcome": None, "basis": [], "subject": "", "horizon": "short"}],
+        {}, date(2026, 7, 15),
+    )
+    assert not any(row["rate_kind"] == "outcome-rate" for row in rows)
+
+
+def test_numeric_output_outcomes_ignores_unusable_briefings(tmp_path, monkeypatch):
+    metrics = _load("numeric_metrics")
+    briefings = tmp_path / "wiki" / "briefings"
+    briefings.mkdir(parents=True)
+    (briefings / "undated.md").write_text("---\ntype: briefing\n---\n[[sources/no-yield]]")
+    (briefings / "2026-07-01.md").write_text(
+        "---\ntype: briefing\ncreated: 2026-07-01\n---\n"
+        "[[sources/no-yield]] [[entities/no-yield]]"
+    )
+    monkeypatch.setattr(metrics.P, "iter_pages", lambda *_args: iter(sorted(briefings.glob("*.md"))))
+    rows = metrics.output_outcome_rows(
+        tmp_path,
+        [{"entity": "other", "date": "2026-07-02", "scores": {"materiality": .1}}],
+        [{"basis": [], "made_on": None}],
+        date(2026, 7, 15),
+    )
+    assert all(row["value"] == 0 for row in rows)
+
+
+def test_calibration_helpers_cover_malformed_and_empty_boundaries(tmp_path, monkeypatch):
+    cal = _load("calibration_refresh")
+    monkeypatch.setenv("PREDICTION_CONFIDENCE_SCALE", '{"custom": 0.42}')
+    assert cal._scale() == {"custom": .42}
+    monkeypatch.setenv("PREDICTION_CONFIDENCE_SCALE", "not-json")
+    assert cal._scale() == cal._DEFAULT_SCALE
+    monkeypatch.setenv("PREDICTION_CONFIDENCE_SCALE", "[]")
+    assert cal._scale() == cal._DEFAULT_SCALE
+    assert cal.confidence_prob(None, {}) is None
+    assert cal._date(datetime(2026, 7, 15, 12)) == date(2026, 7, 15)
+    assert cal._date(date(2026, 7, 15)) == date(2026, 7, 15)
+    assert cal._date("invalid") is None
+    assert cal._refs(["[[sources/a.md]]", "", "plain.md"]) == ["sources/a", "plain"]
+    assert cal._latest_evidence({"evidence": ["legacy", {"date": "invalid"}]}) is None
+    assert cal.calibration([]) == {"n": 0, "brier": None, "base_rate": None, "bands": []}
+    source_a, source_b = tmp_path / "a.md", tmp_path / "b.md"
+    monkeypatch.setattr(cal.P, "iter_pages", lambda *_args: iter((source_a, source_b)))
+    monkeypatch.setattr(cal.P, "read_fm", lambda path: {
+        "signal_class": None if path == source_a else " leading "
+    })
+    assert cal._source_classes(tmp_path) == {"b": "leading"}
+
+    rows = [{"status": "open", "evidence": [None, {}, {"direction": "neutral"}],
+             "outcome": None, "confidence": None}]
+    bias = cal.direction_bias(rows)
+    assert bias["neutral"] == 1 and bias["positive"] == bias["negative"] == 0
+
+    today = date(2026, 7, 15)
+    row = {"status": "open", "made_on": today, "resolves_by": today,
+           "latest_evidence": None, "updated": None, "rel": "predictions/x"}
+    assert cal.near_due([row], today) == []
+    row["made_on"] = today.replace(day=1)
+    row["resolves_by"] = date(2026, 7, 16)
+    row["updated"] = today
+    assert cal.near_due([row], today) == []
+
+    watch = tmp_path / "watch.yaml"
+    watch.write_text("segments: [\n")
+    monkeypatch.setenv("WATCHLIST_PATH", str(watch))
+    assert cal._watchlist(tmp_path) == set()
+    watch.write_text("segments:\n  ignored: string\n  valid:\n    competitors: [entities/acme]\n")
+    assert cal._watchlist(tmp_path) == {"acme"}
+
+    history = tmp_path / "history.jsonl"
+    history.write_text('not-json\n[]\n{"date":"2026-07-14","brier":0.2}\n')
+    result = cal.update_history(history, {"date": "2026-07-15", "brier": None})
+    assert [row["date"] for row in result] == ["2026-07-14", "2026-07-15"]
+
+    rendered = cal.render([], today, [], {}, set())
+    assert "No resolved, scored predictions yet" in rendered

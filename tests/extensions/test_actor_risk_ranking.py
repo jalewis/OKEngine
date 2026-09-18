@@ -214,3 +214,77 @@ def test_classify_pages_survives_non_list_aliases(tmp_path):
     out = mod.classify_pages(vault, {})            # must not raise
     assert out["entities/a/apt-x"]["aliases"] == []        # non-list scalar -> []
     assert out["entities/a/apt-y"]["aliases"] == ["Foo", "Bar"]   # a real list still works
+
+
+def test_parser_config_artifact_and_graph_boundaries(tmp_path, monkeypatch):
+    missing = tmp_path / "missing.md"
+    assert mod._fm(missing) == {}
+    plain = tmp_path / "plain.md"
+    plain.write_text("body")
+    assert mod._fm(plain) == {}
+    malformed = tmp_path / "malformed.md"
+    malformed.write_text("---\nkey: [\n---\n")
+    assert mod._fm(malformed) == {}
+
+    vault = tmp_path / "vault"
+    (vault / "config").mkdir(parents=True)
+    (vault / "config/actor-risk-targets.yaml").write_text("targets: {}\n")
+    assert mod.load_config(vault) is None
+    (vault / "wiki").mkdir()
+    with pytest.raises(SystemExit) as error:
+        mod.load_artifact(vault)
+    assert error.value.code == 1
+    edges, backlinks = mod.build_graph({"backlinks": {"entities/x": [{}, {"key": "sources/s"}]}})
+    assert backlinks and edges["entities/x"] == {"sources/s"}
+
+
+def test_classification_origin_date_and_main_empty_boundaries(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    entities = vault / "wiki/entities"
+    entities.mkdir(parents=True)
+    (entities / "INDEX.md").write_text("---\ntype: threat-actor\n---\n")
+    (entities / "plain.md").write_text("body")
+    assert mod.classify_pages(vault, {}) == {}
+    assert mod.origin_domain({"url": "http://[", "publisher": "Fallback Publisher"}) == \
+        "fallback publisher"
+    assert mod.origin_domain({"publisher": " Publisher "}) == "publisher"
+    assert mod._within_horizon("invalid", 10, time.time()) is False
+    assert mod._within_horizon("9999-99-99", 10, time.time()) is False
+
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path / "absent"))
+    assert mod.main() == 2
+
+    (vault / "config").mkdir()
+    (vault / "config/actor-risk-targets.yaml").write_text(
+        "targets:\n  acme: {type: company}\n")
+    (vault / "wiki/.backlinks.json").write_text(json.dumps({"built_at": time.time(), "backlinks": {}}))
+    monkeypatch.setenv("WIKI_PATH", str(vault))
+    assert mod.main() == 0
+
+
+def test_score_actor_can_reach_high_with_complete_independent_evidence():
+    actor = "entities/a/actor"
+    target_entity = "entities/t/target"
+    tech = "entities/t/tech"
+    vulnerabilities = {f"entities/v/v{i}" for i in range(3)}
+    capabilities = {f"entities/m/m{i}" for i in range(8)}
+    sectors = {"segments/finance", "segments/energy"}
+    sources = {f"sources/s{i}" for i in range(6)}
+    neighbors = {target_entity, *vulnerabilities, *capabilities, *sectors, *sources}
+    edges = {actor: neighbors, **{vuln: {tech} for vuln in vulnerabilities}}
+    today = time.strftime("%Y-%m-%d")
+    pages = {
+        **{vuln: {"type": "vulnerability"} for vuln in vulnerabilities},
+        **{capability: {"type": "malware"} for capability in capabilities},
+        **{sector: {"type": "segment"} for sector in sectors},
+        **{source: {"type": "source", "published": today,
+                    "url": f"https://origin-{index}.example/story"}
+           for index, source in enumerate(sorted(sources))},
+    }
+    result = mod.score_actor(
+        actor, [], {"entity": target_entity, "technologies": [tech],
+                    "sectors": ["finance", "energy"]},
+        edges, pages, {"min_origin_domains": 2}, time.time(),
+    )
+    assert result["score"] == 100
+    assert result["band"] == "high" and result["unknowns"] == []

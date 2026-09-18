@@ -14,7 +14,7 @@ REQS = {
     "reader": REPO / "okengine-reader" / "requirements.txt",
     "cockpit": REPO / "okengine-cockpit" / "requirements.txt",
 }
-_MIN_WEASYPRINT = (68, 0)   # CVE-2025-68616 fixed in 68.0 (okengine#95)
+_MIN_WEASYPRINT = (70, 0)   # CVE-2026-55073 fixed in 70.0
 
 
 def _pin(text: str, pkg: str) -> str | None:
@@ -39,7 +39,7 @@ def test_weasyprint_at_or_above_cve_floor():
         ver = _pin(p.read_text(encoding="utf-8"), "weasyprint")
         tup = tuple(int(x) for x in re.findall(r"\d+", ver)[:2])
         assert tup >= _MIN_WEASYPRINT, (
-            f"{k}: weasyprint {ver} is below the CVE-2025-68616 floor {_MIN_WEASYPRINT} (okengine#95)")
+            f"{k}: weasyprint {ver} is below the CVE-2026-55073 floor {_MIN_WEASYPRINT}")
 
 
 def test_reader_cockpit_share_every_common_dependency_pin():
@@ -61,12 +61,16 @@ def test_reader_cockpit_share_every_common_dependency_pin():
 
 def test_cve_sensitive_deps_are_audited_in_ci_and_makefile():
     """The lag hid because the cockpit is a separate image/venv that no audit surface scanned.
-    Every requirements file that ships in an image must be pip-audited in BOTH CI and the Makefile
-    audit target — a new image whose deps aren't scanned fails HERE."""
+    Every requirements file that ships in an image must be pip-audited in BOTH CI and the engine's
+    audit gate — a new image whose deps aren't scanned fails HERE. The Makefile `audit` target
+    delegates to scripts/audit.sh (the single gate the CI security-audit job runs), so the pip-audit
+    coverage lives there; assert the delegation chain is intact and every req is covered."""
     must = ("okengine-reader/requirements.txt", "okengine-cockpit/requirements.txt",
             "okengine-mcp/requirements.txt")
     ci = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     mk = (REPO / "Makefile").read_text(encoding="utf-8")
+    audit_sh = (REPO / "scripts" / "audit.sh").read_text(encoding="utf-8")
+    assert "scripts/audit.sh" in mk, "the Makefile `audit` target must delegate to the canonical scripts/audit.sh gate"
     for req in must:
         assert req in ci, f"CI pip-audit does not scan {req} — a shipped image's deps are unaudited"
-        assert req in mk, f"Makefile audit target does not scan {req}"
+        assert req in audit_sh, f"scripts/audit.sh (the Makefile + CI audit gate) does not scan {req}"

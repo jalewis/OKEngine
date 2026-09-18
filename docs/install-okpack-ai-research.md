@@ -65,7 +65,7 @@ To enable feed ingest, review `feeds/feeds.opml.example`, copy selected entries
 into `feeds/feeds.opml`, then probe before going live:
 
 ```bash
-python validate.py --probe
+python validate.py
 ```
 
 Enable crons only after you have selected feeds, reviewed schedules, and set

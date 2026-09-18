@@ -13,10 +13,17 @@ import datetime as dt
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Iterable
 
 import yaml
+
+# Cosmic Ray's ExceptionReplacer cannot mutate an Attribute node inside a
+# tuple-valued except clause. Bind the same class to a Name so malformed YAML
+# remains a first-class, mutation-testable error path rather than an
+# INCOMPETENT runner result.
+YamlError = yaml.YAMLError
 
 SCHEMA_VERSION = 1
 OUTCOMES = {"pass", "warn", "reject", "waived", "not-applicable"}
@@ -25,6 +32,9 @@ ENFORCEMENT_POINTS = {"write", "importer", "audit", "ci", "deploy", "cockpit"}
 EVALUATORS = {
     "field-capability", "strict-type-namespace", "source-metadata-completeness",
     "importer-envelope", "page-quality-finding", "policy-digest",
+}
+AUDIT_EVALUATORS = {
+    "strict-type-namespace", "source-metadata-completeness", "page-quality-finding",
 }
 BODY_MODES = {"allow", "append-only", "deny"}
 OPERATIONS = {"create", "update", "patch", "append", "tombstone", "converge",
@@ -58,7 +68,7 @@ def engine_catalog_path() -> Path:
 def load_document(path: Path) -> dict:
     try:
         value = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError) as exc:
+    except (OSError, YamlError) as exc:
         raise PolicyError(f"cannot load policy {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise PolicyError(f"policy {path} must be a mapping")
@@ -171,14 +181,42 @@ def validate_document(document: dict, *, source: str = "policy") -> list[str]:
 
 
 def discover_documents(vault: Path, extra: Iterable[Path] = ()) -> list[Path]:
+    # Policy must consume the SAME effective enablement state as schema and
+    # cron composition. A disabled extension keeps its files on disk; a bare
+    # policy.yaml glob would silently retain revoked write capabilities.
+    source_scripts = Path(__file__).resolve().parents[1] / "scripts"
+    runtime_root = Path(os.environ.get("OKENGINE_DATA") or
+                        os.environ.get("HERMES_HOME") or "/opt/data")
+    runtime_scripts = runtime_root / "scripts"
+    scripts_dir = (source_scripts if (source_scripts / "extension_discovery.py").is_file()
+                   else runtime_scripts)
+    if not (scripts_dir / "extension_discovery.py").is_file():
+        raise PolicyError(f"extension discovery unavailable at {scripts_dir}")
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    import extension_discovery
+
+    if vault.resolve() == scripts_dir.parent.resolve():
+        # CI validates the engine catalog with the source checkout as "vault".
+        # Do not rediscover engine extensions a second time as pack-tier copies.
+        records, discovery_errors = extension_discovery.discover(
+            None, engine_root=scripts_dir.parent)
+        effective_ids, state_errors = extension_discovery.effective_enabled(vault, records)
+        resolved, resolution_errors = extension_discovery.resolve_enabled(
+            sorted(effective_ids), records)
+        errors = discovery_errors + state_errors + resolution_errors
+    else:
+        resolved, errors = extension_discovery.resolve_for_pack(vault)
+    if errors:
+        raise PolicyError("extension discovery/enablement failed: " + "; ".join(errors))
     paths = [engine_catalog_path()]
     for candidate in (vault / "policy.yaml", vault / ".okengine" / "policy.yaml"):
         if candidate.is_file():
             paths.append(candidate)
-    for root in (vault / "extensions", vault / ".okengine" / "extensions"):
-        if root.is_dir():
-            # glob-ok: extension IDs are one flat directory tier; policy files are not content pages.
-            paths.extend(sorted(root.glob("*/policy.yaml")))
+    for ext_id in sorted(resolved):
+        candidate = Path(resolved[ext_id]["dir"]) / "policy.yaml"
+        if candidate.is_file():
+            paths.append(candidate)
     paths.extend(Path(p) for p in extra)
     return paths
 
@@ -327,7 +365,8 @@ def evaluate_capability(policy: dict, actor: str, operation: str, subject: str,
     protected = changed & set(capability.get("protected_fields") or [])
     allowlist = set(capability.get("update_fields") or [])
     field_gated_operations = {"create", "update", "patch", "converge", "tombstone"}
-    outside = changed - allowlist if operation in field_gated_operations else set()
+    outside = (changed - allowlist if "*" not in allowlist and operation in field_gated_operations
+               else set())
     missing_required = (set(capability.get("required_fields") or []) - changed
                         if operation in field_gated_operations else set())
     if protected:
@@ -379,7 +418,12 @@ def coverage(policy: dict) -> dict:
     rows = []
     for rule in policy.get("rules", []):
         declared = sorted(rule.get("enforcement") or [])
-        verified = sorted(set(rule.get("verified_by") or []))
+        verified = set(rule.get("verified_by") or [])
+        # Audit is executable evidence, not a self-attested YAML label. A rule may only claim it
+        # when audit() has a registered evaluator for that rule's evaluator kind.
+        if "audit" in verified and rule.get("evaluator") not in AUDIT_EVALUATORS:
+            verified.remove("audit")
+        verified = sorted(verified)
         rows.append({"rule_id": rule["id"], "owner": rule["owner"],
                      "declared": declared, "verified_by": verified,
                      "covered": bool(verified) and all(point in verified for point in declared),
@@ -400,26 +444,80 @@ def _read_frontmatter(path: Path) -> dict:
         return {}
 
 
+def _audit_schema(vault: Path) -> dict:
+    """Load the same composed schema used by the write path, in source and baked layouts."""
+    import importlib
+    import sys
+    candidates = (
+        Path(__file__).resolve().parents[1] / "scripts" / "cron",
+        Path("/opt/hermes/scripts/cron"),
+        Path("/opt/data/scripts"),
+    )
+    for candidate in candidates:
+        if candidate.is_dir() and str(candidate) not in sys.path:
+            sys.path.insert(0, str(candidate))
+    try:
+        return importlib.import_module("schema_lib").merged_schema(vault)
+    except Exception:
+        return {}
+
+
+def _audit_rule_page(rule: dict, rel: str, fm: dict, schema: dict) -> dict | None:
+    evaluator = rule.get("evaluator")
+    remediation = rule.get("remediation") or "Repair the page and rerun the policy audit."
+    namespace = rel.split("/", 1)[0]
+    applies = rule.get("applies_to") or {}
+    if applies.get("namespace") and applies["namespace"] != namespace:
+        return None
+    if applies.get("type") and applies["type"] != fm.get("type"):
+        return None
+    if evaluator == "source-metadata-completeness":
+        missing = [key for key in ("publisher", "published")
+                   if fm.get(key) in (None, "", "undefined")]
+        if missing:
+            return finding(rule["id"], "warn", rule.get("severity", "review"), rel, "audit",
+                           "scheduled-policy-audit", "source metadata is incomplete", remediation,
+                           {"missing_fields": missing}, enforcement_point="audit")
+    elif evaluator == "page-quality-finding":
+        if not fm.get("type") and not rel.startswith(("operational/", "dashboards/")):
+            return finding(rule["id"], "warn", rule.get("severity", "review"), rel, "audit",
+                           "scheduled-policy-audit", "knowledge page has no type", remediation,
+                           {"missing_fields": ["type"]}, enforcement_point="audit")
+    elif evaluator == "strict-type-namespace" and fm.get("type"):
+        typ = str(fm["type"])
+        types = schema.get("types") or {}
+        try:
+            import schema_lib
+            home = schema_lib.type_home_namespace(schema, typ)
+        except Exception:
+            home = None
+        reasons = []
+        if typ not in types:
+            reasons.append(f"type {typ!r} is not declared by the composed schema")
+        if home and home != namespace:
+            reasons.append(f"type {typ!r} belongs in {home!r}, not {namespace!r}")
+        if reasons:
+            return finding(rule["id"], "warn", rule.get("severity", "reject"), rel, "audit",
+                           "scheduled-policy-audit", "; ".join(reasons), remediation,
+                           {"actual_namespace": namespace, "expected_namespace": home,
+                            "page_type": typ}, enforcement_point="audit")
+    return None
+
+
 def audit(vault: Path, policy: dict) -> list[dict]:
     wiki = vault / "wiki"
     results: list[dict] = []
+    rules = [rule for rule in policy.get("rules", [])
+             if "audit" in (rule.get("enforcement") or [])]
+    schema = _audit_schema(vault) if any(
+        rule.get("evaluator") == "strict-type-namespace" for rule in rules) else {}
     for path in sorted(wiki.rglob("*.md")) if wiki.is_dir() else []:
         rel = path.relative_to(wiki).as_posix()
         fm = _read_frontmatter(path)
-        if rel.startswith("sources/") and fm.get("type") == "source":
-            missing = [key for key in ("publisher", "published") if fm.get(key) in (None, "", "undefined")]
-            if missing:
-                results.append(finding(
-                    "engine-source-metadata-complete", "warn", "review", rel, "audit",
-                    "scheduled-policy-audit", "source metadata is incomplete",
-                    "Recover publisher and publication time from the locally captured source",
-                    {"missing_fields": missing}, enforcement_point="audit"))
-        if not fm.get("type") and not rel.startswith(("operational/", "dashboards/")):
-            results.append(finding(
-                "engine-page-quality-review", "warn", "review", rel, "audit",
-                "scheduled-policy-audit", "knowledge page has no type",
-                "Classify the page under the composed schema or quarantine it",
-                {"missing_fields": ["type"]}, enforcement_point="audit"))
+        for rule in rules:
+            result = _audit_rule_page(rule, rel, fm, schema)
+            if result:
+                results.append(result)
     event_path = vault / ".okengine" / "policy-events.jsonl"
     if event_path.is_file():
         for line in event_path.read_text(encoding="utf-8", errors="replace").splitlines()[-200:]:
@@ -462,9 +560,9 @@ def _write_dashboard(vault: Path, policy: dict, cov: dict, findings: list[dict])
     now = utc_now()
     for waiver in policy.get("waivers") or []:
         active_waivers.append((waiver, str(waiver.get("expires_at")) >= now))
-    counts: dict[str, int] = {}
-    for item in findings:
-        counts[item.get("outcome", "unknown")] = counts.get(item.get("outcome", "unknown"), 0) + 1
+    # Finding totals are rendered directly from ``findings`` below; do not keep
+    # an unconsumed parallel accumulator that can drift from the artifact.
+
     lines = [
         "---", "type: dashboard", "id: dashboard:policy-health", "title: Policy health",
         f"updated: {utc_now()}", "---", "", "# Policy health", "",

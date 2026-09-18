@@ -1,0 +1,223 @@
+diff --git a/agent/codex_runtime.py b/agent/codex_runtime.py
+index 48a6c1a67..54dc71f49 100644
+--- a/agent/codex_runtime.py
++++ b/agent/codex_runtime.py
+@@ -5,10 +5,13 @@ AIAgent first: ``run_codex_app_server_turn`` drives one ``codex app-server`` sub
+ from __future__ import annotations
+ 
+ import contextvars
++import hashlib
+ import json
+ import logging
+ import os
++import re
+ import time
++from collections.abc import Mapping
+ from contextlib import suppress
+ from types import SimpleNamespace
+ from typing import Any, Callable, Dict, List
+@@ -21,6 +24,50 @@ _codex_watchdog_state_var: contextvars.ContextVar[Any | None] = contextvars.Cont
+     "codex_watchdog_state", default=None
+ )
+ 
++_ATTRIBUTION_TOKEN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:/-]*\Z")
++
++
++def _bounded_attribution_token(raw: object, *, limit: int = 96) -> str:
++    """Header-safe stable identity; hash unusual/long values, never emit controls."""
++    if not isinstance(raw, str) or not raw.strip():
++        return ""
++    value = raw.strip()
++    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
++    if not _ATTRIBUTION_TOKEN.fullmatch(value):
++        return "sha256:" + digest[:min(48, limit - 7)]
++    if len(value) <= limit:
++        return value
++    suffix = "-" + digest[:16]
++    return value[:limit - len(suffix)] + suffix
++
++
++def _with_okengine_responses_attribution(agent: Any, request: dict) -> dict:
++    """Attach scoped identities to one physical Responses attempt only."""
++    raw_headers = request.get("extra_headers")
++    if raw_headers is not None and not isinstance(raw_headers, Mapping):
++        raise ValueError("Responses extra_headers must be a mapping")
++    headers = dict(raw_headers or {})
++
++    def has(name: str) -> bool:
++        return any(isinstance(key, str) and key.casefold() == name.casefold()
++                   for key in headers)
++
++    pack = os.environ.get("OKENGINE_PACK", "").strip()
++    component = os.environ.get("OKENGINE_LLM_COMPONENT", "").strip()
++    pack = pack if _ATTRIBUTION_TOKEN.fullmatch(pack) else "unknown"
++    component = component if _ATTRIBUTION_TOKEN.fullmatch(component) else ""
++    client_id = "okengine/" + pack + ("/" + component if component else "")
++    if not has("X-Client-Id"):
++        headers["X-Client-Id"] = _bounded_attribution_token(client_id)
++
++    conversation = _bounded_attribution_token(getattr(agent, "session_id", None))
++    if conversation:
++        if not has("X-Conversation-Id"):
++            headers["X-Conversation-Id"] = conversation
++    elif not has("X-Conversation-Id") and not has("X-Oneshot"):
++        headers["X-Oneshot"] = "1"
++    return {**request, "extra_headers": headers}
++
+ 
+ def _call_guarded(fn: Callable | None, fail_msg: str, *fail_args: Any, args: tuple = (), kwargs: dict | None = None):
+     """Invoke an optional display/debug callback; a buggy hook must never tear down the turn."""
+@@ -930,3 +977,4 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
++        stream_kwargs = _with_okengine_responses_attribution(agent, stream_kwargs)
+         stream_kwargs["stream"] = True
+         return active_client.responses.create(**_bypass_sdk_request_transform(stream_kwargs))
+diff --git a/tests/agent/test_okengine_responses_attribution.py b/tests/agent/test_okengine_responses_attribution.py
+new file mode 100644
+index 000000000..e83478076
+--- /dev/null
++++ b/tests/agent/test_okengine_responses_attribution.py
+@@ -0,0 +1,143 @@
++"""OKEngine identities reach each actual Responses SDK request, not chat calls."""
++
++import json
++from types import SimpleNamespace
++
++import httpx
++from openai import OpenAI
++import pytest
++
++from agent.codex_runtime import (
++    _bounded_attribution_token, _with_okengine_responses_attribution,
++    run_codex_stream)
++
++
++def _agent(session_id="cron_selected_1"):
++    return SimpleNamespace(
++        session_id=session_id, provider="custom", model="qwen3-coder:30b",
++        _interrupt_requested=False, _current_api_request_id="fixture-request",
++        _fallback_index=0, is_subagent=False, show_commentary=False,
++        interim_assistant_callback=None,
++        _touch_activity=lambda _event: None,
++        _fire_stream_delta=lambda _text: None,
++        _fire_reasoning_delta=lambda _text: None,
++        _client_log_context=lambda: "disposable fixture",
++    )
++
++
++def _sse_response():
++    event = {"type": "response.completed", "response": {
++        "id": "fixture-r1", "status": "completed", "output": [], "usage": None}}
++    payload = "data: " + json.dumps(event) + "\n\ndata: [DONE]\n\n"
++    return httpx.Response(200, headers={"content-type": "text/event-stream"},
++                          content=payload.encode("utf-8"))
++
++
++def _wire_client(record, *, fail_first=False):
++    attempts = 0
++
++    def handle(request):
++        nonlocal attempts
++        attempts += 1
++        record.append(request)
++        if fail_first and attempts == 1:
++            raise httpx.ConnectError("disposable first-attempt disconnect", request=request)
++        return _sse_response()
++
++    http_client = httpx.Client(transport=httpx.MockTransport(handle))
++    return OpenAI(api_key="disposable-key", base_url="http://127.0.0.1:8845/v1",
++                  max_retries=1 if fail_first else 0, http_client=http_client)
++
++
++def _request(prompt):
++    return {"model": "qwen3-coder:30b", "instructions": "You are Hermes.",
++            "input": [{"role": "user", "content": prompt}], "store": False}
++
++
++def test_client_and_conversation_identity_reach_real_sdk_wire(monkeypatch):
++    monkeypatch.setenv("OKENGINE_PACK", "okpack-competitive-test")
++    monkeypatch.setenv("OKENGINE_LLM_COMPONENT", "cron-plus")
++    wire = []
++    client = _wire_client(wire)
++    try:
++        result = run_codex_stream(
++            _agent(), _request("fixture prompt"), client=client)
++    finally:
++        client.close()
++    assert result.status == "completed"
++    assert len(wire) == 1
++    request = wire[0]
++    assert request.url.path == "/v1/responses"
++    assert request.headers["X-Client-Id"] == "okengine/okpack-competitive-test/cron-plus"
++    assert request.headers["X-Conversation-Id"] == "cron_selected_1"
++    assert "X-Oneshot" not in request.headers
++
++
++def test_physical_connect_retry_keeps_identity_on_both_sdk_attempts(monkeypatch):
++    monkeypatch.setenv("OKENGINE_PACK", "okpack-domain-example")
++    monkeypatch.delenv("OKENGINE_LLM_COMPONENT", raising=False)
++    wire = []
++    client = _wire_client(wire, fail_first=True)
++    try:
++        result = run_codex_stream(
++            _agent("cron_retry_1"), _request("fixture prompt"),
++            client=client)
++    finally:
++        client.close()
++    assert result.status == "completed"
++    assert len(wire) == 2, "the SDK retry must make exactly two physical attempts"
++    assert [request.headers["X-Client-Id"] for request in wire] == [
++        "okengine/okpack-domain-example"] * 2
++    assert [request.headers["X-Conversation-Id"] for request in wire] == ["cron_retry_1"] * 2
++
++
++def test_summary_like_second_request_keeps_stable_conversation_identity(monkeypatch):
++    monkeypatch.setenv("OKENGINE_PACK", "okcti-test")
++    wire = []
++    client = _wire_client(wire)
++    agent = _agent("cron_summary_1")
++    try:
++        run_codex_stream(agent, _request("fixture first"), client=client)
++        run_codex_stream(agent, _request("fixture summary"), client=client)
++    finally:
++        client.close()
++    assert len(wire) == 2
++    assert {request.headers["X-Conversation-Id"] for request in wire} == {"cron_summary_1"}
++
++
++def test_explicit_case_variant_caller_headers_keep_precedence(monkeypatch):
++    monkeypatch.setenv("OKENGINE_PACK", "ignored-pack")
++    request = {"extra_headers": {
++        "x-client-id": "caller/client", "X-CONVERSATION-ID": "caller-conversation",
++        "X-Other": "preserved"}}
++    attributed = _with_okengine_responses_attribution(_agent(), request)
++    assert attributed["extra_headers"] == request["extra_headers"]
++    assert request["extra_headers"] == {
++        "x-client-id": "caller/client", "X-CONVERSATION-ID": "caller-conversation",
++        "X-Other": "preserved"}, "the caller's mapping must remain untouched"
++
++
++def test_missing_session_uses_oneshot_without_inventing_conversation(monkeypatch):
++    monkeypatch.delenv("OKENGINE_PACK", raising=False)
++    attributed = _with_okengine_responses_attribution(_agent(None), {})
++    assert attributed["extra_headers"] == {"X-Client-Id": "okengine/unknown", "X-Oneshot": "1"}
++    explicit = _with_okengine_responses_attribution(
++        _agent(None), {"extra_headers": {"X-Conversation-Id": "caller-id"}})
++    assert "X-Oneshot" not in explicit["extra_headers"]
++
++
++def test_long_or_control_identity_is_bounded_stable_and_header_safe(monkeypatch):
++    monkeypatch.setenv("OKENGINE_PACK", "long-" + "x" * 140)
++    long_session = "cron_" + "a" * 140
++    first = _with_okengine_responses_attribution(_agent(long_session), {})["extra_headers"]
++    second = _with_okengine_responses_attribution(_agent(long_session), {})["extra_headers"]
++    assert first == second
++    assert len(first["X-Client-Id"]) <= 96
++    assert len(first["X-Conversation-Id"]) <= 96
++    assert _bounded_attribution_token("bad\r\nheader")[:7] == "sha256:"
++    assert "\n" not in _bounded_attribution_token("bad\r\nheader")
++
++
++def test_malformed_extra_headers_fail_before_a_physical_request():
++    with pytest.raises(ValueError, match="extra_headers must be a mapping"):
++        _with_okengine_responses_attribution(_agent(), {"extra_headers": "not a mapping"})

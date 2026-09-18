@@ -2,6 +2,8 @@
 across scaffolders, docs, and the manifest to a single source of truth (engine-manifest.yaml /
 patches/), so a bump that misses one goes RED instead of drifting silently."""
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -18,9 +20,38 @@ def _manifest_scalar(key: str) -> str:
 
 def test_new_pack_sh_reads_hermes_pin_from_manifest():  # invariant-audit #5/#43
     sh = (REPO / "templates" / "pack" / "new-pack.sh").read_text()
-    assert "pinned_tag:" in sh and "engine-manifest.yaml" in sh, \
+    assert "manifest_scalar pinned_tag" in sh and "engine-manifest.yaml" in sh, \
         "new-pack.sh must read the Hermes pin from the manifest, not a literal"
     assert 'HERMES_PIN="v2026' not in sh, "new-pack.sh still hardcodes a Hermes pin literal"
+    assert 'ENGINE="${ENGINE:-' not in sh, (
+        "new-pack.sh must fail loud when engine_release cannot be read, not stamp a stale default"
+    )
+
+
+def test_new_pack_rejects_missing_malformed_and_duplicate_manifest_versions(tmp_path):
+    root = tmp_path / "engine"
+    shutil.copytree(REPO / "templates/pack", root / "templates/pack")
+    script = root / "templates/pack/new-pack.sh"
+
+    def run(manifest):
+        path = root / "engine-manifest.yaml"
+        if manifest is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(manifest, encoding="utf-8")
+        return subprocess.run(
+            ["bash", str(script), "okpack-test", "--out", str(tmp_path / "rendered")],
+            text=True, capture_output=True, check=False,
+        )
+
+    for manifest in (
+        None,
+        "engine_release: # TODO\nruntime:\n  pinned_tag: v2026.9.14\n",
+        "engine_release: v0.13.9\nengine_release: v0.2.0\nruntime:\n  pinned_tag: v2026.9.14\n",
+    ):
+        result = run(manifest)
+        assert result.returncode == 1
+        assert "exactly one valid engine_release" in result.stderr
 
 
 def test_apply_sh_reads_pin_from_manifest():  # invariant-audit #6
@@ -33,12 +64,13 @@ def test_install_and_readme_hermes_pin_agree_with_manifest():  # invariant-audit
     pin = _manifest_scalar("pinned_tag")
     install = (REPO / "INSTALL.md").read_text()
     assert f"git checkout {pin}" in install, f"INSTALL.md checkout pin != manifest {pin}"
-    readme = (REPO / "patches" / "README.md").read_text()
+    readme = (REPO / "patches" / f"target-{pin}" / "README.md").read_text()
     assert pin in readme, f"patches/README.md pin != manifest {pin}"
 
 
 def test_patch_count_literals_match_the_actual_patch_set():  # invariant-audit #42/#49
-    n = len(list((REPO / "patches").glob("*.patch")))
+    pin = _manifest_scalar("pinned_tag")
+    n = len(list((REPO / "patches" / f"target-{pin}").glob("*.patch")))
     for rel in ("INSTALL.md", "engine-manifest.yaml"):
         text = (REPO / rel).read_text()
         assert re.search(rf"(?<!\d){n} (?:core-file|carried) patch", text), \
@@ -46,7 +78,7 @@ def test_patch_count_literals_match_the_actual_patch_set():  # invariant-audit #
     # no STALE wrong-count phrasings survive
     for rel in ("INSTALL.md", "engine-manifest.yaml"):
         text = (REPO / rel).read_text()
-        for wrong in (c for c in range(1, 20) if c != n):
+        for wrong in (c for c in range(1, 25) if c != n):
             assert not re.search(rf"(?<!\d){wrong} (?:core-file|carried) patch", text), \
                 f"{rel} carries a stale patch count ({wrong}, actual {n})"
 

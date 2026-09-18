@@ -1,0 +1,118 @@
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -4697,7 +4697,54 @@
+                     except Exception:
+                         pass
+
++                # okengine#489: capture tool/write evidence at execution time.
++                # The final message list may be compacted later; reconstructing telemetry
++                # from that lossy list made real early writes disappear from receipts.
++                _okengine_tool_result_start = len(messages)
+                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
++                agent._okengine_executed_tool_call_turns = (
++                    getattr(agent, "_okengine_executed_tool_call_turns", 0) + 1
++                )
++                _okengine_write_result = re.compile(
++                    r"\b(?:(?P<operation>created|updated|patched|tombstoned)\s+(?P<path>\S+?)"
++                    r"|(?P<append>appended)\s+to\s+'.*?'\s+in\s+(?P<append_path>\S+?)"
++                    r"|(?P<converge>converged)\s+into\s+(?P<converge_path>\S+?))"
++                    r"\s+(?:\(id.*?\)\s+)?v(?P<version>\d+)\b"
++                )
++                _okengine_writes = getattr(agent, "_okengine_executed_writes", [])
++                for _okengine_message in messages[_okengine_tool_result_start:]:
++                    if (
++                        not isinstance(_okengine_message, dict)
++                        or _okengine_message.get("role") != "tool"
++                        or "okengine_write" not in str(_okengine_message.get("name") or "")
++                    ):
++                        continue
++                    _okengine_content = _okengine_message.get("content")
++                    if isinstance(_okengine_content, list):
++                        _okengine_content = "\n".join(
++                            str(_part.get("text") or "")
++                            for _part in _okengine_content
++                            if isinstance(_part, dict)
++                        )
++                    if not isinstance(_okengine_content, str):
++                        continue
++                    _okengine_hit = _okengine_write_result.search(_okengine_content)
++                    if _okengine_hit:
++                        _okengine_writes.append({
++                            "operation": (
++                                _okengine_hit.group("operation")
++                                or _okengine_hit.group("append")
++                                or _okengine_hit.group("converge")
++                            ),
++                            "path": (
++                                _okengine_hit.group("path")
++                                or _okengine_hit.group("append_path")
++                                or _okengine_hit.group("converge_path")
++                            ),
++                            "version": int(_okengine_hit.group("version")),
++                            "tool": str(_okengine_message.get("name") or ""),
++                        })
++                agent._okengine_executed_writes = _okengine_writes
+
+                 if agent._tool_guardrail_halt_decision is not None:
+                     decision = agent._tool_guardrail_halt_decision
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -3153,6 +3153,56 @@
+             and _m.get("role") == "assistant"
+             and _m.get("tool_calls")
+         )
++        # okengine#469/#478/#489: publish the writes the run ACTUALLY executed,
++        # taking the canonical path from the write tool result. Prefer the
++        # execution-time accumulator because context compression deliberately
++        # removes old tool messages from `result["messages"]`.
++        if hasattr(agent, "_okengine_executed_tool_call_turns"):
++            job["_okengine_executed_tool_calls"] = (
++                agent._okengine_executed_tool_call_turns
++            )
++        _write_result = re.compile(
++            r"\b(?:(?P<operation>created|updated|patched|tombstoned)\s+(?P<path>\S+?)"
++            r"|(?P<append>appended)\s+to\s+'.*?'\s+in\s+(?P<append_path>\S+?)"
++            r"|(?P<converge>converged)\s+into\s+(?P<converge_path>\S+?))"
++            r"\s+(?:\(id.*?\)\s+)?v(?P<version>\d+)\b"
++        )
++        _executed_writes = list(getattr(agent, "_okengine_executed_writes", []) or [])
++        if not _executed_writes:
++            # Compatibility fallback for an agent implementation without the
++            # execution-time hook. This remains useful for short, uncompacted runs.
++            for _m in (result.get("messages") or []):
++                if not isinstance(_m, dict) or _m.get("role") != "tool":
++                    continue
++                _tool_name = str(_m.get("name") or "")
++                if "okengine_write" not in _tool_name:
++                    continue
++                _content = _m.get("content")
++                if isinstance(_content, list):
++                    _content = "\n".join(
++                        str(_part.get("text") or "")
++                        for _part in _content
++                        if isinstance(_part, dict)
++                    )
++                if not isinstance(_content, str):
++                    continue
++                _hit = _write_result.search(_content)
++                if _hit:
++                    _executed_writes.append({
++                        "operation": (
++                            _hit.group("operation")
++                            or _hit.group("append")
++                            or _hit.group("converge")
++                        ),
++                        "path": (
++                            _hit.group("path")
++                            or _hit.group("append_path")
++                            or _hit.group("converge_path")
++                        ),
++                        "version": int(_hit.group("version")),
++                        "tool": _tool_name,
++                    })
++        job["_okengine_executed_writes"] = _executed_writes
+         turn_exit_reason = str(result.get("turn_exit_reason") or "")
+         final_response_text = (result.get("final_response") or "").strip()
+         max_iteration_summary = (

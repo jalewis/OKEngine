@@ -130,7 +130,11 @@ def test_render_trigger_wrapper():
     c = _comp()
     w = c.render_trigger_wrapper("demo.sc", "docker-compose.yml", "okproj")
     assert w.startswith("#!/usr/bin/env bash")
-    assert "docker compose -f docker-compose.yml -p okproj run --rm -T demo.sc-sidecar" in w
+    assert (
+        "docker compose -f docker-compose.yml "
+        "-f .okengine/generated/sidecars.compose.yml "
+        "-p okproj run --rm -T demo.sc-sidecar"
+    ) in w
 
 
 # --- end-to-end: enabled sidecar -> specs + override ----------------------

@@ -31,6 +31,7 @@ operations:
     schedule: {kind: cron, expr: "40 5 * * *"}   # daily 05:40
     entrypoint: select_dup_candidates.py          # wake-gate: name/alias-collision groups
     prompt_file: prompts/dedupe.md
+    max_iterations: 12
     output_contract:
       api: 1
       allowed_namespaces: ["*"]
@@ -44,7 +45,7 @@ operations:
       placeholder_links: reject
       completion: per-selected-item
     adversarial_fixtures: [tests/extensions/test_model_output_contracts.py]
-    toolsets: [file, todo, okengine-write, okengine]
+    toolsets: [todo, okengine-write, okengine]
     timeout: 1200
   # RENAME NOTE: this extension previously declared a single anonymous `operation:` whose
   # synthesized job was named `okengine.dedupe`. It is now `okengine.dedupe:entity-merge` —

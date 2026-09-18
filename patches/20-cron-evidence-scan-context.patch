@@ -1,0 +1,22 @@
+diff --git a/tools/cronjob_tools.py b/tools/cronjob_tools.py
+index f33e165..209938b 100644
+--- a/tools/cronjob_tools.py
++++ b/tools/cronjob_tools.py
+@@ -73,12 +73,14 @@ _CRON_THREAT_PATTERNS = [
+ # command-shape patterns are dropped because they false-positive on prose
+ # in security docs / postmortems. Skill bodies are scanned at install time
+ # by `skills_guard.py`, so the runtime cron scan is purely a tripwire for
+-# obvious injection directives surviving a malicious skill that slipped
+-# through install.
++# actionable injection directives surviving a malicious skill that slipped
++# through install. Taxonomy labels are intentionally excluded: phrases such
++# as "system prompt override" commonly appear as headings, table cells, and
++# product capability names in security evidence. The same phrase remains
++# blocked by the strict user-prompt scanner above.
+ _CRON_SKILL_ASSEMBLED_PATTERNS = [
+     (r'ignore\s+(?:\w+\s+)*(?:previous|all|above|prior)\s+(?:\w+\s+)*instructions', "prompt_injection"),
+     (r'do\s+not\s+tell\s+the\s+user', "deception_hide"),
+-    (r'system\s+prompt\s+override', "sys_prompt_override"),
+     (r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', "disregard_rules"),
+ ]
+ 

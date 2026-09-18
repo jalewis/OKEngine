@@ -46,3 +46,25 @@ def test_subdomain_source_is_tiered_not_dropped(tmp_path):
     counts = m._count_namespace("sources", cfg["namespaces"]["sources"], cfg, date(2026, 7, 7))
     # BOTH the root and the sub-domain source are counted + tiered (was 1 — the sub-domain fell out)
     assert sum(counts.values()) == 2
+
+
+def test_subdomain_uses_its_own_tier_thresholds(tmp_path, monkeypatch):
+    wiki = tmp_path / "wiki"
+    (wiki / "sources/2026/06").mkdir(parents=True)
+    (wiki / "sources/2026/06/root.md").write_text("---\ntype: source\n---\n")
+    (wiki / "sec/sources/2026/06").mkdir(parents=True)
+    (wiki / "sec/schema.yaml").write_text("tier: {}\n")
+    (wiki / "sec/sources/2026/06/sub.md").write_text("---\ntype: source\n---\n")
+    m = _load(tmp_path)
+    root_cfg = {"hot_days": 30, "warm_days": 365,
+                "namespaces": {"sources": {"from_path": True}}}
+    sub_cfg = {"hot_days": 7, "warm_days": 365,
+               "namespaces": {"sources": {"from_path": True}}}
+    monkeypatch.setattr(
+        m.tier_lib, "load_cfg",
+        lambda _vault, namespace="": sub_cfg if namespace == "sec" else root_cfg,
+    )
+    counts = m._count_namespace(
+        "sources", root_cfg["namespaces"]["sources"], root_cfg, date(2026, 6, 20)
+    )
+    assert counts == {"hot": 1, "warm": 1, "cold": 0}

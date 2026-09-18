@@ -70,8 +70,9 @@ def entity_summary(slug: str, max_activity: int = 3) -> dict:
             fm = {}
     activity = [a.strip()[:120] for a in re.findall(r"^[-*]\s+(.+)$", txt, re.M)][:max_activity]
     rel = p.relative_to(WIKI / "entities").with_suffix("").as_posix()
+    updated = fm.get("updated") or fm.get("last_updated")
     return {
         "slug": rel, "found": True, "type": fm.get("type"),
-        "title": fm.get("title", slug), "updated": fm.get("updated") or fm.get("last_updated"),
+        "title": fm.get("title", slug), "updated": str(updated) if updated is not None else None,
         "activity": activity,
     }

@@ -208,14 +208,15 @@ def orphaned_guard_pauses(jobs: list, state: dict) -> list:
     return out
 
 
-def _load_jobs() -> list:
+def _load_jobs() -> list | None:
     p = Path(os.environ.get("OKENGINE_CRON_PLUS_JOBS")
              or str(Path(_hermes_home()) / "cron-plus" / "jobs.json"))
     try:
         d = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return []
-    return d.get("jobs", d) if isinstance(d, dict) else (d if isinstance(d, list) else [])
+        return None
+    jobs = d.get("jobs", d) if isinstance(d, dict) else d
+    return jobs if isinstance(jobs, list) else None
 
 
 def _cronplus(action: str, job_id: str) -> bool:
@@ -368,7 +369,12 @@ def main(argv: list[str] | None = None) -> int:
         prior = state                                    # the state read above (this trip's record so far)
         prior_owned = _guard_owned_ids(prior)
         prior_names = dict(zip(prior.get("paused_ids") or [], prior.get("paused_names") or []))
-        ids = cost_bearing_ids(_load_jobs())             # currently-ENABLED cost-bearing (excludes already-paused)
+        jobs = _load_jobs()
+        if jobs is None:
+            print("budget-guard: ⚠ OVER BUDGET but jobs.json is unreadable; cap NOT enforced and "
+                  "pause state was not advanced. Retrying next tick.", file=sys.stderr)
+            return 1
+        ids = cost_bearing_ids(jobs)                     # currently-ENABLED cost-bearing (excludes already-paused)
         # OWNED is CUMULATIVE across a multi-tick trip: a cron a PRIOR partial tick already paused is
         # excluded from cost_bearing_ids here (it's disabled), so rebuilding the record from only THIS
         # tick's ids would drop it from the owned set -> stranded forever when usage drops (re-verify).
@@ -408,7 +414,12 @@ def main(argv: list[str] | None = None) -> int:
         # mid-trip (co-install during the pause — L8/L9). Without this the cap is defeated by a
         # redeploy or a mid-trip pack install.
         before = len(state.get("paused_ids") or [])
-        repaused = reconcile_pause(state, _load_jobs())
+        jobs = _load_jobs()
+        if jobs is None:
+            print("budget-guard: WARN jobs.json unreadable during pause reconciliation; "
+                  "retaining the active pause state and retrying next tick.", file=sys.stderr)
+            return 1
+        repaused = reconcile_pause(state, jobs)
         if len(state.get("paused_ids") or []) != before:
             _save_state(state)   # persist the widened paused set so a later resume lifts mid-trip adds
         if repaused:
@@ -423,13 +434,29 @@ def main(argv: list[str] | None = None) -> int:
     # operator pause it doesn't own — and clear the record so the heal doesn't loop (HIGH + re-verify).
     if not over and resume_policy == "auto":
         st = _load_state()
-        orphans = orphaned_guard_pauses(_load_jobs(), st)
-        healed = [name for jid, name in orphans if _cronplus("resume", jid)]
+        jobs = _load_jobs()
+        if jobs is None:
+            print("budget-guard: WARN jobs.json unreadable during orphan recovery; retrying next tick.",
+                  file=sys.stderr)
+            return 1
+        orphans = orphaned_guard_pauses(jobs, st)
+        healed_ids = []
+        healed = []
+        for jid, name in orphans:
+            if _cronplus("resume", jid):
+                healed_ids.append(jid)
+                healed.append(name)
         if healed:
-            _save_state({"paused": False, "resumed_at": now, "note": "self-heal",
-                         "resumed_count": len(healed)})
+            failed_ids = [jid for jid, _name in orphans if jid not in healed_ids]
+            fully_healed = not failed_ids
+            _save_state({"paused": not fully_healed, "resumed_at": now, "note": "self-heal",
+                         "resumed_count": len(healed), "paused_ids": failed_ids})
+            if fully_healed:
+                _set_pause_marker(False)
             print(f"budget-guard: ⚠ SELF-HEAL — resumed {len(healed)} orphaned guard-pause(s) "
-                  f"(a prior state write was lost after pausing): {', '.join(healed)}.", file=sys.stderr)
+                  f"(a prior state write was lost after pausing): {', '.join(healed)}"
+                  f"{'; retrying ' + str(len(failed_ids)) + ' remaining pause(s)' if failed_ids else ''}.",
+                  file=sys.stderr)
     return 0
 
 

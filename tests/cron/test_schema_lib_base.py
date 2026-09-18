@@ -100,6 +100,14 @@ def test_type_owner_and_field_owners(tmp_path):
     assert m.field_owners(sch, "attack-pattern") == {"detection": "okpack-hunt"}
     assert m.type_owner(sch, "entity") is None          # undeclared -> no enforcement
     assert m.field_owners(sch, "entity") == {}
+    assert m.type_owner({
+        "types": {"lacuna": {}},
+        "owners": {"types": {"lacuna": "ext:okengine.lacuna"}},
+    }, "lacuna") == "ext:okengine.lacuna"
+    assert m.type_owner({
+        "types": {"lacuna": {"owner": "legacy-pack"}},
+        "owners": {"types": {"lacuna": "ext:okengine.lacuna"}},
+    }, "lacuna") == "ext:okengine.lacuna", "composed owner map is authoritative"
 
 
 def test_required_unions_and_pack_can_opt_into_strict_types(tmp_path):
@@ -188,6 +196,47 @@ def test_int_fields_from_base_and_pack(tmp_path):
     assert "recent_reports" in infl and "total_mentions" in infl   # base contributes
     assert "citation_count" in infl                                # pack adds
     assert "aliases" not in infl                                   # list fields stay out
+
+
+def test_closed_and_extensible_base_vocabularies_compose_monotonically(tmp_path, monkeypatch):
+    """Closed engine enums/aliases cannot be redirected; explicitly extensible and legacy enum
+    declarations retain their additive compatibility behavior."""
+    m = _load()
+    base = {
+        "enums": {"closed": ["a"], "open": ["a"], "legacy": ["a"]},
+        "field_enums": {
+            "unrelated": {"enum": "other"},
+            "closed_one": {"enum": "closed"},
+            "closed_two": {"enum": "closed", "extensible": True},
+            "open_field": {"enum": "open", "extensible": True},
+            "legacy_field": "legacy",
+        },
+        "value_aliases": {"closed_one": {"old": "a"}, "open_field": {"old": "a"}},
+    }
+    pack = {
+        "enums": {"closed": ["b"], "open": ["b"], "legacy": ["b"], "local": ["x"]},
+        "field_enums": {
+            "closed_one": {"enum": "local"}, "open_field": {"enum": "open"},
+        },
+        "value_aliases": {
+            "closed_one": {"old": "b", "new": "a"},
+            "open_field": {"old": "b", "new": "b"},
+            "bad": "not-a-map",
+        },
+    }
+    monkeypatch.setattr(m, "base_schema", lambda: base)
+    monkeypatch.setattr(m, "governing_schema", lambda *_: pack)
+
+    out = m._merge_base_pack(tmp_path)
+
+    assert out["enums"] == {
+        "closed": ["a"], "open": ["a", "b"], "legacy": ["a", "b"], "local": ["x"]
+    }
+    assert out["field_enums"]["closed_one"] == {"enum": "closed"}
+    assert out["field_enums"]["open_field"] == {"enum": "open"}
+    assert out["value_aliases"]["closed_one"] == {"old": "a", "new": "a"}
+    assert out["value_aliases"]["open_field"] == {"old": "b", "new": "b"}
+    assert "bad" not in out["value_aliases"]
 
 
 def test_governing_schema_reloads_after_mtime_change(tmp_path):

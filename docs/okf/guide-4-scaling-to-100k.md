@@ -334,7 +334,7 @@ Top-level INDEX example:
 
 | Tool | Role | Status |
 |---|---|---|
-| **IWE** | Markdown knowledge-graph — backlinks, graph export, traversal over `[[wikilinks]]`; LSP/CLI/MCP | ✅ in use (read-only wrapper `kb_graph.py`) |
+| **Backlink artifact** | Bounded markdown graph — backlinks, graph statistics, traversal over `[[wikilinks]]` | ✅ in use (`backlink_lib.py` + `backlinks_refresh.py`) |
 | **qmd** | Local hybrid BM25 + vector + rerank search; CLI + MCP | ✅ in use (wrapper `kb_search.py`) |
 | **ripgrep** | Fast lexical / regex search; sub-second across 100k files | ✅ in use |
 | **okengine-reader** | Human web browsing/review interface over the vault | ✅ in use |

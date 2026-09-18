@@ -23,6 +23,7 @@ operations:
     schedule: {kind: cron, expr: "50 4 * * *"}     # daily; wake-gated to fresh grounded entities
     entrypoint: select_grounding_check.py
     prompt_file: prompts/grounding-check.md
+    max_iterations: 12
     output_contract:
       api: 1
       allowed_namespaces: [entities, concepts]
@@ -34,6 +35,6 @@ operations:
       unknown_fields: reject
       unresolved_links: review
       placeholder_links: reject
-      completion: per-selected-item
+      completion: run
     adversarial_fixtures: [tests/extensions/test_model_output_contracts.py]
-    toolsets: [file, todo, okengine-write, okengine]
+    toolsets: [todo, okengine-write, okengine]

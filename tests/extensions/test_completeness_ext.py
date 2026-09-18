@@ -187,6 +187,62 @@ def test_gap_drain_silent_when_nothing_fixable(tmp_path, monkeypatch, capsys):
     assert '"wakeAgent": false' in out and "operator-only" in out
 
 
+@pytest.mark.parametrize("content", ["[broken", "- not\n- a\n- mapping\n", "rules: {}\n"])
+def test_gap_drain_rejects_malformed_rule_documents(tmp_path, monkeypatch, capsys, content):
+    (tmp_path / "config").mkdir(parents=True)
+    (tmp_path / "config/completeness-rules.yaml").write_text(content)
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    module = _load("select_gap_fixes_malformed", EXT / "select_gap_fixes.py")
+    assert module.main() == 0
+    assert "unparseable" in capsys.readouterr().out
+
+
+def test_gap_drain_helper_and_agent_mode_batch_order(tmp_path, monkeypatch, capsys):
+    (tmp_path / "config").mkdir(parents=True)
+    (tmp_path / "config/completeness-rules.yaml").write_text(
+        "rules:\n  - id: fixme\n    fix: agent\n"
+    )
+    gaps = tmp_path / "wiki/gaps"
+    gaps.mkdir(parents=True)
+    (gaps / "_ignored.md").write_text("ignored")
+    (gaps / "INDEX.md").write_text("ignored")
+    (gaps / "bad.md").write_text("---\n[broken\n---\n")
+    for slug, first_seen in (("new", "2026-08-01"), ("old", "2026-07-01")):
+        (gaps / f"{slug}.md").write_text(
+            "---\ntype: gap\nrule: fixme\nstatus: open\n"
+            f"subject: risks/{slug}\nexpectation: owner missing\nfirst_seen: {first_seen}\n---\n"
+        )
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    module = _load("select_gap_fixes_agent_edges", EXT / "select_gap_fixes.py")
+    monkeypatch.setattr(module, "BATCH", 1)
+    assert module._fm(tmp_path / "absent.md") == {}
+    sequence = tmp_path / "sequence.md"
+    sequence.write_text("---\n- list\n---\n")
+    assert module._fm(sequence) == {}
+    assert module.main() == 0
+    output = capsys.readouterr().out
+    assert "[[gaps/old]]" in output and "[[gaps/new]]" not in output
+    assert "DRAFT MODE" not in output and "hint:" not in output
+    assert "the rest drain next run" in output
+
+
+def test_gap_drain_dry_when_fixable_rules_have_no_gap_directory(tmp_path, monkeypatch, capsys):
+    (tmp_path / "config").mkdir(parents=True)
+    (tmp_path / "config/completeness-rules.yaml").write_text(
+        "rules:\n  - id: fixme\n    fix: agent\n"
+    )
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    assert _load("select_gap_fixes_dry", EXT / "select_gap_fixes.py").main() == 0
+    assert "drain is dry" in capsys.readouterr().out
+
+
+def test_gap_drain_no_rules_file_is_loud_noop(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    assert _load("select_gap_fixes_no_rules", EXT / "select_gap_fixes.py").main() == 0
+    output = capsys.readouterr().out
+    assert "no completeness rules" in output and '"wakeAgent": false' in output
+
+
 def test_section_kind_gradeability_gate(tmp_path, monkeypatch):
     """okengine#214: a resolvable proposition without substantive refutation criteria opens a
     gap; a thick section satisfies; a present-but-thin section still gaps (vacuous criteria)."""
@@ -202,3 +258,84 @@ def test_section_kind_gradeability_gate(tmp_path, monkeypatch):
     assert "prediction-gradeable--predictions-p-missing" in gaps
     assert "prediction-gradeable--predictions-p-thin" in gaps
     assert not any("p-good" in g for g in gaps), gaps
+
+
+def test_audit_parser_rules_and_expectation_boundaries(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    m = _load("completeness_audit_boundaries", EXT / "completeness_audit.py")
+    assert m._split(tmp_path / "missing.md") == ({}, "")
+    plain = tmp_path / "plain.md"
+    plain.write_text("plain body")
+    assert m._split(plain) == ({}, "plain body")
+    malformed = tmp_path / "malformed.md"
+    malformed.write_text("---\nkey: [\n---\nbody")
+    assert m._split(malformed) == ({}, "\nbody")
+
+    config = tmp_path / "config"
+    config.mkdir()
+    rules = config / "completeness-rules.yaml"
+    rules.write_text("rules: [\n")
+    assert m.load_rules() is None
+    assert "unparseable" in capsys.readouterr().out
+    rules.write_text("rules: {}\n")
+    assert m.load_rules() is None
+    rules.write_text("rules:\n- bad\n- {id: good, when: {type: risk}, expect: field}\n")
+    loaded = m.load_rules()
+    assert loaded and loaded[0]["severity"] == "medium"
+    assert "skipping malformed" in capsys.readouterr().out
+
+    assert m._selected({"type": "risk"}, {"type": "risk", "has_field": "owner"}) is False
+    by_type = {"detection": {"detections/rule"}}
+    type_rule = {"expect": "link", "link": {"type": "detection"}}
+    assert m._unmet(type_rule, "x", "x", {}, "[[rule]]", set(), by_type) is None
+    assert "type: detection" in m._unmet(type_rule, "x", "x", {}, "none", set(), by_type)
+    assert m._unmet({"expect": "link"}, "x", "x", {}, "none", set(), {}) is None
+    assert m._unmet({"expect": "section", "section": ""}, "x", "x", {}, "", set(), {}) is None
+    section = {"expect": "section", "section": "wanted", "min_chars": 1}
+    assert m._unmet(section, "x", "x", {}, "## Other\nno\n## Wanted\nyes", set(), {}) is None
+    freshness = {"expect": "freshness", "field": "updated"}
+    assert "unparseable" in m._unmet(freshness, "x", "x", {}, "", set(), {})
+    assert "unparseable" in m._unmet(
+        freshness, "x", "x", {"updated": "2026-99-99"}, "", set(), {}
+    )
+    assert m._unmet({"expect": "unknown"}, "x", "x", {}, "", set(), {}) is None
+
+
+def test_page_index_skips_reserved_and_indexes_untyped(tmp_path, monkeypatch):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    m = _load("completeness_audit_index_edges", EXT / "completeness_audit.py")
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    (wiki / "INDEX.md").write_text("---\ntype: risk\n---\n")
+    (wiki / "plain.md").write_text("body")
+    pages, keys, by_type = m._page_index()
+    assert len(pages) == 1 and keys == {"plain"} and by_type == {}
+
+
+def test_existing_gap_refresh_reopen_and_reserved_entries(tmp_path, monkeypatch):
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/completeness-rules.yaml").write_text(
+        "rules:\n- id: risk-owner\n  when: {type: risk}\n  expect: field\n  field: owner\n"
+    )
+    _page(tmp_path, "risks/r1", "type: risk\n")
+    _run(tmp_path, monkeypatch)
+    gap = tmp_path / "wiki/gaps/risk-owner--risks-r1.md"
+    (gap.parent / "INDEX.md").write_text("ignored")
+    text = gap.read_text().replace("last_seen:", "last_seen: 2000-01-01 #")
+    gap.write_text(text)
+    _run(tmp_path, monkeypatch)
+    assert "last_seen: 2000" not in gap.read_text()
+    gap.write_text(gap.read_text().replace("status: open", "status: resolved"))
+    _run(tmp_path, monkeypatch)
+    assert "status: open" in gap.read_text()
+
+
+def test_satisfied_rules_render_dashboard_without_gap_directory(tmp_path, monkeypatch):
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/completeness-rules.yaml").write_text(
+        "rules:\n- id: risk-owner\n  when: {type: risk}\n  expect: field\n  field: owner\n"
+    )
+    _page(tmp_path, "risks/r1", "type: risk\nowner: alice\n")
+    _run(tmp_path, monkeypatch)
+    dashboard = (tmp_path / "wiki/dashboards/completeness.md").read_text()
+    assert "Open gaps" not in dashboard and "Rule precision" in dashboard

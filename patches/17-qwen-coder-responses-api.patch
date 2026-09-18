@@ -1,0 +1,241 @@
+diff --git a/run_agent.py b/run_agent.py
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -1368,10 +1368,13 @@ class AIAgent:
+         if normalized_provider == "nous":
+             return False
+         if normalized_provider == "custom":
+-            # Generic custom endpoints are conservative by default. They may
+-            # relay GPT-5 models without full Responses semantics, so only
+-            # direct OpenAI/xAI URL detection should auto-upgrade them.
+-            return False
++            # OKEngine serves Qwen Coder on a Responses-capable local endpoint.
++            # Its Chat Completions compatibility route is retired: selecting
++            # codex_responses here ensures primary generation and tool loops
++            # use /v1/responses. Keep other custom models conservative because
++            # a generic custom endpoint may not implement Responses semantics.
++            normalized_model = model.lower().rsplit("/", 1)[-1]
++            return normalized_model.startswith(("qwen3-coder", "qwen-coder"))
+         if normalized_provider == "copilot":
+             try:
+                 from hermes_cli.models import _should_use_copilot_responses_api
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -481,11 +481,16 @@ def init_agent(
+     # surface.
+-    # When api_mode was explicitly provided, respect it — the user
+-    # knows what their endpoint supports (#10473).
++    # When api_mode was explicitly provided, respect it — except for OKEngine
++    # Qwen Coder, whose Chat Completions compatibility path is retired.
+     # Exception: Azure OpenAI serves gpt-5.x on /chat/completions and
+     # does NOT support the Responses API — skip the upgrade for Azure
+     # (openai.azure.com), even though it looks OpenAI-compatible.
++    _okengine_qwen_responses = (
++        agent.provider == "custom"
++        and agent._provider_model_requires_responses_api(
++            agent.model, provider=agent.provider)
++    )
+     if (
+-        api_mode is None
++        (api_mode is None or _okengine_qwen_responses)
+         and agent.api_mode == "chat_completions"
+         and agent.provider != "copilot-acp"
+         and not str(agent.base_url or "").lower().startswith("acp://copilot")
+@@ -504,6 +509,20 @@ def init_agent(
+         if hasattr(agent, "_transport_cache"):
+             agent._transport_cache.clear()
+
++    # OKEngine readiness evidence: record the resolved wire contract, not just
++    # the provider/base URL. A base ending in /v1 is ambiguous between retired
++    # Chat Completions and the approved Responses endpoint.
++    _wire_path = (
++        "/responses" if agent.api_mode == "codex_responses"
++        else "/chat/completions" if agent.api_mode == "chat_completions"
++        else f"/{agent.api_mode}"
++    )
++    logger.info(
++        "Inference transport selected: api_mode=%s endpoint=%s%s model=%s provider=%s",
++        agent.api_mode, str(agent.base_url or "").rstrip("/"), _wire_path,
++        agent.model, agent.provider,
++    )
++
+     # Pre-warm OpenRouter model metadata cache in a background thread.
+     # fetch_model_metadata() is cached for 1 hour; this avoids a blocking
+     # HTTP request on the first API response when pricing is estimated.
+diff --git a/agent/codex_responses_adapter.py b/agent/codex_responses_adapter.py
+--- a/agent/codex_responses_adapter.py
++++ b/agent/codex_responses_adapter.py
+@@ -686,36 +686,64 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
+
+         if item_type == "message":
+             role = item.get("role")
+-            if role != "assistant":
+-                raise ValueError(f"Codex Responses input[{idx}] message items must have role='assistant'.")
+-            content = item.get("content")
++            if role not in {"user", "assistant", "system", "developer"}:
++                raise ValueError(
++                    f"Codex Responses input[{idx}] message item has unsupported role {role!r}."
++                )
++            content = item.get("content", "")
++            text_type = "output_text" if role == "assistant" else "input_text"
++            if isinstance(content, str):
++                content = [{"type": text_type, "text": content}]
+             if not isinstance(content, list):
+-                raise ValueError(f"Codex Responses input[{idx}] message item must have content list.")
++                raise ValueError(
++                    f"Codex Responses input[{idx}] message item content must be a string or list."
++                )
+             normalized_content = []
+             for part_idx, part in enumerate(content):
++                if isinstance(part, str):
++                    normalized_content.append({"type": text_type, "text": part})
++                    continue
+                 if not isinstance(part, dict):
+                     raise ValueError(
+-                        f"Codex Responses input[{idx}] message content[{part_idx}] must be an object."
++                        f"Codex Responses input[{idx}] message content[{part_idx}] must be an object or string."
+                     )
+                 part_type = part.get("type")
+-                if part_type not in {"output_text", "text"}:
++                if part_type in {"input_text", "output_text", "text"}:
++                    text = part.get("text", "")
++                    if text is None:
++                        text = ""
++                    if not isinstance(text, str):
++                        text = str(text)
++                    normalized_content.append({"type": text_type, "text": text})
++                    continue
++                if role != "assistant" and part_type in {"input_image", "image_url"}:
++                    image_ref = part.get("image_url", "")
++                    detail = part.get("detail")
++                    if isinstance(image_ref, dict):
++                        image_ref = image_ref.get("url", "")
++                    if not isinstance(image_ref, str):
++                        image_ref = str(image_ref or "")
++                    image_part: Dict[str, Any] = {
++                        "type": "input_image",
++                        "image_url": image_ref,
++                    }
++                    if isinstance(detail, str) and detail.strip():
++                        image_part["detail"] = detail.strip()
++                    normalized_content.append(image_part)
++                    continue
++                else:
+                     raise ValueError(
+                         f"Codex Responses input[{idx}] message content[{part_idx}] has unsupported type {part_type!r}."
+                     )
+-                text = part.get("text", "")
+-                if text is None:
+-                    text = ""
+-                if not isinstance(text, str):
+-                    text = str(text)
+-                normalized_content.append({"type": "output_text", "text": text})
+             if not normalized_content:
+                 raise ValueError(f"Codex Responses input[{idx}] message item must contain at least one text part.")
+             normalized_item: Dict[str, Any] = {
+                 "type": "message",
+-                "role": "assistant",
+-                "status": _normalize_responses_message_status(item.get("status")),
++                "role": role,
+                 "content": normalized_content,
+             }
++            if role == "assistant":
++                normalized_item["status"] = _normalize_responses_message_status(item.get("status"))
+             item_id = item.get("id")
+             if isinstance(item_id, str) and item_id.strip():
+                 normalized_item["id"] = item_id.strip()
+@@ -726,7 +754,7 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
+             continue
+
+         role = item.get("role")
+-        if role in {"user", "assistant"}:
++        if role in {"user", "assistant", "system", "developer"}:
+             content = item.get("content", "")
+             if content is None:
+                 content = ""
+@@ -771,12 +799,36 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
+                         raise ValueError(
+                             f"Codex Responses input[{idx}].content[{part_idx}] has unsupported type {part.get('type')!r}."
+                         )
+-                normalized.append({"role": role, "content": validated})
++                if role == "assistant":
++                    normalized.append({
++                        "type": "message",
++                        "role": "assistant",
++                        "status": "completed",
++                        "content": validated,
++                    })
++                else:
++                    normalized.append({
++                        "type": "message",
++                        "role": role,
++                        "content": validated,
++                    })
+                 continue
+             if not isinstance(content, str):
+                 content = str(content)
+
+-            normalized.append({"role": role, "content": content})
++            if role == "assistant":
++                normalized.append({
++                    "type": "message",
++                    "role": "assistant",
++                    "status": "completed",
++                    "content": [{"type": "output_text", "text": content}],
++                })
++            else:
++                normalized.append({
++                    "type": "message",
++                    "role": role,
++                    "content": [{"type": "input_text", "text": content}],
++                })
+             continue
+
+         raise ValueError(
+diff --git a/agent/codex_runtime.py b/agent/codex_runtime.py
+--- a/agent/codex_runtime.py
++++ b/agent/codex_runtime.py
+@@ -826,6 +826,13 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+     """
+     import httpx as _httpx
+
++    # This is the common wire boundary for every Responses request, including
++    # the max-iteration summary path, which reconstructs history and calls
++    # _run_codex_stream() directly. Main-loop callers already preflight, but
++    # doing it again is idempotent and prevents direct/retry/summary callers
++    # from leaking untyped role-bearing items to strict llama.cpp servers.
++    api_kwargs = agent._get_transport().preflight_kwargs(api_kwargs)
++
+     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
+     max_stream_retries = 1
+     # Accumulate streamed text so callers / compat shims can read it.
+@@ -861,6 +868,28 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+                 )
+                 continue
+             raise
++        except Exception as exc:
++            if getattr(exc, "status_code", None) == 400:
++                # Shape-only diagnostics: enough to attribute a malformed
++                # caller without exposing prompts, tool arguments, or secrets.
++                _items = stream_kwargs.get("input")
++                _items = _items if isinstance(_items, list) else []
++                _missing_type = [
++                    idx for idx, item in enumerate(_items)
++                    if isinstance(item, dict)
++                    and item.get("role")
++                    and not item.get("type")
++                ]
++                logger.error(
++                    "Codex Responses HTTP 400: input_items=%d item_types=%s "
++                    "roles=%s missing_type_indexes=%s %s",
++                    len(_items),
++                    [item.get("type") for item in _items if isinstance(item, dict)],
++                    [item.get("role") for item in _items if isinstance(item, dict)],
++                    _missing_type,
++                    agent._client_log_context(),
++                )
++            raise
+
+         try:
+             # Compatibility: some mocks/providers return a concrete response

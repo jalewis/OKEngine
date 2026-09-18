@@ -31,14 +31,15 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     import tier_lib
+    import tz_lib
 except Exception:  # pragma: no cover - tier filtering simply unavailable
     tier_lib = None
+    tz_lib = None
 
 # qmd emits one hit per block beginning with `qmd://<index>/<wiki-rel-path>:<line>`.
 _HIT_RE = re.compile(r"^qmd://[^/]+/(.+?\.md)(?::|\s|$)")
@@ -58,8 +59,8 @@ def _filter_by_tier(out: str, tiers: set[str]) -> tuple[str, int]:
     are always kept). Returns (filtered_text, dropped_count)."""
     if tier_lib is None:
         return out, 0
-    cfg = tier_lib.load_cfg(_WIKI.parent)
-    today = datetime.now(timezone.utc).date()
+    today = tz_lib.deployment_today()
+    configs: dict[str, dict] = {}
     lines = out.split("\n")
     # split into blocks at each `qmd://` header line
     blocks, cur = [], []
@@ -68,7 +69,7 @@ def _filter_by_tier(out: str, tiers: set[str]) -> tuple[str, int]:
             blocks.append(cur); cur = [ln]
         else:
             cur.append(ln)
-    if cur:
+    if cur:  # pragma: no branch - str.split("\n") always yields at least one element
         blocks.append(cur)
     kept, dropped = [], 0
     for b in blocks:
@@ -76,7 +77,12 @@ def _filter_by_tier(out: str, tiers: set[str]) -> tuple[str, int]:
         if head is None:
             kept.append(b); continue          # preamble / non-hit block
         rel = _HIT_RE.match(head).group(1)
-        t = tier_lib.tier_of(rel, tier_lib.fm_of(_WIKI / rel), cfg, today)
+        parts = Path(rel).parts
+        scope = parts[0] if len(parts) > 2 and (_WIKI / parts[0] / "schema.yaml").is_file() else ""
+        tier_rel = "/".join(parts[1:]) if scope else rel
+        if scope not in configs:
+            configs[scope] = tier_lib.load_cfg(_WIKI.parent, namespace=scope)
+        t = tier_lib.tier_of(tier_rel, tier_lib.fm_of(_WIKI / rel), configs[scope], today)
         if t is None or t in tiers:
             kept.append(b)
         else:

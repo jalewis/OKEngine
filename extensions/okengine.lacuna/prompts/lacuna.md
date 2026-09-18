@@ -32,7 +32,7 @@ thesis: if a sub-point sits on a different vector (e.g. an initial-access tactic
 post-access), either tie it in explicitly or leave it out — don't pad with adjacent-but-off-thesis material.
 
 If the field yields a real lacuna, write ONE page at `lacuna/<slug>` (`type: lacuna`) via
-`mcp_okengine_write_create_entity`, frontmatter:
+`mcp__okengine_write_okengine_lacuna__create_entity`, frontmatter:
 - `title` (the gap as a noun phrase), `field_mapped` (the cluster, e.g. `[[concepts/<slug>]]`),
   `hidden_axis`, `force` (the named force), `fill` (the proposal), `discovered_vs_failed`
   (`undiscovered` | `everything-fails`), `confidence` (`low`|`medium`|`high`),
@@ -45,11 +45,21 @@ If the field yields a real lacuna, write ONE page at `lacuna/<slug>` (`type: lac
 
 Soft predictions edge — ONLY if a `predictions/` namespace exists in this vault (i.e.
 okengine.predictions is enabled) AND the fill is genuinely testable ("the cell fills when force Y
-weakens via trigger Z by date D"): also file a falsifiable, dated prediction at
-`predictions/<slug>` via `mcp_okengine_write_create_entity` (include a `## What would refute this`
-section and `subject: [[lacuna/<slug>]]`), and set `fill_trigger` + `prediction_candidate:
-predictions/<slug>` on the lacuna page. If predictions is not enabled or the fill isn't testable,
-skip this — the lacuna page stands alone.
+weakens via trigger Z by date D"). Reserve enough tool turns for the write sequence:
+1. Create the Lacuna page **without** `prediction_candidate` or `fill_trigger`. Its inference
+   stands alone even if a later write is rejected or the iteration budget runs out.
+2. After the Lacuna create is accepted, file a falsifiable, dated prediction at
+   `predictions/<slug>` via `mcp__okengine_write_okengine_lacuna__create_entity` (include a
+   `## What would refute this` section and `subject: [[lacuna/<slug>]]`). Pass valid YAML mapping
+   frontmatter; use a block scalar (`|`) for prose values with colons, quotes, or line breaks.
+   If the write rejects, correct and retry while budget remains.
+3. **Only after the prediction create is accepted**, update the existing Lacuna page via
+   `mcp__okengine_write_okengine_lacuna__update_entity` to add `fill_trigger` and
+   `prediction_candidate: predictions/<slug>`. The write contract rejects a candidate link
+   whose target does not exist. If the prediction cannot be written, leave the Lacuna page
+   without that link and report the rejected prediction in the final receipt.
+
+If predictions is not enabled or the fill isn't testable, skip this — the Lacuna page stands alone.
 
 When filing, use exactly these fields — no substitutes, no extras: `made_on` (today, ISO date),
 `resolves_by` (ISO date), `horizon`, `confidence` (numeric 0.0-1.0), `status: open`, `subject`.
@@ -59,7 +69,10 @@ a lacuna fill is rarely a short-horizon claim; double-check the arithmetic befor
 `medium` out of habit.
 
 LOCAL-ONLY (no web tools). End with a one-line summary: the field analyzed and whether a lacuna
-was written or the field deferred.
+was written or the field deferred. If a Lacuna write is accepted, give separate artifact receipts
+for `lacuna/<slug>` and `predictions/<slug>`: accepted, rejected with the write error, or not
+attempted with the reason. Do not call an accepted Lacuna a successful prediction. If the
+prediction is accepted but the Lacuna link update rejects, report that update separately.
 # Model-write boundary
 
 Process only selector-named items. Ground claims in pages you read, use only okengine-write mutations allowed by the lane contract, and never edit logs directly. Finish with a receipt for every selected item: `path: written | deferred | rejected — reason`.

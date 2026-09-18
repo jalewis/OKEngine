@@ -5,7 +5,9 @@ predicate — lint_html — that decides whether a rendered page is clean, since
 must catch the real regression classes and must NOT false-positive on legitimate content.
 """
 import importlib.util
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,6 +28,19 @@ rl = _load()
 def test_reader_fetch_rejects_non_http_scheme():
     with pytest.raises(ValueError, match=r"http\(s\)"):
         rl._get_json("file:///etc/passwd")
+
+
+def test_http_fetch_helpers_and_visible_prose(monkeypatch):
+    class Response:
+        def __init__(self, payload): self.payload = payload
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def read(self): return self.payload
+    responses = iter([Response(json.dumps({"ok": True}).encode()), Response(b"text\xff")])
+    monkeypatch.setattr(rl.urllib.request, "urlopen", lambda *_a, **_k: next(responses))
+    assert rl._get_json("https://reader.example/json") == {"ok": True}
+    assert rl._get_text("http://reader.example/text").startswith("text")
+    assert "example" not in rl._visible_prose("<p>shown</p><code>example</code>")
 
 
 # ── clean pages must not be flagged ──────────────────────────────────────────
@@ -206,3 +221,106 @@ def test_state_roundtrip_and_corruption_rebuild(tmp_path, capsys):
     p.write_text("{broken")
     assert rl.load_state(p) == {"version": rl._STATE_VERSION, "pages": {}}
     assert "ignoring corrupt state" in capsys.readouterr().err
+    p.write_text(json.dumps({"version": -1, "pages": []}))
+    assert rl.load_state(p) == {"version": rl._STATE_VERSION, "pages": {}}
+
+
+def test_enumeration_falls_back_to_legacy_endpoint(monkeypatch):
+    import urllib.error
+    calls = []
+
+    def get(url, timeout=180):
+        calls.append(url)
+        if url.endswith("/api/page-revisions"):
+            raise urllib.error.HTTPError(url, 404, "missing", {}, None)
+        return {"pages": [{"path": "a", "updated": "u"}, {"no": "path"}, "junk"]}
+
+    monkeypatch.setattr(rl, "_get_json", get)
+    assert rl.enumerate_page_records("http://reader") == [{"path": "a", "revision": "u"}]
+    assert calls[-1].endswith("/api/pages")
+
+
+def test_main_stateless_json_writes_dashboard_and_returns_defect_status(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("WIKI_PATH", raising=False)
+    monkeypatch.setattr(rl, "enumerate_page_records",
+                        lambda _url: [{"path": "clean", "revision": "1"},
+                                      {"path": "dirty", "revision": "2"}])
+    monkeypatch.setattr(rl, "crawl",
+                        lambda _url, paths, workers=16: {"dirty": ["literal-wikilink"]})
+    rc = rl.main(["--reader-url", "http://reader", "--no-state", "--json",
+                  "--write-vault", str(tmp_path), "--now", "2026-07-24T00:00:00Z"])
+    assert rc == 1
+    payload = capsys.readouterr().out
+    assert '"dirty"' in payload
+    report = tmp_path / "wiki" / "operational" / "render-lint.md"
+    assert "literal-wikilink" in report.read_text()
+
+
+def test_main_incremental_updates_state_and_honors_tolerance(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("WIKI_PATH", raising=False)
+    monkeypatch.setattr(rl, "enumerate_page_records",
+                        lambda _url: [{"path": "dirty", "revision": "2"}])
+    monkeypatch.setattr(rl, "crawl",
+                        lambda _url, paths, workers=16: {"dirty": ["literal-wikilink"]})
+    state = tmp_path / "state.json"
+    rc = rl.main(["--reader-url", "http://reader", "--state", str(state),
+                  "--max-offenders", "1", "--batch-size", "10",
+                  "--now", "2026-07-24T00:00:00Z"])
+    assert rc == 0 and state.is_file()
+    assert "incremental batch 1" in capsys.readouterr().out
+
+
+def test_main_returns_two_when_reader_is_unreachable(monkeypatch, capsys):
+    import urllib.error
+    monkeypatch.setattr(
+        rl, "enumerate_page_records",
+        lambda _url: (_ for _ in ()).throw(urllib.error.URLError("down")))
+    assert rl.main(["--reader-url", "http://reader"]) == 2
+    assert "reader unreachable" in capsys.readouterr().err
+
+
+def test_enumeration_non_404_reraises_and_list_shape(monkeypatch):
+    import urllib.error
+    monkeypatch.setattr(rl,"_get_json",lambda *_,**__:[{"path":"a","revision":1}])
+    assert rl.enumerate_pages("http://r")==["a"]
+    def denied(url,timeout=180):
+        raise urllib.error.HTTPError(url,500,"bad",{},None)
+    monkeypatch.setattr(rl,"_get_json",denied)
+    with pytest.raises(urllib.error.HTTPError):
+        rl.enumerate_page_records("http://r")
+
+
+def test_large_report_and_incremental_edge_paths():
+    offenders={f"p{i}":["x"] for i in range(501)}
+    assert "+1 more" in rl.render_report(501,offenders,"now")
+    state={"pages":{"a":{"updated":"1","violations":[]}},"cycle_started_at":"old"}
+    current={"a":"1"}
+    result=rl.apply_incremental(state,current,{"gone":["x"]},"now")
+    assert result[1:]==(1,0) and "cycle_started_at" not in state
+    selected,_=rl.plan_incremental([{"path":"a"}],{"pages":[]},batch_size=0)
+    assert selected==["a"]
+
+
+def test_main_cron_defaults_empty_batch_and_text_overflow(tmp_path,monkeypatch,capsys):
+    monkeypatch.setenv("WIKI_PATH",str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME",str(tmp_path/"data"))
+    monkeypatch.setattr(rl,"enumerate_page_records",lambda _:[{"path":f"p{i}","revision":"1"} for i in range(21)])
+    monkeypatch.setattr(rl,"crawl",lambda *_a,**_k:{f"p{i}":["x"] for i in range(21)})
+    assert rl.main(["--reader-url","http://r","--batch-size","0","--now","now"])==1
+    out=capsys.readouterr().out
+    assert "+1 more" in out and "render-lint.json" in out
+
+
+def test_main_limit_with_explicit_workers_leaves_pending(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("WIKI_PATH", raising=False)
+    monkeypatch.setattr(rl, "enumerate_page_records", lambda _url: [
+        {"path": "a", "revision": "1"}, {"path": "b", "revision": "1"},
+    ])
+    seen = []
+    monkeypatch.setattr(rl, "crawl", lambda _url, paths, workers:
+                        seen.append((paths, workers)) or {})
+    assert rl.main(["--reader-url", "http://reader", "--limit", "1", "--workers", "2",
+                    "--json", "--write-vault", str(tmp_path), "--now", "now"]) == 0
+    assert seen == [(["a"], 2)]
+    payload = capsys.readouterr().out
+    assert '"pending": 1' in payload

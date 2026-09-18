@@ -14,17 +14,17 @@
 #   pip install -e '.[dev]'                      # or: make dev
 #   pip install -r okengine-mcp/requirements.txt # MCP-dependent tests
 #   pip install fastapi markdown nh3 httpx pyyaml croniter python-docx python-pptx openpyxl striprtf
-#   pip install playwright && playwright install chromium    # smoke DOM layer
+#   playwright install chromium                              # smoke DOM layer
 #   # + docker, gitleaks, Claude Code with Workflow support, ripgrep on PATH
 set -uo pipefail
-cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" || exit 1
 PY="${PREFLIGHT_PYTHON:-${SMOKE_PYTHON:-python3}}"
 miss=0; warn=0
 
 echo "preflight: python = $("$PY" -V 2>&1) ($PY)"
 
 # REQUIRED — the offline unit suite imports these; a missing one becomes a silent dependency SKIP.
-req_mods=(pytest yaml fastapi markdown nh3 httpx croniter mcp docx pptx openpyxl striprtf)
+req_mods=(okengine tools pytest pytest_timeout yaml fastapi markdown nh3 httpx croniter mcp docx pptx openpyxl striprtf playwright)
 echo "== required (offline unit suite) =="
 for m in "${req_mods[@]}"; do
   if "$PY" -c "import $m" 2>/dev/null; then printf '  ✓ %s\n' "$m"
@@ -32,7 +32,7 @@ for m in "${req_mods[@]}"; do
 done
 
 # OPTIONAL python — only some dev gates need these; report but don't fail the offline gate.
-opt_mods=(ruff pytest_cov mypy pip_audit playwright weasyprint pydyf)
+opt_mods=(ruff pytest_cov mypy pip_audit weasyprint pydyf)
 echo "== optional (extra dev gates: lint/coverage/typecheck/audit/smoke-DOM/pdf) =="
 for m in "${opt_mods[@]}"; do
   if "$PY" -c "import ${m//-/_}" 2>/dev/null; then printf '  ✓ %s\n' "$m"

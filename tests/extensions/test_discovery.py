@@ -8,6 +8,7 @@ these are hermetic (no engine/pack on disk required).
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -151,3 +152,47 @@ def test_engine_only_discovery_without_pack(tmp_path):
     exts, errors = m.discover(None, engine_root=engine)
     assert errors == []
     assert [e["id"] for e in exts] == ["okengine.solo"]
+
+
+def test_scan_ignores_nonextensions_and_unkeyable_invalid_manifests(tmp_path):
+    m = _mod()
+    root = tmp_path / "extensions"; root.mkdir()
+    (root / "plain").mkdir()
+    (root / "file").write_text("not a directory")
+    bad = root / "bad"; bad.mkdir()
+    (bad / "extension.yaml").write_text(yaml.safe_dump({"id": "BAD"}))
+    records, errors = m._scan_root(root, "pack", m._manifest_mod())
+    assert records == []
+    assert errors and any("id" in error for error in errors)
+
+
+def test_disabled_without_yaml_and_scalar_config_declarations(tmp_path, monkeypatch):
+    m = _mod()
+    monkeypatch.setattr(m, "_manifest_mod", lambda: SimpleNamespace(yaml=None))
+    assert m._load_disabled(tmp_path) == set()
+
+    record = {"id": "demo.config", "tier": "pack", "manifest": {
+        "id": "demo.config", "config": {"scalar": "default", "object": {"default": 1}},
+    }}
+    monkeypatch.setattr(m, "discover", lambda _pack: ([record], []))
+    monkeypatch.setattr(m, "load_enabled_state", lambda _pack: ({
+        "demo.config": {"config": {"scalar": "override"}}
+    }, []))
+    monkeypatch.setattr(m, "effective_enabled", lambda *_: ({"demo.config"}, []))
+    resolved, errors = m.resolve_for_pack(tmp_path)
+    assert errors == []
+    config = resolved["demo.config"]["manifest"]["config"]
+    assert config["scalar"] == "override"
+    assert config["object"] == {"default": 1}
+
+
+@pytest.mark.parametrize("disabled", ["demo", {"demo": True}, ["demo", 7]])
+def test_malformed_disabled_state_fails_loudly(tmp_path, disabled):
+    m = _mod()
+    state = tmp_path / ".okengine/extensions.yaml"
+    state.parent.mkdir()
+    state.write_text(yaml.safe_dump({"enabled": {}, "disabled": disabled}))
+    enabled, errors = m.load_enabled_state(tmp_path)
+    assert enabled == {}
+    assert errors and "must be a list of extension id strings" in errors[0]
+    assert m._load_disabled(tmp_path) == set()

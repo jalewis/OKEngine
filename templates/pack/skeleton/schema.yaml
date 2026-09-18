@@ -4,6 +4,9 @@
 version: 1
 apply_under: [wiki/]
 exclude:
+  # Namespace-wide forms are `name` or `wiki/name/`. A bare multi-segment
+  # path is rejected because namespace-level and page-level consumers cannot
+  # interpret it consistently; use an explicit glob for page-scoped exclusions.
   - wiki/operational/
 
 okf:

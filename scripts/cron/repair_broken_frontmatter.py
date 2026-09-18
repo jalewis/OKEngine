@@ -35,6 +35,9 @@ VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
 
 _FM_OPEN_RE = re.compile(r"\A---[ \t]*\n")
+_FM_BLOCK_RE = re.compile(
+    r"\A---[ \t]*\n(?P<frontmatter>.*?\n)---[ \t]*(?:\n|\Z)", re.S
+)
 _SKIP_SUBSTRINGS = (".bak", "_archived/", ".was-broken", ".restored",
                     ".corrupt", ".recovered", ".backup", ".applied")
 
@@ -54,6 +57,13 @@ _BODY_PROSE_RE = re.compile(r"^[A-Za-z0-9>\[(]")  # line starting with prose/lin
 #   _FM_OPEN_RE so the file is wrongly treated as "no frontmatter" and skipped.
 _CATN_PREFIX_RE = re.compile(r"^\s*\d+\|")          # "     12|"  (never a legit line)
 _PIPE_FENCE_RE = re.compile(r"^\|+-{3,}[ \t]*$")    # "|---" / "||---"  mangled fence
+_GLUED_CLOSE_RE = re.compile(
+    r"^(?P<value>[A-Za-z_][\w-]*:[ \t]+.+?)---[ \t]*(?P<newline>\n?)$"
+)
+# Medium RSS uses URL suffixes such as ``?source=rss----2983bc435765---4``.
+# A historical patch failure echoed that suffix onto standalone lines, sometimes
+# dozens of times, along with the neighboring YAML line and premature fences.
+_RSS_SUFFIX_ECHO_RE = re.compile(r"^-{1,4}(?P<token>[0-9a-f]{12})---4[ \t]*$")
 
 
 def _is_skippable(path: Path) -> bool:
@@ -132,6 +142,29 @@ def repair_body_bleed(text: str) -> str | None:
     return "---\n" + fm_block + "---\n" + ("\n" if not body_block.startswith("\n") else "") + body_block
 
 
+def repair_glued_close(text: str) -> str | None:
+    """Detach a closing fence glued to the final scalar value.
+
+    Example: ``tlp: CLEAR---`` becomes ``tlp: CLEAR\n---``. The candidate is
+    accepted only when the preceding block then parses as a mapping containing
+    ``type``; arbitrary prose ending in dashes is never rewritten.
+    """
+    if not _FM_OPEN_RE.match(text):
+        return None
+    lines = text.splitlines(keepends=True)
+    for i in range(1, len(lines)):
+        match = _GLUED_CLOSE_RE.match(lines[i])
+        if not match:
+            continue
+        fixed_line = match.group("value").rstrip() + "\n"
+        fm = "".join(lines[1:i]) + fixed_line
+        if not parses_with_type(fm):
+            continue
+        remainder = "".join(lines[i + 1:])
+        return lines[0] + fm + "---\n" + remainder
+    return None
+
+
 def repair_inline_flow(text: str) -> str | None:
     """Class B. Close a single unclosed inline flow list, e.g.
     `field_a: [item-one`  → `field_a: [item-one]`.
@@ -175,10 +208,10 @@ def repair_malformed_close(text: str) -> str | None:
     if not _FM_OPEN_RE.match(text):
         return None
     # already has a clean close? then not our case
-    if re.match(r"\A---[ \t]*\n(.*?)\n---[ \t]*(?:\n|\Z)", text, re.S):
+    if _FM_BLOCK_RE.match(text):
         try:
-            mm = re.match(r"\A---[ \t]*\n(.*?)\n---", text, re.S)
-            yaml.safe_load(mm.group(1))
+            mm = _FM_BLOCK_RE.match(text)
+            yaml.safe_load(mm.group("frontmatter"))
             return None  # clean close already parses
         except Exception:
             pass
@@ -217,10 +250,10 @@ def repair_missing_close(text: str) -> str | None:
     if not mo:
         return None
     # not our case if there's already a clean parseable close
-    m = re.match(r"\A---[ \t]*\n(.*?)\n---", text, re.S)
+    m = _FM_BLOCK_RE.match(text)
     if m:
         try:
-            if isinstance(yaml.safe_load(m.group(1)), dict):
+            if isinstance(yaml.safe_load(m.group("frontmatter")), dict):
                 return None
         except Exception:
             pass
@@ -281,7 +314,7 @@ def repair_wikilink_flow(text: str) -> str | None:
     def _block(mo: re.Match) -> str:
         key, val = mo.group(1), mo.group(2)
         toks = _WIKILINK_TOKEN.findall(val)
-        if not toks:
+        if not toks:  # pragma: no cover - the matching flow-line regex requires a wikilink token
             return mo.group(0)
         return key + ":\n" + "\n".join(f'  - "{t}"' for t in toks)
 
@@ -304,7 +337,7 @@ def repair_catn_prefix(text: str) -> str | None:
     is silently un-repairable; this path catches that.
     """
     lines = text.split("\n")
-    if not lines:
+    if not lines:  # pragma: no cover - str.split always returns at least one element
         return None
     catn = any(_CATN_PREFIX_RE.match(ln) for ln in lines)
     pipe = _PIPE_FENCE_RE.match(lines[0]) or lines[0].startswith("|")
@@ -340,16 +373,16 @@ def repair_catn_prefix(text: str) -> str | None:
     lines = out
 
     new = "\n".join(lines)
-    if new == text:
+    if new == text:  # pragma: no cover - entering requires a prefix that the transform removes
         return None
-    m = re.match(r"\A---[ \t]*\n(.*?)\n---[ \t]*(?:\n|\Z)", new, re.S)
-    if not m or not parses_with_type(m.group(1)):
+    m = _FM_BLOCK_RE.match(new)
+    if not m or not parses_with_type(m.group("frontmatter")):
         return None
     # Guard against a lossy early-close on jumbled files (e.g. a spurious mid-FM
     # fence): a stray "---" inside the recovered block, OR a body that opens with
     # an orphaned YAML list item / key, means we closed early and dropped
     # content — bail and leave it for manual repair rather than write a lossy fix.
-    if re.search(r"\n---[ \t]*\n", m.group(1)):
+    if re.search(r"\n---[ \t]*\n", m.group("frontmatter")):  # pragma: no cover - regex closes first
         return None
     first_body = next((b for b in new[m.end():].split("\n") if b.strip()), "")
     first_body = re.sub(r"^\|+", "", first_body)  # an orphan may still be piped
@@ -358,11 +391,80 @@ def repair_catn_prefix(text: str) -> str | None:
     return new
 
 
+def repair_rss_suffix_echo(text: str) -> str | None:
+    """Remove a repeatedly echoed Medium RSS URL suffix from frontmatter.
+
+    This corruption is recognized only when the same standalone suffix occurs
+    at least twice. The final exact fence is retained as the close; earlier
+    exact fences and suffix-only lines are removed. Repeated scalar fields are
+    collapsed to YAML's deterministic last-value-wins result.
+    """
+    if not _FM_OPEN_RE.match(text):
+        return None
+    lines = text.splitlines(keepends=True)
+    close_indexes = [
+        i for i, line in enumerate(lines[1:], 1) if line.rstrip("\r\n").strip() == "---"
+    ]
+    if not close_indexes:
+        return None
+    final_close = close_indexes[-1]
+    fm_lines = lines[1:final_close]
+    tokens = [
+        match.group("token")
+        for line in fm_lines
+        if (match := _RSS_SUFFIX_ECHO_RE.match(line.rstrip("\r\n")))
+    ]
+    if len(tokens) < 2 or len(set(tokens)) != 1:
+        return None
+
+    cleaned: list[str] = []
+    seen_scalars: dict[str, tuple[str, int]] = {}
+    for line in fm_lines:
+        bare = line.rstrip("\r\n")
+        if _RSS_SUFFIX_ECHO_RE.match(bare) or bare.strip() == "---":
+            continue
+        key_match = _YAML_KEY_RE.match(bare)
+        if key_match and not bare.startswith((" ", "\t")):
+            key, value = bare.split(":", 1)
+            # Only non-empty one-line values are safe to collapse. Empty values
+            # may own the indented list/mapping that follows.
+            previous = seen_scalars.get(key) if value.strip() else None
+            if previous is not None:
+                previous_value, previous_index = previous
+                if previous_value != value:
+                    # PyYAML mapping semantics are last-value-wins. Preserve
+                    # that deterministic result without retaining duplicate keys.
+                    cleaned[previous_index] = line
+                    seen_scalars[key] = (value, previous_index)
+                continue
+            if value.strip():
+                seen_scalars[key] = (value, len(cleaned))
+        cleaned.append(line)
+
+    fm_text = "".join(cleaned)
+    if not parses_with_type(fm_text):
+        return None
+    return lines[0] + fm_text + lines[final_close] + "".join(lines[final_close + 1:])
+
+
 def repair_text(text: str) -> tuple[str | None, str]:
     """Try each repair in order; return (new_text|None, class_label)."""
+    r = repair_rss_suffix_echo(text)
+    if r is not None:
+        return r, "rss-suffix-echo"
+    # Once this distinctive corruption class is recognized, do not let a more
+    # permissive body-bleed repair truncate it after the fail-closed repair
+    # rejected conflicting duplicate fields.
+    if sum(
+        1 for line in text.splitlines() if _RSS_SUFFIX_ECHO_RE.match(line)
+    ) >= 2:
+        return None, ""
     r = repair_catn_prefix(text)
     if r is not None:
         return r, "catn-prefix"
+    r = repair_glued_close(text)
+    if r is not None:
+        return r, "glued-close"
     r = repair_body_bleed(text)
     if r is not None:
         return r, "body-bleed"
@@ -372,18 +474,12 @@ def repair_text(text: str) -> tuple[str | None, str]:
     r = repair_wikilink_flow(text)
     if r is not None:
         return r, "wikilink-flow"
-    r = repair_missing_close(text)
-    if r is not None:
-        return r, "missing-close"
     r = repair_inline_flow(text)
     if r is not None:
         return r, "inline-flow"
     r = repair_trailing_garbage(text)
     if r is not None:
         return r, "trailing-garbage"
-    r = repair_malformed_close(text)
-    if r is not None:
-        return r, "malformed-close"
     return None, ""
 
 
@@ -398,11 +494,11 @@ def _already_valid(text: str) -> bool:
         return False
     if not _FM_OPEN_RE.match(text):
         return True  # no frontmatter at all
-    m = re.match(r"\A---[ \t]*\n(.*?)\n---", text, re.S)
+    m = _FM_BLOCK_RE.match(text)
     if not m:
         return False  # opening but no close → body-bleed, needs repair
     try:
-        yaml.safe_load(m.group(1))
+        yaml.safe_load(m.group("frontmatter"))
         return True
     except Exception:
         return False
@@ -414,7 +510,7 @@ def main() -> int:
         print(json.dumps({"wakeAgent": False}))
         return 1
 
-    fixed = {"catn-prefix": 0, "body-bleed": 0, "missing-close": 0, "wikilink-flow": 0, "inline-flow": 0, "trailing-garbage": 0, "malformed-close": 0}
+    fixed = {"rss-suffix-echo": 0, "catn-prefix": 0, "glued-close": 0, "body-bleed": 0, "missing-close": 0, "wikilink-flow": 0, "inline-flow": 0, "trailing-garbage": 0, "malformed-close": 0}
     still_broken = 0
     perm_skips = 0
     print("=== repair-broken-frontmatter ===")
@@ -442,7 +538,9 @@ def main() -> int:
         print(f"  + {path.relative_to(VAULT)}: repaired ({label})")
 
     print()
-    print(f"Repaired: {fixed['catn-prefix']} catn-prefix, {fixed['body-bleed']} body-bleed, {fixed['missing-close']} missing-close, "
+    print(f"Repaired: {fixed['rss-suffix-echo']} rss-suffix-echo, "
+          f"{fixed['catn-prefix']} catn-prefix, {fixed['glued-close']} glued-close, "
+          f"{fixed['body-bleed']} body-bleed, {fixed['missing-close']} missing-close, "
           f"{fixed['wikilink-flow']} wikilink-flow, {fixed['inline-flow']} inline-flow, "
           f"{fixed['trailing-garbage']} trailing-garbage, {fixed['malformed-close']} malformed-close.")
     print(f"Still broken (need manual/agent repair): {still_broken}.")

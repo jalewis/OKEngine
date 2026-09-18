@@ -87,3 +87,29 @@ def test_broken_target_linked_from_both_counts_as_real(tmp_path):
     q = _load(tmp_path).scan_queues()
     assert q["broken-wikilinks"] == 1
     assert q["reference-broken-wikilinks"] == 0
+
+
+def test_generated_surfaces_templates_and_qualification_links_do_not_create_debt(tmp_path):
+    (tmp_path / "schema.yaml").write_text("types: {}\n")
+    _page(
+        tmp_path, "dashboards/control.md", {"type": "dashboard"},
+        "See [[entities/dashboard-only-missing]].\n",
+    )
+    _page(
+        tmp_path, "operational/control.md", {"type": "dashboard"},
+        "See [[entities/operational-only-missing]].\n",
+    )
+    _page(
+        tmp_path, "entities/real.md", {"type": "entity"},
+        "Template [[sources/<stem>]], controlled "
+        "[[concepts/q/w/qwen-final-local-backfill-control-g1]], "
+        "and real [[entities/actionable-missing]].\n",
+    )
+
+    details = {}
+    q = _load(tmp_path).scan_queues(details)
+
+    assert q["broken-wikilinks"] == 1
+    assert details["broken-wikilinks"]["top_missing"] == [
+        {"target": "entities/actionable-missing", "inbound": 1}
+    ]

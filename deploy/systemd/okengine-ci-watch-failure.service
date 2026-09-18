@@ -1,0 +1,6 @@
+[Unit]
+Description=Log when the OKEngine CI watcher process fails
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/logger --tag okengine-ci-watch "Watcher process failed; inspect the user journal."

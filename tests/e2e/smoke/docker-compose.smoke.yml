@@ -1,31 +1,47 @@
-# Barebones smoke stack — the three READ/RENDER surfaces (reader, cockpit, mcp) over a frozen
-# seeded vault. Deliberately NO gateway/Hermes/model: these surfaces are standalone read-only over
-# the vault (`./vault:ro`), so the smoke run needs no API keys, no feeds, and is fully deterministic.
+# Production-like release stack — read/render surfaces plus the narrow review-only write surface
+# over a disposable copy of the frozen seed. Deliberately no gateway/model: the workflows are
+# deterministic and require no external credentials.
 # Ports bind to loopback only. Brought up + torn down by smoke-e2e.sh.
 name: okengine-smoke
 
 services:
   reader:
-    build: ../../../okengine-reader
+    build:
+      context: ../../../
+      dockerfile: okengine-reader/Dockerfile
+      args:
+        PYTHON_BASE_IMAGE: ${OKENGINE_PYTHON_BASE_IMAGE:-python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f}
     image: okengine-reader
     container_name: okengine-smoke-reader
     restart: "no"
+    pids_limit: 256
+    cpus: 1.0
+    mem_limit: 512m
+    memswap_limit: 512m
     ports: ["127.0.0.1:9880:9200"]
     environment:
       - OKENGINE_TRUST=public
       - OKENGINE_BIND=127.0.0.1
-    volumes: ["./vault:/vault:ro"]
+    volumes: ["${SMOKE_VAULT:-./vault}:/vault:ro"]
     deploy:
       resources:
-        limits: {cpus: "1.0", memory: 512M}
+        limits: {cpus: "1.0", memory: 512M, pids: 256}
 
   okengine-mcp:
     build:
       context: ../../../
       dockerfile: okengine-mcp/Dockerfile
+      args:
+        PYTHON_BASE_IMAGE: ${OKENGINE_PYTHON_BASE_IMAGE:-python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f}
+        NODE_BASE_IMAGE: ${OKENGINE_NODE_BASE_IMAGE:-node@sha256:4d676821dff059fd00d277ee4261ef34ea712317fed0737c03941481b5760c96}
     image: okengine-mcp
     container_name: okengine-smoke-mcp
     restart: "no"
+    user: "${SMOKE_UID:-1000}:${SMOKE_GID:-1000}"
+    pids_limit: 256
+    cpus: 1.0
+    mem_limit: 1g
+    memswap_limit: 1g
     ports: ["127.0.0.1:8880:8730"]
     environment:
       - WIKI_PATH=/opt/vault
@@ -38,17 +54,26 @@ services:
       # explicitly; without this the B7.6 MCP smoke check hits connection-refused (invariant-audit).
       - OKENGINE_MCP_ALLOW_DEFAULT_TOKEN=1
     volumes:
-      - ./vault:/opt/vault:ro
-      - smoke-qmd:/opt/data/qmd
+      - ${SMOKE_VAULT:-./vault}:/opt/vault:ro
+      - ${SMOKE_QMD:-./qmd}:/opt/data/qmd
     deploy:
       resources:
-        limits: {cpus: "1.0", memory: 1G}
+        limits: {cpus: "1.0", memory: 1G, pids: 256}
 
   cockpit:
-    build: ../../../okengine-cockpit
+    build:
+      context: ../../../
+      dockerfile: okengine-cockpit/Dockerfile
+      args:
+        PYTHON_BASE_IMAGE: ${OKENGINE_PYTHON_BASE_IMAGE:-python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f}
+        NODE_BASE_IMAGE: ${OKENGINE_NODE_BASE_IMAGE:-node@sha256:4d676821dff059fd00d277ee4261ef34ea712317fed0737c03941481b5760c96}
     image: okengine-cockpit
     container_name: okengine-smoke-cockpit
     restart: "no"
+    pids_limit: 256
+    cpus: 1.5
+    mem_limit: 1g
+    memswap_limit: 1g
     ports: ["127.0.0.1:9881:9200"]
     environment:
       - VAULT_DIR=/vault
@@ -59,10 +84,57 @@ services:
       - HOME=/tmp/cockpit-home
       - TMPDIR=/tmp
       - XDG_CACHE_HOME=/tmp/cockpit-cache
-    volumes: ["./vault:/vault:ro"]
+    volumes: ["${SMOKE_VAULT:-./vault}:/vault:ro"]
     deploy:
       resources:
-        limits: {cpus: "1.5", memory: 1G}
+        limits: {cpus: "1.5", memory: 1G, pids: 256}
 
-volumes:
-  smoke-qmd:
+  review-write:
+    build:
+      context: ../../../
+      dockerfile: okengine-mcp/Dockerfile.review
+      args:
+        PYTHON_BASE_IMAGE: ${OKENGINE_PYTHON_BASE_IMAGE:-python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f}
+    image: okengine-review-write
+    container_name: okengine-smoke-review-write
+    restart: "no"
+    user: "${SMOKE_UID:-1000}:${SMOKE_GID:-1000}"
+    pids_limit: 128
+    cpus: 1.0
+    mem_limit: 512m
+    memswap_limit: 512m
+    ports: ["127.0.0.1:8881:8731"]
+    environment:
+      - WIKI_PATH=/opt/vault
+      - OKENGINE_WRITE_TRANSPORT=http
+      - OKENGINE_WRITE_REVIEW_ONLY=1
+      - OKENGINE_WRITE_HOST=0.0.0.0
+      - OKENGINE_WRITE_PORT=8731
+      - OKENGINE_WRITE_TOKEN=okengine-smoke-review-secret
+    volumes: ["${SMOKE_VAULT:-./vault}:/opt/vault"]
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: 512M, pids: 128}
+
+  responses-gateway:
+    build:
+      context: ../../../
+      dockerfile: tests/e2e/smoke/Dockerfile.fault-gateway
+      args:
+        PYTHON_BASE_IMAGE: ${OKENGINE_PYTHON_BASE_IMAGE:-python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f}
+    image: okengine-fault-gateway
+    container_name: okengine-smoke-responses-gateway
+    restart: "no"
+    # The performance lane creates 100 simultaneous virtual users.  ThreadingHTTPServer uses one
+    # thread per in-flight request, so the harness needs room for all users plus its main thread;
+    # keep it bounded, but do not turn a 64-PID test-fixture ceiling into a false product timeout.
+    pids_limit: 128
+    cpus: 0.5
+    mem_limit: 128m
+    memswap_limit: 128m
+    ports: ["127.0.0.1:8882:8080"]
+    tmpfs:
+      - /fault-disk:size=64k,mode=1777
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 128M, pids: 128}

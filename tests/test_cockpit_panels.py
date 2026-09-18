@@ -81,11 +81,34 @@ def test_load_dir_cold_miss_scans_synchronously(tmp_path, monkeypatch):
     assert m._load_dir("adhoc") == [{"_name": "x"}]
 
 
+def test_frontmatter_hot_path_uses_accelerated_safe_loader(tmp_path, monkeypatch):
+    """Landing readiness parses every row in its configured namespaces. Pin the libyaml-backed
+    loader selection so that scan cannot silently regress to PyYAML's several-times-slower
+    pure-Python ``safe_load`` path."""
+    m = _load(tmp_path, monkeypatch)
+    calls = []
+    real_load = m.yaml.load
+
+    def tracked(text, *, Loader):
+        calls.append(Loader)
+        return real_load(text, Loader=Loader)
+
+    monkeypatch.setattr(m.yaml, "load", tracked)
+    fm, body = m.split_fm("---\ntype: actor\naliases: [Alpha]\n---\n# Body\n")
+
+    assert fm == {"type": "actor", "aliases": ["Alpha"]}
+    assert body == "# Body\n"
+    assert calls == [m._FAST_YAML_LOADER]
+    if hasattr(m.yaml, "CSafeLoader"):
+        assert m._FAST_YAML_LOADER is m.yaml.CSafeLoader
+
+
 def test_warm_tab_datasets_prepopulates_configured_dirs(tmp_path, monkeypatch):
     """The startup warmer must pre-scan every namespace the tabs/streams read, so the first tab
     request is already warm."""
     (tmp_path / "schema.yaml").write_text(
         "cockpit:\n"
+        "  tabs: [overview]\n"
         "  tab_defs:\n"
         "    overview:\n"
         "      label: Overview\n"
@@ -120,6 +143,93 @@ def test_initial_warmer_scans_only_landing_tab(tmp_path, monkeypatch):
     m._warm_initial_tab_datasets()
     assert set(scanned) == {"entities", "dashboards"}
     assert "assessments" not in scanned
+
+
+def test_dataset_warm_order_follows_tabs_then_streams_without_duplicates(tmp_path, monkeypatch):
+    (tmp_path / "schema.yaml").write_text(
+        "cockpit:\n  tabs: [overview, adversaries, assessments]\n  tab_defs:\n"
+        "    overview:\n      boxes:\n"
+        "        - {title: Overview actors, dataset: {dir: entities}}\n"
+        "    adversaries:\n      boxes:\n"
+        "        - {title: Actors, dataset: {dir: entities}}\n"
+        "        - {title: Reports, dataset: {dir: sources}}\n"
+        "    assessments:\n      boxes:\n"
+        "        - {title: Assessments, dataset: {dir: assessments}}\n"
+        "  streams:\n"
+        "    - {key: briefs, label: Briefs, dir: briefings}\n",
+        encoding="utf-8",
+    )
+    m = _load(tmp_path, monkeypatch)
+    assert m._configured_dataset_dirs(landing_only=True) == ["entities"]
+    assert m._configured_dataset_dirs() == ["entities", "sources", "assessments", "briefings"]
+
+
+def test_remaining_warmer_is_serial_skips_landing_and_yields_to_active_requests(
+        tmp_path, monkeypatch):
+    (tmp_path / "schema.yaml").write_text(
+        "cockpit:\n  tabs: [overview, adversaries, assessments]\n  tab_defs:\n"
+        "    overview:\n      boxes:\n"
+        "        - {title: Overview, dataset: {dir: entities}}\n"
+        "    adversaries:\n      boxes:\n"
+        "        - {title: Sources, dataset: {dir: sources}}\n"
+        "    assessments:\n      boxes:\n"
+        "        - {title: Assessments, dataset: {dir: assessments}}\n",
+        encoding="utf-8",
+    )
+    m = _load(tmp_path, monkeypatch)
+    m._DIR_CACHE.clear()
+    m._DIR_CACHE["entities"] = (time.monotonic(), [{"_name": "landing"}])
+    pressure = iter([True, False, False])
+    monkeypatch.setattr(m, "_requests_active", lambda: next(pressure, False))
+    events = []
+    monkeypatch.setattr(m.time, "sleep", lambda seconds: events.append(("sleep", seconds)))
+    monkeypatch.setattr(
+        m, "_scan_dir_meta",
+        lambda sub: events.append(("scan", sub)) or [{"_name": sub}],
+    )
+    m._POST_READY_WARM_GAP = 0
+
+    m._warm_remaining_tab_datasets()
+
+    assert events == [
+        ("sleep", m._POST_READY_IDLE_POLL),
+        ("scan", "sources"),
+        ("scan", "assessments"),
+        ("scan", "briefings"),
+    ]
+    assert m._DIR_CACHE["entities"][1] == [{"_name": "landing"}]
+    assert m._DIR_CACHE["sources"][1] == [{"_name": "sources"}]
+    assert m._DIR_CACHE["assessments"][1] == [{"_name": "assessments"}]
+    assert m._DIR_CACHE["briefings"][1] == [{"_name": "briefings"}]
+
+
+def test_post_ready_scheduler_is_delayed_and_idempotent(tmp_path, monkeypatch):
+    m = _load(tmp_path, monkeypatch)
+    events = []
+
+    class ImmediateThread:
+        def __init__(self, *, target, name, daemon):
+            events.append(("thread", name, daemon))
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(m.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(m.time, "sleep", lambda seconds: events.append(("sleep", seconds)))
+    monkeypatch.setattr(m, "_warm_remaining_tab_datasets", lambda: events.append(("warm",)))
+    m._POST_READY_WARM_DELAY = 0.5
+    if hasattr(m._schedule_remaining_tab_warmup, "_started"):
+        delattr(m._schedule_remaining_tab_warmup, "_started")
+
+    m._schedule_remaining_tab_warmup()
+    m._schedule_remaining_tab_warmup()
+
+    assert events == [
+        ("thread", "cockpit-tab-warmer", True),
+        ("sleep", 0.5),
+        ("warm",),
+    ]
 
 
 def test_ds_sorted_date_fields_honor_direction(tmp_path, monkeypatch):
@@ -238,6 +348,17 @@ def test_prediction_files_recurse_into_dated_partition(tmp_path, monkeypatch):
     assert any(r.get("subject") == "X pattern expands" for r in rows), f"not loaded: {rows}"
 
 
+def test_prediction_loader_accepts_schema_type_case_variants(tmp_path, monkeypatch):
+    pred = tmp_path / "wiki" / "predictions"
+    pred.mkdir(parents=True)
+    (pred / "predict-case.md").write_text(
+        "---\ntype: Prediction\nsubject: Case-safe forecast\nstatus: open\n---\nbody\n",
+        encoding="utf-8",
+    )
+    m = _load(tmp_path, monkeypatch)
+    assert [row["subject"] for row in m._load_predictions()] == ["Case-safe forecast"]
+
+
 def test_prediction_detail_resolves_nested_partition(tmp_path, monkeypatch):
     """UI feedback #1: prediction rows are discovered recursively (predictions/YYYY/qN/…), but the
     detail endpoint looked up a FLAT predictions/<id>.md — so a partitioned prediction appeared in
@@ -248,9 +369,27 @@ def test_prediction_detail_resolves_nested_partition(tmp_path, monkeypatch):
         "---\ntype: prediction\nstatus: open\nconfidence: 0.6\nsubject: Widgets\n"
         "resolves_by: 2026-12-31\n---\nWidgets will ship.\n", encoding="utf-8")
     m = _load(tmp_path, monkeypatch)
-    d = m.api_prediction(id="predict-widget-adoption")           # nested id, no slash
-    assert d["id"] == "predict-widget-adoption"
+    d = m.api_prediction(id="predictions/2026/q3/predict-widget-adoption")
+    assert d["id"] == "predictions/2026/q3/predict-widget-adoption"
     assert "Widgets" in (d.get("claim") or "") or d["fm"].get("subject") == "Widgets"
+
+
+def test_prediction_identity_is_partition_qualified(tmp_path, monkeypatch):
+    base = tmp_path / "wiki" / "predictions" / "2026"
+    for quarter, subject in (("q1", "Alpha"), ("q2", "Beta")):
+        d = base / quarter
+        d.mkdir(parents=True)
+        (d / "same.md").write_text(
+            f"---\ntype: prediction\nstatus: open\nsubject: {subject}\n---\n{subject} claim\n",
+            encoding="utf-8",
+        )
+    m = _load(tmp_path, monkeypatch)
+    rows = m._load_predictions()
+    assert {r["id"] for r in rows} == {
+        "predictions/2026/q1/same", "predictions/2026/q2/same",
+    }
+    assert m.api_prediction(id="predictions/2026/q1/same")["fm"]["subject"] == "Alpha"
+    assert m.api_prediction(id="predictions/2026/q2/same")["fm"]["subject"] == "Beta"
 
 
 def test_dashboard_autolist_includes_nested_namespaces(tmp_path, monkeypatch):
@@ -349,11 +488,11 @@ def test_prediction_evidence_drilldown_and_string_tally(tmp_path, monkeypatch):
         "  - {date: 2026-07-01, direction: contradicts, note: Countersignal}\n"
         "---\nAlpha will happen.\n", encoding="utf-8")
     m = _load(tmp_path, monkeypatch)
-    r = next(x for x in m._load_predictions() if x["id"] == "predict-alpha")
+    r = next(x for x in m._load_predictions() if x["id"].endswith("/predict-alpha"))
     assert r["evidence_n"] == 2                       # string entry counted, not zero
     assert r["ev_dir"]["contradicts"] == 1
     assert r["idle"] is False                         # evidenced -> not idle despite old made_on
-    d = m.api_prediction(id="predict-alpha")
+    d = m.api_prediction(id="predictions/2026/q4/predict-alpha")
     assert len(d["evidence"]) == 2
     assert d["evidence"][0]["note"].startswith("Vendor report")   # sorted oldest-first
 
@@ -383,6 +522,98 @@ def test_ops_tab_surfaces_operational_health_pages(tmp_path, monkeypatch):
     assert "operational/lint-watch-2026-07-06" not in by["Operational log"]
     assert "operational/lint-watch-2026-07-07" not in by["Operational log"]
     assert "ops" in m.api_config()["tabs"]                                  # auto-appended
+
+
+def test_ops_summary_leads_with_exceptions_and_distinguishes_missing(tmp_path, monkeypatch):
+    w = tmp_path / "wiki"
+    (w / "dashboards").mkdir(parents=True)
+    (w / "operational").mkdir(parents=True)
+    (w / "dashboards" / "fleet-health.md").write_text(
+        "---\ntitle: Fleet health\n---\n**attention needed**\n"
+        "- ok: 94 · stale: 0 · errored: 1 · off-model: 0 · never-run: 2\n", encoding="utf-8")
+    (w / "operational" / "deployment-validation.md").write_text(
+        "---\ntitle: Deployment validation\n---\n**FAIL** — 1 fail · 3 warn\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    summary = m.api_ops()["summary"]
+    assert summary["state"] == "critical"
+    by = {x["label"]: x for x in summary["metrics"]}
+    assert by["errored"]["value"] == 1 and by["errored"]["path"] == "dashboards/fleet-health"
+    assert by["validation failures"]["value"] == 1
+
+    (w / "operational" / "deployment-validation.md").unlink()
+    summary = m._ops_summary()
+    by = {x["label"]: x for x in summary["metrics"]}
+    assert by["deployment validation"]["value"] == "missing"
+
+
+def test_ops_summary_treats_stale_as_warning_not_critical(tmp_path, monkeypatch):
+    w = tmp_path / "wiki"
+    (w / "dashboards").mkdir(parents=True)
+    (w / "operational").mkdir(parents=True)
+    (w / "dashboards" / "fleet-health.md").write_text(
+        "---\ntitle: Fleet health\n---\n"
+        "- ok: 94 · stale: 1 · critical-stale: 0 · errored: 0 "
+        "· off-model: 0 · never-run: 0\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    summary = m._ops_summary()
+    assert summary["state"] == "warning"
+    by = {x["label"]: x for x in summary["metrics"]}
+    assert by["stale"]["tone"] == "warn"
+
+
+def test_ops_reports_backlog_ingest_and_artifact_freshness(tmp_path, monkeypatch):
+    today = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).date()
+    w = tmp_path / "wiki"
+    (w / "dashboards").mkdir(parents=True)
+    (w / "sources").mkdir(parents=True)
+    (w / "dashboards" / "fleet-health.md").write_text(
+        f"---\ntitle: Fleet\nupdated: {today.isoformat()}\n---\n- ok: 1 · stale: 0 · errored: 0 · off-model: 0 · never-run: 0\n",
+        encoding="utf-8")
+    (w / "_review-queue.md").write_text(
+        "---\ntitle: Review\n---\n# Queue\n\n- one\n- [ ] two\n", encoding="utf-8")
+    (w / "sources" / "s1.md").write_text(
+        f"---\ntype: source\ntitle: Latest\ncreated: {today.isoformat()}T10:00:00Z\n---\nbody\n",
+        encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    out = m.api_ops()
+    by = {x["label"]: x for x in out["summary"]["metrics"]}
+    assert by["review backlog"]["value"] == 2 and by["review backlog"]["path"] == "_review-queue"
+    assert by["latest ingest"]["value"] == today.isoformat() and by["latest ingest"]["path"] == "sources/s1"
+    fleet = next(i for g in out["groups"] for i in g["items"] if i["path"] == "dashboards/fleet-health")
+    assert fleet["freshness"] == "current" and fleet["age_days"] == 0
+
+
+def test_ops_healthy_warning_and_stale_states(tmp_path, monkeypatch):
+    import datetime
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    old = today - datetime.timedelta(days=7)
+    w = tmp_path / "wiki"
+    (w / "dashboards").mkdir(parents=True)
+    (w / "operational").mkdir(parents=True)
+    (w / "sources").mkdir(parents=True)
+    fleet = w / "dashboards" / "fleet-health.md"
+    fleet.write_text(f"---\ntitle: Fleet\nupdated: {today}\n---\n"
+                     "- ok: 1 · stale: 0 · errored: 0 · off-model: 0 · never-run: 0\n",
+                     encoding="utf-8")
+    (w / "operational" / "deployment-validation.md").write_text(
+        f"---\ntitle: Validation\nupdated: {today}\n---\n**PASS** — 0 fail · 0 warn\n",
+        encoding="utf-8")
+    (w / "sources" / "s.md").write_text(
+        f"---\ntype: source\ntitle: S\ncreated: {today}T01:00:00Z\n---\nbody\n",
+        encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    assert m._ops_summary()["state"] == "ok"
+
+    (w / "_review-queue.md").write_text("---\ntitle: Queue\n---\n- pending\n", encoding="utf-8")
+    assert m._ops_summary()["state"] == "warning"
+
+    fleet.write_text(f"---\ntitle: Fleet\nupdated: {old}\n---\n"
+                     "- ok: 1 · stale: 0 · errored: 0 · off-model: 0 · never-run: 0\n",
+                     encoding="utf-8")
+    summary = m._ops_summary()
+    assert summary["state"] == "critical"
+    assert next(x for x in summary["metrics"] if x["label"] == "stale artifacts")["path"] == \
+        "dashboards/fleet-health"
 
 
 def test_page_overlay_surfaces_facts_conflicts_and_observations(tmp_path, monkeypatch):
@@ -434,6 +665,32 @@ def test_page_overlay_surfaces_facts_conflicts_and_observations(tmp_path, monkey
     assert d["observations"] and d["observations"][0]["source"] == "Vendor A"
 
 
+def test_cockpit_conflict_reliability_matches_reader_unknown_grade_semantics(
+    tmp_path, monkeypatch
+):
+    m = _load(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        m, "_source_reliability",
+        lambda: {"bogus": "Bogus", "unrated": "", "combined": "F6", "strong": "A"},
+    )
+    values = m._shape_conflicts({
+        "conflicts": [{"field": "claim", "headline": "strong", "values": [
+            {"value": "bogus", "sources": ["bogus"]},
+            {"value": "unrated", "sources": ["unrated"]},
+            {"value": "combined", "sources": ["combined"]},
+            {"value": "strong", "sources": ["strong"]},
+        ]}]
+    })[0]["values"]
+    assert values[0]["rank"] == -1 and values[0]["reliability_oov"] is True
+    assert values[1]["rank_known"] is False and values[1]["reliability_oov"] is False
+    assert values[2]["rank_known"] is True and values[2]["reliability_oov"] is False
+    assert values[3]["rank"] == 5
+
+    app_js = (REPO / "okengine-cockpit/static/app.js").read_text(encoding="utf-8")
+    assert 'el.dataset.rankKnown === "true"' in app_js
+    assert 'el.dataset.reliabilityOov !== "true"' in app_js
+
+
 def test_box_engine_missing_filter_and_list_group_by(tmp_path, monkeypatch):
     """Engine box capability for work-surface tabs: a `missing:` dataset filter selects field-ABSENT
     pages (e.g. unsourced actors), and group_by EXPLODES list fields (an actor targeting
@@ -452,6 +709,42 @@ def test_box_engine_missing_filter_and_list_group_by(tmp_path, monkeypatch):
     assert counts == {"gov": 1, "finance": 2}                        # list field exploded per element
     assert m._gb_values(["gov", "finance"]) == ["gov", "finance"] and m._gb_values("KP") == ["KP"]
     assert m._gb_values(None) == []
+
+
+def test_actor_dataset_quarantines_terminalfix_variant(tmp_path, monkeypatch):
+    ent = tmp_path / "wiki" / "entities" / "t"
+    ent.mkdir(parents=True)
+    (ent / "terminalfix.md").write_text(
+        "---\ntype: actor\ntitle: TerminalFix\nactor_type: cybercriminal\nrecent_news: 4\n---\n"
+        "A new ClickFix variant, dubbed TerminalFix, tricks users into running commands.\n",
+        encoding="utf-8",
+    )
+    (ent / "shinyhunters.md").write_text(
+        "---\ntype: actor\ntitle: ShinyHunters\nactor_identity_validated: true\n---\n"
+        "ShinyHunters is a cybercriminal group.\n",
+        encoding="utf-8",
+    )
+    m = _load(tmp_path, monkeypatch)
+    rows = m._ds_rows({"dir": "entities", "type": "actor"})
+    assert [row["title"] for row in rows] == ["ShinyHunters"]
+
+
+def test_actor_dataset_quarantines_affected_software_product(tmp_path, monkeypatch):
+    ent = tmp_path / "wiki" / "entities" / "j"
+    ent.mkdir(parents=True)
+    (ent / "artifactory.md").write_text(
+        "---\ntype: actor\ntitle: JFrog Artifactory\nactor_type: cybercriminal\n---\n"
+        "Threat actors are exploiting a critical flaw impacting JFrog Artifactory.\n",
+        encoding="utf-8",
+    )
+    (ent / "teampcp.md").write_text(
+        "---\ntype: actor\ntitle: TeamPCP\n---\n"
+        "TeamPCP is a cybercriminal group exploiting a vulnerability in JFrog Artifactory.\n",
+        encoding="utf-8",
+    )
+    m = _load(tmp_path, monkeypatch)
+    rows = m._ds_rows({"dir": "entities", "type": "actor"})
+    assert [row["title"] for row in rows] == ["TeamPCP"]
 
 
 def test_evidence_section_grades_and_dates_citations(tmp_path, monkeypatch):
@@ -711,7 +1004,8 @@ def test_backtick_wrapped_wikilink_renders_as_link_not_escaped_html(tmp_path, mo
     the backticks so it becomes a real link. Regression: HTML anchor tags shown as literal text."""
     m = _load(tmp_path, monkeypatch)
     html = m.render_md("The 14 pages linking to `[[concepts/supply-chain-attacks]]` document a surface.")
-    assert '<a class="wl" data-page="concepts/supply-chain-attacks">' in html   # a real link
+    # prefix match: the sanitizer (okengine#659) stamps rel="noopener noreferrer" on anchors
+    assert '<a class="wl" data-page="concepts/supply-chain-attacks"' in html    # a real link
     assert "&lt;a class" not in html and "<code>" not in html                   # not escaped code
     # a genuine code span that isn't a bare wikilink is left alone
     assert "<code>" in m.render_md("call `build(force=True)` to rescan.")
@@ -970,8 +1264,72 @@ def test_operation_control_requires_plan_and_uses_generic_operation_name(tmp_pat
     assert "Review every canonical actor" in html
 
 
+def test_panel_boundary_helpers_fail_closed_without_crashing(tmp_path, monkeypatch):
+    (tmp_path / "wiki").mkdir()
+    m = _load(tmp_path, monkeypatch)
+
+    assert "Alpha, Beta" in m._ds_cell(
+        {"tags": ["a", "b"]}, {"field": "tags", "labels": {"a": "Alpha", "b": "Beta"}}
+    )
+    assert m._drill_attrs(None) == ("", "")
+    assert m._v_bars({}, []) == ""
+    assert m._v_bignums({"items": ["bad"]}, []) == ""
+    assert "dmini" not in m._v_cards({}, [{"title": "bad series", "count_by_year": {"x": "bad"}}])
+    assert m._v_coverage({}, []) == ""
+    assert m._latest_doc({"dir": "briefings"}) is None
+    assert m._v_doc({"dir": "briefings"}) == ("", "")
+    assert m._v_doc_summary({"dir": "briefings"}) == ("", "")
+    assert "Invalid operation configuration" in m._v_operation_control({"operation": "!"})
+    assert "Invalid operation arguments" in m._v_operation_control(
+        {"operation": "valid-operation", "arguments": [1]}
+    )
+    assert m._markdown_section("# Heading\nBody", "") == ""
+    assert m._markdown_sections("plain text") == ""
+    assert m._markdown_sections("# Title\nIntro\n## First\nA\n## Second\nB", 1) == "## First\nA"
+
+    monkeypatch.setattr(m, "_ds_rows", lambda _versus: [{"id": "x", "group": None}])
+    assert m._v_coverage({
+        "list_field": "covers", "versus": {"key": "id", "group_by": "group"}
+    }, [{"covers": ["x"]}]) == ""
+
+
 def test_operation_control_client_plans_before_starting():
     js = (REPO / "okengine-cockpit/static/app.js").read_text(encoding="utf-8")
     assert "planOperation(panel)" in js and "startOperation(panel)" in js
     assert js.index("panel.dataset.planDigest") < js.index("confirm(`Start ${name}")
     assert '"X-OKEngine-Operation":"1"' in js
+
+
+def test_drill_client_renders_optional_semantic_sections():
+    js = (REPO / "okengine-cockpit/static/app.js").read_text(encoding="utf-8")
+    css = (REPO / "okengine-cockpit/static/style.css").read_text(encoding="utf-8")
+    assert "Array.isArray(d.sections)" in js
+    assert 'class="drill-section"' in js
+    assert "d.count_label" in js
+    assert ".drill-section h3" in css
+
+
+def test_drill_client_renders_context_filter_and_record_actions():
+    js = (REPO / "okengine-cockpit" / "static" / "app.js").read_text(encoding="utf-8")
+    css = (REPO / "okengine-cockpit" / "static" / "style.css").read_text(encoding="utf-8")
+    assert "Array.isArray(p.facts)" in js
+    assert 'class="dresult-summary"' in js
+    assert 'data-drill-filter' in js
+    assert 'data-drill-visible' in js
+    assert 'data-copy-path' in js
+    assert ".dresult-facts" in css
+    assert ".drill-tools" in css
+
+
+def test_prediction_confidence_accepts_the_full_sanctioned_scale(tmp_path, monkeypatch):
+    app = _load(tmp_path, monkeypatch)
+    expected = {
+        "very-low": 0.1, "low": 0.25, "medium-low": 0.375, "medium": 0.5,
+        "medium-high": 0.625, "high": 0.75, "very-high": 0.9,
+    }
+    assert {label: app._conf({"confidence": label}) for label in expected} == expected
+
+    monkeypatch.setenv("PREDICTION_CONFIDENCE_SCALE", '{"High": 0.81}')
+    assert app._conf({"confidence": "HIGH"}) == 0.81
+    monkeypatch.setenv("PREDICTION_CONFIDENCE_SCALE", "not-json")
+    assert app._conf({"confidence": "high"}) == expected["high"]

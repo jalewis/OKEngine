@@ -15,7 +15,7 @@ usage: new-pack.sh <pack-name> [title] [options]
 
 options:
   --offset N         host-port offset (reader=9200+N, mcp=8730+N)   [default 0]
-  --engine TAG       engine pin                                     [default v0.2.0]
+  --engine TAG       engine pin                                     [default: engine-manifest engine_release]
   --hermes-pin TAG   Hermes runtime pin (engine.version)            [default: engine-manifest pinned_tag]
   --owner NAME       GitHub owner for the README CI badge           [default REPLACE_OWNER]
   --license NAME     LICENSE to ship: apache-2.0 | none             [default apache-2.0]
@@ -47,16 +47,35 @@ TITLE="${POSITIONAL[1]:-}"
 
 # Default engine.version to the release THIS scaffold ships with (engine-manifest.yaml), not a
 # hardcoded pin that silently drifts as the engine bumps (okengine invariant-audit). --engine wins.
+manifest_scalar() {
+  local key="$1" manifest="$SCRIPT_DIR/../../engine-manifest.yaml" values value
+  [ -f "$manifest" ] || return 1
+  values="$(awk -v key="$key" '
+    $0 ~ "^[[:space:]]*" key ":[[:space:]]*" {
+      value=$0; sub("^[[:space:]]*" key ":[[:space:]]*", "", value)
+      sub(/[[:space:]]+#.*/, "", value); gsub(/^[[:space:]\047\"]+|[[:space:]\047\"]+$/, "", value)
+      if (value != "") print value
+    }
+  ' "$manifest")"
+  [ "$(printf '%s\n' "$values" | sed '/^$/d' | wc -l)" -eq 1 ] || return 1
+  value="$(printf '%s\n' "$values" | sed '/^$/d')"
+  [[ "$value" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([._+-][A-Za-z0-9.-]+)?$ ]] || return 1
+  printf '%s\n' "$value"
+}
 if [ -z "$ENGINE" ]; then
-  ENGINE="$( (cd "$(dirname "$0")/../.." 2>/dev/null && grep -E '^engine_release:' engine-manifest.yaml 2>/dev/null | awk '{print $2}') )"
-  ENGINE="${ENGINE:-v0.2.0}"
+  if ! ENGINE="$(manifest_scalar engine_release)"; then
+    echo "error: engine-manifest.yaml must contain exactly one valid engine_release — pass --engine" >&2
+    exit 1
+  fi
 fi
 # Same for the Hermes pin: read engine-manifest.yaml runtime.pinned_tag, NOT a hardcoded literal that
 # rots on the next Hermes bump (the sibling literal one line away was left behind — invariant-audit
 # #5/#43). --hermes-pin wins. Fail loud rather than stamp a guessed pin if the manifest is unreadable.
 if [ -z "$HERMES_PIN" ]; then
-  HERMES_PIN="$( (cd "$(dirname "$0")/../.." 2>/dev/null && grep -E '^[[:space:]]*pinned_tag:' engine-manifest.yaml 2>/dev/null | awk '{print $2}' | head -1) )"
-  [ -n "$HERMES_PIN" ] || { echo "error: could not read runtime.pinned_tag from engine-manifest.yaml — pass --hermes-pin" >&2; exit 1; }
+  if ! HERMES_PIN="$(manifest_scalar pinned_tag)"; then
+    echo "error: engine-manifest.yaml must contain exactly one valid runtime.pinned_tag — pass --hermes-pin" >&2
+    exit 1
+  fi
 fi
 
 [ -d "$SKELETON" ] || { echo "error: skeleton/ not found next to this script" >&2; exit 1; }

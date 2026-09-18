@@ -50,6 +50,12 @@ def _load():
     return m
 
 
+@pytest.fixture(scope="module")
+def pure_write_server():
+    """Load the large write boundary outside individual pure-helper call budgets."""
+    return _load()
+
+
 @pytest.fixture
 def vault(tmp_path, monkeypatch):
     """A temp vault with wiki/ and a governing schema.yaml so the validator fires.
@@ -92,6 +98,56 @@ def _enable_source_contract(root: Path, monkeypatch, *, mode="enforce", operatio
     monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", mode)
 
 
+def _enable_lacuna_contract(root: Path, monkeypatch):
+    schema = _SCHEMA.replace("  source:\n", """  lacuna:
+    required: [type, field_mapped, hidden_axis, force, fill]
+    optional: [confidence, needs_review, fill_trigger, prediction_candidate]
+  prediction:
+    required: [type, made_on, resolves_by, horizon, confidence, status, subject]
+  source:
+""", 1)
+    schema += """type_namespaces:
+  lacuna: lacuna
+  prediction: predictions
+partitioning:
+  namespaces:
+    lacuna: {}
+    predictions: {}
+"""
+    (root / "schema.yaml").write_text(schema, encoding="utf-8")
+    contract = {
+        "api": 1, "allowed_namespaces": ["lacuna", "predictions"],
+        "allowed_types": ["lacuna", "prediction"], "operations": ["create", "update"],
+        "required_fields": ["type"], "required_relationships": [],
+        "optional_relationships": ["prediction_candidate"],
+        "body": {"required": True, "min_non_whitespace": 80},
+        "unknown_fields": "reject", "unresolved_links": "review",
+        "placeholder_links": "reject", "completion": "run",
+    }
+    raw = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    digest = "sha256:" + hashlib.sha256(raw.encode()).hexdigest()
+    (root / "jobs.json").write_text(json.dumps({"jobs": [{
+        "name": "okengine.lacuna", "output_contract": contract,
+        "output_contract_digest": digest,
+    }]}), encoding="utf-8")
+    monkeypatch.setenv("OKENGINE_CRON_JOBS", str(root / "jobs.json"))
+    monkeypatch.setenv("OKENGINE_WRITE_ACTOR", "cron:okengine.lacuna")
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "enforce")
+
+
+def _lacuna_frontmatter():
+    return {
+        "type": "lacuna", "field_mapped": "concepts/a/g/agentic-ai-security",
+        "hidden_axis": "operator control", "force": "no shared measurement boundary",
+        "fill": "independent runtime containment", "confidence": "medium",
+        "needs_review": True,
+    }
+
+
+def _lacuna_body():
+    return "# Review-required gap\n\n" + ("A structural inference from the concept graph. " * 6)
+
+
 def test_output_contract_rejects_qilin_class_atomically(vault, monkeypatch):
     m, root = vault
     _enable_source_contract(root, monkeypatch)
@@ -106,12 +162,220 @@ def test_output_contract_rejects_qilin_class_atomically(vault, monkeypatch):
     assert not target.exists()
 
 
-def test_contract_only_lane_does_not_require_duplicate_policy_capability(vault, monkeypatch):
+def test_rejected_prediction_cannot_leave_a_dangling_lacuna_link(vault, monkeypatch):
+    m, root = vault
+    _enable_lacuna_contract(root, monkeypatch)
+    path = "lacuna/agentic-ai-standard-of-care"
+    target = root / "wiki" / f"{path}.md"
+    prediction = root / "wiki/predictions/agentic-ai-standard-of-care.md"
+
+    created = m._create(path, _lacuna_frontmatter(), _lacuna_body())
+    assert created.startswith("created"), created
+    before = target.read_bytes()
+    rejected = m._create("predictions/agentic-ai-standard-of-care", "not a YAML mapping",
+                         "# Forecast\n\n" + ("Observable trigger and refutation. " * 5))
+    assert "rejected" in rejected.lower(), rejected
+    assert not prediction.exists(), "rejected prediction unexpectedly became client-visible"
+    refused_link = m._update(path, {
+        "prediction_candidate": "predictions/agentic-ai-standard-of-care",
+    })
+    assert "relationship_unresolved" in refused_link, refused_link
+    assert target.read_bytes() == before, "a rejected prediction left a dangling Lacuna link"
+
+
+def test_accepted_prediction_can_be_linked_after_the_lacuna_write(vault, monkeypatch):
+    m, root = vault
+    _enable_lacuna_contract(root, monkeypatch)
+    path = "lacuna/agentic-ai-standard-of-care"
+    assert m._create(path, _lacuna_frontmatter(), _lacuna_body()).startswith("created")
+    prediction_path = "predictions/agentic-ai-standard-of-care"
+    frontmatter = {
+        "type": "prediction", "made_on": "2026-06-15", "resolves_by": "2030-12-31",
+        "horizon": "long", "confidence": 0.35, "status": "open",
+        "subject": f"[[{path}]]",
+    }
+    forecast = "# Forecast\n\n" + ("A dated trigger can be observed and refuted. " * 5)
+    accepted = m._create(prediction_path, frontmatter, forecast)
+    assert accepted.startswith("created"), accepted
+
+    linked = m._update(path, {
+        "fill_trigger": "a published autonomous-agent oversight control",
+        "prediction_candidate": prediction_path,
+    })
+    assert linked.startswith("updated"), linked
+    assert (root / "wiki" / f"{prediction_path}.md").is_file()
+    assert "prediction_candidate: predictions/agentic-ai-standard-of-care" in (
+        root / "wiki" / f"{path}.md"
+    ).read_text(encoding="utf-8")
+
+
+def test_historical_dangling_lacuna_candidate_can_be_cleared(vault, monkeypatch):
+    m, root = vault
+    _enable_lacuna_contract(root, monkeypatch)
+    path = "lacuna/agentic-ai-standard-of-care"
+    assert m._create(path, _lacuna_frontmatter(), _lacuna_body()).startswith("created")
+    # Reproduce the old report-mode write: the page is retained even though the
+    # prediction target was never accepted by the writer.
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    historical = m._update(path, {
+        "prediction_candidate": "predictions/agentic-ai-standard-of-care",
+        "fill_trigger": "an externally observable control milestone",
+    })
+    assert historical.startswith("updated"), historical
+    target = root / "wiki" / f"{path}.md"
+    assert "prediction_candidate: predictions/agentic-ai-standard-of-care" in (
+        target.read_text(encoding="utf-8")
+    )
+
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "enforce")
+    repaired = m._update(path, {"prediction_candidate": None, "fill_trigger": None})
+    assert repaired.startswith("updated"), repaired
+    assert "predictions/agentic-ai-standard-of-care" not in target.read_text(encoding="utf-8")
+    assert not (root / "wiki/predictions/agentic-ai-standard-of-care.md").exists()
+
+
+def test_server_resolved_output_contract_supplies_job_write_capability(vault, monkeypatch):
     m, root = vault
     _enable_source_contract(root, monkeypatch)
+    monkeypatch.setattr(m, "_effective_policy", lambda: {
+        "rules": [{"id": "engine-authenticated-writer", "severity": "reject"}],
+        "capabilities": {},
+    })
+    refusal = m._capability_reject(
+        root / "wiki" / "sources" / "x.md", "create", page_type="source"
+    )
+    assert refusal is None
+
+
+def test_job_capability_rejects_paths_types_and_operations_outside_contract(vault, monkeypatch):
+    m, root = vault
+    _enable_source_contract(root, monkeypatch, operations=["create"])
+    monkeypatch.setattr(m, "_effective_policy", lambda: {
+        "rules": [{"id": "engine-authenticated-writer", "severity": "reject"}],
+        "capabilities": {},
+    })
+
+    wrong_path = m._capability_reject(
+        root / "wiki" / "entities" / "x.md", "create", page_type="source"
+    )
+    wrong_type = m._capability_reject(
+        root / "wiki" / "sources" / "x.md", "create", page_type="actor"
+    )
+    wrong_operation = m._capability_reject(
+        root / "wiki" / "sources" / "x.md", "update", page_type="source"
+    )
+
+    assert "path is outside allowed scopes" in wrong_path
+    assert "page type 'actor' is not allowed" in wrong_type
+    assert "operation 'update' is not allowed" in wrong_operation
+
+
+def test_job_capability_fails_closed_for_tampered_contract_digest(vault, monkeypatch):
+    m, root = vault
+    _enable_source_contract(root, monkeypatch)
+    jobs = root / "jobs.json"
+    document = json.loads(jobs.read_text())
+    document["jobs"][0]["output_contract"]["allowed_namespaces"] = ["entities"]
+    jobs.write_text(json.dumps(document))
+    m._output_contract._cache["key"] = None
     monkeypatch.setattr(m, "_effective_policy", lambda: {"capabilities": {}})
-    assert m._capability_reject(root / "wiki" / "sources" / "x.md", "create",
-                                page_type="source") is None
+
+    refusal = m._capability_reject(
+        root / "wiki" / "entities" / "x.md", "create", page_type="source"
+    )
+
+    assert "no declared write capability" in refusal
+
+
+def test_catalog_capability_remains_narrower_than_job_contract(vault, monkeypatch):
+    m, root = vault
+    _enable_source_contract(root, monkeypatch)
+    monkeypatch.setattr(m, "_effective_policy", lambda: {
+        "rules": [{"id": "narrow", "severity": "reject"}],
+        "capabilities": {"cron:raw-backfill": {
+            "rule_id": "narrow", "operations": ["update"],
+            "paths": ["sources/**"], "types": ["source"],
+            "update_fields": ["reliability"], "body": "deny",
+        }},
+    })
+
+    refusal = m._capability_reject(
+        root / "wiki" / "sources" / "x.md", "create", page_type="source",
+        changed_fields=["type", "publisher"], body_change="replace",
+    )
+
+    assert "policy[narrow]" in refusal
+    assert "operation 'create' is not allowed" in refusal
+
+
+def test_extension_declared_capability_flows_into_shared_policy_evaluator(vault, monkeypatch):
+    m, root = vault
+    monkeypatch.setattr(m, "_effective_policy", lambda: {
+        "rules": [{"id": "extension-create", "severity": "reject"}],
+        "capabilities": {},
+    })
+    token = m._caller_var.set({
+        "kind": "extension", "actor": "extension:demo", "ext_id": "demo",
+        "write_scopes": ["briefings/**"],
+        "write_capability": {
+            "rule_id": "extension-create", "operations": ["create"],
+            "paths": ["briefings/**"], "types": ["briefing"],
+            "update_fields": ["*"], "body": "allow",
+        },
+    })
+    try:
+        refusal = m._capability_reject(
+            root / "wiki" / "briefings" / "daily.md", "create",
+            page_type="briefing", changed_fields=["type", "title"],
+            body_change="replace",
+        )
+    finally:
+        m._caller_var.reset(token)
+
+    assert refusal is None
+
+
+def test_unknown_non_admin_caller_kind_fails_closed(vault, monkeypatch):
+    m, root = vault
+    monkeypatch.setattr(m, "_effective_policy", lambda: {
+        "rules": [{"id": "engine-authenticated-writer", "severity": "reject"}],
+        "capabilities": {},
+    })
+    token = m._caller_var.set({"kind": "user", "actor": "unexpected-user"})
+    try:
+        refusal = m._capability_reject(
+            root / "wiki" / "briefings" / "daily.md", "create",
+            page_type="briefing",
+        )
+    finally:
+        m._caller_var.reset(token)
+
+    assert "policy[engine-authenticated-writer]" in refusal
+    assert "no declared write capability" in refusal
+
+
+@pytest.mark.parametrize("actor", [
+    "cron:source-quality-backfill", "cron:raw-backfill", "cron:entity-backfill",
+])
+def test_every_job_actor_rejects_update_when_page_misses_required_schema_field(
+        vault, monkeypatch, actor):
+    """#670: authenticated maintenance identity never bypasses OKF schema validation."""
+    m, root = vault
+    (root / "schema.yaml").write_text(_SCHEMA.replace(
+        "required: [type]", "required: [type, id]", 1
+    ), encoding="utf-8")
+    target = root / "wiki/sources/legacy.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    original = "---\ntype: source\nsource_kind: news\npublisher: Example\npublished: 2026-01-01\n---\nbody\n"
+    target.write_text(original, encoding="utf-8")
+    monkeypatch.setenv("OKENGINE_WRITE_ACTOR", actor)
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setattr(m, "_contract_reject", lambda *args, **kwargs: None)
+
+    result = m._update("sources/legacy", {"reliability": "A", "credibility": "1"})
+
+    assert result.startswith("rejected: missing required field(s): id"), result
+    assert target.read_text(encoding="utf-8") == original
 
 
 def test_output_contract_accepts_valid_source_and_protects_updates(vault, monkeypatch):
@@ -174,17 +438,68 @@ def test_output_contract_allows_declared_tombstone_and_flag(vault, monkeypatch):
     assert m._tombstone("sources/2026/07/reviewed", "duplicate").startswith("tombstoned")
 
 
+def test_source_duplicate_receipts_cannot_be_pages_or_tombstone_successors(vault):
+    """#437: operational duplicate receipts must never replace canonical intelligence."""
+    m, root = vault
+    source = {
+        "type": "source",
+        "source_kind": "vendor-blog",
+        "publisher": "Example",
+        "published": "2026-06-14",
+    }
+
+    rejected = m._create(
+        "sources/2026/06/receipt",
+        {**source, "status": "duplicate-receipt"},
+        "# Receipt\n\nDuplicate processing state.",
+    )
+    assert rejected.startswith("rejected:") and "append the duplicate raw provenance" in rejected
+    rejected = m._converge(
+        "sources/2026/06/converged-receipt",
+        {**source, "status": "duplicate-receipt"},
+        "# Receipt\n\nDuplicate processing state.",
+    )
+    assert rejected.startswith("rejected:") and "append the duplicate raw provenance" in rejected
+
+    assert m._create(
+        "sources/2026/06/canonical", source, "# Canonical\n\nGrounded source."
+    ).startswith("created")
+    canonical = root / "wiki" / "sources" / "2026" / "06" / "canonical.md"
+    before = canonical.read_bytes()
+    rejected = m._update(
+        "sources/2026/06/canonical", {"status": "duplicate-receipt"}
+    )
+    assert rejected.startswith("rejected:")
+    assert canonical.read_bytes() == before
+
+    receipt = root / "wiki" / "sources" / "2026" / "06" / "legacy-receipt.md"
+    receipt.write_text(
+        "---\ntype: source\nsource_kind: vendor-blog\npublisher: Example\n"
+        "published: 2026-06-14\nstatus: duplicate-receipt\n---\nlegacy\n",
+        encoding="utf-8",
+    )
+    rejected = m._tombstone(
+        "sources/2026/06/canonical",
+        "duplicate",
+        "sources/2026/06/legacy-receipt",
+    )
+    assert rejected.startswith("rejected: superseded_by target is a duplicate receipt")
+    assert canonical.read_bytes() == before
+
+
 # ── degeneration guard (soft flag at the enforced write boundary) ─────────────
 
-def test_degeneration_flags_word_salad():
-    m = _load()
-    salad = " ".join(f"term{i}" for i in range(400))       # 400-word unpunctuated run (repetition loop)
+def test_degeneration_flags_word_salad(pure_write_server):
+    m = pure_write_server
+    # Boundary value: the guard trips above 250 words.  A 400-word fixture tested the same branch
+    # while consuming avoidable CPU in the globally bounded unit lane.
+    salad = " ".join(["x"] * 251)
     flags = m._degeneration_flags("# X\n\n" + salad + ".\n")
     assert any("unpunctuated run" in f for f in flags), flags
 
 
-def test_degeneration_flags_legitimate_content_clean():
-    m = _load()
+def test_degeneration_flags_legitimate_content_clean(pure_write_server):
+    m = pure_write_server
     assert m._degeneration_flags("# X\n\nA coherent page. It has sentences. They end.\n") == []
     # a long comma-separated LIST (MITRE techniques / killed services) is legitimate, not filler
     assert m._degeneration_flags("Applies to: " + ", ".join(f"Svc {i}" for i in range(300)) + ".\n") == []
@@ -195,10 +510,11 @@ def test_degeneration_flags_legitimate_content_clean():
     assert m._degeneration_flags(None) == [] and m._degeneration_flags("") == []
 
 
-def test_degeneration_guard_agrees_with_content_lint():
+@pytest.mark.contract
+def test_degeneration_guard_agrees_with_content_lint(pure_write_server):
     """Cross-surface contract: the write-path guard and scripts/cron/content_lint.py must agree on the
     same samples, or a fix to one silently drifts from the other (the multi-surface-contract rule)."""
-    m = _load()
+    m = pure_write_server
     cl_spec = importlib.util.spec_from_file_location("content_lint", REPO / "scripts" / "cron" / "content_lint.py")
     cl = importlib.util.module_from_spec(cl_spec)
     cl_spec.loader.exec_module(cl)
@@ -442,6 +758,32 @@ def test_valid_create(vault):
     assert "entities/vendor/acme.md v1" in _log_text(root)
 
 
+def test_create_serializes_multiline_title_as_valid_yaml(vault):
+    """Regression for #434: wrapped model output must not corrupt page frontmatter."""
+    m, root = vault
+    title = (
+        "Trump executive order tightens defense supply chain oversight, mandates domestic\n"
+        "sourcing of critical materials"
+    )
+    res = m._create(
+        "sources/2026/07/23/defense-supply-chain",
+        {
+            "type": "source",
+            "title": title,
+            "source_kind": "news",
+            "publisher": "Industrial Cyber",
+            "published": "2026-06-14",
+        },
+        "# Defense supply chain\n\nSource summary.",
+    )
+    assert res.startswith("created"), res
+
+    page = root / "wiki" / "sources" / "2026" / "07" / "23" / "defense-supply-chain.md"
+    text = page.read_text(encoding="utf-8")
+    parsed = m.yaml.safe_load(text.split("---", 2)[1])
+    assert parsed["title"] == title
+
+
 def test_strict_pack_normalizes_type_alias_and_rejects_unknown(vault):
     m, root = vault
     (root / "schema.yaml").write_text(
@@ -589,6 +931,23 @@ def test_update_bumps_version(vault):
     assert "update" in _log_text(root)
 
 
+def test_update_expected_hash_refuses_concurrent_mutation(vault):
+    m, root = vault
+    m._create("entities/vendor/acme", "type: entity\nname: Acme", "original")
+    page = root / "wiki/entities/vendor/acme.md"
+    selected = "sha256:" + hashlib.sha256(page.read_bytes()).hexdigest()
+    page.write_text(page.read_text().replace("original", "concurrent"))
+    before = page.read_text()
+    result = m._update(
+        "entities/vendor/acme",
+        {"name": "Repair overwrite"},
+        "replacement",
+        expected_sha256=selected,
+    )
+    assert result.startswith("deferred: concurrent mutation")
+    assert page.read_text() == before
+
+
 def test_update_invalid_rejected_original_untouched(vault):
     m, root = vault
     m._create(
@@ -670,6 +1029,57 @@ def test_flag_for_review_replay_is_idempotent_by_page(vault):
     assert "retry paraphrased the reason" not in queue
     assert "flag already-queued entities/vendor/acme.md" in _log_text(root)
     assert "retry paraphrased the reason" in _log_text(root)
+
+
+@pytest.mark.parametrize("note", [
+    "Script exited with code 1: '/opt/vault/raw' does not exist",
+    "Data-collection script failed before ingest could begin",
+    "Raw directory missing at /opt/vault/raw",
+    "No entity backfill needed this run",
+    "Machine evidence scan completed for entity backfill cron job",
+    "source-quality-backfill batch complete: all sources already scored",
+])
+def test_non_page_infrastructure_and_receipt_flags_go_to_log_not_human_queue(vault, note):
+    m, root = vault
+
+    result = m._flag("diagnostics/nightly-run", note)
+
+    assert result.startswith("recorded operational note")
+    assert "operational-note diagnostics/nightly-run.md" in _log_text(root)
+    queue = root / "wiki" / "_review-queue.md"
+    assert not queue.exists() or "diagnostics/nightly-run.md" not in queue.read_text()
+
+
+def test_a_nonexistent_page_with_a_content_review_reason_still_enters_human_queue(vault):
+    m, root = vault
+
+    result = m._flag("entities/a/ambiguous", "publisher attribution looks wrong")
+
+    assert result.startswith("flagged")
+    assert "entities/a/ambiguous.md" in (root / "wiki" / "_review-queue.md").read_text()
+
+
+def test_missing_content_field_is_not_misclassified_as_missing_infrastructure(vault):
+    m, root = vault
+
+    result = m._flag("sources/2026/08/incomplete", "source file is missing author attribution")
+
+    assert result.startswith("flagged")
+    assert "sources/2026/08/incomplete.md" in (
+        root / "wiki" / "_review-queue.md"
+    ).read_text()
+
+
+def test_an_existing_page_is_not_deflected_just_because_its_content_mentions_an_error(vault):
+    m, root = vault
+    page = root / "wiki" / "entities" / "vendor" / "acme.md"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    page.write_text("---\ntype: entity\nname: Acme\n---\nbody\n")
+
+    result = m._flag("entities/vendor/acme", "analysis says the script error claim is unsupported")
+
+    assert result.startswith("flagged")
+    assert "entities/vendor/acme.md" in (root / "wiki" / "_review-queue.md").read_text()
 
 
 # --- G2 structural permissions + G3 review FLAGS (not gates) --------------
@@ -973,20 +1383,313 @@ def test_create_slug_variant_does_not_duplicate(vault):
     """okengine#98/#99/#100: create_entity keys on IDENTITY, not the filename. The
     same entity written a second time under a cosmetically different path/slug (here
     `Akira` vs `akira`, different shard dir) derives the same minted slug id and is
-    refused as a slug collision + flagged — so exactly ONE canonical exists instead
-    of a stale duplicate the assembler never reconciles."""
+    resolved to the existing canonical without auto-merging — so exactly ONE canonical exists and
+    no unopenable attempted path pollutes the human queue."""
     m, root = vault
     r1 = m._create("entities/a/akira", "type: entity\nname: Akira", "first")
     assert r1.startswith("created"), r1
     # same identity (name), cosmetically different filename + shard dir
     r2 = m._create("entities/vendor/Akira", "type: entity\nname: akira", "second")
-    assert r2.startswith("refused:") and "slug id" in r2 and "akira" in r2, r2
+    assert r2.startswith("resolved existing canonical entities/a/akira.md"), r2
+    assert "use converge_entity" in r2 and "entities:akira" in r2
     # only the first canonical exists; the duplicate path was never written
     assert (root / "wiki" / "entities" / "a" / "akira.md").is_file()
     assert not (root / "wiki" / "entities" / "vendor" / "Akira.md").exists()
-    assert "slug id collision" in (root / "wiki" / "_review-queue.md").read_text()
+    queue = root / "wiki" / "_review-queue.md"
+    assert not queue.exists() or "entities/vendor/Akira.md" not in queue.read_text()
+    assert "collision-resolved entities/vendor/Akira.md -> entities/a/akira.md" in _log_text(root)
     # the stamped id is the content-derived identity, independent of the path
     assert _fm(root / "wiki" / "entities" / "a" / "akira.md")["id"] == "entities:akira"
+
+
+def test_create_cross_namespace_slug_collision_routes_to_live_canonical_without_review(vault):
+    """#539: the dominant live collision shape must not queue a nonexistent attempted page.
+
+    Historical entity pages can own a minted ``concepts:`` id even though their physical path is
+    beneath ``entities/``.  A later create for the logical concept already has both sides of the
+    identity conflict, so return the live owner and keep only ledger provenance.
+    """
+    m, root = vault
+    existing = m._create(
+        "entities/s/i/side-channel-attack",
+        {"type": "entity", "name": "Side Channel Attack", "id": "concepts:side-channel-attack"},
+        "canonical entity",
+    )
+    assert existing.startswith("created"), existing
+
+    result = m._create(
+        "concepts/side-channel-attack",
+        {"type": "concept", "name": "Side Channel Attack"},
+        "attempted shadow",
+    )
+
+    # The current schema canonicalizes the historical ``entities/s/i`` spelling to this shard.
+    canonical = "entities/s/side-channel-attack.md"
+    attempted = "concepts/side-channel-attack.md"
+    assert result.startswith(f"resolved existing canonical {canonical}"), result
+    assert not (root / "wiki" / attempted).exists()
+    queue = root / "wiki" / "_review-queue.md"
+    assert not queue.exists() or attempted not in queue.read_text(encoding="utf-8")
+    assert f"collision-resolved {attempted} -> {canonical}" in _log_text(root)
+
+
+def test_source_slug_collision_without_url_is_refused_not_resolved(vault, monkeypatch):
+    """A weak title slug cannot route a source into the entity-style explicit merge path."""
+    m, root = vault
+    literal_namespace = "sources"
+    dynamic_namespace = bytearray(literal_namespace, "utf-8").decode()
+    assert dynamic_namespace == literal_namespace and dynamic_namespace is not literal_namespace
+    monkeypatch.setitem(
+        m._dedup_on_create.__globals__, "_namespace", lambda _path: dynamic_namespace
+    )
+    frontmatter = {
+        "type": "source", "source_kind": "news", "publisher": "Example",
+        "published": "2026-06-15", "title": "Shared report title",
+    }
+    first = m._create("sources/2026/06/first", frontmatter, "first document")
+    assert first.startswith("created"), first
+
+    second = m._create("sources/2026/06/second", frontmatter, "different document")
+    assert second.startswith("refused: weak source slug id sources:shared-report-title"), second
+    assert "URL identity is required" in second
+    assert not (root / "wiki" / "sources" / "2026" / "06" / "second.md").exists()
+    assert "collision-refused sources/2026/06/second.md" in _log_text(root)
+    assert "use converge_entity" not in second
+
+
+def test_non_source_namespace_after_sources_uses_explicit_resolution(vault):
+    """Routing is exact namespace matching, not lexicographic comparison."""
+    m, root = vault
+    first = m._create("trends/a/akira", {"type": "entity", "name": "Akira"}, "first")
+    assert first.startswith("created"), first
+    second = m._create(
+        "trends/vendor/Akira", {"type": "entity", "name": "akira"}, "second"
+    )
+    assert second.startswith("resolved existing canonical trends/a/akira.md"), second
+    assert "use converge_entity" in second and "trends:akira" in second
+    assert not (root / "wiki" / "trends" / "vendor" / "Akira.md").exists()
+
+
+def test_create_refuses_separator_variant_even_when_ids_genuinely_differ(vault):
+    """#592: an authority id beside a title-minted id must not bypass filename identity."""
+    m, root = vault
+    first = m._create(
+        "entities/a/agent-tesla",
+        {"type": "entity", "name": "Agent Tesla", "id": "mitre:g9999"},
+        "authority canonical",
+    )
+    assert first.startswith("created"), first
+
+    second = m._create(
+        "entities/a/agenttesla",
+        {"type": "entity", "name": "Verbose unrelated minted title"},
+        "candidate",
+    )
+    assert second.startswith("refused: slug id spelling"), second
+    assert "weak spelling identity never auto-merges" in second
+    assert not (root / "wiki" / "entities" / "a" / "agenttesla.md").exists()
+    queue = (root / "wiki" / "_review-queue.md").read_text()
+    assert "separator-insensitive" in queue
+    assert "**entities/a/agent-tesla.md**" in queue
+    assert "**entities/a/agenttesla.md**" not in queue
+
+
+def test_separator_identity_does_not_cross_namespaces(vault):
+    m, root = vault
+    assert m._create("entities/a/agent-tesla", "type: entity\nname: Agent Tesla", "one").startswith("created")
+    result = m._create("concepts/a/agenttesla", "type: concept\nname: AgentTesla", "two")
+    assert result.startswith("created"), result
+    assert (root / "wiki" / "concepts" / "a" / "agenttesla.md").is_file()
+
+
+def test_tombstoned_slug_variant_releases_the_weak_identity(vault):
+    m, root = vault
+    assert m._create("entities/a/agent-tesla", "type: entity\nname: Agent Tesla", "one").startswith("created")
+    assert m._tombstone("entities/a/agent-tesla", "invalid legacy spelling").startswith("tombstoned")
+    result = m._create("entities/a/agenttesla", "type: entity\nname: AgentTesla", "two")
+    assert result.startswith("created"), result
+    assert (root / "wiki" / "entities" / "a" / "agenttesla.md").is_file()
+
+
+def test_separator_hit_with_same_url_converges_legacy_source_id(vault, monkeypatch):
+    """The spelling guard must not outrank a source's authority-grade URL identity."""
+    m, root = vault
+    canonical = root / "wiki" / "sources" / "2026" / "06" / "agent-tesla.md"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text(
+        "---\ntype: source\nid: sources:legacy-title\ntitle: Legacy title\n"
+        "url: https://example.test/shared\nsource_kind: news\npublisher: Example\n"
+        "published: 2026-06-15\n---\nlegacy body\n",
+        encoding="utf-8",
+    )
+    literal_namespace = "sources"
+    dynamic_namespace = bytearray(literal_namespace, "utf-8").decode()
+    assert dynamic_namespace == literal_namespace and dynamic_namespace is not literal_namespace
+    original_namespace = m._namespace
+    monkeypatch.setitem(
+        m._dedup_on_create.__globals__, "_namespace",
+        lambda path: dynamic_namespace if "sources" in path.parts else original_namespace(path),
+    )
+
+    result = m._create(
+        "sources/2026/06/agenttesla",
+        {"type": "source", "title": "Different title",
+         "url": "https://example.test/shared", "source_kind": "news",
+         "publisher": "Example", "published": "2026-06-15"},
+        "new observation",
+    )
+    assert result.startswith("converged"), result
+    assert not (root / "wiki" / "sources" / "2026" / "06" / "agenttesla.md").exists()
+    assert "new observation" in canonical.read_text()
+
+
+@pytest.mark.parametrize("existing_url,incoming_url", [
+    ("https://example.test/a", "https://example.test/z"),
+    ("https://example.test/z", "https://example.test/a"),
+])
+def test_separator_equivalent_sources_with_different_urls_still_refuse(
+        vault, existing_url, incoming_url):
+    m, root = vault
+    canonical = root / "wiki" / "sources" / "2026" / "06" / "agent-tesla.md"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text(
+        "---\ntype: source\nid: sources:legacy-title\ntitle: Legacy title\n"
+        f"url: {existing_url}\nsource_kind: news\npublisher: Example\n"
+        "published: 2026-06-15\n---\nlegacy body\n",
+        encoding="utf-8",
+    )
+    result = m._create(
+        "sources/2026/06/agenttesla",
+        {"type": "source", "title": "Different title", "url": incoming_url,
+         "source_kind": "news", "publisher": "Example", "published": "2026-06-15"},
+        "different document",
+    )
+    assert result.startswith("refused: slug id spelling"), result
+    assert not (root / "wiki" / "sources" / "2026" / "06" / "agenttesla.md").exists()
+
+
+@pytest.mark.parametrize("namespace", ["entities", "trends"])
+def test_non_source_url_fields_never_authorize_separator_convergence(vault, namespace):
+    m, root = vault
+    canonical = root / "wiki" / namespace / "a" / "agent-tesla.md"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text(
+        "---\ntype: entity\nid: mitre:g0001\nname: Agent Tesla\n"
+        "url: https://example.test/shared\n---\ncanonical\n",
+        encoding="utf-8",
+    )
+    result = m._create(
+        f"{namespace}/a/agenttesla",
+        {"type": "entity", "id": "mitre:g0002", "name": "Different entity",
+         "url": "https://example.test/shared"},
+        "candidate",
+    )
+    assert result.startswith("refused: slug id spelling"), result
+
+
+def test_strict_slug_lookup_filters_every_noncanonical_candidate(vault, monkeypatch):
+    m, root = vault
+    directory = root / "wiki" / "entities" / "a"
+    directory.mkdir(parents=True, exist_ok=True)
+    incoming = directory / "agent-tesla.md"
+    candidates = {
+        "self": incoming,
+        "missing": directory / "missing.md",
+        "hidden": directory / "_agent_tesla.md",
+        "lower": directory / "aaa.md",
+        "higher": directory / "zzz.md",
+        "oserror": directory / "agent___tesla.md",
+        "valueerror": directory / "agent tesla.md",
+        "tombstone": directory / "agent--tesla.md",
+        "same_one": directory / "agent_tesla.md",
+        "same_two": directory / "agent.tesla.md",
+    }
+    for name, path in candidates.items():
+        if name != "missing":
+            status = "tombstoned" if name == "tombstone" else "verified"
+            path.write_text(f"---\ntype: entity\nstatus: {status}\n---\nbody\n")
+
+    class Registry:
+        has_slug_identity_index = True
+
+        def slug_identity_hits(self, _namespace, _stem):
+            return [m._rel(path) for path in candidates.values()]
+
+    monkeypatch.setattr(m, "_registry", lambda: Registry())
+    original_read = m._read_page
+
+    def controlled_read(path):
+        assert path not in {candidates["missing"], candidates["hidden"]}
+        if path == candidates["oserror"]:
+            raise OSError("raced away")
+        if path == candidates["valueerror"]:
+            raise ValueError("bad path state")
+        return original_read(path)
+
+    monkeypatch.setattr(m, "_read_page", controlled_read)
+    assert m._strict_slug_hits(incoming) == sorted(
+        [candidates["same_one"], candidates["same_two"]], key=m._rel,
+    )
+
+
+def test_strict_slug_lookup_requires_both_namespace_and_identity(vault, monkeypatch):
+    m, root = vault
+    candidate = root / "wiki" / "entities" / "a" / "agent-tesla.md"
+    monkeypatch.setattr(m, "_qualified_namespace", lambda _path: "")
+    monkeypatch.setattr(m, "_registry", lambda: (_ for _ in ()).throw(
+        AssertionError("an unusable identity must not consult the registry")
+    ))
+    assert m._strict_slug_hits(candidate) == []
+
+
+def test_strict_slug_refusal_bounds_evidence_and_flags_first_canonical(vault, monkeypatch):
+    m, root = vault
+    hits = [root / "wiki" / "entities" / "a" / f"agent{'-' * n}tesla.md"
+            for n in range(1, 8)]
+    flagged = []
+    monkeypatch.setattr(m, "_strict_slug_hits", lambda _path: hits)
+    monkeypatch.setattr(m, "_flag", lambda path, note: flagged.append((path, note)))
+    incoming = root / "wiki" / "entities" / "a" / "agenttesla.md"
+    result = m._dedup_on_create(
+        "entities/a/agenttesla", incoming, {"type": "entity", "name": "AgentTesla"}, "body",
+    )
+    expected = ", ".join(m._rel(path) for path in hits[:5])
+    assert expected in result
+    assert m._rel(hits[5]) not in result
+    assert len(flagged) == 1
+    assert flagged[0][0] == m._rel(hits[0])
+    assert expected in flagged[0][1]
+
+
+def test_strict_slug_refuses_when_incoming_identity_cannot_be_evaluated(vault, monkeypatch):
+    m, root = vault
+    canonical = root / "wiki" / "entities" / "a" / "agent-tesla.md"
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_text(
+        "---\ntype: entity\nid: mitre:g0001\nname: Agent Tesla\n---\ncanonical\n",
+        encoding="utf-8",
+    )
+    incoming = root / "wiki" / "entities" / "a" / "agenttesla.md"
+    monkeypatch.setattr(m, "_strict_slug_hits", lambda _path: [canonical])
+    original_identity = m._page_id_and_kind
+    calls = 0
+
+    def fail_incoming_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("incoming identity is not evaluable")
+        return original_identity(*args, **kwargs)
+
+    monkeypatch.setattr(m, "_page_id_and_kind", fail_incoming_once)
+    result = m._dedup_on_create(
+        "entities/a/agenttesla",
+        incoming,
+        {"type": "entity", "id": "mitre:g0001", "name": "AgentTesla"},
+        "candidate",
+    )
+    assert result.startswith("refused: slug id spelling"), result
+    assert calls == 2
 
 
 def test_create_name_matching_existing_alias_converges(vault):
@@ -1232,15 +1935,15 @@ def test_create_no_op_for_type_without_a_home_rule(tns_vault):
 # frontmatter value mangles. _coerce_fm canonicalizes refs to plain paths at the enforced-write
 # chokepoint, fixing every extension at once. (okengine#145 follow-up)
 
-def test_normalize_refs_strips_bare_wikilink_string():
-    m = _load()
+def test_normalize_refs_strips_bare_wikilink_string(pure_write_server):
+    m = pure_write_server
     fm = m._normalize_refs({"field_mapped": "[[concepts/x]]", "title": "Plain Title"})
     assert fm["field_mapped"] == "concepts/x"
     assert fm["title"] == "Plain Title"            # non-wikilink string untouched
 
 
-def test_normalize_refs_flattens_yaml_mangled_nested_lists():
-    m = _load()
+def test_normalize_refs_flattens_yaml_mangled_nested_lists(pure_write_server):
+    m = pure_write_server
     fm = m._normalize_refs({
         "field_mapped": [["concepts/supply-chain-compromise"]],   # bare [[x]] -> [["x"]]
         "see_also": [[["concepts/x"]], [["entities/s/y"]]],       # list of bare [[..]] items
@@ -1249,22 +1952,22 @@ def test_normalize_refs_flattens_yaml_mangled_nested_lists():
     assert fm["see_also"] == ["concepts/x", "entities/s/y"]
 
 
-def test_normalize_refs_strips_wikilinks_in_flat_list():
-    m = _load()
+def test_normalize_refs_strips_wikilinks_in_flat_list(pure_write_server):
+    m = pure_write_server
     fm = m._normalize_refs({"see_also": ["[[concepts/a]]", "[[entities/b]]"]})
     assert fm["see_also"] == ["concepts/a", "entities/b"]
 
 
-def test_normalize_refs_leaves_plain_values_untouched():
-    m = _load()
+def test_normalize_refs_leaves_plain_values_untouched(pure_write_server):
+    m = pure_write_server
     fm = m._normalize_refs({"aliases": ["foo", "bar"], "sources": [], "name": "Acme"})
     assert fm["aliases"] == ["foo", "bar"]
     assert fm["sources"] == []
     assert fm["name"] == "Acme"
 
 
-def test_coerce_fm_normalizes_bare_wikilinks_from_yaml_string():
-    m = _load()
+def test_coerce_fm_normalizes_bare_wikilinks_from_yaml_string(pure_write_server):
+    m = pure_write_server
     # the REAL path: agent writes bare [[..]] in the YAML string -> safe_load mangles to nested
     # lists -> _coerce_fm must return canonical plain paths.
     yaml_text = ("type: lacuna\nfield_mapped: [[concepts/x]]\n"
@@ -1415,6 +2118,33 @@ def test_source_forward_reference_still_allowed(vault):
                     "type: source\npublisher: X\nsource_kind: vendor-research\npublished: 2026-06-14",
                     "Updates [[entities/not-yet-created]] with new capability.")
     assert res.startswith("created"), res
+
+
+def test_entity_source_forward_reference_is_rejected(vault):
+    m, root = vault
+    res = m._create(
+        "entities/a/acme",
+        "type: entity\nname: Acme\nsources:\n- sources/2026/06/invented-report",
+        "Grounded-looking but unsupported profile.",
+    )
+    assert res.startswith("rejected:")
+    assert "must cite existing canonical source pages" in res
+    assert not (root / "wiki/entities/a/acme.md").exists()
+
+
+def test_entity_existing_broken_source_is_grandfathered_but_new_one_rejected(vault):
+    m, root = vault
+    _seed(
+        root, "entities/a/acme.md",
+        "type: entity\nid: entities:acme\nname: Acme\nsources:\n- sources/legacy/missing\n",
+    )
+    assert m._update("entities/a/acme", "tags: [repairable]").startswith("updated")
+    res = m._update(
+        "entities/a/acme",
+        "sources:\n- sources/legacy/missing\n- sources/new/invented",
+    )
+    assert res.startswith("rejected:")
+    assert "sources/new/invented" in res
 
 
 def test_briefing_update_body_rechecked(vault):
@@ -1839,6 +2569,51 @@ def test_extension_id_is_not_client_forgeable(vault):
     assert "extension_id" not in fm_of("entities/y/yr.md")
 
 
+def test_producer_lane_is_authenticated_server_provenance(vault, monkeypatch):
+    """The offline output-contract audit must attribute pages to the authenticated lane.
+
+    A model cannot forge the field, and a later admin edit preserves the last authenticated
+    producer instead of erasing or replacing it with client YAML.
+    """
+    import yaml
+
+    m, root = vault
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+
+    def fm_of(rel):
+        return yaml.safe_load((root / "wiki" / rel).read_text().split("---")[1])
+
+    token = m._caller_var.set({"kind": "job", "actor": "cron:entity-backfill"})
+    try:
+        out = m._create(
+            "entities/l/lane-owned",
+            "type: entity\nname: Lane owned\nproducer_lane: forged",
+            "Grounded body.",
+        )
+        assert out.startswith("created"), out
+        assert fm_of("entities/l/lane-owned.md")["producer_lane"] == "entity-backfill"
+    finally:
+        m._caller_var.reset(token)
+
+    out = m._update(
+        "entities/l/lane-owned", "name: Admin edit\nproducer_lane: forged-admin"
+    )
+    assert out.startswith("updated"), out
+    assert fm_of("entities/l/lane-owned.md")["producer_lane"] == "entity-backfill"
+
+    token = m._caller_var.set({"kind": "job", "actor": "cron:source-quality-backfill"})
+    try:
+        out = m._update(
+            "entities/l/lane-owned",
+            "name: Quality edit\nproducer_lane: forged-quality",
+        )
+        assert out.startswith("updated"), out
+        assert fm_of("entities/l/lane-owned.md")["producer_lane"] == "entity-backfill"
+    finally:
+        m._caller_var.reset(token)
+
+
 def test_update_entity_wrapper_passes_body_and_frontmatter_through(vault):
     """M22: the @mcp.tool() wrappers carry real falsy-mapping logic (update_entity maps
     frontmatter_yaml='' -> None and passes body='' -> clear / None -> keep), but the okengine#52
@@ -1976,3 +2751,75 @@ def test_update_grandfathers_legacy_bad_ref_but_blocks_new_one(vault):
     bad = m._update("entities/l/legacy",
                     {"sources": ["source/old/fake", "source/new/alsofake"]})
     assert bad.startswith("rejected:") and "alsofake" in bad, bad
+
+
+def test_update_refuses_invalid_utf8_without_changing_bytes_and_queues_review(vault):
+    m, root = vault
+    page = root / "wiki" / "entities" / "b" / "broken.md"
+    page.parent.mkdir(parents=True)
+    original = b"---\ntype: entity\nname: Broken\n---\nvalid prefix\xffsuffix\n"
+    page.write_bytes(original)
+
+    result = m._update("entities/b/broken", {"name": "Changed"})
+
+    assert result.startswith("refused:") and "invalid UTF-8" in result
+    assert page.read_bytes() == original
+    queue = (root / "wiki" / "_review-queue.md").read_text(encoding="utf-8")
+    assert "entities/b/broken.md" in queue
+    assert "invalid UTF-8" in queue
+
+
+def test_every_existing_page_write_path_refuses_invalid_utf8(vault):
+    m, root = vault
+    page = root / "wiki/entities/b/broken.md"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    original = b"---\ntype: entity\nid: entities:broken\nname: Broken\n---\nbody\xff"
+
+    calls = [
+        lambda: m._converge("entities/b/broken", {"type": "entity", "id": "entities:broken"}),
+        lambda: m._patch("entities/b/broken", "body", "new"),
+        lambda: m._append_section("entities/b/broken", "Notes", "new"),
+        lambda: m._tombstone("entities/b/broken", "duplicate"),
+        lambda: m._flag("entities/b/broken", "review"),
+        lambda: m._assign_review("entities/b/broken", "alice", 1, "0" * 64),
+        lambda: m._resolve_review("entities/b/broken", "approve", "alice", "", 1, "0" * 64),
+        lambda: m._record_machine_review("entities/b/broken", "bot", "supported"),
+    ]
+    for call in calls:
+        page.write_bytes(original)
+        result = call()
+        rendered = result if isinstance(result, str) else result.get("error", "")
+        assert "invalid UTF-8" in rendered
+        assert page.read_bytes() == original
+
+
+def test_atomic_write_removes_partial_temp_when_metadata_sync_fails(vault, monkeypatch):
+    m, root = vault
+    page = root / "wiki/entities/a/atomic.md"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(m.os, "chmod", lambda *_a: (_ for _ in ()).throw(OSError("disk")))
+    with pytest.raises(OSError, match="disk"):
+        m._atomic_write_text(page, "content")
+    assert not page.exists()
+    assert list(page.parent.iterdir()) == []
+
+
+def test_update_publishes_through_atomic_replace(vault, monkeypatch):
+    m, root = vault
+    assert not m._create("entities/a/atomic", {"type": "entity", "name": "Before"}).startswith(
+        ("refused:", "rejected:")
+    )
+    page = root / "wiki" / "entities" / "a" / "atomic.md"
+    original_replace = m.os.replace
+    replacements = []
+
+    def observed_replace(source, destination):
+        replacements.append((Path(source), Path(destination)))
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(m.os, "replace", observed_replace)
+    result = m._update("entities/a/atomic", {"name": "After"})
+
+    assert result.startswith("updated "), result
+    assert any(destination == page and source.parent == page.parent for source, destination in replacements)
+    assert "name: After" in page.read_text(encoding="utf-8")

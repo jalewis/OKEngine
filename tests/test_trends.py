@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -67,6 +68,7 @@ def test_engine_ships_trends_lane():
     assert "trends-refresh" in tiers["engine-template"]
 
 
+@pytest.mark.integration
 def test_skeleton_scaffolds_trend():
     s = yaml.safe_load((ROOT / "templates/pack/skeleton/schema.yaml").read_text())
     # the `trend` TYPE is core (engine-owned, okengine#90); the skeleton supplies the trends
@@ -78,4 +80,6 @@ def test_skeleton_scaffolds_trend():
     assert "trends" in s["partitioning"]["namespaces"]
     assert "trends" in (s["rail_top_section"]["namespaces"])
     prompts = json.loads((ROOT / "templates/pack/skeleton/crons/engine-template-prompts.json").read_text())
-    assert "trends-refresh" in prompts and "trend" in prompts["trends-refresh"].lower()
+    trend_ref = prompts["trends-refresh"]["prompt_file"]
+    assert "trends-refresh" in prompts and "trend" in (
+        ROOT / "templates/pack/skeleton" / trend_ref).read_text().lower()

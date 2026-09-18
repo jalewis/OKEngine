@@ -4,6 +4,7 @@ rather than extraction quality (that lives in test_extract_html.py)."""
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -43,6 +44,7 @@ def test_installer_is_idempotent_guarded():
     # Greps the current crontab for the wrapper before appending — re-runnable.
     assert 'grep -qF "scripts/extract-raw.sh"' in txt
     assert "crontab -" in txt
+    assert "probe_write_dir" in txt and ".okengine-extract-write-check" in txt
 
 
 def test_wrapper_exits_zero_on_empty_raw(tmp_path=None):
@@ -67,3 +69,20 @@ def test_wrapper_errors_on_missing_raw_root():
                        capture_output=True, text=True, timeout=30)
     assert r.returncode == 1
     assert "raw root not found" in r.stderr
+
+
+def test_wrapper_runs_all_extractors_but_returns_failure(tmp_path):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "thin.html").write_text("<article>tiny</article>", encoding="utf-8")
+    env = dict(os.environ, EXTRACT_PYTHON=sys.executable)
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER), str(raw)],
+        capture_output=True, text=True, env=env, timeout=60,
+    )
+
+    assert result.returncode == 1
+    combined = result.stdout + result.stderr
+    assert "extract-html.py exited non-zero" in combined
+    assert "extract-raw completed with extractor failures" in combined

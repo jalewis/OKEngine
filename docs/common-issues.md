@@ -6,6 +6,18 @@ obsolete). This is a companion to the authoring guides and to [`pack-building-ch
 
 ## Operating a deployment
 
+- **"Is this deployment healthy? What's wrong with it?"** Run the live diagnostics from the engine
+  checkout against the deployment (pack/vault) dir: `framework status <deployment>` for a one-glance
+  summary (engine/Hermes version, scheduler state, per-area roll-up), or `framework doctor
+  <deployment> [--checks a,b] [--json]` for the full finding list. Both run the SAME checks the daily
+  in-gateway validator writes to `wiki/operational/deployment-validation.md` (pins, composed schema,
+  cron fleet, timezone, partition dups, rules, extensions, storage ownership, auth posture, the
+  enforced write-path libs, provenance, operation runs) — one shared library, three surfaces
+  (`scripts/cron/deployment_checks.py`; okengine#405). `framework validate` stays the OFFLINE
+  pack-source conformance check; status/doctor inspect a LIVE/host-mounted deployment. Exit codes: 0
+  = no FAIL, 1 = at least one FAIL, 2 = usage error. Baked-vs-staged write-path drift and container
+  health need in-container access — for those run `scripts/post_deploy_verify.sh` from the deployment
+  dir (it also folds in the host-readable shared checks).
 - **A model-calling no_agent script dies with "Script timed out after 120s".** Hermes bounds cron
   scripts at 120s (`HERMES_CRON_SCRIPT_TIMEOUT` env / `cron.script_timeout_seconds`). Two rules for
   lanes that call a model via llm_lib: (1) never re-scan the corpus to find work — a 36k-page scan

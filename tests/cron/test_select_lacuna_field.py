@@ -102,7 +102,14 @@ def test_undated_page_uses_mtime_and_window_elapses(tmp_path):
     m = _load(tmp_path)
     # fresh file (mtime ~ now) -> within the window -> excluded
     assert "supply-chain-compromise" in m._recently_analyzed()
-    # backdate the file well past REANALYZE_DAYS -> field re-opens
-    old = __import__("time").time() - (m.REANALYZE_DAYS + 30) * 86400
+    # Backdate relative to the PINNED cutoff, not the real clock. Deriving the offset from
+    # time.time() while _today() is pinned to 2026-07-07 made this a time bomb: the margin shrank
+    # by a day per real day and hit zero on 2026-08-06, after which the backdated mtime landed
+    # exactly ON the cutoff and the strict `<` kept the page covered forever. It read as a
+    # timezone flake because UTC crossed that date ~4h before EDT.
+    import time as _time
+    from datetime import date as _date, datetime as _dt, timedelta as _td
+    target = _date.fromisoformat(m._cutoff()) - _td(days=30)
+    old = _time.mktime(_dt(target.year, target.month, target.day, 12).timetuple())
     os.utime(p, (old, old))
     assert "supply-chain-compromise" not in m._recently_analyzed()

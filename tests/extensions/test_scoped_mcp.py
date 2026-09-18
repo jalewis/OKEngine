@@ -2,7 +2,7 @@
 
 Covers the pure pieces and the load-bearing cross-module contract: a token MINTED
 host-side (scripts/extension_tokens.py) must RESOLVE container-side
-(okengine-mcp/scope.py) to the right scopes. Auth-wrapper behavior (admin=full,
+(src/okengine/mcp/scope.py) to the right scopes. Auth-wrapper behavior (admin=full,
 extension=scoped, provenance stamp) is unit-tested where importable; full ASGI
 propagation + the extension_id stamp are verified on a live deploy.
 """
@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent.parent
-SCOPE_PATH = REPO / "okengine-mcp" / "scope.py"
+SCOPE_PATH = REPO / "src" / "okengine" / "mcp" / "scope.py"
 TOKENS_PATH = REPO / "scripts" / "extension_tokens.py"
 
 pytestmark = pytest.mark.skipif(not (SCOPE_PATH.is_file() and TOKENS_PATH.is_file()),
@@ -77,6 +77,18 @@ def test_write_capability_from_manifest():
     assert tok.write_capability_from_manifest(manifest) == policy
 
 
+def test_token_store_load_and_permission_failures_are_safe(tmp_path, monkeypatch):
+    tok = _tokens()
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text("{bad", encoding="utf-8")
+    assert tok._load(malformed) == {}
+
+    destination = tmp_path / "private.json"
+    monkeypatch.setattr(Path, "chmod", lambda self, mode: (_ for _ in ()).throw(OSError("no chmod")))
+    tok._write_private(destination, {"safe": True})
+    assert json.loads(destination.read_text(encoding="utf-8")) == {"safe": True}
+
+
 def test_mint_writes_hashed_store_and_plaintext_secret(tmp_path):
     tok = _tokens()
     plaintext = tok.mint(tmp_path, "demo.alpha", ["wiki/**"], ["dashboards/**"])
@@ -104,6 +116,11 @@ def test_revoke_removes_from_store_and_secrets(tmp_path):
     assert ids == {"demo.beta"}
     sec = json.loads((tmp_path / ".okengine" / "extension-secrets.json").read_text())
     assert "demo.alpha" not in sec and "demo.beta" in sec
+
+
+def test_revoke_is_idempotent_when_no_token_files_exist(tmp_path):
+    _tokens().revoke(tmp_path, "missing.extension")
+    assert not (tmp_path / ".okengine").exists()
 
 
 def test_reconcile_updates_scopes_without_rotating_valid_token(tmp_path):
@@ -188,3 +205,30 @@ def test_write_authorize_admin_full_extension_scoped():
         assert ws._wauth_refusal("dashboards/x") is None
     finally:
         ws._caller_var.reset(tokn)
+
+
+def test_review_tools_enforce_extension_path_scope(tmp_path, monkeypatch):
+    """#671: review authority cannot escape the token's declared write paths."""
+    (tmp_path / "wiki/entities/a").mkdir(parents=True)
+    (tmp_path / "schema.yaml").write_text("types: {}\n", encoding="utf-8")
+    (tmp_path / "wiki/entities/a/target.md").write_text(
+        "---\ntype: entity\nversion: 1\nneeds_review: true\n---\nbody\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    ws = _load(f"write_server_scoped_review_{id(tmp_path)}",
+               REPO / "okengine-mcp" / "write_server.py")
+    token = ws._caller_var.set({
+        "kind": "extension", "ext_id": "dashboard-only",
+        "actor": "extension:dashboard-only", "write_scopes": ["dashboards/**"],
+    })
+    try:
+        results = [
+            ws._assign_review("entities/a/target", "reviewer", 1, "0" * 64),
+            ws._resolve_review("entities/a/target", "approve", "reviewer", "", 1, "0" * 64),
+            ws._record_machine_review("entities/a/target", "machine", "supported"),
+        ]
+    finally:
+        ws._caller_var.reset(token)
+
+    assert all(result["status"] == 403 for result in results)
+    assert all("outside extension 'dashboard-only'" in result["error"] for result in results)

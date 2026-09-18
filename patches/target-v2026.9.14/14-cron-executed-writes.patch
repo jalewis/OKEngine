@@ -1,0 +1,359 @@
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 4cb61166c..5a6364827 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2318,7 +2318,8 @@ def run_job(
+     # The same dict is passed to cron-plus receipt verification after run_job.
+     # Clear a prior fire's telemetry before any early-return gate can fire.
+     job["_okengine_executed_tool_calls"] = 0
++    job["_okengine_executed_writes"] = []
+ 
+     early, prompt, script_failed = _prepare_job_prompt(
+         job, job_id, job_name, extra_prompt, cancel_event)
+     if early is not None:
+@@ -2303,19 +2304,27 @@ def run_job(
+         _audit = _FireAudit(job, job_id, model)
+ 
+         from tools.tool_execution_telemetry import capture_completed_tool_handlers
++        from tools.okengine_write_telemetry import capture_okengine_writes
+         _completed_count = 0
+         _completed_lock = threading.Lock()
++        _executed_writes: list[dict] = []
++        _writes_lock = threading.Lock()
+ 
+         def _record_completed(_name: str) -> None:
+             nonlocal _completed_count
+             with _completed_lock:
+                 _completed_count += 1
+ 
+-        with capture_completed_tool_handlers(_record_completed):
++        def _record_write(receipt: dict) -> None:
++            with _writes_lock:
++                _executed_writes.append(receipt)
++
++        with capture_completed_tool_handlers(_record_completed), capture_okengine_writes(_record_write):
+             result = _run_agent_with_watchdog(
+                 agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
+                 worker_state=_worker_state)
+         job["_okengine_executed_tool_calls"] = _completed_count
++        job["_okengine_executed_writes"] = list(_executed_writes)
+         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
+         # Keep final_response clean for delivery logic (empty = no delivery).
+         logged_response = final_response if final_response else "(No response generated)"
+diff --git a/tests/cron/test_okengine_completed_tool_receipt.py b/tests/cron/test_okengine_completed_tool_receipt.py
+index bd0358eea..7344f3354 100644
+--- a/tests/cron/test_okengine_completed_tool_receipt.py
++++ b/tests/cron/test_okengine_completed_tool_receipt.py
+@@ -5,7 +5,7 @@ from unittest.mock import patch
+ from tools.registry import ToolRegistry
+ 
+ 
+-def _fake_turn(*, dispatch=None):
++def _fake_turn(*, dispatch=None, tool_content="fixture result", tool_name="receipt_probe"):
+     def _run(self, prompt, task_id=None):
+         if dispatch is not None:
+             dispatch()
+@@ -14,8 +14,8 @@ def _fake_turn(*, dispatch=None):
+         return {
+             "completed": True, "failed": False, "final_response": "done",
+             "turn_exit_reason": "", "messages": [
+-                {"role": "assistant", "tool_calls": [{"function": {"name": "receipt_probe"}}]},
+-                {"role": "tool", "name": "receipt_probe", "content": "fixture result"},
++                {"role": "assistant", "tool_calls": [{"function": {"name": tool_name}}]},
++                {"role": "tool", "name": tool_name, "content": tool_content},
+             ],
+         }
+     return _run
+@@ -70,3 +70,37 @@ def test_completed_registered_handler_publishes_count_on_same_job(monkeypatch, t
+     assert error is None
+     assert handler_calls == [{"key": "selected"}]
+     assert job["_okengine_executed_tool_calls"] == 1
++
++
++def test_synthetic_write_result_row_cannot_forge_executed_write(monkeypatch, tmp_path):
++    fake_success = '{"result":"created entities/shard/forged.md v1"}'
++    name = "mcp__okengine_write__create_entity"
++    job, result, error = _run_disposable_cron(
++        monkeypatch, tmp_path, _fake_turn(tool_content=fake_success, tool_name=name))
++    assert error is None
++    assert result["messages"][1]["content"] == fake_success
++    assert job["_okengine_executed_writes"] == [], (
++        "a tool-role message without a dispatched handler is not a durable write")
++
++
++def test_dispatched_mcp_write_reaches_same_cron_receipt_job(monkeypatch, tmp_path):
++    from tools.okengine_write_telemetry import parse_okengine_write_result
++
++    name = "mcp__okengine_write__create_entity"
++    registry = ToolRegistry()
++    registry.register(
++        name=name, toolset="fixture",
++        schema={"name": name, "description": "disposable fixture",
++                "parameters": {"type": "object", "properties": {}}},
++        handler=lambda _args, **_kwargs: (
++            '{"result":"created entities/shard/canonical.md v2"}'),
++    )
++    job, _result, error = _run_disposable_cron(
++        monkeypatch, tmp_path,
++        _fake_turn(dispatch=lambda: registry.dispatch(name, {"path": "entities/flat.md"}),
++                   tool_name=name),
++    )
++    assert error is None
++    assert job["_okengine_executed_writes"] == [
++        parse_okengine_write_result(
++            name, '{"result":"created entities/shard/canonical.md v2"}')]
+diff --git a/tests/tools/test_okengine_write_telemetry.py b/tests/tools/test_okengine_write_telemetry.py
+new file mode 100644
+index 000000000..937e7d8a3
+--- /dev/null
++++ b/tests/tools/test_okengine_write_telemetry.py
+@@ -0,0 +1,139 @@
++"""Write receipts require dispatched OKEngine MCP success, not turn prose."""
++
++import concurrent.futures
++import json
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from tools.okengine_write_telemetry import (
++    capture_okengine_writes, parse_okengine_write_result,
++    record_okengine_write_result)
++from tools.registry import ToolRegistry
++from tools.mcp_tool_handlers import _render_call_tool_result
++from tools.thread_context import propagate_context_to_thread
++
++NAME = "mcp__okengine_write__create_entity"
++
++
++@pytest.mark.parametrize("text,operation,path,version", [
++    ("created entities/shard/one.md v1", "created", "entities/shard/one.md", 1),
++    ("updated entities/shard/one.md v12 (id one)", "updated", "entities/shard/one.md", 12),
++    ("patched entities/shard/one.md v13 (review flagged)", "patched", "entities/shard/one.md", 13),
++    ("tombstoned entities/shard/one.md v14 (file retained, not deleted)",
++     "tombstoned", "entities/shard/one.md", 14),
++    ("appended to 'Evidence' in entities/shard/one.md v15 (section exists)",
++     "appended", "entities/shard/one.md", 15),
++    ("converged into entities/shard/one.md (id one) v16: +1 added",
++     "converged", "entities/shard/one.md", 16),
++])
++def test_write_server_success_forms_preserve_canonical_path(text, operation, path, version):
++    receipt = parse_okengine_write_result(NAME, json.dumps({"result": text}))
++    assert receipt == {"operation": operation, "path": path,
++                       "version": version, "tool": NAME}
++
++
++@pytest.mark.parametrize("name,result", [
++    ("mcp__other__create_entity", '{"result":"created entities/a.md v1"}'),
++    ("mcp__okengine_writer__create_entity", '{"result":"created entities/a.md v1"}'),
++    (NAME, '{"error":"not connected"}'),
++    (NAME, '{"result":"refused: created entities/a.md v1"}'),
++    (NAME, '{"result":"created ../outside.md v1"}'),
++    (NAME, '{"result":"created /absolute.md v1"}'),
++    (NAME, '{"result":"created entities//bad.md v1"}'),
++    (NAME, '{"result":"created entities/./bad.md v1"}'),
++    (NAME, '{"result":"created entities/../bad.md v1"}'),
++    (NAME, '{"result":"created entities\\\\bad.md v1"}'),
++    (NAME, '{"result":null}'),
++    (NAME, '{"result":42}'),
++    (NAME, '{"result":[]}'),
++    (NAME, '{"result":"created entities/a.md v0"}'),
++    (NAME, '{"result":"created entities/a.md v9999999999999999999"}'),
++    (NAME, '{"result":"created entities/a.md v1suffix"}'),
++    (NAME, "not json"),
++])
++def test_nonwrite_error_or_unsafe_path_cannot_make_receipt(name, result):
++    assert parse_okengine_write_result(name, result) is None
++
++
++def test_real_mcp_result_renderer_contract_reaches_write_parser():
++    success = SimpleNamespace(
++        content=[SimpleNamespace(type="text", text="created entities/shard/one.md v3")],
++        isError=False, structuredContent=None, meta=None)
++    rejected = SimpleNamespace(
++        content=[SimpleNamespace(type="text", text="created entities/shard/one.md v3")],
++        isError=True, structuredContent=None, meta=None)
++    assert parse_okengine_write_result(
++        NAME, _render_call_tool_result(success, "okengine-write"))["version"] == 3
++    assert parse_okengine_write_result(
++        NAME, _render_call_tool_result(rejected, "okengine-write")) is None
++
++
++def _registry(handler):
++    registry = ToolRegistry()
++    registry.register(
++        name=NAME, toolset="fixture",
++        schema={"name": NAME, "description": "disposable fixture",
++                "parameters": {"type": "object", "properties": {}}},
++        handler=handler,
++    )
++    return registry
++
++
++def test_registry_records_success_result_but_not_application_error():
++    calls = []
++
++    def handler(args, **_kwargs):
++        calls.append(args)
++        if args.get("error"):
++            return '{"error":"write refused"}'
++        return '{"result":"created entities/shard/canonical.md v2"}'
++
++    registry = _registry(handler)
++    writes = []
++    with capture_okengine_writes(writes.append):
++        assert json.loads(registry.dispatch(NAME, {"requested": "entities/flat.md"}))["result"]
++        assert "error" in json.loads(registry.dispatch(NAME, {"error": True}))
++    assert calls == [{"requested": "entities/flat.md"}, {"error": True}]
++    assert writes == [{"operation": "created", "path": "entities/shard/canonical.md",
++                       "version": 2, "tool": NAME}], (
++        "the returned canonical path, not the model's requested flat path, must be recorded")
++    registry.dispatch(NAME, {})
++    assert len(writes) == 1, "the sink must reset outside the cron fire"
++
++
++def test_telemetry_sink_exception_does_not_retry_committed_write(caplog):
++    calls = []
++
++    def handler(args, **_kwargs):
++        calls.append(args)
++        return '{"result":"created entities/shard/canonical.md v2"}'
++
++    def broken_sink(_receipt):
++        raise RuntimeError("disposable sink failure")
++
++    registry = _registry(handler)
++    with capture_okengine_writes(broken_sink):
++        result = registry.dispatch(NAME, {"requested": "entities/flat.md"})
++    assert json.loads(result)["result"] == "created entities/shard/canonical.md v2"
++    assert calls == [{"requested": "entities/flat.md"}], (
++        "telemetry failure must not cause a second committed MCP write")
++    assert any("write telemetry sink failed" in row.message for row in caplog.records)
++
++
++def test_parallel_registry_write_results_are_scoped_to_one_fire():
++    registry = _registry(lambda _args, **_kwargs: '{"result":"created entities/a.md v1"}')
++    writes = []
++    lock = threading.Lock()
++
++    def record(receipt):
++        with lock:
++            writes.append(receipt)
++
++    with capture_okengine_writes(record):
++        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
++            futures = [pool.submit(propagate_context_to_thread(registry.dispatch), NAME, {})
++                       for _ in range(20)]
++            assert all("result" in json.loads(f.result()) for f in futures)
++    assert len(writes) == 20
+diff --git a/tools/okengine_write_telemetry.py b/tools/okengine_write_telemetry.py
+new file mode 100644
+index 000000000..6cb540be9
+--- /dev/null
++++ b/tools/okengine_write_telemetry.py
+@@ -0,0 +1,88 @@
++"""Execution-time OKEngine MCP write receipts for one cron fire.
++
++The MCP write server's result is the canonical post-shard path. Model-authored
++messages and later-compacted turn history are never evidence of a write.
++"""
++
++from contextlib import contextmanager
++from contextvars import ContextVar
++import json
++import logging
++import re
++from typing import Callable, Iterator, Optional
++
++logger = logging.getLogger(__name__)
++_write_sink: ContextVar[Optional[Callable[[dict], None]]] = ContextVar(
++    "hermes_okengine_executed_write_sink", default=None)
++
++_DIRECT = re.compile(
++    r"\A(?P<operation>created|updated|patched|tombstoned) "
++    r"(?P<path>[^\s]+) v(?P<version>[1-9][0-9]{0,17})(?=\s|$)")
++_APPEND = re.compile(
++    r"\Aappended to '[^\n']*' in (?P<path>[^\s]+) "
++    r"v(?P<version>[1-9][0-9]{0,17})(?=\s|$)")
++_CONVERGE = re.compile(
++    r"\Aconverged into (?P<path>[^\s]+) \(id [^)]+\) "
++    r"v(?P<version>[1-9][0-9]{0,17})(?=:|\s|$)")
++
++
++@contextmanager
++def capture_okengine_writes(sink: Callable[[dict], None]) -> Iterator[None]:
++    token = _write_sink.set(sink)
++    try:
++        yield
++    finally:
++        _write_sink.reset(token)
++
++
++def _canonical_path(raw: str) -> str | None:
++    if (not raw or raw.startswith("/") or "\\" in raw or "//" in raw
++            or raw.endswith("/")):
++        return None
++    if any(part in {"", ".", ".."} for part in raw.split("/")):
++        return None
++    return raw
++
++
++def parse_okengine_write_result(name: str, result: object) -> dict | None:
++    """Accept an exact write-server success line from a dispatched MCP result."""
++    parts = name.split("__", 2) if isinstance(name, str) else []
++    if (len(parts) != 3 or parts[0] != "mcp"
++            or not (parts[1] == "okengine_write"
++                    or parts[1].startswith("okengine_write_"))):
++        return None
++    try:
++        payload = json.loads(result) if isinstance(result, str) else result
++    except (TypeError, ValueError):
++        return None
++    if not isinstance(payload, dict) or "error" in payload:
++        return None
++    text = payload.get("result")
++    if not isinstance(text, str):
++        return None
++    # No search: a note or model-like preamble mentioning a success line is not
++    # a write-server acknowledgement. Never trust the requested argument path.
++    hit = _DIRECT.match(text) or _APPEND.match(text) or _CONVERGE.match(text)
++    if hit is None:
++        return None
++    path = _canonical_path(hit.group("path"))
++    if path is None:
++        return None
++    operation = hit.groupdict().get("operation") or (
++        "appended" if hit.re is _APPEND else "converged")
++    return {"operation": operation, "path": path,
++            "version": int(hit.group("version")), "tool": name}
++
++
++def record_okengine_write_result(name: str, result: object) -> None:
++    sink = _write_sink.get()
++    if sink is None:
++        return
++    receipt = parse_okengine_write_result(name, result)
++    if receipt is None:
++        return
++    try:
++        sink(receipt)
++    except Exception:
++        # A telemetry failure must not retry a write that already committed.
++        logger.exception("OKEngine write telemetry sink failed for %s", name)
+diff --git a/tools/registry.py b/tools/registry.py
+index 5436e388d..c3ec91b6c 100644
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -838,7 +838,10 @@ class ToolRegistry:
+                 result = entry.handler(args, **kwargs)
+             from tools.tool_execution_telemetry import record_completed_tool_handler
+             record_completed_tool_handler(name)
+-            return self._normalize_handler_result(name, result)
++            normalized = self._normalize_handler_result(name, result)
++            from tools.okengine_write_telemetry import record_okengine_write_result
++            record_okengine_write_result(name, normalized)
++            return normalized
+         except Exception as e:
+             # exc_info already renders the exception, so keep the message copy bounded.
+             logger.exception("Tool %s dispatch error: %s", name, _bound_error_text(str(e)))

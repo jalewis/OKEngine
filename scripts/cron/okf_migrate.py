@@ -44,30 +44,162 @@ _FM_RE = re.compile(r"\A---[ \t]*\n(.*?\n)---[ \t]*(?:\n|\Z)", re.S)
 _SCHEMA_CACHE: dict[str, dict] = {}
 
 
+def _load_schema(sp: Path) -> dict:
+    k = str(sp)
+    if k not in _SCHEMA_CACHE:
+        try:
+            _SCHEMA_CACHE[k] = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}
+        except Exception:
+            _SCHEMA_CACHE[k] = {}
+    return _SCHEMA_CACHE[k]
+
+
 def _governing_schema(root: Path, namespace: str) -> dict:
-    """The domain-pack schema.yaml governing wiki/<namespace>/ — found by walking UP
-    (a sub-domain's own, e.g. wiki/<subdomain>/schema.yaml, else the vault root's). Cached."""
+    """The schema governing wiki/<namespace>/ — a sub-domain's own schema.yaml if it has one
+    (walking UP), else the DEPLOYMENT'S EFFECTIVE schema at the vault root.
+
+    At the root the COMPOSED artifact wins over the pack's raw `schema.yaml`
+    (okengine#515). For a composed/bundle pack the composition is what the write path
+    enforces, and a namespace declared only there was invisible here: on one live
+    deployment the pack's own schema declared partitioning for four namespaces and omitted
+    `sources`, so `_partition_cfg` fell back to its `flat` default, `_new_key` returned
+    None, and this mover reported "0 files to move" — truthfully — while 44k source pages
+    accumulated across five partition shapes with nothing normalizing them. Reshelve had
+    been a silent no-op for that namespace for as long as the pack had been composed. The
+    composed schema declares `sources: by-date`, which the write path was already using.
+    """
     cur = root / "wiki" / namespace
-    while True:
+    while cur != root and cur.parent != cur:
         sp = cur / "schema.yaml"
         if sp.is_file():
-            k = str(sp)
-            if k not in _SCHEMA_CACHE:
-                try:
-                    _SCHEMA_CACHE[k] = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}
-                except Exception:
-                    _SCHEMA_CACHE[k] = {}
-            return _SCHEMA_CACHE[k]
-        if cur == root or cur.parent == cur:
-            return {}
+            return _load_schema(sp)
         cur = cur.parent
+    return _root_schema(root)
+
+
+def _root_schema(root: Path) -> dict:
+    """The deployment's EFFECTIVE schema at the vault root: the composed artifact wins over
+    the pack's raw `schema.yaml`.
+
+    Sole owner of that precedence rule. It used to be inline above while `reshelve.py` kept
+    its OWN reader of `root/schema.yaml` for enumerating namespaces, so fixing the mover left
+    its only caller still blind: reshelve enumerated the four namespaces the raw schema
+    declared, `sources` was not among them, and the drain ran to completion reporting success
+    without ever passing that namespace to the mover (okengine#519).
+    """
+    for sp in (root / ".okengine" / "composed-schema.yaml", root / "schema.yaml"):
+        if sp.is_file():
+            return _load_schema(sp)
+    return {}
+
+
+def partitioned_namespaces(root: Path) -> list[str]:
+    """Every non-flat namespace in the vault — root-level per the EFFECTIVE root schema, plus
+    each sub-domain's own. What a whole-vault drain should iterate; resolved through the same
+    precedence the mover itself uses, so the two cannot disagree about what exists."""
+    out: list[str] = []
+
+    def add(schema: dict, prefix: str) -> None:
+        for leaf, cfg in ((schema.get("partitioning") or {}).get("namespaces") or {}).items():
+            if (cfg or {}).get("strategy", "flat") == "flat":
+                continue
+            ns = f"{prefix}{leaf}"
+            out.append(ns)
+
+    add(_root_schema(root), "")
+    wiki = root / "wiki"
+    if wiki.is_dir():
+        for sd in sorted(p for p in wiki.iterdir() if p.is_dir()):
+            if (sd / "schema.yaml").is_file():
+                add(_load_schema(sd / "schema.yaml"), f"{sd.name}/")
+    return out
+
+
+_UNDECLARED_WARNED: set = set()
 
 
 def _partition_cfg(schema: dict, namespace: str) -> dict:
     # config keys are leaf namespace names (entities/sources/...), even for sub-domains.
     leaf = namespace.split("/")[-1]
-    return ((schema.get("partitioning") or {}).get("namespaces") or {}).get(
-        leaf, {"strategy": "flat"})
+    declared = (schema.get("partitioning") or {}).get("namespaces") or {}
+    if leaf in declared:
+        return declared[leaf]
+    # An UNDECLARED namespace is a gap, not a policy. Genuinely-flat namespaces are
+    # declared explicitly (`predictions: {strategy: flat}`), so falling silently back to
+    # flat here is how a missing declaration became "already correctly placed" and this
+    # mover went quietly idle (okengine#515). Still defaults to flat — changing placement
+    # on an undeclared namespace would be worse — but says so, once, per schema+namespace.
+    if declared and leaf not in _UNDECLARED_WARNED:
+        _UNDECLARED_WARNED.add(leaf)
+        print(f"okf_migrate: WARNING namespace {leaf!r} has no `partitioning.namespaces` "
+              f"entry in the governing schema (declares: {', '.join(sorted(declared))}) — "
+              "treating it as flat, so NOTHING will be re-filed for it. Declare it "
+              "explicitly if that is intended.", file=sys.stderr)
+    return {"strategy": "flat"}
+
+
+def is_tombstoned(fm: dict | None) -> bool:
+    """The engine-wide spelling of "retired" — identical to canonical_assemble, corpus_audit
+    and the dedup tools, so every consumer agrees on what is LIVE. Disagreeing about that is
+    its own bug class: reid reported 16,031 outstanding duplicates the dedup had already
+    resolved because it counted retired pages (okengine#516)."""
+    return str((fm or {}).get("status") or "").strip().lower() == "tombstoned"
+
+
+def _fm_at(root: Path, key: str) -> dict:
+    """Frontmatter of the page at a wiki-relative key (no .md), or {}."""
+    try:
+        mt = _FM_RE.match((root / "wiki" / (key + ".md")).read_text(
+            encoding="utf-8", errors="replace"))
+    except OSError:
+        return {}
+    if not mt:
+        return {}
+    try:
+        fm = yaml.safe_load(mt.group(1))
+    except Exception:
+        return {}
+    return fm if isinstance(fm, dict) else {}
+
+
+def classify_collisions(root: Path, collisions: list[tuple[str, str]]) -> dict[str, list]:
+    """Why each held-back collision could not be placed (okengine#520).
+
+    A bare count reads as one undifferentiated backlog. These are three different problems
+    with three different owners:
+
+    ``redundant_tombstone`` — the seat holds a tombstone whose ``superseded_by`` IS the page
+      trying to move in. Provably redundant: once the survivor occupies that path, a link
+      landing there reaches the survivor instead of a redirect pointing at it. Resolvable —
+      but by the dedup pass, because retiring a duplicate is not a placement decision and
+      this mover does not delete.
+    ``blocked_by_tombstone`` — the seat holds a tombstone pointing somewhere ELSE. Its redirect
+      is still load-bearing for a different page, so the seat is not free.
+    ``live_conflict`` — two live pages want one seat. The genuine duplicate-slug case
+      okengine#165 describes, and the dedup pass's job.
+
+    ``superseded_by`` is matched as a PATH first and an id second, because a path is what this
+    engine actually writes: `dedup_sources_by_url` stores `survivor_rel` and
+    `write_server._tombstone` runs the value through `_safe()`, a path sanitiser. Measured on a
+    live vault, 15,978 of 16,061 values are path-shaped. Comparing only against the mover's id —
+    as this did first — matched just the 83-value minority and misfiled two genuinely redundant
+    seats as unresolvable. Both forms are accepted rather than one being declared correct: the
+    field has no schema definition to appeal to, so tolerating what the corpus contains beats
+    asserting a convention it does not follow.
+    """
+    out: dict[str, list] = {"redundant_tombstone": [], "blocked_by_tombstone": [],
+                            "live_conflict": []}
+    for cur, new in collisions:
+        occupant = _fm_at(root, new)
+        if not is_tombstoned(occupant):
+            out["live_conflict"].append((cur, new))
+            continue
+        superseded = str(occupant.get("superseded_by") or "").strip()
+        mover_id = str(_fm_at(root, cur).get("id") or "").strip()
+        redundant = bool(superseded) and (superseded == cur
+                                          or (bool(mover_id) and superseded == mover_id))
+        out["redundant_tombstone" if redundant else "blocked_by_tombstone"].append((cur, new))
+    return out
 
 
 def _letter(slug: str) -> str:
@@ -153,7 +285,12 @@ def find_page(root: Path, namespace: str, slug: str) -> Path | None:
     hits = [p for p in base.rglob(f"{slug}.md") if p.stem == slug]
     if not hits:
         return None
-    return sorted(hits, key=lambda p: (-len(p.parts), p.as_posix()))[0]
+    # A LIVE copy outranks any tombstone regardless of depth (okengine#663): a retired page never
+    # holds a seat (build_map), so an importer's update must land on the live page, not be routed
+    # INTO a deeper tombstone. A lone tombstone is still returned so callers can see the slug is
+    # retired (the write path refuses to resurrect it).
+    return sorted(hits, key=lambda p: (is_tombstoned(_fm_at(root, p.relative_to(root / "wiki").as_posix()[:-3])),
+                                       -len(p.parts), p.as_posix()))[0]
 
 
 def _day(slug: str, fm: dict) -> str:
@@ -181,6 +318,19 @@ def reshard_seg(reshard_by: str, slug: str, fm: dict) -> "str | None":
     return fn(slug, fm) if fn else None
 
 
+def desired_key(root: Path, namespace: str, slug: str, fm: dict | None = None) -> str:
+    """The seat the declared strategy WANTS for <namespace>/<slug> (canonical key + reshard
+    segment), ignoring what currently sits on disk. write_key layers the on-disk convergence
+    rules on top; the dedup pass uses this directly to decide whether a seat held by a
+    redundant tombstone may be taken (okengine#663)."""
+    root = Path(root)
+    fm = fm or {}
+    base_key = canonical_key(root, namespace, slug, fm)
+    pcfg = _partition_cfg(_governing_schema(root, namespace), namespace)
+    seg = reshard_seg(pcfg.get("reshard_by"), slug, fm)
+    return f"{base_key.rsplit('/', 1)[0]}/{seg}/{slug}" if seg else base_key
+
+
 def write_key(root: Path, namespace: str, slug: str, fm: dict | None = None) -> str:
     """Wiki-relative key (no .md) a direct writer should use.
 
@@ -195,12 +345,11 @@ def write_key(root: Path, namespace: str, slug: str, fm: dict | None = None) -> 
     """
     root = Path(root)
     fm = fm or {}
-    base_key = canonical_key(root, namespace, slug, fm)
-    pcfg = _partition_cfg(_governing_schema(root, namespace), namespace)
-    seg = reshard_seg(pcfg.get("reshard_by"), slug, fm)
-    desired = f"{base_key.rsplit('/', 1)[0]}/{seg}/{slug}" if seg else base_key
+    desired = desired_key(root, namespace, slug, fm)
     desired_path = root / "wiki" / f"{desired}.md"
-    if desired_path.is_file():
+    # An occupied seat is only "taken" by a LIVE page; a tombstone there must not swallow the
+    # write when a live copy exists elsewhere (okengine#663). find_page prefers the live copy.
+    if desired_path.is_file() and not is_tombstoned(_fm_at(root, desired)):
         return desired
 
     existing = find_page(root, namespace, slug)
@@ -228,7 +377,14 @@ def build_map(root: Path, namespace: str, only_types: set[str] | None = None,
     config (domain-agnostic). Covers flat pages AND pages nested in a non-canonical
     layout (okengine#165). Collisions — a destination already occupied by a different
     file, or two sources mapping to one destination — are excluded from the map and
-    returned for the dedup pass. only_types / only_year: staged-pilot filters."""
+    returned for the dedup pass. only_types / only_year: staged-pilot filters.
+
+    A TOMBSTONED page never moves (okengine#520). It is a retired duplicate whose path
+    exists so links to the superseded location still resolve; relocating it would move the
+    redirect away from the very path that needs it, and — because it still competes for a
+    canonical seat — a retired page was holding a LIVE page out of its own shard. On one
+    live vault 44 of 80 held-back collisions were exactly that: a tombstone versus a live
+    page, or two tombstones arguing over a seat neither should occupy."""
     schema = _governing_schema(root, namespace)
     pcfg = _partition_cfg(schema, namespace)
     canonical = set((schema.get("types") or {}).keys())
@@ -254,6 +410,8 @@ def build_map(root: Path, namespace: str, only_types: set[str] | None = None,
             continue
         if only_types is not None and str(fm.get("type") or "").strip() not in only_types:
             continue
+        if is_tombstoned(fm):
+            continue                       # retired: never moves, never claims a seat
         cur = p.relative_to(root / "wiki").as_posix()[:-3]
         new = _new_key(namespace, slug, fm, pcfg, canonical)
         if new and only_year and new.startswith(f"{namespace}/") \
@@ -331,6 +489,12 @@ def main(argv: list[str]) -> int:
         print(f"   {k}  ->  {move_map[k]}")
     if collisions:
         print(f"  ! collisions (dedup first — true-dup merge or slug disambiguation, okengine#165):")
+        kinds = classify_collisions(root, collisions)
+        print(f"      redundant-tombstone seat : {len(kinds['redundant_tombstone'])}"
+              f"  (superseded_by IS the mover — dedup can retire it)")
+        print(f"      tombstone points elsewhere: {len(kinds['blocked_by_tombstone'])}"
+              f"  (or malformed pointer — inspect, do not auto-resolve)")
+        print(f"      live-vs-live slug conflict: {len(kinds['live_conflict'])}")
         for cur, new in collisions[:40]:
             print(f"      {cur}  ~X~>  {new}")
         if len(collisions) > 40:

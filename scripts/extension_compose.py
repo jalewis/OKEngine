@@ -19,13 +19,27 @@ gate (do not enable / do not deploy).
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import json
+import os
 import re
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
+
+
+def _cron_jitter_mod():
+    """Load the sibling helper without assuming ``scripts`` is on sys.path."""
+    path = _HERE / "cron_jitter.py"
+    spec = importlib.util.spec_from_file_location("extension_cron_jitter", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+concrete_cron_error = _cron_jitter_mod().concrete_cron_error
 
 # Surfaces the synthesized job opts into: read via the query MCP, write via the
 # enforced okengine-write path (the §4 MCP-client contract).
@@ -37,6 +51,24 @@ _WORKDIR = "/opt/vault"
 SCRIPTS_ROOT = "/opt/data/scripts"
 TRIGGER_NAME = "trigger.sh"            # the generated sidecar launcher (#135)
 _ENV_TOKEN_RE = re.compile(r"[^A-Z0-9]+")
+
+
+def _script_uses_llm_lib(path: Path) -> bool:
+    """Return true when a deterministic operation imports the sanctioned LLM client."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        return False  # existence/syntax are enforced by their owning validation stages
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and any(
+                alias.name == "llm_lib" or alias.name.endswith(".llm_lib")
+                for alias in node.names):
+            return True
+        if isinstance(node, ast.ImportFrom) and (
+                node.module == "llm_lib" or str(node.module or "").endswith(".llm_lib")
+                or any(alias.name == "llm_lib" for alias in node.names)):
+            return True
+    return False
 
 
 def _discovery_mod():
@@ -210,6 +242,27 @@ def _resolve_prompt(op: dict, ext_dir) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _op_timeout(label: str, op: dict) -> tuple[int | None, str | None]:
+    """(timeout_seconds | None, error | None) for one operation.
+
+    Absent means "inherit the runner default" and is fine. A DECLARED value that is not a positive
+    integer is an error rather than a silent fallback: the whole point of okengine#561 is that a
+    timeout nobody honours is indistinguishable from one nobody set.
+    """
+    raw = op.get("timeout")
+    if raw is None:
+        return None, None
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        return None, f"{label}: operation.timeout must be a positive integer of seconds, got {raw!r}"
+    try:
+        seconds = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None, f"{label}: operation.timeout must be a positive integer of seconds, got {raw!r}"
+    if seconds <= 0:
+        return None, f"{label}: operation.timeout must be positive, got {seconds}"
+    return seconds, None
+
+
 def _synthesize_one(ext_id: str, m: dict, trust, op_name: str | None, op: dict,
                     ext_dir=None) -> tuple[dict | None, list[str], list[str]]:
     """One operation -> (job | None, errors, warnings). The job is namespaced
@@ -223,10 +276,20 @@ def _synthesize_one(ext_id: str, m: dict, trust, op_name: str | None, op: dict,
     sched = op.get("schedule")
     sched_ok = (isinstance(sched, dict) and sched.get("kind") == "cron"
                 and bool(sched.get("expr")))
+    if sched_ok:
+        expr = str(sched["expr"]).strip()
+        fields = expr.split()
+        if len(fields) == 5 and fields[0] in {"0", "*", "*/1"}:
+            errors.append(f"{label}: herd-prone minute-0/every-minute schedule {expr!r}; "
+                          "use an @jitter:* sentinel so each deployment receives a nonzero minute")
+            return None, errors, warnings
 
-    # sidecar / image entrypoint -> a TRIGGER job whose script is the generated
-    # wrapper that launches the container (okengine#135). The wrapper + the compose
-    # service are materialized by the deploy from sidecar_specs().
+    # Sidecar execution remains operator-opt-in (docs/design/sidecar-contract.md).
+    # Generate its compose service and candidate wrapper via sidecar_specs(), but do
+    # not install a cron job that points at /opt/data/scripts: deploy does not stage
+    # the wrapper there and the gateway deliberately has neither the Docker socket
+    # nor a Docker client. Emitting an enabled job here produced a green deploy with
+    # a permanently missing script on every tick (F08-sidecar-restore).
     if trust == "sidecar" or (isinstance(entrypoint, dict) and "image" in entrypoint):
         if not (isinstance(entrypoint, dict) and "image" in entrypoint):
             errors.append(f"{label}: trust=sidecar requires operation.entrypoint.image")
@@ -234,18 +297,15 @@ def _synthesize_one(ext_id: str, m: dict, trust, op_name: str | None, op: dict,
         if not sched_ok:
             errors.append(f"{label}: operation.schedule must be {{kind: cron, expr: ...}}")
             return None, errors, warnings
-        job = {
-            "id": _job_id(name),
-            "name": name,
-            "enabled": True,
-            "schedule": {"kind": "cron", "expr": sched["expr"]},
-            "workdir": _WORKDIR,
-            "script": f"{SCRIPTS_ROOT}/{ext_id}/{TRIGGER_NAME}",   # generated wrapper (#135)
-            "prompt": None,
-            "no_agent": True,
-            "deliver": "local",
-        }
-        return job, errors, warnings
+        timeout, terr = _op_timeout(label, op)   # sidecar triggers deserve the same deadline (#561)
+        if terr:
+            errors.append(terr)
+            return None, errors, warnings
+        warnings.append(
+            f"{label}: sidecar artifacts generated, but automatic scheduling is disabled; "
+            "the gateway has no supported container-runner transport"
+        )
+        return None, errors, warnings
 
     # in-gateway op. Two flavors, discriminated by a `prompt`:
     #   - no_agent: a deterministic script (entrypoint REQUIRED), runs to completion.
@@ -278,6 +338,12 @@ def _synthesize_one(ext_id: str, m: dict, trust, op_name: str | None, op: dict,
     if not sched_ok:
         errors.append(f"{label}: operation.schedule must be {{kind: cron, expr: ...}}")
         return None, errors, warnings
+    if not is_agent and has_script and ext_dir:
+        entry_path = Path(ext_dir) / script
+        if entry_path.is_file() and _script_uses_llm_lib(entry_path) and not op.get("cost_bearing"):
+            errors.append(f"{label}: no_agent entrypoint {script!r} imports llm_lib but does not "
+                          "declare cost_bearing: true")
+            return None, errors, warnings
 
     job = {
         "id": _job_id(name),
@@ -316,6 +382,21 @@ def _synthesize_one(ext_id: str, m: dict, trust, op_name: str | None, op: dict,
     model = op.get("model")             # per-operation model override: the cron scheduler
     if isinstance(model, str) and model.strip():   # honors job["model"] over the config default,
         job["model"] = model.strip()    # so a low-stakes lane can run on a free/cheap model.
+    # Per-operation run deadline. cron-plus resolves it as
+    # job.get("timeout", $OKENGINE_AGENT_RUN_TIMEOUT_SECONDS, 1200), so an operation that declares
+    # one and never has it carried here silently inherits the 1200s default -- with nothing
+    # anywhere saying the declaration was ignored. Measured on okcti-test before this fix: 5
+    # extension cron defs declared 300-3600s and 0 of 27 extension-sourced jobs carried a timeout
+    # (okengine#561). One lane declared 600 and was killed at 1200 on eight consecutive runs.
+    timeout, terr = _op_timeout(label, op)
+    if terr:
+        errors.append(terr)
+        return None, errors, warnings
+    if timeout is not None:
+        job["timeout"] = timeout
+    max_iterations = op.get("max_iterations")
+    if isinstance(max_iterations, int) and max_iterations > 0:
+        job["max_iterations"] = max_iterations
     if op.get("cost_bearing"):          # a no_agent op that still spends via llm_lib — budget_guard
         job["cost_bearing"] = True      # must be able to pause it despite no_agent (invariant-audit #36)
     after = op.get("after")             # okengine#129: hard cross-job dependency(ies)
@@ -364,7 +445,7 @@ def synthesize_ops(record: dict) -> tuple[list[dict], list[str], list[str]]:
         job["extension"] = ext_id               # provenance marker (okengine#141): lets the
         # cron split/dump tooling recognize extension-tier jobs (they regenerate from the
         # extension pass, not from cron-tiers.yaml) instead of failing them as unclassified.
-        if job["name"] in local_seen:           # defensive — keys are unique by construction
+        if job["name"] in local_seen:  # pragma: no cover - operation keys uniquely determine names
             errors.append(f"{ext_id}: duplicate operation job name {job['name']}")
         local_seen.add(job["name"])
         if trust != "sidecar" and config_env:
@@ -394,7 +475,7 @@ def synthesize_jobs(resolved: dict[str, dict]) -> tuple[list[dict], list[str], l
         errors.extend(errs)
         warnings.extend(warns)
         for job in ext_jobs:
-            if job["name"] in seen:
+            if job["name"] in seen:  # pragma: no cover - extension id namespaces every job name
                 errors.append(f"job-id collision among extensions: {job['name']}")
             seen.add(job["name"])
             jobs.append(job)
@@ -530,7 +611,9 @@ def render_trigger_wrapper(ext_id: str, compose_file: str, project: str) -> str:
         "#!/usr/bin/env bash\n"
         f"# generated by okengine#135 for extension {ext_id} — DO NOT EDIT\n"
         "set -euo pipefail\n"
-        f"exec docker compose -f {compose_file} -p {project} run --rm -T "
+        f"exec docker compose -f {compose_file} "
+        "-f .okengine/generated/sidecars.compose.yml "
+        f"-p {project} run --rm -T "
         f"{ext_id}-sidecar\n"
     )
 
@@ -634,6 +717,12 @@ def _fragments_from_resolved(resolved: dict) -> tuple[list, list[str]]:
             if not isinstance(data, dict):
                 errors.append(f"{ext_id}: schema fragment {sf} is not a mapping")
                 continue
+            # Older installed assessments manifests also listed JSON Schema result contracts in
+            # `schema:`. They are runtime payload validators, not OKF ownership fragments. Keep
+            # accepting those installed manifests during an engine upgrade; current manifests no
+            # longer list the auxiliary contracts here.
+            if "$schema" in data and data.get("type") in {"object", "array"}:
+                continue
             frags.append((f"ext:{ext_id}", data))
     return frags, errors
 
@@ -682,8 +771,20 @@ def write_composed_schema(pack_dir) -> list[str]:
     # fragments — the in-gateway validator/conformance recompose then agrees with this artifact
     # instead of silently omitting every enabled extension's schema.
     composed["_fragments"] = [[owner, frag] for owner, frag in frags]
-    artifact.write_text(yaml.safe_dump(composed, sort_keys=False, allow_unicode=True),
-                        encoding="utf-8")
+    temp = artifact.with_name(artifact.name + ".tmp")
+    try:
+        with temp.open("w", encoding="utf-8") as stream:
+            stream.write(yaml.safe_dump(composed, sort_keys=False, allow_unicode=True))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, artifact)
+        directory_fd = os.open(artifact.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temp.unlink(missing_ok=True)
     return []
 
 
@@ -821,8 +922,8 @@ def _apply_schedule_overrides(jobs: list[dict], pack_dir: Path) -> list[str]:
             errors.append(f"extension-schedules.json: no extension job named {name!r} "
                           "(stale override key?)")
             continue
-        if not isinstance(expr, str) or len(expr.split()) != 5:
-            errors.append(f"extension-schedules.json[{name!r}]: expr must be a 5-field cron string")
+        if error := concrete_cron_error(expr):
+            errors.append(f"extension-schedules.json[{name!r}]: {error}")
             continue
         job["schedule"] = {"kind": "cron", "expr": expr.strip()}
     return errors

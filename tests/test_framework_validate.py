@@ -1,5 +1,6 @@
 """Regression: `framework validate` catches deploy-breaking pack defects."""
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -43,6 +44,64 @@ def test_scaffolded_pack_validates_clean(tmp_path):
     assert v.main([str(pack), "--quiet"]) == 0
 
 
+def test_schema_exclude_rejects_ambiguous_subtree_before_deploy(tmp_path):
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    schema = yaml.safe_load((pack / "schema.yaml").read_text(encoding="utf-8"))
+    schema["exclude"] = ["assessments/staging"]
+    (pack / "schema.yaml").write_text(yaml.safe_dump(schema), encoding="utf-8")
+    v = _load("framework_validate_exclude_grammar", VAL)
+
+    report = v.validate(pack)
+
+    assert any(severity == "FAIL" and check == "schema.exclude"
+               and "not a namespace exclusion" in detail
+               for severity, check, detail in report.rows)
+
+
+def test_runtime_config_rejects_qwen_coder_with_global_fallback(tmp_path):
+    """P0: a Qwen failure must be visible, never silently become paid cloud traffic."""
+    pack = tmp_path / "pack"
+    cfg = pack / ".hermes-data" / "config.yaml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(yaml.safe_dump({
+        "model": {"default": "qwen3-coder:30b", "provider": "custom"},
+        "fallback_providers": [{"provider": "deepseek", "model": "deepseek-flash"}],
+        "terminal": {"backend": "local"},
+        "mcp_servers": {
+            "okengine": {"headers": {"Authorization": "Bearer test"}},
+            "okengine-write": {},
+            "okengine-write-source-quality": {},
+        },
+    }))
+    v = _load("framework_validate_qwen_fallback", VAL)
+    report = v.Report()
+    v.check_runtime_config(pack, report)
+    assert any(s == "FAIL" and c == "Qwen Coder fallback policy"
+               for s, c, _d in report.rows)
+
+
+def test_runtime_config_accepts_qwen_coder_with_empty_fallback(tmp_path):
+    pack = tmp_path / "pack"
+    cfg = pack / ".hermes-data" / "config.yaml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(yaml.safe_dump({
+        "model": {"default": "qwen3-coder:30b-tools", "provider": "custom"},
+        "fallback_providers": [],
+        "terminal": {"backend": "local"},
+        "mcp_servers": {
+            "okengine": {"headers": {"Authorization": "Bearer test"}},
+            "okengine-write": {},
+            "okengine-write-source-quality": {},
+        },
+    }))
+    v = _load("framework_validate_qwen_no_fallback", VAL)
+    report = v.Report()
+    v.check_runtime_config(pack, report)
+    assert not any(s == "FAIL" and c == "Qwen Coder fallback policy"
+                   for s, c, _d in report.rows)
+
+
 def test_compose_drift_ignores_commented_base_port(tmp_path):
     """Regression (library deploy-matrix): the port-offset drift check greps the RAW compose
     text, so a commented-out example binding that shows the un-offset base port — e.g. a doc
@@ -82,6 +141,33 @@ def test_broken_schema_is_a_fail(tmp_path):
     (pack / "schema.yaml").write_text("types: [this, is, not, a, mapping\n:::bad yaml")
     v = _load("framework_validate", VAL)
     assert v.main([str(pack), "--quiet"]) == 1
+
+
+def test_unknown_reshard_strategy_is_a_fail(tmp_path):
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    schema = yaml.safe_load((pack / "schema.yaml").read_text())
+    namespace = next(iter(schema["partitioning"]["namespaces"]))
+    schema["partitioning"]["namespaces"][namespace]["reshard_by"] = "year"
+    (pack / "schema.yaml").write_text(yaml.safe_dump(schema, sort_keys=False))
+
+    v = _load("framework_validate_bad_reshard", VAL)
+    rows = v.validate(pack).rows
+    assert any(s == "FAIL" and c == "schema.yaml reshard_by" for s, c, _d in rows)
+
+
+def test_scalar_namespace_partition_config_does_not_raise_a_false_reshard_error(tmp_path):
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    schema = yaml.safe_load((pack / "schema.yaml").read_text())
+    schema["partitioning"]["namespaces"]["broken"] = "scalar"
+    (pack / "schema.yaml").write_text(yaml.safe_dump(schema, sort_keys=False))
+
+    v = _load("framework_validate_scalar_namespace", VAL)
+    rows = v.validate(pack).rows
+    assert not any(
+        check == "schema.yaml reshard_by" for _status, check, _detail in rows
+    ), "a non-mapping namespace config has no reshard_by value to reject"
 
 
 def test_feed_validation_rejects_dtd_entity_opml(tmp_path):
@@ -441,6 +527,30 @@ def test_cron_without_usable_schedule_is_a_fail(tmp_path):
     assert "no-expr" in fails        # empty expr caught despite the dict being truthy
     assert "no-action" in fails      # neither script nor prompt
     assert v.main([str(pack), "--quiet"]) == 1
+
+
+def test_domain_cron_rejects_spring_forward_loss_patterns(tmp_path):
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    v = _load("framework_validate", VAL)
+    import json
+    dc = pack / "crons/domain-crons.json"
+    dc.write_text(json.dumps([
+        {"name": "dense-gap", "schedule": {"expr": "0 0-4,8,12,16,20 * * *"},
+         "prompt": "x", "enabled_toolsets": []},
+        {"name": "single-gap", "schedule": {"expr": "0 2 * * *"},
+         "prompt": "x", "enabled_toolsets": []},
+    ]))
+    failures = [(context, detail) for status, context, detail in v.validate(pack).rows
+                if status == "FAIL"]
+    assert any("dense-gap" in context and "collapse" in detail for context, detail in failures)
+    assert any("single-gap" in context and "skipped" in detail for context, detail in failures)
+    assert v._dst_schedule_problem("0 */2 * * *") is None
+    assert v._dst_schedule_problem("0 1-23/2 * * *") is None
+    assert v._fixed_cron_hours("") == []
+    assert v._fixed_cron_hours("0 */0 * * *") == []
+    assert v._fixed_cron_hours("0 a-b * * *") == []
+    assert v._fixed_cron_hours("0 nope * * *") == []
 
 
 def test_empty_engine_template_prompt_is_a_fail(tmp_path):
@@ -822,3 +932,263 @@ def test_owns_check_honors_schema_exclude(tmp_path):  # invariant-audit #351 / #
     v.check_owns_covers_schema(pack, r)
     assert not any("dashboards" in d for s, c, d in r.rows), \
         f"an EXCLUDED namespace must not warn: {r.rows}"
+
+
+def _percheck_cron(pack: Path, *, script_body: str | None, script_name="select_thing.py"):
+    """A pack cron declaring completion=per-selected-item, with a selector we control."""
+    import json
+    crons = pack / "crons"
+    crons.mkdir(parents=True, exist_ok=True)
+    if script_body is not None:
+        sdir = crons / "scripts"
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / script_name).write_text(script_body)
+    (crons / "domain-crons.json").write_text(json.dumps([{
+        "name": "thing-drain",
+        "id": "aaaabbbbcccc",
+        "script": script_name,
+        "schedule": {"kind": "cron", "expr": "0 * * * *"},
+        "enabled": True,
+        "workdir": "/opt/vault",
+        "enabled_toolsets": ["okengine-write", "okengine"],
+        "adversarial_fixtures": ["tests/cron/test_model_write_contract_inventory.py"],
+        "output_contract": {"api": 1, "allowed_namespaces": ["entities"],
+                            "allowed_types": ["*"], "operations": ["update"],
+                            "required_fields": ["type"], "required_relationships": [],
+                            "body": {"required": False, "min_non_whitespace": 0},
+                            "unknown_fields": "reject", "unresolved_links": "review",
+                            "placeholder_links": "reject",
+                            "completion": "per-selected-item"},
+    }], indent=1))
+
+
+def test_per_selected_item_lane_without_a_manifest_writer_is_a_fail(tmp_path):
+    """okengine#478: declaring the contract without writing the manifest fails EVERY run.
+
+    `per-selected-item` makes the runner verify the receipt against the selection manifest.
+    A selector that never writes one yields "selection manifest unavailable" forever, and the
+    failure reads like a model fault. Measured live: 6 engine lanes in exactly this state,
+    171 failed receipts. Two surfaces that must agree, with nothing enforcing the agreement.
+    """
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    _percheck_cron(pack, script_body="print('I select things but write no manifest')\n")
+    v = _load("framework_validate", VAL)
+    rows = v.validate(pack).rows
+    assert any(s == "FAIL" and "never writes a selection manifest" in d
+               for s, _c, d in rows), [r for r in rows if r[0] == "FAIL"]
+
+
+def test_per_selected_item_lane_with_a_manifest_writer_passes(tmp_path):
+    """The other direction: a selector that writes the manifest must NOT be flagged."""
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    _percheck_cron(pack, script_body=(
+        "from selection_manifest import write_selection_manifest\n"
+        "write_selection_manifest([], 'x.json')\n"))
+    v = _load("framework_validate", VAL)
+    rows = v.validate(pack).rows
+    assert not any("selection manifest" in d for s, _c, d in rows if s == "FAIL"), rows
+
+
+def test_required_write_lane_rejects_two_iteration_budget(tmp_path):
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    _percheck_cron(pack, script_body="print('select')\n")
+    path = pack / "crons/domain-crons.json"
+    jobs = json.loads(path.read_text())
+    jobs[0]["output_contract"]["completion"] = "run"
+    jobs[0]["output_contract"]["required_write_path"] = "briefings/daily-{date}.md"
+    jobs[0]["max_iterations"] = 2
+    path.write_text(json.dumps(jobs))
+    rows = _load("framework_validate", VAL).validate(pack).rows
+    assert any(s == "FAIL" and c == "cron iteration budget" and "at least 6" in d
+               for s, c, d in rows), rows
+
+
+def test_required_write_lane_accepts_bounded_recovery_budget(tmp_path):
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    _percheck_cron(pack, script_body="print('select')\n")
+    path = pack / "crons/domain-crons.json"
+    jobs = json.loads(path.read_text())
+    jobs[0]["output_contract"]["completion"] = "run"
+    jobs[0]["output_contract"]["required_write_path"] = "briefings/daily-{date}.md"
+    jobs[0]["max_iterations"] = 8
+    path.write_text(json.dumps(jobs))
+    rows = _load("framework_validate", VAL).validate(pack).rows
+    assert not any(s == "FAIL" and c == "cron iteration budget" for s, c, _d in rows), rows
+
+
+def test_unfindable_selector_warns_rather_than_vacuously_passing(tmp_path):
+    """An absent selector is UNDETECTABLE, not clean — it must warn, never silently pass."""
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    _percheck_cron(pack, script_body=None)          # declared, but no file written
+    v = _load("framework_validate", VAL)
+    rows = v.validate(pack).rows
+    assert any(s == "WARN" and "cannot confirm" in d for s, _c, d in rows), rows
+
+
+def _partitioned_pack(tmp_path, strategy="by-letter"):
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    sp = pack / "schema.yaml"
+    sch = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}
+    sch.setdefault("partitioning", {}).setdefault("namespaces", {})["things"] = {"strategy": strategy}
+    sp.write_text(yaml.safe_dump(sch, sort_keys=False), encoding="utf-8")
+    sdir = pack / "crons" / "scripts"
+    sdir.mkdir(parents=True, exist_ok=True)
+    return pack, sdir
+
+
+def _fails(pack):
+    v = _load("framework_validate", VAL)
+    return [(c, d) for s, c, d in v.validate(pack).rows if s == "FAIL"]
+
+
+def test_hand_built_path_into_a_partitioned_namespace_fails(tmp_path):
+    """okengine#54. `canonical_key`/`write_key` exist so an importer and the reshelve drain 'can
+    never disagree and re-open the loop'. A lane that hand-builds the path re-creates the page at
+    its own spelling each run while the drain files it under the declared strategy — on one live
+    vault, 48 duplicated records, NINE of which disagreed about whether the judgment was live."""
+    pack, sdir = _partitioned_pack(tmp_path)
+    (sdir / "lane.py").write_text(
+        "rel = f'things/kind/{rec}.md'\n", encoding="utf-8")
+    hits = [d for c, d in _fails(pack) if c == "cron partition-aware writes"]
+    assert hits and "things/kind" in hits[0], _fails(pack)
+
+
+def test_quoted_interpolation_does_not_hide_the_offender(tmp_path):
+    """The real lanes read f\"assessments/identity/{rec['id']}.md\" — inner QUOTES that no
+    quote-delimited regex can span. A text scan missed exactly the three lanes this check exists
+    for, so the check parses the AST and renders interpolations to a shape."""
+    pack, sdir = _partitioned_pack(tmp_path)
+    (sdir / "lane.py").write_text(
+        "rel = f\"things/kind/{record['id'].rsplit(':', 1)[-1]}.md\"\n", encoding="utf-8")
+    hits = [d for c, d in _fails(pack) if c == "cron partition-aware writes"]
+    assert hits and "things/kind" in hits[0], _fails(pack)
+
+
+def test_a_computed_shard_segment_is_not_judged(tmp_path):
+    """An interpolated segment may compute the correct seat; statically it cannot be called wrong.
+    corpus_audit's partition_collisions catches those against the real corpus instead."""
+    pack, sdir = _partitioned_pack(tmp_path)
+    (sdir / "lane.py").write_text(
+        "rel = f\"things/{slug[0].lower()}/{slug}.md\"\n", encoding="utf-8")
+    assert [d for c, d in _fails(pack) if c == "cron partition-aware writes"] == []
+
+
+def test_a_single_letter_segment_is_a_plausible_shard(tmp_path):
+    pack, sdir = _partitioned_pack(tmp_path)
+    (sdir / "lane.py").write_text("rel = f'things/a/{slug}.md'\n", encoding="utf-8")
+    assert [d for c, d in _fails(pack) if c == "cron partition-aware writes"] == []
+
+
+def test_a_flat_namespace_may_carry_sub_segments(tmp_path):
+    """flat namespaces 'may legitimately carry sub-segments' (is_partitioned's own contract), so
+    the check must not fire on every correctly-built pack layout."""
+    pack, sdir = _partitioned_pack(tmp_path, strategy="flat")
+    (sdir / "lane.py").write_text("rel = f'things/kind/{rec}.md'\n", encoding="utf-8")
+    assert [d for c, d in _fails(pack) if c == "cron partition-aware writes"] == []
+
+
+def test_a_syntactically_broken_lane_is_the_compile_checks_verdict(tmp_path):
+    """This check must not double-report a syntax error as a placement defect."""
+    pack, sdir = _partitioned_pack(tmp_path)
+    (sdir / "lane.py").write_text("def broken(:\n", encoding="utf-8")
+    assert [d for c, d in _fails(pack) if c == "cron partition-aware writes"] == []
+
+
+def test_a_pack_script_shadowing_an_engine_cron_script_is_a_fail(tmp_path):
+    """`deploy-cron-scripts.sh` stages the engine's `scripts/cron/*.py` first and the pack's
+    `crons/scripts/*.py` second, into the SAME `/opt/data/scripts/`. A shared basename means the
+    pack copy silently wins -- on every deploy, forever -- and nothing downstream notices: the
+    deploy exits 0, the file is present, and the cron runs "successfully" doing whatever the fork
+    does.
+
+    Measured: okcti-test carried a pre-#267 fork of `nvd_import.py`. The engine had since taken
+    ownership of that lane, and the regenerated cron def already passed `NVD_PAGE_MODEL` -- which
+    the fork ignores. So a live deployment ran a three-week-stale lane whose own configuration
+    described a different one, and it surfaced only because a hash was compared inside the
+    container. This is the gate that makes it visible before the deploy, not after.
+    """
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    v = _load("framework_validate", VAL)
+    engine_cron = Path(v.__file__).resolve().parent / "cron"
+    victim = sorted(p.name for p in engine_cron.glob("*.py"))[0]
+
+    scripts = pack / "crons" / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / victim).write_text("# a pack fork of an engine lane\n", encoding="utf-8")
+
+    r = v.validate(pack)
+    fails = [(c, d) for s, c, d in r.rows if s == "FAIL"]
+    assert any("shadow" in d for _c, d in fails), f"shadowing must FAIL, got: {fails}"
+    assert any(victim in d for _c, d in fails), f"the offending file must be named: {fails}"
+    assert v.main([str(pack), "--quiet"]) != 0, "a shadow must make the whole validate fail"
+
+
+def test_a_pack_script_with_its_own_name_is_not_a_shadow(tmp_path):
+    """The negative half. Packs are SUPPOSED to ship domain cron scripts -- if any pack script
+    tripped this, every pack would fail validation and the check would be turned off rather than
+    fixed. Only a same-basename collision is refused; a deliberate override renames."""
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    v = _load("framework_validate", VAL)
+
+    scripts = pack / "crons" / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "my_domain_lane.py").write_text("print('domain')\n", encoding="utf-8")
+
+    r = v.validate(pack)
+    fails = [(c, d) for s, c, d in r.rows if s == "FAIL"]
+    assert fails == [], f"a distinctly-named pack script is normal, got: {fails}"
+    assert any("no pack script shadows" in d for s, _c, d in r.rows if s == "OK"), r.rows
+
+
+def test_a_shadowing_script_is_not_described_as_engine_supplied(tmp_path):
+    """The cron-def line used to say "supplied by the engine" whenever the engine HAD the script —
+    including when the pack also had it, which is the one case where the engine's copy is precisely
+    what does NOT run. That reassuring sentence is what a reader saw for three weeks while okcti ran
+    a fork. It must name the file that actually runs."""
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    v = _load("framework_validate", VAL)
+    victim = sorted(p.name for p in v.ENGINE_CRON_DIR.glob("*.py"))[0]
+
+    scripts = pack / "crons" / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / victim).write_text("# pack fork\n", encoding="utf-8")
+    crons = pack / "crons"
+    crons.mkdir(parents=True, exist_ok=True)
+    (crons / "domain-crons.json").write_text(json.dumps([{
+        "name": "forked-lane", "no_agent": True,
+        "schedule": {"kind": "cron", "expr": "0 3 * * *"},
+        "script": f"/opt/data/scripts/{victim}",
+    }]), encoding="utf-8")
+
+    rows = v.validate(pack).rows
+    said = " ".join(d for _s, c, d in rows if "forked-lane" in c)
+    assert "the PACK copy runs" in said, said
+    assert "supplied by the engine" not in said, (
+        "an engine copy that is overwritten at deploy must not be reported as the live one")
+
+
+def test_shadowing_reports_undetectable_when_the_engine_cron_dir_is_missing(tmp_path,
+                                                                            monkeypatch):
+    """The missing-key rule: with nothing to compare against, the check must say it could not look
+    rather than emit a confident "no shadows". A vacuous pass here is exactly the shape of failure
+    the detector exists to remove."""
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    v = _load("framework_validate", VAL)
+    (pack / "crons" / "scripts").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(v, "ENGINE_CRON_DIR", tmp_path / "no-such-engine-cron-dir")
+
+    rows = v.validate(pack).rows
+    shadow_rows = [(s, d) for s, c, d in rows if "shadow" in c.lower() or "scripts/cron" in c]
+    assert any(s == "WARN" and "UNDETECTABLE" in d for s, d in shadow_rows), shadow_rows
+    assert not any(s == "OK" and "no pack script shadows" in d for s, d in shadow_rows), (
+        "must not claim a clean result it could not measure")

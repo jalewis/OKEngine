@@ -6,8 +6,8 @@ stdout pipe, so the post-kill communicate() blocked until IT exited — the "int
 cosmetic, client hangs to its 300s ceiling" bug. The fix runs the child in its own process group
 and killpg's the tree.
 
-#199 — graph_stats serves from the wiki/.backlinks.json artifact (meta + hub ranking) instead of
-a live whole-graph IWE rebuild per call; live IWE remains only as the no-artifact fallback.
+#199 — graph_stats serves from the wiki/.backlinks.json artifact (meta + hub ranking). Missing or
+malformed graph evidence fails explicitly and never launches a whole-corpus rebuild.
 """
 import importlib.util
 import json
@@ -102,20 +102,18 @@ def test_graph_stats_serves_from_artifact_without_subprocess(monkeypatch, tmp_pa
     assert "backlinks artifact" in out
 
 
-def test_graph_stats_falls_back_to_live_iwe_without_artifact(monkeypatch, tmp_path):
+def test_graph_stats_reports_unavailable_without_artifact(monkeypatch, tmp_path):
     (tmp_path / "wiki").mkdir(parents=True)
     m = _load(monkeypatch, tmp_path)
-    called = {}
-    monkeypatch.setattr(m, "_run", lambda args, **k: (called.setdefault("args", args), "IWE STATS")[1])
-    assert m.graph_stats() == "IWE STATS"
-    assert any("kb_graph.py" in str(a) for a in called["args"])
+    monkeypatch.setattr(m, "_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("subprocess")))
+    assert "graph unavailable" in m.graph_stats()
 
 
-def test_graph_stats_falls_back_on_malformed_meta(monkeypatch, tmp_path):
-    """An artifact without integer meta (older builder) must not crash or mis-report — fall back."""
+def test_graph_stats_reports_unavailable_on_malformed_meta(monkeypatch, tmp_path):
+    """An artifact without integer meta must not crash, mis-report, or launch a subprocess."""
     wiki = tmp_path / "wiki"
     wiki.mkdir(parents=True)
     (wiki / ".backlinks.json").write_text(json.dumps({"backlinks": {"a": []}}))
     m = _load(monkeypatch, tmp_path)
-    monkeypatch.setattr(m, "_run", lambda *a, **k: "IWE STATS")
-    assert m.graph_stats() == "IWE STATS"
+    monkeypatch.setattr(m, "_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("subprocess")))
+    assert "graph unavailable" in m.graph_stats()

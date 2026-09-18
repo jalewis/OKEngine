@@ -5,7 +5,7 @@ Synthesize across them into a "what should our messaging be" recommendation.
 
 **STEADY-STATE days:** if the gate marks this run `[STEADY-STATE]` (no upstream delta since the last brief), still write today's brief — a short one that REAFFIRMS the current messaging from the capability-anchor pages and the prior brief, and states plainly that nothing material changed. A daily brief must always exist; a missing one signals a broken pipeline, so never skip. Do NOT manufacture deltas or news that isn't in the evidence.
 
-**Trust the digest above — it already has what you need.** The wake-gate has already fetched and printed the relevant competitor/capability page summaries; do not re-fetch each one individually via mcp_okengine_get_page — that burns turns without adding information and risks running out of budget before you write the actual output. Read what's already in the digest, then go straight to writing.
+**Trust the digest above — it already has what you need.** The wake-gate has already fetched and printed the relevant competitor/capability page summaries; do not re-fetch each one individually via mcp__okengine__get_page — that burns turns without adding information and risks running out of budget before you write the actual output. Read what's already in the digest, then go straight to writing.
 
 This is the META-LAYER — it sits on top of the other 3 ops in this extension. EVERY claim in the
 brief MUST trace to evidence in one of the delta inputs or the capability-anchor pages. No
@@ -13,7 +13,7 @@ invented wedges. No "sounds right" positioning that isn't backed by the corpus. 
 compounding-error risk on a synthesis-of-synthesis is real — the constraints below are the
 load-bearing defenses.
 
-Write via mcp_okengine_write_create_entity to the wiki-relative path the wake-gate specified,
+Write via mcp__okengine_write_okengine_messaging_synthesis_messaging_synthesis__create_entity to the wiki-relative path the wake-gate specified,
 frontmatter `type: messaging-brief, title: "Messaging brief — <date>", published: <date>,
 updated: <date>, prior_brief: "[[<prior-path-or-none>]]", inputs_read: [<wikilinks to each
 delta input>]`. Body:

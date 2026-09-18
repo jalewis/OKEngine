@@ -1,0 +1,197 @@
+diff --git a/tools/web_tools.py b/tools/web_tools.py
+index a94cfc75..9c5fec03 100644
+--- a/tools/web_tools.py
++++ b/tools/web_tools.py
+@@ -12,6 +12,7 @@ Debug: ``WEB_TOOLS_DEBUG=true`` writes ``logs/web_tools_debug_<UUID>.json``.
+ import json
+ import logging
+ import os
++import threading
+ from typing import List, Any, Optional
+ # Per-vendor client cache slots; plugins read/write these via tools.web_tools (tests reset them to None).
+ _firecrawl_client = _firecrawl_client_config = _parallel_client = _async_parallel_client = _exa_client = None
+@@ -145,14 +146,63 @@ def _get_backend() -> str:
+     return "firecrawl"  # default (backward compat)
+ 
+ 
++# OKEngine #190: opt-in keyed search rotation, preserving the carried default
++# cohort. Paid xAI and keyless-only providers do not join this ring.
++_OKENGINE_ROTATE_LEGACY_ORDER = (
++    "tavily", "exa", "parallel", "firecrawl", "searxng", "brave-free", "ddgs")
++_OKENGINE_ROTATE_I = -1
++_OKENGINE_ROTATE_LOCK = threading.Lock()
++
++
++def _okengine_rotate_candidates(capability: str) -> list[str]:
++    """Admitted, currently usable provider names for search or extraction."""
++    names = list(_OKENGINE_ROTATE_LEGACY_ORDER)
++    for provider in _list_registered_web_providers():
++        name = getattr(provider, "name", "")
++        if name and name != "xai" and name not in _LEGACY_WEB_BACKENDS and name not in names:
++            names.append(name)
++    result = []
++    method = "supports_search" if capability == "search" else "supports_extract"
++    for name in names:
++        if not _is_backend_available(name):
++            continue
++        provider = _registered_web_provider(name)
++        if provider is not None and _probe(provider, method):
++            result.append(name)
++    return result
++
++
++def _okengine_rotate_search_backend() -> str:
++    """Advance once per search call, serializing concurrent gateway workers."""
++    global _OKENGINE_ROTATE_I
++    available = _okengine_rotate_candidates("search")
++    if not available:
++        return "firecrawl"  # explicit unavailable selection surfaces a typed vendor error
++    with _OKENGINE_ROTATE_LOCK:
++        _OKENGINE_ROTATE_I = (_OKENGINE_ROTATE_I + 1) % len(available)
++        return available[_OKENGINE_ROTATE_I]
++
++
++def _okengine_rotate_extract_backend() -> str:
++    """A shared search ring cannot pass a search-only provider to web_extract."""
++    available = _okengine_rotate_candidates("extract")
++    return available[0] if available else "firecrawl"
++
++
+ def _get_search_backend() -> str:
+     """Backend for web_search: ``web.search_backend`` (strict, no probe) > ``web.backend`` > autodetect."""
+-    return _configured_backend("search_backend") or _get_backend()
++    specific = _configured_backend("search_backend")
++    if specific == "rotate" or (not specific and _configured_backend() == "rotate"):
++        return _okengine_rotate_search_backend()
++    return specific or _get_backend()
+ 
+ 
+ def _get_extract_backend() -> str:
+     """Backend for web_extract: ``web.extract_backend`` (strict, no probe) > ``web.backend`` > autodetect."""
+-    return _configured_backend("extract_backend") or _get_backend()
++    specific = _configured_backend("extract_backend")
++    if specific == "rotate" or (not specific and _configured_backend() == "rotate"):
++        return _okengine_rotate_extract_backend()
++    return specific or _get_backend()
+ 
+ 
+ def _ddgs_package_importable() -> bool:
+diff --git a/tests/tools/test_okengine_web_rotation.py b/tests/tools/test_okengine_web_rotation.py
+new file mode 100644
+index 00000000..a9ba67b0
+--- /dev/null
++++ b/tests/tools/test_okengine_web_rotation.py
+@@ -0,0 +1,113 @@
++"""Opt-in keyed web-search rotation keeps extraction off search-only providers."""
++
++from collections import Counter
++from concurrent.futures import ThreadPoolExecutor
++import json
++
++import pytest
++
++import tools.web_tools as web
++from agent.web_search_provider import WebSearchProvider
++
++
++class _FixtureProvider(WebSearchProvider):
++    def __init__(self, name, *, extract=False):
++        self._name = name
++        self._extract = extract
++
++    @property
++    def name(self):
++        return self._name
++
++    def is_available(self):
++        return True
++
++    def supports_extract(self):
++        return self._extract
++
++    def search(self, query, limit=5):
++        return {"success": True, "data": {"web": [
++            {"title": self.name, "url": "https://example.test/fixture", "description": query,
++             "position": 1}]}}
++
++
++def _configured_rotation(monkeypatch):
++    providers = {
++        "tavily": _FixtureProvider("tavily"),
++        "exa": _FixtureProvider("exa", extract=True),
++        "serper": _FixtureProvider("serper"),
++        "xai": _FixtureProvider("xai"),
++    }
++    monkeypatch.setattr(web, "_load_web_config", lambda: {"backend": "rotate"})
++    monkeypatch.setattr(web, "_registered_web_provider", lambda name: providers.get(name))
++    monkeypatch.setattr(web, "_list_registered_web_providers", lambda: list(providers.values()))
++    monkeypatch.setattr(web, "_is_backend_available", lambda name: name in providers)
++    monkeypatch.setattr(web, "_OKENGINE_ROTATE_I", -1, raising=False)
++    return providers
++
++
++def test_rotate_selects_each_available_search_provider_then_wraps(monkeypatch):
++    _configured_rotation(monkeypatch)
++    assert [web._get_search_backend() for _ in range(6)] == [
++        "tavily", "exa", "serper", "tavily", "exa", "serper"]
++
++
++def test_shared_rotate_keeps_extract_on_a_capable_provider(monkeypatch):
++    _configured_rotation(monkeypatch)
++    assert [web._get_extract_backend() for _ in range(4)] == ["exa"] * 4
++
++
++@pytest.mark.parametrize(
++    ("specific_key", "selected", "resolve"),
++    [
++        ("search_backend", "tavily", web._get_search_backend),
++        ("extract_backend", "firecrawl", web._get_extract_backend),
++    ],
++)
++def test_explicit_capability_selection_overrides_shared_rotation(
++    monkeypatch, specific_key, selected, resolve
++):
++    _configured_rotation(monkeypatch)
++    monkeypatch.setattr(web, "_load_web_config", lambda: {
++        "backend": "rotate", specific_key: selected,
++    })
++
++    assert [resolve() for _ in range(3)] == [selected] * 3
++
++
++def test_concurrent_rotation_is_balanced_and_excludes_paid_xai(monkeypatch):
++    _configured_rotation(monkeypatch)
++    with ThreadPoolExecutor(max_workers=12) as pool:
++        selected = list(pool.map(lambda _i: web._get_search_backend(), range(60)))
++    assert Counter(selected) == Counter({"tavily": 20, "exa": 20, "serper": 20})
++
++
++def test_empty_rotation_does_not_select_unavailable_backend(monkeypatch):
++    _configured_rotation(monkeypatch)
++    monkeypatch.setattr(web, "_is_backend_available", lambda _name: False)
++    assert web._get_search_backend() == "firecrawl"  # old explicit failure fallback
++    assert web._get_extract_backend() == "firecrawl"
++
++
++def test_search_dispatch_rotates_real_registered_provider_envelopes(monkeypatch, tmp_path):
++    import agent.web_search_registry as registry
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(web, "_load_web_config", lambda: {"backend": "rotate"})
++    monkeypatch.setattr(web, "_ensure_web_plugins_loaded", lambda: None)
++    monkeypatch.setattr(web, "_is_backend_available",
++                        lambda name: name in {"fixture-tavily", "fixture-serper"})
++    monkeypatch.setattr(web, "_OKENGINE_ROTATE_I", -1)
++    providers = [_FixtureProvider("fixture-tavily"), _FixtureProvider("fixture-serper")]
++    prior = {p.name: registry.snapshot_registration(p.name) for p in providers}
++    for provider in providers:
++        registry.register_provider(provider)
++    try:
++        actual = [json.loads(web.web_search_tool(f"query-{i}")) for i in range(4)]
++        titles = [row["data"]["web"][0]["title"] for row in actual]
++        assert Counter(titles) == Counter({"fixture-tavily": 2, "fixture-serper": 2})
++        assert titles[0] != titles[1] and titles[0] == titles[2] and titles[1] == titles[3]
++        assert all(row["success"] and row["data"]["web"][0]["position"] == 1 for row in actual)
++    finally:
++        for provider in providers:
++            registry.restore_registration(provider.name, provider, prior[provider.name])

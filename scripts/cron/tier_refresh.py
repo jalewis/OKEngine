@@ -53,10 +53,17 @@ def _namespace_bases(ns: str) -> list:
 def _count_namespace(ns: str, nscfg: dict, cfg: dict, today) -> dict:
     counts = {t: 0 for t in _TIERS}
     untiered = 0
-    from_path = nscfg.get("from_path") and not nscfg.get("status_field")
     for base in _namespace_bases(ns):
         if not base.is_dir():
             continue
+        active_cfg = cfg
+        active_nscfg = nscfg
+        if base.parent != WIKI:
+            active_cfg = tier_lib.load_cfg(VAULT, namespace=base.parent.name)
+            active_nscfg = (active_cfg.get("namespaces") or {}).get(ns)
+            if not active_nscfg:
+                continue
+        from_path = active_nscfg.get("from_path") and not active_nscfg.get("status_field")
         for p in base.rglob("*.md"):
             n = p.name
             if n == "INDEX.md" or n.startswith("INDEX-p") or n.startswith("_"):
@@ -67,7 +74,7 @@ def _count_namespace(ns: str, nscfg: dict, cfg: dict, today) -> dict:
             # the namespace's date/status tiering config never applied (multipack under-count).
             rel = f"{ns}/{p.relative_to(base).as_posix()}"
             fm = {} if from_path else tier_lib.fm_of(p)
-            t = tier_lib.tier_of(rel, fm, cfg, today)
+            t = tier_lib.tier_of(rel, fm, active_cfg, today)
             if t in counts:
                 counts[t] += 1
             else:
@@ -85,7 +92,12 @@ def main() -> int:
     today = tz_lib.deployment_today()                                  # okengine#301: deployment TZ
     now = tz_lib.deployment_now().strftime("%Y-%m-%d %H:%M %Z")        # %Z = the deployment zone, not "UTC"
 
-    nss = cfg.get("namespaces") or {}
+    nss = dict(cfg.get("namespaces") or {})
+    for sub in sorted(WIKI.iterdir()):
+        if sub.is_dir() and (sub / "schema.yaml").is_file():
+            sub_cfg = tier_lib.load_cfg(VAULT, namespace=sub.name)
+            for ns, nscfg in (sub_cfg.get("namespaces") or {}).items():
+                nss.setdefault(ns, nscfg)
     dist = {ns: _count_namespace(ns, nscfg, cfg, today) for ns, nscfg in nss.items()}
 
     prior = {}

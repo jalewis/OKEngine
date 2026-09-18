@@ -20,14 +20,19 @@ pytest.importorskip("mcp")
 
 REPO = Path(__file__).resolve().parent.parent
 SRV = REPO / "okengine-mcp" / "server.py"
+_MODULE = None
 
 
 def _load():
+    global _MODULE
+    if _MODULE is not None:
+        return _MODULE
     spec = importlib.util.spec_from_file_location("okengine_server_idx", SRV)
     m = importlib.util.module_from_spec(spec)
     sys.modules["okengine_server_idx"] = m
     spec.loader.exec_module(m)
-    return m
+    _MODULE = m
+    return _MODULE
 
 
 class _Clock:
@@ -146,13 +151,18 @@ def test_failed_incremental_update_does_not_mark_indexed(monkeypatch):
     s, clock, state, updates, mtime = _rig(monkeypatch)
     mtime["v"] = 500.0                                   # a page changed (cur=500 > last_seen=0)
     monkeypatch.setattr(s, "_qmd", lambda args, timeout=1800: (1, "boom"))   # qmd FAILS
+    statuses = []
+    monkeypatch.setattr(s, "_set_index_status", lambda **kw: statuses.append(kw))
     s._index_maintainer_step(state)                     # incremental branch runs, update fails
     assert state["last_seen"] == 0.0, "a FAILED update wrongly marked the change indexed"
+    assert statuses == [], "a failed incremental update must not re-arm search readiness"
     # a later SUCCESSFUL update advances it
     monkeypatch.setattr(s, "_qmd", lambda args, timeout=1800: (0, ""))
     clock.now = state["cooldown_until"] + 1
     s._index_maintainer_step(state)
     assert state["last_seen"] == 500.0, "a successful update must advance last_seen"
+    assert statuses == [{"ready": True, "error": ""}], \
+        "a successful retry must immediately re-arm search instead of waiting for the 6h full refresh"
 
 
 def test_failed_full_refresh_leaves_seen_pending(monkeypatch):
@@ -165,3 +175,19 @@ def test_failed_full_refresh_leaves_seen_pending(monkeypatch):
     s._index_maintainer_step(state)
     assert state["last_full"] == clock.now, "periodic clock must advance (avoid tight retry loop)"
     assert state["last_seen"] == 0.0, "a failed full refresh must NOT mark the index current"
+
+
+def test_initial_refresh_publishes_readiness_and_failure(monkeypatch):
+    s = _load()
+    s._set_index_status(active=True, ready=False, error="")
+    monkeypatch.setattr(s, "_qmd", lambda args, timeout=1800: (0, "qmd://wiki\n"))
+    assert s._refresh_index_locked() is True
+    assert s._index_unavailable_message() is None
+
+    monkeypatch.setattr(s, "_qmd", lambda args, timeout=1800: (9, "failed"))
+    assert s._refresh_index_locked() is False
+    assert "initial qmd refresh failed (rc=9)" in s._index_unavailable_message()
+
+    monkeypatch.setattr(s, "_qmd", lambda args, timeout=1800: (127, "missing"))
+    assert s._refresh_index_locked() is True
+    assert "qmd is not installed" in s._index_unavailable_message()

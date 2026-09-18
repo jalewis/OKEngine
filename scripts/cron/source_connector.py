@@ -468,8 +468,7 @@ def _validate_network_url(url: str, allowed_hosts: list[str], allow_private: boo
         raise ConnectorError(f"cannot resolve connector host: {exc}") from exc
     for info in addresses:
         address = ipaddress.ip_address(info[4][0])
-        if (address.is_private or address.is_loopback or address.is_link_local
-                or address.is_multicast or address.is_reserved):
+        if not address.is_global:
             raise ConnectorError(f"refusing non-public connector address: {address}")
 
 
@@ -668,7 +667,7 @@ def execute(manifest: dict, *, inputs: dict[str, str] | None = None,
             "label": manifest.get("name") or manifest["id"],
             # Authority does not imply primary/independent origin. Connectors may
             # declare those once the contract gains claim-specific provenance.
-            "source_kind": "unknown", "independent_origin": None,
+            "origin_class": "unknown", "independent_origin": None,
         }], connector_id=manifest["id"])
     pagination = manifest["pagination"]
     max_pages = min(pagination.get("max_pages", 1), manifest["rate_limit"]["max_requests"])
@@ -808,9 +807,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--param", action="append", default=[], metavar="NAME=VALUE")
     parser.add_argument("--fixture", type=Path, help="deterministic response fixture; disables network")
     parser.add_argument("--dry-run", action="store_true", help="validate and print a redacted request plan")
-    parser.add_argument("--state-root", type=Path, default=Path(".okengine/connectors/state"))
-    parser.add_argument("--archive-root", type=Path, default=Path("raw/connectors"))
-    parser.add_argument("--health-root", type=Path, default=Path(".okengine/connectors/health"))
+    # Anchor these vault-relative defaults to WIKI_PATH, not the CURRENT WORKING DIRECTORY
+    # (okengine#509). They were bare relative paths, so wherever the process happened to be
+    # started became the vault: running the authority-enrich lane from a checkout wrote the
+    # connector health record into the REPO and left a tracked file permanently modified.
+    # That is why `git add -A` was unsafe here and why the working tree was never clean —
+    # and a permanently dirty tree is what let three days of uncommitted work hide (#493).
+    # Same class as the cwd-based vault resolution fixed in !364.
+    #
+    # WIKI_PATH unset falls back to "." — byte-identical to the previous behaviour — and an
+    # explicit --state-root/--archive-root/--health-root is unaffected either way. The real
+    # ingest caller (framework_ingest_rebuild.py) already passes --health-root explicitly;
+    # this default was only ever reached by a caller that forgot to.
+    vault_root = Path(os.environ.get("WIKI_PATH") or ".")
+    parser.add_argument("--state-root", type=Path,
+                        default=vault_root / ".okengine/connectors/state")
+    parser.add_argument("--archive-root", type=Path, default=vault_root / "raw/connectors")
+    parser.add_argument("--health-root", type=Path,
+                        default=vault_root / ".okengine/connectors/health")
     parser.add_argument("--collection-ledger", type=Path,
                         default=(Path(os.environ["COLLECTION_LEDGER_DIR"])
                                  if os.environ.get("COLLECTION_LEDGER_DIR") else

@@ -40,6 +40,7 @@ def _live_jobs(m):
     return m._load_jobs(m.JOBS)
 
 
+@pytest.mark.external
 def test_every_live_job_classified_exactly_once():
     m = _mod()
     jobs = _live_jobs(m)
@@ -78,6 +79,42 @@ def test_tracked_model_writers_declare_contract_or_legacy_exemption():
     assert m.validate_output_contracts(jobs, require_declared=True) == []
 
 
+def test_prompt_file_round_trip_preserves_references_without_inline_source(tmp_path):
+    m = _mod()
+    pack = tmp_path / "pack"
+    (pack / "crons").mkdir(parents=True)
+    (pack / "prompts").mkdir()
+    (pack / "prompts" / "daily.md").write_text("External daily prompt\n")
+    prompt_path = pack / "crons" / m.DOMAIN_PROMPTS
+    prompt_path.write_text(json.dumps({
+        "daily": {"prompt_file": "prompts/daily.md"}
+    }))
+    prompts = m._load_prompts(prompt_path)
+    jobs = m.merge([{"name": "daily"}], [], prompts, {"daily": "engine-template"})
+    assert jobs[0]["prompt"] == "External daily prompt"
+    assert jobs[0]["prompt_file"] == "prompts/daily.md"
+
+    parts = m.split(jobs, {"daily": "engine-template"})
+    assert "prompt" not in parts[m.ENGINE_CRONS][0]
+    assert "prompt_file" not in parts[m.ENGINE_CRONS][0]
+    assert parts[m.DOMAIN_PROMPTS] == {
+        "daily": {"prompt_file": "prompts/daily.md"}
+    }
+
+
+def test_engine_prompt_file_split_drops_only_resolved_prompt():
+    m = _mod()
+    parts = m.split([{
+        "name": "repair",
+        "prompt_file": "prompts/cron/repair.md",
+        "prompt": "resolved bytes",
+    }], {"repair": "engine"})
+    assert parts[m.ENGINE_CRONS] == [{
+        "name": "repair", "prompt_file": "prompts/cron/repair.md"
+    }]
+
+
+@pytest.mark.external
 def test_round_trip_is_lossless():
     m = _mod()
     jobs = _live_jobs(m)
@@ -88,6 +125,7 @@ def test_round_trip_is_lossless():
     assert m._canon(jobs) == m._canon(merged), "merge(split(x)) != x — boundary lossy"
 
 
+@pytest.mark.external
 def test_engine_template_prompt_moves_to_pack_and_returns():
     """An engine-template job's prompt is stripped from the engine half and lives
     only in the domain pack, but the merge restores it byte-for-byte."""
@@ -104,6 +142,7 @@ def test_engine_template_prompt_moves_to_pack_and_returns():
     assert parts[m.DOMAIN_PROMPTS][sample] == et[0]["prompt"], "pack prompt mismatch"
 
 
+@pytest.mark.external
 def test_split_partitions_counts():
     m = _mod()
     jobs = _live_jobs(m)
@@ -176,6 +215,7 @@ def _seed_slice2(m, tmp_path):
     return jobs
 
 
+@pytest.mark.external
 def test_regen_reproduces_jobs(tmp_path):
     m = _mod()
     jobs = _seed_slice2(m, tmp_path)
@@ -200,12 +240,15 @@ def test_regen_tolerates_pack_without_crons_dir(tmp_path):  # invariant-audit #1
     m.JOBS = tmp_path / "cron-plus-jobs.json"
     m.PACK_DIR.mkdir()
     (m.PACK_DIR / "pack.yaml").write_text("name: engineonly-pack\n")
-    m.ENGINE_CRONS_FILE.write_text(m._dump_list([{"name": "eng-a", "schedule": {"expr": "0 7 * * *"}}]))
+    m.ENGINE_CRONS_FILE.write_text(m._dump_list([{
+        "name": "eng-a", "schedule": {"expr": "0 7 * * *"}, "max_iterations": 2,
+    }]))
     merged = m.regen()                                  # must NOT raise FileNotFoundError
     assert m.JOBS.is_file()
     assert "eng-a" in {j["name"] for j in merged}
 
 
+@pytest.mark.external
 def test_dump_from_live_round_trips_through_sources(tmp_path):
     m = _mod()
     jobs = _seed_slice2(m, tmp_path)
@@ -269,6 +312,27 @@ def test_engine_template_object_prompt_composes_output_contract():
     assert jobs[0]["output_contract"]["body"]["min_non_whitespace"] == 80
 
 
+def test_split_preserves_inline_prompt_output_contract_policy():
+    m = _mod()
+    value = {
+        "name": "daily-brief", "prompt": "write today", "max_iterations": 8,
+        "output_contract": {
+            "api": 1, "allowed_namespaces": ["briefings"],
+            "allowed_types": ["briefing"], "operations": ["create"],
+            "required_fields": ["type"], "required_relationships": [],
+            "body": {"required": True, "min_non_whitespace": 80},
+            "unknown_fields": "review", "unresolved_links": "review",
+            "placeholder_links": "reject", "completion": "run",
+            "required_write_path": "briefings/daily-{date}.md",
+        },
+    }
+    parts = m.split([value], {"daily-brief": "engine-template"})
+    assert parts[m.DOMAIN_PROMPTS]["daily-brief"] == {
+        "prompt": "write today", "output_contract": value["output_contract"]}
+    merged = m.merge(parts[m.ENGINE_CRONS], [], parts[m.DOMAIN_PROMPTS])
+    assert merged[0]["output_contract"] == value["output_contract"]
+
+
 def test_model_writer_contract_inventory_gate():
     m = _mod()
     jobs = [{"name": "unsafe", "enabled_toolsets": ["okengine-write"]},
@@ -295,6 +359,45 @@ def test_generated_job_has_stable_lane_id_and_contract_digest():
     assert first["output_contract_digest"] == m.output_contract.digest(contract)
     assert first["env"]["OKENGINE_LANE_ID"] == first["id"]
     assert first["env"]["OKENGINE_CONTRACT_DIGEST"] == first["output_contract_digest"]
+
+
+def test_generated_model_lanes_forbid_guessed_mcp_prompts_and_resources():
+    m = _mod()
+    generated = json.loads(m._dump_jobs([
+        {"name": "raw-backfill", "prompt": "compile raws", "enabled": True},
+        {"name": "source-quality-backfill", "prompt": "score sources", "enabled": True},
+        {"name": "deterministic", "prompt": "(unused)", "no_agent": True, "enabled": True},
+    ]))["jobs"]
+    by_name = {job["name"]: job for job in generated}
+    for name in ("raw-backfill", "source-quality-backfill"):
+        prompt = by_name[name]["prompt"]
+        assert "MCP DISCOVERY CONTRACT:" in prompt
+        assert "`list_prompts` or `get_prompt`" in prompt
+        assert "pass only a URI returned verbatim" in prompt
+        assert "never invent `file://`, `okengine://`" in prompt
+    assert "MCP DISCOVERY CONTRACT:" not in by_name["deterministic"]["prompt"]
+
+
+def test_generated_source_quality_lane_embeds_rubric_for_legacy_pack_prompt():
+    m = _mod()
+    generated = json.loads(m._dump_jobs([{
+        "name": "source-quality-backfill",
+        "prompt": "Use the rubric in CLAUDE.md.",
+        "enabled": True,
+    }]))["jobs"][0]
+    assert "SOURCE QUALITY RUBRIC:" in generated["prompt"]
+    assert "A=completely reliable" in generated["prompt"]
+    assert "6=truth cannot be judged" in generated["prompt"]
+
+
+def test_generated_source_quality_lane_does_not_duplicate_embedded_rubric():
+    m = _mod()
+    prompt = "Reliability: A=completely reliable. Credibility: 6=truth cannot be judged."
+    generated = json.loads(m._dump_jobs([{
+        "name": "source-quality-backfill", "prompt": prompt, "enabled": True,
+    }]))["jobs"][0]
+    assert "SOURCE QUALITY RUBRIC:" not in generated["prompt"]
+    assert generated["prompt"].count("A=completely reliable") == 1
 
 
 def test_contracted_model_writer_is_lane_bound_not_generic_admin():
@@ -440,6 +543,7 @@ def test_validate_unique_ids_flags_collisions():  # invariant-audit M37
     assert m.validate_unique_ids([{"name": "a", "id": "1"}, {"name": "b", "id": "2"}]) == []
 
 
+@pytest.mark.external
 def test_current_fleet_has_no_id_collisions():  # invariant-audit M37 (regression on real data)
     m = _mod()
     assert m.validate_unique_ids(_live_jobs(m)) == [], "the deployed fleet has a colliding id/name"
@@ -554,3 +658,121 @@ def test_pack_marked_dotted_name_routes_to_domain_not_extensions(tmp_path):  # i
     ext_names = {j["name"] for j in parts[m.EXTENSIONS]}
     assert domain_names == {"acme.fetch", "okpack-x:feed-fetch", "plain-feed"}
     assert ext_names == {"some.extension:op"}      # only the real extension-marked job
+
+
+def test_prompt_file_resolution_rejects_escape_and_preserves_contract(tmp_path):
+    m = _mod()
+    pack = tmp_path / "pack"
+    crons = pack / "crons"
+    prompts = pack / "prompts"
+    crons.mkdir(parents=True)
+    prompts.mkdir()
+    (prompts / "lane.md").write_text("Do the work.\n")
+
+    jobs_path = crons / "jobs.json"
+    jobs_path.write_text(json.dumps([{"name": "lane", "prompt_file": "../escape.md"}]))
+    with pytest.raises(ValueError, match="escapes source root"):
+        m._load_jobs(jobs_path)
+
+    prompts_path = crons / "engine-template-prompts.json"
+    prompts_path.write_text(json.dumps({"lane": {"prompt_file": "../escape.md"}}))
+    with pytest.raises(ValueError, match="escapes pack root"):
+        m._load_prompts(prompts_path)
+
+    contract = {
+        "api": 1, "allowed_namespaces": ["entities"], "allowed_types": ["*"],
+        "operations": ["update"], "required_fields": ["type"],
+        "required_relationships": [], "body": {"required": False, "min_non_whitespace": 0},
+        "unknown_fields": "reject", "unresolved_links": "review",
+        "placeholder_links": "reject", "completion": "per-selected-item",
+    }
+    parts = m.split(
+        [{"name": "lane", "prompt_file": "prompts/lane.md", "prompt": "Do the work.",
+          "output_contract": contract}],
+        {"lane": "engine-template"},
+    )
+    assert parts[m.DOMAIN_PROMPTS]["lane"] == {
+        "prompt_file": "prompts/lane.md", "output_contract": contract,
+    }
+    merged, errors = m.merge_packs(
+        [{"name": "lane", "output_contract": contract}],
+        [{"name": "pack", "domain": [], "prompts": {
+            "lane": {"prompt": "Do the work.", "prompt_file": "prompts/lane.md"}
+        }}],
+        tier_of={"lane": "engine-template"},
+    )
+    assert errors == []
+    assert merged[0]["prompt_file"] == "prompts/lane.md"
+
+
+def test_source_normalize_runs_after_the_reshard_that_strands_refs():
+    """Ordering is the point of this lane's schedule, and nothing else enforces it.
+
+    `reshard-oversized` re-files pages as buckets grow -- and back again as they shrink -- which
+    strands every stored reference pointing into the old shard. Measured on a live vault: 77
+    assessments carried a `subject:` that no longer resolved, all two-letter -> one-letter
+    collapses, and the judgments read as "Review not run" while sitting `active` on disk.
+
+    Repairing pointers BEFORE the move that strands them fixes nothing and leaves a full day of
+    drift. This asserts the repair runs later in the day than the reshard, so a future schedule edit
+    cannot quietly invert them.
+    """
+    import json
+    from pathlib import Path
+    jobs = json.loads((Path(__file__).resolve().parents[2] / "config/engine-crons.json").read_text())
+    by_name = {j["name"]: j for j in jobs}
+
+    def minute_of_day(name):
+        expr = by_name[name]["schedule"]["expr"].split()
+        minute, hour = expr[0], expr[1]
+        assert minute.isdigit() and hour.isdigit(), f"{name}: expected a fixed daily time, got {expr}"
+        return int(hour) * 60 + int(minute)
+
+    assert minute_of_day("source-normalize") > minute_of_day("reshard-oversized"), (
+        "source-normalize must run AFTER reshard-oversized -- repairing stranded refs before the "
+        "reshard that strands them leaves the vault broken until the next day")
+
+
+def test_source_normalize_is_a_bounded_no_agent_lane():
+    """It walks the whole corpus, so it must be deterministic and bounded. A lane with no timeout
+    that wedges holds its slot forever -- this one previously blocked in uninterruptible I/O for
+    days on a live gateway, and a `timeout` cannot kill a process in D state, so the bound is a
+    floor on the damage rather than a guarantee."""
+    import json
+    from pathlib import Path
+    jobs = json.loads((Path(__file__).resolve().parents[2] / "config/engine-crons.json").read_text())
+    job = next(j for j in jobs if j["name"] == "source-normalize")
+    assert job["no_agent"] is True, "deterministic repair — never a model lane"
+    assert job.get("prompt"), "even a no_agent lane states what it does, for the operator reading jobs.json"
+    assert isinstance(job.get("timeout"), int) and job["timeout"] > 0, "must declare a bound"
+    assert job["script"].endswith("source_normalize.py")
+    assert job["enabled"] is True
+
+
+def test_wiki_health_declares_deterministic_artifact_reporting():
+    m = _mod()
+    jobs = json.loads((REPO / "config" / "engine-crons.json").read_text())
+    job = next(value for value in jobs if value["name"] == "wiki-health-audit")
+    assert job["no_agent"] is True
+    assert job["artifact_contract"] == {"api": 1, "min_artifacts": 1}
+    assert m.validate_artifact_contracts(jobs) == []
+
+
+def test_artifact_contract_schema_fails_loudly():
+    m = _mod()
+    errors = m.validate_artifact_contracts([{
+        "name": "broken", "artifact_contract": {"api": 2, "min_artifacts": -1,
+                                                   "surprise": True},
+    }])
+    assert any("unknown key" in error for error in errors)
+    assert any("api must be 1" in error for error in errors)
+    assert any("non-negative integer" in error for error in errors)
+    assert any("only valid for no_agent" in error for error in errors)
+
+    truthy_non_boolean = m.validate_artifact_contracts([{
+        "name": "ambiguous", "no_agent": 1,
+        "artifact_contract": {"api": 1, "min_artifacts": 0},
+    }])
+    assert truthy_non_boolean == [
+        "job 'ambiguous' artifact_contract is only valid for no_agent jobs"
+    ]

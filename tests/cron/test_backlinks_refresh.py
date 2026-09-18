@@ -70,6 +70,7 @@ def test_skip_source_reserved_and_excluded():
         assert lib.skip_source(key, excl), key
     for key in ("entities/a/acme-corp", "briefings/daily", "concepts/x"):
         assert not lib.skip_source(key, excl), key
+    assert not lib.skip_source("entities/a/acme-corp.md", excl)
 
 
 # ── titles ───────────────────────────────────────────────────────────────────
@@ -275,3 +276,59 @@ def test_scan_skips_excluded_namespaces_as_referrers(tmp_path):
     (wiki / "sources/2026/x.md").write_text("# X\n[[entities/c/crowdstrike]]\n")
     docs = lib.scan_forward_refs(wiki, lib.excluded_top_dirs(vault))
     assert not any(d["key"] == "sources/2026/x" for d in docs)
+
+
+def test_schema_title_and_link_parser_edge_paths(tmp_path):
+    absent = tmp_path / "absent-schema"
+    absent.mkdir()
+    assert {"dashboards", "sources"} <= lib.excluded_top_dirs(absent)
+    broken = tmp_path / "broken-schema"
+    broken.mkdir()
+    (broken / "schema.yaml").write_text("[")
+    assert {"dashboards", "sources"} <= lib.excluded_top_dirs(broken)
+    empty_exclusion = tmp_path / "empty-exclusion"
+    empty_exclusion.mkdir()
+    (empty_exclusion / "schema.yaml").write_text("exclude: ['///', operational]\n")
+    assert "operational" in lib.excluded_top_dirs(empty_exclusion)
+
+    vault, wiki = _vault(tmp_path / "titles", exclude=("operational", "", "raw"))
+    malformed = wiki / "malformed.md"
+    malformed.write_text("---\n[\n---\n# Fallback heading\n")
+    assert lib.page_title(wiki, "malformed") == "Fallback heading"
+    unclosed = wiki / "unclosed.md"
+    unclosed.write_text("---\nno closing fence")
+    assert lib.page_title(wiki, "unclosed") == "unclosed"
+
+    for value in ("", " https://example.test ", "mailto:x@example.test"):
+        assert lib._wikilink_key(value) is None
+    assert lib._wikilink_key("entity.md") == "entity"
+    for value in ("", "https://example.test/x.md", "#anchor", "../../escape.md"):
+        assert lib._mdlink_key(value, "briefings") is None
+    assert lib._mdlink_key("../entities/a.md", "briefings") == "entities/a"
+
+
+def test_invert_reuses_title_and_scanner_tolerates_io_and_invalid_links(tmp_path, monkeypatch):
+    vault, wiki = _vault(tmp_path)
+    (wiki / "briefings").mkdir()
+    source = wiki / "briefings/source.md"
+    source.write_text("# Source\n")
+    # Duplicate source records exercise the title cache's already-present branch.
+    result = lib.invert([
+        {"key": "briefings/source", "references": [{"key": "entities/a"}]},
+        {"key": "briefings/source", "references": [{"key": "entities/b"}]},
+    ], wiki, frozenset())
+    assert set(result) == {"entities/a", "entities/b"}
+
+    unreadable = wiki / "briefings/unreadable.md"
+    unreadable.write_text("[[entities/a]]")
+    invalid = wiki / "briefings/invalid.md"
+    invalid.write_text("[[]] [[https://example.test]] [external](https://example.test/x.md)")
+    original = Path.read_text
+    monkeypatch.setattr(
+        Path, "read_text",
+        lambda self, *a, **k: (_ for _ in ()).throw(OSError("race"))
+        if self == unreadable else original(self, *a, **k),
+    )
+    docs = lib.scan_forward_refs(wiki, frozenset())
+    assert any(doc["key"] == "briefings/invalid" and not doc["references"] for doc in docs)
+    assert not any(doc["key"] == "briefings/unreadable" for doc in docs)

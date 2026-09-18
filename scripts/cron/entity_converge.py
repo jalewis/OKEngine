@@ -68,6 +68,24 @@ def _strong(a: dict, b: dict) -> bool:
     return bool(ap and ap == bp) or len(ak & bk) >= 2
 
 
+def _same_type(a: dict, b: dict) -> bool:
+    """Two pages of DIFFERENT declared types are never duplicates of each other.
+
+    A shared name across types is a collision, not an identity — and in threat intelligence it is
+    the norm rather than the exception, because tooling is routinely named after the group that
+    wields it (or the reverse). Without this, name adjacency alone merged the ACTOR `APT3` into the
+    MALWARE page `shotput`, and the ACTOR `Fox Kitten` into the MALWARE `pay2key`: both actors were
+    tombstoned as "Duplicate of" a piece of software, taking their assessments' subject with them.
+
+    Winner-scoring already preferred a schema-valid type, which tolerated the mixed cluster instead
+    of refusing it — a preference cannot express "these are not the same thing".
+    """
+    at, bt = str(a.get("type") or "").strip(), str(b.get("type") or "").strip()
+    if not at or not bt:
+        return True            # an undeclared type is unknown, not a mismatch — judge on identity
+    return at == bt
+
+
 def clusters(records: dict[str, dict]) -> list[list[str]]:
     """Return only all-pairs-strong components; bridge-shaped components stay unresolved."""
     paths = sorted(records)
@@ -83,6 +101,8 @@ def clusters(records: dict[str, dict]) -> list[list[str]]:
     for a, b in candidates:
         ap, ak = identities[a]
         bp, bk = identities[b]
+        if not _same_type(records[a], records[b]):
+            continue
         if (ap and ap == bp) or len(ak & bk) >= 2:
             neighbors[a].add(b)
             neighbors[b].add(a)
@@ -116,9 +136,11 @@ def choose_winner(root: Path, members: list[str], records: dict[str, dict]) -> s
 
     def score(rel: str):
         fm = records[rel]
+        aliases = fm.get("aliases") or []
+        aliases = aliases if isinstance(aliases, list) else [aliases]
         return (1 if str(fm.get("type") or "") in valid else 0,
                 _grounded(fm), 1 if fm.get("needs_review") is not True else 0,
-                len(fm.get("aliases") or []), -len(rel))
+                len(aliases), -len(rel))
     return max(members, key=lambda rel: (score(rel), rel))
 
 
@@ -175,10 +197,7 @@ def run(root: Path, apply: bool = False, approved: dict[str, str] | None = None)
     for p in sorted((wiki / "entities").rglob("*.md")) if (wiki / "entities").is_dir() else []:
         if p.name.startswith(("_", ".", "INDEX")):
             continue
-        try:
-            fm, body = _read(p)
-        except OSError:
-            continue
+        fm, body = _read(p)  # _read owns file-race/error handling and returns an empty record
         if not fm or str(fm.get("status") or "").lower() == "tombstoned":
             continue
         rel = p.relative_to(wiki).as_posix()[:-3]

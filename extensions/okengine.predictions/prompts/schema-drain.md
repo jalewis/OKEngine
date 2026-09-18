@@ -20,14 +20,17 @@ For each page in the batch, IN ORDER:
      body). **missing `resolves_by`** → the explicit deadline in the claim; if the claim gives a
      horizon but no date, compute resolves_by = made_on + the horizon's span. **missing `subject`**
      → the primary `[[entities/...]]` or `[[concepts/...]]` the claim is about (from the body).
-     **missing `horizon`** → classify from the made_on→resolves_by span using the rubric above.
+     **missing `horizon`** → when the digest supplies `-> '<bucket>' (from dates)`, transcribe that
+     exact computed bucket. Only calculate from the dates yourself when the digest explicitly says
+     it could not derive one.
      **missing `confidence`** → only if the body states one; else flag (see below).
-   - **horizon drift** (e.g. `medium-term`) → the canonical bucket for the actual day-span.
+   - **horizon drift** (e.g. `medium-term`) → transcribe the digest's computed `-> '<bucket>' (from
+     dates)` value when present; it is authoritative. Do not independently reclassify that span.
    - **status drift** → the canonical status the body supports (a suggestion may be in the digest).
    - **unparseable confidence** → the numeric or qualitative value the body's certainty language
      supports.
 3. Apply with a SINGLE merge write per page:
-   `mcp_okengine_write_update_entity(path="predictions/<slug>", frontmatter_yaml="<only the
+   `mcp__okengine_write_okengine_predictions_prediction_schema_drain__update_entity(path="predictions/<slug>", frontmatter_yaml="<only the
    corrected/added fields>")` — this MERGES the given keys and leaves the body untouched.
 
 HARD rules:

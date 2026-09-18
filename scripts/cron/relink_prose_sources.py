@@ -81,7 +81,9 @@ def relink_text(text: str, idx: dict[str, set[str]]) -> tuple[str, int]:
         return text, 0
     n = 0
     j = s + 1
-    while j < len(lines):
+    # A matched frontmatter block always contains its closing `---` after
+    # `sources:`, so the loop terminates via the top-level-key break below.
+    while j < len(lines):  # pragma: no branch
         im = re.match(r"^(\s*)-\s+(.*\S)\s*$", lines[j])
         if not im:
             if re.match(r"^\S", lines[j]):   # next top-level key — end of block

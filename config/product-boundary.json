@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "decision": "OKEngine is the governed compilation and maintenance plane for evidence-backed knowledge products.",
+  "kernel": ["schema", "policy", "transactions", "provenance", "maintenance", "projections"],
+  "runtime": {"hermes": "execution-adapter"},
+  "consumers": ["reader", "cockpit", "applications"],
+  "non_goals": ["general-purpose-agent-runtime", "canonical-relational-datastore", "vertical-application-monolith", "universal-content-management-system", "model-provider-or-inference-server"],
+  "adapter_contract_version": 1
+}

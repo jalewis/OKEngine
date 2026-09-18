@@ -31,9 +31,36 @@ if [ -z "${WIKI_PATH:-}" ]; then
     echo "       no-ops every run. Set WIKI_PATH to the vault root on THIS host and re-run." >&2
     exit 1
 fi
-if [ ! -d "$WIKI_PATH/raw" ]; then
-    echo "  ⚠ $WIKI_PATH/raw does not exist yet — the cron will skip until raw/ appears." >&2
+RAW_ROOT="$WIKI_PATH/raw"
+if ! mkdir -p "$RAW_ROOT"; then
+    echo "ERROR: cannot create host extraction root: $RAW_ROOT" >&2
+    echo "       Run this installer as the user that owns the vault/raw tree." >&2
+    exit 1
 fi
+
+# Do not install a schedule that can read inputs but cannot publish companions.
+# Probe the root and every existing source-bearing directory with a real create +
+# unlink, rather than mode-bit inference (`test -w` is unreliable across ACLs and
+# mapped/fixed UIDs). This also catches a mixed-owner subtree under a writable root.
+probe_write_dir() {
+    local dir="$1" probe
+    if ! probe="$(mktemp "$dir/.okengine-extract-write-check.XXXXXX" 2>/dev/null)"; then
+        echo "ERROR: host extraction user $(id -u):$(id -g) cannot create companions in: $dir" >&2
+        echo "       Reconcile vault ownership or run the host cron as the owning user; cron not installed." >&2
+        return 1
+    fi
+    if ! rm -f -- "$probe" || [ -e "$probe" ]; then
+        echo "ERROR: host extraction write probe could not be removed: $probe" >&2
+        return 1
+    fi
+}
+
+probe_write_dir "$RAW_ROOT"
+while IFS= read -r -d '' source_dir; do
+    [ "$source_dir" = "$RAW_ROOT" ] || probe_write_dir "$source_dir"
+done < <(find "$RAW_ROOT" -type f \( -iname '*.pdf' -o -iname '*.html' -o -iname '*.htm' \
+    -o -iname '*.docx' -o -iname '*.pptx' -o -iname '*.xlsx' -o -iname '*.rtf' \
+    -o -iname '*.doc' \) -printf '%h\0' | sort -zu)
 
 # Carry WIKI_PATH / EXTRACT_PYTHON into the cron environment (cron has a bare env)
 # so the scheduled run resolves the same raw/ root and interpreter as this install.

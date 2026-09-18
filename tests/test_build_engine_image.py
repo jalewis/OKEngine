@@ -46,3 +46,14 @@ def test_no_stale_hardcoded_pin_fallback():
     assert "v2026.6.19" not in txt, "stale hardcoded pin fallback must be removed"
     assert "RELEASE:-unknown" not in txt, "'unknown' version fallback must be removed"
     assert '[ -n "$PIN" ]' in txt and '[ -n "$RELEASE" ]' in txt, "must fail loud on an empty PIN/RELEASE"
+
+
+def test_editable_install_does_not_require_pypi_build_isolation():
+    """A gateway rebuild must not contact PyPI merely to rediscover the build
+    backend already installed by Hermes' dependency-sync layer."""
+    txt = SH.read_text(encoding="utf-8")
+    assert "--no-build-isolation -e" in txt
+    assert "setuptools-82.0.1-py3-none-any.whl" in txt
+    assert "a59e362652f08dcd477c78bb6e7bd9d80a7995bc73ce773050228a348ce2e5bb" in txt
+    assert 'grep -Fq "$EDITABLE_INSTALL"' in txt, \
+        "upstream Dockerfile drift must fail instead of silently losing the hardening"

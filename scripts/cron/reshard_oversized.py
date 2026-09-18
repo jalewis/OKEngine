@@ -30,6 +30,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import okf_migrate  # noqa: E402
+import schema_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
@@ -64,23 +65,28 @@ def _reshardable_namespaces() -> list[tuple[str, str, int]]:
     domain packs that declares a usable reshard_by directive."""
     out: list[tuple[str, str, int]] = []
 
-    def add(schema_path: Path, prefix: str) -> None:
-        try:
-            sch = yaml.safe_load(schema_path.read_text(encoding="utf-8")) or {}
-        except Exception:
-            return
+    def add(sch: dict, prefix: str) -> None:
         part = sch.get("partitioning") or {}
         over = int(part.get("reshard_over") or DEFAULT_MAX)
         for leaf, cfg in (part.get("namespaces") or {}).items():
             rb = (cfg or {}).get("reshard_by")
-            if rb in _RESHARD_BY:
-                out.append((f"{prefix}{leaf}", rb, over))
+            if rb in (None, "not-applicable"):
+                continue
+            if rb not in _RESHARD_BY:
+                raise ValueError(
+                    f"unsupported partitioning.namespaces.{prefix}{leaf}.reshard_by '{rb}' "
+                    f"(supported: {', '.join(sorted(_RESHARD_BY))}, not-applicable)"
+                )
+            out.append((f"{prefix}{leaf}", rb, over))
 
-    if (VAULT / "schema.yaml").is_file():
-        add(VAULT / "schema.yaml", "")
-    for sd in sorted(WIKI.iterdir()):
-        if sd.is_dir() and (sd / "schema.yaml").is_file():
-            add(sd / "schema.yaml", f"{sd.name}/")
+    if schema_lib.governing_schema(VAULT) or (VAULT / ".okengine/composed-schema.yaml").is_file():
+        add(schema_lib.merged_schema(VAULT), "")
+    if WIKI.is_dir():
+        for sd in sorted(WIKI.iterdir()):
+            if sd.is_dir() and (sd / "schema.yaml").is_file():
+                sub_schema = schema_lib.governing_schema(VAULT, sd.name)
+                if sub_schema:
+                    add(sub_schema, f"{sd.name}/")
     return out
 
 

@@ -46,16 +46,23 @@ mapped**, so this extension:
    the floor holds. *When `okengine.predictions` is also enabled*, a testable fill ("fills when
    force Y weakens via trigger Z by date D") is emitted as a **prediction candidate** into
    `predictions/**` — exactly how `candidate-watch` files candidates — and predictions grades it
-   for free. **No hard `requires`:** if predictions is absent, lacuna pages stand alone.
+   for free. The lacuna page is created first without a prediction link. Only after the
+   prediction writer accepts a valid dated forecast does the agent update the lacuna page
+   with `prediction_candidate` and `fill_trigger`. A rejected prediction leaves the lacuna
+   page intact and unlinked; the output contract verifies any supplied candidate target.
+   **No hard `requires`:** if predictions is absent, lacuna pages stand alone.
 3. **Generic — no domain coupling.** Ships only the method; all market vocabulary stays in pack
    config. Runs unchanged on any pack.
 
 ## How it works
 
-Weekly, the wake-gate `select_lacuna_field.py` ranks concept clusters by density, drops any
+Daily, the wake-gate `select_lacuna_field.py` ranks concept clusters by density, drops any
 analyzed within `reanalyze_days`, and surfaces the densest unanalyzed field(s) (with their
-measured density). The agent runs the 6 steps over that field's real subgraph and — only if it
-can name a real force — writes one `lacuna/<slug>` page (`type: lacuna`). It **defers** any
+measured density). A pack may nominate fields from recent material sources through the bounded
+operational queue; fresh nominations sort ahead of rotation candidates but cannot bypass the
+concept-page, density, or recency gates. The agent runs the 6 steps over that field's real
+subgraph and — only if it can name a real force — writes one `lacuna/<slug>` page
+(`type: lacuna`). It **defers** any
 field where the gap has no nameable force. Coverage is not a goal.
 
 ### The page
@@ -82,6 +89,8 @@ supported by the reader; this extension ships neither.
 | `min_density` | 8 | a field must have ≥ N referencing pages to be worth mapping (a thin patch ⇒ extrapolation) |
 | `reanalyze_days` | 90 | don't re-analyze the same field within this window (rotation) |
 | `batch_size` | 3 | how many of the densest unanalyzed fields to surface per run (the agent writes at most one) |
+| `nominations_path` | `.okengine/lacuna-nominations.json` | vault-relative JSON queue of pack-supplied material-source field nominations |
+| `nomination_max_age_days` | 7 | discard routing hints older than this window |
 
 ## When to use it (and when not)
 

@@ -1,16 +1,24 @@
 # Design documents — status index
 
+The accepted primary product and runtime boundary is defined in
+[`product-boundary.md`](product-boundary.md). New kernel, extension, application, and runtime work
+must pass its decision filter.
+
 Design docs record how a subsystem was reasoned about; they are **not** the current contract (the
 code + `engine-manifest.yaml` + the reference docs are). This index gives each a reliable lifecycle
 status so a reader can tell shipped architecture from open exploration at a glance (okengine#209 §12).
 Where a doc's own header disagrees with this table, this table wins; where it disagrees with the
 code, the **code** wins.
 
+Earlier-stage opportunity maps and unresolved explorations live in [`../ideas/`](../ideas/README.md).
+An idea moves here when it has a proposed boundary, contract, and meaningful tradeoffs.
+
 Status legend: **Shipped** — implemented and live · **Active** — being built / partially shipped ·
 **Draft** — proposed, not built · **Exploratory** — evaluation/notes, no commitment.
 
 | Document | Status | Subsystem |
 |---|---|---|
+| [product-boundary.md](product-boundary.md) | **Shipped** | primary product, kernel, consumers, and runtime adapter contract |
 | [composable-okpacks.md](composable-okpacks.md) | **Shipped** | multipack composition (globally-disjoint type ownership) |
 | [composable-okpacks-v1-plan.md](composable-okpacks-v1-plan.md) | **Shipped** | the v1 composition build plan (delivered) |
 | [composed-schema-spec.md](composed-schema-spec.md) | **Shipped** | base⊕pack⊕extension schema fold + composed artifact |
@@ -23,6 +31,7 @@ Status legend: **Shipped** — implemented and live · **Active** — being buil
 | [application-profile.md](application-profile.md) | **Shipped** | versioned application composition and conformance contract |
 | [multi-source-entity-resolution.md](multi-source-entity-resolution.md) | **Shipped** | MDM / canonical golden-record overlay (epic #38, closed) |
 | [actor-risk-ranking.md](actor-risk-ranking.md) | **Draft** | a census-grounded actor risk score (v1 not built) |
+| [actor-assessment-ledger.md](actor-assessment-ledger.md) | **Draft** | estimative actor analysis, source trust, hypotheses, and prediction handoff |
 | [federation-evaluation.md](federation-evaluation.md) | **Exploratory** | cross-vault federation — evaluation, no commitment |
 
 (Domain-specific design docs are kept private and are not listed here.)

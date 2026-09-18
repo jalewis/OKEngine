@@ -1,6 +1,7 @@
 # secrets + runtime — NEVER commit (a pack may be public)
 .env
 .hermes-data/
+docker-compose.okengine-image.yml
 config.yaml
 raw/            # feed_fetch output: scraped third-party article bodies, not source-of-truth
 

@@ -1,0 +1,8 @@
+[Unit]
+Description=Alert when the OKEngine CI watcher heartbeat is stale
+OnFailure=okengine-ci-watch-failure.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/engines/okengine
+ExecStart=/usr/bin/python3 %h/engines/okengine/ci/pipeline_watch.py --check-liveness --max-age-seconds 900

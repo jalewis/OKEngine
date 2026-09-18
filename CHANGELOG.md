@@ -14,6 +14,187 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
 > **About panel** (reader/cockpit deployment purpose + composition from live state); and now **pack
 > bundles** (v0.10.0). If you are jumping from v0.3.5, read v0.4.0 onward.
 
+## Unreleased
+
+## v0.14.4
+
+PATCH — restore governed-writer startup with Hermes MCP 2.x while retaining the
+legacy FastMCP import path, and make the packaged-dependency system-Python test
+import OKEngine from the source layout under editable installs so the gated public
+snapshot and GitHub CI exercise PyYAML bootstrapping without depending on ambient
+interpreter state.
+
+## v0.14.3
+
+PATCH — repair installed policy discovery and host-side runtime-path verification,
+and reconcile the PostgreSQL projection before immediate post-deploy verification.
+
+## v0.14.2
+
+PATCH — make deploy-time schema recomposition import the source-layout OKEngine
+package on application hosts, preventing a post-migration abort before rebuild.
+
+## v0.14.1
+
+PATCH — repair the v0.14.0 deployment upgrade gate for installed first-party
+schema extensions. Legacy inquiry partition/tier declarations now compose with
+owner scoping, auxiliary JSON result schemas are not mistaken for OKF ownership
+fragments, and CI verifies every shipped first-party schema fragment composes.
+
+## v0.14.0
+
+MINOR — upgrade Hermes Agent from v0.18.2 (`v2026.7.7.2`) to v0.21.3
+(`v2026.9.14`) and include the prepared, unreleased v0.13.9 corrections. These
+ship together to avoid a redundant intermediate fleet rebuild. The release
+preserves current Qwen Coder Responses routing, the affected domain-pack
+delegation and curator limits, every deployment's current SOUL voice, and the
+cron-plus pin.
+
+This is also the first tagged release of the v0.13.8-era changes below, plus corrections
+merged after four deployments were built from the untagged `c13f13ad` revision.
+The fleet's existing `v0.13.8` image labels are not a Git tag or proof of a
+uniform release. Deployment requires a gateway
+rebuild/recreate for baked reader/MCP/write-path fixes, in addition to staging
+the cron scripts. See #758 and #759 for qualification and per-deployment verification.
+
+- **Hermes v0.21.3 port (okengine#758, okengine#759).** The exact upstream tag
+  and peeled SHA are pinned atomically. Twenty-two original patch IDs are ported
+  in 21 ordered production artifacts; patch 05 is retired in favor of native
+  delegated-session finalization with a retained negative contract. Custom and
+  Serper overlays follow the v0.21.3 contracts, while OpenRouter remains native.
+  Patch 17 deliberately preserves the existing forced `/v1/responses` route for
+  custom Qwen Coder models, including when an explicit Chat mode is present.
+
+- **`observability-validation` can pass on a live deployment (okengine#757).** The lane had never
+  passed anywhere: it required fleet-health's search snapshot to equal a qmd artifact the read-MCP
+  republishes on every call, rejected the artifact's real no-samples shape (percentile keys absent),
+  and did not know fleet-health's `undetectable` bucket. Fleet-health also filed every passing
+  `deployment-validate` as UNDETECTABLE — a silent `no_agent` run persists no stdout — and read the
+  artifact twice, so its dashboard and sidecar could describe different versions. Fleet-health now
+  reads the telemetry once and takes a silent run's verdict from the report that run wrote; the
+  validator compares the dashboard to its own snapshot, requires exact agreement with the artifact
+  only while the artifact is unchanged since the run (counters may only grow after), accepts
+  unsampled buckets, and shares one bucket list with fleet-health. A producer→consumer contract test
+  drives the real writers. The two scripts can be staged, but this release also
+  includes baked-surface changes and therefore requires an image rebuild.
+- **Lacuna soft-prediction links require an accepted prediction write (okengine#760).** The
+  first-party Lacuna workflow now creates a standalone inference before an optional prediction,
+  then adds `prediction_candidate` only after the prediction create is accepted. The write
+  contract rejects links to absent targets, and separate receipts distinguish accepted Lacuna
+  and accepted or rejected prediction artifacts. Real writer-boundary tests cover both accepted
+  and rejected prediction paths. This release does not by itself remediate the already-dangling
+  Strat Intel page; that data repair needs its own authorized write workflow.
+- **Invariant-audit corrections landed after the first four image builds.** The
+  `d40ecf32` merge contains fixes and regression tests for reader paths,
+  write-policy enforcement, cron/index/backup/upgrade behavior, and version
+  contracts; these bits were absent from the untagged `c13f13ad` images.
+- **Exact-SHA adversarial reverify corrections.** Converge now authorizes the resolved target type
+  and actual changed/removed fields; pack migration checkpoints cannot skip same-release siblings;
+  review-write image provenance covers the complete baked package and wheel runtime members;
+  taxonomy preflight checks pack-owned namespaces even when host additions contain only types;
+  reader namespace exclusions use the composed schema without confusing nested folder names;
+  producer-lane attribution survives later narrow job edits; and mixed out-of-vocabulary reliability
+  evidence remains visible. Sidecar overrides are attached only by their scheduled `run --rm`
+  wrappers, never the default deploy project. Negative fixtures cover each repaired boundary.
+- **CI reliability gates.** Registry reachability is checked independently of
+  earlier stages (#751); the security suite has its own deadline and the
+  Makefile gates have explicit budgets. CI evidence remains GitLab pipeline
+  jobs, not local deployment evidence.
+- **Retained deadline limitation (invariant-audit waiver, #779).** Cron-plus publishes and
+  enforces each run deadline, but model-producing lanes do not yet use that signal to stop early
+  with a partial-success receipt. A hard timeout can therefore still discard an over-budget run.
+  Wiring this safely requires cross-lane selection, iteration, and receipt changes plus scheduled
+  runtime evidence; it is explicitly deferred from this integrity patch and remains a gate for the
+  Hermes v0.14.0 rollout. This release does not claim graceful deadline degradation.
+- **Low-severity Wardley vocabulary residual (#778).** Invalid evolution values are still grouped
+  with unenriched concepts by the optional Wardley-map extension. The follow-up will establish one
+  producer/schema/consumer vocabulary and separate missing from invalid values; no v0.13.9 core
+  write or repair path relies on that visualization.
+
+## v0.13.8
+
+PATCH — security, integrity, runtime-performance, and analysis-routing fixes accumulated since
+v0.13.7. No schema-breaking change. Packs on v0.13.7 re-stamp after validation.
+
+- **Read-MCP graph tools are vault-contained (okengine#660).** `_resolve_key()` fell back to a bare `(WIKI / target).is_file()`, so `retrieve_context("../CLAUDE")` served the vault-root persona file and a symlink inside `wiki/` read anything on the host; `find_references` took the same route. The on-disk fallback and the page read now go through `_safe()` exactly as `get_page` does, and the key handed back is the canonical wiki-relative path. Read-MCP image rebuild.
+- **Cockpit markdown is sanitized (okengine#659).** The cockpit rendered agent- and feed-derived page bodies straight into `innerHTML` with no `nh3` pass (it shipped the dependency and never imported it), so a `<script>` tag, an `onerror=` handler, or a `javascript:` href in any ingested page executed in every viewer's browser on a `trust:public` deployment. The nh3 allowlist and the panel-svg stash now live in the wheel (`okengine.html_sanitize`) and BOTH read surfaces call it, so the reader and the cockpit cannot drift apart again. Cockpit and reader image rebuild.
+- **Human review decisions are no longer MCP tools (okengine#661).** `resolve_review` and `assign_review` sat on the default `okengine-write` server that 12 of 14 agent crons and api_server chat carry, with a free-text `reviewer` and an `admin` stdio caller, so a lane could clear its own `needs_review` flags with human-looking approvals. Humans reach the same functions through the review-only HTTP sidecar and `framework review`; the MCP surface keeps only `record_machine_review`, which cannot clear human-required state. Gateway image rebuild (baked write path).
+- **Converge ownership keys on the deployment's pack identity (okengine#662).** `_converge` did `pack = pack or _prov_pack()`, so the tool argument won over the deployment-pinned `OKENGINE_PACK` and any lane with `converge_entity` could overwrite another pack's owned fields with "0 conflicts" by naming the owner. The deployment identity now governs whenever it is set; a differing argument is refused (a legacy deploy without the env keeps honouring the argument). Gateway image rebuild (baked write path).
+- **The dedup drain is tombstone-aware (okengine#663).** `dedup_partition_collisions` grouped every same-slug copy with no `status` filter and let the deepest path win every scalar, so a live page plus a deeper tombstone merged into a *tombstoned* survivor with the tombstone's `id` and no review flag, and two live copies disagreeing on `status: live` vs `retracted` were resolved by depth silently. Now only live copies merge; a tombstone whose `superseded_by` names the survivor is retired with its links rewritten (the call `build_map` defers to this pass), a tombstone pointing elsewhere is left in place and reported, and live copies that disagree on any non-volatile scalar are merged with `needs_review: true` and the fields named. `okf_migrate.find_page`/`write_key` prefer a live copy over a tombstone at any depth (`desired_key` exposes the strategy's seat). Stage-only (`deploy-cron-scripts.sh`); `okf_migrate.py` is also baked for the write path, so a gateway rebuild picks up the `find_page` change there.
+- **Per-lane MCP tool allowlists are pack config (okengine#664).** `write_server` carried a private deployment's cron name in its actor→tools table, baked into the write path and caught by the publish guard. A pack lane now declares `write_tools: [...]` on its cron def; ensure-runtime forwards it as `OKENGINE_WRITE_TOOLS` on that lane's server-bound writer and the server prunes to exactly that set. The engine table keeps engine lanes only. Bare private product names were scrubbed from engine comments and the publish guard now matches the bare form. Gateway image rebuild (baked write path); a pack that relied on the removed entry must add `write_tools` to its lane before its next roll.
+- **Secret files are owner-only; `--fix-perms` no longer opens them (okengine#665).** `.env` is created under umask 077 and tightened to 0600 by both `deploy.sh` and `ensure-runtime.sh` (INSTALL promised 600; nothing set it). `ensure-runtime.sh --fix-perms` used to `chmod -R a+rwX` the whole pack, making `.env` and the Bearer token in `.hermes-data/config.yaml` world-readable while reporting only world-writable; it now opens only the trees the container writes (`.hermes-data`, `wiki`, `raw`, `.okengine`), keeps `.env` 0600 and names `config.yaml` as world-readable in its output. `post_deploy_verify.sh` FAILs a group/other-readable `.env` and WARNs on a world-readable `config.yaml`.
+- **The per-tool MCP fence costs O(pages touched), not O(vault) (okengine#666).** `corpus_transaction.mutation` SHA-256'd every wiki page before and after each write-tool call, under the exclusive corpus lock: 1.3 s per no-op call at 20k pages, 3.5 s at 60k, on rejected calls too — the id-index first-write timeout and the #650 lock window re-created at the fence. `mutation()` gains `tracking="touched"`: the write services declare each page they mutate with `corpus_transaction.touch()`, which records that one page's before-digest into the active marker, and the receipt is built from the touched set; a killed writer's recovery replays the same set. Batch writers (operations, reconciliation) keep the default full snapshot. Gateway image rebuild (baked write path).
+- **Retire request-triggered IWE graph rebuilds (okengine#651).** The bounded backlink scanner and
+  `wiki/.backlinks.json` are now the authoritative graph implementation. MCP graph calls return
+  explicit unavailable/not-found-or-ambiguous results when evidence cannot answer a query; typos,
+  new slugs, stale artifacts, and corrupt artifacts can no longer launch a multi-gigabyte
+  whole-corpus subprocess. The IWE binary and wrapper are removed from runtime images and staging.
+- **`deploy.sh` reports whether the deployment verified (okengine#597).** It exited `0` whether or
+  not `post_deploy_verify.sh` passed, so a fleet roll, a CI job, or `deploy.sh && <next step>` could
+  not distinguish a working deployment from one that came up with failing checks — both print
+  `==> done` and differ only in the sentence after it. Now `0` = up and verified, **`3` = up but
+  checks reported issues**, `1` = bring-up failed, `2` = usage error. Behaviour is otherwise
+  unchanged: the stack still comes up and the remediation still prints, because aborting a bring-up
+  over a gateway that has not finished binding would be worse. `OKENGINE_VERIFY_DELAY` (default 5)
+  now controls the settle before probing.
+- **Behavioural tests for the two scripts that gate deployment (okengine#602).** `deploy.sh` and
+  `post_deploy_verify.sh` were guarded almost entirely by grepping their own source, which cannot
+  tell "the check is gone" from "the check moved" and cannot see whether a branch runs at all. Both
+  now execute for real against stub `docker`/`git` and a scratch tree. The verifier's tally is
+  asserted to count exactly the verdicts it printed — an operator reads the verdicts, a script reads
+  the exit status, and nothing checked that those two agree.
+- PostgreSQL projection is now part of the standard deployment lifecycle: `deploy.sh` generates
+  distinct per-deployment credentials, upgrades older deployments through a generated Compose
+  overlay, starts the projector by default, and verifies health, file-count conformance, and a
+  typed MCP query before reporting the deployment healthy.
+
+- **Optional PostgreSQL structured-query projection (#566, #569–#574).** Large deployments can
+  compile schema-selected Markdown pages and wikilinks into a disposable epoch/digest read model,
+  query it through freshness-enforced typed MCP tools with complete coverage receipts, and prove
+  recovery through health and scratch-schema reproducibility checks. The projector and PostgreSQL
+  services are opt-in; Markdown remains canonical, qmd remains lexical discovery, and the database
+  reader is structurally read-only. The implementation incorporates lessons from the measured reference deployment
+  deployment lessons: UTF-8 initdb enforcement, frontmatter links, resolution provenance,
+  explicit unreadable/skip accounting, dual deletion guards, real-PostgreSQL CI, typed date binds,
+  loop-aware pools, alarms that are fault-tested, and refusal to serve stale results.
+
+## v0.13.7
+
+PATCH — rollout follow-up for v0.13.6. No schema or runtime-image behavior changes outside the
+upgrade and repair tools.
+
+- **Symlink-safe upgrade snapshots (#441).** `framework upgrade` preserves file symlinks without
+  following dangling or external targets, so ephemeral browser singleton links cannot disable the
+  rollback-protected upgrade path.
+- **Syntax-only repair classification (#442).** Valid typeless frontmatter remains the schema
+  classifier's responsibility and is no longer mislabeled as broken YAML; transformed repair
+  candidates still require a valid `type` before they can be written.
+
+## v0.13.6
+
+PATCH — receipted operations framework, operator diagnostics, and a broad data-integrity hardening
+pass. No schema-breaking change. Packs on v0.13.5 re-stamp after validation.
+
+- **Receipted operations and operator CLI (#401–#409).** Adds validated operation manifests,
+  run IDs, locks, input digests, durable receipts, runner integration, stable job management,
+  status/doctor diagnostics, guarded audit/repair, ingest/derived rebuild families, explainability,
+  and evidence exports.
+- **Repair and reconciliation convergence (#412, #413, #416, #423–#427, #431–#438).** Repaired
+  sources re-enter downstream synthesis; entity reconciliation is receipt-backed; dedupe backlogs
+  converge; raw/source-quality/model-write receipts are complete and attributable; fleet health
+  recognizes terminal outcomes; reference repairs are bounded and audited; malformed source
+  shapes, glued delimiters, receipt identity inversion, and repeated RSS-suffix corruption are
+  detected or deterministically repaired. Closing fences now match complete lines so suffix
+  fragments cannot masquerade as valid delimiters.
+- **Runtime and UI hardening (#410, #411, #414, #418–#421, #428–#430).** Bounds and cancels
+  saturated qmd work; preserves runner PID ownership and host provenance; reconciles model-write
+  receipts; preserves extension namespace partitioning; improves Cockpit layout; ships the branded
+  favicon; includes the review write runtime in images; and embeds the source-quality rubric in
+  rolled packs.
+- **Release safety and documentation.** Merge-request gates are blocking, carried cron patches are
+  validated, operator boundaries are documented, and the executive architecture guide and rollout
+  policy define release pins as the compatibility contract.
+
 ## v0.13.5
 
 PATCH — cron-plus scheduler pin bump (DST fall-back double-fire fix) + DST-window detector. Packs on
@@ -189,6 +370,12 @@ root cause + a validation at the earliest gate + a red-proven regression test.
   work queues, views, and success measures through `.okengine/application.yaml`; `framework
   validate` rejects incoherent composition before runtime. A two-class synthetic fixture proves
   exact changed-evidence selection and preserves a reviewed reassessment-to-learning receipt.
+- **Cockpit work surface (#187, #230–#233):** responsive compact navigation and accessible tabs/
+  drilldowns; attention-first pack landing pages via reusable `doc-summary` cards; declared aliases
+  merge legacy aggregate buckets while invalid numeric metrics degrade visibly; metric metadata now
+  distinguishes shown records/groups from corpus totals and table columns support declared value
+  labels; trend cards declare full-period, same-cutoff YTD, or partial/no-direction clocks; Ops now
+  leads with evidence-linked backlog/ingest/validation metrics and sorted artifact freshness states.
 
 - **fix(mcp #198):** `_run` starts helpers in their own process group and `killpg`s the tree on
   timeout — the orphaned-`iwe` leak (internal timeouts were cosmetic; grandchildren piled up) is
@@ -665,7 +852,7 @@ enforced boundary with a red test, plus one real feature (the cockpit analyst ho
 ### Changed
 - **`build-index-tree` runs intraday (every 6h)** — a nightly-only INDEX build meant pages
   ingested during the day didn't appear in namespace listings until the next morning (hit live
-  twice; cyber-market had a pack-level workaround, now retired). Freshness of an engine-generated
+  twice; one domain pack had a pack-level workaround, now retired). Freshness of an engine-generated
   artifact is an engine default. Hours sit outside the 01–02 DST window; the DST guard test now
   parses comma-list hour fields, and a red test pins the intraday cadence.
 

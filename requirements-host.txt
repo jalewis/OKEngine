@@ -1,0 +1,5 @@
+# Host-side cron generation and deployment. Keep croniter aligned with the
+# gateway scheduler so five-field overrides are validated before jobs.json is
+# changed. Install into the checkout's .venv, not system Python.
+pyyaml>=6,<7
+croniter>=6,<7

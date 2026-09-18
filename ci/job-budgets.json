@@ -1,0 +1,61 @@
+{
+  "_why": [
+    "Recorded runtimes for every CI job that claims a timeout under the shared-preamble floor.",
+    "",
+    "A short timeout is a CLAIM that a job is cheap. Nothing checked the claim against the job's",
+    "actual runtime, so the claim could be false indefinitely: diff-check and mutation-targets both",
+    "carried 5m while needing 208-311s, and both died at the wall repeatedly (!1018, !1020, !1013).",
+    "The rule that was supposed to catch this keyed on which PREAMBLE a job used, not on how long",
+    "the job took, so trimming a preamble made a job compliant without making it fast.",
+    "",
+    "This file is the evidence half. tests/test_ci_config.py asserts two things against it:",
+    "  1. every job with a timeout below the floor HAS an entry here -- a new job cannot escape",
+    "     the rule by simply not being listed, which is exactly how these two escaped;",
+    "  2. its timeout is at least HEADROOM_FACTOR x its recorded runtime.",
+    "",
+    "measured_s is wall-clock from a real CI job, not a local run and not an estimate. Record the",
+    "job id so the number can be audited. Re-measure when a job's work changes; a stale number",
+    "that is too LOW is the dangerous direction, because it makes a tight budget look safe."
+  ],
+  "headroom_factor": 2.0,
+  "jobs": {
+    "diff-check": {
+      "measured_s": 14.0,
+      "timeout": "5m",
+      "job_id": 109309,
+      "measured_on": "2026-09-13",
+      "note": "Was 208-309s until !1023 moved it off python:3.12-slim; the cost was apt installing git+make, never the diff gate itself."
+    },
+    "resource-policy": {
+      "measured_s": 12.4,
+      "timeout": "5m",
+      "job_id": 109311,
+      "measured_on": "2026-09-13",
+      "note": "before_script: [] -- the verifier imports only the stdlib, so nothing is installed."
+    },
+    "mutation-targets": {
+      "measured_s": 66.4,
+      "timeout": "5m",
+      "job_id": 109320,
+      "measured_on": "2026-09-13",
+      "note": "Was 302-311s on an idle runner; apt held 295 of the 300s. The remaining 66s is this job's own pip install, which it genuinely needs."
+    }
+  },
+  "make_deadlines": {
+    "_why": [
+      "Deadlines enforced INSIDE a job by a Makefile `timeout` wrapper, which a job's own `timeout:`",
+      "does not see. test-security shared TEST_FAST_DEADLINE=120 while its suite measured up to 95.5s",
+      "-- about 1.26x headroom -- and was killed at 89% complete on a contended runner (pipeline 9740,",
+      "job 110495). The `jobs` rule above could not catch it: that job's timeout was a comfortable",
+      "10m; the cap that fired was this inner one. Same contract as `jobs`: measured_s is a real CI",
+      "measurement with its job id, and the deadline must be at least headroom_factor x measured_s."
+    ],
+    "test-security": {
+      "variable": "TEST_SECURITY_DEADLINE",
+      "measured_s": 95.46,
+      "job_id": 110365,
+      "measured_on": "2026-09-13",
+      "note": "Slowest of four passing runs (83.2/94.2/94.7/95.5s), pytest's own reported duration for the security layer."
+    }
+  }
+}

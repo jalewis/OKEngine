@@ -1,29 +1,66 @@
 diff --git a/runner.py b/runner.py
+index ff929e5..94aed93 100644
 --- a/runner.py
 +++ b/runner.py
-@@ -59,6 +59,8 @@ except Exception as e:
+@@ -59,6 +59,9 @@ except Exception as e:
      sys.stderr.write(f"warning: load_hermes_dotenv failed: {e}\n")
  
  import jobs as jobs_mod  # type: ignore[import]  # noqa: E402
 +import run_receipts  # type: ignore[import]  # noqa: E402
 +import model_slots  # type: ignore[import]  # noqa: E402
++import run_timeout  # type: ignore[import]  # noqa: E402
  
  logging.basicConfig(
      level=os.environ.get("CRON_PLUS_LOG_LEVEL", "INFO").upper(),
-@@ -156,6 +157,40 @@ def _run_via_hermes(job: dict) -> tuple[bool, str, str, str | None]:
+@@ -156,6 +158,76 @@ def _run_via_hermes(job: dict) -> tuple[bool, str, str, str | None]:
      return run_job(job)
  
  
-+def _verify_receipt(job: dict, response: str) -> Optional[str]:
++def _selected_this_run(job: dict, started_at: datetime) -> bool:
++    """Did THIS run's selector write a manifest?
++
++    A wakeAgent=true selector writes the manifest before the agent starts, so a
++    manifest whose mtime falls at or after this run began is work this run owes
++    a receipt for. Existence alone is NOT that signal: manifests are not removed
++    on the no-work path, so a file left by an earlier run persists indefinitely
++    (okengine#479 — a day-old manifest sitting beside its own `.completed.json`
++    failed every subsequent wakeAgent=false run of an enforce-mode lane).
++
++    Unreadable mtime is treated as "selected", so a broken clock or a vanished
++    file fails CLOSED into verification rather than silently exempting a lane.
++    """
++    import json
++
++    manifest = job.get("selection_manifest")
++    if not manifest:
++        return False
++    try:
++        path = Path(manifest)
++        if path.stat().st_mtime < started_at.timestamp():
++            return False
++        value = json.loads(path.read_text())
++        selected = value.get("selected") if isinstance(value, dict) else None
++        # A selector is required to refresh its manifest even on a no-work
++        # path. A fresh, structurally valid empty selection therefore owes no
++        # receipt; malformed content still fails closed into verification.
++        return not (isinstance(selected, list) and not selected)
++    except FileNotFoundError:
++        return False
++    except (OSError, ValueError, TypeError):
++        return True
++
++
++def _verify_receipt(job: dict, response: str, started_at: datetime) -> Optional[str]:
 +    contract = job.get("output_contract") or {}
 +    if contract.get("completion") != "per-selected-item":
 +        return None
-+    # A clean wakeAgent=false gate returns [SILENT] without running an agent.
-+    # It has no selected work and therefore owes no completion receipt. A
-+    # wakeAgent=true selector writes the manifest before the agent starts, so
-+    # SILENT + missing manifest unambiguously identifies the clean no-work path.
-+    manifest = job.get("selection_manifest")
-+    if response.strip() == "[SILENT]" and (not manifest or not Path(manifest).is_file()):
++    # A clean wakeAgent=false gate returns [SILENT] without running an agent
++    # (cron.scheduler returns SILENT_MARKER as the RESPONSE; the explanatory
++    # markdown is the output_doc). It has no selected work and therefore owes no
++    # completion receipt. An agent that DID have work selected and still returned
++    # [SILENT] is a real failure and must not be exempted -- so the test is
++    # whether this run selected anything, not whether a manifest file exists.
++    if response.strip() == "[SILENT]" and not _selected_this_run(job, started_at):
 +        logger.info("no selected items; completion receipt not required")
 +        return None
 +    mode = str(job.get("receipt_mode") or "report")
@@ -33,7 +70,8 @@ diff --git a/runner.py b/runner.py
 +    except run_receipts.ReceiptError as exc:
 +        receipt, result = {}, {"valid": False, "state": "failed", "errors": [str(exc)],
 +                               "counts": {"selected": 0, "accepted": 0, "rejected": 0,
-+                                          "deferred": 0, "undisposed": 0}, "retry": []}
++                                          "deferred": 0, "undisposed": 0}, "retry": [],
++                               "reconciliation": [], "verified": []}
 +    receipt_dir = jobs_mod.CRON_PLUS_HOME / "receipts" / str(job["id"])
 +    receipt_dir.mkdir(parents=True, exist_ok=True)
 +    stamp = _utc_now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -51,23 +89,48 @@ diff --git a/runner.py b/runner.py
  def main() -> int:
      parser = argparse.ArgumentParser(description="cron-plus subprocess runner")
      parser.add_argument("--job-id", required=True)
-@@ -196,6 +231,7 @@ def main() -> int:
+@@ -185,7 +258,19 @@ def main() -> int:
+ 
          # Run the agent (or skip if wake-gate emits false)
          try:
 -            success, output_doc, response, error = _run_via_hermes(job)
-+            with model_slots.model_slot(job):
-+                success, output_doc, response, error = _run_via_hermes(job)
++            with run_timeout.run_deadline(job):
++                with model_slots.model_slot(job):
++                    success, output_doc, response, error = _run_via_hermes(job)
++                    if (
++                        not success
++                        and "Response truncated due to output length limit" in str(error or output_doc)
++                        and int(job.get("_okengine_executed_tool_calls") or 0) == 0
++                    ):
++                        logger.warning(
++                            "retrying one pre-write truncated model response "
++                            "(job=%s)", job.get("name") or job.get("id")
++                        )
++                        success, output_doc, response, error = _run_via_hermes(job)
          except Exception as e:
              logger.error("agent invocation crashed: %s", e, exc_info=True)
              jobs_mod.mark_job_run(args.job_id, success=False, error=str(e))
-@@ -228,6 +264,12 @@ def main() -> int:
+@@ -202,6 +287,25 @@ def main() -> int:
          local_path = _save_local_output(job, output_doc)
          logger.info("output saved to %s", local_path)
  
-+        receipt_error = _verify_receipt(job, response)
++        receipt_error = _verify_receipt(job, response, started_at)
 +        if receipt_error:
 +            logger.error(receipt_error)
 +            jobs_mod.mark_job_run(args.job_id, success=False, error=receipt_error)
++            return 1
++
++        try:
++            verified_writes = run_receipts.verify_run_completion(
++                job, started_at,
++                Path(os.environ.get("WIKI_PATH") or "/opt/vault") / "wiki",
++            )
++            if verified_writes:
++                job["_okengine_executed_writes"] = verified_writes
++        except run_receipts.ReceiptError as exc:
++            completion_error = f"invalid run completion: {exc}"
++            logger.error(completion_error)
++            jobs_mod.mark_job_run(args.job_id, success=False, error=completion_error)
 +            return 1
 +
          # Honor the [SILENT] marker — agent says "nothing to report,

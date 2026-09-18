@@ -64,7 +64,7 @@ def test_prompt_makes_an_agent_job_with_wake_gate():
 def test_agent_op_without_entrypoint_has_no_wake_gate():
     c = _load("extension_compose", COMPOSE)
     rec = _record("okengine.brief", {
-        "schedule": {"kind": "cron", "expr": "0 8 * * *"},
+        "schedule": {"kind": "cron", "expr": "@jitter:daily@8"},
         "prompt": "Write the daily brief.",
     })
     jobs, errors, _ = c.synthesize_ops(rec)
@@ -85,7 +85,7 @@ def test_custom_toolsets_respected():
 
 def test_no_prompt_no_entrypoint_is_an_error():
     c = _load("extension_compose", COMPOSE)
-    rec = _record("x.y", {"schedule": {"kind": "cron", "expr": "0 4 * * *"}})
+    rec = _record("x.y", {"schedule": {"kind": "cron", "expr": "@jitter:daily@4"}})
     _, errors, _ = c.synthesize_ops(rec)
     assert any("no_agent operation needs an entrypoint" in e for e in errors), errors
 
@@ -93,9 +93,31 @@ def test_no_prompt_no_entrypoint_is_an_error():
 def test_no_prompt_stays_no_agent_backcompat():
     c = _load("extension_compose", COMPOSE)
     rec = _record("okengine.contradictions", {
-        "schedule": {"kind": "cron", "expr": "0 4 * * *"}, "entrypoint": "run.py"})
+        "schedule": {"kind": "cron", "expr": "@jitter:daily@4"}, "entrypoint": "run.py"})
     jobs, errors, _ = c.synthesize_ops(rec)
     assert not errors and jobs[0]["no_agent"] is True and jobs[0]["prompt"] is None
+
+
+def test_no_agent_llm_entrypoint_requires_cost_bearing(tmp_path):
+    c = _load("extension_compose", COMPOSE)
+    (tmp_path / "run.py").write_text("from scripts.cron import llm_lib\nllm_lib.chat('x')\n")
+    rec = _record("okengine.costly", {
+        "schedule": {"kind": "cron", "expr": "7 4 * * *"}, "entrypoint": "run.py"})
+    rec["dir"] = str(tmp_path)
+    jobs, errors, _ = c.synthesize_ops(rec)
+    assert not jobs
+    assert any("cost_bearing: true" in e for e in errors)
+    rec["manifest"]["operation"]["cost_bearing"] = True
+    jobs, errors, _ = c.synthesize_ops(rec)
+    assert not errors and jobs[0]["cost_bearing"] is True
+
+
+def test_llm_entrypoint_detection_tolerates_missing_and_invalid_python(tmp_path):
+    c = _load("extension_compose", COMPOSE)
+    assert c._script_uses_llm_lib(tmp_path / "missing.py") is False
+    bad = tmp_path / "bad.py"
+    bad.write_text("def broken(:\n")
+    assert c._script_uses_llm_lib(bad) is False
 
 
 def test_mixed_agent_and_no_agent_multi_op():
@@ -108,7 +130,7 @@ def test_mixed_agent_and_no_agent_multi_op():
              "candidate-watch": {"schedule": {"kind": "cron", "expr": "17 6 * * *"},
                                  "entrypoint": "select_candidates.py",
                                  "prompt": "File prediction candidates.", **_contract_fields()},
-             "regrade-sweep": {"schedule": {"kind": "cron", "expr": "0 3 * * *"},
+             "regrade-sweep": {"schedule": {"kind": "cron", "expr": "@jitter:daily@3"},
                                "entrypoint": "reindex.py"},   # no prompt -> no_agent
          }}
     jobs, errors, _ = c.synthesize_ops({"id": ext_id, "tier": "engine", "dir": "/x", "manifest": m})
@@ -123,7 +145,7 @@ def test_mixed_agent_and_no_agent_multi_op():
 def test_manifest_accepts_agent_op_without_entrypoint():
     mod = _load("extension_manifest", MANIFEST)
     rec = _record("okengine.brief", {"schedule": {"kind": "cron", "expr": "0 8 * * *"},
-                                      "prompt": "Write the brief."})
+                                      "prompt": "Write the brief.", "max_iterations": 8})
     errors, _ = mod.validate_manifest(rec["manifest"])
     assert not errors, errors
 
@@ -141,3 +163,13 @@ def test_manifest_rejects_bad_toolsets():
                           "prompt": "x", "toolsets": "okengine"})   # str, not list
     errors, _ = mod.validate_manifest(rec["manifest"])
     assert any("toolsets must be a list" in e for e in errors), errors
+
+
+def test_manifest_rejects_raw_file_mutation_beside_enforced_writer():
+    mod = _load("extension_manifest_raw_file", MANIFEST)
+    rec = _record("x.y", {
+        "schedule": {"kind": "cron", "expr": "0 4 * * *"},
+        "prompt": "x", "toolsets": ["file", "okengine-write", "okengine"],
+    })
+    errors, _ = mod.validate_manifest(rec["manifest"])
+    assert any("cannot combine okengine-write" in error for error in errors), errors

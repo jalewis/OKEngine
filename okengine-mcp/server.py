@@ -12,9 +12,9 @@ knowledge attributable when a consumer ingests it (`discovered_by`).
 Tools:
   search(query, mode, limit)            — qmd hybrid/lexical search (via kb_search)
   get_page(path)                        — fetch a wiki page (frontmatter + body)
-  find_references(target)               — IWE backlinks / resolved refs (via kb_graph)
-  retrieve_context(path)                — a page + its expanded graph neighbourhood (IWE)
-  graph_stats()                         — orphans / most-referenced / hierarchy (IWE)
+  find_references(target)               — precomputed backlinks + direct forward refs
+  retrieve_context(path)                — a page + its precomputed graph neighbourhood
+  graph_stats()                         — precomputed graph health and hubs
   list_pages(namespace, type, status)   — list pages in a namespace, filtered by
                                           frontmatter type/status (domain-agnostic)
 
@@ -32,6 +32,7 @@ Env: WIKI_PATH (/opt/vault), OKENGINE_MCP_SCRIPTS (/opt/data/scripts).
 """
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import hmac
 import json
@@ -40,6 +41,7 @@ import re
 import signal
 import subprocess
 import sys
+from datetime import datetime, timezone
 import threading
 import time
 from pathlib import Path
@@ -48,8 +50,10 @@ import yaml
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import scope as _scope  # noqa: E402  per-extension token resolution (okengine#132)
+from okengine.mcp import projection as _projection
+
+_BACKLINK_READ_ERRORS = (OSError, json.JSONDecodeError, ValueError)
+from okengine.mcp import scope as _scope
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
@@ -71,11 +75,45 @@ _FM = re.compile(r"\A---[ \t]*\n(.*?\n)---(.*)\Z", re.S)
 mcp = FastMCP("okengine",
               transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
 
+# One shared admission gate covers interactive qmd searches and background qmd
+# maintenance. It is deliberately thread-based: the HTTP tool runs on asyncio
+# while the index maintainer is a thread. Callers poll non-blockingly, so a
+# canceled HTTP request never leaves a waiter that later steals a slot.
+_QMD_CONCURRENCY = max(1, int(os.environ.get("OKENGINE_MCP_QMD_CONCURRENCY", "2") or 2))
+_QMD_CAPACITY = threading.BoundedSemaphore(_QMD_CONCURRENCY)
+_SEARCH_QUEUE_SECONDS = max(
+    0.0, float(os.environ.get("OKENGINE_MCP_SEARCH_QUEUE_SECONDS", "10") or 10))
+_SEARCH_TIMEOUT_SECONDS = max(
+    1.0, float(os.environ.get("OKENGINE_MCP_SEARCH_TIMEOUT_SECONDS", "120") or 120))
+_INDEX_REFRESH_LOCK = threading.Lock()
+_INDEX_STATUS_LOCK = threading.Lock()
+_INDEX_STATUS = {"active": False, "ready": False, "error": ""}
+
+
+def _set_index_status(*, active: bool | None = None, ready: bool | None = None,
+                      error: str | None = None) -> None:
+    with _INDEX_STATUS_LOCK:
+        if active is not None:
+            _INDEX_STATUS["active"] = active
+        if ready is not None:
+            _INDEX_STATUS["ready"] = ready
+        if error is not None:
+            _INDEX_STATUS["error"] = error
+
+
+def _index_unavailable_message() -> str | None:
+    with _INDEX_STATUS_LOCK:
+        status = dict(_INDEX_STATUS)
+    if not status["active"] or status["ready"]:
+        return None
+    detail = status["error"] or "knowledge index is building"
+    return f"(search unavailable: {detail}; retry later)"
+
 
 def _run(args: list[str], extra_env: dict | None = None, timeout: int = 90) -> str:
     """Run a helper script with a timeout that actually bounds wall-clock (okengine#198).
 
-    subprocess.run(timeout=) only kills the DIRECT child; a spawned grandchild (kb_graph's `iwe`)
+    subprocess.run(timeout=) only kills the DIRECT child; a spawned grandchild
     survives holding the stdout pipe, and the post-kill communicate() blocks until IT exits — so
     the internal timeout was cosmetic and the client hung to its own 300s ceiling. Start the child
     in its OWN process group (start_new_session) and killpg the whole tree on timeout."""
@@ -87,7 +125,7 @@ def _run(args: list[str], extra_env: dict | None = None, timeout: int = 90) -> s
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(proc.pid, signal.SIGKILL)     # the whole group: python + any iwe grandchild
+            os.killpg(proc.pid, signal.SIGKILL)     # the whole group, including grandchildren
         except (ProcessLookupError, PermissionError):
             proc.kill()
         proc.communicate()                           # reap; pipes close now the group is dead
@@ -96,15 +134,122 @@ def _run(args: list[str], extra_env: dict | None = None, timeout: int = 90) -> s
     return out or (stderr or "(no output)").strip()
 
 
+def _kill_process_group(proc) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
+async def _run_async(args: list[str], extra_env: dict | None = None,
+                     timeout: float = 90) -> str:
+    """Cancellation-safe helper execution for HTTP tools.
+
+    Cancellation and timeout kill the complete helper process group (Python
+    wrapper plus qmd descendants) and await reaping before returning control.
+    """
+    env = {**os.environ, **(extra_env or {})}
+    proc = await asyncio.create_subprocess_exec(
+        PYBIN, *args, cwd=str(VAULT), env=env,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        start_new_session=True)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
+        _kill_process_group(proc)
+        await proc.communicate()
+        raise
+    except asyncio.CancelledError:
+        _kill_process_group(proc)
+        await proc.communicate()
+        raise
+    out = (stdout or b"").decode(errors="replace").strip()
+    err = (stderr or b"").decode(errors="replace").strip()
+    return out or err or "(no output)"
+
+
+async def _acquire_qmd_capacity(wait_seconds: float) -> bool:
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        if _QMD_CAPACITY.acquire(blocking=False):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
 def _safe(path: str) -> Path | None:
-    """Resolve a wiki-relative path, refusing escapes outside the vault wiki/."""
-    p = WIKI / path.lstrip("/")
+    """Resolve the same canonical path spelling accepted by the write surface."""
+    try:
+        wiki_abs = WIKI.resolve()
+    except OSError:
+        wiki_abs = WIKI
+    rel = str(path).strip()
+    prefixes = []
+    for base in (wiki_abs, wiki_abs.parent):
+        value = str(base)
+        prefixes.extend((value, value.lstrip("/")))
+    rel = rel.lstrip("/")
+    # Tolerate a repeatedly-prefixed absolute path from clients that accidentally joined a
+    # vault root to an already-absolute value. Strip recognized roots until no progress remains.
+    while True:
+        before = rel
+        for prefix in sorted({value for value in prefixes if value}, key=len, reverse=True):
+            if rel == prefix or rel.startswith(prefix + "/"):
+                rel = rel[len(prefix):].lstrip("/")
+                break
+        while rel == "wiki" or rel.startswith("wiki/"):
+            rel = rel[len("wiki"):].lstrip("/")
+        if rel == before:
+            break
+
+    parts = rel.split("/")
+    exact = WIKI / rel
+    if exact.suffix != ".md":
+        exact = exact.with_name(exact.name + ".md")
+    try:
+        exact_resolved = exact.resolve()
+        exact_relative = exact_resolved.relative_to(wiki_abs)
+    except (OSError, ValueError):
+        exact_relative = None
+    entity_shape = (
+        parts and parts[0] == "entities"
+        and (len(parts) == 2 or (len(parts) >= 3 and all(len(seg) == 1 for seg in parts[1:-1])))
+    )
+    # Canonical shards win only when they actually exist. Flat legacy pages and special files
+    # remain readable; INDEX.md is never treated as an entity slug.
+    special_entity = parts and parts[-1].lower() in {"index", "index.md"}
+    if exact_relative is not None and exact_resolved.is_file() and (
+        not entity_shape or special_entity
+    ):
+        rel = str(exact_relative)
+    elif entity_shape:
+        stem = parts[-1][:-3] if parts[-1].endswith(".md") else parts[-1]
+        if stem:
+            first = stem[0].lower()
+            one = f"entities/{first}/{stem}.md"
+            second = stem[1].lower() if len(stem) > 1 and stem[1].isalnum() else "_"
+            two = f"entities/{first}/{second}/{stem}.md"
+            try:
+                leaf = WIKI / "entities" / first
+                if (WIKI / two).is_file() or (
+                    not (WIKI / one).exists()
+                    and leaf.is_dir()
+                    and any(child.is_dir() and len(child.name) == 1 for child in leaf.iterdir())
+                ):
+                    rel = two if (WIKI / two).is_file() else str(exact_relative or rel)
+                else:
+                    rel = one if (WIKI / one).is_file() else str(exact_relative or rel)
+            except OSError:
+                rel = one
+
+    p = WIKI / rel
     if p.suffix != ".md":
         # APPEND, never with_suffix() — it strips everything after the last dot and truncates a
-        # dotted slug, desyncing the read path from the write path (write_server._safe stores
-        # 'openssl-3.0.7-advisory.md'; a with_suffix() read would look for 'openssl-3.0.md' and 404
-        # the page). This aligns the .md handling with write_server._safe; the two still diverge on
-        # entity-shard / over-qualified / wiki-prefix normalization (pre-existing, tracked for v0.11.1).
+        # dotted slug, desyncing the read path from the write path.
         p = p.with_name(p.name + ".md")
     try:
         p = p.resolve()
@@ -127,8 +272,7 @@ def _clamp_limit(v, default: int) -> int:
     return max(1, min(n, _LIMIT_MAX))
 
 
-@mcp.tool()
-def search(query: str, mode: str = "search", limit: int = 8, tier: str = "") -> str:
+async def _search(query: str, mode: str = "search", limit: int = 8, tier: str = "") -> str:
     """Search the compiled knowledge base.
 
     mode: 'search' (default) — instant BM25 lexical; no model load, best for finding a
@@ -138,12 +282,109 @@ def search(query: str, mode: str = "search", limit: int = 8, tier: str = "") -> 
     tier: optional comma list of hot,warm,cold to keep (G4 tier; empty = all tiers).
     Returns ranked passages, each with its vault path for provenance.
     """
+    unavailable = _index_unavailable_message()
+    if unavailable:
+        return unavailable
     qmode = "search" if mode == "search" else "query"   # 'hybrid' -> qmd 'query'
     cmd = [str(SCRIPTS / "kb_search.py"), "--mode", qmode,
            "--limit", str(_clamp_limit(limit, 8)), str(query)]
     if (tier or "").strip():
         cmd += ["--tier", tier.strip()]
-    return _run(cmd, extra_env=_QMD_ENV)[:8000]
+    if not await _acquire_qmd_capacity(_SEARCH_QUEUE_SECONDS):
+        print("okengine-mcp: SEARCH_SATURATED qmd capacity queue expired",
+              file=sys.stderr, flush=True)
+        # THIS is the saturation okengine#410 was about: a lane refused an answer. It was
+        # unmeasured because the first telemetry only wrapped `_qmd`, which searches never use.
+        _record_qmd("search", "saturated")
+        _publish_qmd_stats()
+        return "(search saturated: qmd capacity is busy; retry with backoff)"
+    started = time.monotonic()
+    try:
+        try:
+            result = (await _run_async(
+                cmd, extra_env=_QMD_ENV, timeout=_SEARCH_TIMEOUT_SECONDS))[:8000]
+            _record_qmd("search", "ok", (time.monotonic() - started) * 1000)
+            return result
+        except TimeoutError:
+            print(f"okengine-mcp: SEARCH_TIMEOUT after {_SEARCH_TIMEOUT_SECONDS:.0f}s",
+                  file=sys.stderr, flush=True)
+            _record_qmd("search", "timeouts", (time.monotonic() - started) * 1000)
+            return "(search timed out: narrow the query or retry later)"
+    finally:
+        _QMD_CAPACITY.release()
+        _publish_qmd_stats()
+
+
+@mcp.tool()
+async def search(query: str, mode: str = "search", limit: int = 8, tier: str = "") -> str:
+    """Search the compiled knowledge base with bounded qmd capacity."""
+    return await _search(query, mode, limit, tier)
+
+
+@mcp.tool()
+async def projection_status() -> dict:
+    """Report the optional PostgreSQL projection epoch and freshness.
+
+    Raises an explicit tool error when the projection is not configured or has never completed.
+    Unlike completeness-sensitive query tools, status itself reports (rather than rejects) stale
+    state so operators can diagnose it.
+    """
+    _authorize_projection_query()
+    return await _projection.projection_status()
+
+
+def _authorize_projection_query() -> None:
+    """Projection queries can reveal aggregate facts outside a narrow path scope.
+
+    Until SQL predicates are compiled from arbitrary extension globs, permit only the admin or a
+    token whose declared scope already covers the whole vault. Refusal is safer than returning a
+    complete-but-unauthorized count.
+    """
+    caller = _caller()
+    if caller.get("kind") != "admin" and not _scope.is_full(caller.get("read_scopes") or []):
+        raise PermissionError("PostgreSQL projection tools require full-vault read scope")
+
+
+@mcp.tool()
+async def count_pages(namespace: str = "", type: str = "", status: str = "",
+                      include_tombstoned: bool = False, published_after: str = "",
+                      published_before: str = "", updated_after: str = "",
+                      updated_before: str = "") -> dict:
+    """Count all matching canonical pages using the complete, freshness-checked projection."""
+    _authorize_projection_query()
+    return await _projection.count_pages(namespace, type, status, include_tombstoned,
+                                         published_after=published_after,
+                                         published_before=published_before,
+                                         updated_after=updated_after, updated_before=updated_before)
+
+
+@mcp.tool()
+async def find_projected_pages(namespace: str = "", type: str = "", status: str = "",
+                               include_tombstoned: bool = False,
+                               published_after: str = "", published_before: str = "",
+                               updated_after: str = "", updated_before: str = "",
+                               order: str = "path", limit: int = 40) -> dict:
+    """Find structured page metadata with matched/returned/truncated coverage."""
+    _authorize_projection_query()
+    return await _projection.find_pages(
+        namespace, type, status, include_tombstoned, published_after=published_after,
+        published_before=published_before, updated_after=updated_after,
+        updated_before=updated_before, order=order, limit=limit)
+
+
+@mcp.tool()
+async def get_projected_page_meta(path_or_id: str) -> dict:
+    """Fetch projected metadata by vault path or canonical page id; never returns page prose."""
+    _authorize_projection_query()
+    return await _projection.get_page_meta(path_or_id)
+
+
+@mcp.tool()
+async def find_projected_links(target: str = "", source: str = "", resolution: str = "",
+                               limit: int = 40) -> dict:
+    """Query projected wikilinks, including exact/alias/slug/unresolved provenance."""
+    _authorize_projection_query()
+    return await _projection.find_links(target, source, resolution, limit)
 
 
 @mcp.tool()
@@ -161,13 +402,13 @@ def get_page(path: str) -> str:
     return p.read_text(encoding="utf-8", errors="replace")[:16000]
 
 
-# ── knowledge-graph backlinks: serve the cron-precomputed artifact, not live IWE ──────────────────
+# ── knowledge-graph backlinks: serve the cron-precomputed artifact ────────────────────────────────
 # The `backlinks-refresh` cron writes the inverted {target -> [{key,title}]} graph to
 # wiki/.backlinks.json (okengine#168/#179); the reader + cockpit serve it directly. This MCP used to
 # rebuild the IWE graph live on EVERY find_references/retrieve_context call (kb_graph -> iwe
 # subprocess) — O(rebuild-whole-graph), which on a 60k-page vault blew past the MCP call timeout
-# (cyber-market, recurring). Read the artifact instead (O(dict lookup)); fall back to live IWE only
-# when the artifact is absent/stale (small vault without the cron, or a missed refresh).
+# (a 60k-page deployment, recurring). The artifact is authoritative: request paths must never turn a typo,
+# ambiguous slug, or missed refresh into an unbounded whole-corpus subprocess.
 _BL_ARTIFACT_MAX_AGE = max(3600, int(os.environ.get("OKENGINE_BACKLINKS_MAX_AGE", "172800")))
 _BL_CACHE: dict = {"map": None, "mtime": None, "doc": None}
 _WL_RE = re.compile(r"\[\[([^\]|#\n]+?)(?:[#|][^\]]*)?\]\]")
@@ -175,7 +416,7 @@ _WL_RE = re.compile(r"\[\[([^\]|#\n]+?)(?:[#|][^\]]*)?\]\]")
 
 def _artifact_backlinks() -> dict | None:
     """The precomputed {target -> [{key,title}]} backlink map (wiki/.backlinks.json), or None when
-    absent / stale / corrupt — callers then fall back to live IWE. mtime-cached (steady-state cost
+    absent / stale / corrupt. Callers return an explicit degraded result. mtime-cached (steady-state cost
     per call is one stat)."""
     p = WIKI / ".backlinks.json"
     try:
@@ -188,7 +429,7 @@ def _artifact_backlinks() -> dict | None:
         return _BL_CACHE["map"]
     try:
         doc = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError):
+    except _BACKLINK_READ_ERRORS:
         return None
     m = doc.get("backlinks") if isinstance(doc, dict) else None
     if not isinstance(m, dict):
@@ -210,8 +451,13 @@ def _resolve_key(target: str, bl: dict) -> str | None:
     t = t[:-3] if t.endswith(".md") else t
     if t in bl:
         return t
-    if (WIKI / (t + ".md")).is_file():
-        return t
+    # On-disk fallback goes through _safe() like get_page does: an unguarded
+    # `(WIKI / t).is_file()` let `../CLAUDE` resolve to the vault-root persona file and let a
+    # symlink inside wiki/ read anything on the host (okengine#660). The key handed back is the
+    # CANONICAL wiki-relative path, so an in-vault `a/../a/x` cannot mint a second graph key.
+    p = _safe(t)
+    if p is not None and p.is_file():
+        return p.relative_to(WIKI.resolve()).as_posix()[:-3]
     slug = t.split("/")[-1].lower()
     hits = {k for k in bl if k.split("/")[-1].lower() == slug}
     if not hits:                                    # also scan referrer keys (pages with no inbound)
@@ -248,15 +494,26 @@ def _fmt_refs(head: str, items: list, cap: int) -> list[str]:
     return lines
 
 
+def _graph_unavailable() -> str:
+    return ("(knowledge graph unavailable: wiki/.backlinks.json is absent, stale, or corrupt; "
+            "run the backlinks-refresh lane)")
+
+
+def _target_unresolved(target: str) -> str:
+    return f"(not found or ambiguous knowledge-graph target: {target})"
+
+
 @mcp.tool()
 def find_references(target: str) -> str:
     """Knowledge-graph lookup: pages that reference `target` (backlinks) plus `target`'s own outbound
-    references. Served from the cron-precomputed backlink graph (wiki/.backlinks.json); falls back to
-    live IWE when that artifact is absent/stale. `target` is a page path or name."""
+    references. Served from the cron-precomputed backlink graph (wiki/.backlinks.json).
+    `target` is a page path or name."""
     bl = _artifact_backlinks()
-    key = _resolve_key(str(target), bl) if bl is not None else None
-    if bl is None or key is None:                   # artifact missing OR target unresolved -> live IWE
-        return _run([str(SCRIPTS / "kb_graph.py"), "find", str(target)])[:8000]
+    if bl is None:
+        return _graph_unavailable()
+    key = _resolve_key(str(target), bl)
+    if key is None:
+        return _target_unresolved(str(target))
     lines = [f"# {key}", ""]
     lines += _fmt_refs("Referenced by", bl.get(key, []), 50) + [""]
     lines += _fmt_refs("References", _forward_links(key), 50)
@@ -267,16 +524,20 @@ def find_references(target: str) -> str:
 def retrieve_context(path: str) -> str:
     """Retrieve a page WITH its knowledge-graph context expanded: the page plus its outbound
     references and incoming backlinks, one hop out. Richer than get_page (the raw file) — use it to
-    load a page together with its neighbourhood. Served from the precomputed backlink graph; falls
-    back to live IWE when absent/stale. `path` is a vault page id/path, e.g. 'entities/a/example'."""
+    load a page together with its neighbourhood. Served from the precomputed backlink graph.
+    `path` is a vault page id/path, e.g. 'entities/a/example'."""
     if not _authorize_read(str(path)):
         return "(refused: outside this caller's read scope)"
     bl = _artifact_backlinks()
-    key = _resolve_key(str(path), bl) if bl is not None else None
-    if bl is None or key is None:
-        return _run([str(SCRIPTS / "kb_graph.py"), "retrieve", "-k", str(path)])[:16000]
+    if bl is None:
+        return _graph_unavailable()
+    key = _resolve_key(str(path), bl)
+    if key is None:
+        return _target_unresolved(str(path))
+    page = _safe(key)                  # keys come from the artifact or _resolve_key; contain anyway
     try:
-        body = (WIKI / (key + ".md")).read_text(encoding="utf-8", errors="replace")[:12000]
+        body = (page.read_text(encoding="utf-8", errors="replace")[:12000]
+                if page is not None else "(page body unavailable)")
     except OSError:
         body = "(page body unavailable)"
     lines = [body, "", "---"]
@@ -292,8 +553,7 @@ def graph_stats() -> str:
     pages or the hubs. No arguments.
 
     Served from the precomputed wiki/.backlinks.json artifact (okengine#199 — a live
-    whole-graph IWE rebuild per call times out on large vaults); falls back to live
-    IWE only when the artifact is absent/stale."""
+    whole-graph rebuild per call times out on large vaults)."""
     doc = _artifact_doc()
     if doc is not None:
         bl = doc.get("backlinks") or {}
@@ -310,7 +570,7 @@ def graph_stats() -> str:
                      "", "Most-referenced pages (inbound links):"]
             lines += [f"  {len(v):>5}  {k}" for k, v in hubs]
             return "\n".join(lines)[:8000]
-    return _run([str(SCRIPTS / "kb_graph.py"), "stats"])[:8000]
+    return _graph_unavailable()
 
 
 @mcp.tool()
@@ -475,15 +735,128 @@ _QMD_BIN = os.environ.get("OKENGINE_QMD_BIN", "qmd")
 _INDEX_REFRESH_HOURS = float(os.environ.get("OKENGINE_MCP_INDEX_REFRESH_HOURS", "6") or 0)
 
 
-def _qmd(args: list[str], timeout: int = 1800) -> tuple[int, str]:
+# ── qmd search telemetry ─────────────────────────────────────────────────────
+# okengine#410 fixed search saturation by ADMISSION CONTROL (a 2-slot semaphore) and recommended
+# "expose timeout/saturation distinctly in fleet health". That half never shipped, so the very
+# conditions that would justify revisiting the search layer -- rising p95, routine saturation --
+# are currently unobservable (okengine#568). A cap you cannot see hitting is indistinguishable from
+# a cap you never reach.
+#
+# The mcp cannot reach /opt/data/metrics (not mounted here), but /opt/data/qmd IS its writable
+# mount and the gateway sees the same directory, so that is the channel. A tiny JSON snapshot,
+# rewritten atomically, read by fleet_health.
+_QMD_STATS_PATH = Path(os.environ.get(
+    "OKENGINE_MCP_QMD_STATS", "/opt/data/qmd/search-telemetry.json"))
+_QMD_STATS_LOCK = threading.Lock()
+# SEARCH and MAINTENANCE are counted SEPARATELY. They contend for the same two slots -- which is
+# why saturation is reported as one shared number -- but their latencies are different populations
+# and pooling them produces a metric that lies. The first live reading did exactly that: a 7.6s
+# index refresh rendered as "search p95 over 5000ms" on a vault whose searches run in ~0.5s.
+#
+# Worse, the first version instrumented `_qmd` only, and SEARCHES DO NOT GO THROUGH `_qmd` -- they
+# take the async path. So a file called search-telemetry.json measured zero searches, and its
+# `saturated: 0` could never have incremented from the search path at all.
+_QMD_LATENCY_SAMPLES = 200
+_QMD_STATS: dict = {
+    "search": {"ok": 0, "timeouts": 0, "errors": 0, "latency_ms": []},
+    "maintenance": {"ok": 0, "timeouts": 0, "errors": 0, "latency_ms": []},
+    "saturated": {"search": 0, "maintenance": 0},
+}
+
+
+def _record_qmd(kind: str, outcome: str, elapsed_ms: float | None = None) -> None:
+    with _QMD_STATS_LOCK:
+        if outcome == "saturated":
+            _QMD_STATS["saturated"][kind] = _QMD_STATS["saturated"].get(kind, 0) + 1
+            return
+        bucket = _QMD_STATS.setdefault(
+            kind, {"ok": 0, "timeouts": 0, "errors": 0, "latency_ms": []})
+        bucket[outcome] = bucket.get(outcome, 0) + 1
+        if elapsed_ms is not None:
+            samples = bucket["latency_ms"]
+            samples.append(round(elapsed_ms))
+            if len(samples) > _QMD_LATENCY_SAMPLES:
+                del samples[: len(samples) - _QMD_LATENCY_SAMPLES]
+
+
+def _percentiles(samples: list[int]) -> dict:
+    if not samples:
+        return {}
+    ordered = sorted(samples)
+    # nearest-rank; with few samples this IS the max, which is the honest answer rather than an
+    # interpolated number implying precision the sample size does not support
+    return {
+        "p50_ms": ordered[max(0, (len(ordered) * 50) // 100 - 1)],
+        "p95_ms": ordered[max(0, (len(ordered) * 95) // 100 - 1)],
+        "max_ms": ordered[-1],
+        "samples": len(ordered),
+    }
+
+
+def _qmd_stats_snapshot() -> dict:
+    with _QMD_STATS_LOCK:
+        search = dict(_QMD_STATS["search"])
+        maint = dict(_QMD_STATS["maintenance"])
+        saturated = dict(_QMD_STATS["saturated"])
+    out = {
+        "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "concurrency_limit": _QMD_CONCURRENCY,
+        "queue_seconds": _SEARCH_QUEUE_SECONDS,
+        # shared, because the contention is shared -- one lane's refresh can refuse another's search
+        "saturated": sum(saturated.values()),
+        "saturated_by_kind": saturated,
+    }
+    for name, bucket in (("search", search), ("maintenance", maint)):
+        counts = {k: v for k, v in bucket.items() if k != "latency_ms"}
+        out[name] = {**counts, "calls": sum(counts.values()),
+                     **_percentiles(bucket["latency_ms"])}
+    return out
+
+
+def _publish_qmd_stats() -> None:
+    """Best-effort. Telemetry must never be able to break search: a failure here is swallowed
+    deliberately, because the alternative is an unwritable metrics path taking the MCP down."""
     try:
-        r = subprocess.run([_QMD_BIN, *args], cwd=str(VAULT), env={**os.environ, **_QMD_ENV},
-                           capture_output=True, text=True, timeout=timeout)
-        return r.returncode, (r.stdout or "") + (r.stderr or "")
+        snap = _qmd_stats_snapshot()
+        _QMD_STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _QMD_STATS_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snap, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(_QMD_STATS_PATH)
+    except Exception:
+        pass
+
+
+def _qmd(args: list[str], timeout: int = 1800) -> tuple[int, str]:
+    # Every search AND every background refresh passes through here, which is what makes it the
+    # right place to measure: they contend for the SAME 2 slots, so counting only searches would
+    # under-report exactly the contention #410 was about.
+    if not _QMD_CAPACITY.acquire(timeout=_SEARCH_QUEUE_SECONDS):
+        _record_qmd("maintenance", "saturated")
+        _publish_qmd_stats()
+        return 75, "qmd capacity saturated"
+    started = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            [_QMD_BIN, *args], cwd=str(VAULT), env={**os.environ, **_QMD_ENV},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc)
+            proc.communicate()
+            _record_qmd("maintenance", "timeouts", (time.monotonic() - started) * 1000)
+            return 124, "qmd timed out"
+        rc = proc.returncode
+        _record_qmd("maintenance", "ok" if rc == 0 else "errors",
+                    (time.monotonic() - started) * 1000)
+        return rc, (stdout or "") + (stderr or "")
     except FileNotFoundError:
+        _record_qmd("maintenance", "errors")
         return 127, "qmd not installed"
-    except subprocess.TimeoutExpired:
-        return 124, "qmd timed out"
+    finally:
+        _QMD_CAPACITY.release()
+        _publish_qmd_stats()
 
 
 def _refresh_index() -> bool:
@@ -491,15 +864,30 @@ def _refresh_index() -> bool:
     whether the refresh SUCCEEDED — the caller must not mark the index current on a failure, or a
     failed `qmd update` silently reads as 'up to date' and search stays stale (invariant-audit).
     qmd-absent (rc 127) returns True: a permanent condition, not a transient failure to retry-spin on."""
+    if not _INDEX_REFRESH_LOCK.acquire(blocking=False):
+        print("okengine-mcp: qmd index refresh coalesced", file=sys.stderr, flush=True)
+        return True
+    try:
+        return _refresh_index_locked()
+    finally:
+        _INDEX_REFRESH_LOCK.release()
+
+
+def _refresh_index_locked() -> bool:
     rc, out = _qmd(["collection", "list"], timeout=60)
     if rc == 127:
         print("okengine-mcp: qmd not found — skipping index maintenance", file=sys.stderr, flush=True)
+        _set_index_status(ready=False, error="qmd is not installed")
         return True
     if "qmd://wiki" not in out:                       # not registered yet (e.g. fresh deploy)
         arc, _ = _qmd(["collection", "add", str(WIKI)])
         print(f"okengine-mcp: registered qmd 'wiki' collection (rc={arc})", file=sys.stderr, flush=True)
     rc, _ = _qmd(["update"])
     print(f"okengine-mcp: qmd index refresh rc={rc}", file=sys.stderr, flush=True)
+    if rc == 0:
+        _set_index_status(ready=True, error="")
+    else:
+        _set_index_status(ready=False, error=f"initial qmd refresh failed (rc={rc})")
     return rc == 0
 
 
@@ -585,6 +973,7 @@ def _index_maintainer_step(state: dict) -> None:
         state["cooldown_until"] = done + _index_update_cooldown(done - now)
         if rc == 0:
             state["last_seen"] = cur              # mark indexed ONLY on success; a failed update
+            _set_index_status(ready=True, error="")
         # leaves last_seen so the change is retried next poll, not silently lost (invariant-audit).
 
 
@@ -623,6 +1012,7 @@ if __name__ == "__main__":
             app = _ScopedAuth(app, token)
         # Self-maintain the search index (qmd is only in this container; cron-plus can't).
         if _INDEX_REFRESH_HOURS > 0:
+            _set_index_status(active=True, ready=False, error="")
             threading.Thread(target=_index_maintainer, name="qmd-index-maintainer",
                              daemon=True).start()
         uvicorn.run(app, host=host, port=int(os.environ.get("PORT", "8730")))

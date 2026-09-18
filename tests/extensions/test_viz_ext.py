@@ -103,6 +103,43 @@ def test_anchor_scopes_to_neighborhood(tmp_path, monkeypatch):
     assert "<!-- panel-svg" in dash and "<svg " in dash and "Genesis" in dash
 
 
+def test_wardley_defensive_helpers_missing_anchor_scan_race_and_cap(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path / "missing"))
+    empty = _load("build_wardley_map_missing", EXT / "build_wardley_map.py")
+    assert empty.main() == 0
+    assert "no concepts" in capsys.readouterr().out
+    assert empty._fm(tmp_path / "missing.md") == {}
+    assert empty._num("150%") == 1.0 and empty._num("-1") == 0.0
+    assert empty._num("bad") is None
+    assert empty._pctile({}) == {} and empty._pctile({"one": 4}) == {"one": .5}
+
+    vault = tmp_path / "vault"
+    wiki = vault / "wiki"
+    concepts = wiki / "concepts"
+    for slug in ("alpha", "beta", "gamma"):
+        _concept(concepts, slug)
+    (concepts / "_hidden.md").write_text("---\ntype: concept\n---\n")
+    sources = wiki / "sources"
+    sources.mkdir()
+    raced = sources / "raced.md"
+    raced.write_text("[[concepts/alpha]]")
+    (sources / "unknown.md").write_text("[[concepts/ghost]]")
+    (sources / "INDEX.md").write_text("[[concepts/beta]]")
+    original = Path.read_text
+    monkeypatch.setattr(
+        Path, "read_text",
+        lambda path, *args, **kwargs: (_ for _ in ()).throw(OSError("vanished"))
+        if path == raced else original(path, *args, **kwargs),
+    )
+    monkeypatch.setenv("WIKI_PATH", str(vault))
+    monkeypatch.setenv("VIZ_ANCHOR", "dashboards/missing.md")
+    monkeypatch.setenv("WARDLEY_MAX_NODES", "1")
+    module = _load("build_wardley_map_edges", EXT / "build_wardley_map.py")
+    assert module.main() == 0
+    out = capsys.readouterr().out
+    assert "anchor not found" in out and "capped to top 1" in out
+
+
 def test_panel_svg_upsert_idempotent():
     ps = _load("panel_svg_vt", EXT / "panel_svg.py")
     panel = {"kind": "two-axis", "x_label": "X", "y_label": "Y",
@@ -117,6 +154,23 @@ def test_panel_svg_upsert_idempotent():
     panel["nodes"][0]["x"] = 0.25
     twice = ps.upsert_block(once, panel)                   # changed data -> replaced, not duplicated
     assert twice.count("<svg ") == 1 and "prose" in twice
+
+
+def test_panel_svg_overlap_and_lane_guard_edges(monkeypatch):
+    ps = _load("panel_svg_overlap", EXT / "panel_svg.py")
+    panel = {
+        "kind": "two-axis",
+        "nodes": [
+            {"label": "A", "slug": "a", "x": .5, "y": .5},
+            {"label": "B", "slug": "b", "x": .5, "y": .5},
+        ],
+    }
+    rendered = ps.render_panel_svg(panel)
+    assert rendered and "stroke-width=\"0.6\"" in rendered
+    assert ps.svg_block({"kind": "bar-chart"}) is None
+    assert ps.upsert_block("# body", {"kind": "bar-chart"}) is None
+    monkeypatch.setattr(ps, "render_panel_svg", lambda panel: (_ for _ in ()).throw(RuntimeError()))
+    assert ps.svg_block(panel) is None
 
 
 def test_render_panel_svgs_drain(tmp_path, monkeypatch):
@@ -134,3 +188,35 @@ def test_render_panel_svgs_drain(tmp_path, monkeypatch):
     assert "<svg" not in (d / "plain.md").read_text()      # no panel -> untouched
     assert r.main() == 0                                   # second run: all current
     assert (d / "quadrant-x.md").read_text() == q
+
+
+def test_render_panel_svgs_defensive_scan_edges(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    empty = _load("render_panel_svgs_empty", EXT / "render_panel_svgs.py")
+    assert empty.main() == 0
+    assert "no dashboards" in capsys.readouterr().out
+
+    d = tmp_path / "wiki/dashboards"
+    d.mkdir(parents=True)
+    fixtures = {
+        "_private.md": "ignored",
+        "INDEX.md": "ignored",
+        "plain.md": "body without frontmatter",
+        "bad-yaml.md": "---\n[broken\n---\nbody",
+        "wrong-panel.md": "---\npanel: string\n---\nbody",
+        "wrong-kind.md": "---\npanel: {kind: table}\n---\nbody",
+        "moved.md": "---\npanel: {kind: two-axis}\n---\nbody",
+    }
+    for name, content in fixtures.items():
+        (d / name).write_text(content)
+    module = _load("render_panel_svgs_edges", EXT / "render_panel_svgs.py")
+    original = Path.read_text
+
+    def read_text(path, *args, **kwargs):
+        if path.name == "moved.md":
+            raise OSError("removed during scan")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    assert module.main() == 0
+    assert "0 rendered, 0 already current" in capsys.readouterr().out

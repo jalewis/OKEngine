@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "http": {
+    "reader": {
+      "module": "okengine-reader/app.py",
+      "routes": {
+        "/healthz": ["get"],
+        "/api/page": ["get"],
+        "/api/search": ["get"],
+        "/api/backlinks": ["get"]
+      }
+    },
+    "cockpit": {
+      "module": "okengine-cockpit/app.py",
+      "routes": {
+        "/healthz": ["get"],
+        "/api/home": ["get"],
+        "/api/page": ["get"],
+        "/api/tab/{key}": ["get"]
+      }
+    }
+  },
+  "mcp": {
+    "module": "okengine-mcp/server.py",
+    "tools": {
+      "search": ["query"],
+      "get_page": ["path"],
+      "find_references": ["target"],
+      "retrieve_context": ["path"],
+      "graph_stats": [],
+      "list_pages": ["namespace"],
+      "projection_status": [],
+      "count_pages": [],
+      "find_projected_pages": [],
+      "get_projected_page_meta": ["path_or_id"],
+      "find_projected_links": []
+    }
+  }
+}

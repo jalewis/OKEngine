@@ -200,7 +200,7 @@ def main(argv: list[str]) -> int:
     print(f"  extracted: {extracted}")
     print(f"  skipped (companion newer): {skipped}")
     print(f"  failed (no text / errored): {failed}")
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

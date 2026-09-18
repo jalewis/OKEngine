@@ -16,7 +16,7 @@
 #   bash $ENGINE_DIR/scripts/deploy.sh /path/to/pack
 # Flags:
 #   --rebuild        force-rebuild the gateway image (default: build only if absent)
-#   --skip-build     never build the image (use an existing hermes-agent:latest)
+#   --skip-build     never build the immutable image selected for this deployment
 #   --skip-validate  skip the pre-deploy validate gate
 #   --no-upgrade     skip the pre-validate engine-pin reconcile (framework upgrade)
 #   --no-crons       bring up containers only; don't deploy crons
@@ -25,6 +25,16 @@
 #   --kickstart      after deploy, populate the vault NOW (ingest -> compile -> dashboards
 #                    -> brief) instead of waiting for the schedule. Opt-in: the compile +
 #                    brief stages spend on the model. See scripts/kickstart.sh.
+#
+# Exit codes (okengine#597) — the third state used to be reported as success:
+#   0   up and verified
+#   3   up, but post_deploy_verify.sh reported issues (the stack IS running; see remediation)
+#   1   bring-up failed (no compose file, validate/recompose/policy failure)
+#   2   usage error (unknown flag)
+# A human sees no change: the stack still comes up and the remediation still prints. A scripted
+# caller — a fleet roll, a CI job, `deploy.sh && <next>` — can finally tell the states apart.
+#
+# Env: OKENGINE_VERIFY_DELAY (default 5) — seconds to let the reader/MCP bind before verifying.
 set -euo pipefail
 
 ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -80,7 +90,11 @@ echo "    engine $ENGINE_DIR · uid:gid $HERMES_UID:$HERMES_GID"
 # (the exact trap that forced a full rebuild of a review instance). Idempotent; never overrides an
 # existing pin. CREATE .env if the operator hasn't yet: ensure-runtime.sh (step 2) appends its own
 # keys with `>>` and would otherwise mint a .env with NO uid pin on a clean deploy — pin FIRST here.
-[ -f "$PACK/.env" ] || : > "$PACK/.env"
+# .env holds model keys, OKENGINE_MCP_TOKEN and Postgres passwords and is read by docker compose
+# on the HOST only, so it is always owner-only: created under umask 077 and tightened if an older
+# deploy left it at the caller's umask (okengine#665 — INSTALL promised 600; nothing set it).
+[ -f "$PACK/.env" ] || ( umask 077; : > "$PACK/.env" )
+chmod 600 "$PACK/.env" 2>/dev/null || echo "WARN: could not chmod 600 $PACK/.env (not the owner?) — secrets may be readable by others" >&2
 if ! grep -qE '^HERMES_UID=' "$PACK/.env"; then
     printf '\n# uid:gid the gateway remaps to; pinned by deploy.sh so bare docker-compose ops match\n# the runtime tree owner (else compose defaults to 10000 and the scheduler dies on a perm error).\nHERMES_UID=%s\nHERMES_GID=%s\n' "$HERMES_UID" "$HERMES_GID" >> "$PACK/.env"
     echo "    pinned HERMES_UID:GID=$HERMES_UID:$HERMES_GID -> .env (matches the runtime tree owner)"
@@ -120,7 +134,7 @@ fi
 #     write path then keeps using UNCONDITIONALLY — so a broken/renamed extension fragment silently
 #     freezes the governing schema and every future schema.yaml edit is ignored on the write path.
 #     A WARN here (the old behavior) let that ship green. Fail the deploy so it's fixed, not frozen.
-if ! "$PYTHON" -c "import sys, pathlib; sys.path.insert(0, '$ENGINE_DIR/scripts'); import extension_compose as c; errs = c.write_composed_schema(pathlib.Path('$PACK')); [print('    ERROR: recompose:', e, file=sys.stderr) for e in (errs or [])]; sys.exit(1 if errs else 0)"; then
+if ! "$PYTHON" -c "import sys, pathlib; sys.path[:0] = ['$ENGINE_DIR/scripts', '$ENGINE_DIR/src']; import extension_compose as c; errs = c.write_composed_schema(pathlib.Path('$PACK')); [print('    ERROR: recompose:', e, file=sys.stderr) for e in (errs or [])]; sys.exit(1 if errs else 0)"; then
     echo "==> [1b/6] FAILED: composed-schema recompose errored — the enforced write path is frozen on" >&2
     echo "    the stale .okengine/composed-schema.yaml (a broken/renamed extension schema fragment)." >&2
     echo "    Fix the fragment (or disable the extension) and re-run; deploy ABORTED." >&2
@@ -137,9 +151,29 @@ if ! OKENGINE_POLICY_CATALOG="$ENGINE_DIR/config/policy/catalog.yaml" \
 fi
 echo "    policy artifact composed from engine + pack + enabled extension policy"
 
+# Materialize enabled sidecar services before Compose reconciliation. A default backup deliberately
+# omits their scoped tokens and token-bearing override; generation therefore fails loud after restore
+# with the supported `extensions enable <id>` remediation instead of reporting a successful deploy
+# whose enabled sidecar is silently absent. With no enabled sidecars, generation removes a stale
+# override left by an earlier disable.
+if ! "$PYTHON" "$ENGINE_DIR/scripts/framework.py" extensions sidecar-generate "$PACK"; then
+    echo "==> [1d/6] FAILED: enabled sidecar deployment artifacts could not be generated" >&2
+    echo "    If this is a secrets-excluded restore, re-run 'framework extensions enable <pack> <id>'" >&2
+    echo "    for each enabled sidecar to re-mint its scoped token, then deploy again." >&2
+    exit 1
+fi
+echo "    sidecar artifacts reconciled from enabled extensions"
+
 # Generate the authoritative fleet before runtime reconciliation so every contracted
 # lane's dedicated MCP server exists when the gateway first starts.
 CRON_PACK_DIR="$PACK" "$PYTHON" "$ENGINE_DIR/scripts/cron_pack_split.py" regen
+
+# PostgreSQL is the standard structured-query read path. Generate distinct per-deployment
+# credentials and, for packs created before the native compose services shipped, materialize an
+# engine-managed compatibility overlay. Run only after validation has accepted the deployment;
+# the operation is idempotent and never prints secret values.
+echo "==> [1p/6] ensure PostgreSQL projection configuration"
+"$PYTHON" "$ENGINE_DIR/scripts/ensure_projection_config.py" "$PACK" --engine "$ENGINE_DIR"
 
 # 2. seed the runtime dir + ensure it's writable by HERMES_UID BEFORE compose binds it,
 #    and install the cron-plus scheduler plugin into the runtime (the seeded config
@@ -149,6 +183,16 @@ FIX_PERMS="$FIX_PERMS" bash "$ENGINE_DIR/scripts/ensure-runtime.sh" "$PACK"
 bash "$ENGINE_DIR/scripts/install-cron-plus.sh" "$PACK"
 
 # 3. gateway image — build if missing OR stale (label != current checkout), or forced.
+#
+# First: is this tree fit to be built from AT ALL? The staleness gate below compares the ENGINE_DIR
+# checkout against the image, which answers "is the image current" and says nothing about "is this
+# checkout the code we mean to ship". On 2026-08-15 a deployment's ENGINE_DIR pointed at a working
+# tree on a feature branch behind main; building there would have shipped a cockpit missing a fix
+# that was live and serving, and the build, the container health check and the rendered page would
+# all have reported success. Refuse rather than warn — every downstream signal is green either way,
+# so a warning here is a warning nobody has any reason to read.
+"$PYTHON" "$ENGINE_DIR/scripts/engine_source_guard.py" "$ENGINE_DIR"
+
 cur_sha="$(git -C "$ENGINE_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 # build-engine-image.sh bakes the WORKING TREE (COPYs the tree, not HEAD), yet the staleness gate
 # below compares HEAD short-shas — so an UNCOMMITTED edit at HEAD X against an image built at X reads
@@ -161,20 +205,100 @@ if [ -n "$(git -C "$ENGINE_DIR" status --porcelain 2>/dev/null)" ]; then
 else
     ENGINE_DIRTY=0
 fi
-img_sha="$(docker image inspect -f '{{ index .Config.Labels "org.okengine.git_sha" }}' hermes-agent:latest 2>/dev/null || echo)"
+engine_release="$(awk -F': *' '/^engine_release:/{print $2; exit}' "$ENGINE_DIR/engine-manifest.yaml" | awk '{print $1}')"
+[ -n "$engine_release" ] || { echo "ERROR: cannot resolve engine release for immutable image identity" >&2; exit 1; }
+gateway_tag="okengine-${engine_release}-${cur_sha}"
+gateway_repository="${OKENGINE_IMAGE:-hermes-agent}"
+gateway_image="${OKENGINE_GATEWAY_IMAGE:-${gateway_repository}:${gateway_tag}}"
+if [ -n "${OKENGINE_GATEWAY_IMAGE:-}" ] && [ "$SKIP_BUILD" = 0 ]; then
+    echo "ERROR: OKENGINE_GATEWAY_IMAGE selects a prebuilt image; use --skip-build or set OKENGINE_IMAGE to select the build repository" >&2
+    exit 1
+fi
+
+# Persist the exact image and the engine-managed override in the deployment itself. This protects
+# later bare `docker compose up` calls too; an environment export that exists only for this deploy
+# would leave the old cross-deployment :latest hazard intact. Preserve unrelated COMPOSE_FILE
+# entries while ensuring the override is present exactly once.
+gateway_override="$PACK/docker-compose.okengine-image.yml"
+cat >"$gateway_override" <<'EOF'
+# Generated by OKEngine deploy.sh. Do not hand-edit; regenerated on every deploy.
+services:
+  gateway:
+    image: ${OKENGINE_GATEWAY_IMAGE:?deploy.sh must pin an immutable gateway image}
+    # Engine-owned availability contract. Keep this in the deploy override as well as the
+    # scaffold: existing packs must gain new fail-loud health semantics on their next deploy.
+    healthcheck:
+      test: ["CMD-SHELL", "now=$$(date +%s); tick=$$(stat -c %Y /opt/data/cron-plus/.tick.lock 2>/dev/null) || exit 1; [ $$((now-tick)) -le 180 ] || exit 1; [ ! -s /opt/data/cron-plus/.scheduler-stalled ] || exit 1; owner=/opt/vault/.okengine/corpus/lock-owner.json; [ ! -e $$owner ] || { mtime=$$(stat -c %Y $$owner) || exit 1; [ $$((now-mtime)) -le 300 ] || exit 1; }; gen=$$(( $$(awk '/^btime/{print $$2}' /proc/stat) + $$(sed 's/.*) //' /proc/1/stat | awk '{print $$20}') / $$(getconf CLK_TCK) )); ! find /opt/data/cron-plus/runs -type f -mmin +60 -newermt @$$gen -exec grep -lE '\"status\"[[:space:]]*:[[:space:]]*\"running\"' {} + 2>/dev/null | grep -q . || exit 1; for stat in /proc/[0-9]*/stat; do grep -q ') D ' $$stat 2>/dev/null && exit 1; done; exit 0"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+EOF
+python3 - "$PACK/.env" "$gateway_image" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+image = sys.argv[2]
+lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+values = {}
+order = []
+for line in lines:
+    if "=" in line and not line.lstrip().startswith("#"):
+        key = line.split("=", 1)[0]
+        values[key] = line
+        order.append(key)
+values["OKENGINE_GATEWAY_IMAGE"] = f"OKENGINE_GATEWAY_IMAGE={image}"
+parts = [p for p in values.get("COMPOSE_FILE", "COMPOSE_FILE=").split("=", 1)[1].split(":") if p]
+sidecars = ".okengine/generated/sidecars.compose.yml"
+# Sidecars are one-shot scheduled services. They must never be part of the default project used by
+# `docker compose up`, or a deploy launches untrusted extension code outside budget/schedule gates.
+# Remove relative and absolute legacy spellings; generated trigger wrappers attach the override
+# explicitly only for `docker compose run --rm`.
+sidecar_path = (path.parent / sidecars).resolve()
+def compose_path(part):
+    candidate = Path(part).expanduser()
+    return candidate.resolve() if candidate.is_absolute() else (path.parent / candidate).resolve()
+parts = [
+    part for part in parts
+    if compose_path(part) != sidecar_path
+]
+for required in ("docker-compose.yml", "docker-compose.okengine-image.yml"):
+    if required not in parts:
+        parts.append(required)
+values["COMPOSE_FILE"] = "COMPOSE_FILE=" + ":".join(parts)
+out = []
+seen = set()
+for line in lines:
+    if "=" in line and not line.lstrip().startswith("#"):
+        key = line.split("=", 1)[0]
+        if key in values:
+            if key not in seen:
+                out.append(values[key]); seen.add(key)
+            continue
+    out.append(line)
+for key in ("OKENGINE_GATEWAY_IMAGE", "COMPOSE_FILE"):
+    if key not in seen:
+        out.append(values[key])
+path.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+PY
+export OKENGINE_GATEWAY_IMAGE="$gateway_image"
+echo "    gateway image: $gateway_image (pinned in .env + docker-compose.okengine-image.yml)"
+
+img_sha="$(docker image inspect -f '{{ index .Config.Labels "org.okengine.git_sha" }}' "$gateway_image" 2>/dev/null || echo)"
 if [ "$SKIP_BUILD" = 0 ]; then
     if [ "$REBUILD" = 1 ]; then
         echo "==> [3/6] build gateway image (--rebuild)"
-        bash "$ENGINE_DIR/scripts/build-engine-image.sh"
-    elif ! docker image inspect hermes-agent:latest >/dev/null 2>&1; then
+        OKENGINE_IMAGE="$gateway_repository" OKENGINE_TAG="$gateway_tag" TAG_LATEST=0 bash "$ENGINE_DIR/scripts/build-engine-image.sh"
+    elif ! docker image inspect "$gateway_image" >/dev/null 2>&1; then
         echo "==> [3/6] build gateway image (none present)"
-        bash "$ENGINE_DIR/scripts/build-engine-image.sh"
+        OKENGINE_IMAGE="$gateway_repository" OKENGINE_TAG="$gateway_tag" TAG_LATEST=0 bash "$ENGINE_DIR/scripts/build-engine-image.sh"
     elif [ "$ENGINE_DIRTY" = 1 ]; then
         echo "==> [3/6] engine tree has UNCOMMITTED changes — rebuilding so the image bakes current source (a HEAD-sha match would otherwise run stale code)"
-        bash "$ENGINE_DIR/scripts/build-engine-image.sh"
+        OKENGINE_IMAGE="$gateway_repository" OKENGINE_TAG="$gateway_tag" TAG_LATEST=0 bash "$ENGINE_DIR/scripts/build-engine-image.sh"
     elif [ "$img_sha" != "$cur_sha" ]; then
         echo "==> [3/6] gateway image is STALE (image sha='${img_sha:-none/unlabeled}' != engine sha '$cur_sha') — rebuilding"
-        bash "$ENGINE_DIR/scripts/build-engine-image.sh"
+        OKENGINE_IMAGE="$gateway_repository" OKENGINE_TAG="$gateway_tag" TAG_LATEST=0 bash "$ENGINE_DIR/scripts/build-engine-image.sh"
     else
         echo "==> [3/6] gateway image up to date (sha $cur_sha) — skipping build"
     fi
@@ -229,10 +353,30 @@ fi
 #    operator remediation for anything down. Non-fatal: the stack is already up, so a reported
 #    issue is diagnostic, not a reason to abort (and the gateway may still be booting).
 echo "==> [6/6] verify deployment"
-sleep 5   # give the reader/MCP a moment to bind before probing
+# A journal-fed projection can legitimately predate files restored or moved with
+# preserved mtimes. Reconcile once at deploy so the health gate compares the live
+# corpus with a complete, current projection rather than waiting for its cadence.
+if ( cd "$PACK" && docker compose config --services 2>/dev/null | grep -Fxq okengine-projection ); then
+    echo "    reconciling PostgreSQL projection against the complete live corpus"
+    ( cd "$PACK" && docker compose exec -T okengine-projection python /app/service.py --reconcile )
+fi
+# Give the reader/MCP a moment to bind before probing. Overridable so the behavioural tests in
+# tests/test_deploy_exit_contract.py do not pay it on every run (twelve runs x 5s dominated the
+# whole file); the default is unchanged for every real deploy.
+sleep "${OKENGINE_VERIFY_DELAY:-5}"
+VERIFY_RC=0
 if ( cd "$PACK" && bash "$ENGINE_DIR/scripts/post_deploy_verify.sh" ); then
     echo "==> done — deployment verified healthy."
 else
+    # okengine#597: report the third state instead of collapsing it into success. Aborting the
+    # bring-up here would still be wrong — the stack is already up, the gateway may only be
+    # binding, and the remediation above is what the operator needs. But exit status is ALL a
+    # scripted caller sees, and `exit 0` told a fleet roll, a CI job, or an agent chaining
+    # `deploy.sh && <next>` that a deployment with failing checks was a working one. Both paths
+    # print `==> done` and differ only in the sentence after it, which no script reads.
+    #
+    # 0 = up and verified · 3 = up, checks reported issues · other non-zero = bring-up failed.
+    VERIFY_RC=3
     echo "==> done — bring-up complete, but post-deploy checks reported issues (see remediation above)."
     echo "    re-verify any time:  ( cd $PACK && bash $ENGINE_DIR/scripts/post_deploy_verify.sh )"
 fi
@@ -247,3 +391,7 @@ if [ "$KICKSTART" = 1 ]; then
         CRON_PACK_DIR="$PACK" HERMES_UID="$HERMES_UID" bash "$ENGINE_DIR/scripts/kickstart.sh" "$PACK"
     fi
 fi
+
+# Carry the verification verdict out as the script's status. Without an explicit exit the status is
+# whatever ran last — an `echo`, or the kickstart block — which is how the verdict was lost.
+exit "$VERIFY_RC"

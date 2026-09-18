@@ -8,6 +8,7 @@ twin can never drift from the boundary it mirrors."""
 from __future__ import annotations
 
 import importlib.util
+import datetime as dt
 import sys
 from pathlib import Path
 
@@ -183,3 +184,40 @@ def test_cross_implementation_contract_with_write_server(tmp_path, monkeypatch):
         if not ws_reject:
             assert ws_fm["evidence"] == ig_fm["evidence"], \
                 f"fixture {i}: coerced results diverge"
+
+
+def test_remaining_shape_date_and_fail_open_edges(tmp_path, monkeypatch):
+    ig = _load("importer_guard_edges", REPO / "scripts" / "cron" / "importer_guard.py")
+    monkeypatch.setattr(ig.schema_lib, "list_fields", lambda _schema: {"tags"})
+    monkeypatch.setattr(ig.schema_lib, "int_fields", lambda _schema: {"count", "bad"})
+    fm = {"tags": "one", "count": " 12 ", "bad": True}
+    problems = ig._coerce_shapes(fm, {})
+    assert fm["tags"] == ["one"] and fm["count"] == 12
+    assert any("bad" in problem for problem in problems)
+
+    schema = {"field_items": {"items": {
+        "date": {"shape": "date"},
+        "name": {"shape": "str"},
+        "meta": {"shape": "dict"},
+        "number": {"shape": "number"},
+    }}}
+    fm = {"items": [{"date": dt.date(2026, 7, 31), "name": 7,
+                      "meta": [], "number": 3}]}
+    problems = ig._guard_items(fm, schema)
+    assert any("name" in p and "string" in p for p in problems)
+    assert any("meta" in p and "object" in p for p in problems)
+    assert not any("date" in p for p in problems)
+
+    assert ig.guard([], vault=tmp_path) == []
+    monkeypatch.setattr(
+        ig.schema_lib, "merged_schema",
+        lambda *_a: (_ for _ in ()).throw(RuntimeError("schema unavailable")),
+    )
+    assert ig.guard({"type": "source"}, vault=tmp_path) == []
+
+    monkeypatch.setattr(ig.schema_lib, "merged_schema", lambda *_a: {})
+    monkeypatch.setattr(
+        ig.schema_lib, "canonical_type",
+        lambda *_a: (_ for _ in ()).throw(RuntimeError("bad schema")),
+    )
+    assert ig.guard({"type": "source"}, vault=tmp_path) == []

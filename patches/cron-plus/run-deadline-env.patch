@@ -1,0 +1,35 @@
+--- a/runner.py
++++ b/runner.py
+@@ -100,6 +100,24 @@
+         os.environ.setdefault(key, str(value))
+ 
+ 
++def _export_run_deadline(job: dict) -> None:
++    """Publish this run's resolved wall-clock deadline to the lane's environment.
++
++    The runner already ENFORCES a hard timeout but never TOLD the lane what it was:
++    run_timeout_seconds(job) is resolved in here and the child process saw nothing. A lane could
++    not budget against its own ceiling, so its only available failure was being killed mid-work --
++    losing everything done so far, with no partial result and no explanation of what it managed.
++
++    Publishing the deadline lets a lane stop early, keep what it finished, and report the
++    truncation. Both forms are exported because both get used: an ABSOLUTE epoch stays correct when
++    read at any point in a long run, while remaining-seconds is what a fresh subprocess wants.
++    """
++    seconds = run_timeout.run_timeout_seconds(job)
++    os.environ["OKENGINE_RUN_TIMEOUT_SECONDS"] = str(seconds)
++    os.environ["OKENGINE_RUN_DEADLINE_EPOCH"] = (
++        f"{datetime.now(timezone.utc).timestamp() + seconds:.3f}")
++
++
+ def _write_pid_file(job_id: str) -> Path:
+     """Record this runner's PID + start time so scheduler.py's
+     `_job_is_running` can detect PID reuse on the next tick.
+@@ -254,6 +272,7 @@
+ 
+         try:
+             _apply_job_env(job)
++            _export_run_deadline(job)
+         except ValueError as e:
+             logger.error("invalid job environment: %s", e)
+             jobs_mod.mark_job_run(args.job_id, success=False, error=str(e))

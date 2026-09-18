@@ -33,7 +33,8 @@ def _fm(p: Path) -> dict:
     try:
         import yaml
         m = _FM.match(p.read_text(encoding="utf-8", errors="replace")[:8000])
-        return (yaml.safe_load(m.group(1)) or {}) if m else {}
+        parsed = (yaml.safe_load(m.group(1)) or {}) if m else {}
+        return parsed if isinstance(parsed, dict) else {}
     except Exception:
         return {}
 
@@ -91,7 +92,7 @@ def main() -> int:
         return 0
     batch = cands[:BATCH]
     print(f"  batch: {len(batch)} of {len(cands)}\n=== entities to verify ===")
-    print("For EACH entity: read it AND its cited source pages (mcp_okengine_get_page), then check "
+    print("For EACH entity: read it AND its cited source pages (mcp__okengine__get_page), then check "
           "whether each substantive claim is SUPPORTED by those sources. Append a `## Grounding "
           "check` note (supported / unsupported / not-found-in-source) and set "
           "`grounding_checked: <today>`. Flag a MATERIAL unsupported claim for review. Be "

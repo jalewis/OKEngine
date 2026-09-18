@@ -4,6 +4,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -21,7 +22,7 @@ def test_append_projection_preserves_zero_yield_failure_and_unknown(tmp_path):
     now = datetime(2026, 7, 18, 12, tzinfo=timezone.utc)
     sources = [
         {"source_id": "official", "connector_id": "test", "label": "Official",
-         "source_kind": "primary", "independent_origin": True},
+         "origin_class": "primary", "independent_origin": True},
         {"source_id": "never", "connector_id": "test", "label": "Never"},
     ]
     m.register_sources(tmp_path, sources)
@@ -108,3 +109,50 @@ def test_dashboard_renders_unknowns_and_ops_artifact(tmp_path, monkeypatch):
     assert "| unknown | Never run" in text
     assert "never interpreted as zero or healthy" in text
     assert "recent yield: unknown — no collection attempts recorded" in text
+
+
+def test_collection_health_empty_registry_latency_units_and_main(tmp_path, monkeypatch, capsys):
+    health = _load("collection_health_edges", REPO / "scripts/cron/collection_health.py")
+    assert health._latency(None) == "unknown"
+    assert health._latency(3_600_000) == "1.0h"
+    assert health._latency(4 * 86_400_000) == "4.0d"
+    out = health.render(vault=tmp_path, ledger=tmp_path / "empty",
+                        now=datetime(2026, 7, 18, tzinfo=timezone.utc))
+    assert "No configured sources registered" in out.read_text()
+    monkeypatch.setattr(health, "render", lambda: out)
+    assert health.main() == 0
+    printed = capsys.readouterr().out
+    assert "collection-health: wrote" in printed and '"wakeAgent": false' in printed
+
+
+def test_ledger_validation_load_races_retention_and_partial_status(tmp_path, monkeypatch):
+    m = _load("collection_ledger_edges", REPO / "scripts/cron/collection_ledger.py")
+    assert m.source_id("connector", "native", "My Source").startswith("my-source-")
+    assert m.source_id("connector", "native", "!!!").startswith("source-")
+    assert m.checkpoint_digest(None) is None
+    with pytest.raises(ValueError, match="source_id and connector_id"):
+        m.register_sources(tmp_path, [{"source_id": "missing-connector"}])
+    with pytest.raises(ValueError, match="connector_id and source_id"):
+        m.append_attempt(tmp_path, {})
+    with pytest.raises(ValueError, match="invalid collection outcome"):
+        m.append_attempt(tmp_path, {"connector_id": "c", "source_id": "s", "outcome": "bad"})
+    with pytest.raises(ValueError, match="non-negative"):
+        m.append_attempt(tmp_path, {"connector_id": "c", "source_id": "s", "fetched": -1})
+
+    now = datetime(2026, 7, 18, 12, tzinfo=timezone.utc)
+    old = tmp_path / "attempts-2026-07.ndjson"
+    old.write_text("{broken\n" + json.dumps({
+        "finished_at": "2020-01-01T00:00:00Z", "attempt_id": "old"}) + "\n")
+    assert m.load_attempts(tmp_path, now=now, retention_days=1) == []
+    original = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda path, *args, **kwargs:
+                        (_ for _ in ()).throw(OSError("race"))
+                        if path == old else original(path, *args, **kwargs))
+    assert m.load_attempts(tmp_path, now=now) == []
+    monkeypatch.setattr(Path, "read_text", original)
+    assert m.prune(tmp_path, now=now, retention_days=365) == []
+
+    source = {"source_id": "s", "connector_id": "c"}
+    attempt = {"source_id": "s", "connector_id": "c", "outcome": "partial",
+               "started_at": now, "finished_at": now}
+    assert m.project_current([source], [attempt], now=now)[0]["status"] == "partial"

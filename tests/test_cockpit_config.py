@@ -4,6 +4,8 @@ the domain-agnostic defaults (zero-config) and the parse of a populated block,
 including the rule that the watchlist + competitors tabs stay hidden until a
 `watchlist:` config exists."""
 import importlib.util
+import asyncio
+import base64
 import sys
 from pathlib import Path
 
@@ -259,3 +261,80 @@ def test_humanize_preserves_acronyms(tmp_path, monkeypatch):
              "api-monitoring": "API Monitoring", "saas-metrics": "SaaS Metrics", "okcti": "Okcti"}
     for slug, want in cases.items():
         assert m._humanize(slug) == want, (slug, m._humanize(slug))
+
+
+def test_config_and_application_defensive_shapes(tmp_path, monkeypatch):
+    m = _load(tmp_path, monkeypatch)
+    app = tmp_path / ".okengine/application.yaml"
+    app.parent.mkdir()
+    app.write_text("[invalid\n")
+    assert m.load_application_declaration(tmp_path) is None
+    app.write_text("- list\n")
+    assert m.load_application_declaration(tmp_path) is None
+    app.write_text("profile: ''\n")
+    assert m.load_application_declaration(tmp_path) is None
+    app.write_text(
+        "profile: test\nbindings: []\nsurfaces: []\nqueues: []\n"
+        "success_measures: []\n"
+    )
+    declaration = m.load_application_declaration(tmp_path)
+    assert declaration == {
+        "profile": "test", "profile_version": "", "propositions": [], "roles": {},
+        "surfaces": {}, "queues": {}, "success_measures": {},
+    }
+
+    _write_schema(tmp_path, """
+cockpit:
+  streams: [bad, {dir: ''}]
+  competitors: [bad, {key: blank}, {path: x}]
+  tab_defs: {bad: [], nobox: {}, good: {boxes: [bad, {view: table}]}}
+  profiles: {bad: scalar, empty: ['', null], good: [name, '']}
+""")
+    cfg = m.load_cockpit_config(tmp_path)
+    assert cfg["streams"][0]["key"] == "briefings"
+    assert cfg["competitors"] == [{"key": "x", "path": "x"}]
+    assert cfg["tab_defs"] == {"good": {"label": "Good", "boxes": [{"view": "table"}]}}
+    assert cfg["profiles"] == {"good": ["name"]}
+
+
+def test_config_cache_hit(tmp_path, monkeypatch):
+    m = _load(tmp_path, monkeypatch)
+    sentinel = {"title": "cached"}
+    monkeypatch.setattr(m, "_CFG_CACHE", (10.0, sentinel))
+    monkeypatch.setattr(m.time, "monotonic", lambda: 11.0)
+    assert m.cockpit_config() is sentinel
+
+
+def test_basic_auth_health_authorized_and_rejected(tmp_path, monkeypatch):
+    m = _load(tmp_path, monkeypatch)
+    calls = []
+
+    async def downstream(scope, receive, send):
+        calls.append(scope["path"])
+
+    async def receive():
+        return {}
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    auth = m._BasicAuth(downstream, "operator", "secret")
+    asyncio.run(auth({"type": "http", "path": "/healthz", "headers": []}, receive, send))
+    asyncio.run(auth({"type": "websocket", "path": "/ws", "headers": []}, receive, send))
+    asyncio.run(auth({"type": "http", "path": "/private", "headers": []}, receive, send))
+    header = b"Basic " + base64.b64encode(b"operator:secret")
+    asyncio.run(auth({"type": "http", "path": "/ok", "headers": [(b"authorization", header)]},
+                     receive, send))
+    assert calls == ["/healthz", "/ws", "/ok"]
+    assert sent[0]["status"] == 401 and sent[1]["body"] == b"unauthorized"
+
+
+def test_private_nonloopback_import_refuses_without_password(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_DIR", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_TRUST", "private")
+    monkeypatch.setenv("OKENGINE_BIND", "0.0.0.0")
+    monkeypatch.delenv("OKENGINE_READER_PASSWORD", raising=False)
+    with pytest.raises(SystemExit, match="REFUSED to start"):
+        _load(tmp_path, monkeypatch)

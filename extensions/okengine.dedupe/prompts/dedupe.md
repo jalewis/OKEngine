@@ -17,17 +17,18 @@ For each candidate group:
    cleanest slug). Then for every OTHER member:
    - **Absorb into the canonical** what it lacks — append distinct `## Recent activity` lines,
      union the `sources:` list, and add the loser's name + aliases to the canonical's `aliases:` —
-     via `mcp_okengine_write_update_entity` / `mcp_okengine_write_append_to_section` on the
+     via `mcp__okengine_write_okengine_dedupe_entity_merge__update_entity` / `mcp__okengine_write_okengine_dedupe_entity_merge__append_to_section` on the
      CANONICAL. For list fields (`sources:`, `aliases:`) read first, then send the COMPLETE
      merged list.
-   - **Then tombstone the loser** with `mcp_okengine_write_tombstone_entity`, `superseded_by` →
+   - **Then tombstone the loser** with `mcp__okengine_write_okengine_dedupe_entity_merge__tombstone_entity`, `superseded_by` →
      the canonical. Never delete; tombstoning retains the file as `status: tombstoned`, and
      `[[links]]` to it resolve onward via `superseded_by` — so do NOT rewrite other pages.
 
-WRITE only via the MCP write path (never `file_write`). Be conservative and terse: skip any group
-that isn't a true duplicate and note why in one line. LOCAL-ONLY — do not use web tools. End your
-response with a one-line summary of what you merged; the MCP write path logs each change to
-`wiki/log.md` automatically — do not write it yourself.
+WRITE only via the MCP write path (never `file_write`). Be conservative: skip any group that isn't
+a true duplicate. LOCAL-ONLY — do not use web tools. Your final response must be ONLY the exact
+fenced `okengine-receipt` printed by the selector, accounting for every selected group. Use
+`accepted` with read-back hashes for completed merges, `skipped` with a reason for distinct entities,
+and leave failed or deferred groups retryable. The MCP write path logs changes automatically.
 # Model-write boundary
 
 Process only selector-named items. Ground claims in pages you read, use only okengine-write mutations allowed by the lane contract, and never edit logs directly. Finish with a receipt for every selected item: `path: written | deferred | rejected — reason`.

@@ -120,6 +120,19 @@ if [ -f "$REPO_ROOT/config/base-schema.yaml" ]; then
     echo "  engine base-schema deployed to $CONTAINER:/opt/data/config/"
 fi
 
+# Expected cron-plus revision for the continuous live-drift check. A stage-only engine update does
+# not reinstall the scheduler, so publish the CURRENT manifest pin beside the other staged
+# references; deployment_validate compares it to the managed clone's actual HEAD every day.
+CRON_PLUS_PIN="$(awk '/^  cron-plus:/{f=1} f&&/pinned_sha:/{print $2; exit}' "$REPO_ROOT/engine-manifest.yaml")"
+if [ -z "$CRON_PLUS_PIN" ]; then
+    echo "ERROR: could not read dependencies.cron-plus.pinned_sha" >&2
+    exit 1
+fi
+printf '%s\n' "$CRON_PLUS_PIN" \
+    | docker exec -i -u "$HERMES_UID" "$CONTAINER" sh -c \
+        'tmp=/opt/data/config/cron-plus.pin.tmp; cat > "$tmp" && chmod 600 "$tmp" && mv "$tmp" /opt/data/config/cron-plus.pin'
+echo "  cron-plus expected pin deployed to $CONTAINER:/opt/data/config/cron-plus.pin"
+
 # --- tools/schema_validator.py REFERENCE -> /opt/data/config/ (okengine#326 [15]) ---
 # The OKF conformance validator is BAKED at /opt/hermes/tools — the write-guard hook AND the staged
 # importer_guard/schema_drift_lint crons import it from there. It is IMAGE-only, so a validator change
@@ -135,6 +148,26 @@ fi
 if [ -d "$PACK_SCRIPTS" ]; then
     pcount="$(find "$PACK_SCRIPTS" -maxdepth 1 -name '*.py' | wc -l)"
     if [ "$pcount" -gt 0 ]; then
+        # Pack scripts are staged AFTER the engine's into the same directory, so a shared basename
+        # means the pack copy silently wins on every deploy. That is how okcti-test ran a
+        # pre-#267 fork of nvd_import.py for three weeks: deploy exits 0, file present, cron runs
+        # "successfully", and the engine's version simply never arrives. Refuse rather than
+        # overwrite -- an intended override gets a different basename and a matching cron `script:`.
+        shadowed=""
+        for pf in "$PACK_SCRIPTS"/*.py; do
+            [ -e "$pf" ] || continue
+            if [ -f "$SRC_DIR/$(basename "$pf")" ]; then
+                shadowed="$shadowed $(basename "$pf")"
+            fi
+        done
+        if [ -n "$shadowed" ]; then
+            echo "ERROR: pack script(s) would overwrite an engine cron script of the same name:" >&2
+            for s in $shadowed; do echo "  - $s  ($PACK_SCRIPTS/$s shadows $SRC_DIR/$s)" >&2; done
+            echo "The pack copy is staged last and would win on every deploy. Rename the pack" >&2
+            echo "script (and its cron 'script:') to override deliberately, or delete it to use" >&2
+            echo "the engine's. Refusing to stage a silent shadow." >&2
+            exit 1
+        fi
         ( cd "$PACK_SCRIPTS" && tar -cf - ./*.py ) \
             | docker exec -i -u "$HERMES_UID" "$CONTAINER" tar -xf - -C /opt/data/scripts/
         echo "  $pcount pack (domain) cron script(s) deployed from $PACK_SCRIPTS"
@@ -167,6 +200,26 @@ print("\n".join(out))
 if [ -n "$REMOVED" ]; then
     echo "  reconciled: removed stale staged script(s) no longer in source:"
     printf '%s\n' "$REMOVED" | sed 's/^/    - /'
+fi
+
+# --- prove the stage LANDED: compare the target against source, not this script's exit code. ---
+# A deploy exiting 0 means it ran, not that the right bytes arrived. okcti-test's pre-#267 fork of
+# nvd_import.py overwrote the engine's copy on every run for three weeks while this script printed
+# "done." each time; it surfaced only when someone hashed the file inside the container. So hash it
+# here, every time. Note the ordering: this runs AFTER the fossil reconcile, so `extra` means the
+# reconcile itself did not do its job rather than a file it was about to remove.
+STAGED_LISTING="$(docker exec -u "$HERMES_UID" "$CONTAINER" \
+    sh -c 'cd /opt/data/scripts 2>/dev/null && sha256sum ./*.py 2>/dev/null' || true)"
+DRIFT_ARGS=(--source-dir "$SRC_DIR" --label "$(basename "$PACK_DIR")")
+if [ -d "$PACK_SCRIPTS" ]; then
+    DRIFT_ARGS+=(--source-dir "$PACK_SCRIPTS")
+fi
+for helper in "${RUNTIME_COMPOSE_HELPERS[@]}"; do
+    DRIFT_ARGS+=(--source-file "$REPO_ROOT/scripts/$helper")
+done
+if ! printf '%s\n' "$STAGED_LISTING" \
+        | python3 "$REPO_ROOT/scripts/staged_drift.py" "${DRIFT_ARGS[@]}" --staged-listing -; then
+    exit 1
 fi
 
 # --- enabled extension scripts -> /opt/data/scripts/<id>/ (okengine#128) ---
@@ -269,5 +322,41 @@ if [ -d "$PACK_CONNECTORS" ]; then
         echo "  (no source connector manifests found under $PACK_CONNECTORS)"
     fi
 fi
+
+# A standalone stage is a deploy operation, not a harmless copy. The read MCP bakes these search
+# libraries into its own image while this script updates the gateway-mounted source. Refuse to
+# report success when those two runtimes now disagree; otherwise search/graph silently serves old
+# behavior until somebody happens to rebuild the MCP image later.
+for lib in kb_search.py tier_lib.py schema_lib.py; do
+    STAGED_HASH="$(docker exec "$CONTAINER" sh -c "sha256sum /opt/data/scripts/$lib 2>/dev/null | cut -d' ' -f1")"
+    MCP_HASH="$(docker compose -f "$PACK_DIR/docker-compose.yml" exec -T okengine-mcp \
+        sh -c "sha256sum /app/scripts/$lib 2>/dev/null | cut -d' ' -f1" 2>/dev/null || true)"
+    if [ -z "$STAGED_HASH" ] || [ -z "$MCP_HASH" ]; then
+        echo "ERROR: cannot prove read-MCP $lib parity after staging (one or both copies missing)." >&2
+        echo "       Rebuild/recreate okengine-mcp, then rerun this stage." >&2
+        exit 1
+    fi
+    if [ "$STAGED_HASH" != "$MCP_HASH" ]; then
+        echo "ERROR: read-MCP $lib is stale after staging; refusing a split-version deploy." >&2
+        echo "       docker compose -f '$PACK_DIR/docker-compose.yml' build okengine-mcp &&" >&2
+        echo "       docker compose -f '$PACK_DIR/docker-compose.yml' up -d okengine-mcp" >&2
+        exit 1
+    fi
+done
+STAGED_HASH="$(docker exec "$CONTAINER" sh -c "sha256sum /opt/data/config/base-schema.yaml 2>/dev/null | cut -d' ' -f1")"
+MCP_HASH="$(docker compose -f "$PACK_DIR/docker-compose.yml" exec -T okengine-mcp \
+    sh -c "sha256sum /app/config/base-schema.yaml 2>/dev/null | cut -d' ' -f1" 2>/dev/null || true)"
+if [ -z "$STAGED_HASH" ] || [ -z "$MCP_HASH" ]; then
+    echo "ERROR: cannot prove read-MCP base-schema.yaml parity after staging (one or both copies missing)." >&2
+    echo "       Rebuild/recreate okengine-mcp, then rerun this stage." >&2
+    exit 1
+fi
+if [ "$STAGED_HASH" != "$MCP_HASH" ]; then
+    echo "ERROR: read-MCP base-schema.yaml is stale after staging; refusing a split-version deploy." >&2
+    echo "       docker compose -f '$PACK_DIR/docker-compose.yml' build okengine-mcp &&" >&2
+    echo "       docker compose -f '$PACK_DIR/docker-compose.yml' up -d okengine-mcp" >&2
+    exit 1
+fi
+echo "  read-MCP baked search libraries match staged source"
 
 echo "  done."

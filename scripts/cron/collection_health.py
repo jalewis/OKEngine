@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,12 @@ VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 LEDGER = Path(os.environ.get("COLLECTION_LEDGER_DIR", "/opt/data/collection"))
 RETENTION_DAYS = int(os.environ.get("COLLECTION_LEDGER_RETENTION_DAYS", "90"))
 STALE_HOURS = float(os.environ.get("COLLECTION_STALE_HOURS", "26"))
+# okengine#748 — raw files per distinct article. 1.0 means every raw item is its own article.
+# A ratio above this is the capture layer minting revisions for documents that did not change;
+# the incident that motivated the metric ran at 12.7 (82,769 files, 6,531 articles) with 639
+# copies of one blog post, and nothing reported it because nothing measured it.
+CHURN_RATIO_WARN = float(os.environ.get("COLLECTION_CHURN_RATIO_WARN", "1.5"))
+_REVISION_RE = re.compile(r"-revision-[0-9a-f]{8}(?:-[0-9a-f]{8})?(?=\.[^.]+$)")
 
 
 def _show(value, suffix=""):
@@ -28,6 +35,33 @@ def _latency(ms):
     return f"{hours:.1f}h" if hours < 72 else f"{hours / 24:.1f}d"
 
 
+def raw_churn(vault: Path) -> dict:
+    """Raw files per distinct article, and the worst offender.
+
+    The standing detector for okengine#748. Counting FILES was how the duplication stayed
+    invisible: every surface reported a healthy, growing corpus while 92% of it was re-captures
+    of documents that had not changed.
+
+    Returns `ratio: None` when there is no raw tree — unknown, never a healthy-looking zero.
+    """
+    raw = Path(vault) / "raw"
+    if not raw.is_dir():
+        return {"files": 0, "articles": 0, "ratio": None, "worst": 0, "worst_article": ""}
+    groups: dict[str, int] = {}
+    files = 0
+    for path in raw.rglob("*.md"):
+        if any(part.startswith(".") for part in path.parts):
+            continue
+        files += 1
+        key = _REVISION_RE.sub("", path.name)
+        groups[key] = groups.get(key, 0) + 1
+    if not groups:
+        return {"files": files, "articles": 0, "ratio": None, "worst": 0, "worst_article": ""}
+    worst_article, worst = max(groups.items(), key=lambda kv: (kv[1], kv[0]))
+    return {"files": files, "articles": len(groups), "ratio": files / len(groups),
+            "worst": worst, "worst_article": worst_article}
+
+
 def render(*, vault: Path = VAULT, ledger: Path = LEDGER, now=None) -> Path:
     now_dt = now or datetime.now(timezone.utc)
     sources = collection_ledger.load_sources(ledger)
@@ -37,7 +71,7 @@ def render(*, vault: Path = VAULT, ledger: Path = LEDGER, now=None) -> Path:
     collection_ledger.prune(ledger, now=now_dt, retention_days=RETENTION_DAYS)
     statuses = {key: sum(row["status"] == key for row in rows)
                 for key in ("healthy", "partial", "failing", "stale", "unknown")}
-    kinds = {key: sum(row.get("source_kind") == key for row in rows)
+    kinds = {key: sum(collection_ledger.origin_class_of(row) == key for row in rows)
              for key in ("primary", "secondary", "unknown")}
     independent = {
         "yes": sum(row.get("independent_origin") is True for row in rows),
@@ -53,6 +87,7 @@ def render(*, vault: Path = VAULT, ledger: Path = LEDGER, now=None) -> Path:
         f"dead letters {totals['dead_letter']}" if recent else
         "unknown — no collection attempts recorded"
     )
+    churn = raw_churn(vault)
     generated = now_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     lines = [
         "---", "type: dashboard", "id: dashboard:collection-health",
@@ -67,6 +102,14 @@ def render(*, vault: Path = VAULT, ledger: Path = LEDGER, now=None) -> Path:
         "", "## Provenance coverage", "",
         f"- source class: primary {kinds['primary']} · secondary {kinds['secondary']} · unknown {kinds['unknown']}",
         f"- independent origin: yes {independent['yes']} · no {independent['no']} · unknown {independent['unknown']}",
+        "", "## Capture churn", "",
+        (f"- raw files: {churn['files']} across {churn['articles']} distinct article(s)"
+         if churn["articles"] else "- raw files: no raw tree — ratio unknown"),
+        (f"- files per article: {churn['ratio']:.2f}"
+         + (f"  **ABOVE {CHURN_RATIO_WARN:.2f} — the capture layer is minting revisions for "
+            f"unchanged documents (okengine#748); worst: {churn['worst']} copies of "
+            f"`{churn['worst_article']}`**" if churn["ratio"] > CHURN_RATIO_WARN else "  (ok)")
+         if churn["ratio"] is not None else "- files per article: unknown"),
         "", "Missing or stale telemetry is shown as `unknown`/`stale`; it is never interpreted as zero or healthy.", "",
         "## Configured sources", "",
         "| Status | Source | Connector | Last attempt | Last success | Failures | Fetched → accepted | Dead letters | Pub→ingest | Class | Independent |",
@@ -81,7 +124,7 @@ def render(*, vault: Path = VAULT, ledger: Path = LEDGER, now=None) -> Path:
             f"| {row['status']} | {row.get('label') or row['source_id']} | {row['connector_id']} | "
             f"{_show(row.get('last_attempt'))} | {_show(row.get('last_success'))} | "
             f"{_show(row.get('consecutive_failures'))} | {counts} | {_show(row.get('dead_letter'))} | "
-            f"{_latency(row.get('publication_to_ingest_ms'))} | {row.get('source_kind') or 'unknown'} | {independent_label} |"
+            f"{_latency(row.get('publication_to_ingest_ms'))} | {collection_ledger.origin_class_of(row)} | {independent_label} |"
         )
     if not rows:
         lines.append("| unknown | No configured sources registered | — | unknown | unknown | unknown | unknown | unknown | unknown | unknown | unknown |")

@@ -117,3 +117,9 @@ def test_cron_jobs_deploy_uses_dotenv_parser_for_brief_hour():
     assert '_okengine_env_file_val "$PACK_DIR" OKENGINE_BRIEF_HOUR' in text
     assert "OKENGINE_BRIEF_HOUR must be" in text
     assert "grep -oE '^OKENGINE_BRIEF_HOUR=" not in text
+
+
+def test_cron_jobs_dst_gate_uses_scheduler_timezone_precedence():
+    text = (REPO / "scripts" / "deploy-cron-plus-jobs.sh").read_text()
+    assert '_okengine_env_file_val "$PACK_DIR" CRON_TZ' in text
+    assert 'DEPLOY_TZ="${PACK_CRON_TZ:-${TZ:-${PACK_TZ:-UTC}}}"' in text

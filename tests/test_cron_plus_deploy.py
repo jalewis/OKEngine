@@ -8,7 +8,10 @@ revert the fixes.
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
+
+pytestmark = pytest.mark.invariant
 
 REPO = Path(__file__).resolve().parent.parent
 S = REPO / "scripts"
@@ -87,6 +90,8 @@ def test_install_cron_plus_targets_runtime_and_reads_pin():  # #20
     assert "cron-plus/job-env.patch" in t and "cron-plus/after-ordering.patch" in t
     assert "cron-plus/run-receipts.patch" in t and "run_receipts.py" in t and "model_slots.py" in t
     assert "cron-plus/cli-null-next-run.patch" in t
+    assert "cron-plus/pid-ownership.patch" in t and "pid_ownership.py" in t
+    assert "cron-plus/slug-identity-guard.patch" in t and "slug_identity_guard.py" in t
     assert "after_ordering.py" in t and "apply --reverse --check" in t
     assert (REPO / "patches" / "cron-plus" / "job-env.patch").is_file()
     assert (REPO / "patches" / "cron-plus" / "after-ordering.patch").is_file()
@@ -94,9 +99,32 @@ def test_install_cron_plus_targets_runtime_and_reads_pin():  # #20
     assert (REPO / "patches" / "cron-plus" / "run-receipts.patch").is_file()
     assert (REPO / "patches" / "cron-plus" / "run_receipts.py").is_file()
     assert (REPO / "patches" / "cron-plus" / "model_slots.py").is_file()
+    assert (REPO / "patches" / "cron-plus" / "run_timeout.py").is_file()
     assert (REPO / "patches" / "cron-plus" / "cli-null-next-run.patch").is_file()
+    assert (REPO / "patches" / "cron-plus" / "pid-ownership.patch").is_file()
+    assert (REPO / "patches" / "cron-plus" / "pid_ownership.py").is_file()
+    assert (REPO / "patches" / "cron-plus" / "slug-identity-guard.patch").is_file()
+    assert (REPO / "patches" / "cron-plus" / "slug_identity_guard.py").is_file()
     r = subprocess.run(["bash", "-n", str(S / "install-cron-plus.sh")], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+def test_carried_cron_plus_patches_are_well_formed():  # #419
+    """A one-line payload edit must not leave stale unified-diff hunk lengths.
+
+    `git apply --numstat` parses every hunk without needing the upstream checkout,
+    so malformed carried patches fail CI instead of blocking the next deployment.
+    Context compatibility with the pin remains enforced by install-cron-plus.sh.
+    """
+    patch_dir = REPO / "patches" / "cron-plus"
+    patches = sorted(patch_dir.glob("*.patch"))
+    assert patches
+    for patch in patches:
+        result = subprocess.run(
+            ["git", "apply", "--numstat", str(patch)],
+            cwd=REPO, capture_output=True, text=True,
+        )
+        assert result.returncode == 0, f"{patch.name}: {result.stderr}"
 
 
 def test_cron_plus_pin_agrees_across_manifest_and_docs():  # #177 follow-up; #6 (H6)
@@ -136,7 +164,8 @@ def test_deploy_persists_hermes_uid_to_env():  # uid-muddle prevention
     # #7 regression: the persist ran only when .env ALREADY existed, but ensure-runtime creates
     # .env afterward (via >>) without the pin — so a clean deploy left .env with no HERMES_UID.
     # The fix creates .env first; guard that it's still there.
-    assert '[ -f "$PACK/.env" ] || : > "$PACK/.env"' in t, \
+    # okengine#665: .env is born owner-only (umask 077) — the creation-before-pin guard stands.
+    assert '[ -f "$PACK/.env" ] || ( umask 077; : > "$PACK/.env" )' in t, \
         "deploy.sh must create .env before pinning, else a clean deploy (no .env yet) leaves no uid pin"
 
 
@@ -247,6 +276,7 @@ def test_install_cron_plus_force_recovers_a_dirty_managed_clone(tmp_path):  # in
     )
     (eng / "patches" / "cron-plus" / "run_receipts.py").write_text("# receipt overlay\n")
     (eng / "patches" / "cron-plus" / "model_slots.py").write_text("# model slot overlay\n")
+    (eng / "patches" / "cron-plus" / "run_timeout.py").write_text("# timeout overlay\n")
     (eng / "patches" / "cron-plus" / "cli-null-next-run.patch").write_text(
         "diff --git a/cli.py b/cli.py\n"
         "--- a/cli.py\n"
@@ -255,6 +285,47 @@ def test_install_cron_plus_force_recovers_a_dirty_managed_clone(tmp_path):  # in
         " # cli\n"
         " AFTER-ORDERING-PATCHED\n"
         "+NULL-NEXT-RUN-PATCHED\n"
+    )
+    (eng / "patches" / "cron-plus" / "pid-ownership.patch").write_text(
+        "diff --git a/pid-hook b/pid-hook\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/pid-hook\n"
+        "@@ -0,0 +1 @@\n"
+        "+PID-OWNERSHIP-PATCHED\n"
+    )
+    (eng / "patches" / "cron-plus" / "pid_ownership.py").write_text("# pid ownership overlay\n")
+    (eng / "patches" / "cron-plus" / "run_records.py").write_text("# run records overlay\n")
+    (eng / "patches" / "cron-plus" / "artifact_records.py").write_text(
+        "# artifact records overlay\n")
+    (eng / "patches" / "cron-plus" / "run-records.patch").write_text(
+        "diff --git a/run-record-hook b/run-record-hook\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/run-record-hook\n"
+        "@@ -0,0 +1 @@\n"
+        "+RUN-RECORDS-PATCHED\n"
+    )
+    # every patch the installer applies must exist in the fixture, or the install aborts on a
+    # "required cron-plus patch not found" that has nothing to do with what the test is asserting
+    (eng / "patches" / "cron-plus" / "run-deadline-env.patch").write_text(
+        "diff --git a/run-deadline-hook b/run-deadline-hook\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/run-deadline-hook\n"
+        "@@ -0,0 +1 @@\n"
+        "+RUN-DEADLINE-PATCHED\n"
+    )
+    (eng / "patches" / "cron-plus" / "slug-identity-guard.patch").write_text(
+        "diff --git a/slug-guard-hook b/slug-guard-hook\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/slug-guard-hook\n"
+        "@@ -0,0 +1 @@\n"
+        "+SLUG-GUARD-PATCHED\n"
+    )
+    (eng / "patches" / "cron-plus" / "slug_identity_guard.py").write_text(
+        "# slug identity overlay\n"
     )
 
     pack = tmp_path / "pack"; dest = pack / ".hermes-data" / "plugins" / "cron-plus"
@@ -271,7 +342,10 @@ def test_install_cron_plus_force_recovers_a_dirty_managed_clone(tmp_path):  # in
     assert (dest / "cli.py").read_text() == \
         "# cli\nAFTER-ORDERING-PATCHED\nNULL-NEXT-RUN-PATCHED\n"
     assert (dest / "receipt-hook").read_text() == "RUN-RECEIPTS-PATCHED\n"
+    assert (dest / "pid-hook").read_text() == "PID-OWNERSHIP-PATCHED\n"
+    assert (dest / "run-record-hook").read_text() == "RUN-RECORDS-PATCHED\n"
     assert (dest / "after_ordering.py").read_text() == "# policy overlay\n"
+    assert (dest / "pid_ownership.py").read_text() == "# pid ownership overlay\n"
     assert "discarding LOCAL" in r.stderr, "must surface the discarded change, not silently drop it"
 
     again = subprocess.run(["bash", str(eng / "scripts" / "install-cron-plus.sh"), str(pack)],
@@ -281,6 +355,7 @@ def test_install_cron_plus_force_recovers_a_dirty_managed_clone(tmp_path):  # in
     assert (dest / "jobs.py").read_text() == "NEW-PINNED\nJOB-ENV-PATCHED\n", \
         "same-pin redeploy accumulated or lost a carried patch"
     assert (dest / "receipt-hook").read_text() == "RUN-RECEIPTS-PATCHED\n"
+    assert (dest / "pid-hook").read_text() == "PID-OWNERSHIP-PATCHED\n"
 
 
 def test_cron_plus_logs_reads_container_not_host_hermes():  # invariant-audit #15
@@ -358,6 +433,17 @@ def test_jobs_deploy_seeds_jitter_rng_for_stability():  # invariant-audit #47
     t = (S / "deploy-cron-plus-jobs.sh").read_text()
     assert "random.Random(_seed)" in t and "hashlib.sha256(pack_dir" in t, \
         "deploy must seed cron_jitter.expand_jobs deterministically from the pack, not use an unseeded RNG"
+    assert "pack_dir = os.path.realpath(pack_dir)" in t, \
+        "a symlink alias for one deployment must not re-roll its schedule"
+
+
+def test_deploy_rejects_qwen_jobs_with_global_fallback_after_profile_expansion():
+    """The deploy gate must inspect concrete jobs, so @local cannot bypass the policy."""
+    t = (S / "deploy-cron-plus-jobs.sh").read_text()
+    expansion = t.index("model_profiles.expand_jobs")
+    policy = t.index("model_profiles.validate_qwen_no_fallback")
+    write = t.index("cat >")
+    assert expansion < policy < write
 
 
 def test_jobs_deploy_validates_scripts_before_overwriting_live_store():  # invariant-audit #50

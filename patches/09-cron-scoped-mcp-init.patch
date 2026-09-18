@@ -1,8 +1,17 @@
 diff --git a/cron/scheduler.py b/cron/scheduler.py
-index 84b0cb4..a3c5dcd 100644
+index 84b0cb4..09ac9fb 100644
 --- a/cron/scheduler.py
 +++ b/cron/scheduler.py
-@@ -222,6 +222,25 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
+@@ -210,7 +210,7 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
+     surprise $4.63 run).
+     """
+     per_job = job.get("enabled_toolsets")
+-    if per_job:
++    if per_job is not None:
+         return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
+     try:
+         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
+@@ -222,6 +222,49 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
          )
          return None
  
@@ -25,27 +34,30 @@ index 84b0cb4..a3c5dcd 100644
 +    return register_mcp_servers(selected)
 +
 +
++def _require_explicit_cron_tool_surface(job: dict, enabled_toolsets: list[str] | None) -> None:
++    """Fail closed when a cron lane omitted its per-job allowlist."""
++    if enabled_toolsets is None:
++        raise RuntimeError(
++            f"Job '{job.get('name') or job.get('id')}' has enabled_toolsets=null; "
++            "cron agent tool surfaces must be explicit"
++        )
++
++
++def _validate_cron_mcp_surface(job: dict, enabled_toolsets: list[str],
++                               mcp_tools: list[str]) -> None:
++    required = [name for name in enabled_toolsets if name.startswith("okengine")]
++    canonical = [name for name in mcp_tools if str(name).startswith("mcp__")]
++    logger.info(
++        "Job '%s': tool surface — %d MCP offered (%s)",
++        job.get("name") or job.get("id"), len(canonical),
++        ", ".join(canonical) if canonical else "NONE",
++    )
++    if required and not canonical:
++        raise RuntimeError(
++            f"Job '{job.get('name') or job.get('id')}' requires MCP server(s) "
++            f"{required}, but zero canonical MCP tools were offered"
++        )
++
  # Valid delivery platforms — used to validate user-supplied platform names
  # in cron delivery targets, preventing env var enumeration via crafted names.
  _KNOWN_DELIVERY_PLATFORMS = frozenset({
-@@ -2968,9 +2987,9 @@ def run_job(
-         # ticks short-circuit on already-connected servers inside
-         # register_mcp_servers(). Non-fatal on failure: a broken MCP server
-         # shouldn't kill an otherwise-working cron job. See #4219.
-+        _cron_enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
-         try:
--            from tools.mcp_tool import discover_mcp_tools
--            _mcp_tools = discover_mcp_tools()
-+            _mcp_tools = _discover_cron_mcp_tools(_cron_enabled_toolsets)
-             if _mcp_tools:
-                 logger.info(
-                     "Job '%s': %d MCP tool(s) available",
-@@ -3001,7 +3020,7 @@ def run_job(
-             providers_order=pr.get("order"),
-             provider_sort=pr.get("sort"),
-             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
--            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
-+            enabled_toolsets=_cron_enabled_toolsets,
-             disabled_toolsets=_apply_failure_path_toolset_guard(
-                 _resolve_cron_disabled_toolsets(_cfg), _script_failed
-             ),

@@ -9,7 +9,7 @@
 # MCP server: /opt/hermes/okengine-mcp/write_server.py).
 #
 # Usage:
-#   bash scripts/build-engine-image.sh              # clone Hermes, build hermes-agent:okengine-<engine_release> + :latest
+#   bash scripts/build-engine-image.sh              # clone Hermes, build immutable release+sha tag
 #   HERMES_SRC=/path/to/hermes bash scripts/build-engine-image.sh   # reuse a checkout (must be at the pin)
 #   OKENGINE_IMAGE=myrepo/okengine OKENGINE_TAG=custom bash scripts/build-engine-image.sh
 #   SKIP_BUILD=1 bash scripts/build-engine-image.sh # assemble the tree only (no docker build) — for inspection/CI
@@ -33,14 +33,15 @@ ENG_SHA="$(git -C "$ENGINE_DIR" rev-parse --short HEAD 2>/dev/null || echo unkno
 [ -n "$(git -C "$ENGINE_DIR" status --porcelain 2>/dev/null)" ] && ENG_SHA="${ENG_SHA}-dirty"
 HERMES_REPO="${HERMES_REPO:-https://github.com/NousResearch/hermes-agent.git}"
 IMAGE="${OKENGINE_IMAGE:-hermes-agent}"
-# Default tag tracks the engine release from the manifest (okengine#101) — never a hardcoded
-# literal, so a default build stamps the image with the version of the source it was built from.
-TAG="${OKENGINE_TAG:-okengine-$RELEASE}"
+# Image identity is immutable by default (#627). A release-only tag still aliases every commit
+# made between releases, which recreates the same cross-deployment hazard as :latest. Include the
+# exact engine revision so two packs on one host can remain pinned to different engine builds.
+TAG="${OKENGINE_TAG:-okengine-$RELEASE-$ENG_SHA}"
 
 echo "==> OKEngine gateway image build"
 echo "    engine : $ENGINE_DIR"
 echo "    Hermes : $HERMES_REPO @ $PIN"
-echo "    image  : $IMAGE:$TAG (+ :latest)"
+echo "    image  : $IMAGE:$TAG"
 
 # 1. Hermes source at the pin.
 CLEAN_WORK=0
@@ -94,6 +95,40 @@ fi
 echo "==> applying carried patches"
 bash "$ENGINE_DIR/patches/apply.sh" "$WORK"
 
+# Hermes installs its already-synced project editable with `--no-deps`, but uv
+# still creates an isolated build environment and resolves setuptools from
+# PyPI.  That makes an otherwise self-contained image rebuild depend on live
+# DNS/PyPI.  Reuse the build backend already installed by the preceding
+# dependency-sync layer.  Fail loudly if upstream changes the instruction so
+# this supply-chain hardening cannot silently disappear.
+EDITABLE_INSTALL='uv pip install --no-cache-dir --no-deps -e "."'
+if ! grep -Fq "$EDITABLE_INSTALL" "$WORK/Dockerfile"; then
+  echo "ERROR: Hermes Dockerfile editable-install instruction changed; cannot enforce offline build isolation" >&2
+  exit 1
+fi
+SETUPTOOLS_WHEEL="$ENGINE_DIR/vendor/python-build/setuptools-82.0.1-py3-none-any.whl"
+SETUPTOOLS_SHA256="a59e362652f08dcd477c78bb6e7bd9d80a7995bc73ce773050228a348ce2e5bb"
+printf '%s  %s\n' "$SETUPTOOLS_SHA256" "$SETUPTOOLS_WHEEL" | sha256sum -c - >/dev/null
+mkdir -p "$WORK/.okengine-build"
+install -m 0644 "$SETUPTOOLS_WHEEL" "$WORK/.okengine-build/"
+sed -i 's@uv pip install --no-cache-dir --no-deps -e "\."@uv pip install --no-cache-dir --no-deps ./.okengine-build/setuptools-82.0.1-py3-none-any.whl \&\& uv pip install --no-cache-dir --no-deps --no-build-isolation -e "."@' "$WORK/Dockerfile"
+
+# Build the engine package once for this gateway revision, bake that exact wheel
+# into the immutable image context, and install it after Hermes. The gateway is
+# therefore a wheel consumer just like every engine-owned sidecar without
+# performing a mutable install at container startup.
+python3 "$ENGINE_DIR/scripts/build_engine_wheel.py" --out "$WORK/.okengine-build"
+OKENGINE_WHEEL="$(find "$WORK/.okengine-build" -maxdepth 1 -name 'okengine-*.whl' -print -quit)"
+[ -n "$OKENGINE_WHEEL" ] || { echo "ERROR: OKEngine wheel build produced no artifact" >&2; exit 1; }
+printf '\nRUN uv pip install --no-cache-dir --no-deps /opt/hermes/.okengine-build/%s\n' \
+  "$(basename "$OKENGINE_WHEEL")" >> "$WORK/Dockerfile"
+
+# Governed MCP writes run from the vault and therefore import policy_plane from
+# the installed wheel, not from the source overlay. Give both locations the
+# same explicit catalog path so the wheel cannot derive a nonexistent
+# site-packages/config/policy/catalog.yaml path.
+printf '\nENV OKENGINE_POLICY_CATALOG=/opt/hermes/config/policy/catalog.yaml\n' >> "$WORK/Dockerfile"
+
 # 3. Overlay the engine layer into the Hermes tree (merge — Hermes' COPY . . bakes
 #    it into /opt/hermes). Keep in sync with engine-manifest.yaml engine_layer.
 echo "==> overlaying engine layer"
@@ -102,15 +137,30 @@ install -m 0644 "$ENGINE_DIR/tools/policy_plane.py" "$WORK/tools/policy_plane.py
 rm -rf "$WORK/okengine-mcp" "$WORK/okengine-reader"
 cp -r "$ENGINE_DIR/okengine-mcp"    "$WORK/okengine-mcp"
 cp -r "$ENGINE_DIR/okengine-reader" "$WORK/okengine-reader"
+# These write-path libraries are installed from the revision wheel above. Do
+# not leave service-local copies that shadow the wheel according to script-dir
+# import precedence and recreate baked-vs-staged resolution ambiguity.
+rm -f "$WORK/okengine-mcp/scope.py" "$WORK/okengine-mcp/projection.py" \
+      "$WORK/okengine-mcp/output_contract_enforce.py" "$WORK/okengine-mcp/converge.py"
 mkdir -p "$WORK/scripts" "$WORK/config" "$WORK/plugins/model-providers"
 cp -r "$ENGINE_DIR/scripts/." "$WORK/scripts/"
 cp -r "$ENGINE_DIR/config/."  "$WORK/config/"
-cp -r "$ENGINE_DIR/plugins/model-providers/custom"     "$WORK/plugins/model-providers/"
-cp -r "$ENGINE_DIR/plugins/model-providers/openrouter" "$WORK/plugins/model-providers/"
+install -m 0644 "$ENGINE_DIR/engine-manifest.yaml" "$WORK/engine-manifest.yaml"
+# Exact-pin overlay set: target v0.21.3 must not bake the old custom/OpenRouter
+# profiles, which would replace upstream routing and reasoning safeguards.
+PLUGIN_OVERLAY_ROOT="$(bash "$ENGINE_DIR/scripts/select_hermes_plugin_overlays.sh" "$ENGINE_DIR" "$PIN")"
+cp -r "$PLUGIN_OVERLAY_ROOT/model-providers/custom"     "$WORK/plugins/model-providers/"
+if [ "$PIN" = "v2026.9.14" ]; then
+  # The target's native OpenRouter profile already contains every carried
+  # behavior plus new affinity/reasoning/speed-tier safeguards. Keep it intact.
+  bash "$ENGINE_DIR/scripts/verify_native_openrouter.sh" "$WORK"
+else
+  cp -r "$PLUGIN_OVERLAY_ROOT/model-providers/openrouter" "$WORK/plugins/model-providers/"
+fi
 # web-search provider overlay: Serper (okengine#190) — a backend Hermes doesn't ship, added as a
 # plugin (addition, not a fork). Auto-loads via kind: backend alongside the bundled web providers.
 mkdir -p "$WORK/plugins/web"
-cp -r "$ENGINE_DIR/plugins/web/serper" "$WORK/plugins/web/serper"
+cp -r "$PLUGIN_OVERLAY_ROOT/web/serper" "$WORK/plugins/web/serper"
 # Bake the RUNNING engine version into the image (okengine#192) so deployment_validate can compare
 # it to the deployment's runtime stamp and self-heal an image-roll that skipped the re-stamp — the
 # About panel then never reports a version the deployment isn't running.
@@ -122,16 +172,56 @@ printf '%s\n' "$PIN" > "$WORK/.hermes_pin"
 # drop any __pycache__ that hitched along
 find "$WORK/okengine-mcp" "$WORK/okengine-reader" "$WORK/scripts" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
 
+# Never bake a GITIGNORED artifact (okengine#511). The overlay above copies the WORKING
+# TREE, but ENG_SHA's dirty check is `git status --porcelain`, which does NOT report
+# ignored files. So a checkout holding generated artifacts built as "clean at commit X"
+# while shipping content that is in no commit at all: config/cron-plus-jobs.json (a
+# cron_pack_split.py output, .gitignore:20) was baked carrying 132 jobs, 79 of them
+# pack-specific, into a domain-agnostic engine image — and a build of the SAME commit from
+# a different checkout baked a 53-job version of the same path. Two images, identical clean
+# provenance, different contents.
+#
+# Tracked-but-modified files are still baked deliberately: that is the local iteration
+# path, and ENG_SHA already labels it "X-dirty". Only ignored paths are dropped, and only
+# under the trees this overlay actually copied — $WORK is a Hermes checkout, and blindly
+# removing every engine-ignored path could delete an unrelated Hermes file that happens to
+# share a name (its own .venv, for instance).
+# --- BEGIN ignored-artifact sweep (okengine#511) --- extracted verbatim by
+# tests/test_build_image_excludes_ignored.py; keep the sentinels.
+overlaid_prefixes='okengine-mcp/ okengine-reader/ scripts/ config/ plugins/ tools/'
+dropped_ignored=0
+while IFS= read -r ignored; do
+  [ -n "$ignored" ] || continue
+  for prefix in $overlaid_prefixes; do
+    case "$ignored" in
+      "$prefix"*)
+        if [ -e "$WORK/$ignored" ]; then
+          rm -rf -- "${WORK:?}/$ignored"
+          dropped_ignored=$((dropped_ignored + 1))
+          echo "    dropped gitignored artifact: $ignored"
+        fi
+        break
+        ;;
+    esac
+  done
+done <<EOF
+$(git -C "$ENGINE_DIR" ls-files --others --ignored --exclude-standard 2>/dev/null || true)
+EOF
+if [ "$dropped_ignored" -gt 0 ]; then
+  echo "==> dropped $dropped_ignored gitignored artifact(s) from the overlay (okengine#511)"
+fi
+# --- END ignored-artifact sweep ---
+
 if [ "${SKIP_BUILD:-0}" = "1" ]; then
   echo "==> SKIP_BUILD=1 — assembled tree at $WORK (not building)"
   exit 0
 fi
 
 # 4. Build the gateway image via Hermes' own Dockerfile.
-#    TAG_LATEST=1 (default) also tags :latest (what pack composes reference by
-#    default). Set TAG_LATEST=0 to avoid moving an existing :latest in use.
+#    TAG_LATEST=1 is an explicit compatibility escape hatch only. Deployments never consume it;
+#    moving :latest by default makes an unrelated pack change revision on its next recreate.
 LATEST_ARGS=()
-[ "${TAG_LATEST:-1}" = "1" ] && LATEST_ARGS=(-t "$IMAGE:latest")
+[ "${TAG_LATEST:-0}" = "1" ] && LATEST_ARGS=(-t "$IMAGE:latest")
 # Stamp provenance so `deploy.sh` can tell whether an existing :latest is stale
 # (built from a different engine checkout) and so an operator can see what's running.
 LABELS=(

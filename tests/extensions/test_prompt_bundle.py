@@ -78,7 +78,7 @@ def test_prompt_file_is_loaded_as_the_agent_prompt(tmp_path):
 def test_missing_prompt_file_is_an_error(tmp_path):
     c = _load("extension_compose", COMPOSE)
     rec = {"id": "x.y", "tier": "engine", "dir": str(tmp_path),
-           "manifest": _manifest("x.y", {"schedule": {"kind": "cron", "expr": "0 4 * * *"},
+           "manifest": _manifest("x.y", {"schedule": {"kind": "cron", "expr": "@jitter:daily@4"},
                                          "prompt_file": "nope.md"})}
     _, errors, _ = c.synthesize_ops(rec)
     assert any("prompt_file not found" in e for e in errors), errors
@@ -88,7 +88,7 @@ def test_inline_prompt_beats_default_path():
     # inline prompt wins when both present? validator forbids both; composer prefers inline.
     c = _load("extension_compose", COMPOSE)
     rec = {"id": "x.y", "tier": "engine", "dir": "/nonexistent",
-           "manifest": _manifest("x.y", {"schedule": {"kind": "cron", "expr": "0 4 * * *"},
+           "manifest": _manifest("x.y", {"schedule": {"kind": "cron", "expr": "@jitter:daily@4"},
                                          "prompt": "inline wins"})}
     jobs, errors, _ = c.synthesize_ops(rec)
     assert not errors and jobs[0]["prompt"] == "inline wins"
@@ -102,7 +102,8 @@ def test_pack_override_replaces_bundled_prompt(tmp_path):
     pack = tmp_path
     man = _manifest("demo.predictions",
                     {"schedule": {"kind": "cron", "expr": "23 6 * * *"},
-                     "entrypoint": "gate.py", "prompt_file": "prompts/grade.md"})
+                     "entrypoint": "gate.py", "prompt_file": "prompts/grade.md",
+                     "max_iterations": 8})
     _ext_dir(pack, "demo.predictions", man, files={"prompts/grade.md": "GENERIC default."})
     disc.set_enabled(pack, "demo.predictions", True)
     # pack supplies a tuned prompt keyed by the namespaced job name
@@ -135,7 +136,7 @@ def test_pack_override_unknown_job_is_an_error(tmp_path):
 
 def test_manifest_rejects_both_prompt_and_prompt_file():
     mod = _load("extension_manifest", MANIFEST)
-    m = _manifest("x.y", {"schedule": {"kind": "cron", "expr": "0 4 * * *"},
+    m = _manifest("x.y", {"schedule": {"kind": "cron", "expr": "@jitter:daily@4"},
                           "prompt": "a", "prompt_file": "b.md"})
     errors, _ = mod.validate_manifest(m)
     assert any("either 'prompt' or 'prompt_file'" in e for e in errors), errors
@@ -143,7 +144,7 @@ def test_manifest_rejects_both_prompt_and_prompt_file():
 
 def test_manifest_accepts_prompt_file_without_entrypoint():
     mod = _load("extension_manifest", MANIFEST)
-    m = _manifest("okengine.brief", {"schedule": {"kind": "cron", "expr": "0 8 * * *"},
-                                     "prompt_file": "prompts/brief.md"})
+    m = _manifest("okengine.brief", {"schedule": {"kind": "cron", "expr": "@jitter:daily@8"},
+                                     "prompt_file": "prompts/brief.md", "max_iterations": 8})
     errors, _ = mod.validate_manifest(m)
     assert not errors, errors

@@ -47,6 +47,22 @@ def _tokens():
     return _load("extension_tokens")
 
 
+def _policy():
+    path = _HERE.parent / "tools" / "policy_plane.py"
+    spec = importlib.util.spec_from_file_location("okengine_policy_plane", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _materialize_policy(pack: Path) -> list[str]:
+    try:
+        _policy().materialize(pack)
+        return []
+    except Exception as exc:
+        return [str(exc)]
+
+
 def _require_clean_discovery(extensions, errors, pack) -> list[str]:
     """A broken discovery set (duplicate id, reserved-ns, parse fault) blocks
     enable/disable — you cannot mutate enabled-state on top of an ambiguous tree."""
@@ -307,6 +323,11 @@ def _cmd_enable(args) -> int:
     write_capability = tok.write_capability_from_manifest(target["manifest"])
     if args.id in enabled:
         rec = tok.reconcile(pack, args.id, read_scopes, write_scopes, write_capability)
+        policy_errors = _materialize_policy(pack)
+        if policy_errors:
+            for error in policy_errors:
+                print(f"FAIL: policy regen: {error}", file=sys.stderr)
+            return 1
         action = "token rotated" if rec["rotated"] else (
             "token scopes reconciled" if rec["changed"] else "token scopes current")
         print(f"already enabled: {args.id} ({action})")
@@ -321,6 +342,13 @@ def _cmd_enable(args) -> int:
     serr = comp.write_composed_schema(pack)        # regenerate composed-schema.yaml (#133)
     for e in serr:
         print(f"WARN: composed-schema regen: {e}", file=sys.stderr)
+    policy_errors = _materialize_policy(pack)
+    if policy_errors:
+        for error in policy_errors:
+            print(f"FAIL: policy regen: {error}", file=sys.stderr)
+        print(f"enabled: {args.id} in state, but effective-policy.json was NOT regenerated. "
+              "Resolve the policy error and re-run enable or deploy.", file=sys.stderr)
+        return 1
     print(f"enabled: {args.id}")
     print("redeploy to apply — regen folds its cron job into cron-plus-jobs.json "
           "(generated-from-source); scoped MCP token minted; composed schema regenerated.")
@@ -410,10 +438,27 @@ def _cmd_sidecar_generate(args) -> int:
         for e in errors:
             print(f"FAIL: {e}" if not str(e).startswith("FAIL") else e, file=sys.stderr)
         return 1
+    gen = pack / ".okengine" / "generated"
+
+    def remove_stale_wrappers() -> None:
+        if not gen.is_dir():
+            return
+        trigger_name = getattr(comp, "TRIGGER_NAME", "trigger.sh")
+        for directory in gen.iterdir():
+            trigger = directory / trigger_name
+            if directory.is_dir() and directory.name not in wrappers and trigger.is_file():
+                trigger.unlink()
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+
+    remove_stale_wrappers()
     if not override["services"]:
+        compose_file = gen / "sidecars.compose.yml"
+        compose_file.unlink(missing_ok=True)
         print("no enabled sidecar extensions")
         return 0
-    gen = pack / ".okengine" / "generated"
     gen.mkdir(parents=True, exist_ok=True)
     compose_file = gen / "sidecars.compose.yml"
     compose_file.write_text(yaml.safe_dump(override, sort_keys=False), encoding="utf-8")
@@ -457,6 +502,13 @@ def _cmd_disable(args) -> int:
               f"reflects the old enabled set). Resolve the errors above and re-run "
               f"`framework extensions disable`/`enable` (or fix the offending extension), then "
               f"redeploy.", file=sys.stderr)
+        return 1
+    policy_errors = _materialize_policy(pack)
+    if policy_errors:
+        for error in policy_errors:
+            print(f"FAIL: policy regen: {error}", file=sys.stderr)
+        print(f"disabled: {args.id} in state, but effective-policy.json was NOT regenerated. "
+              "Resolve the policy error and re-run disable or deploy.", file=sys.stderr)
         return 1
     print(f"disabled: {args.id}")
     print("redeploy to apply — its cron job drops from the generated fleet. Pages it "

@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch OKEngine GitLab pipelines outside the CI runner
+OnFailure=okengine-ci-watch-failure.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/engines/okengine
+EnvironmentFile=-%h/.config/okengine/ci-watch.env
+ExecStart=/usr/bin/python3 %h/engines/okengine/ci/pipeline_watch.py
+SuccessExitStatus=1

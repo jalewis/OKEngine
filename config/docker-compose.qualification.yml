@@ -1,0 +1,27 @@
+# Qualification-only gateway override.
+#
+# Use this alongside a pack's normal docker-compose.yml while running a
+# controlled cron-plus qualification matrix. It prevents the in-process ticker
+# from consuming fixtures while preserving the gateway container, volumes, and
+# network that the one-shot qualification runners use.
+#
+# Pause:
+#   docker compose -f docker-compose.yml \
+#     -f /path/to/okengine/config/docker-compose.qualification.yml \
+#     up -d --force-recreate --no-deps gateway
+#
+# Restore:
+#   docker compose up -d --force-recreate --no-deps gateway
+services:
+  gateway:
+    environment:
+      CRON_PLUS_DISABLED: "1"
+  okengine-reader:
+    ports: !override
+      - "127.0.0.1:${OKENGINE_QUALIFICATION_READER_PORT:-19200}:9200"
+  okengine-cockpit:
+    ports: !override
+      - "127.0.0.1:${OKENGINE_QUALIFICATION_COCKPIT_PORT:-19201}:9200"
+  okengine-mcp:
+    ports:
+      - "127.0.0.1:${OKENGINE_QUALIFICATION_MCP_PORT:-18730}:8730"

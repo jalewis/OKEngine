@@ -13,7 +13,7 @@ the next audit auto-resolves the gap. You are closing gaps, not writing essays.
    a cited page must exist and genuinely support the fix.** If the vault holds nothing that
    honestly satisfies the expectation, SKIP the gap and say so — an unfixable gap is the
    operator's signal, and a fabricated fix is corpus poisoning.
-3. **Apply the fix via the MCP write path** (mcp_okengine_write_update_entity), NOT
+3. **Apply the fix via the MCP write path** (mcp__okengine_write_okengine_completeness_gap_drain__update_entity), NOT
    file_write. Touch ONLY what the expectation asks: add the missing field, the missing
    wikilink, the missing companion reference. Do not rewrite bodies, do not "improve" pages.
 4. **DRAFT MODE** (the wake-gate marks these): judgment-bearing fixes (e.g. a refutation

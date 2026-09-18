@@ -1,0 +1,7 @@
+ARG PYTHON_BASE_IMAGE=python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f
+FROM ${PYTHON_BASE_IMAGE}
+WORKDIR /app
+COPY tests/e2e/smoke/fault_gateway.py /app/fault_gateway.py
+USER 10001:10001
+EXPOSE 8080
+CMD ["python", "/app/fault_gateway.py"]

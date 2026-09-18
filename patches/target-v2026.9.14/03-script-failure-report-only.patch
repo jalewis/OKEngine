@@ -1,0 +1,250 @@
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 093b7eda..b304342c 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -1951,9 +1951,10 @@ _RunResult = tuple[bool, str, str, Optional[str]]
+ 
+ def _prepare_job_prompt(
+     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
+-) -> tuple[Optional[_RunResult], Optional[str]]:
+-    """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
++) -> tuple[Optional[_RunResult], Optional[str], bool]:
++    """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt, script_failed)``: an early
+     result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
+-    injection block, empty prompt); otherwise ``prompt`` is set."""
++    injection block, empty prompt); otherwise ``prompt`` is set. The third
++    value marks a script-failure run, which must be report-only."""
+     # Fail closed on a corrupt config.yaml: defaults would let auto-detection bill a provider the
+     # user never chose. no_agent jobs are exempt. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
+@@ -1988,21 +1989,21 @@ def _prepare_job_prompt(
+             require_parseable_user_config()
+         except InvalidUserConfigError as exc:
+             logger.error("Job '%s': refusing to run — %s", job_id, exc)
+-            return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None
++            return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None, False
+ 
+     # no_agent short-circuits BEFORE importing run_agent / opening SessionDB.
+     if job.get("no_agent"):
+-        return _run_no_agent_job(job, job_id, job_name, cancel_event), None
++        return _run_no_agent_job(job, job_id, job_name, cancel_event), None, False
+ 
+     # Legacy / hand-edited job with nothing to run: pause it instead of waking the LLM every fire.
+     from cron.jobs import EMPTY_PAYLOAD_ERROR, job_payload_is_empty
+ 
+     if job_payload_is_empty(job):
+-        return _block_and_pause_job(job_id, job_name, EMPTY_PAYLOAD_ERROR), None
++        return _block_and_pause_job(job_id, job_name, EMPTY_PAYLOAD_ERROR), None, False
+ 
+     _early, extra_prompt = _apply_monitor_gate(job, job_id, job_name, extra_prompt)
+     if _early is not None:
+-        return _early, None
++        return _early, None, False
+ 
+     # Wake-gate: run the pre-check script BEFORE building the prompt; its result is passed into
+     # _build_job_prompt so the script runs only once.
+@@ -2012,6 +2013,7 @@ def _prepare_job_prompt(
+     # happens inside the main try, right before the agent is constructed — after every early-return path
+     # (#96290).
+     prerun_script = None
++    script_failed = False
+     script_path = job.get("script")
+     if script_path:
+         prerun_script = _run_job_script_with_claim_heartbeat(
+@@ -2021,6 +2023,7 @@ def _prepare_job_prompt(
+             cancel_event=cancel_event,
+         )
+         _ran_ok, _script_output = prerun_script
++        script_failed = not _ran_ok
+         if _ran_ok and not _parse_wake_gate(_script_output):
+             logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
+             silent_doc = (
+@@ -2029,7 +2032,12 @@ def _prepare_job_prompt(
+                 f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
+             )
+-            return (True, silent_doc, SILENT_MARKER, None), None
++            return (True, silent_doc, SILENT_MARKER, None), None, False
++
++    if script_failed:
++        logger.warning(
++            "Job '%s' (ID: %s): data-collection script failed — report-only agent has no tools",
++            job_name, job_id)
+ 
+     try:
+         prompt = _build_job_prompt(job, prerun_script=prerun_script, extra_prompt=extra_prompt)
+@@ -2051,11 +2059,11 @@ def _prepare_job_prompt(
+             "and the match is a false positive, rephrase the content to avoid "
+             "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
+         )
+-        return (False, blocked_doc, "", str(block_exc)), None
++        return (False, blocked_doc, "", str(block_exc)), None, script_failed
+     if prompt is None:
+         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
+-        return (True, "", SILENT_MARKER, None), None
+-    return None, prompt
++        return (True, "", SILENT_MARKER, None), None, script_failed
++    return None, prompt, script_failed
+ 
+ 
+ _CRON_DELIVERY_VARS = (
+@@ -2229,7 +2237,8 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
+     return setup
+ 
+ 
+-def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
++def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db,
++                          report_only: bool = False):
+     runtime = setup.runtime
+     pr = _cfg.get("provider_routing") or {}
+     return AIAgent(
+@@ -2204,7 +2213,10 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
+         providers_order=pr.get("order"),
+         provider_sort=pr.get("sort"),
+         openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
+-        enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
++        # A failed collection script is already quoted in the prompt. The agent
++        # only reports it; an empty allowlist denies *all* tools, including MCP
++        # writers, browser/terminal composites, plugins, and newly added sets.
++        enabled_toolsets=[] if report_only else _resolve_cron_enabled_toolsets(job, _cfg),
+         disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+         quiet_mode=True,
+         # Project context files only with a configured workdir; SOUL.md always.
+@@ -2263,7 +2275,8 @@ def run_job(
+     job_id = job["id"]
+     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+ 
+-    early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
++    early, prompt, script_failed = _prepare_job_prompt(
++        job, job_id, job_name, extra_prompt, cancel_event)
+     if early is not None:
+         return early
+     from run_agent import AIAgent
+@@ -2295,7 +2308,7 @@ def run_job(
+         _session_db = _open_cron_session_db(job)
+         agent = _construct_cron_agent(
+             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
+-            session_db=_session_db)
++            session_db=_session_db, report_only=script_failed)
+         _audit = _FireAudit(job, job_id, model)
+ 
+         result = _run_agent_with_watchdog(
+diff --git a/cron/scheduler_prompt.py b/cron/scheduler_prompt.py
+index 058b8615..e297eb23 100644
+--- a/cron/scheduler_prompt.py
++++ b/cron/scheduler_prompt.py
+@@ -249,7 +249,9 @@ def _build_job_prompt(
+             ("Script Output", "The following data was collected by a pre-run script. "
+                               "Use it as context for your analysis.")
+             if success
+-            else ("Script Error", "The data-collection script failed. Report this to the user.")
++            else ("Script Error", "The data-collection script failed. Report this error to the user "
++                  "as your final response. Do NOT investigate, fix, modify, or delete any files; "
++                  "only report the error text below.")
+         )
+         prompt = _prepend_context_block(prompt, heading, intro, script_output)
+         has_injected_data = True
+diff --git a/tests/cron/test_scheduler_completion_verification.py b/tests/cron/test_scheduler_completion_verification.py
+index d787ee84..2abd0b27 100644
+--- a/tests/cron/test_scheduler_completion_verification.py
++++ b/tests/cron/test_scheduler_completion_verification.py
+@@ -63,7 +63,7 @@ class _RecordingSessionDB:
+         pass
+ 
+ 
+-def _run_booked_job(monkeypatch, tmp_path):
++def _run_booked_job(monkeypatch, tmp_path, job=None, agent_type=_FakeCronAgent):
+     import hermes_state
+     import run_agent
+ 
+@@ -76,7 +76,7 @@ def _run_booked_job(monkeypatch, tmp_path):
+ 
+     monkeypatch.setattr(_RecordingSessionDB, "__init__", _capture_init)
+     monkeypatch.setattr(hermes_state, "SessionDB", _RecordingSessionDB)
+-    monkeypatch.setattr(run_agent, "AIAgent", _FakeCronAgent)
++    monkeypatch.setattr(run_agent, "AIAgent", agent_type)
+     monkeypatch.setattr(
+         "hermes_constants.resolve_reasoning_config", lambda *_a, **_k: None
+     )
+@@ -104,7 +104,7 @@ def _run_booked_job(monkeypatch, tmp_path):
+         cron_scheduler, "_guard_job_credential_exfil", lambda _job: None
+     )
+     cron_scheduler.run_job(
+-        {
++        job or {
+             "id": "verify-complete",
+             "name": "Verification",
+             "prompt": "Do the thing",
+diff --git a/tests/cron/test_okengine_script_failure_report_only.py b/tests/cron/test_okengine_script_failure_report_only.py
+new file mode 100644
+index 00000000..2afa41b9
+--- /dev/null
++++ b/tests/cron/test_okengine_script_failure_report_only.py
+@@ -0,0 +1,68 @@
++"""A failed collection script may be reported, never repaired by cron tools."""
++
++from unittest.mock import create_autospec
++
++import cron.notepad as notepad
++import cron.scheduler as scheduler
++from cron.scheduler_prompt import _build_job_prompt
++from tests.cron.test_scheduler_completion_verification import _FakeCronAgent, _run_booked_job
++
++
++def _run_script_fire(monkeypatch, tmp_path, *, script_ok):
++    observed = []
++
++    class RecordingAgent(_FakeCronAgent):
++        def __init__(self, *args, **kwargs):
++            observed.append(kwargs)
++
++    monkeypatch.setattr(
++        scheduler, "_run_job_script_with_claim_heartbeat",
++        lambda *_a, **_k: (script_ok, "collection script failed" if not script_ok else "data ready"),
++    )
++    _run_booked_job(
++        monkeypatch, tmp_path,
++        job={"id": "report-script", "name": "Report script", "prompt": "Report collection result",
++             "script": "disposable-script.sh", "model": "fixture-model",
++             "enabled_toolsets": ["terminal", "file", "code_execution"],
++             "schedule_display": "manual"},
++        agent_type=RecordingAgent,
++    )
++    assert len(observed) == 1
++    return observed[0]
++
++
++def test_failed_script_report_agent_has_no_tools(monkeypatch, tmp_path):
++    kwargs = _run_script_fire(monkeypatch, tmp_path, script_ok=False)
++    assert kwargs["enabled_toolsets"] == [], (
++        "failed-script reporting must have zero tools even when the job requested mutating ones")
++
++
++def test_successful_script_retains_requested_toolsets(monkeypatch, tmp_path):
++    kwargs = _run_script_fire(monkeypatch, tmp_path, script_ok=True)
++    assert kwargs["enabled_toolsets"] == ["terminal", "file", "code_execution"]
++
++
++def test_empty_successful_script_skips_agent_prompt_without_reexecution(monkeypatch):
++    monkeypatch.setattr(
++        notepad, "render_notepad_section",
++        create_autospec(notepad.render_notepad_section, return_value=""),
++    )
++    prompt = _build_job_prompt(
++        {"id": "empty-collection", "prompt": "Report data", "script": "missing-script.sh"},
++        prerun_script=(True, ""),
++    )
++
++    assert prompt is None, "a successful empty collection has nothing for the agent to report"
++
++
++def test_run_context_is_added_only_to_effective_prompt(monkeypatch):
++    monkeypatch.setattr(
++        notepad, "render_notepad_section",
++        create_autospec(notepad.render_notepad_section, return_value=""),
++    )
++    job = {"id": "context-fire", "prompt": "Summarize current results"}
++
++    assembled = _build_job_prompt(job, extra_prompt="Current run is a manual audit")
++
++    assert "## Run Context\nCurrent run is a manual audit" in assembled
++    assert job["prompt"] == "Summarize current results", "run context must not persist on the job"

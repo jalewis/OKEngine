@@ -1,28 +1,67 @@
 {
-  "raw-backfill": {
-    "prompt": "{{DOMAIN}} SOURCE-ONLY compilation lane. Process each selector item in order and create or converge at most one complete canonical source page keyed by the exact selected `raw:` path. Preserve declared ingest provenance, publisher, publication date, URL, and meaningful extracted body. DEDUPE before create; duplicate captures append the raw path to the existing source. This lane MUST NOT create or update entities, concepts, predictions, findings, or briefings. If extraction is incomplete or exceeds context, mark the item deferred or failed instead of committing a partial or empty canonical. WRITE only via okengine-write; never use file_write or edit wiki/log.md manually. End with exactly one fenced `okengine-receipt` JSON object using the exact lane_id, contract_digest, and input_digest printed by the selector. Account for every selected raw path exactly once as accepted, duplicate, skipped, rejected, failed, or deferred. Every accepted item lists each canonical write with wiki-relative path and sha256; duplicate or skipped items require a reason. Never claim a write the server did not confirm.",
-    "output_contract": {
-      "api": 1,
-      "allowed_namespaces": ["sources"],
-      "allowed_types": ["source"],
-      "operations": ["create", "update", "converge"],
-      "required_fields": ["type", "raw", "publisher", "published"],
-      "required_relationships": [],
-      "body": {"required": true, "min_non_whitespace": 80},
-      "unknown_fields": "reject",
-      "unresolved_links": "reject",
-      "placeholder_links": "reject",
-      "completion": "per-selected-item"
-    }
+  "concept-backfill": {
+    "prompt_file": "prompts/concept-backfill.md"
   },
-  "entity-backfill": "{{DOMAIN}} downstream grounded entity synthesis. Consume only accepted, compiled source pages. Create or enrich only pack-declared entity types, and require every changed entity to carry at least one resolving `sources` relationship using an exact source slug actually read from the digest or vault. Every material claim must resolve to that grounding; model memory is not evidence. If accepted sources do not support a subject or claim, do not write it. Never create sources, concepts, predictions, findings, or briefings in this lane. Dedupe before create and send the complete `sources:` list on update. WRITE only via okengine-write.",
-  "concept-backfill": "{{DOMAIN}} concept backfill. The select_concept_candidates.py digest above lists missing concept slugs (wikilinked but no page). FIRST response MUST be a tool call. Per $WIKI_PATH/CLAUDE.md, create concept pages (a cross-cutting pattern / segment / cluster) synthesized from the citing sources. If a slug is really an entity name, it is an ENTITY not a concept — skip and note it. WRITE via mcp_okengine_write_create_entity. LOCAL-ONLY (no web tools).",
-  "source-quality-backfill": "Source scoring. The select_unscored_sources.py digest above lists source pages lacking your quality fields. FIRST response MUST be a tool call. Per the rubric in $WIKI_PATH/CLAUDE.md, score each via mcp_okengine_write_source_quality_update_entity, passing a frontmatter_yaml PATCH containing ONLY reliability and credibility and NO body. This server-bound lane is technically limited to source pages and those two fields. Never resend or alter identity, provenance, publication, lifecycle, or content fields. LOCAL-ONLY (no web tools).",
-  "schema-classify-drain": "Type classification. The select_schema_classify.py digest above lists entities typed `entity`/`organization` that need a canonical type. FIRST response MUST be a tool call. Per the $WIKI_PATH/CLAUDE.md taxonomy, set `type:` to the single best canonical type via mcp_okengine_write_update_entity (frontmatter merge) — or leave the page alone if no canonical type honestly fits. LOCAL-ONLY (no web tools).",
-  "page-quality-enrich": "Deepen thin pages. The select_page_quality_enrich.py digest above lists deficient entity/concept pages with the source pages that cite each. FIRST response MUST be a tool call. Per $WIKI_PATH/CLAUDE.md, AUGMENT each target — append 2-4 `##` sections of real analysis grounded ONLY in the citing sources — via mcp_okengine_write_append_to_section. Never replace existing content. LOCAL-ONLY (no web tools).",
-  "prediction-grade": "Resolve overdue predictions. The select_predictions_for_grading.py digest above lists open predictions whose `resolves_by` has passed. FIRST response MUST be a tool call. Per $WIKI_PATH/CLAUDE.md, for each: ADD a `## Postmortem` via mcp_okengine_write_append_to_section, then flip `status:` (confirmed/refuted/partial/expired-ungraded) via mcp_okengine_write_update_entity. Never edit made_on/horizon/basis. LOCAL-ONLY (no web tools).",
-  "prediction-regrade": "Re-grade open predictions against new evidence. The select_regrade_batch.py digest above lists open predictions + new source pages. FIRST response MUST be a tool call. Per $WIKI_PATH/CLAUDE.md, for each source that bears on a claim, append a structured record to the body `## Evidence log` (append_to_section) and update the `evidence:` list + top-level `confidence:` via update_entity (send the COMPLETE evidence list). No-op is correct when no new source bears. LOCAL-ONLY (no web tools).",
-  "prediction-candidate-watch": "File prediction candidates. The select_prediction_candidates.py digest above lists entities with recent activity and no open prediction. FIRST response MUST be a tool call. Per $WIKI_PATH/CLAUDE.md, FILE a falsifiable, dated prediction (mcp_okengine_write_create_entity in predictions/, including a `## What would refute this` section) ONLY when a specific, observable, dated claim is genuinely warranted; DEFER otherwise — conservative bias, coverage is not a goal. LOCAL-ONLY (no web tools).",
-  "trends-refresh": "{{DOMAIN}} trend synthesis. The select_trend_deltas.py digest above lists entities whose recent source-mention frequency rose sharply over the rolling window. Synthesize 1-3 grounded `trend` pages at wiki/trends/<slug> (frontmatter: type: trend, title, period: <e.g. '2026-05..2026-06'>, direction: <up|down|shift>, updated: <YYYY-MM-DD using TODAY's date>) — each a DATED, DIRECTIONAL observation over the window (NOT a timeless concept, NOT a daily snapshot), with [[wikilinks]] to the driving entities + their recent sources and a one-line 'why it's moving'. Ground each trend in the underlying entities first (retrieve_context / search on the okengine read MCP). Write via the MCP write path; skip a candidate that is noise rather than a real directional shift. LOCAL-ONLY: do not use web tools. End your response with a one-line summary of the trends written.",
-  "daily-brief": "Daily {{DOMAIN}} brief. Your FIRST response MUST be a tool call: file_read on wiki/HOT.md (the derived load-first set: recent sources, recently-updated entities, open predictions). Then write today's brief to wiki/briefings/<YYYY-MM-DD>.md (frontmatter: type: briefing, title, published: <YYYY-MM-DD>, updated: <YYYY-MM-DD> — use TODAY's actual date, not a guessed or future one, for the filename and both date fields; published drives tier recency) summarizing the 3-5 most significant developments, each 2-3 sentences with [[wikilinks]] to the entities + their source. Expert-grade and terse; skip 101 explanation. If the vault is essentially empty, say so in one line instead of padding. LOCAL-ONLY: do not use web tools.\n\nThe select_daily_brief.py digest above lists the window's fresh sources, entity movement, due predictions, and new gaps — TRUST THE DIGEST; do not tour the vault."
+  "daily-brief": {
+    "prompt_file": "prompts/daily-brief.md"
+  },
+  "entity-backfill": {
+    "prompt_file": "prompts/entity-backfill.md"
+  },
+  "page-quality-enrich": {
+    "prompt_file": "prompts/page-quality-enrich.md"
+  },
+  "prediction-candidate-watch": {
+    "prompt_file": "prompts/prediction-candidate-watch.md"
+  },
+  "prediction-grade": {
+    "prompt_file": "prompts/prediction-grade.md"
+  },
+  "prediction-regrade": {
+    "prompt_file": "prompts/prediction-regrade.md"
+  },
+  "raw-backfill": {
+    "output_contract": {
+      "allowed_namespaces": [
+        "sources"
+      ],
+      "allowed_types": [
+        "source"
+      ],
+      "api": 1,
+      "body": {
+        "min_non_whitespace": 80,
+        "required": true
+      },
+      "completion": "per-selected-item",
+      "operations": [
+        "create",
+        "update",
+        "converge"
+      ],
+      "placeholder_links": "reject",
+      "required_fields": [
+        "type",
+        "raw",
+        "publisher",
+        "published"
+      ],
+      "required_relationships": [],
+      "unknown_fields": "reject",
+      "unresolved_links": "reject"
+    },
+    "prompt_file": "prompts/raw-backfill.md"
+  },
+  "schema-classify-drain": {
+    "prompt_file": "prompts/schema-classify-drain.md"
+  },
+  "source-quality-backfill": {
+    "prompt_file": "prompts/source-quality-backfill.md"
+  },
+  "source-staleness-refresh": {
+    "prompt_file": "prompts/source-staleness-refresh.md"
+  },
+  "trends-refresh": {
+    "prompt_file": "prompts/trends-refresh.md"
+  }
 }

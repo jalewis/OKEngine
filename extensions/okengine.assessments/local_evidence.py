@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Deterministic local-only evidence resolution for CHE producers (#328)."""
+"""Deterministic local-only evidence resolution for CHE producers (#328).
+
+The attestation inputs ``local_only``, ``export_policy``, ``record_checksum``,
+and ``bounded_auto_accept`` are optional producer/pack conventions.  The
+engine deliberately does not synthesize trust assertions; corpus_audit.py
+registers these consumed fields so a nonempty source corpus with no producer
+is reported as a degraded capability instead of being silently indistinguishable
+from records that were evaluated and failed attestation.
+"""
 from __future__ import annotations
 
 import hashlib

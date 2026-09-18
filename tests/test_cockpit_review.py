@@ -1,7 +1,11 @@
 """Cockpit read queue + protected review proxy contract (#256)."""
 import importlib.util
+import asyncio
+import io
 import json
 import sys
+import types
+import urllib.error
 import warnings
 from pathlib import Path
 
@@ -233,7 +237,12 @@ def test_actor_page_surfaces_subject_assessments_above_quarantine(tmp_path, monk
     m = _load(tmp_path, monkeypatch)
     page = m.api_page("entities/a/apt39")
     assert page["trust"]["state"] == "quarantined"
-    assert page["assessments"] == [{
+    assert len(page["assessments"]) == 1, "the superseded judgment must not read as active evidence"
+    row = page["assessments"][0]
+    assert {k: row[k] for k in (
+        "path", "title", "claim", "status", "assessment_kind", "assessed_value", "assessed_label",
+        "epistemic_status", "confidence", "confidence_band", "as_of", "last_updated",
+        "needs_review", "reviewed_by", "reviewed_on")} == {
         "path": "assessments/a/apt39-iran", "title": "APT39 — Iran association",
         "claim": "Reporting associates APT39 with Iran.", "status": "active",
         "assessment_kind": "", "assessed_value": None, "assessed_label": "",
@@ -241,7 +250,12 @@ def test_actor_page_surfaces_subject_assessments_above_quarantine(tmp_path, monk
         "confidence": 0.85, "confidence_band": "high", "as_of": "2026-07-16",
         "last_updated": "2026-07-16", "needs_review": True,
         "reviewed_by": "", "reviewed_on": "",
-    }]
+    }
+    # the ANALYTIC SUBSTANCE must travel with the row (okengine#563) — without it the entity page
+    # shows a one-line claim and the reasoning stays a click away, unread
+    for key in ("confidence_rationale", "alternatives", "would_increase_confidence",
+                "would_decrease_confidence", "evidence", "relationship_level", "evidence_state"):
+        assert key in row, key
     js = (REPO / "okengine-cockpit" / "static" / "app.js").read_text()
     assert js.index("assessmentPanel(d.assessments)") < js.index("trustGatedHtml(d.trust")
 
@@ -335,3 +349,269 @@ def test_doc_view_caps_giant_documents(tmp_path, monkeypatch):
     assert 'data-page="dashboards/giant"' in html                   # full page one click away
     small, _ = m._v_doc({"dir": "dashboards", "glob": "small.md"})
     assert "truncated" not in small                                  # small docs untouched
+
+
+def test_review_filters_throughput_and_same_origin_boundaries(review_app, monkeypatch):
+    m, _ = review_app
+    rows = [
+        {"subject": "entities/a", "title": "A", "type": "actor", "state": "open",
+         "reasons": [{"code": "grounding"}], "assigned_to": "alice", "updated": "2026-08-01",
+         "age_days": 3, "source_resolution": "complete", "machine_eligible": True},
+        {"subject": "predictions/p", "title": "P", "type": "prediction", "state": "deferred",
+         "reasons": [{"code": "conflict"}], "assigned_to": None, "updated": "2026-01-01",
+         "age_days": 100, "source_resolution": "partial", "machine_eligible": False},
+        {"subject": "entities/no-age", "title": "N", "type": "actor", "state": "open",
+         "reasons": ["legacy"], "assigned_to": None, "updated": "", "age_days": None,
+         "source_resolution": "none", "machine_eligible": False},
+    ]
+    records = [{"history": [None, {}, {"decision": "approve", "decision_at": "invalid"},
+                            {"decision": "approve", "decision_at": m.TODAY().isoformat()}]}]
+    monkeypatch.setattr(m, "_review_queue_snapshot", lambda: (rows, records))
+
+    def reviews(**kwargs):
+        values = {"offset": 0, "limit": 50, "reason": "", "page_type": "", "state": "",
+                  "assignment": "", "source_resolution": "", "age": "",
+                  "machine_eligible": "", "page_types": ""}
+        values.update(kwargs)
+        return m.api_reviews(**values)
+
+    assert reviews(reason="grounding")["total"] == 1
+    assert reviews(page_types="prediction")["total"] == 1
+    assert reviews(page_type="actor")["total"] == 2
+    assert reviews(state="deferred")["total"] == 1
+    assert reviews(assignment="assigned")["total"] == 1
+    assert reviews(assignment="unassigned")["total"] == 2
+    assert reviews(assignment="alice")["total"] == 1
+    assert reviews(source_resolution="partial")["total"] == 1
+    assert reviews(machine_eligible="true")["total"] == 1
+    assert reviews(age="0-30")["total"] == 1
+    assert reviews(age="31-90")["total"] == 0
+    result = reviews(age="91+")
+    assert result["total"] == 1 and result["metrics"]["throughput_30d"] == 1
+
+    def request(headers):
+        return types.SimpleNamespace(headers=headers, url=types.SimpleNamespace(scheme="https"))
+
+    assert m._same_origin_review(request({})) is False
+    assert m._same_origin_review(request({"x-okengine-review": "1"})) is True
+    assert m._same_origin_review(request({"x-okengine-review": "1", "origin": "https://host",
+                                          "host": "host"})) is True
+    assert m._same_origin_review(request({"x-okengine-review": "1", "origin": "https://evil",
+                                          "host": "host"})) is False
+    assert m._same_origin_operation(request({})) is False
+    assert m._same_origin_operation(request({"x-okengine-operation": "1"})) is True
+    assert m._same_origin_operation(request({"x-okengine-operation": "1", "origin": "https://host/",
+                                             "host": "host"})) is True
+
+
+def test_operation_proxy_success_and_failure_boundaries(review_app, monkeypatch):
+    m, _ = review_app
+    m._OPERATION_API = "http://operations"; m._OPERATION_TOKEN = "token"
+
+    class Response:
+        def __init__(self, value): self.value = value
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def read(self): return json.dumps(self.value).encode()
+
+    monkeypatch.setattr(m.urllib.request, "urlopen", lambda *_args, **_kwargs: Response({"ok": True}))
+    assert m._operation_request("/operations") == {"ok": True}
+    assert m._operation_request("/operations/x/plan", data={"x": 1}, method="POST") == {"ok": True}
+
+    def http_error(payload):
+        return urllib.error.HTTPError("url", 409, "conflict", {}, io.BytesIO(payload))
+
+    monkeypatch.setattr(m.urllib.request, "urlopen", lambda *_a, **_k: (_ for _ in ()).throw(
+        http_error(b'{"detail":"collision"}')))
+    with pytest.raises(m.HTTPException) as error:
+        m._operation_request("/operations")
+    assert error.value.status_code == 409 and "collision" in error.value.detail
+    monkeypatch.setattr(m.urllib.request, "urlopen", lambda *_a, **_k: (_ for _ in ()).throw(
+        http_error(b"bad")))
+    with pytest.raises(m.HTTPException):
+        m._operation_request("/operations")
+    monkeypatch.setattr(m.urllib.request, "urlopen", lambda *_a, **_k: (_ for _ in ()).throw(
+        urllib.error.URLError("offline")))
+    with pytest.raises(m.HTTPException) as error:
+        m._operation_request("/operations")
+    assert error.value.status_code == 503
+
+    class Request:
+        headers = {"x-okengine-operation": "1"}
+        url = types.SimpleNamespace(scheme="https")
+        async def json(self): return {"scope": "x"}
+
+    m._OPERATION_ENABLED = False
+    for call in (lambda: m.api_operations(), lambda: asyncio.run(m.api_operation_plan("x", Request())),
+                 lambda: asyncio.run(m.api_operation_run("x", Request())),
+                 lambda: m.api_operation_request("id")):
+        with pytest.raises(m.HTTPException): call()
+    m._OPERATION_ENABLED = True
+    denied = Request(); denied.headers = {}
+    with pytest.raises(m.HTTPException): asyncio.run(m.api_operation_plan("x", denied))
+    with pytest.raises(m.HTTPException): asyncio.run(m.api_operation_run("x", denied))
+    monkeypatch.setattr(m, "_operation_request", lambda path, **kwargs: {"path": path, **kwargs})
+    assert m.api_operations()["path"] == "/operations"
+    assert asyncio.run(m.api_operation_plan("x", Request()))["method"] == "POST"
+    assert asyncio.run(m.api_operation_run("x", Request()))["method"] == "POST"
+    assert m.api_operation_request("id")["path"].endswith("/id")
+
+
+def test_review_decision_and_assignment_proxy_failure_boundaries(review_app, monkeypatch):
+    m, _ = review_app
+
+    class Request:
+        headers = {"x-okengine-review": "1"}
+        url = types.SimpleNamespace(scheme="https")
+        def __init__(self, value=None, error=None): self.value, self.error = value, error
+        async def json(self):
+            if self.error: raise self.error
+            return self.value or {}
+
+    for function in (m.api_review_decision, m.api_review_assign):
+        m._REVIEW_ENABLED = False
+        with pytest.raises(m.HTTPException): asyncio.run(function(Request()))
+        m._REVIEW_ENABLED = True
+        denied = Request(); denied.headers = {}
+        with pytest.raises(m.HTTPException): asyncio.run(function(denied))
+        with pytest.raises(m.HTTPException): asyncio.run(function(Request(error=ValueError("bad"))))
+
+    m._REVIEW_API = "http://review"; m._REVIEW_TOKEN = "token"; m._REVIEWER = "analyst"
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def read(self): return b'{"ok":true}'
+
+    invalidated = []
+    monkeypatch.setattr(m, "_invalidate_review_snapshot", lambda: invalidated.append(True))
+    monkeypatch.setattr(m.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
+    assert asyncio.run(m.api_review_decision(Request({"path": "x"}))) == {"ok": True}
+    assert asyncio.run(m.api_review_assign(Request({"path": "x"}))) == {"ok": True}
+    assert len(invalidated) == 2
+
+    def http_error(payload):
+        return urllib.error.HTTPError("url", 422, "bad", {}, io.BytesIO(payload))
+
+    for payload in (b'{"error":"rejected"}', b"bad"):
+        monkeypatch.setattr(m.urllib.request, "urlopen", lambda *_a, p=payload, **_k: (
+            _ for _ in ()).throw(http_error(p)))
+        for function in (m.api_review_decision, m.api_review_assign):
+            with pytest.raises(m.HTTPException) as error:
+                asyncio.run(function(Request({"path": "x"})))
+            assert error.value.status_code == 422
+    monkeypatch.setattr(m.urllib.request, "urlopen", lambda *_a, **_k: (_ for _ in ()).throw(
+        urllib.error.URLError("offline")))
+    for function in (m.api_review_decision, m.api_review_assign):
+        with pytest.raises(m.HTTPException) as error:
+            asyncio.run(function(Request({"path": "x"})))
+        assert error.value.status_code == 503
+
+
+def test_review_record_candidate_detail_and_snapshot_boundaries(tmp_path, monkeypatch):
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    (tmp_path / "schema.yaml").write_text("cockpit: {tabs: [browse]}\n")
+    m = _load(tmp_path, monkeypatch)
+    assert m._review_records() == []
+    reviews = wiki / "operational/reviews"
+    reviews.mkdir(parents=True)
+    (reviews / "bad.yaml").write_text("[broken")
+    (reviews / "list.yaml").write_text("- item\n")
+    (reviews / "good.yaml").write_text("subject: entities/a\nrequested_at: 2026-08-01\n")
+    loaded = m._review_records()
+    assert len(loaded) == 1 and loaded[0]["subject"] == "entities/a"
+
+    for path, status in (("../bad", 400), ("missing", 404)):
+        with pytest.raises(m.HTTPException) as error:
+            m._review_candidate(path)
+        assert error.value.status_code == status
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside")
+    (wiki / "blocked.md").symlink_to(outside)
+    with pytest.raises(m.HTTPException) as error:
+        m._review_candidate("blocked")
+    assert error.value.status_code == 403
+
+    page = wiki / "entities/a.md"
+    page.parent.mkdir(exist_ok=True)
+    page.write_text("---\ntype: actor\ntitle: A\nversion: invalid\nneeds_review: true\n---\nbody")
+    detail = m._review_detail(page)
+    assert detail["version"] == 1 and detail["state"] == "open"
+
+    hidden = wiki / "_hidden.md"
+    hidden.write_text("---\ntype: actor\nneeds_review: true\n---\n")
+    plain = wiki / "plain.md"
+    plain.write_text("body")
+    records, _ = m._build_review_snapshot()
+    assert [row["subject"] for row in records] == ["entities/a"]
+
+    original = m._read_head
+    monkeypatch.setattr(m, "_read_head", lambda path, limit=0: (_ for _ in ()).throw(OSError("raced"))
+                        if path == page else original(path, limit))
+    records, _ = m._build_review_snapshot()
+    assert records == []
+
+
+def test_assessment_subject_index_skips_invalid_retired_and_nonentity(tmp_path, monkeypatch):
+    assessments = tmp_path / "wiki/assessments"
+    assessments.mkdir(parents=True)
+    (tmp_path / "schema.yaml").write_text("cockpit: {tabs: [browse]}\n")
+    (assessments / "source.md").write_text("---\ntype: source\n---\n")
+    (assessments / "retired.md").write_text(
+        "---\ntype: assessment\nstatus: retired\nsubject: entities/a\n---\n")
+    (assessments / "nonentity.md").write_text(
+        "---\ntype: assessment\nsubject: concepts/a\n---\n")
+    valid = assessments / "valid.md"
+    valid.write_text(
+        "---\ntype: assessment\nsubject: '[[entities/a.md]]'\nclaim: Claim\nconfidence: high\n---\n")
+    m = _load(tmp_path, monkeypatch)
+    result = m._assessment_subject_index()
+    assert list(result) == ["entities/a"] and result["entities/a"][0]["confidence"] is None
+    assert m._assessment_subject_index() is result
+
+    m._assessment_subject_cache = (float("-inf"), {})
+    original = m._read_head
+    monkeypatch.setattr(m, "_read_head", lambda path, limit=0: (_ for _ in ()).throw(OSError("raced"))
+                        if path == valid else original(path, limit))
+    result = m._assessment_subject_index()
+    assert result == {}
+
+
+def test_assessment_reasoning_reaches_the_entity_page(tmp_path, monkeypatch):
+    """okengine#563: the panel used to carry only a headline, so WHY an assessment holds its
+    confidence, what else could explain the observation, and what would move it were all one click
+    away and never read. They are rendered FROM the assessment, never copied into the entity — the
+    assessment stays the single source of truth and states its own scope."""
+    actor = tmp_path / "wiki" / "entities" / "a" / "sudan.md"
+    actor.parent.mkdir(parents=True)
+    actor.write_text("---\ntype: actor\ntitle: Sudan\n---\nStub.\n", encoding="utf-8")
+    a = tmp_path / "wiki" / "assessments" / "a" / "sudan-ru.md"
+    a.parent.mkdir(parents=True)
+    a.write_text(
+        "---\ntype: assessment\ntitle: Sudan — Russia association\n"
+        "subject: entities/a/sudan\nclaim: Reporting associates Sudan with Russia.\n"
+        "status: active\nconfidence: 0.65\nconfidence_band: moderate\nas_of: 2026-08-04\n"
+        "assessed_label: Russia\nrelationship_level: reported-association\n"
+        "evidence_state: supported\n"
+        "confidence_rationale: Lineage and independence remain unresolved.\n"
+        "alternatives:\n  - Outdated vendor association.\n  - Targeting mistaken for affiliation.\n"
+        "would_increase_confidence:\n  - Independent primary reporting.\n"
+        "would_decrease_confidence:\n  - A retraction or alias correction.\n"
+        "adversarial_evidence:\n"
+        "  - evidence_kind: observed\n    observation: DDoS against French sites.\n"
+        "    source: https://example.invalid/report\n    observation_confidence: medium\n"
+        "    evidence_lineage: vendor:lineage-unresolved\n"
+        "---\nAnalysis.\n", encoding="utf-8")
+    (tmp_path / "schema.yaml").write_text("cockpit: {tabs: [browse]}\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    row = m.api_page("entities/a/sudan")["assessments"][0]
+
+    assert row["assessed_label"] == "Russia"
+    assert row["relationship_level"] == "reported-association"
+    assert row["confidence_rationale"].startswith("Lineage")
+    assert len(row["alternatives"]) == 2
+    assert row["would_increase_confidence"] == ["Independent primary reporting."]
+    assert row["evidence"] and row["evidence"][0]["source"] == "https://example.invalid/report"
+    assert row["evidence"][0]["observation"].startswith("DDoS")
+    assert row["evidence"][0]["lineage"] == "vendor:lineage-unresolved"

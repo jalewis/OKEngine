@@ -92,3 +92,34 @@ def test_out_of_range_minute_fails_loud():  # invariant-audit #351
         cj.expand_brief_jobs([{"schedule": {"expr": "@morning:75"}}], 7)
     # an in-range minute still expands normally
     assert cj.expand_morning_one("@morning:45", 7) == "45 7 * * *"
+    assert cj.morning_dst_errors(
+        [{"schedule": {"expr": "@morning:75"}}], 7, "UTC", start_year=2026, years=1
+    ) == []
+
+
+def test_morning_dst_gate_rejects_nonexistent_local_hour():
+    jobs = [
+        {"name": "daily-brief", "schedule": {"expr": "@morning:30"}},
+        {"name": "ordinary", "schedule": {"expr": "0 2 * * *"}},
+    ]
+    errors = cj.morning_dst_errors(
+        jobs, 2, "America/New_York", start_year=2026, years=2
+    )
+    assert len(errors) == 1
+    assert "daily-brief" in errors[0]
+    assert "nonexistent local time 02:30" in errors[0]
+
+
+def test_morning_dst_gate_accepts_safe_hour_and_utc():
+    jobs = [{"name": "daily-brief", "schedule": {"expr": "@morning:30"}}]
+    assert cj.morning_dst_errors(
+        jobs, 7, "America/New_York", start_year=2026, years=2
+    ) == []
+    assert cj.morning_dst_errors(jobs, 2, "UTC", start_year=2026, years=2) == []
+
+
+def test_morning_dst_gate_rejects_unknown_timezone():
+    jobs = [{"name": "daily-brief", "schedule": {"expr": "@morning:30"}}]
+    assert "unknown deployment timezone" in cj.morning_dst_errors(
+        jobs, 7, "Mars/Olympus_Mons", start_year=2026, years=1
+    )[0]

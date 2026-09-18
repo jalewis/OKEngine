@@ -52,8 +52,8 @@ projection.
 | **Obsidian** | the vault's editor; Dataview + graph view | — | Current human browse/review layer |
 | **okengine-reader** (this repo) | standalone read-only web reader over the vault | — | Current custom reader; domain-neutral |
 
-**Both qmd and IWE are wired in** — agent-accessible via the
-`kb_search.py` (qmd hybrid search) and `kb_graph.py` (IWE wikilink graph) terminal
+**Both search and graph retrieval are wired in** — agent-accessible via
+`kb_search.py` (qmd hybrid search) and the precomputed backlink artifact
 wrappers; binaries baked into the image, models/index on the `/opt/data` volume.
 See [`kb-tooling.md`](kb-tooling.md) for the design.
 

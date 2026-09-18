@@ -1,5 +1,6 @@
 """Regression: derived hot/warm/cold tiering (G4) — tier_lib.tier_of."""
 import importlib.util
+import sys
 from datetime import date
 from pathlib import Path
 
@@ -63,6 +64,7 @@ def test_predictions_open_floor_hot_regardless_of_date():
 
 
 def test_untiered_namespace_returns_none():
+    assert t("sources") is None
     assert t("dashboards/wardley/map") is None
     assert t("operational/metrics") is None          # operational is not a tiered namespace
     assert t("research/notes/x") is None             # a sub-domain namespace untiered in this pack
@@ -96,3 +98,83 @@ def test_load_cfg_uses_the_shared_merged_schema_composer(tmp_path):
     composed = schema_lib.merged_schema(tmp_path).get("tier")
     assert cfg == composed                                        # identical to the shared composer
     assert "custom" in cfg["namespaces"]["predictions"]["open_values"]   # pack value composed on core
+
+
+def test_load_cfg_resolves_walkup_namespace_schema(tmp_path, monkeypatch):
+    calls = []
+    composer = type("SchemaLib", (), {
+        "merged_schema": staticmethod(
+            lambda vault, namespace="": calls.append((Path(vault), namespace))
+            or {"tier": {"hot_days": 7 if namespace == "sec" else 30}}
+        )
+    })
+    monkeypatch.setitem(sys.modules, "schema_lib", composer)
+    assert TL.load_cfg(tmp_path, namespace="sec")["hot_days"] == 7
+    assert calls == [(tmp_path, "sec")]
+
+
+def test_load_cfg_fallbacks_cover_raw_yaml_and_default(tmp_path, monkeypatch):
+    blocker = type("BrokenSchemaLib", (), {
+        "merged_schema": staticmethod(lambda _vault: (_ for _ in ()).throw(RuntimeError("boom")))
+    })
+    monkeypatch.setitem(sys.modules, "schema_lib", blocker)
+    (tmp_path / "schema.yaml").write_text("tier:\n  hot_days: 7\n", encoding="utf-8")
+    assert TL.load_cfg(tmp_path) == {"hot_days": 7}
+
+    (tmp_path / "schema.yaml").write_text("tier: [not, a, mapping]\n", encoding="utf-8")
+    assert TL.load_cfg(tmp_path) is TL._DEFAULT_TIER
+    (tmp_path / "schema.yaml").write_text("tier: [broken\n", encoding="utf-8")
+    assert TL.load_cfg(tmp_path) is TL._DEFAULT_TIER
+    (tmp_path / "schema.yaml").unlink()
+    assert TL.load_cfg(tmp_path) is TL._DEFAULT_TIER
+    monkeypatch.setattr(TL, "yaml", None)
+    assert TL.load_cfg(tmp_path) is TL._DEFAULT_TIER
+
+    monkeypatch.setattr(TL, "yaml", yaml := __import__("yaml"))
+    monkeypatch.setitem(sys.modules, "schema_lib", type("EmptySchemaLib", (), {
+        "merged_schema": staticmethod(lambda _vault: {})
+    }))
+    assert TL.load_cfg(tmp_path) is TL._DEFAULT_TIER
+
+
+def test_date_and_frontmatter_defensive_paths(tmp_path, monkeypatch):
+    assert TL._parse_date(None) is None
+    assert TL._parse_date("not-a-date") is None
+    assert TL._parse_date("2026-02-31") is None
+    assert TL._parse_date("2026-02-28") == date(2026, 2, 28)
+    assert TL._date_from_path(["sources", "x"]) is None
+    assert TL._date_from_path(["sources"]) is None
+    assert TL._date_from_path(["sources", "2026", "02", "31", "x"]) == date(2026, 2, 1)
+    assert TL._date_from_path(["sources", "2026", "13", "x"]) is None
+
+    missing = tmp_path / "missing.md"
+    assert TL.fm_of(missing) == {}
+    plain = tmp_path / "plain.md"
+    plain.write_text("no frontmatter", encoding="utf-8")
+    assert TL.fm_of(plain) == {}
+
+    cfg = {"hot_days": 30, "warm_days": 365,
+           "namespaces": {"entities": {"date_field": ""}}}
+    assert TL.tier_of("entities/x", {"created": "2026-06-14"}, cfg, TODAY) == "hot"
+    malformed = tmp_path / "malformed.md"
+    malformed.write_text("---\na: [broken\n---\n", encoding="utf-8")
+    assert TL.fm_of(malformed) == {}
+    scalar = tmp_path / "scalar.md"
+    scalar.write_text("---\n- item\n---\n", encoding="utf-8")
+    assert TL.fm_of(scalar) == {}
+    monkeypatch.setattr(TL, "yaml", None)
+    assert TL.fm_of(plain) == {}
+
+
+def test_tier_file_outside_vault_and_status_from_frontmatter(tmp_path):
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    assert TL.tier_of_file(tmp_path / "outside.md", wiki, CFG, TODAY) is None
+    untiered = wiki / "other" / "x.md"
+    untiered.parent.mkdir()
+    untiered.write_text("---\ntype: note\n---\n", encoding="utf-8")
+    assert TL.tier_of_file(untiered, wiki, CFG, TODAY) is None
+    prediction = wiki / "predictions" / "p.md"
+    prediction.parent.mkdir()
+    prediction.write_text("---\nstatus: open\nresolves_by: 2020-01-01\n---\n", encoding="utf-8")
+    assert TL.tier_of_file(prediction, wiki, CFG, TODAY) == "hot"

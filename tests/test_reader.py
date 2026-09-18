@@ -111,6 +111,38 @@ def test_bare_basename_prefers_canonical_then_refuses_true_ambiguity(tmp_path, m
     assert ei.value.status_code == 409
 
 
+def test_page_resolution_prefers_live_deepest_duplicate_over_exact_tombstone(tmp_path, monkeypatch):
+    wiki = tmp_path / "wiki"
+    flat = wiki / "entities" / "acme.md"
+    live = wiki / "entities" / "a" / "c" / "acme.md"
+    live.parent.mkdir(parents=True)
+    flat.parent.mkdir(parents=True, exist_ok=True)
+    flat.write_text("---\ntype: entity\nstatus: tombstoned\n---\n# Retired\n")
+    live.write_text("---\ntype: entity\nstatus: verified\n---\n# Current\n")
+    m = _load(tmp_path, monkeypatch)
+
+    assert m._resolve_page("entities/acme") == live.resolve()
+    assert m._resolve_page("acme") == live.resolve()
+
+
+def test_page_resolution_treats_an_unreadable_candidate_as_live(tmp_path, monkeypatch):
+    wiki = tmp_path / "wiki"
+    page = wiki / "entities" / "a" / "acme.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("---\ntype: entity\n---\n# Acme\n")
+    m = _load(tmp_path, monkeypatch)
+    original_read_text = Path.read_text
+
+    def read_text(candidate, *args, **kwargs):
+        if candidate == page:
+            raise OSError("transient read failure")
+        return original_read_text(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+
+    assert m._resolve_page("acme") == page.resolve()
+
+
 def test_pandoc_passes_a_nonempty_title(tmp_path, monkeypatch):
     # Regression: pandoc standalone HTML/docx defaulted the title to the temp
     # filename stem ("in") whenever no title metadata was supplied. Every export
@@ -315,6 +347,8 @@ def test_walkup_subdomain_multi_source_entity_resolves(tmp_path, monkeypatch):  
     409-ambiguous. _ns_dirs makes it layout-agnostic."""
     sub = tmp_path / "wiki" / "cti-sub"
     (tmp_path / "schema.yaml").write_text("exclude: [observations]\n")
+    sub.mkdir(parents=True)
+    (sub / "schema.yaml").write_text("types: {}\n")
     (sub / "entities" / "a").mkdir(parents=True)
     (sub / "observations" / "src1" / "a").mkdir(parents=True)
     (sub / "entities" / "a" / "apt29.md").write_text("---\ntype: actor\ntitle: APT29\n---\nE")
@@ -353,12 +387,58 @@ def test_shape_conflicts_survives_scalar_values(tmp_path, monkeypatch):
     assert out2[0]["values"][0]["sources"] == [] and out2[0]["values"][1]["sources"] == []
 
 
+def test_conflict_reliability_distinguishes_unrated_from_out_of_vocabulary(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "wiki").mkdir()
+    m = _load(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        m,
+        "_source_reliability",
+        lambda: {
+            "numeric-top": "1", "admiralty-top": "A", "unrated": "",
+            "weak": "D", "combined": "B2",
+        },
+    )
+    fm = {
+        "conflicts": [
+            {
+                "field": "claim",
+                "headline": "x",
+                "values": [
+                    {"value": "x", "sources": ["numeric-top"]},
+                    {"value": "y", "sources": ["admiralty-top"]},
+                    {"value": "z", "sources": ["unrated"]},
+                    {"value": "mixed", "sources": ["weak", "numeric-top"]},
+                    {"value": "combined", "sources": ["combined"]},
+                ],
+            }
+        ]
+    }
+    values = m._shape_conflicts(fm)[0]["values"]
+    assert values[0]["reliability_oov"] is True
+    assert values[0]["rank_known"] is False
+    assert values[0]["sources"][0]["reliability_recognized"] is False
+    assert values[1]["rank"] == 5 and values[1]["rank_known"] is True
+    assert values[2]["reliability_oov"] is False
+    assert values[2]["sources"][0]["reliability_recognized"] is None
+    assert values[3]["rank_known"] is True and values[3]["reliability_oov"] is True
+    assert values[4]["rank"] == 4 and values[4]["reliability_oov"] is False
+
+    app_js = (m.STATIC / "app.js").read_text(encoding="utf-8")
+    assert 'el.dataset.rankKnown === "true"' in app_js
+    assert 'el.dataset.reliabilityOov !== "true"' in app_js
+    assert "unrecognized reliability grade" in app_js
+
+
 def test_browse_tree_excludes_nested_namespace_in_walkup(tmp_path, monkeypatch):
     """api_tree's page count must not include pages in an EXCLUDED namespace nested under a walk-up
     sub-domain — the root-anchored `d.name in excluded` only dropped a TOP-LEVEL excluded dir, so a
     walk-up <subdomain>/observations/ leaked into the browse count (invariant-audit M-1310)."""
     (tmp_path / "schema.yaml").write_text("exclude: [observations]\n", encoding="utf-8")
     sd = tmp_path / "wiki" / "acme-sub"
+    sd.mkdir(parents=True)
+    (sd / "schema.yaml").write_text("types: {}\n")
     (sd / "observations" / "s1").mkdir(parents=True)
     (sd / "observations" / "s1" / "obs1.md").write_text("---\ntype: observation\n---\nO\n", encoding="utf-8")
     (sd / "entities" / "a").mkdir(parents=True)
@@ -390,22 +470,27 @@ def test_scan_dir_and_tree_hide_archived_subdir(tmp_path, monkeypatch):
 
 
 def test_search_exclusion_is_any_depth(tmp_path, monkeypatch):
-    """The search ripgrep ignore for an excluded namespace must match at ANY depth (`!**/{d}/**`),
-    not root-anchored (`!{d}/**`) — else a walk-up <subdomain>/observations/ leaks into search
-    results (invariant-audit M-1310). Capture the rg argv without needing ripgrep installed."""
-    import subprocess as _sp
-    (tmp_path / "schema.yaml").write_text("exclude: [observations]\n", encoding="utf-8")
-    (tmp_path / "wiki").mkdir()
+    """Search excludes real namespaces at any depth without dropping same-named shard buckets."""
+    (tmp_path / "schema.yaml").write_text(
+        "exclude: [observations]\n"
+        "partitioning:\n  namespaces:\n    entities: {strategy: first-letter}\n",
+        encoding="utf-8")
+    nested_excluded = tmp_path / "wiki/acme-sub/observations/x.md"
+    partition_bucket = tmp_path / "wiki/entities/observations/actor.md"
+    nested_excluded.parent.mkdir(parents=True)
+    (tmp_path / "wiki/acme-sub/schema.yaml").write_text("types: {}\n")
+    partition_bucket.parent.mkdir(parents=True)
     m = _load(tmp_path, monkeypatch)
     monkeypatch.setattr(m, "_guard", lambda *a, **k: (lambda: None))   # bypass rate-limit guard
     cap = {}
 
     class _P:
-        stdout = ""
+        stdout = (f"{nested_excluded}:1:hello excluded\n"
+                  f"{partition_bucket}:1:hello retained\n")
     monkeypatch.setattr(m.subprocess, "run", lambda cmd, **k: (cap.__setitem__("cmd", cmd), _P())[1])
-    m.api_search(None, q="hello")
-    assert "!**/observations/**" in cap["cmd"], cap["cmd"]
-    assert "!observations/**" not in cap["cmd"], "root-anchored exclusion still present"
+    result = m.api_search(None, q="hello")
+    assert [row["path"] for row in result["results"]] == ["entities/observations/actor"]
+    assert "!**/observations/**" not in cap["cmd"], "name-only glob drops valid shard buckets"
     # reserved-dir prune must EXEMPT the bare-`_` reshard bucket: `!_?*` (underscore + ≥1 char), never
     # `!_*` which also drops entities/x/_/x-force.md — search must agree with browse (batch-2 gate).
     assert "!_?*" in cap["cmd"] and "!_*" not in cap["cmd"], cap["cmd"]

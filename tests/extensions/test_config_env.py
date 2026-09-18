@@ -28,7 +28,7 @@ def test_in_gateway_config_is_synthesized_as_namespaced_job_env(tmp_path):
             "focus": {"type": "string", "default": ""},
         },
         "operation": {
-            "schedule": {"kind": "cron", "expr": "0 * * * *"},
+            "schedule": {"kind": "cron", "expr": "@jitter:hourly"},
             "entrypoint": "run.py",
         },
     }
@@ -56,7 +56,7 @@ def test_normalized_config_key_collision_fails_loudly(tmp_path):
         "trust": "in-gateway",
         "config": {"batch-size": 1, "batch_size": 2},
         "operation": {
-            "schedule": {"kind": "cron", "expr": "0 * * * *"},
+            "schedule": {"kind": "cron", "expr": "@jitter:hourly"},
             "entrypoint": "run.py",
         },
     }

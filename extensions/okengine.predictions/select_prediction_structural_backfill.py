@@ -26,15 +26,27 @@ Env: WIKI_PATH (default /opt/vault) · PSB_BATCH_SIZE (5) · PSB_MIN_HITS (1)
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "cron"))
 import pred_lib as P  # noqa: E402
+from selection_manifest import write_selection_manifest  # noqa: E402
 
 BATCH_SIZE = int(os.environ.get("PSB_BATCH_SIZE", "5"))
 MIN_HITS = int(os.environ.get("PSB_MIN_HITS", "1"))
+CONTROLLED_TARGET = os.environ.get("PSB_TARGET", "").strip().lstrip("/")
+SELECTION_MANIFEST = Path(os.environ.get(
+    "OKENGINE_SELECTION_MANIFEST",
+    str(Path(os.environ.get("HERMES_HOME", str(P.vault() / ".hermes-data")))
+        / "cron-plus" / "selections"
+        / "okengine.predictions:prediction-structural-backfill.json"),
+))
 
 # resolved / retired statuses whose predictions are NOT in scope (see module docstring).
 RESOLVED = {"confirmed", "refuted", "partial", "expired-ungraded", "tombstoned"}
@@ -47,6 +59,13 @@ def _has_refutation(path) -> bool:
         return bool(_REFUTE_RE.search(path.read_text(encoding="utf-8", errors="replace")))
     except OSError:
         return False
+
+
+def _selection_key(path: Path, vault: Path) -> str:
+    """Bind an update-in-place selection to its exact pre-write content."""
+    rel = path.relative_to(vault / "wiki").as_posix()
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return f"wiki/{rel}|sha256:{digest}"
 
 
 def main() -> int:
@@ -69,7 +88,15 @@ def main() -> int:
     # soonest-resolving first (most urgent to make gradable), then oldest-made.
     needs.sort(key=lambda pf: (P.fm_date(pf[1], "resolves_by") or "9999-99-99",
                                P.fm_date(pf[1], "made_on", "created") or "9999-99-99"))
+    if CONTROLLED_TARGET:
+        target = CONTROLLED_TARGET.removeprefix("wiki/").removesuffix(".md")
+        needs = [
+            item for item in needs
+            if item[0].relative_to(v / "wiki").with_suffix("").as_posix() == target
+        ]
     batch = needs[:BATCH_SIZE]
+    selected = [_selection_key(p, v) for p, _fm in batch]
+    manifest = write_selection_manifest(selected, SELECTION_MANIFEST)
 
     print("=== prediction-structural-backfill wake-gate ===")
     print(f"  vault: {v}")
@@ -84,6 +111,24 @@ def main() -> int:
         print(f"   status={fm.get('status')}  confidence={fm.get('confidence')}  "
               f"resolves_by={fm.get('resolves_by')}  subject={fm.get('subject')}")
     print()
+    if selected:
+        receipt = {
+            "api": 1,
+            "lane_id": manifest["lane_id"],
+            "contract_digest": manifest["contract_digest"],
+            "input_digest": manifest["input_digest"],
+            "items": [{
+                "key": key,
+                "disposition": "<accepted|skipped|rejected|failed|deferred>",
+                "writes": [{"path": key.split("|", 1)[0], "sha256": None}],
+                "reason": "<required unless accepted>",
+            } for key in selected],
+        }
+        print("FINAL RESPONSE CONTRACT (MANDATORY): return ONLY this fenced receipt.")
+        print("Remove placeholder writes from non-accepted items; the runner supplies hashes.")
+        print("```okengine-receipt")
+        print(json.dumps(receipt, indent=2))
+        print("```")
     print(json.dumps({"wakeAgent": len(needs) >= MIN_HITS}))
     return 0
 

@@ -16,8 +16,10 @@ yaml = pytest.importorskip("yaml")
 REPO = Path(__file__).resolve().parent.parent.parent
 DISC_PATH = REPO / "scripts" / "extension_discovery.py"
 
-pytestmark = pytest.mark.skipif(not DISC_PATH.is_file(),
-                                reason="extension modules not present")
+pytestmark = [
+    pytest.mark.invariant,
+    pytest.mark.skipif(not DISC_PATH.is_file(), reason="extension modules not present"),
+]
 
 
 def _load(name):
@@ -47,7 +49,7 @@ def test_contradictions_extension_ships_valid():
     job, errs, _ = comp.synthesize_job(rec)
     assert errs == []
     assert job["name"] == "okengine.contradictions"
-    assert job["schedule"]["expr"] == "0 4 * * *"
+    assert job["schedule"]["expr"] == "@jitter:daily@4"
     assert job["script"] == \
         "/opt/data/scripts/okengine.contradictions/select_contradictions.py"
     assert job["no_agent"] is True
@@ -65,6 +67,29 @@ def test_every_first_party_manifest_is_warning_free():
         if manifest_errors or warnings:
             findings[rec["id"]] = {"errors": manifest_errors, "warnings": warnings}
     assert findings == {}
+
+
+def test_every_first_party_schema_fragment_composes(tmp_path):
+    """A shipped extension must not make deploy-time schema regeneration impossible."""
+    disc = _load("extension_discovery")
+    schema_lib = _load("cron/schema_lib")
+    (tmp_path / "schema.yaml").write_text(yaml.safe_dump({
+        "partitioning": {"namespaces": {}}, "types": {},
+    }), encoding="utf-8")
+    exts, discovery_errors = disc.discover(None, engine_root=REPO)
+    assert discovery_errors == []
+    failures = {}
+    for rec in exts:
+        fragments = []
+        for rel in rec["manifest"].get("schema") or []:
+            fragment = yaml.safe_load((Path(rec["dir"]) / rel).read_text(encoding="utf-8"))
+            fragments.append((f"ext:{rec['id']}", fragment))
+        if not fragments:
+            continue
+        _, errors = schema_lib.compose_schema(tmp_path, fragments)
+        if errors:
+            failures[rec["id"]] = errors
+    assert failures == {}
 
 
 def test_contradictions_fully_migrated_out_of_engine_fleet():

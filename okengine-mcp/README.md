@@ -15,11 +15,12 @@ the knowledge attributable when a consumer ingests it.
 |---|---|
 | `search(query, mode, limit)` | qmd search — defaults to `search` (instant BM25); `hybrid` (BM25+vector+rerank) on request. Hybrid is CPU-slow without a GPU, hence the lexical default. Requires a registered qmd collection or it returns nothing — setup, performance & GPU tuning in [`docs/kb-tooling.md`](../docs/kb-tooling.md#search-index--setup-performance--tuning-deployment-reality) |
 | `get_page(path)` | fetch one wiki page (frontmatter + body); path-sandboxed to the vault |
-| `find_references(target)` | IWE knowledge-graph: matching pages + resolved refs/backlinks |
+| `find_references(target)` | matching pages + resolved refs/backlinks from the precomputed graph artifact |
 | `list_pages(namespace, type, status, limit)` | list pages in a vault namespace, optionally filtered by frontmatter `type`/`status`, newest first (domain-agnostic) |
 
-Wraps the engine's `kb_search.py` (qmd) and `kb_graph.py` (IWE) plus direct,
-sandboxed vault reads.
+Wraps the engine's `kb_search.py` (qmd), the bounded backlink artifact, and direct
+sandboxed vault reads. Missing/stale graph evidence and unresolved targets return explicit
+degraded results; a request never initiates a whole-corpus graph rebuild.
 
 ## Run
 
@@ -32,16 +33,20 @@ OKENGINE_MCP_TRANSPORT=streamable-http WIKI_PATH=/opt/vault python okengine-mcp/
 ```
 
 Env: `WIKI_PATH`, `OKENGINE_MCP_SCRIPTS` (default `/opt/data/scripts`),
-`OKENGINE_MCP_PY`, `OKENGINE_MCP_TRANSPORT`.
+`OKENGINE_MCP_PY`, `OKENGINE_MCP_TRANSPORT`. qmd capacity is bounded by
+`OKENGINE_MCP_QMD_CONCURRENCY` (default 2), with
+`OKENGINE_MCP_SEARCH_QUEUE_SECONDS` (default 10) and
+`OKENGINE_MCP_SEARCH_TIMEOUT_SECONDS` (default 120); see
+[`docs/kb-tooling.md`](../docs/kb-tooling.md).
 
 ## Deployment
 
 - **stdio:** server + read tools run stdio in the existing gateway container (it
-  has the venv, mcp SDK, qmd/IWE, scripts, and the vault mount).
+  has the venv, MCP SDK, scripts, and the vault mount).
 - **networked:** a slim dedicated image
   (`Dockerfile`, option A): `python:3.13-slim-trixie` + nodejs/qmd (`@tobilu/qmd`,
-  better-sqlite3 compiled via a fixed node-gyp) + IWE binary + the engine `kb_*`
-  wrappers + `server.py`. **Not** the hermes image — so no duplicate gateway (no
+  better-sqlite3 compiled via a fixed node-gyp) + the engine search wrapper +
+  `server.py`. **Not** the hermes image — so no duplicate gateway (no
   gateway/cron/telegram process runs inside the container).
   Compose service `okengine-mcp` on `:8730` (streamable-http), vault mounted `:ro`,
   only `/opt/data/qmd` writable (qmd's SQLite cache), run as `HERMES_UID`,

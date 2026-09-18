@@ -484,6 +484,11 @@ def _expand_bundle(meta: dict, bundle_spec: dict, dest: Path, catalog: dict | No
 # Operator-owned trees an in-place update must NEVER touch (runtime, secrets,
 # content) — also skipped when surfacing/clearing `.upstream` files.
 _UPDATE_PRESERVE = {".env", ".hermes-data", "raw", "wiki", ".git"}
+_UPDATE_PRESERVE_SUBTREES = {
+    (".okengine", "snapshots"),
+    (".okengine", "rolled-back"),
+}
+_RECOMPOSE_RETRY_UPSTREAM = Path(".okengine/recompose-required.upstream")
 
 
 def _update_in_place(upstream: Path, dest: Path) -> dict:
@@ -493,8 +498,14 @@ def _update_in_place(upstream: Path, dest: Path) -> dict:
     wiki, .git). Returns {added, changed, unchanged}."""
     # Clear stale `.upstream` from a prior update (outside the preserved trees).
     for old in dest.rglob("*.upstream"):
-        if old.relative_to(dest).parts[0] not in _UPDATE_PRESERVE:
-            old.unlink()
+        relative = old.relative_to(dest)
+        if relative.parts[0] in _UPDATE_PRESERVE:
+            continue
+        if tuple(relative.parts[:2]) in _UPDATE_PRESERVE_SUBTREES:
+            continue
+        if relative == _RECOMPOSE_RETRY_UPSTREAM:
+            continue
+        old.unlink()
     added: list[str] = []
     changed: list[str] = []
     unchanged = 0
@@ -624,9 +635,10 @@ def main(argv: list[str]) -> int:
                                         changelog_text=incoming_changelog,
                                         no_validate=args.no_validate)
         _engine_check(dest)
+        rc_validate = 0
         if not args.no_validate:
-            _validate(dest)
-        return 0 if rc_mig == 0 else 1
+            rc_validate = _validate(dest)
+        return 0 if rc_mig == 0 and rc_validate == 0 else 1
 
     print(f"  ↓ {spec['name']}  ←  {where}{' @ ' + spec['ref'] if spec['ref'] else ''}")
     fetch(spec, dest, args.force)

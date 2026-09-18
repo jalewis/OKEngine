@@ -2,6 +2,8 @@
 and reports (never auto-merges) collisions.
 """
 import importlib.util
+import builtins
+import json
 import sys
 from pathlib import Path
 
@@ -35,6 +37,7 @@ def test_resolves_sharded_pages_aliases_tombstones(tmp_path):
     _page(tmp_path, "entities/x/old.md", "type: vendor\nid: 'entities:old'\nstatus: tombstoned")
     _page(tmp_path, "entities/n/noid.md", "type: vendor")             # no id -> skipped
     _page(tmp_path, "entities/_index.md", "type: dashboard\nid: 'entities:idx'")  # reserved -> skipped
+    _page(tmp_path, "entities/README.md", "type: entity\nid: 'entities:readme'")
 
     idx = m.build(tmp_path, force=True)
     assert idx.resolve("entities:acme") == "entities/vendor/a/acme.md"   # sharded
@@ -43,6 +46,7 @@ def test_resolves_sharded_pages_aliases_tombstones(tmp_path):
     assert idx.is_tombstoned("entities:old")
     assert idx.resolve("entities:noid-anything") is None
     assert "entities:idx" not in idx.by_id                             # reserved skipped
+    assert "entities:readme" not in idx.by_id
 
 
 def test_collisions_reported_not_merged(tmp_path):
@@ -110,13 +114,35 @@ def test_write_index_persists(tmp_path):
     import json
     data = json.loads(out.read_text())
     assert data["by_id"]["entities:acme"] == "entities/a/acme.md"
-    assert data["norm_version"] == 2                              # v2 adds identity maps (okengine#324)
+    assert data["norm_version"] == 3                              # v3 adds strict slug identity (#592)
     # name/alias identity maps are serialized + normalized (okengine#324)
     assert data["name_to_rels"]["acme"] == ["entities/a/acme.md"]
     assert data["alias_to_rels"]["acme-corp"] == ["entities/a/acme.md"]
-    # and a v2 payload round-trips through from_dict
+    assert data["slug_identity_to_rels"]["entities:acme"] == ["entities/a/acme.md"]
+    # and a v3 payload round-trips through from_dict
     idx2 = m.from_dict(data)
     assert idx2.name_to_rels == idx.name_to_rels and idx2.alias_to_rels == idx.alias_to_rels
+    assert idx2.slug_identity_hits("entities", "A_C-ME") == ["entities/a/acme.md"]
+
+
+def test_strict_slug_identity_is_namespace_and_subdomain_scoped(tmp_path):
+    m = _load()
+    (tmp_path / "wiki" / "acme").mkdir(parents=True)
+    (tmp_path / "wiki" / "acme" / "schema.yaml").write_text("types: {entity: {}}\n")
+    _page(tmp_path, "entities/a/agent-tesla.md", "type: entity\nid: entities:agent-tesla")
+    _page(tmp_path, "concepts/a/agenttesla.md", "type: concept\nid: concepts:agenttesla")
+    _page(tmp_path, "acme/entities/a/agent_tesla.md", "type: entity\nid: entities:agent-tesla")
+
+    idx = m._scan(tmp_path)
+    assert idx.slug_identity_hits("entities", "agenttesla") == [
+        "entities/a/agent-tesla.md"
+    ]
+    assert idx.slug_identity_hits("concepts", "agent-tesla") == [
+        "concepts/a/agenttesla.md"
+    ]
+    assert idx.slug_identity_hits("acme/entities", "AGENT TESLA") == [
+        "acme/entities/a/agent_tesla.md"
+    ]
 
 
 def test_scan_indexes_subdomain_entities(tmp_path):  # invariant-audit #351 (A1)
@@ -134,3 +160,80 @@ def test_scan_indexes_subdomain_entities(tmp_path):  # invariant-audit #351 (A1)
     assert "acme/entities/s/shinyhunters.md" in idx.name_to_rels.get(nk("ShinyHunters"), []), idx.name_to_rels
     assert "acme/entities/s/shinyhunters.md" in idx.alias_to_rels.get(nk("UNC6240"), []), idx.alias_to_rels
     assert "entities/r/rootco.md" in idx.name_to_rels.get(nk("RootCo"), [])             # root path preserved
+
+
+def test_standalone_import_fallback_and_identity_empty_keys(monkeypatch):
+    original_import = builtins.__import__
+    attempts = {"id_lib": 0}
+
+    def importing(name, *args, **kwargs):
+        if name == "id_lib" and attempts["id_lib"] == 0:
+            attempts["id_lib"] += 1
+            raise ImportError("standalone")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", importing)
+    m = _load()
+    assert attempts["id_lib"] == 1
+    idx = m.IdIndex()
+    idx._add_identity("", {"aliases": [""]})
+    idx._add_identity("entities/a/no-extension", {"name": "No Extension"})
+    assert "no-extension" in idx.name_to_rels
+    assert idx.alias_to_rels
+
+
+def test_scan_io_races_refresh_write_failure_and_main(tmp_path, monkeypatch, capsys):
+    m = _load()
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    (wiki / "schema.yaml").write_text("types: {}\n")
+    schema = wiki / "domain/schema.yaml"
+    schema.parent.mkdir()
+    schema.write_text("types: {}\n")
+    unreadable = wiki / "entities/a/unreadable.md"
+    unreadable.parent.mkdir(parents=True)
+    unreadable.write_text("---\nid: unreadable\n---\n")
+    outside = wiki / "entities/a/outside.md"
+    outside.write_text("---\nid: outside\n---\n")
+    original_read = Path.read_text
+    original_resolve = Path.resolve
+    monkeypatch.setattr(
+        Path, "read_text",
+        lambda self, *a, **k: (_ for _ in ()).throw(OSError("race"))
+        if self == unreadable else original_read(self, *a, **k),
+    )
+    monkeypatch.setattr(
+        Path, "resolve",
+        lambda self, *a, **k: (_ for _ in ()).throw(OSError("outside"))
+        if self in {schema.parent, outside} else original_resolve(self, *a, **k),
+    )
+    idx = m._scan(tmp_path)
+    assert not idx.by_id
+
+    target = m.IdIndex()
+    target.by_id["racing"] = "entities/r/racing.md"
+    target._add_slug_identity("entities", "entities/r/racing.md", "racing")
+    target._add_slug_identity("entities", "entities/r/racing.md", "racing")
+    monkeypatch.setattr(m, "_scan", lambda _vault: m.IdIndex())
+    monkeypatch.setattr(
+        m, "write_index", lambda *_a, **_k: (_ for _ in ()).throw(OSError("readonly")),
+    )
+    key = str(tmp_path)
+    m._REFRESHING.add(key)
+    m._refresh_into(target, tmp_path, key)
+    assert target.by_id["racing"] == "entities/r/racing.md"
+    assert target.slug_identity_hits("entities", "r-a-c-i-n-g") == [
+        "entities/r/racing.md"
+    ]
+    assert target.has_slug_identity_index
+    assert key not in m._REFRESHING
+
+    collision = m.IdIndex()
+    collision.by_id = {"same": "entities/a/a.md"}
+    collision._collisions = {"same": ["entities/a/a.md", "entities/b/b.md"]}
+    monkeypatch.setattr(m, "build", lambda **_kwargs: collision)
+    monkeypatch.setattr(m, "write_index", lambda *_a, **_k: None)
+    assert m.main([]) == 0
+    assert "COLLISION same" in capsys.readouterr().out
+    collision._collisions = {}
+    assert m.main([]) == 0

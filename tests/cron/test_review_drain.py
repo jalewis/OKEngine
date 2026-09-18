@@ -94,3 +94,21 @@ def test_no_work_path_emits_valid_json_wake_sentinel(tmp_path, capsys):
     assert rc == 0
     last = capsys.readouterr().out.strip().splitlines()[-1]
     assert json.loads(last) == {"wakeAgent": False}, "last line must be parseable no-wake JSON"
+
+
+def test_reference_and_candidate_parse_edge_paths(tmp_path, monkeypatch):
+    mod = _load(); wiki = tmp_path / "wiki"; wiki.mkdir()
+    assert mod._existing_source_refs(wiki, 3) == []
+    assert mod._existing_source_refs(wiki, ["entities/nope", "sources/missing.md"]) == []
+    _page(tmp_path, "sources/direct.md", "type: source", "evidence")
+    assert mod._existing_source_refs(wiki, "sources/direct.md") == ["sources/direct"]
+
+    _page(tmp_path, "dashboards/skipped.md", "type: dashboard", "body " * 100)
+    plain = wiki / "plain.md"; plain.write_text("plain")
+    malformed = wiki / "malformed.md"; malformed.write_text("---\n[bad\n---\n" + "x" * 300)
+    unreadable = wiki / "unreadable.md"; unreadable.write_text("text")
+    original = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda path, *args, **kwargs:
+                        (_ for _ in ()).throw(OSError("race"))
+                        if path == unreadable else original(path, *args, **kwargs))
+    assert mod.candidates(tmp_path) == []

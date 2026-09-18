@@ -12,17 +12,17 @@
 # (schema.yaml + persona + feeds + crons + content). See INSTALL.md and
 # docs/deploy-a-new-domain.md.
 version: 1
-engine_release: v0.13.5  # PATCH: cron-plus pin bump to the DST fall-back double-fire fix + _fixed_hours DST-window detector (#326 [28]); see CHANGELOG.md
+engine_release: v0.14.4  # PATCH: make the public source-layout test deterministic
 
 runtime:
   # Hermes is a PINNED DEPENDENCY, not vendored into this repo. You clone Hermes
   # at the pinned tag, apply patches/, then overlay the engine_layer below.
   description: pinned Hermes-Agent (cloned separately, patched + overlaid — see INSTALL.md)
   upstream: https://github.com/NousResearch/hermes-agent.git
-  pinned_version: v0.18.2          # upstream git tag v2026.7.7.2
-  pinned_tag: v2026.7.7.2
-  pinned_sha: 9de9c25f620ff7f1ce0fd5457d596052d5159596   # commit the tag resolves to; build-engine-image.sh verifies the clone matches
-  carried_patches: patches/        # 12 core-file patches + apply.sh (idempotent) + README
+  pinned_version: v0.21.3          # upstream git tag v2026.9.14
+  pinned_tag: v2026.9.14
+  pinned_sha: 345cd2b057a452236de401d3534b8502a7465e8d   # commit the tag resolves to; build-engine-image.sh verifies the clone matches
+  carried_patches: patches/target-v2026.9.14/  # 22 carried patch artifacts selected by apply.sh (23 original IDs; 09+22 share one artifact; 05 is test-only retirement evidence)
 
 dependencies:
   # External plugins the engine REQUIRES at runtime — cloned separately by the
@@ -68,7 +68,10 @@ engine_layer:
   framework_cli:
     - scripts/framework.py                # branded CLI: `init` (scaffold) + `validate` (pre-deploy pack check)
     - scripts/framework_init.py           # pack scaffolder (delegated to by `framework init`)
-    - scripts/framework_validate.py       # pre-deploy pack-spec validator
+    - scripts/framework_validate.py       # pre-deploy pack-spec validator (OFFLINE pack-source conformance)
+    - scripts/framework_status.py         # `status`: compact LIVE deployment summary over the shared checks (okengine#405)
+    - scripts/framework_doctor.py         # `doctor`: bounded LIVE diagnostics over the shared checks (okengine#405)
+    - scripts/framework_diagnostics.py    # shared status/doctor plumbing: host deployment resolution + finding emit (okengine#405)
     - scripts/engine_meta.py              # single source of truth for engine/Hermes pins (init stamps, validate enforces)
   extension_system:
     - extensions/                         # tier-1 engine-shipped extension discovery root (present≠enabled; okengine#134)
@@ -81,6 +84,7 @@ engine_layer:
     - scripts/backfill_source_fields.py
     - scripts/backfill_typeless_type.py
     - scripts/normalize_publishers.py
+    - scripts/normalize_vocabulary.py       # map a minted vocabulary (raw/ or wiki/) onto values the schema declares (okengine#594, #595)
   reader:
     - okengine-reader/                      # generic OKF vault reader (markdown + backlinks + PDF)
     - okengine-cockpit/                     # function-oriented "intelligence cockpit" reader (stream rail + briefings/predictions/dashboards tabs + OPTIONAL pack-config-driven watchlist/competitors); reads schema.yaml `cockpit:` block, no hermes import

@@ -25,8 +25,18 @@ function tick() {
   $("#clock").textContent = out;
 }
 tick(); setInterval(tick, 30000);
-// set the clock's zone from the server once at load (About loads lazily, so fetch it directly)
-fetch("/api/about").then(r => r.json()).then(a => { if (a && a.tz) { CLOCK_TZ = a.tz; tick(); } }).catch(() => {});
+function applyReaderIdentity(about) {
+  const name = String((about && about.ui_display_name) || "vault reader").trim() || "vault reader";
+  const label = $("#brand-home span");
+  if (label) label.textContent = name;
+  document.title = `OKEngine · ${name}`;
+}
+// Set deployment identity and the clock's zone from the server once at load. About itself loads
+// lazily, but the top-level pack name must not depend on opening that panel first.
+fetch("/api/about").then(r => r.json()).then(a => {
+  applyReaderIdentity(a);
+  if (a && a.tz) { CLOCK_TZ = a.tz; tick(); }
+}).catch(() => {});
 
 // ── browse: directories → pages ──────────────────────────────────────────────
 let CURRENT_DIR = null;
@@ -172,7 +182,7 @@ function auxPanel(meta) {
 }
 // ── multi-source provenance (okengine#42): "what each source says" + drill-down ──
 const relBadge = s => s.reliability
-  ? ` <b class="rel rel-${esc(s.reliability)}" title="Admiralty reliability ${esc(s.reliability)}">${esc(s.reliability)}</b>` : "";
+  ? ` <b class="rel rel-${esc(s.reliability)}${s.reliability_recognized === false ? " rel-oov" : ""}" title="${s.reliability_recognized === false ? "Unrecognized reliability grade" : "Admiralty reliability"} ${esc(s.reliability)}">${esc(s.reliability)}</b>` : "";
 function provPanel(d) {
   const conflicts = d.conflicts || [], obs = d.observations || [];
   if (!conflicts.length && !obs.length) return "";
@@ -183,9 +193,10 @@ function provPanel(d) {
     conflicts.forEach(c => {
       h += `<div class="cf"><div class="cf-field">${esc(c.field)}</div>` +
         c.values.map(v =>
-          `<div class="cf-val${v.is_headline ? " cf-head" : ""}" data-rank="${v.rank}">` +
+          `<div class="cf-val${v.is_headline ? " cf-head" : ""}" data-rank="${v.rank}" data-rank-known="${v.rank_known}" data-reliability-oov="${v.reliability_oov}">` +
           `<span class="cf-v">${esc(v.value)}</span>` +
           `<span class="cf-srcs">` + (v.sources.map(s => `<span class="cf-src">${esc(s.name)}${relBadge(s)}</span>`).join("") || "—") + `</span>` +
+          (v.reliability_oov ? `<span class="nr">unrecognized reliability grade</span>` : "") +
           (v.is_headline ? `<span class="cf-pick">chosen</span>` : "") + `</div>`).join("") +
         `</div>`;
     });
@@ -206,11 +217,27 @@ function recentReportingPanel(items) {
       return `<a class="wl obs-item" data-page="${esc(primary.path)}">${esc(item.title)}${extra} ↗</a>`;
     }).join("") + `</div></div>`;
 }
-// ≥B filter: hide any conflicting value whose best source reliability ranks below B (4).
+function assessmentPanel(items) {
+  if (!items || !items.length) return "";
+  return `<div class="prov assessment-panel"><div class="prov-head">Assessments</div>` +
+    `<div class="assessment-list">` + items.map(a => {
+      const suspected = ["low", "very-low"].includes(a.confidence_band) || a.epistemic_status === "suspected";
+      const label = suspected ? "suspected attribution" : (a.epistemic_status || a.kind || "assessment");
+      const confidence = a.confidence == null ? "" : ` · ${esc(a.confidence_band || "confidence")} ${esc(a.confidence)}`;
+      const review = a.needs_review ? ` <span class="nr">needs review</span>` : "";
+      return `<a class="wl assessment-item" data-page="${esc(a.path)}">` +
+        `<span class="assessment-label${suspected ? " suspected" : ""}">${esc(label)}</span>` +
+        `<strong>${esc(a.assessed_value || a.title)}</strong>${confidence}${review}` +
+        `<span class="assessment-claim">${esc(a.claim || "")}</span></a>`;
+    }).join("") + `</div></div>`;
+}
+// ≥B filter: dim only values ranked in the active Admiralty vocabulary. An explicit but
+// unrecognized grade stays visible and is labelled; silently treating it as unrated hid evidence.
 function wireProvFilter(root) {
   const cb = $("#prov-bfilter", root); if (!cb) return;
   cb.onchange = () => $$(".cf-val", root).forEach(el =>
-    el.classList.toggle("dim", cb.checked && (+el.dataset.rank) < 4));
+    el.classList.toggle("dim", cb.checked && el.dataset.reliabilityOov !== "true" &&
+      el.dataset.rankKnown === "true" && (+el.dataset.rank) < 4));
 }
 
 // Keep the open page in the URL (?page=…) so a browser REFRESH restores it instead of dropping
@@ -269,6 +296,11 @@ function provHtml(p) {
   if (!p) return "";
   const b = [];
   if (p.source_pages) b.push(`<span class="pv ok">🔗 ${p.source_pages} source${p.source_pages > 1 ? "s" : ""}</span>`);
+  // A registry-graded prose publisher IS evidence (okengine#563) — it is what review_autoverify
+  // publishes on, so it must not read as a gap. An absent registry cannot tell graded from ungraded,
+  // so report the check as unavailable rather than asserting "ungrounded".
+  else if (p.graded_sources) b.push(`<span class="pv ok">◈ ${p.graded_sources} graded source${p.graded_sources > 1 ? "s" : ""}</span>`);
+  else if (p.sources && p.registry_available === false) b.push(`<span class="pv warn">⚠ ${p.sources} prose source${p.sources > 1 ? "s" : ""} — grounding unverifiable</span>`);
   else if (p.sources) b.push(`<span class="pv warn">⚠ ${p.sources} prose source${p.sources > 1 ? "s" : ""} — ungrounded</span>`);
   if (p.grounding) {
     if (p.grounding.supported) b.push(`<span class="pv ok">✓ ${p.grounding.supported} claim${p.grounding.supported > 1 ? "s" : ""} grounded</span>`);
@@ -288,7 +320,7 @@ async function openPage(path, push = true) {
     $("#ov-title").textContent = d.title || path;
     $("#ov-path").textContent = (d.type ? d.type + " · " : "") + (d.rel || path);
     $("#ov-dl").innerHTML = dlLinks(`path=${encodeURIComponent(d.rel || path)}`);
-    c.innerHTML = provHtml(d.provenance) + panelHtml(d.panel) + recentReportingPanel(d.recent_reporting) + d.html + factPanel(d.meta) + provPanel(d) + auxPanel(d.meta_aux) + `<div id="backlinks" class="backlinks"></div>`; c.scrollTop = 0;
+    c.innerHTML = provHtml(d.provenance) + panelHtml(d.panel) + assessmentPanel(d.assessments) + recentReportingPanel(d.recent_reporting) + d.html + factPanel(d.meta) + provPanel(d) + auxPanel(d.meta_aux) + `<div id="backlinks" class="backlinks"></div>`; c.scrollTop = 0;
     wireProvFilter(c);
     $("#ov-back").style.visibility = pageStack.length > 1 ? "visible" : "hidden";
     loadBacklinks(d.rel || path);

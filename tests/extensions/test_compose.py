@@ -105,17 +105,16 @@ def test_sidecar_without_image_is_error():
     assert any("image" in e for e in errors)
 
 
-def test_sidecar_with_image_yields_trigger_job():
+def test_sidecar_with_image_does_not_schedule_unreachable_trigger():
     m = _mod()
     rec = _record("demo.img")
     rec["manifest"]["trust"] = "sidecar"
     rec["manifest"]["operation"]["entrypoint"] = {"image": {
         "registry": "reg.example.com/demo.img", "tag": "0.1.0", "digest": "sha256:abc"}}
-    job, errors, _ = m.synthesize_job(rec)
+    job, errors, warnings = m.synthesize_job(rec)
     assert errors == []
-    assert job["name"] == "demo.img"
-    assert job["script"] == "/opt/data/scripts/demo.img/trigger.sh"   # generated wrapper (#135)
-    assert job["no_agent"] is True
+    assert job is None
+    assert any("automatic scheduling is disabled" in warning for warning in warnings)
 
 
 def test_non_operation_kind_emits_no_job():
@@ -156,3 +155,52 @@ def test_compose_clean_when_no_collision():
     jobs, errors, _ = m.compose(resolved, existing_names={"build-hot-set"})
     assert errors == []
     assert {j["name"] for j in jobs} == {"demo.alpha", "demo.bravo"}
+
+
+# --- okengine#561: declared operation fields must survive composition ---------------------------
+def test_declared_timeout_reaches_the_generated_job():
+    """cron-plus resolves job.get("timeout", $OKENGINE_AGENT_RUN_TIMEOUT_SECONDS, 1200), so a
+    timeout that never reaches the job silently becomes 1200s with nothing reporting it.
+
+    Measured on okcti-test before the fix: 5 extension cron defs declared 300-3600s and 0 of 27
+    extension-sourced jobs carried a timeout. One lane declared 600 and was killed at 1200 on
+    eight consecutive runs across two days. Note this file's own fixture has declared
+    `timeout: 1800` since it was written -- nothing ever asserted it arrived.
+    """
+    m = _mod()
+    job, errors, _ = m.synthesize_job(_record())
+    assert not errors, errors
+    assert job["timeout"] == 1800, f"declared timeout dropped during composition: {job}"
+
+
+def test_absent_timeout_leaves_the_runner_default_in_charge():
+    """Omitting it must NOT stamp a value -- absent means "inherit", and inventing a number here
+    would silently override the deployment-wide default."""
+    m = _mod()
+    rec = _record()
+    del rec["manifest"]["operation"]["timeout"]
+    job, errors, _ = m.synthesize_job(rec)
+    assert not errors, errors
+    assert "timeout" not in job
+
+
+@pytest.mark.parametrize("bad", [0, -5, "abc", 1.5, True, [1800]])
+def test_a_declared_but_invalid_timeout_is_an_error_not_a_silent_fallback(bad):
+    """The whole defect class is a declaration nobody honours. Falling back to the default on a
+    malformed value would reproduce it exactly -- fail loudly instead."""
+    m = _mod()
+    job, errors, _ = m.synthesize_job(_record(timeout=bad))
+    assert job is None
+    assert any("timeout" in e for e in errors), errors
+
+
+def test_every_carried_operation_field_round_trips():
+    """The general form (okengine#561): the job dict is an explicit allowlist, so ANY optional
+    field can be forgotten silently. Pin the ones the composer is meant to carry, so the next
+    addition that gets dropped fails here rather than in production a week later.
+    """
+    m = _mod()
+    job, errors, _ = m.synthesize_job(_record(tier="kickstart", model="cheap-model", timeout=900))
+    assert not errors, errors
+    for field, expected in (("tier", "kickstart"), ("model", "cheap-model"), ("timeout", 900)):
+        assert job.get(field) == expected, f"{field} did not survive composition: {job}"

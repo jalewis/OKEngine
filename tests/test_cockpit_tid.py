@@ -150,3 +150,155 @@ def test_dossier_queue_and_gap_workbench_are_deterministic_and_complete(vault):
     assert "analyst@example.test" in workbench
     assert "expired" in workbench
     assert ">1<" in workbench
+
+
+def test_unknown_gap_priority_is_visible_and_ranked_for_attention(vault):
+    _page(vault.VAULT, "detection-gaps/urgent", {
+        "type": "detection-gap", "id": "detection-gap:urgent",
+        "title": "Urgent vocabulary drift", "analytic_ref": "analytic:voice",
+        "status": "proposed", "priority": "urgent",
+    })
+
+    queue = next(
+        box["html"] for box in vault.api_tab("tid")["boxes"]
+        if box["title"] == "Validation queue"
+    )
+
+    assert "unknown consequence" in queue
+    assert "unknown priority value(s): urgent — schema/producer drift" in queue
+    assert ">620<" in queue, "unknown vocabulary must rank above critical, never below low"
+
+
+def test_tid_boundary_helpers_keep_incomplete_and_malformed_data_explicit(vault, monkeypatch):
+    assert vault._tid_path(None) == ""
+    assert vault._tid_ref("[[wiki/entities/a.md#identity|Actor]]") == "entities/a"
+    assert "Unknown" in vault._tid_state("not-a-real-state")
+    assert "Unknown" in vault._tid_validation_history([])
+    assert vault._tid_expired("not-a-timestamp") is False
+    assert vault._tid_priority([]) == ("low", 100, None)
+    assert vault._tid_priority([{"priority": "HIGH"}]) == ("high", 300, None)
+    priority, score, reason = vault._tid_priority([{"priority": "urgent"}])
+    assert (priority, score) == ("unknown", 500)
+    assert reason == "unknown priority value(s): urgent — schema/producer drift"
+
+    application_data = vault._tid_application_data
+    monkeypatch.setattr(vault, "_tid_application_data", lambda: {"roles": {}, "index": {}})
+    assert vault._v_tid_trace({}) == ""
+    monkeypatch.setattr(vault, "_tid_application_data", application_data)
+
+    application = {
+        "profile": "other",
+        "roles": {
+            "malformed": [None, {}, {"namespace": "records", "type": "wanted"}],
+        },
+    }
+    monkeypatch.setattr(vault, "cockpit_config", lambda: {"application": application})
+    monkeypatch.setattr(
+        vault,
+        "_load_dir",
+        lambda _namespace: [
+            {"type": "other", "id": "skip"},
+            {"type": "wanted", "id": "keep", "_sub": "records", "_name": "keep"},
+        ],
+    )
+    data = vault._tid_application_data()
+    assert [row["id"] for row in data["roles"]["malformed"]] == ["keep"]
+    assert data["index"]["keep"]["id"] == "keep"
+
+
+def test_tid_missing_validation_and_assessment_metadata_paths(vault, monkeypatch):
+    analytic = {
+        "type": "detection-analytic",
+        "id": "analytic:unvalidated",
+        "title": "Unvalidated analytic",
+        "revision": "git:2222222222222222222222222222222222222222",
+        "_sub": "detection-analytics",
+        "_name": "unvalidated",
+    }
+    data = {
+        "roles": {"detection_analytic": [analytic], "validation_result": []},
+        "index": {"analytic:unvalidated": analytic},
+    }
+    monkeypatch.setattr(vault, "_tid_application_data", lambda: data)
+    queue = vault._v_tid_validation_queue({})
+    assert "no validation result" in queue
+    assert "Never" in queue
+
+    record = {"epistemic_status": "assessed", "assessed_value": None}
+    monkeypatch.setattr(vault, "_assessment_for_row", lambda _row, _spec: record)
+    assert vault._assessment_bucket({}, {}) == ("__metadata_unavailable__", record)
+
+    unknown = {"epistemic_status": "unknown", "path": "assessments/unknown"}
+    monkeypatch.setattr(vault, "_assessment_for_row", lambda _row, _spec: unknown)
+    assert "<strong>Unknown</strong>" in vault._assessed_value_cell({}, {})
+    assert vault._assessment_terminal_for_row({}, {"kind": "another-kind"}) is None
+
+
+def test_tid_existing_source_and_current_validation_avoid_false_warnings(vault, monkeypatch):
+    procedure = {"id": "procedure:x", "title": "X", "_sub": "procedures", "_name": "x"}
+    source = {"id": "source:x", "title": "Source", "_sub": "sources", "_name": "x"}
+    group = {
+        "procedure": procedure, "actor_ref": "", "sources": ["source:x"],
+        "requirements": [], "strategies": [], "analytics": [], "deployments": [],
+        "validations": [], "coverage": [], "current_coverage": None, "outcomes": [],
+    }
+    monkeypatch.setattr(vault, "_tid_application_data", lambda: {
+        "roles": {}, "index": {"source:x": source}
+    })
+    monkeypatch.setattr(vault, "_tid_groups", lambda _data: [group])
+    assert "Source" in vault._v_tid_trace({})
+
+    analytic = {
+        "id": "analytic:current", "title": "Current", "revision": "git:same",
+        "_sub": "detection-analytics", "_name": "current",
+    }
+    validation = {
+        "id": "validation:current", "analytic_ref": "analytic:current",
+        "analytic_revision": "git:same", "result": "passed", "valid_until": "",
+        "_sub": "validation-results", "_name": "current",
+    }
+    monkeypatch.setattr(vault, "_tid_application_data", lambda: {
+        "roles": {
+            "detection_analytic": [analytic], "validation_result": [validation],
+            "detection_gap": [], "defensive_decision": [],
+        },
+        "index": {"analytic:current": analytic},
+    })
+    queue = vault._v_tid_validation_queue({})
+    assert "analytic revision changed" not in queue and "validation stale" not in queue
+
+
+def test_a_resharded_subject_keeps_its_standing_judgment(vault, monkeypatch):
+    """A partitioned namespace re-files pages as it grows -- and back again as it shrinks.
+    `entities/q/i/qilin-ransomware` became `entities/q/qilin-ransomware` on the live vault.
+
+    An assessment records `subject:` as the path AT WRITE TIME, so a reshard silently orphaned every
+    judgment pointing into the old shard: the record stayed `active` on disk while the panel showed
+    "Review not run", which reads as never-assessed. Measured: 10 of 43 live attributions went dark
+    between two reads hours apart, one of them a version-45 active RU judgment.
+
+    Identity is (namespace, slug) -- shard depth is placement, not identity."""
+    m = vault
+    assert m._subject_key("entities/q/i/qilin-ransomware") == "entities/qilin-ransomware"
+    assert m._subject_key("entities/q/qilin-ransomware") == "entities/qilin-ransomware"
+    assert m._subject_key("entities/qilin-ransomware") == "entities/qilin-ransomware"
+    # a wikilink and a wiki/ prefix normalise the same way
+    assert m._subject_key("[[wiki/entities/q/i/qilin-ransomware.md]]") == "entities/qilin-ransomware"
+    # a bare token has no namespace to scope to and must not be forced into one
+    assert m._subject_key("qilin-ransomware") == "qilin-ransomware"
+    assert m._subject_key("") == ""
+
+
+def test_the_lookup_survives_a_shard_move_in_either_direction(vault, monkeypatch):
+    """Both sides of the comparison are normalised, so it does not matter whether the record or the
+    page is the one carrying the stale depth."""
+    m = vault
+    record = {"assessment_kind": "actor-country-linkage", "status": "active",
+              "assessed_value": "RU", "epistemic_status": "assessed", "path": "assessments/q/qilin"}
+    monkeypatch.setattr(m, "_assessment_subject_index",
+                        lambda: {"entities/qilin-ransomware": [record]})
+    spec = {"kind": "actor-country-linkage", "value_field": "assessed_value"}
+    for rel in ("q/i/qilin-ransomware", "q/qilin-ransomware", "q/i/x/qilin-ransomware"):
+        row = {"_sub": "entities", "_rel": rel}
+        assert m._assessment_for_row(row, spec) is record, rel
+        assert m._assessment_bucket(row, spec)[0] == "RU", rel

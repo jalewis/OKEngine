@@ -1,0 +1,41 @@
+diff --git a/runner.py b/runner.py
+index 372854b..10670bc 100644
+--- a/runner.py
++++ b/runner.py
+@@ -64,7 +64,8 @@ import model_slots  # type: ignore[import]  # noqa: E402
+ import run_timeout  # type: ignore[import]  # noqa: E402
+ import pid_ownership  # type: ignore[import]  # noqa: E402
+ import run_records  # type: ignore[import]  # noqa: E402
+ import artifact_records  # type: ignore[import]  # noqa: E402
++import slug_identity_guard  # type: ignore[import]  # noqa: E402
+ 
+ logging.basicConfig(
+     level=os.environ.get("CRON_PLUS_LOG_LEVEL", "INFO").upper(),
+@@ -284,6 +285,13 @@ def main() -> int:
+             job_name, args.job_id, os.getpid(), started_at.isoformat(),
+         )
+ 
++        wiki = Path(os.environ.get("WIKI_PATH") or "/opt/vault") / "wiki"
++        slug_snapshot = (
++            slug_identity_guard.snapshot(wiki)
++            if job.get("no_agent") is True
++            else None
++        )
++
+         # Run the agent (or skip if wake-gate emits false)
+         try:
+             with run_timeout.run_deadline(job):
+@@ -299,6 +307,13 @@ def main() -> int:
+                             "(job=%s)", job.get("name") or job.get("id")
+                         )
+                         success, output_doc, response, error = _run_via_hermes(job)
++                    if slug_snapshot is not None:
++                        slug_identity_guard.enforce(
++                            wiki,
++                            slug_snapshot,
++                            jobs_mod.CRON_PLUS_HOME / "quarantine" / "slug-collisions",
++                            job_id=str(job.get("id") or args.job_id),
++                        )
+         except Exception as e:
+             logger.error("agent invocation crashed: %s", e, exc_info=True)
+             jobs_mod.mark_job_run(args.job_id, success=False, error=str(e))

@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -186,6 +187,24 @@ def test_update_in_place_preserves_config_and_flags_changes(tmp_path):
     assert not (dest / "feeds.opml.upstream").exists()
     assert not (dest / "README.md.upstream").exists()
     assert s["unchanged"] >= 1
+
+
+def test_update_preserves_recompose_retry_and_rollback_upstream_files(tmp_path):
+    m = _load()
+    up, dest = tmp_path / "up", tmp_path / "dest"
+    _w(up / "pack.yaml", "name: p\n")
+    _w(dest / "pack.yaml", "name: p\n")
+    retry = dest / ".okengine/recompose-required.upstream"
+    snapshot = dest / ".okengine/snapshots/s1/tree/schema.yaml.upstream"
+    rolled_back = dest / ".okengine/rolled-back/s1/schema.yaml.upstream"
+    for path in (retry, snapshot, rolled_back):
+        _w(path, "recovery evidence\n")
+
+    m._update_in_place(up, dest)
+
+    assert retry.read_text() == "recovery evidence\n"
+    assert snapshot.read_text() == "recovery evidence\n"
+    assert rolled_back.read_text() == "recovery evidence\n"
 
 
 def test_giturl_local_directory_is_first_class(tmp_path):
@@ -379,3 +398,119 @@ def test_warn_busy_host_ports_flags_a_taken_port(tmp_path, capsys):  # invariant
         s.close()
     out = capsys.readouterr().out
     assert "already in use" in out and str(port) in out
+
+
+def test_pull_remaining_helper_edges(tmp_path, monkeypatch, capsys):
+    m = _load()
+
+    monkeypatch.setattr(m.subprocess, "run", lambda *_a, **_k: type("R", (), {"stdout": "v9.8.7\n"})())
+    assert m.engine_version() == "v9.8.7"
+    monkeypatch.setitem(
+        sys.modules, "engine_meta",
+        types.SimpleNamespace(engine_release=lambda: (_ for _ in ()).throw(RuntimeError())),
+    )
+    assert m._engine_release_from_manifest() == ""
+
+    unreadable = tmp_path / "unreadable.json"
+    unreadable.write_text("{}")
+    original_read = m.Path.read_text
+    monkeypatch.setattr(
+        m.Path, "read_text",
+        lambda self, *a, **k: (_ for _ in ()).throw(OSError("denied"))
+        if self == unreadable else original_read(self, *a, **k),
+    )
+    assert "cannot read" in m.read_catalog(str(unreadable))[1]
+
+    dest = tmp_path / "clone"
+    dest.mkdir()
+    calls = []
+    monkeypatch.setattr(m, "_git", lambda args: calls.append(args))
+    m.fetch({"ref": None, "subdir": "", "giturl": "repo"}, dest, True)
+    assert calls and not dest.exists()
+
+    runtime = tmp_path / "runtime"
+    m._layer_runtime(runtime)
+    assert (runtime / ".hermes-data" / ".gitkeep").is_file()
+    monkeypatch.setattr(m, "ENGINE_ROOT", tmp_path / "engine-without-template")
+    m._layer_runtime(tmp_path / "runtime-no-template")
+    m._apply_port_offset(runtime, 3)
+    m._warn_busy_host_ports(runtime)
+    assert "ports: reader 9203" in capsys.readouterr().out
+
+    free = tmp_path / "free-port"
+    _w(free / "docker-compose.yml", 'ports:\n  - "127.0.0.1:0:9200"\n')
+    m._warn_busy_host_ports(free)
+
+    ev = tmp_path / "engine.version"
+    ev.write_text("comment only\n")
+    m._engine_check(tmp_path)
+    ev.write_text("version:\n")
+    m._engine_check(tmp_path)
+
+    assert m._resolve_member("x", {"subdir": "packs/b", "giturl": "g"}, {"packs": []})["subdir"] == "packs/x"
+    assert m._resolve_member("x", {"subdir": "packs/b", "giturl": "g"}, {"packs": [{"name": "other"}]})["subdir"] == "packs/x"
+    assert m._resolve_member("x", {}, {"packs": [{"name": "x", "repo": "o/r"}]})["name"] == "x"
+    assert m._bundle_identity(tmp_path / "absent") == {}
+    m._apply_bundle_identity(tmp_path / "absent", {"name": "x"})
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    monkeypatch.setattr(m, "_pack_meta_mod", lambda: types.SimpleNamespace(validate_bundle_recipe=lambda _meta: []))
+    monkeypatch.setattr(m, "_resolve_member", lambda name, *_a: {"name": name})
+    monkeypatch.setattr(m, "fetch", lambda *_a, **_k: None)
+    m._expand_bundle({"bundle_host": "host", "bundle_compose": []}, {}, bundle, None)
+
+    up, current = tmp_path / "up", tmp_path / "current"
+    _w(up / "new", "new")
+    _w(current / ".hermes-data" / "old.upstream", "keep")
+    result = m._update_in_place(up, current)
+    assert result["added"] == ["new"]
+    assert (current / ".hermes-data" / "old.upstream").is_file()
+
+
+def test_pull_main_default_destination_and_composed_update_warning(tmp_path, monkeypatch, capsys):
+    m = _load()
+    monkeypatch.chdir(tmp_path)
+    spec = {"name": "pack", "giturl": "repo", "subdir": "", "ref": None}
+    monkeypatch.setattr(m, "read_catalog", lambda *_a: (None, None))
+    monkeypatch.setattr(m, "resolve", lambda *_a: (dict(spec), False))
+    monkeypatch.setattr(m, "fetch", lambda _s, dest, _force: (_w(dest / "pack.yaml", "name: pack\nversion: 0.0.0\n")))
+    for name in ("_jitter_crons", "_layer_runtime", "_apply_port_offset", "_warn_busy_host_ports", "_engine_check"):
+        monkeypatch.setattr(m, name, lambda *_a: None)
+    monkeypatch.setattr(m, "_load_meta_safe", lambda *_a: None)
+    monkeypatch.setattr(m, "_resolve_offset", lambda *_a: (0, ""))
+    assert m.main(["anything", "--no-validate"]) == 0
+    assert (tmp_path / "pack").is_dir()
+
+    dest = tmp_path / "existing"
+    _w(dest / "pack.yaml", "name: pack\nversion: 1.0.0\n")
+    _w(dest / "CLAUDE.md", "## Installed domain: one\n")
+
+    class Temp:
+        def __enter__(self):
+            self.path = tmp_path / "temporary"
+            self.path.mkdir(exist_ok=True)
+            return str(self.path)
+        def __exit__(self, *_args):
+            return False
+
+    def clone(args):
+        clone = Path(args[-1])
+        _w(clone / "pack.yaml", "name: pack\nversion: 1.0.0\n")
+        _w(clone / "new-definition", "new\n")
+
+    class Upgrade:
+        installed_pack_version = staticmethod(lambda *_a, **_k: "1.0.0")
+        run_pack_migrations = staticmethod(lambda *_a, **_k: 0)
+
+    monkeypatch.setattr(m.tempfile, "TemporaryDirectory", Temp)
+    monkeypatch.setattr(m, "_git", clone)
+    monkeypatch.setattr(m, "_load_meta_safe", lambda path: {"name": "pack", "version": "2.0.0"} if "temporary" in str(path) else {"name": "pack", "version": "1.0.0"})
+    monkeypatch.setattr(m, "_framework_upgrade_mod", lambda: Upgrade)
+    assert m.main(["anything", str(dest), "--update", "--no-validate"]) == 0
+    out = capsys.readouterr().out
+    assert "WITHOUT coinstall" in out and "new-definition" in out
+
+    # A failed update validation is an observable command failure, not a warning-only success.
+    monkeypatch.setattr(m, "_validate", lambda _dest: 1)
+    assert m.main(["anything", str(dest), "--update"]) == 1

@@ -126,3 +126,81 @@ def test_body_preserved_byte_for_byte(tmp_path, monkeypatch):
     _run(tmp_path, monkeypatch, _fake_llm())
     _, after = _fm(tmp_path, "anchored-core")
     assert after.split("---", 2)[2] == body_before
+
+
+def test_enrich_missing_concepts_and_frontmatter_parser_edges(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    sys.modules["llm_lib"] = _fake_llm()
+    try:
+        module = _load("enrich_concepts_empty", EXT / "enrich_concepts.py")
+        assert module._parse_fm("- list\n- value\n") == {}
+        assert module._parse_fm("[broken") == {}
+        assert module._fm_text("body") is None
+        assert module.main() == 0
+    finally:
+        sys.modules.pop("llm_lib", None)
+    output = capsys.readouterr().out
+    assert "no concepts" in output and '"wakeAgent": false' in output
+
+
+def test_value_uncertain_and_zero_budget_leave_pages_untouched(tmp_path, monkeypatch, capsys):
+    _vault(tmp_path)
+    _, before = _fm(tmp_path, "anchored-core")
+    _run(tmp_path, monkeypatch, _fake_llm(evo="product", val="uncertain"))
+    assert _fm(tmp_path, "anchored-core")[1] == before
+
+    _run(tmp_path, monkeypatch, _fake_llm(), budget="0")
+    assert "time budget" in capsys.readouterr().out
+
+
+def test_page_losing_frontmatter_before_checkpoint_is_skipped(tmp_path, monkeypatch):
+    _vault(tmp_path)
+    target = next((tmp_path / "wiki/concepts").rglob("anchored-core.md"))
+    llm = _fake_llm()
+    original = llm.classify
+
+    def classify(*args, **kwargs):
+        verdict = original(*args, **kwargs)
+        if llm._calls["n"] == 2:
+            target.write_text("page replaced concurrently")
+        return verdict
+
+    llm.classify = classify
+    _run(tmp_path, monkeypatch, llm, batch="1")
+    assert target.read_text() == "page replaced concurrently"
+
+
+def test_anchor_entity_hop_adds_linked_concept_to_scope(tmp_path, monkeypatch):
+    _vault(tmp_path)
+    entity = tmp_path / "wiki/entities/anchored-core.md"
+    entity.parent.mkdir()
+    entity.write_text("---\ntype: entity\n---\n[[concepts/t/tail-item]]\n")
+    _run(tmp_path, monkeypatch, _fake_llm(), batch="2")
+    assert _fm(tmp_path, "tail-item")[0].get("evolution") == "product"
+
+
+def test_scan_skips_reserved_plain_moved_and_unknown_links(tmp_path, monkeypatch):
+    _vault(tmp_path)
+    concepts = tmp_path / "wiki/concepts"
+    (concepts / "_reserved.md").write_text("[[concepts/not-indexed]]")
+    (concepts / "plain.md").write_text("plain [[concepts/not-indexed]]")
+    gone = concepts / "gone.md"
+    gone.write_text("---\ntype: concept\n---\n")
+    source = tmp_path / "wiki/sources/unknown.md"
+    source.write_text("---\ntype: source\n---\n[[concepts/not-indexed]]")
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("VIZ_ANCHOR", "concepts/w/watchlist.md,concepts/missing.md")
+    sys.modules["llm_lib"] = _fake_llm()
+    original = Path.read_text
+
+    def read_text(path, *args, **kwargs):
+        if path == gone:
+            raise OSError("moved")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    try:
+        module = _load("enrich_concepts_scan_edges", EXT / "enrich_concepts.py")
+        assert module.main() == 0
+    finally:
+        sys.modules.pop("llm_lib", None)

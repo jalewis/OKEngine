@@ -91,7 +91,8 @@ def _fm_text(text: str):
 def _parse_fm(fm_text: str) -> dict:
     try:
         import yaml
-        return yaml.safe_load(fm_text) or {}
+        parsed = yaml.safe_load(fm_text) or {}
+        return parsed if isinstance(parsed, dict) else {}
     except Exception:
         return {}
 

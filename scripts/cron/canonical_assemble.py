@@ -31,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import okf_migrate  # noqa: E402  — shared shard-aware page locator (find_page / canonical_key)
 import entity_resolve  # noqa: E402 — conservative cross-source identity resolver
+import schema_lib  # noqa: E402
 
 _FM = re.compile(r"\A---[ \t]*\n(.*?\n)---[ \t]*\n?(.*)\Z", re.S)
 # A>...>F, higher rank = more reliable; unknown reliability sorts below F.
@@ -149,11 +150,9 @@ def fuse(observations: list[dict], policy: dict) -> dict:
 
 # ── schema config ────────────────────────────────────────────────────────────
 def load_schema(vault: Path) -> dict:
-    try:
-        import yaml
-        return yaml.safe_load((vault / "schema.yaml").read_text(encoding="utf-8")) or {}
-    except Exception:
+    if not schema_lib.governing_schema(vault) and not (vault / ".okengine/composed-schema.yaml").is_file():
         return {}
+    return schema_lib.merged_schema(vault)
 
 
 def merge_policy(schema: dict) -> dict:
@@ -216,7 +215,7 @@ def collect_observations(vault: Path, reliability: dict) -> dict:
 
 def _canonical_index(vault: Path) -> entity_resolve.CanonicalIndex:
     """Build a resolver index over active canonical entity pages."""
-    records = []
+    records: list[tuple[str, str, list]] = []
     root = vault / "wiki" / "entities"
     if not root.is_dir():
         return entity_resolve.build_index(records)
@@ -290,7 +289,10 @@ def _assoc_section(rels: list) -> str:
     by: dict = {}
     for r in rels or []:
         if isinstance(r, dict) and r.get("t"):
-            by.setdefault(_PRED_LABEL.get(r.get("p"), "Related"), set()).add((r["t"], r.get("n") or r["t"]))
+            predicate = str(r.get("p") or "")
+            by.setdefault(_PRED_LABEL.get(predicate, "Related"), set()).add(
+                (r["t"], r.get("n") or r["t"])
+            )
     if not by:
         return ""
     out = [_ASSOC_HEAD, ""]
@@ -317,11 +319,12 @@ def _dump_fm(d: dict) -> str:
 
 
 def write_canonical(vault: Path, slug: str, type_: str, fused: dict, conflicts: list,
-                    sources: list, policy: dict, today: str, dry_run: bool = False) -> str:
+                    sources: list, policy: dict, today: str,
+                    dry_run: bool = False) -> tuple[str, bool]:
     """Write the canonical entities/<slug>.md from the fused fields, PRESERVING the agent
     body + any curated/non-owned frontmatter, UNIONing additive (union-policy) fields with
     the existing page (so agent/feed additions are never dropped), and flagging conflicts
-    for G3 review. Returns the new page text."""
+    for G3 review. Returns the page text and whether a write was required."""
     # The canonical seat, shard-correct: find the page wherever it currently sits (find_page), else
     # the schema's canonical key for a new one. The old `entities/slug[0]/slug.md` used the RAW first
     # char — wrong for an uppercase, digit, or symbol slug (canonical shards lowercase, map digits to
@@ -329,12 +332,13 @@ def write_canonical(vault: Path, slug: str, type_: str, fused: dict, conflicts: 
     existing = okf_migrate.find_page(vault, "entities", slug)
     path = existing if existing else vault / "wiki" / f"{okf_migrate.write_key(vault, 'entities', slug, fused)}.md"
     existing_fm, body = (read_fm(path) if path.exists() else ({}, ""))
-    union_f = policy.get("union", set())
+    union_f = policy.get("union") or set()
 
     fields = dict(fused)
     for k in list(fields):                       # preserve agent-added LIST items, but don't
         if k in union_f:                         # merge a legacy comma-string into a list field
-            existing_items = existing_fm.get(k) if isinstance(existing_fm.get(k), list) else []
+            existing_value = existing_fm.get(k)
+            existing_items: list = existing_value if isinstance(existing_value, list) else []
             seen, merged = set(), []
             for item in existing_items + _as_list(fields[k]):
                 kk = _key(item)

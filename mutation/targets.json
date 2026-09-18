@@ -1,0 +1,2365 @@
+{
+  "schema_version": 1,
+  "floors": {
+    "overall": 80,
+    "critical": 90
+  },
+  "runtime_costs": {
+    "basis": "worker-seconds from GitLab job 94246 (2026-09-07), job 105473 (2026-09-10), and schema-exclusions promotion job 116649 (2026-09-16); previously measured write-service mutant counts from job 69571 multiplied by the observed 19 worker-second write-suite rate",
+    "worker_seconds": {
+      "extensions/okengine.relevance-gate/llm_lib.py": 1451,
+      "extensions/okengine.viz/llm_lib.py": 1313,
+      "okengine-cockpit/auth.py": 163,
+      "okengine-mcp/output_contract_enforce.py": 97,
+      "okengine-mcp/server.py": 14056,
+      "okengine-mcp/write_server.py": 4338,
+      "okengine-reader/auth.py": 222,
+      "patches/cron-plus/artifact_records.py": 374,
+      "patches/cron-plus/run_records.py": 302,
+      "scripts/cron/condition_recheck.py": 1791,
+      "scripts/cron/hardening_lib.py": 140,
+      "scripts/cron/id_index.py": 853,
+      "scripts/cron/id_lib.py": 554,
+      "scripts/cron/llm_lib.py": 1239,
+      "scripts/cron/output_contract.py": 906,
+      "scripts/cron/review_autoverify.py": 2646,
+      "scripts/cron/schema_lib.py": 3878,
+      "scripts/ensure_projection_config.py": 390,
+      "scripts/framework_ingest_rebuild.py": 844,
+      "scripts/model_profiles.py": 409,
+      "scripts/reid_sources_by_url.py": 1576,
+      "scripts/scheduler_watchdog.py": 770,
+      "src/okengine/actor_identity.py": 3600,
+      "src/okengine/corpus_transaction.py": 1381,
+      "src/okengine/mcp/projection.py": 798,
+      "src/okengine/mcp/scope.py": 344,
+      "src/okengine/operations/run.py": 1381,
+      "src/okengine/schema_exclusions.py": 28,
+      "src/okengine/write_services/authorization.py": 7752,
+      "src/okengine/write_services/binding.py": 380,
+      "src/okengine/write_services/convergence.py": 8170,
+      "src/okengine/write_services/deduplication.py": 6479,
+      "src/okengine/write_services/integrity.py": 9633,
+      "src/okengine/write_services/patching.py": 8151,
+      "src/okengine/write_services/policy.py": 8474,
+      "src/okengine/write_services/review.py": 9253,
+      "src/okengine/write_services/state.py": 608,
+      "src/okengine/write_services/transactions.py": 7999,
+      "src/okengine/write_services/transport.py": 1881,
+      "src/okengine/write_services/validation.py": 4465,
+      "tools/policy_plane.py": 5648,
+      "tools/schema_validator.py": 2999
+    }
+  },
+  "floor_waivers": {
+    "okengine-reader/directory_index.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-09-17 first complete merged-main baseline is 78.81%; exact directory-index survivors remain counted while the newly measured assertion surface is strengthened under #612.",
+      "issue": "#612",
+      "expires": "2026-10-17"
+    },
+    "scripts/audit/patch_inventory.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-09-17 first complete merged-main baseline is 63.61%; exact inventory-policy survivors remain counted while the newly measured assertion surface is strengthened under #612.",
+      "issue": "#612",
+      "expires": "2026-10-17"
+    },
+    "scripts/cron/deployment_checks.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-09-17 first complete merged-main baseline is 73.02%; exact deployment-check survivors remain counted while the newly measured assertion surface is strengthened under #612.",
+      "issue": "#612",
+      "expires": "2026-10-17"
+    },
+    "scripts/cron/fleet_health.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-09-17 first complete merged-main baseline is 23.33%; exact fleet-health survivors remain counted while the newly measured assertion surface is strengthened under #612.",
+      "issue": "#612",
+      "expires": "2026-10-17"
+    },
+    "scripts/cron_jitter.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-09-17 first complete merged-main baseline is 68.60%; exact scheduling-jitter survivors remain counted while the newly measured assertion surface is strengthened under #612.",
+      "issue": "#612",
+      "expires": "2026-10-17"
+    },
+    "scripts/fleet_status.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-09-17 first complete merged-main baseline is 73.43%; exact fleet-status survivors remain counted while the newly measured assertion surface is strengthened under #612.",
+      "issue": "#612",
+      "expires": "2026-10-17"
+    },
+    "okengine-cockpit/auth.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-08-28 baseline is 88.10%; five reachable auth assertion gaps remain tracked while shared auth tests are strengthened.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "okengine-mcp/server.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-08-28 baseline is 69.13% on the newly expanded critical read surface; exact survivor artifacts are retained for the next assertion ratchet.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "okengine-mcp/write_server.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "The formerly unmeasured enforced facade now completes with a real 72.67% score; extracted-service tests are being raised independently without hiding this facade score.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "okengine-reader/auth.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-08-28 baseline is 88.10%; five reachable auth assertion gaps remain tracked while shared auth tests are strengthened.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "patches/cron-plus/run_records.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-09-08 first complete baseline is 80.23%; exact run-record survivors remain counted and retained for the next assertion ratchet.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "scripts/cron/id_index.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-09-08 first complete baseline is 79.23%; exact identifier-index survivors remain counted and retained for the next assertion ratchet.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "scripts/cron/output_contract.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-09-09 first complete sharded baseline is 88.43%; the retained output-contract survivors remain counted and owned while receipt assertions are strengthened.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "scripts/cron/review_autoverify.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-08-28 baseline is 86.47%; retained survivors are owned review-automation assertion debt.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "scripts/framework_ingest_rebuild.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-08-28 baseline is 84.47%; retained subprocess and selection survivors are owned assertion debt.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "scripts/reid_sources_by_url.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-09-08 first complete baseline is 81.91%; exact source-reidentification survivors remain counted and retained for the next assertion ratchet.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "scripts/scheduler_watchdog.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-08-28 baseline is 75.97%; retained watchdog edge survivors are owned assertion debt.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "src/okengine/corpus_transaction.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-09-08 first complete baseline is 85.36%; exact recovery and journal survivors remain counted and retained for the next assertion ratchet.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "src/okengine/mcp/projection.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-08-28 baseline is 75.66%; projection freshness and authorization survivors remain counted and owned.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "src/okengine/operations/run.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-08-28 baseline is 84.78%; lockset and receipt-state survivors remain counted and owned.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "src/okengine/write_services/binding.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-08-28 extracted-service baseline is 85.00%; three rebinding survivors remain counted and owned.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "src/okengine/write_services/authorization.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-09-17 first complete merged-main changed-lines baseline is 79.41%; exact authorization survivors remain counted while the newly measured assertion surface is strengthened under #612.",
+      "issue": "#612",
+      "expires": "2026-10-17"
+    },
+    "src/okengine/write_services/convergence.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-08-28 extracted-service baseline is 83.20%; convergence survivors remain counted and owned.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "src/okengine/write_services/deduplication.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-08-28 extracted-service baseline is 66.18%; identity and queue survivors remain counted and owned.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "src/okengine/write_services/integrity.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-08-28 extracted-service baseline is 81.07%; citation and identity-integrity survivors remain counted and owned.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "src/okengine/write_services/patching.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-08-28 extracted-service baseline is 79.72%; section and body-integrity survivors remain counted and owned.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "src/okengine/write_services/policy.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-08-28 extracted-service baseline is 84.12%; namespace and review-policy survivors remain counted and owned.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "src/okengine/write_services/review.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-08-28 extracted-service baseline is 62.78%; review state-machine survivors remain counted and owned.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "src/okengine/write_services/transactions.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-08-28 extracted-service baseline is 84.96%; create/update/tombstone survivors remain counted and owned.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "tools/policy_plane.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-08-28 baseline is 89.58%, 0.42 points below the critical floor; survivors remain counted pending the next policy assertion ratchet.",
+      "issue": "#612",
+      "expires": "2026-09-30"
+    },
+    "tools/schema_validator.py": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "2026-09-17 first complete merged-main changed-lines baseline is 87.88%; exact schema-validation survivors remain counted while the newly measured assertion surface is strengthened under #612.",
+      "issue": "#612",
+      "expires": "2026-10-17"
+    }
+  },
+  "targets": [
+    {
+      "path": "ci/flake_policy.py",
+      "category": "ci-policy",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/ci/test_flake_policy.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.actor-risk-ranking/actor_risk_rank.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_actor_risk_ranking.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.assessments/adversarial_evidence.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_adversarial_evidence.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.assessments/local_evidence.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_local_evidence.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.competitive-analytics/comp_lib.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_comp_lib.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.completeness/completeness_audit.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_completeness_ext.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.completeness/select_gap_fixes.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_completeness_ext.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.dedupe/select_dup_candidates.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_dedupe.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.events/event_schemas.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_event_schemas.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.events/event_scoring.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_events_ext.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.frontier-watch/select_whitespace.py",
+      "category": "extension-selector",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/extensions/test_frontier_watch_ext.py tests/test_frontier_watch_manifest.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.lacuna/select_lacuna_field.py",
+      "category": "extension-selector",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/extensions/test_lacuna_ext.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.grounding/select_grounding_check.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_grounding_ext.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.inquiry/inquiry_collect.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_inquiry.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.inquiry/inquiry_dossier.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_inquiry.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.inquiry/inquiry_lib.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_inquiry.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.predictions/select_prediction_structural_backfill.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_predictions_ext.py tests/extensions/test_predictions_discipline.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.predictions/select_regrade_batch.py",
+      "category": "extension-selector",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_predictions_ext.py tests/extensions/test_predictions_discipline.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.relevance-gate/llm_lib.py",
+      "category": "inference-client",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_llm_lib.py tests/test_llm_call_discipline.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.relevance-gate/scope_lib.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_scope_lib.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.viz/enrich_concepts.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_viz_enrich.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.viz/llm_lib.py",
+      "category": "inference-client",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_llm_lib.py tests/test_llm_call_discipline.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "extensions/okengine.viz/panel_svg.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_panel_svg_guard.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-cockpit/app.py",
+      "category": "cockpit",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 120,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_cockpit_config.py tests/test_cockpit_css.py tests/test_cockpit_dataset_tabs.py tests/test_cockpit_edge_paths.py tests/test_cockpit_grounding_registry.py tests/test_cockpit_home.py tests/test_cockpit_id_refs.py tests/test_cockpit_inputshape.py tests/test_cockpit_panels.py tests/test_cockpit_policy.py tests/test_cockpit_review.py tests/test_cockpit_sort_then.py tests/test_cockpit_tid.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-cockpit/auth.py",
+      "category": "cockpit-auth",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_cockpit_auth.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-mcp/server.py",
+      "category": "read-path",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_mcp_auth.py tests/test_mcp_graph_hardening.py tests/test_mcp_index_maintainer.py tests/test_mcp_search_capacity.py tests/test_mcp_server_contract_edges.py tests/test_mcp_server_edge_paths.py tests/test_mcp_server_helpers.py tests/contract/test_read_plane_contract_v1.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-mcp/write_server.py",
+      "category": "write-path",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 90,
+      "session_deadline_seconds": 21600,
+      "test_command": "{python} -m pytest tests/test_write_server.py tests/test_write_server_adversarial.py tests/test_write_server_authorization_mutation.py tests/test_write_server_body_integrity.py tests/test_write_server_branch_edges.py tests/test_write_server_confidence_scale.py tests/test_write_server_contract_edges2.py tests/test_write_server_converge.py tests/test_write_server_grounding_guards.py tests/test_write_server_orchestration.py tests/test_write_server_paths.py tests/test_write_server_review_lifecycle.py tests/test_write_server_tool_contracts.py tests/test_write_server_walkup.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-operations/app.py",
+      "category": "operator-cli",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_operation_api.py tests/test_operation_api_edges.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-projection/service.py",
+      "category": "projection-integrity",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_projection_service.py tests/test_projection_service_paths.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-reader/about.py",
+      "category": "reader-domain",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_reader.py tests/test_reader_browse.py tests/test_reader_contract_edges.py tests/test_reader_edge_paths.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-reader/app.py",
+      "category": "reader",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_reader.py tests/test_reader_browse.py tests/test_reader_contract_edges.py tests/test_reader_edge_paths.py tests/test_reader_grounding_registry.py tests/test_reader_inputshape.py tests/test_reader_limits.py tests/test_reader_cockpit_panel_parity.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-reader/auth.py",
+      "category": "reader-auth",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_reader_edge_paths.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-reader/backlinks.py",
+      "category": "reader-domain",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_reader.py tests/test_reader_contract_edges.py tests/test_reader_edge_paths.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-reader/browse.py",
+      "category": "reader-domain",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_reader.py tests/test_reader_browse.py tests/test_reader_contract_edges.py tests/test_reader_edge_paths.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-reader/chat.py",
+      "category": "reader-transport",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_reader.py tests/test_reader_contract_edges.py tests/test_reader_edge_paths.py tests/test_reader_limits.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-reader/directory_index.py",
+      "category": "reader-storage",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_reader.py tests/test_reader_browse.py tests/test_reader_contract_edges.py tests/test_reader_edge_paths.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-reader/exports.py",
+      "category": "reader-rendering",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_reader.py tests/test_reader_contract_edges.py tests/test_reader_edge_paths.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-reader/page_metadata.py",
+      "category": "reader-rendering",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_reader.py tests/test_reader_browse.py tests/test_reader_contract_edges.py tests/test_reader_edge_paths.py tests/test_reader_cockpit_panel_parity.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-reader/rendering.py",
+      "category": "reader-rendering",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_reader.py tests/test_reader_browse.py tests/test_reader_contract_edges.py tests/test_reader_edge_paths.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-reader/search.py",
+      "category": "reader-storage",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_reader.py tests/test_reader_contract_edges.py tests/test_reader_edge_paths.py tests/test_reader_limits.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-reader/settings.py",
+      "category": "reader-configuration",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_reader.py tests/test_reader_browse.py tests/test_reader_limits.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "patches/cron-plus/artifact_records.py",
+      "category": "cron-integrity",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_artifact_records.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "patches/cron-plus/run_records.py",
+      "category": "cron-integrity",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_run_records.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/audit/deterministic_audit.py",
+      "category": "invariant-audit",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_deterministic_audit.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/audit/hermes_patch_coverage.py",
+      "category": "supply-chain-governance",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_hermes_patch_coverage.py tests/test_hermes_target_contract_gate.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/audit/hermes_target_contract_gate.py",
+      "category": "supply-chain-governance",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_hermes_target_contract_gate.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/audit/import_boundary.py",
+      "category": "package-boundary",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_package_boundary.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/audit/patch_inventory.py",
+      "category": "supply-chain-governance",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_patch_inventory.py tests/test_target_patch_inventory.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/audit/release_evidence.py",
+      "category": "release-evidence",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_release_evidence_cli.py tests/test_issue204_gates.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/backfill_ids.py",
+      "category": "identity-integrity",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_backfill_ids.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/backfill_qualification.py",
+      "category": "qualification",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_backfill_qualification.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/bench_vault.py",
+      "category": "qualification",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_bench_vault.py tests/cron/test_scale_fast_load.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/build_engine_wheel.py",
+      "category": "package-build",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_package_boundary.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/coinstall_preflight.py",
+      "category": "coinstall",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_coinstall_preflight.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/composed_pack_state.py",
+      "category": "composition-state",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_composed_pack_state.py tests/test_pack_version_migrations.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/artifact_contract.py",
+      "category": "cron-observability",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_artifact_contract.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/backlink_lib.py",
+      "category": "corpus-integrity",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_backlinks_refresh.py tests/cron/test_rotate_wiki_log.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/budget_guard.py",
+      "category": "budget-enforcement",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_budget_guard.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/build_hot_set.py",
+      "category": "knowledge-lifecycle",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_build_hot_set.py tests/cron/test_composed_schema_consumers.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/canonical_assemble.py",
+      "category": "canonical-assembly",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 10800,
+      "test_command": "{python} -m pytest tests/cron/test_canonical_assemble.py tests/cron/test_canonical_assemble_shard.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/collection_health.py",
+      "category": "collection-telemetry",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_collection_health_render.py tests/test_source_kind_vocabulary_contract.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/collection_ledger.py",
+      "category": "collection-telemetry",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_collection_ledger.py tests/cron/test_collection_health_render.py tests/test_source_kind_vocabulary_contract.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/condition_recheck.py",
+      "category": "review",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_condition_recheck.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/corpus_audit.py",
+      "category": "corpus-integrity",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_corpus_audit.py tests/cron/test_corpus_audit_raw_capture.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/corpus_audit_domain.py",
+      "category": "corpus-integrity-domain",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_corpus_audit.py tests/cron/test_corpus_audit_raw_capture.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/corpus_audit_inputs.py",
+      "category": "corpus-integrity-storage",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_corpus_audit.py tests/cron/test_corpus_audit_raw_capture.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/corpus_audit_render.py",
+      "category": "corpus-integrity-rendering",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_corpus_audit.py tests/cron/test_corpus_audit_raw_capture.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/corpus_indexer.py",
+      "category": "corpus-index",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_composed_schema_consumers.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/dedupe_raw_captures.py",
+      "category": "ingest-hygiene",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_dedupe_raw_captures.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/deployment_checks.py",
+      "category": "deployment-observability",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 10800,
+      "test_command": "{python} -m pytest tests/cron/test_deployment_checks.py tests/cron/test_deployment_checks_edges.py tests/cron/test_deployment_validate.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/engine_package.py",
+      "category": "cron-observability",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_cron_modules_import_by_path.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/entity_converge.py",
+      "category": "entity-convergence",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_entity_converge.py tests/cron/test_entity_converge_model.py tests/cron/test_entity_converge_types.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/feed_fetch.py",
+      "category": "feed-ingest",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_feed_fetch_dedupe.py tests/cron/test_feed_fetch.py tests/test_source_kind_vocabulary_contract.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/fleet_health.py",
+      "category": "fleet-monitoring",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_fleet_health.py tests/cron/test_fleet_health_escalation.py tests/cron/test_fleet_health_qmd.py tests/cron/test_health_export_fleet_parse.py tests/cron/test_observability_contract.py tests/cron/test_observability_validate.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/health_export.py",
+      "category": "fleet-monitoring",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_health_export.py tests/cron/test_health_export_fleet_parse.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/observability_validate.py",
+      "category": "deployment-observability",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_observability_validate.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/hardening_lib.py",
+      "category": "deployment-guards",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 1800,
+      "test_command": "{python} -m pytest tests/cron/test_hardening_lib.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/id_index.py",
+      "category": "identity-integrity",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_id_index.py tests/cron/test_id_index_model.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/id_lib.py",
+      "category": "identity-integrity",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_id_lib.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/kb_search.py",
+      "category": "search",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_kb_search.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/kb_health.py",
+      "category": "knowledge-health",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_composed_schema_consumers.py tests/cron/test_ledger_local_date.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/knowledge_quality.py",
+      "category": "knowledge-quality",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_knowledge_quality.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/lane_budget.py",
+      "category": "lane-scheduling",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_lane_budget.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/llm_lib.py",
+      "category": "inference-client",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_llm_lib.py tests/test_llm_call_discipline.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/model_write_audit.py",
+      "category": "model-write-integrity",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_model_write_audit.py tests/test_output_contract_enforce.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/output_contract.py",
+      "category": "receipts",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 1800,
+      "test_command": "{python} -m pytest tests/cron/test_output_contract.py tests/cron/test_run_receipts.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/postgres_projection.py",
+      "category": "projection-integrity",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_postgres_projection.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/provenance_lib.py",
+      "category": "provenance-repair",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 1800,
+      "test_command": "{python} -m pytest tests/cron/test_provenance_lib.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/refresh_kb_dashboards.py",
+      "category": "dashboard-refresh",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_refresh_kb_dashboards.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/registry_coverage.py",
+      "category": "review",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_registry_coverage.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/repair_carried_provenance.py",
+      "category": "provenance-repair",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_repair_carried_provenance.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/repair_raw_backlinks.py",
+      "category": "provenance-repair",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_repair_raw_backlinks.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/reshard_oversized.py",
+      "category": "partition-integrity",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 10800,
+      "test_command": "{python} -m pytest tests/cron/test_reshard_oversized_runtime.py tests/cron/test_reshard_oversized_residuals.py tests/cron/test_reshard_frontmatter_refs.py tests/cron/test_composed_schema_consumers.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/review_autoverify.py",
+      "category": "review",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_review_autoverify.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/review_queue.py",
+      "category": "review",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_review_queue.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/rotate_wiki_log.py",
+      "category": "corpus-integrity",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_rotate_wiki_log.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/schema_lib.py",
+      "category": "schema",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_schema_lib_accessors.py tests/cron/test_schema_lib_base.py tests/cron/test_schema_lib_branch_edges.py tests/cron/test_schema_lib_compose_conflicts.py tests/cron/test_compose_schema.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/select_publisher_canonical_drain.py",
+      "category": "cron-selection",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_publisher_canonical_drain.py tests/cron/test_agent_lane_bounds.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/select_raw_batch.py",
+      "category": "raw-backfill",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_select_raw_batch.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/select_review_drain.py",
+      "category": "cron-selection",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_review_drain.py tests/cron/test_agent_lane_bounds.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/select_trend_deltas.py",
+      "category": "cron-selection",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_trends.py tests/cron/test_agent_lane_bounds.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/slot_starvation.py",
+      "category": "fleet-monitoring",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_slot_starvation.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/source_connector.py",
+      "category": "collection-telemetry",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_source_connector.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/source_decay.py",
+      "category": "source-quality",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 1800,
+      "test_command": "{python} -m pytest tests/cron/test_source_decay_vocab.py tests/test_source_kind_vocabulary_contract.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/source_normalize.py",
+      "category": "citation-normalisation",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_source_normalize.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/tier_lib.py",
+      "category": "tiering",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_tier_lib.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/tier_refresh.py",
+      "category": "tiering",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_tier_refresh.py tests/cron/test_tier_refresh_multipack.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/tz_lib.py",
+      "category": "scheduling",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_tz_lib.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/web_capture.py",
+      "category": "feed-ingest",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_web_capture.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/wiki_health_audit.py",
+      "category": "cron-observability",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_wiki_health_audit.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/wiki_schema_audit.py",
+      "category": "validation",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_wiki_schema_audit_merged.py tests/cron/test_rotate_wiki_log.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron_jitter.py",
+      "category": "scheduler",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_cron_jitter.py tests/test_cron_morning.py tests/test_cron_schedule_overrides.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron_pack_split.py",
+      "category": "cron-composition",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_cron_pack_split.py tests/cron/test_cron_pack_split_cli.py tests/cron/test_cron_split_extensions.py tests/cron/test_agent_lane_bounds.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/dedup_entity_slugs.py",
+      "category": "dedupe",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_dedup_entity_slugs_direct.py tests/test_okf_dedup_entity_shards.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/dedup_sources_by_url.py",
+      "category": "dedupe",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_dedup_sources_by_url.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/engine_source_guard.py",
+      "category": "deploy-verification",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_engine_source_guard.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/ensure_projection_config.py",
+      "category": "deployment-security",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_projection_rollout.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/extension_compose.py",
+      "category": "extension-composition",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 10800,
+      "test_command": "{python} -m pytest tests/extensions tests/test_schedule_override.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/extension_discovery.py",
+      "category": "extension-discovery",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 10800,
+      "test_command": "{python} -m pytest tests/extensions/test_discovery.py tests/extensions/test_list_effective_state.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_extensions.py",
+      "category": "extension-lifecycle",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 10800,
+      "test_command": "{python} -m pytest tests/extensions/test_cli_workflows.py tests/extensions/test_lifecycle.py tests/extensions/test_sidecar.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/extension_manifest.py",
+      "category": "extension",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/extensions/test_first_party.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/fleet_status.py",
+      "category": "fleet-monitoring",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_fleet_status.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework.py",
+      "category": "operator-cli",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_framework_dispatch_direct.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_backup.py",
+      "category": "backup",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_framework_backup.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_deployment.py",
+      "category": "deployment-generation",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_framework_deployment.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_explain_export.py",
+      "category": "evidence-export",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_framework_explain_export.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/extract-docs.py",
+      "category": "ingest-extraction",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_extract_docs.py tests/test_extract_raw.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/extract-html.py",
+      "category": "ingest-extraction",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_extract_html.py tests/test_extract_raw.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_ingest_rebuild.py",
+      "category": "projection-integrity",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_framework_ingest_rebuild.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_init.py",
+      "category": "framework",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_framework_init_pin.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_install_domain.py",
+      "category": "domain-install",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 60,
+      "session_deadline_seconds": 14400,
+      "test_command": "{python} -m pytest tests/test_framework_install_domain.py tests/test_framework_install_domain_branch_edges.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_reconcile.py",
+      "category": "pack-reconciliation",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_framework_reconcile.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_pull.py",
+      "category": "pack-update",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 60,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_framework_pull.py tests/test_pack_version_migrations.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_upgrade.py",
+      "category": "upgrade",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 60,
+      "session_deadline_seconds": 14400,
+      "test_command": "{python} -m pytest tests/test_framework_upgrade.py tests/test_framework_upgrade_branch_edges.py tests/test_pack_version_migrations.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/flash_fallback_audit.py",
+      "category": "model-routing",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_flash_fallback_audit.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "plugins/model-providers/openrouter/__init__.py",
+      "category": "model-routing",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_deepseek_v41_migration.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "migrations/m_v0_13_8_v0_14_0_deepseek_v4_1_flash.py",
+      "category": "upgrade",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_deepseek_v41_migration.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/pack_meta.py",
+      "category": "pack-metadata",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_pack_meta.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_validate.py",
+      "category": "validation",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 60,
+      "session_deadline_seconds": 14400,
+      "test_command": "{python} -m pytest tests/test_framework_validate.py tests/test_framework_validate_branch_edges.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_validate_crons.py",
+      "category": "validation",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 60,
+      "session_deadline_seconds": 14400,
+      "test_command": "{python} -m pytest tests/test_framework_validate.py tests/test_framework_validate_branch_edges.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_validate_docs.py",
+      "category": "validation",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 60,
+      "session_deadline_seconds": 14400,
+      "test_command": "{python} -m pytest tests/test_framework_validate.py tests/test_framework_validate_branch_edges.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_validate_extensions.py",
+      "category": "validation",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 90,
+      "session_deadline_seconds": 14400,
+      "test_command": "{python} -m pytest tests/test_framework_validate.py tests/test_framework_validate_branch_edges.py tests/extensions/test_pack_requires_ext.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_validate_metadata.py",
+      "category": "validation",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 60,
+      "session_deadline_seconds": 14400,
+      "test_command": "{python} -m pytest tests/test_framework_validate.py tests/test_framework_validate_branch_edges.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_validate_models.py",
+      "category": "validation",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 60,
+      "session_deadline_seconds": 14400,
+      "test_command": "{python} -m pytest tests/test_framework_validate.py tests/test_framework_validate_branch_edges.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_validate_pack.py",
+      "category": "validation",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 60,
+      "session_deadline_seconds": 14400,
+      "test_command": "{python} -m pytest tests/test_framework_validate.py tests/test_framework_validate_branch_edges.py tests/test_validator_vintage_content.py tests/test_framework_source_connectors.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_validate_policy.py",
+      "category": "validation",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 60,
+      "session_deadline_seconds": 14400,
+      "test_command": "{python} -m pytest tests/test_framework_validate.py tests/test_framework_validate_branch_edges.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_validate_report.py",
+      "category": "validation",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 60,
+      "session_deadline_seconds": 14400,
+      "test_command": "{python} -m pytest tests/test_framework_validate.py tests/test_framework_validate_branch_edges.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/framework_validate_runtime.py",
+      "category": "validation",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 60,
+      "session_deadline_seconds": 14400,
+      "test_command": "{python} -m pytest tests/test_framework_validate.py tests/test_framework_validate_branch_edges.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/generate_qualification_corpus.py",
+      "category": "scale-qualification",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_generate_qualification_corpus.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/image_drift.py",
+      "category": "deploy-verification",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 60,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_image_drift.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/model_profiles.py",
+      "category": "model-routing",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 1800,
+      "test_command": "{python} -m pytest tests/cron/test_model_profiles.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/normalize_vocabulary.py",
+      "category": "ingest-hygiene",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_normalize_vocabulary.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/prepare_backfill_qualification.py",
+      "category": "qualification",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_qualification_tools_have_no_deployment_defaults.py tests/test_serving_and_qualification_tools.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/prompt_lint.py",
+      "category": "prompt-validation",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_prompt_lint.py tests/test_extension_prompt_bindings.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/reid_sources_by_url.py",
+      "category": "identity-migration",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_reid_sources_by_url.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/review_context.py",
+      "category": "review-provenance",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 1800,
+      "test_command": "{python} -m pytest tests/test_review_context.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/run_scale_qualification.py",
+      "category": "scale-qualification",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 60,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_scale_qualification.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/scheduler_watchdog.py",
+      "category": "scheduler-availability",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_scheduler_watchdog.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/staged_drift.py",
+      "category": "deploy-verification",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_staged_drift.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/__init__.py",
+      "category": "package-metadata",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_package_boundary.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/actor_identity.py",
+      "category": "write-path",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 1800,
+      "test_command": "{python} -m pytest tests/test_actor_identity.py tests/test_write_server_converge.py tests/test_cockpit_panels.py tests/cron/test_corpus_audit.py tests/cron/test_review_autoverify.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/cli.py",
+      "category": "package-cli",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_package_boundary.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/cockpit_services/__init__.py",
+      "category": "cockpit",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 120,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_cockpit_config.py tests/test_cockpit_css.py tests/test_cockpit_dataset_tabs.py tests/test_cockpit_edge_paths.py tests/test_cockpit_grounding_registry.py tests/test_cockpit_home.py tests/test_cockpit_id_refs.py tests/test_cockpit_inputshape.py tests/test_cockpit_panels.py tests/test_cockpit_policy.py tests/test_cockpit_review.py tests/test_cockpit_sort_then.py tests/test_cockpit_tid.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/cockpit_services/assessments.py",
+      "category": "cockpit",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 120,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_cockpit_config.py tests/test_cockpit_css.py tests/test_cockpit_dataset_tabs.py tests/test_cockpit_edge_paths.py tests/test_cockpit_grounding_registry.py tests/test_cockpit_home.py tests/test_cockpit_id_refs.py tests/test_cockpit_inputshape.py tests/test_cockpit_panels.py tests/test_cockpit_policy.py tests/test_cockpit_review.py tests/test_cockpit_sort_then.py tests/test_cockpit_tid.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/cockpit_services/chat.py",
+      "category": "cockpit",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 120,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_cockpit_config.py tests/test_cockpit_css.py tests/test_cockpit_dataset_tabs.py tests/test_cockpit_edge_paths.py tests/test_cockpit_grounding_registry.py tests/test_cockpit_home.py tests/test_cockpit_id_refs.py tests/test_cockpit_inputshape.py tests/test_cockpit_panels.py tests/test_cockpit_policy.py tests/test_cockpit_review.py tests/test_cockpit_sort_then.py tests/test_cockpit_tid.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/cockpit_services/configuration.py",
+      "category": "cockpit",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 120,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_cockpit_config.py tests/test_cockpit_css.py tests/test_cockpit_dataset_tabs.py tests/test_cockpit_edge_paths.py tests/test_cockpit_grounding_registry.py tests/test_cockpit_home.py tests/test_cockpit_id_refs.py tests/test_cockpit_inputshape.py tests/test_cockpit_panels.py tests/test_cockpit_policy.py tests/test_cockpit_review.py tests/test_cockpit_sort_then.py tests/test_cockpit_tid.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/cockpit_services/dataset_views.py",
+      "category": "cockpit",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 120,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_cockpit_config.py tests/test_cockpit_css.py tests/test_cockpit_dataset_tabs.py tests/test_cockpit_edge_paths.py tests/test_cockpit_grounding_registry.py tests/test_cockpit_home.py tests/test_cockpit_id_refs.py tests/test_cockpit_inputshape.py tests/test_cockpit_panels.py tests/test_cockpit_policy.py tests/test_cockpit_review.py tests/test_cockpit_sort_then.py tests/test_cockpit_tid.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/cockpit_services/datasets.py",
+      "category": "cockpit",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 120,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_cockpit_config.py tests/test_cockpit_css.py tests/test_cockpit_dataset_tabs.py tests/test_cockpit_edge_paths.py tests/test_cockpit_grounding_registry.py tests/test_cockpit_home.py tests/test_cockpit_id_refs.py tests/test_cockpit_inputshape.py tests/test_cockpit_panels.py tests/test_cockpit_policy.py tests/test_cockpit_review.py tests/test_cockpit_sort_then.py tests/test_cockpit_tid.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/cockpit_services/documents.py",
+      "category": "cockpit",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 120,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_cockpit_config.py tests/test_cockpit_css.py tests/test_cockpit_dataset_tabs.py tests/test_cockpit_edge_paths.py tests/test_cockpit_grounding_registry.py tests/test_cockpit_home.py tests/test_cockpit_id_refs.py tests/test_cockpit_inputshape.py tests/test_cockpit_panels.py tests/test_cockpit_policy.py tests/test_cockpit_review.py tests/test_cockpit_sort_then.py tests/test_cockpit_tid.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/cockpit_services/drill_ops.py",
+      "category": "cockpit",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 120,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_cockpit_config.py tests/test_cockpit_css.py tests/test_cockpit_dataset_tabs.py tests/test_cockpit_edge_paths.py tests/test_cockpit_grounding_registry.py tests/test_cockpit_home.py tests/test_cockpit_id_refs.py tests/test_cockpit_inputshape.py tests/test_cockpit_panels.py tests/test_cockpit_policy.py tests/test_cockpit_review.py tests/test_cockpit_sort_then.py tests/test_cockpit_tid.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/cockpit_services/exports.py",
+      "category": "cockpit",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 120,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_cockpit_config.py tests/test_cockpit_css.py tests/test_cockpit_dataset_tabs.py tests/test_cockpit_edge_paths.py tests/test_cockpit_grounding_registry.py tests/test_cockpit_home.py tests/test_cockpit_id_refs.py tests/test_cockpit_inputshape.py tests/test_cockpit_panels.py tests/test_cockpit_policy.py tests/test_cockpit_review.py tests/test_cockpit_sort_then.py tests/test_cockpit_tid.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/cockpit_services/navigation.py",
+      "category": "cockpit",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 120,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_cockpit_config.py tests/test_cockpit_css.py tests/test_cockpit_dataset_tabs.py tests/test_cockpit_edge_paths.py tests/test_cockpit_grounding_registry.py tests/test_cockpit_home.py tests/test_cockpit_id_refs.py tests/test_cockpit_inputshape.py tests/test_cockpit_panels.py tests/test_cockpit_policy.py tests/test_cockpit_review.py tests/test_cockpit_sort_then.py tests/test_cockpit_tid.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/cockpit_services/page_metadata.py",
+      "category": "cockpit",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 120,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_cockpit_config.py tests/test_cockpit_css.py tests/test_cockpit_dataset_tabs.py tests/test_cockpit_edge_paths.py tests/test_cockpit_grounding_registry.py tests/test_cockpit_home.py tests/test_cockpit_id_refs.py tests/test_cockpit_inputshape.py tests/test_cockpit_panels.py tests/test_cockpit_policy.py tests/test_cockpit_review.py tests/test_cockpit_sort_then.py tests/test_cockpit_tid.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/cockpit_services/reviews.py",
+      "category": "cockpit",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 120,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_cockpit_config.py tests/test_cockpit_css.py tests/test_cockpit_dataset_tabs.py tests/test_cockpit_edge_paths.py tests/test_cockpit_grounding_registry.py tests/test_cockpit_home.py tests/test_cockpit_id_refs.py tests/test_cockpit_inputshape.py tests/test_cockpit_panels.py tests/test_cockpit_policy.py tests/test_cockpit_review.py tests/test_cockpit_sort_then.py tests/test_cockpit_tid.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/cockpit_services/state.py",
+      "category": "cockpit",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 120,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_cockpit_config.py tests/test_cockpit_css.py tests/test_cockpit_dataset_tabs.py tests/test_cockpit_edge_paths.py tests/test_cockpit_grounding_registry.py tests/test_cockpit_home.py tests/test_cockpit_id_refs.py tests/test_cockpit_inputshape.py tests/test_cockpit_panels.py tests/test_cockpit_policy.py tests/test_cockpit_review.py tests/test_cockpit_sort_then.py tests/test_cockpit_tid.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/cockpit_services/streams.py",
+      "category": "cockpit",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 120,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_cockpit_config.py tests/test_cockpit_css.py tests/test_cockpit_dataset_tabs.py tests/test_cockpit_edge_paths.py tests/test_cockpit_grounding_registry.py tests/test_cockpit_home.py tests/test_cockpit_id_refs.py tests/test_cockpit_inputshape.py tests/test_cockpit_panels.py tests/test_cockpit_policy.py tests/test_cockpit_review.py tests/test_cockpit_sort_then.py tests/test_cockpit_tid.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/cockpit_services/tid_views.py",
+      "category": "cockpit",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 120,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_cockpit_config.py tests/test_cockpit_css.py tests/test_cockpit_dataset_tabs.py tests/test_cockpit_edge_paths.py tests/test_cockpit_grounding_registry.py tests/test_cockpit_home.py tests/test_cockpit_id_refs.py tests/test_cockpit_inputshape.py tests/test_cockpit_panels.py tests/test_cockpit_policy.py tests/test_cockpit_review.py tests/test_cockpit_sort_then.py tests/test_cockpit_tid.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/compat.py",
+      "category": "package-compatibility",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_package_boundary.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/corpus_transaction.py",
+      "category": "corpus-integrity",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_corpus_transaction.py -q",
+      "min_mutants": 200
+    },
+    {
+      "path": "src/okengine/mcp/__init__.py",
+      "category": "package-boundary",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_package_boundary.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/mcp/projection.py",
+      "category": "projection-integrity",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_projection_queries.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/mcp/scope.py",
+      "category": "write-auth",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_scope_boundary.py tests/extensions/test_scoped_mcp.py tests/extensions/test_scope_edge.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/operations/__init__.py",
+      "category": "operations",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 60,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_framework_operations.py tests/test_operation_run.py tests/test_framework_executable.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/operations/framework.py",
+      "category": "operations",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 60,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_framework_operations.py tests/test_operation_run.py tests/test_framework_executable.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/operations/run.py",
+      "category": "operations",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 60,
+      "session_deadline_seconds": 21600,
+      "test_command": "{python} -m pytest tests/test_framework_operations.py tests/test_operation_run.py tests/test_framework_executable.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/projection/__init__.py",
+      "category": "package-boundary",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_package_boundary.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/projection/projector.py",
+      "category": "projection-integrity",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/cron/test_postgres_projection.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/schema_exclusions.py",
+      "category": "schema-contract",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 30,
+      "session_deadline_seconds": 1800,
+      "test_command": "{python} -m pytest tests/test_schema_exclusions.py tests/test_schema_validator_units.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/write_services/__init__.py",
+      "category": "write-path",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 90,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_write_server.py tests/test_write_server_adversarial.py tests/test_write_server_authorization_mutation.py tests/test_write_server_body_integrity.py tests/test_write_server_branch_edges.py tests/test_write_server_confidence_scale.py tests/test_write_server_contract_edges2.py tests/test_write_server_converge.py tests/test_write_server_grounding_guards.py tests/test_write_server_orchestration.py tests/test_write_server_paths.py tests/test_write_server_review_lifecycle.py tests/test_write_server_tool_contracts.py tests/test_write_server_walkup.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "okengine-mcp/output_contract_enforce.py",
+      "category": "write-path",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 7200,
+      "test_command": "{python} -m pytest tests/test_output_contract_enforce.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/write_services/authorization.py",
+      "category": "write-path",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 90,
+      "session_deadline_seconds": 21600,
+      "test_command": "{python} -m pytest tests/test_write_server.py tests/test_write_server_adversarial.py tests/test_write_server_authorization_mutation.py tests/test_write_server_body_integrity.py tests/test_write_server_branch_edges.py tests/test_write_server_confidence_scale.py tests/test_write_server_contract_edges2.py tests/test_write_server_converge.py tests/test_write_server_grounding_guards.py tests/test_write_server_orchestration.py tests/test_write_server_paths.py tests/test_write_server_review_lifecycle.py tests/test_write_server_tool_contracts.py tests/test_write_server_walkup.py -q",
+      "min_mutants": 350
+    },
+    {
+      "path": "src/okengine/write_services/binding.py",
+      "category": "write-path",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 90,
+      "session_deadline_seconds": 21600,
+      "test_command": "{python} -m pytest tests/test_write_service_binding.py tests/test_write_server.py tests/test_write_server_adversarial.py tests/test_write_server_authorization_mutation.py tests/test_write_server_body_integrity.py tests/test_write_server_branch_edges.py tests/test_write_server_confidence_scale.py tests/test_write_server_contract_edges2.py tests/test_write_server_converge.py tests/test_write_server_grounding_guards.py tests/test_write_server_orchestration.py tests/test_write_server_paths.py tests/test_write_server_review_lifecycle.py tests/test_write_server_tool_contracts.py tests/test_write_server_walkup.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/write_services/convergence.py",
+      "category": "write-path",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 90,
+      "session_deadline_seconds": 21600,
+      "test_command": "{python} -m pytest tests/test_write_server.py tests/test_write_server_adversarial.py tests/test_write_server_authorization_mutation.py tests/test_write_server_body_integrity.py tests/test_write_server_branch_edges.py tests/test_write_server_confidence_scale.py tests/test_write_server_contract_edges2.py tests/test_write_server_converge.py tests/test_write_server_grounding_guards.py tests/test_write_server_orchestration.py tests/test_write_server_paths.py tests/test_write_server_review_lifecycle.py tests/test_write_server_tool_contracts.py tests/test_write_server_walkup.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/write_services/deduplication.py",
+      "category": "write-path",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 90,
+      "session_deadline_seconds": 21600,
+      "test_command": "{python} -m pytest tests/test_write_server.py tests/test_write_server_adversarial.py tests/test_write_server_authorization_mutation.py tests/test_write_server_body_integrity.py tests/test_write_server_branch_edges.py tests/test_write_server_confidence_scale.py tests/test_write_server_contract_edges2.py tests/test_write_server_converge.py tests/test_write_server_grounding_guards.py tests/test_write_server_orchestration.py tests/test_write_server_paths.py tests/test_write_server_review_lifecycle.py tests/test_write_server_tool_contracts.py tests/test_write_server_walkup.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/write_services/integrity.py",
+      "category": "write-path",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 90,
+      "session_deadline_seconds": 21600,
+      "test_command": "{python} -m pytest tests/test_write_server.py tests/test_write_server_adversarial.py tests/test_write_server_authorization_mutation.py tests/test_write_server_body_integrity.py tests/test_write_server_branch_edges.py tests/test_write_server_confidence_scale.py tests/test_write_server_contract_edges2.py tests/test_write_server_converge.py tests/test_write_server_grounding_guards.py tests/test_write_server_orchestration.py tests/test_write_server_paths.py tests/test_write_server_review_lifecycle.py tests/test_write_server_tool_contracts.py tests/test_write_server_walkup.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/write_services/patching.py",
+      "category": "write-path",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 90,
+      "session_deadline_seconds": 21600,
+      "test_command": "{python} -m pytest tests/test_write_server.py tests/test_write_server_adversarial.py tests/test_write_server_authorization_mutation.py tests/test_write_server_body_integrity.py tests/test_write_server_branch_edges.py tests/test_write_server_confidence_scale.py tests/test_write_server_contract_edges2.py tests/test_write_server_converge.py tests/test_write_server_grounding_guards.py tests/test_write_server_orchestration.py tests/test_write_server_paths.py tests/test_write_server_review_lifecycle.py tests/test_write_server_tool_contracts.py tests/test_write_server_walkup.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/write_services/policy.py",
+      "category": "write-path",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 90,
+      "session_deadline_seconds": 21600,
+      "test_command": "{python} -m pytest tests/test_write_server.py tests/test_write_server_adversarial.py tests/test_write_server_authorization_mutation.py tests/test_write_server_body_integrity.py tests/test_write_server_branch_edges.py tests/test_write_server_confidence_scale.py tests/test_write_server_contract_edges2.py tests/test_write_server_converge.py tests/test_write_server_grounding_guards.py tests/test_write_server_orchestration.py tests/test_write_server_paths.py tests/test_write_server_review_lifecycle.py tests/test_write_server_tool_contracts.py tests/test_write_server_walkup.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/write_services/review.py",
+      "category": "write-path",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 90,
+      "session_deadline_seconds": 21600,
+      "test_command": "{python} -m pytest tests/test_write_server.py tests/test_write_server_adversarial.py tests/test_write_server_authorization_mutation.py tests/test_write_server_body_integrity.py tests/test_write_server_branch_edges.py tests/test_write_server_confidence_scale.py tests/test_write_server_contract_edges2.py tests/test_write_server_converge.py tests/test_write_server_grounding_guards.py tests/test_write_server_orchestration.py tests/test_write_server_paths.py tests/test_write_server_review_lifecycle.py tests/test_write_server_tool_contracts.py tests/test_write_server_walkup.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/write_services/state.py",
+      "category": "write-path",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 90,
+      "session_deadline_seconds": 21600,
+      "test_command": "{python} -m pytest tests/test_write_server.py tests/test_write_server_adversarial.py tests/test_write_server_authorization_mutation.py tests/test_write_server_body_integrity.py tests/test_write_server_branch_edges.py tests/test_write_server_confidence_scale.py tests/test_write_server_contract_edges2.py tests/test_write_server_converge.py tests/test_write_server_grounding_guards.py tests/test_write_server_orchestration.py tests/test_write_server_paths.py tests/test_write_server_review_lifecycle.py tests/test_write_server_tool_contracts.py tests/test_write_server_walkup.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/write_services/transactions.py",
+      "category": "write-path",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 90,
+      "session_deadline_seconds": 21600,
+      "test_command": "{python} -m pytest tests/test_write_server.py tests/test_write_server_adversarial.py tests/test_write_server_authorization_mutation.py tests/test_write_server_body_integrity.py tests/test_write_server_branch_edges.py tests/test_write_server_confidence_scale.py tests/test_write_server_contract_edges2.py tests/test_write_server_converge.py tests/test_write_server_grounding_guards.py tests/test_write_server_orchestration.py tests/test_write_server_paths.py tests/test_write_server_review_lifecycle.py tests/test_write_server_tool_contracts.py tests/test_write_server_walkup.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/write_services/transport.py",
+      "category": "write-path",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 90,
+      "session_deadline_seconds": 21600,
+      "test_command": "{python} -m pytest tests/test_write_server.py tests/test_write_server_adversarial.py tests/test_write_server_authorization_mutation.py tests/test_write_server_body_integrity.py tests/test_write_server_branch_edges.py tests/test_write_server_confidence_scale.py tests/test_write_server_contract_edges2.py tests/test_write_server_converge.py tests/test_write_server_grounding_guards.py tests/test_write_server_orchestration.py tests/test_write_server_paths.py tests/test_write_server_review_lifecycle.py tests/test_write_server_tool_contracts.py tests/test_write_server_walkup.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/write_services/validation.py",
+      "category": "write-path",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 90,
+      "session_deadline_seconds": 21600,
+      "test_command": "{python} -m pytest tests/test_write_server.py tests/test_write_server_adversarial.py tests/test_write_server_authorization_mutation.py tests/test_write_server_body_integrity.py tests/test_write_server_branch_edges.py tests/test_write_server_confidence_scale.py tests/test_write_server_contract_edges2.py tests/test_write_server_converge.py tests/test_write_server_grounding_guards.py tests/test_write_server_orchestration.py tests/test_write_server_paths.py tests/test_write_server_review_lifecycle.py tests/test_write_server_tool_contracts.py tests/test_write_server_walkup.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "tools/policy_plane.py",
+      "category": "policy",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 12600,
+      "test_command": "{python} -m pytest tests/test_policy_plane.py tests/test_policy_plane_evaluation.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "tools/schema_validator.py",
+      "category": "schema",
+      "critical": true,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 10800,
+      "test_command": "{python} -m pytest tests/test_schema_validator_base.py tests/test_schema_validator_body_citations.py tests/test_schema_validator_cache.py tests/test_schema_validator_governance.py tests/test_schema_validator_mutation.py tests/test_schema_validator_policy.py tests/test_schema_validator_units.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "src/okengine/html_sanitize.py",
+      "category": "reader-rendering",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_cockpit_sanitize.py tests/test_reader.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/okf_migrate.py",
+      "category": "corpus-integrity",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_okf_migrate.py tests/cron/test_okf_migrate_tombstones.py tests/cron/test_dedup_partition_collisions_tombstones.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/dedup_partition_collisions.py",
+      "category": "dedupe",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_dedup_partition_collisions.py tests/cron/test_dedup_partition_collisions_tombstones.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/cron/nvd_import.py",
+      "category": "feed-ingest",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/cron/test_nvd_import.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "ci/registry_canary.py",
+      "category": "supply-chain-governance",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/ci/test_registry_canary.py -q",
+      "min_mutants": 1
+    }
+  ]
+}

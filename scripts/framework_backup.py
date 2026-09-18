@@ -13,19 +13,25 @@ index) — MINUS heavy/transient/secret files (`.git`, logs, snapshots/backups, 
 so a backup can be integrity-verified before any restore. Restore extracts into a target dir only
 after the manifest verifies, then (by default) re-runs `framework validate` on the result.
 
-Secrets (`.env`, `.hermes-data/auth.json`) are EXCLUDED by default — restore re-provisions keys.
+Secrets (`.env`, `.hermes-data/auth.json`, and generated extension credentials) are EXCLUDED by
+default — restore re-provisions keys.
 Pass `--include-secrets` to capture them (the archive is then sensitive; store it accordingly).
 """
 import argparse
+import collections
 import hashlib
 import importlib.util
 import io
 import json
+import os
 import re
 import sys
 import tarfile
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+
+from okengine.corpus_transaction import CorpusLockTimeout, stable_corpus
 
 _HERE = Path(__file__).resolve().parent
 
@@ -42,7 +48,17 @@ _SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
 # path prefixes (relative to the pack) skipped — transient / heavy / recursive
 _SKIP_PREFIXES = (".okengine/snapshots", ".okengine/backups", ".hermes-data/logs", "tmp")
 # sensitive files skipped unless --include-secrets
-_SECRET_PATHS = {".env", ".hermes-data/auth.json"}
+_SECRET_PATHS = {
+    ".env",
+    ".hermes-data/auth.json",
+    ".okengine/extension-secrets.json",
+    ".okengine/generated/sidecars.compose.yml",
+}
+_CORPUS_TRANSIENT_PATHS = {
+    ".okengine/corpus/active.json",
+    ".okengine/corpus/lock",
+    ".okengine/corpus/lock-owner.json",
+}
 # config.yaml is KEPT (restorable runtime config) but its live MCP Bearer token is REDACTED in a
 # no-secrets backup: ensure-runtime.sh rewrites its Authorization header to `Bearer <token>`, so an
 # un-redacted no-secrets archive would leak that token while the CLI prints "(secrets excluded)"
@@ -75,6 +91,8 @@ def _excluded(rel: Path, include_secrets: bool) -> bool:
     if s.startswith(".hermes-data/qmd/cache/") and not _is_sqlite(rel):
         return True
     if not include_secrets and s in _SECRET_PATHS:
+        return True
+    if s in _CORPUS_TRANSIENT_PATHS:
         return True
     if any(rel.name.endswith(sc) for sc in _SQLITE_SIDECARS):
         return True                     # transient sqlite WAL/journal — folded into the db snapshot
@@ -154,6 +172,60 @@ def build_manifest(pack: Path, files, include_secrets: bool = True) -> dict:
     return {"files": entries, "digest": rollup, "count": len(entries)}
 
 
+def _deployment_identity(pack: Path) -> tuple[int | None, int | None]:
+    """Return the portable gateway uid/gid pin without archiving dotenv secrets."""
+    values: dict[str, int] = {}
+    env_path = pack / ".env"
+    if env_path.is_file():
+        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            match = re.match(r"^\s*(HERMES_UID|HERMES_GID)\s*=\s*([0-9]+)\s*(?:#.*)?$", line)
+            if match and int(match.group(2)) > 0:
+                values[match.group(1)] = int(match.group(2))
+    runtime = pack / ".hermes-data"
+    owner_path = runtime if runtime.exists() else pack
+    stat = owner_path.stat()
+    return values.get("HERMES_UID", stat.st_uid or None), values.get("HERMES_GID", stat.st_gid or None)
+
+
+def _restore_deployment_identity(target: Path, manifest: dict) -> None:
+    """Bind a restore to the target host's extracted runtime owner.
+
+    Numeric uid/gid values are host-local. Reusing the source host's values can make the gateway
+    start as an identity that cannot write the files just extracted. The restored runtime directory
+    is the target-host authority; a minimal archive without it falls back to the target directory.
+    """
+    owner = target / ".hermes-data"
+    owner = owner if owner.exists() else target
+    owner_stat = owner.stat()
+    replacements = {
+        "HERMES_UID": f"HERMES_UID={owner_stat.st_uid}",
+        "HERMES_GID": f"HERMES_GID={owner_stat.st_gid}",
+    }
+    env_path = target / ".env"
+    if not env_path.exists():
+        fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(
+                "# Restored non-secret deployment identity; add deployment secrets below.\n"
+                + "\n".join(replacements.values()) + "\n"
+            )
+    else:
+        existing = env_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        output = []
+        seen = set()
+        for line in existing:
+            key = line.split("=", 1)[0].strip() if "=" in line else ""
+            if key in replacements:
+                if key not in seen:
+                    output.append(replacements[key])
+                    seen.add(key)
+            else:
+                output.append(line)
+        output.extend(replacements[key] for key in ("HERMES_UID", "HERMES_GID") if key not in seen)
+        env_path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+    env_path.chmod(0o600)
+
+
 # --- create ------------------------------------------------------------------
 
 def default_dest(pack: Path) -> Path:
@@ -161,35 +233,56 @@ def default_dest(pack: Path) -> Path:
     return pack.parent / f"{pack.name}-backups"
 
 
-def create(pack: Path, dest_dir: Path, include_secrets: bool, stamp: str) -> tuple:
+def create(pack: Path, dest_dir: Path, include_secrets: bool, stamp: str,
+           lock_timeout_seconds: float | None = None) -> tuple:
     # SINGLE-PASS: hash each file from the SAME bytes we write into the tar. The old two-pass path
     # (build_manifest read every file, then the tar re-read every file) hashed and archived snapshots
     # taken minutes apart on a 10k-page + ~2GB-qmd vault — any file that changed between its two reads
     # produced an archive whose bytes no longer matched its manifest sha256, which verify()/restore()
     # then rejected as corrupt (invariant-audit HIGH). Reading once closes the window.
-    files = iter_files(pack, include_secrets)
     dest_dir.mkdir(parents=True, exist_ok=True)
     archive = dest_dir / f"{pack.name}-{stamp}.tar.gz"
-    entries = {}
-    with tarfile.open(archive, "w:gz") as tar:
-        for rel in files:
-            data = _file_bytes(pack, rel, include_secrets)
-            entries[rel.as_posix()] = hashlib.sha256(data).hexdigest()
-            st = (pack / rel).stat()
-            info = tarfile.TarInfo(rel.as_posix())
-            info.size = len(data)
-            info.mode = st.st_mode & 0o777
-            info.mtime = int(st.st_mtime)          # preserve mtime — restore was dating every file to
-                                                   # 1970-01-01, deranging mtime-keyed engine lanes (#39)
-            tar.addfile(info, io.BytesIO(data))
-        rollup = hashlib.sha256(
-            "\n".join(f"{k} {v}" for k, v in sorted(entries.items())).encode()).hexdigest()
-        manifest = {"files": entries, "digest": rollup, "count": len(entries),
-                    "created": stamp, "pack": pack.name, "include_secrets": include_secrets}
-        data = (json.dumps(manifest, indent=2) + "\n").encode()
-        info = tarfile.TarInfo(_MANIFEST)
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
+    fd, partial_name = tempfile.mkstemp(
+        prefix=f".{archive.name}.", suffix=".partial", dir=dest_dir
+    )
+    os.close(fd)
+    Path(partial_name).unlink()
+    try:
+        with stable_corpus(pack, lock_timeout_seconds=lock_timeout_seconds) as corpus_epoch:
+            files = iter_files(pack, include_secrets)
+            entries = {}
+            with tarfile.open(partial_name, "w:gz") as tar:
+                for rel in files:
+                    data = _file_bytes(pack, rel, include_secrets)
+                    entries[rel.as_posix()] = hashlib.sha256(data).hexdigest()
+                    st = (pack / rel).stat()
+                    info = tarfile.TarInfo(rel.as_posix())
+                    info.size = len(data)
+                    info.mode = st.st_mode & 0o777
+                    info.mtime = int(st.st_mtime)
+                    tar.addfile(info, io.BytesIO(data))
+                rollup = hashlib.sha256(
+                    "\n".join(f"{k} {v}" for k, v in sorted(entries.items())).encode()
+                ).hexdigest()
+                hermes_uid, hermes_gid = _deployment_identity(pack)
+                manifest = {
+                    "files": entries, "digest": rollup, "count": len(entries),
+                    "created": stamp, "pack": pack.name, "include_secrets": include_secrets,
+                    "corpus_epoch": corpus_epoch,
+                    "consistency": {
+                        "canonical_markdown_schema_config": "corpus-fenced",
+                        "sqlite": "online-backup-per-database",
+                        "runtime_files": "best-effort-per-file",
+                    },
+                    "hermes_uid": hermes_uid, "hermes_gid": hermes_gid,
+                }
+                data = (json.dumps(manifest, indent=2) + "\n").encode()
+                info = tarfile.TarInfo(_MANIFEST)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        os.replace(partial_name, archive)
+    finally:
+        Path(partial_name).unlink(missing_ok=True)
     return archive, manifest
 
 
@@ -198,17 +291,42 @@ def create(pack: Path, dest_dir: Path, include_secrets: bool, stamp: str) -> tup
 def verify(archive: Path) -> tuple:
     """(ok, manifest, problems). Recompute every archived file's sha256 vs the manifest."""
     problems = []
-    with tarfile.open(archive, "r:gz") as tar:
+    try:
+        tar = tarfile.open(archive, "r:gz")
+    except (OSError, tarfile.TarError) as exc:
+        return False, {}, [(archive.name, f"unreadable archive: {exc}")]
+    with tar:
         try:
-            manifest = json.loads(tar.extractfile(_MANIFEST).read())
-        except Exception as e:
-            return False, {}, [(_MANIFEST, f"unreadable: {e}")]
-        names = set(tar.getnames())
-        for name, expected in manifest.get("files", {}).items():
+            manifest_member = tar.extractfile(_MANIFEST)
+            if manifest_member is None:
+                raise ValueError("manifest is not a regular file")
+            manifest = json.loads(manifest_member.read())
+            declared = manifest.get("files", {})
+            if not isinstance(declared, dict):
+                raise ValueError("files must be an object")
+        except Exception as exc:
+            return False, {}, [(_MANIFEST, f"unreadable: {exc}")]
+
+        member_names = tar.getnames()
+        names = set(member_names)
+        expected_names = set(declared) | {_MANIFEST}
+        for name in sorted(names - expected_names):
+            problems.append((name, "not declared in manifest"))
+        for name in sorted(expected_names - names):
+            problems.append((name, "missing from archive"))
+        duplicates = sorted(name for name, count in collections.Counter(member_names).items()
+                            if count > 1)
+        for name in duplicates:
+            problems.append((name, "duplicate archive member"))
+
+        for name, expected in declared.items():
             if name not in names:
-                problems.append((name, "missing from archive"))
                 continue
-            got = hashlib.sha256(tar.extractfile(name).read()).hexdigest()
+            member = tar.extractfile(name)
+            if member is None:
+                problems.append((name, "not a regular file"))
+                continue
+            got = hashlib.sha256(member.read()).hexdigest()
             if got != expected:
                 problems.append((name, "checksum mismatch"))
     return (not problems), manifest, problems
@@ -232,6 +350,29 @@ def _validator(target: Path):
 VALIDATOR = _validator   # overridable for tests
 
 
+def _rearm_restored_schedule(target: Path) -> None:
+    """Force cron-plus to compute future fire times after a point-in-time restore.
+
+    The historical run/result fields remain useful DR state, but an archived
+    ``next_run_at`` is necessarily relative to the backup instant. Replaying it
+    days later makes every overdue lane fire together on the first scheduler
+    tick. A null value is cron-plus's supported recomputation signal.
+    """
+    jobs_path = target / ".hermes-data" / "cron-plus" / "jobs.json"
+    if not jobs_path.is_file():
+        return
+    state = json.loads(jobs_path.read_text(encoding="utf-8"))
+    jobs = state.get("jobs") if isinstance(state, dict) and set(state) == {"jobs"} else state
+    if not isinstance(jobs, list):
+        raise ValueError(f"restored cron state is not a job list: {jobs_path}")
+    for job in jobs:
+        if isinstance(job, dict):
+            job["next_run_at"] = None
+    staged = jobs_path.with_suffix(".json.restore-staged")
+    staged.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    staged.replace(jobs_path)
+
+
 def restore(archive: Path, target: Path, force: bool) -> tuple:
     """Verify the archive, then extract into target (must be empty unless force)."""
     ok, manifest, problems = verify(archive)
@@ -243,6 +384,8 @@ def restore(archive: Path, target: Path, force: bool) -> tuple:
     with tarfile.open(archive, "r:gz") as tar:
         members = [m for m in tar.getmembers() if m.name != _MANIFEST]
         tar.extractall(target, members=members, filter="data")   # 'data' = path-traversal safe
+    _rearm_restored_schedule(target)
+    _restore_deployment_identity(target, manifest)
     return True, manifest, []
 
 
@@ -281,7 +424,7 @@ def _human(n: int) -> str:
         if f < 1024 or u == "TB":
             return f"{f:.0f}{u}" if u == "B" else f"{f:.1f}{u}"
         f /= 1024
-    return f"{n}B"
+    return f"{n}B"  # pragma: no cover - the loop's TB arm is unconditional
 
 
 def main(argv: list) -> int:
@@ -315,7 +458,11 @@ def main(argv: list) -> int:
             return 2
         dest = Path(a.dest) if a.dest else default_dest(pack)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        archive, manifest = create(pack, dest, a.include_secrets, stamp)
+        try:
+            archive, manifest = create(pack, dest, a.include_secrets, stamp)
+        except CorpusLockTimeout as exc:
+            print(f"ERROR: backup could not acquire a stable corpus state: {exc}", file=sys.stderr)
+            return 1
         size = archive.stat().st_size
         print(f"backup: {archive}")
         print(f"  {manifest['count']} files · {_human(size)} · digest {manifest['digest'][:12]}"
@@ -373,7 +520,7 @@ def main(argv: list) -> int:
             print(f"  {f.name}  ({_human(f.stat().st_size)})")
         return 0
 
-    if a.action == "prune":
+    if a.action == "prune":  # pragma: no branch - argparse restricts action to the handled choices
         pack = Path(a.pack)
         dest = Path(a.dest) if a.dest else default_dest(pack)
         try:
@@ -384,7 +531,7 @@ def main(argv: list) -> int:
         print(f"pruned {n} '{pack.name}' backup(s) in {dest} (kept newest {a.keep})")
         return 0
 
-    return 2
+    return 2  # pragma: no cover - required subparser choices are exhaustively handled above
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""okengine#193 / #67 — offline regression for two post_deploy_verify.sh gates that used to be
+"""okengine#193 / #67 / #557 — offline regression for post_deploy_verify.sh gates that used to be
 blind, driven with a controllable fake `docker` on PATH (NO live stack — the sibling
 test_post_deploy_verify.py needs one and is normally skipped).
 
@@ -8,6 +8,10 @@ test_post_deploy_verify.py needs one and is normally skipped).
   #23 the qmd check must probe writability so a PERMANENTLY unwritable /opt/data/qmd (PermissionError,
       index empty forever) is distinguished from a benign still-building index — and must NOT point at
       a non-existent "corpus-indexer cron".
+  #557 the ownership gate must SWEEP the runtime tree, not spot-check two paths. #5 above stats only
+      cron-plus/ and jobs.json, so it stayed green while 774 root-owned files accumulated across the
+      fleet for a week — a gateway that could not open agent.log at all, and cron-plus/runs/<id>/
+      dirs silently dropping lane receipts.
 """
 import shutil
 import subprocess
@@ -35,9 +39,22 @@ case "$args" in
   *.pdv_wtest*)                     exit "${FAKE_QMD_WTEST_RC:-0}" ;;   # writability probe
   *qmd\ status*)  echo "${FAKE_NDOCS:-42}"; exit 0 ;;   # already post-pipeline (grep runs in sh -c)
   *HERMES_UID*)                     [ -n "${FAKE_UID_EMPTY:-}" ] && exit 1; echo "${FAKE_WANT_UID:-1003}"; exit 0 ;;
+  *vault-ownership-peer*)
+      case "${FAKE_VAULT_OWNER_STATE:-ok}" in
+        fail) printf 'FAIL\townership\twiki/operational/INDEX.md (file, uid 0) not owned by lane uid\n' ;;
+        err)  printf 'ERR\townership\tshared check unavailable\n' ;;
+        empty) exit 1 ;;
+        *)    printf 'OK\townership\tall lane-maintained vault paths owned by the gateway lane uid\n' ;;
+      esac
+      exit 0 ;;
   *python3*jobs.json*|*jobs.json*python3*) echo "${FAKE_NJOBS:-5}"; exit 0 ;;
   *stat\ -c*jobs.json*)             [ -n "${FAKE_UID_EMPTY:-}" ] && exit 1; echo "${FAKE_JOB_UID:-1003}"; exit 0 ;;
   *stat\ -c*cron-plus*)             [ -n "${FAKE_UID_EMPTY:-}" ] && exit 1; echo "${FAKE_DIR_UID:-1003}"; exit 0 ;;
+  # 5d sweep (okengine#557). Order matters: the "! -uid" forms must match BEFORE the plain
+  # total-count form, and the count/sample forms are told apart by wc-vs-head.
+  *find\ /opt/data\ !\ -uid*wc*)    [ -n "${FAKE_SWEEP_EMPTY:-}" ] && exit 1; echo "${FAKE_STRAY_COUNT:-0}"; exit 0 ;;
+  *find\ /opt/data\ !\ -uid*head*)  printf '%s\n' "${FAKE_STRAY_PATHS:-/opt/data/logs/agent.log}"; exit 0 ;;
+  *find\ /opt/data*wc*)             echo "${FAKE_TOTAL_PATHS:-79810}"; exit 0 ;;
   *.tick.lock*)                     exit 0 ;;
   *cron-plus*)                      exit 0 ;;       # config.yaml grep for cron-plus plugin
   *) exit 0 ;;
@@ -115,3 +132,84 @@ def test_unexecable_gateway_warns_not_vacuous_pass(tmp_path):  # invariant-audit
     _, out = _run(tmp_path, FAKE_UID_EMPTY=1)
     assert "cannot verify runtime ownership" in out and "not a pass" in out, out
     assert "owned by the gateway uid (?)" not in out, "still reports a vacuous PASS with uid '?'"
+
+
+# --- #557: whole-tree ownership sweep -----------------------------------------------------------
+def test_mis_owned_files_below_a_well_owned_dir_fail_the_sweep(tmp_path):
+    """The exact okengine#557 shape: cron-plus/ and jobs.json are FINE, the tree underneath is not.
+
+    5c stats only those two paths, so it stayed green while 774 root-owned files accumulated across
+    the fleet for a week -- one gateway unable to open agent.log at all, and root-owned
+    cron-plus/runs/<id>/ dirs silently dropping lane receipts. The sweep is what makes that loud.
+    """
+    _, out = _run(tmp_path, FAKE_WANT_UID=1003, FAKE_DIR_UID=1003, FAKE_JOB_UID=1003,
+                  FAKE_STRAY_COUNT=774, FAKE_STRAY_PATHS="/opt/data/logs/agent.log")
+    # the spot-checks still pass -- proving the sweep is what caught it, not 5c
+    assert "runtime dir + jobs.json owned by the gateway uid" in out, out
+    assert "774 file(s) under /opt/data are NOT owned by the gateway uid 1003" in out, out
+    assert "/opt/data/logs/agent.log" in out, out
+    assert "FAIL" in out, out
+    # the remediation must NOT recommend the world-writable shortcut
+    assert "chown -R 1003:1003" in out, out
+    assert "Do NOT use ensure-runtime.sh --fix-perms" in out, out
+
+
+def test_fully_owned_tree_passes_the_sweep(tmp_path):
+    _, out = _run(tmp_path, FAKE_WANT_UID=1003, FAKE_DIR_UID=1003, FAKE_JOB_UID=1003,
+                  FAKE_STRAY_COUNT=0, FAKE_TOTAL_PATHS=79810)
+    assert "runtime tree fully owned by the gateway uid (1003)" in out, out
+    assert "79810 paths swept" in out, out
+    assert "NOT owned by the gateway uid" not in out, out
+
+
+def test_root_owned_vault_page_fails_even_when_scheduler_peers_pass(tmp_path):
+    """Negative fixture: the root-owned INDEX survives cron-plus probes but post-deploy fails."""
+    _, out = _run(tmp_path, FAKE_VAULT_OWNER_STATE="fail", FAKE_DIR_UID=1003,
+                  FAKE_JOB_UID=1003, FAKE_STRAY_COUNT=0)
+    assert "runtime dir + jobs.json owned by the gateway uid" in out, out
+    assert "vault ownership (scheduler-independent peer)" in out, out
+    assert "[ownership] wiki/operational/INDEX.md" in out and "FAIL" in out, out
+
+
+def test_vault_ownership_peer_passes_and_unavailable_is_not_vacuous_green(tmp_path):
+    healthy_dir = tmp_path / "healthy"
+    healthy_dir.mkdir()
+    _, healthy = _run(healthy_dir, FAKE_VAULT_OWNER_STATE="ok")
+    assert "all lane-maintained vault paths owned" in healthy, healthy
+    unavailable_dir = tmp_path / "unavailable"
+    unavailable_dir.mkdir()
+    _, unavailable = _run(unavailable_dir, FAKE_VAULT_OWNER_STATE="empty")
+    assert "cannot verify vault ownership" in unavailable, unavailable
+    assert "UNDETECTABLE here, not a pass" in unavailable, unavailable
+    assert "all lane-maintained vault paths owned" not in unavailable, unavailable
+
+
+def test_unrunnable_sweep_probe_warns_undetectable_rather_than_passing(tmp_path):
+    """An empty probe means nothing was measured. Reporting PASS there is the vacuous green the
+    repo's "missing key = WARN undetectable, never a vacuous pass" rule forbids -- and it is the
+    failure mode this gate exists to catch, so it must not self-silence."""
+    _, out = _run(tmp_path, FAKE_WANT_UID=1003, FAKE_DIR_UID=1003, FAKE_JOB_UID=1003,
+                  FAKE_SWEEP_EMPTY="1")
+    assert "cannot sweep runtime-tree ownership" in out, out
+    assert "UNDETECTABLE here, not a pass" in out, out
+    assert "runtime tree fully owned" not in out, out
+
+
+# --- okengine#665: secret file modes ------------------------------------------------------------
+def test_group_or_world_readable_env_fails_the_secret_mode_gate(tmp_path):
+    (tmp_path / ".env").write_text("OKENGINE_MCP_TOKEN=x\n")
+    (tmp_path / ".env").chmod(0o644)
+    _rc, out = _run(tmp_path)
+    assert ".env is mode 644" in out and "readable by group/other" in out
+
+
+def test_owner_only_env_passes_and_world_readable_config_warns(tmp_path):
+    (tmp_path / ".env").write_text("OKENGINE_MCP_TOKEN=x\n")
+    (tmp_path / ".env").chmod(0o600)
+    rt = tmp_path / ".hermes-data"
+    rt.mkdir(exist_ok=True)
+    (rt / "config.yaml").write_text("mcp_servers: {}\n")
+    (rt / "config.yaml").chmod(0o644)
+    _rc, out = _run(tmp_path)
+    assert ".env is owner-only" in out
+    assert "config.yaml is mode 644" in out and "Bearer token is world-readable" in out

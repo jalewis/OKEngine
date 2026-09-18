@@ -18,9 +18,9 @@ engine.version           engine pin (okengine {{ENGINE_VERSION}})
 feeds/feeds.opml         ACTIVE sources — EMPTY by default (safe; opt in to enable)
 feeds/feeds.opml.example suggested sources (copy entries to opt in)
 crons/                   domain cron defs (enabled + jittered) + ingest-lane prompts + scripts
-docker-compose.yml       gateway + okengine-reader + okengine-mcp
+docker-compose.yml       gateway + reader/MCP + PostgreSQL structured-query projection
 .env.example             secrets & delivery (copy to .env; never commit)
-validate.py              offline parse + cross-consistency checks (run in CI)
+validate.py              thin shim to the engine-pinned framework validator
 wiki/                    the vault (THE product) — populated by ingest
 raw/                     runtime: feed_fetch output (gitignored)
 ```
@@ -37,13 +37,14 @@ Five files control what this vault becomes. Edit these (not the engine):
 | `crons/domain-crons.json` | the pack's **own** cron jobs (e.g. feed-fetch, daily brief; enabled + `@jitter:*` by default) | retune cadence (keep a non-:00 minute); populate feeds.opml to activate ingest |
 | `crons/engine-template-prompts.json` | the **prompts + executable output contracts** for model-driven lanes | tune curation while preserving the staged source-only and grounded-entity boundaries |
 
-After editing, run `python3 validate.py` (offline) and `framework validate` (the
-engine's deeper check) before deploy.
+After editing, run `python3 validate.py`. The shim delegates to the installed
+engine validator, which also verifies the pack's `engine.version` pin.
 
 ### Preserve the staged model-write boundary
 
 `raw-backfill` is deliberately source-only: it compiles one complete canonical source per
-selected raw item and emits an exact, verifiable per-item receipt. `entity-backfill` runs
+selected raw item and emits an exact, verifiable per-item receipt. Repaired source
+revisions remain pending until they are surfaced to `entity-backfill`, which runs
 downstream and may write an entity only when it cites a source page that resolves. Keep those
 lanes separate when replacing the placeholders. Narrow contracts when your schema needs more,
 but never widen raw ingestion beyond `sources`; add a separate contracted lane for another page
@@ -75,7 +76,7 @@ sentinel or a non-:00 minute — a committed round schedule fails CI).
 
 The crons are already running, so this one step turns ingest on: review
 `feeds/feeds.opml.example`, copy the `<outline>` entries you want into `feeds/feeds.opml`,
-and re-probe first: `python3 validate.py --probe`. To retune cadence, edit the schedules
+and re-probe their HTTPS URLs before enabling them. To retune cadence, edit the schedules
 in `crons/domain-crons.json` (keep a non-:00 minute, or a `@jitter:*` sentinel).
 
 ## Deploy (local)
@@ -108,18 +109,23 @@ The equivalent manual steps:
 ```sh
 # HERMES_UID/HERMES_GID default to your uid (you own the clone) — nothing to export.
 # Only for a portable/shared vault: export a fixed uid AND `sudo chown -R <uid> .` first.
-bash $ENGINE_DIR/scripts/build-engine-image.sh  # builds the gateway image (hermes-agent)
+bash $ENGINE_DIR/scripts/build-engine-image.sh  # builds immutable hermes-agent:okengine-<release>-<sha>
 bash $ENGINE_DIR/scripts/ensure-runtime.sh      # seed .hermes-data/config.yaml (fresh clone has none) — MUST run before compose
 ENGINE_DIR=$ENGINE_DIR docker compose up -d      # builds reader+mcp, runs all three
 CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-scripts.sh
 CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-plus-jobs.sh
 ```
+
+Prefer `deploy.sh`: it pins `OKENGINE_GATEWAY_IMAGE` and the generated
+`docker-compose.okengine-image.yml` override in `.env`, so a later bare Compose run keeps this
+deployment on the reviewed engine revision. The manual path must export the exact immutable image
+reference before Compose; it never consumes `hermes-agent:latest`.
 Full procedure: `docs/deploy-a-new-domain.md` §2 in the engine repo; the domain-pack
 spec is §1.
 
 ### Services & ports
 
-All three services share a per-pack bridge (the compose default network); only the reader
+The default services share a per-pack bridge (the compose default network); only the reader
 publishes a host port, offset by **+{{PORT_OFFSET}}** to avoid colliding with other packs
 (okengine#138).
 
@@ -128,11 +134,10 @@ publishes a host port, offset by **+{{PORT_OFFSET}}** to avoid colliding with ot
 | `gateway` | `{{PACK}}-gateway` | none (bridge; reaches `okengine-mcp` by service name) | Hermes agent runtime + delivery |
 | `okengine-reader` | `{{PACK}}-reader` | `{{READER_PORT}} → 9200` | search/read index over the vault (`:ro`) |
 | `okengine-mcp` | `{{PACK}}-mcp` | none by default (`{{MCP_PORT}} → 8730` only if exposed to external agents) | enforced MCP write/query surface (`WIKI_PATH=/opt/vault`) |
+| `postgres` + `okengine-projection` | Compose-managed | none | standard disposable structured-query read model; `deploy.sh` generates credentials and verifies it |
 
 ## Validate
 
 ```sh
-python3 validate.py            # parse + cross-consistency checks (offline)
-python3 validate.py --fix      # repair the feeds.opml.example count comment if it drifted
-python3 validate.py --probe    # HTTP-probe the suggested feeds in feeds.opml.example (network)
+python3 validate.py            # delegates to the engine-pinned `framework validate`
 ```

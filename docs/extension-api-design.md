@@ -5,6 +5,11 @@
 > [`authoring-an-extension.md`](authoring-an-extension.md); this doc formalizes it and adds the
 > missing contribution points (#63: custom importers, validators, reader panels, scoring
 > policies), built on a single principle: **drop-in contributions**.
+>
+> Extension proposals also follow the accepted
+> [`product-boundary decision`](design/product-boundary.md): domain behavior remains an extension
+> or application concern; only cross-product governance and portability contracts enter the
+> engine kernel, and runtime integration targets the versioned adapter rather than Hermes internals.
 
 ## 0. Where we are, and the two structural problems
 

@@ -44,6 +44,31 @@ def test_install_extract_cron_refuses_without_wiki_path(tmp_path):
     assert "WIKI_PATH is not set" in (r.stderr + r.stdout)
 
 
+def test_install_extract_cron_refuses_unwritable_raw_before_crontab(tmp_path):
+    """A real companion-create probe must gate schedule installation."""
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "crontab-called"
+    (fake_bin / "mktemp").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    (fake_bin / "crontab").write_text(
+        f"#!/bin/sh\ntouch '{marker}'\nexit 0\n", encoding="utf-8"
+    )
+    (fake_bin / "mktemp").chmod(0o755)
+    (fake_bin / "crontab").chmod(0o755)
+    env = dict(os.environ, WIKI_PATH=str(vault), PATH=f"{fake_bin}:{os.environ['PATH']}")
+
+    result = subprocess.run(
+        ["bash", str(REPO / "scripts" / "install-extract-cron.sh")],
+        env=env, capture_output=True, text=True,
+    )
+
+    assert result.returncode != 0
+    assert "cannot create companions" in result.stderr
+    assert not marker.exists(), "crontab must not be touched after a failed write probe"
+
+
 # ── B7.3 framework budget: fail loud on the host ─────────────────────────────
 
 def _budget():

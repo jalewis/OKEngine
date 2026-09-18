@@ -16,8 +16,9 @@ OPERATIONS = {"create", "update", "patch", "append", "converge", "tombstone", "f
 COMPLETION = {"run", "per-selected-item"}
 KEYS = {
     "api", "allowed_namespaces", "allowed_types", "operations",
-    "required_fields", "required_relationships", "body", "unknown_fields",
+    "required_fields", "required_relationships", "optional_relationships", "body", "unknown_fields",
     "unresolved_links", "placeholder_links", "completion",
+    "required_write_path",
 }
 BODY_KEYS = {"required", "min_non_whitespace"}
 
@@ -53,11 +54,19 @@ def validate(contract: object, where: str = "output_contract") -> list[str]:
             _strings(contract.get(key), f"{where}.{key}", nonempty=True)
         except ValueError as exc:
             errors.append(str(exc))
-    for key in ("required_fields", "required_relationships"):
+    for key in ("required_fields", "required_relationships", "optional_relationships"):
         try:
             _strings(contract.get(key, []), f"{where}.{key}")
         except ValueError as exc:
             errors.append(str(exc))
+    required = contract.get("required_relationships", [])
+    optional = contract.get("optional_relationships", [])
+    if isinstance(required, list) and isinstance(optional, list) and all(
+        isinstance(value, str) for value in [*required, *optional]
+    ):
+        overlap = sorted(set(required) & set(optional))
+        if overlap:
+            errors.append(f"{where}.optional_relationships overlaps required_relationships: {overlap}")
     try:
         operations = set(_strings(contract.get("operations"), f"{where}.operations", nonempty=True))
         bad = sorted(operations - OPERATIONS)
@@ -84,6 +93,14 @@ def validate(contract: object, where: str = "output_contract") -> list[str]:
             errors.append(f"{where}.{key} must be one of {sorted(POLICIES)}")
     if contract.get("completion") not in COMPLETION:
         errors.append(f"{where}.completion must be one of {sorted(COMPLETION)}")
+    required_path = contract.get("required_write_path")
+    if required_path is not None:
+        if not isinstance(required_path, str) or not required_path.strip():
+            errors.append(f"{where}.required_write_path must be a non-empty string")
+        elif required_path.startswith("/") or ".." in required_path.split("/"):
+            errors.append(f"{where}.required_write_path must be wiki-relative")
+        elif contract.get("completion") != "run":
+            errors.append(f"{where}.required_write_path requires completion=run")
     return errors
 
 
@@ -121,8 +138,20 @@ def compose(floor: dict | None, policy: dict | None, where: str = "output_contra
         if (key == "operations" or "*" not in floor[key]) and set(policy[key]) - set(floor[key]):
             raise ValueError(f"{where}.{key} policy may not widen the engine floor")
         out[key] = narrowed
-    for key in ("required_fields", "required_relationships"):
-        out[key] = list(dict.fromkeys([*floor.get(key, []), *policy.get(key, [])]))
+    for key in ("required_fields", "required_relationships", "optional_relationships"):
+        values = list(dict.fromkeys([*floor.get(key, []), *policy.get(key, [])]))
+        if key != "optional_relationships" or values:
+            out[key] = values
+        else:
+            out.pop(key, None)
+    # A pack may tighten an optional engine-floor relationship into a required
+    # one. The composed contract keeps the stronger requirement, not both modes.
+    optional = [field for field in out.get("optional_relationships", [])
+                if field not in out["required_relationships"]]
+    if optional:
+        out["optional_relationships"] = optional
+    else:
+        out.pop("optional_relationships", None)
     rank = {"allow": 0, "review": 1, "reject": 2}
     for key in ("unknown_fields", "unresolved_links", "placeholder_links"):
         if rank[policy[key]] < rank[floor[key]]:
@@ -141,5 +170,12 @@ def compose(floor: dict | None, policy: dict | None, where: str = "output_contra
     if floor["completion"] == "per-selected-item" and policy["completion"] != "per-selected-item":
         raise ValueError(f"{where}.completion policy may not weaken the engine floor")
     out["completion"] = policy["completion"]
+    floor_path = floor.get("required_write_path")
+    policy_path = policy.get("required_write_path")
+    if floor_path and policy_path and floor_path != policy_path:
+        raise ValueError(f"{where}.required_write_path policy may not replace the engine floor")
+    out["required_write_path"] = policy_path or floor_path
+    if out["required_write_path"] is None:
+        out.pop("required_write_path")
     out["api"] = API_VERSION
     return out

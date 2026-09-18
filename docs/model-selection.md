@@ -55,6 +55,14 @@ Cause: smaller / local models are reliable at *reading and reasoning* but unreli
 **"read N things, then emit a structured tool call to write"** flow — they regress to answering in
 prose instead of calling the tool.
 
+> **First rule out the serving layer.** For a **local** model these symptoms are indistinguishable
+> from a server that is failing to *parse* tool calls the model emitted correctly — a mismatch
+> between the GGUF's chat template and the one the server substitutes. Same missing page, same
+> prose, same "completed successfully", but nothing about the model is wrong and routing the lane
+> to a bigger model will not fix it. Confirm with the replay in
+> [local-model-serving.md](local-model-serving.md#confirm-it-before-you-migrate) before spending
+> the model upgrade.
+
 Fix: route **synthesis-and-write** lanes to a **capable, reliable-tool-calling** model (a
 reasoning/"pro" tier) via a per-lane override, even when `model.default` is a cheaper local model.
 These lanes are low-volume, so the extra cost is small. The rule of thumb: **don't judge a write lane
@@ -111,6 +119,10 @@ the `@`-refs and stays round-trippable.
 - `ollama_num_ctx` in a profile is honored per-lane only with the companion Hermes patch
   (okengine#151 Suggestion 2b); without it, a lane on a local-endpoint profile still gets ctx via
   the agent's auto-detect (capped to `context_length`), just not an explicit per-lane cap.
+- When set, `ollama_num_ctx` must be a positive integer (not a string or boolean).
+  `framework validate` rejects malformed profile values before deploy; the Hermes
+  runtime rejects malformed direct job/agent overrides as a backstop. The chosen
+  size still needs serving-endpoint and memory-capacity verification.
 
 ## On specific models
 
@@ -141,7 +153,7 @@ sets the complete request deadline; `agent.http_status_policy` maps a status to 
 ```yaml
 providers:
   custom:
-    request_timeout_seconds: 350
+    request_timeout_seconds: 500
 agent:
   http_status_policy:
     404: {max_attempts: 1, fallback: false}
@@ -177,7 +189,8 @@ lanes run more serially and slower, but finish instead of dying in a rate-limit 
   `:free` tier (or `openrouter/free`, the **Free Models Router**, which routes to any available
   free model — the free counterpart of `openrouter/auto`; never use `openrouter/auto` itself, it
   can route to a paid model). For a *paid escape hatch* when every free tier is rate-limited, end
-  the chain with **one explicit paid model** (the engine default uses `deepseek-v4-pro`). Drop
+  the chain with **one explicit paid model** (the engine default uses V4.1 Flash as
+  `deepseek-flash`). Drop
   the paid entry entirely for a strictly-free deployment.
 - **Spread the schedules** — pack crons use `@jitter:` sentinels so they don't all coincide.
 - **Cut the call volume** — prefer `no_agent` deterministic lanes, batch work, and keep the

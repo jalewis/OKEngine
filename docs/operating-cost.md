@@ -30,21 +30,26 @@
 | Web search/fetch | No | `web_search`/`web_extract` are **disabled** in every ingest prompt (`LOCAL-ONLY`) — no paid web-API spend from crons. |
 | Feed fetching | No | `feed-fetch` is a pure script (`no_agent`) — plain HTTP GETs of RSS. |
 | Delivery (Telegram) | No | Free API. |
-| The other 17 maintenance crons | No | Index/health/tier/repair/reshelve are `no_agent` scripts. |
+| Deterministic maintenance crons | No model cost | Index/health/tier/repair/reshelve jobs marked `no_agent` use CPU, storage, and network where applicable but never call an LLM. |
 | Hosting | Indirect | The gateway + reader + mcp containers run 24/7 (server/electricity), and any local model inference uses your CPU/GPU. |
 | **Interactive agent (Telegram chat)** | **YES, if used** | Every message you send the gateway agent is an LLM session, and it *can* use paid web tools if you enable them. Separate from the cron fleet below. |
 
 ## The cron fleet, by cost
 
-Counts below are the ENGINE-ONLY baseline (`config/engine-crons.json` at engine v0.11.x) — NOT an
+Counts below are the ENGINE-ONLY baseline (`config/engine-crons.json` at engine v0.13.7) — NOT an
 engine invariant: a composed deployment ADDS pack + extension jobs, so a live fleet is larger (e.g.
-the okcti bundle runs ~90+). Re-derive per deployment from its `cron-plus-jobs.json`; treat this as
+the OKCTI bundle runs more than 100). Re-derive per deployment from its `cron-plus-jobs.json`; treat this as
 the engine floor, not the total.
 
-**53 engine jobs. 34 are free `no_agent` scripts** (feed-fetch, reshelve, index/hot-set/tier
+**61 engine jobs. 44 are `no_agent` scripts** (feed-fetch, reshelve, index/hot-set/tier
 builders, YAML/schema/frontmatter repair drains, health refreshers) — they never call the LLM.
-**19 invoke the agent**, and most are wake-gated (a cheap script decides each tick whether there's
+**17 can invoke the agent**, and most are wake-gated (a cheap script decides each tick whether there's
 work; the agent fires only if so). Only the **daily brief** fires unconditionally (once/day).
+
+These counts describe code at one release, not what a running pack has deployed.
+Check `.hermes-data/engine-runtime.yaml` for the pack's engine commit and compare it
+with the approved GitLab commit before using this inventory for operational or cost
+decisions. Engine fixes do not become fleet-wide merely because they merged.
 
 So the schedule frequency is an **upper bound on gate checks**, not on LLM calls.
 `raw-backfill` ticks every 5 min but only wakes the agent when raw items are waiting,

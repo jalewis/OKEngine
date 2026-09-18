@@ -7,8 +7,10 @@ tools; the prediction's own claim + reasoning are your source.
 
 For each prediction in the batch, IN ORDER:
 
-1. `file_read` the prediction page. Read its claim, reasoning/basis, `subject`, `confidence`, and
-   `resolves_by`.
+1. `file_read` the prediction page using the exact vault-relative file path
+   `wiki/predictions/<slug>.md`. Read its claim, reasoning/basis, `subject`, `confidence`, and
+   `resolves_by`. (`append_to_section` below uses the logical key without `wiki/` or `.md`;
+   the read tool does not.)
 2. Derive **what observable outcome, by `resolves_by`, would prove this prediction WRONG.** Good
    criteria are:
    - **Specific and observable** — a concrete event, threshold, or absence you could check against
@@ -20,7 +22,7 @@ For each prediction in the batch, IN ORDER:
      be unfalsifiable as written; say so in the section (one line: "As written this is hard to
      falsify because …") rather than inventing a fake test. Do NOT pad.
 3. Add the section with:
-   `mcp_okengine_write_append_to_section(path="predictions/<slug>", heading="What would refute this", text="<criteria>")`
+   `mcp__okengine_write_okengine_predictions_prediction_structural_backfill__append_to_section(path="predictions/<slug>", heading="What would refute this", text="<criteria>")`
    — this creates `## What would refute this` at the end of the page, preserving everything else.
    Use a short bulleted list (2–4 bullets) of concrete refuters.
 

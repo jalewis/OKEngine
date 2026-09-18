@@ -44,6 +44,7 @@ operations:
     schedule: {kind: cron, expr: "17 6 * * *"}
     entrypoint: select_prediction_candidates.py      # wake-gate selector
     prompt_file: prompts/candidate-watch.md
+    max_iterations: 12
     output_contract: &prediction_contract
       api: 1
       allowed_namespaces: [predictions, dashboards]
@@ -55,23 +56,25 @@ operations:
       unknown_fields: reject
       unresolved_links: review
       placeholder_links: reject
-      completion: per-selected-item
+      completion: run
     adversarial_fixtures: &model_fixtures [tests/extensions/test_model_output_contracts.py]
-    toolsets: [file, todo, okengine-write, okengine]
+    toolsets: [file_read, okengine-write, okengine]
   grade:
     schedule: {kind: cron, expr: "23 6 * * *"}
     entrypoint: select_predictions_for_grading.py
     prompt_file: prompts/grade.md
+    max_iterations: 12
     output_contract: *prediction_contract
     adversarial_fixtures: *model_fixtures
-    toolsets: [file, todo, okengine-write, okengine]
+    toolsets: [todo, okengine-write, okengine]
   regrade:
     schedule: {kind: cron, expr: "29 */6 * * *"}
     entrypoint: select_regrade_batch.py
     prompt_file: prompts/regrade.md
+    max_iterations: 12
     output_contract: *prediction_contract
     adversarial_fixtures: *model_fixtures
-    toolsets: [file, todo, okengine-write, okengine]
+    toolsets: [todo, okengine-write, okengine]
   confidence-recommender:
     schedule: {kind: cron, expr: "27 */6 * * *"}  # materialize before regrade at :29
     entrypoint: confidence_recommender.py          # recommendation-only JSONL + digest
@@ -104,49 +107,66 @@ operations:
     schedule: {kind: cron, expr: "30 21 * * 0"}   # ported cadence: weekly (Sun)
     entrypoint: select_prediction_schema_drain.py
     prompt_file: prompts/schema-drain.md
+    max_iterations: 12
     output_contract: *prediction_contract
     adversarial_fixtures: *model_fixtures
-    toolsets: [file, todo, okengine-write, okengine]
+    toolsets: [todo, okengine-write, okengine]
   prediction-structural-backfill:
     schedule: {kind: cron, expr: "45 */6 * * *"}   # ported cadence: every 6h, drains 5/run
     entrypoint: select_prediction_structural_backfill.py
     prompt_file: prompts/structural-backfill.md
-    output_contract: *prediction_contract
+    max_iterations: 12
+    output_contract:
+      api: 1
+      allowed_namespaces: [predictions]
+      allowed_types: [prediction]
+      operations: [append]
+      required_fields: [type]
+      required_relationships: []
+      body: {required: true, min_non_whitespace: 40}
+      unknown_fields: reject
+      unresolved_links: review
+      placeholder_links: reject
+      completion: per-selected-item
     adversarial_fixtures: *model_fixtures
-    toolsets: [file, todo, okengine-write, okengine]
+    toolsets: [file_read_exact, okengine-write]
   # Forecasting-discipline JUDGMENT lanes (okengine#159 P2) — agent ops (wake-gate + prompt).
   # The origin backtest's useful portfolio slices and portfolio-watch are folded into the one
   # deterministic calibration-refresh authority (#222); update-recommender remains separate.
   forecast-review:
-    schedule: {kind: cron, expr: "0 16 * * 6"}   # weekly (Sat) — the meta-layer, ported from
+    schedule: {kind: cron, expr: "@jitter:weekly@16,6"} # weekly Sat near 16:00 — the meta-layer
                                                   # the origin system's weekly-forecast-review
     entrypoint: select_forecast_review.py
     prompt_file: prompts/forecast-review.md
+    max_iterations: 12
     output_contract: *prediction_contract
     adversarial_fixtures: *model_fixtures
-    toolsets: [file, todo, okengine-write, okengine]
+    toolsets: [todo, okengine-write, okengine]
   base-rates:
     schedule: {kind: cron, expr: "50 6 * * 1"}
     entrypoint: select_base_rates.py
     prompt_file: prompts/base-rates.md
+    max_iterations: 12
     output_contract: *prediction_contract
     adversarial_fixtures: *model_fixtures
-    toolsets: [file, todo, okengine-write, okengine]
+    toolsets: [todo, okengine-write, okengine]
     # Selector first writes deterministic A–E rate families to base-rate-metrics + JSONL (#223),
     # then wakes the agent only when there is enough resolved history to interpret them.
   prediction-falsification-search:
     schedule: {kind: cron, expr: "35 */6 * * *"}
     entrypoint: select_falsification.py
     prompt_file: prompts/falsification-search.md
+    max_iterations: 12
     output_contract: *prediction_contract
     adversarial_fixtures: *model_fixtures
-    toolsets: [web, file, todo, okengine-write, okengine]
+    toolsets: [web, todo, okengine-write, okengine]
   output-outcome-eval:
     schedule: {kind: cron, expr: "55 6 * * 1"}
     entrypoint: select_output_outcome.py
     prompt_file: prompts/output-outcome-eval.md
+    max_iterations: 12
     output_contract: *prediction_contract
     adversarial_fixtures: *model_fixtures
-    toolsets: [file, todo, okengine-write, okengine]
+    toolsets: [todo, okengine-write, okengine]
     # Selector first writes deterministic output→later-state joins + JSONL (#223); the agent adds
     # qualitative accuracy review only when outputs and enough resolved outcomes exist.

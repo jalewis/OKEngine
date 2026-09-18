@@ -39,3 +39,17 @@ def test_satisfies_pin_unparseable_is_none():
     assert em.satisfies_pin("not-a-version", "v0.3.2") is None
     assert em.satisfies_pin("v0.3.0", "") is None
     assert em.satisfies_pin(None, "v0.3.2") is None
+
+
+def test_manifest_load_release_and_runtime_edge_shapes(tmp_path, monkeypatch):
+    em = _em()
+    monkeypatch.setattr(em, "MANIFEST", tmp_path / "missing.yaml")
+    assert em._load() == {} and em.engine_release() is None and em.hermes_pin() is None
+    em.MANIFEST.write_text("[]")
+    assert em._load() == {}
+    em.MANIFEST.write_text("[")
+    assert em._load() == {}
+    em.MANIFEST.write_text("engine_release: v1.2.3\nruntime: nope\n")
+    assert em.engine_release() == "v1.2.3" and em.hermes_pin() is None
+    em.MANIFEST.write_text("runtime: {pinned_tag: v9.8.7}\n")
+    assert em.hermes_pin() == "v9.8.7"

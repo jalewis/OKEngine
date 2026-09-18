@@ -20,6 +20,8 @@ MCP=${OKENGINE_MCP_SVC:-okengine-mcp}
 READER=${OKENGINE_READER_SVC:-okengine-reader}
 COCKPIT=${OKENGINE_COCKPIT_SVC:-okengine-cockpit}
 OPERATIONS=${OKENGINE_OPERATION_SVC:-okengine-operation-runner}
+POSTGRES=${OKENGINE_POSTGRES_SVC:-postgres}
+PROJECTION=${OKENGINE_PROJECTION_SVC:-okengine-projection}
 # Keep the verifier's own source path out of the deployment environment's
 # ENGINE_DIR namespace. Packs commonly pin ENGINE_DIR in .env; that file is
 # sourced below and must not redirect verification to an older checkout.
@@ -30,6 +32,20 @@ ok()  { printf "  \033[32mPASS\033[0m  %s\n" "$1"; pass=$((pass+1)); }
 wn()  { printf "  \033[33mWARN\033[0m  %s\n        ↳ %s\n" "$1" "$2"; warn=$((warn+1)); }
 bad() { printf "  \033[31mFAIL\033[0m  %s\n        ↳ %s\n" "$1" "$2"; fail=$((fail+1)); }
 dcx() { docker compose exec -T "$@" 2>/dev/null; }
+
+# Compose service list, resolved ONCE and reused. `docker compose config --services 2>/dev/null |
+# grep -Fxq` conflates two different answers: compose replied and the service is not defined, and
+# compose could not be asked at all. Observed live on 2026-08-17 — five verifiers run back to back,
+# one `config` call failed under the contention, and the run reported "projection services are
+# absent from effective Compose configuration" on a deployment whose projection was up and healthy,
+# then passed three times in a row immediately after. A command that could not be asked must not
+# answer for the thing it was asked about.
+COMPOSE_SERVICES=$(docker compose config --services 2>/dev/null)
+COMPOSE_SERVICES_RC=$?
+has_service() {
+    [ "$COMPOSE_SERVICES_RC" -eq 0 ] || return 2      # 2 = could not ask, distinct from absent
+    printf '%s\n' "$COMPOSE_SERVICES" | grep -Fxq "$1"
+}
 
 if [ ! -f docker-compose.yml ] && [ ! -f compose.yml ]; then
     echo "no docker-compose.yml here — run from the deployment dir (where you ran deploy.sh)." >&2
@@ -50,14 +66,73 @@ echo "[1] containers"
 # never checked the cockpit, so a cockpit that failed to start passed verification (invariant-audit
 # B7.5).
 svcs="$GW $MCP $READER"
-if docker compose config --services 2>/dev/null | grep -Fxq "$COCKPIT"; then
+has_service "$COCKPIT"; _cockpit=$?
+if [ "$_cockpit" -eq 0 ]; then
     svcs="$svcs $COCKPIT"
+elif [ "$_cockpit" -eq 2 ]; then
+    wn "cannot read the effective Compose configuration — cockpit presence unknown" \
+       "undetectable, not a pass: docker compose config --services failed; re-run, and check the daemon"
 fi
 for svc in $svcs; do
     state=$(docker compose ps --status running --services 2>/dev/null | grep -Fx "$svc")
     if [ -n "$state" ]; then ok "$svc is running"
     else bad "$svc is not running" "docker compose up -d $svc  (then: docker compose logs $svc)"; fi
 done
+
+# The engine-generated override is the upgrade path for existing packs: checking only the source
+# file would let Compose omit/override it while deploy still reported healthy. Inspect the running
+# gateway's effective Docker health command and require every #650 failure signal. This is config
+# evidence, not current health state; the independent live probes below establish current behavior.
+gw_health_cid="$(docker compose ps -q "$GW" 2>/dev/null | head -1)"
+gw_health_test=""
+[ -n "$gw_health_cid" ] && gw_health_test="$(docker inspect \
+    --format '{{json .Config.Healthcheck.Test}}' "$gw_health_cid" 2>/dev/null || true)"
+if [ -z "$gw_health_test" ] || [ "$gw_health_test" = "null" ]; then
+    bad "gateway effective health contract is absent or unreadable" \
+        "re-run deploy.sh so docker-compose.okengine-image.yml installs the engine-owned healthcheck"
+else
+    missing_health=""
+    for signal in '.tick.lock' '.scheduler-stalled' 'lock-owner.json' '-mmin +60' '/proc/[0-9]*/stat' ') D '; do
+        case "$gw_health_test" in *"$signal"*) ;; *) missing_health="$missing_health $signal" ;; esac
+    done
+    if [ -n "$missing_health" ]; then
+        bad "gateway effective health contract is incomplete (missing:$missing_health)" \
+            "re-run deploy.sh and force-recreate gateway so stale lock/run and D-state failures cannot read healthy"
+    else
+        ok "gateway effective health contract covers scheduler, corpus lock, stale runs, and D-state"
+    fi
+fi
+
+# PostgreSQL projection is a standard service. Verify both the projector's scan-vs-row/digest
+# health contract and the actual typed MCP consumer path; a running container alone is not proof
+# that analysis tasks can query it or that reader credentials/freshness enforcement work.
+echo "[1p] PostgreSQL projection"
+has_service "$PROJECTION"; _projection=$?
+if [ "$_projection" -eq 2 ]; then
+    wn "cannot read the effective Compose configuration — projection checks skipped" \
+       "undetectable, not a pass: docker compose config --services failed; re-run, and check the daemon"
+elif [ "$_projection" -eq 0 ]; then
+    for svc in "$POSTGRES" "$PROJECTION"; do
+        state=$(docker compose ps --status running --services 2>/dev/null | grep -Fx "$svc")
+        if [ -n "$state" ]; then ok "$svc is running"
+        else bad "$svc is not running" "docker compose up -d --build $svc; docker compose logs $svc"; fi
+    done
+    # `if cmd; then` rather than assign-then-test-$?: the two are equivalent only while nothing
+    # sits between them, and one inserted line silently inverts the verdict. This repo has been
+    # bitten by the same shape twice — `deploy-cron-scripts.sh … | tail -3` returning tail's
+    # status, and a `$?` read after a pipe reporting the wrong exit code (okengine#602).
+    if projection_health=$(timeout 120 docker compose exec -T "$PROJECTION" \
+            python /app/service.py --health 2>&1); then
+        ok "projection health and file-count conformance passed: $projection_health"
+    else bad "projection health/conformance failed" "$projection_health"; fi
+    if typed_count=$(timeout 30 docker compose exec -T "$MCP" python -c \
+            'import asyncio,json; from okengine.mcp import projection; print(json.dumps(asyncio.run(projection.count_pages())))' 2>&1); then
+        ok "typed MCP count_pages query passed: $typed_count"
+    else bad "typed MCP projection query failed" "$typed_count"; fi
+else
+    bad "projection services are absent from effective Compose configuration" \
+        "re-run deploy.sh to materialize the standard projection overlay"
+fi
 
 # helper: host port + bind for a service's container port
 hostport() {   # ip:port, or EMPTY when unpublished
@@ -96,7 +171,8 @@ fi
 echo "[2b] hardened posture"
 hv=$(python3 - "$VERIFY_ENGINE_DIR" <<'PY' 2>/dev/null
 import os, sys
-sys.path.insert(0, os.path.join(sys.argv[1], "scripts", "cron"))
+sys.path[:0] = [os.path.join(sys.argv[1], "scripts", "cron"),
+                os.path.join(sys.argv[1], "src")]
 try:
     from hardening_lib import hardened_posture_violations, is_hardened
 except Exception as exc:
@@ -126,7 +202,7 @@ echo "[3] MCP read server"
 MB=$(hostport "$MCP" 8730)
 if [ -z "$MB" ]; then wn "MCP port 8730 not published" "the agent reaches it in-network; only publish it if a host client needs it"
 else
-    MIP=${MB%:*}; MPORT=${MB##*:}; MURL="http://127.0.0.1:$MPORT"
+    MPORT=${MB##*:}; MURL="http://127.0.0.1:$MPORT"
     code=$(curl -s -o /dev/null -w "%{http_code}" -m8 "$MURL/mcp")
     if [ "$code" = "401" ]; then ok "MCP /mcp 401 without token (auth enforced, on $MB)"
         if [ -n "$MCP_TOKEN" ]; then
@@ -145,7 +221,7 @@ fi
 # truth (/opt/data/scripts, refreshed by deploy-cron-scripts, read via the gateway which mounts it):
 # a stage-only deploy makes the staged copy NEW while the read-MCP baked copy stays OLD -> stale
 # search. Present on only one side is UNDETECTABLE, never a pass (the M22 one-sided-drift rule).
-for lib in kb_search.py kb_graph.py tier_lib.py; do
+for lib in kb_search.py tier_lib.py schema_lib.py; do
   mh=$(dcx "$MCP" sh -c "sha256sum /app/scripts/$lib 2>/dev/null | cut -d' ' -f1")
   sh_=$(dcx "$GW" sh -c "sha256sum /opt/data/scripts/$lib 2>/dev/null | cut -d' ' -f1")
   if [ -n "$mh" ] && [ -n "$sh_" ]; then
@@ -156,6 +232,15 @@ for lib in kb_search.py kb_graph.py tier_lib.py; do
        "undetectable, not a pass: ensure both the read-MCP image and /opt/data/scripts carry $lib"
   fi
 done
+mh=$(dcx "$MCP" sh -c "sha256sum /app/config/base-schema.yaml 2>/dev/null | cut -d' ' -f1")
+sh_=$(dcx "$GW" sh -c "sha256sum /opt/data/config/base-schema.yaml 2>/dev/null | cut -d' ' -f1")
+if [ -n "$mh" ] && [ -n "$sh_" ]; then
+  [ "$mh" != "$sh_" ] && bad "read-MCP base-schema.yaml is STALE vs the staged source — tier-filtered search is out of date" \
+      "rebuild the read-MCP image (docker compose build $MCP && up -d $MCP); a stage-only deploy misses it"
+elif [ -n "$mh" ] || [ -n "$sh_" ]; then
+  wn "cannot compare read-MCP base-schema.yaml — present on only one of {read-MCP baked, staged}" \
+     "undetectable, not a pass: ensure both /app/config/base-schema.yaml and /opt/data/config/base-schema.yaml exist"
+fi
 
 # 3b. write-path baked-lib drift (okengine invariant-audit B2) ---------------
 # The enforced okengine-write MCP (write_server.py) runs INSIDE the gateway and imports its write-path
@@ -174,6 +259,23 @@ for lib in schema_lib.py id_lib.py id_index.py okf_migrate.py; do
   elif [ -n "$bh" ] || [ -n "$sh_" ]; then
     wn "cannot compare write-path lib $lib — present on only one of {baked /opt/hermes/scripts/cron, staged /opt/data/scripts}" \
        "undetectable, not a pass: ensure both the gateway image and /opt/data/scripts carry $lib"
+  fi
+done
+
+# The write server also bakes these two contract artifacts. Keep this scheduler-independent peer in
+# lockstep with deployment_checks.check_write_path_libs: a dead cron-plus lane must not hide drift.
+for spec in "config/base-schema.yaml:config/base-schema.yaml" \
+            "tools/schema_validator.py:config/schema_validator.py"; do
+  baked=${spec%%:*}; staged=${spec#*:}
+  name=${baked##*/}
+  bh=$(dcx "$GW" sh -c "sha256sum /opt/hermes/$baked 2>/dev/null | cut -d' ' -f1")
+  sh_=$(dcx "$GW" sh -c "sha256sum /opt/data/$staged 2>/dev/null | cut -d' ' -f1")
+  if [ -n "$bh" ] && [ -n "$sh_" ]; then
+    [ "$bh" != "$sh_" ] && bad "write-path contract $name is STALE (baked vs staged) — the enforced write path is running an old contract" \
+        "rebuild the gateway image (build-engine-image.sh) && docker compose up -d $GW"
+  elif [ -n "$bh" ] || [ -n "$sh_" ]; then
+    wn "cannot compare write-path contract $name — present on only one of {baked, staged}" \
+       "undetectable, not a pass: ensure both the gateway image and /opt/data/config carry $name"
   fi
 done
 
@@ -212,6 +314,25 @@ else bad "okengine-write not in $CFG" "re-run deploy; the enforced write path mu
 if dcx "$GW" test -f /opt/hermes/okengine-mcp/write_server.py; then ok "write_server.py present in the gateway image"
 else bad "write_server.py missing in the gateway" "rebuild the gateway image (scripts/build-engine-image.sh)"; fi
 
+# Hermes launches stdio MCP processes with the server's declared env mapping rather than the
+# gateway's image-level environment. Check the child-process contract itself: a shell-level import
+# can pass while every cron-scoped writer still resolves a nonexistent wheel-relative catalog.
+writer_policy_env=$(dcx "$GW" /opt/hermes/.venv/bin/python -c '
+import yaml
+d=yaml.safe_load(open("/opt/data/config.yaml")) or {}
+bad=[]
+for name, spec in (d.get("mcp_servers") or {}).items():
+    if name == "okengine-write" or name.startswith("okengine-write-"):
+        env=(spec or {}).get("env") or {}
+        if env.get("OKENGINE_POLICY_CATALOG") != "/opt/hermes/config/policy/catalog.yaml": bad.append(name)
+print(",".join(sorted(bad)) or "OK")')
+if [ "$writer_policy_env" = "OK" ]; then
+    ok "every stdio write server receives the baked policy catalog path"
+else
+    bad "stdio writer policy env missing or wrong: ${writer_policy_env:-undetectable}" \
+        "rerun ensure-runtime from the merged engine and recreate the gateway"
+fi
+
 # 4a. composed policy digest + non-mutating least-privilege probe ----------------
 expected_policy=$(OKENGINE_POLICY_CATALOG="$VERIFY_ENGINE_DIR/config/policy/catalog.yaml" \
     python3 "$VERIFY_ENGINE_DIR/tools/policy_plane.py" digest --vault "$PWD" 2>/dev/null)
@@ -222,8 +343,8 @@ else
     bad "runtime policy digest drift (runtime=${runtime_policy:-missing}, expected=${expected_policy:-unavailable})" \
         "rerun deploy.sh so policy is recomposed from merged engine/pack/extension sources"
 fi
-probe=$(dcx "$GW" /opt/hermes/.venv/bin/python -c \
-    'import sys;sys.path.insert(0,"/opt/hermes/tools");import policy_plane as p;x=p.effective_policy();r=p.evaluate_capability(x,"cron:source-quality-backfill","update","sources/probe","source",["type"],"none");print((r or {}).get("rule_id", "ALLOW"))')
+probe=$(dcx "$GW" sh -c \
+    "cd /opt/vault && /opt/hermes/.venv/bin/python -c 'from tools import policy_plane as p; assert p.engine_catalog_path().is_file(); x=p.effective_policy(); r=p.evaluate_capability(x,\"cron:source-quality-backfill\",\"update\",\"sources/probe\",\"source\",[\"type\"],\"none\"); print((r or {}).get(\"rule_id\", \"ALLOW\"))'")
 if [ "$probe" = "source-quality-fields-only" ]; then
     ok "source-quality capability probe rejects protected-field mutation without writing"
 else
@@ -331,6 +452,94 @@ elif [ -n "$job_uid" ] && [ "$job_uid" != "$want_uid" ]; then
         "the scheduler can't READ it (root:0600 poison) and the WHOLE fleet stalls (okengine#193); chown jobs.json to $want_uid, or re-run deploy-cron-plus-jobs.sh with HERMES_UID=$want_uid"
 else ok "runtime dir + jobs.json owned by the gateway uid ($got_uid)"; fi
 
+# 5e. secret file modes (okengine#665) — host-side, needs no docker. .env is read by compose on the
+# host only, so anything beyond owner-only is a leak of model keys/tokens/DB passwords; the
+# read-MCP Bearer token in config.yaml must be readable by the gateway uid, so world-readable is
+# a WARN there (it is what --fix-perms produces) and a FAIL only for .env.
+if [ -f .env ]; then
+    env_mode="$(stat -c '%a' .env 2>/dev/null)"
+    if [ -n "$env_mode" ] && [ "${env_mode: -2}" != "00" ]; then
+        bad ".env is mode $env_mode — model keys, OKENGINE_MCP_TOKEN and DB passwords are readable by group/other" \
+            "chmod 600 .env (deploy.sh/ensure-runtime.sh now do this; an older deploy left the caller's umask)"
+    else ok ".env is owner-only (mode ${env_mode:-?})"; fi
+fi
+if [ -f .hermes-data/config.yaml ]; then
+    cfg_mode="$(stat -c '%a' .hermes-data/config.yaml 2>/dev/null)"
+    if [ -n "$cfg_mode" ] && [ "${cfg_mode: -1}" != "0" ]; then
+        wn ".hermes-data/config.yaml is mode $cfg_mode — the read-MCP Bearer token is world-readable" \
+           "acceptable only as a --fix-perms local convenience; prefer HERMES_UID=\$(id -u) so the file can be owner-only"
+    else ok "config.yaml is not world-readable (mode ${cfg_mode:-?})"; fi
+fi
+# 5d. runtime-tree ownership SWEEP — 5c stats exactly TWO paths (the cron-plus dir + jobs.json), so a
+# correctly-owned dir can still hold hundreds of mis-owned files underneath and 5c stays green. Not
+# hypothetical: 774 root-owned files accumulated across the fleet's .hermes-data over three days
+# (okengine#557) with 5c passing throughout, because cron-plus/ and jobs.json were both fine. It went
+# unnoticed for a WEEK, and the damage was silent in both directions:
+#   * one gateway could not open /opt/data/logs/agent.log at all — it logged NOTHING for seven days;
+#   * root-owned cron-plus/runs/<id>/ dirs rejected receipt writes, so a lane RAN, did its work, and
+#     lost its receipt — which downstream reads as "the lane did nothing" (empty parse is `unknown`,
+#     never `nothing happened`).
+# 5c's own comment already names this hazard ("the dir-level stat misses a mis-owned file in a
+# well-owned dir") but only closes it for jobs.json. Sweep the tree instead of spot-checking it:
+# ~80k files costs <0.5s, which is nothing at a deploy gate.
+if [ -n "$want_uid" ]; then
+    nstray="$(dcx "$GW" sh -c "find /opt/data ! -uid $want_uid 2>/dev/null | wc -l" | tr -d '[:space:]')"
+    # Empty => the probe never ran (gateway not exec-able). Reporting PASS there is the vacuous green
+    # the repo's "missing key = WARN undetectable, never a vacuous pass" rule (M22) exists to forbid.
+    if [ -z "$nstray" ]; then
+        wn "cannot sweep runtime-tree ownership — the find probe returned nothing (gateway not exec-able?); UNDETECTABLE here, not a pass" \
+           "docker compose ps $GW; docker compose logs $GW, then re-run once the gateway is up"
+    elif [ "$nstray" -gt 0 ] 2>/dev/null; then
+        eg="$(dcx "$GW" sh -c "find /opt/data ! -uid $want_uid 2>/dev/null | head -3" | tr '\n' ' ')"
+        bad "$nstray file(s) under /opt/data are NOT owned by the gateway uid $want_uid (e.g. ${eg:-?})" \
+            "every write to them fails SILENTLY — dropped cron receipts, an unwritable agent.log (okengine#557); fix with 'sudo chown -R $want_uid:$want_uid <pack>/.hermes-data'. Do NOT use ensure-runtime.sh --fix-perms: it makes the tree world-writable, trading an ownership bug for a permissions downgrade"
+    else
+        ok "runtime tree fully owned by the gateway uid ($want_uid) — $(dcx "$GW" sh -c 'find /opt/data 2>/dev/null | wc -l' | tr -d '[:space:]') paths swept"
+    fi
+fi
+
+# 5f. VAULT ownership peer (invariant-audit #4) — deployment_validate's ownership check is a
+# cron-plus lane, so a stalled scheduler cannot report a root-owned INDEX/dashboard directory.
+# Run the SAME shared check independently as the actual lane uid inside the gateway; a host-side
+# invocation would compare against the operator's uid and could report a false green or false FAIL.
+echo "[5f] vault ownership (scheduler-independent peer)"
+if [ -z "$want_uid" ] || ! [[ "$want_uid" =~ ^[0-9]+$ ]]; then
+    wn "cannot verify vault ownership — gateway lane uid is unavailable; UNDETECTABLE here, not a pass" \
+       "docker compose ps $GW; docker compose logs $GW, then re-run the verifier"
+else
+    vault_owners=$(dcx -u "$want_uid" "$GW" python3 -c '
+import sys
+sys.path.insert(0, "/opt/data/scripts")
+try:
+    import deployment_checks as C
+    C.configure("/opt/vault", data="/opt/data", hermes="/opt/hermes")
+    findings = C.run(["ownership"])
+    for level, area, msg in findings:
+        print("%s\t%s\t%s" % (level, area, " ".join(msg.split())))
+    if not findings:
+        print("OK\townership\tall lane-maintained vault paths owned by the gateway lane uid")
+except Exception as exc:
+    print("ERR\townership\tshared check unavailable: %s" % exc)
+# vault-ownership-peer
+' 2>/dev/null)
+    if [ -z "$vault_owners" ]; then
+        wn "cannot verify vault ownership — in-container check returned nothing; UNDETECTABLE here, not a pass" \
+           "docker compose ps $GW; check /opt/data/scripts/deployment_checks.py is staged, then re-run"
+    else
+        while IFS=$'\t' read -r level area msg; do
+            case "$level" in
+                OK) ok "$msg" ;;
+                FAIL) bad "[$area] $msg" "fix-vault-ownership.sh for this deployment, then re-run post-deploy verification" ;;
+                WARN) wn "[$area] $msg" "framework doctor $PWD --checks ownership" ;;
+                ERR) wn "vault ownership check unavailable ($msg); UNDETECTABLE here, not a pass" \
+                        "check staged deployment_checks.py and gateway Python, then re-run" ;;
+                *) wn "vault ownership check returned an unexpected result; UNDETECTABLE here, not a pass" \
+                      "inspect the gateway and re-run the verifier" ;;
+            esac
+        done <<< "$vault_owners"
+    fi
+fi
+
 # 5b. NB: backlinks-refresh no longer needs an iwe binary (okengine#179 — it builds the graph
 # with an in-process link-scanner), so there is no gateway iwe dependency to verify here anymore.
 
@@ -369,6 +578,11 @@ echo "[8] deployment timezone -> UI clocks (okengine#301)"
 EXPECT_TZ="${TZ:-}"
 if [ -z "$EXPECT_TZ" ] || [ "$EXPECT_TZ" = "UTC" ]; then
     ok "TZ unset/UTC — UTC clocks are correct by default (nothing to verify)"
+elif ! OKENGINE_VERIFY_TZ="$EXPECT_TZ" python3 -c \
+    'import os; from zoneinfo import ZoneInfo; ZoneInfo(os.environ["OKENGINE_VERIFY_TZ"])' \
+    >/dev/null 2>&1; then
+    bad "deployment TZ=$EXPECT_TZ is not a valid IANA timezone — services would silently disagree with the intended calendar" \
+        "correct TZ in .env (for example America/New_York), then recreate every service"
 else
     UI_AUTH=(); [ -n "$READER_PW" ] && UI_AUTH=(-u "${OKENGINE_READER_USER:-okengine}:$READER_PW")
     # served tz from a UI JSON endpoint, or empty if unreachable/unauthorized/pre-#301
@@ -383,9 +597,94 @@ else
         else bad "$1 clock tz=$tz but the deployment TZ=$EXPECT_TZ" "add '- TZ=\${TZ:-UTC}' to the $2 service environment in docker-compose.yml, then: docker compose up -d --force-recreate $2 (okengine#301)"; fi
     }
     _check_ui_tz "reader" "$READER" "/api/about"
-    if docker compose config --services 2>/dev/null | grep -Fxq "$COCKPIT"; then
+    if has_service "$COCKPIT"; then
         _check_ui_tz "cockpit" "$COCKPIT" "/api/config"
     fi
+fi
+
+# 9. deployment self-checks (shared library, okengine#405) -------------------
+# The filesystem checks below run through the SAME shared library the daily in-gateway validator and
+# `framework doctor` use (scripts/cron/deployment_checks.py) — one source of truth instead of a shell
+# re-implementation. Only the host-readable, uid-neutral checks run here (auth/toolset lockdown,
+# composed schema, sub-domains, timezone, partition dups, rules, extensions, provenance, pins,
+# operation runs). The BAKED-vs-staged
+# write-path drift (3b), runtime-uid ownership (5c), and vault ownership (5f) stay above: they require in-container
+# access (the baked /opt/hermes libs, the container's HERMES_UID) that a host-side read cannot reach.
+echo "[9] deployment self-checks (shared library)"
+selfchecks=$(python3 - "$VERIFY_ENGINE_DIR" "$PWD" <<'PY' 2>/dev/null
+import os, sys
+sys.path.insert(0, os.path.join(sys.argv[1], "scripts", "cron"))
+try:
+    import deployment_checks as C
+except Exception as exc:
+    print("ERR\t\t%s" % exc); raise SystemExit(0)
+dep = sys.argv[2]
+C.configure(dep, data=os.path.join(dep, ".hermes-data"),
+            hermes=os.path.join(dep, ".no-baked-image-on-host"))
+subset = ["pins", "schema", "subdomains", "crons", "timezone", "partition-dups",
+          "rules", "extensions", "provenance", "operations", "auth"]
+for level, area, msg in C.run(subset):
+    print("%s\t%s\t%s" % (level, area, " ".join(msg.split())))
+PY
+)
+if [ -z "$selfchecks" ]; then
+    ok "shared checks produced no findings (or the engine checkout is unavailable)"
+else
+    while IFS=$'\t' read -r level area msg; do
+        [ -z "$level" ] && continue
+        case "$level" in
+            FAIL) bad "[$area] $msg" "framework doctor $PWD --checks $area  (fix, then re-run deploy)" ;;
+            WARN) wn  "[$area] $msg" "framework doctor $PWD --checks $area" ;;
+            INFO) ok  "[$area] $msg" ;;
+            ERR)  wn  "shared checks unavailable ($msg)" "run from the deployment dir with the engine checkout intact" ;;
+        esac
+    done <<< "$selfchecks"
+fi
+
+# unmaintained running services -----------------------------------------------
+# A container that is RUNNING but absent from the resolved Compose configuration is one no deploy
+# can ever touch: `docker compose up -d --build` only knows the services `config` resolves, so an
+# orphan keeps running whatever image it started with, for ever, silently.
+#
+# The live case this was written for: okcti-test runs okengine-operation-runner and
+# okengine-review-write behind `profiles: ["review"]` with COMPOSE_PROFILES unset. `config`
+# resolved 6 services, `ps` showed 8, and the two invisible ones drifted 20 commits behind while
+# every deploy reported success. That is also the root of the okengine#590 incident below --
+# provenance caught the symptom, and this catches the reason.
+if [ "$COMPOSE_SERVICES_RC" -eq 0 ]; then
+    # `if ! var=$(...)` rather than reading $? after the assignment (okengine#602): the status
+    # belongs to the command that produced it, and a masked one is how a check stops failing.
+    if ! running_svcs=$(docker compose ps --services 2>/dev/null); then
+        wn "cannot list running services — orphan check UNDETECTABLE, not a pass" \
+           "docker compose ps --services failed here; re-run when the daemon is responsive"
+    else
+        orphans=""
+        for svc in $running_svcs; do
+            has_service "$svc" || orphans="$orphans $svc"
+        done
+        if [ -n "$orphans" ]; then
+            bad "running but NOT in the resolved Compose config:$orphans" \
+                "no deploy can rebuild or recreate these — they run their original image for ever. If they are profile-gated, pin the profile (e.g. COMPOSE_PROFILES=review in .env); if they are obsolete, remove them."
+        else
+            ok "every running service is in the resolved Compose config"
+        fi
+    fi
+fi
+
+# image provenance (okengine#590) --------------------------------------------
+# The other three deploy surfaces are checked; this is the fourth. `okcti-review-write` --
+# write_server.py mounting the vault read-write -- ran three weeks on an image 20 commits old,
+# missing write-path ENFORCEMENT the gateway had already gained, and nothing said so. An invariant
+# enforced at one boundary and not the other is not enforced, and here both boundaries were the
+# same file at two ages. The gateway image is covered by its org.okengine.git_sha label; these
+# are compose-built from a docker-compose.yml the PACK owns, so they are verified by content.
+img_project="${COMPOSE_PROJECT_NAME:-$(basename "$PWD")}"
+if img_out=$(python3 "$VERIFY_ENGINE_DIR/scripts/image_drift.py" \
+        --project "$img_project" --engine-dir "$VERIFY_ENGINE_DIR" 2>&1); then
+    ok "engine images built from this source ($(printf '%s' "$img_out" | grep -c 'in sync') in sync)"
+else
+    bad "engine image(s) not built from this source: $(printf '%s' "$img_out" | grep -E 'DRIFTED|UNDETECTABLE' | tr '\n' ' ')" \
+        "rebuild and roll them: docker compose build <svc> && docker compose up -d --force-recreate <svc>"
 fi
 
 # summary --------------------------------------------------------------------

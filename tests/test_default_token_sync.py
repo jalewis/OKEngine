@@ -14,7 +14,7 @@ _COMPOSE = re.compile(r'OKENGINE_MCP_TOKEN=\$\{OKENGINE_MCP_TOKEN:-([^}]+)\}')
 
 SURFACES = (
     ("okengine-mcp/server.py", _PY),
-    ("okengine-mcp/write_server.py", _PY),
+    ("src/okengine/write_services/state.py", _PY),
     ("scripts/cron/hardening_lib.py", _PY),
     ("templates/pack/skeleton/docker-compose.yml", _COMPOSE),
 )

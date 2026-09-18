@@ -140,3 +140,48 @@ def test_unrecognized_section_kind_is_surfaced(tmp_path, capsys):  # okengine#32
     assert "unrecognized kind" in err and "bogus" in err, err
     # the valid section still rendered (HOT.md written)
     assert (tmp_path / "wiki" / "HOT.md").is_file()
+
+
+def test_helper_error_and_invalid_date_paths(tmp_path, monkeypatch):
+    m=_load(tmp_path)
+    assert m._hot_set_cfg()==m._DEFAULT_HOT_SET
+    (tmp_path/"schema.yaml").write_text("[bad")
+    assert m._hot_set_cfg()==m._DEFAULT_HOT_SET
+    (tmp_path/"schema.yaml").write_text("hot_set: []\n")
+    assert m._hot_set_cfg()==m._DEFAULT_HOT_SET
+    for value in (None,"bad","2026-02-30"):
+        assert m._d(value) is None
+    assert m._resolve_date({"updated":"bad","last_updated":TODAY.isoformat()},"updated")==TODAY
+    assert m._resolve_date({}, "") is None
+    plain=tmp_path/"plain.md";plain.write_text("body");assert m._fm(plain)=={}
+    bad=tmp_path/"bad.md";bad.write_text("---\n[bad\n---");assert m._fm(bad)=={}
+    scalar=tmp_path/"scalar.md";scalar.write_text("---\n- x\n---");assert m._fm(scalar)=={}
+    original_read = Path.read_text
+    monkeypatch.setattr(
+        Path, "read_text",
+        lambda self, *a, **k: (_ for _ in ()).throw(OSError("gone"))
+        if self == plain else original_read(self, *a, **k),
+    )
+    assert m._fm(plain) == {}
+    assert m._select_recent({"namespace":"missing"},TODAY)==[]
+    assert m._select_open({"namespace":"missing"})==[]
+    assert m._path_upper_date("2026/02/31/x.md")==date(2026,2,28)
+
+
+def test_index_filters_and_render_optional_columns(tmp_path, monkeypatch):
+    wiki=tmp_path/"wiki";src=wiki/"sources";pred=wiki/"predictions"
+    _src(src/"INDEX.md",TODAY);_src(src/"_skip.md",TODAY);_src(src/"keep.md",TODAY)
+    _pred(pred/"INDEX.md","open");_pred(pred/"keep.md","open")
+    (tmp_path/"schema.yaml").write_text(
+      "hot_set:\n  days: 30\n  cap: 5\n  sections:\n"
+      "  - {kind: open, namespace: predictions, open_values: [open], title: Open}\n"
+      "  - {kind: recent, namespace: sources, date_field: published, show_type: true, show_status: true, title: Recent}\n")
+    m=_load(tmp_path);monkeypatch.setattr(m.tz_lib,"deployment_now",lambda:datetime.now(timezone.utc))
+    assert m.main()==0
+    hot=(wiki/"HOT.md").read_text()
+    assert "[keep]" in hot and "Type" in hot and "Status" in hot
+
+
+def test_main_missing_wiki_returns_error(tmp_path):
+    m=_load(tmp_path)
+    assert m.main()==1

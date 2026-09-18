@@ -4,7 +4,7 @@
 # so the documented inline commands abort a `set -e` script exactly when they pass — this wraps them so
 # scripts, hooks, and CI can gate on the result normally (issue okengine#204, gap 6).
 #
-# Scans exactly the TRACKED files (the leak surface) across the code/doc globs, using the git-ignored
+# Scans tracked files PLUS untracked-and-unignored ones (everything about to be committed), using
 # .scrub-patterns (private hostnames/product names, one extended regex per line) plus the generic
 # private-IP pattern. publish-snapshot.sh + its test are excluded (they legitimately contain the
 # patterns). See CLAUDE.md "Before you commit".
@@ -27,14 +27,21 @@ EXCL=(
   ':!docs/design/sec-threat-hunting-prd.md' ':!docs/design/sec-threat-hunting-technical-spec.md'
   ':!.gitlab-ci.yml'   # legitimately names the internal group runner (org-abbrev pattern); publish-excluded, never ships
 )
+# `git grep` sees TRACKED files only, so a brand-new file is invisible to this gate until it is
+# staged -- and a new file is exactly where a fresh leak lives. A private product name sat in a new
+# engine script through a local "scrub: clean", and only CI caught it after the commit made the file
+# tracked. So scan the union: tracked files PLUS anything untracked-and-not-ignored, i.e. everything
+# that is about to be committed. `--untracked` does exactly that and still honours .gitignore, so
+# local notes and build output stay exempt by construction.
+UNTRACKED=--untracked
 found=0
 
 # git grep: exit 0 (prints matches) when a leak IS present, exit 1 when clean. So a taken if-branch
 # == a leak.
-if git grep -inE "192\.168\." -- "${EXCL[@]}"; then found=1; fi
+if git grep $UNTRACKED -inE "192\.168\." -- "${EXCL[@]}"; then found=1; fi
 
 if [ -f .scrub-patterns ]; then
-  if git grep -inE -f .scrub-patterns -- "${EXCL[@]}"; then
+  if git grep $UNTRACKED -inE -f .scrub-patterns -- "${EXCL[@]}"; then
     found=1
   fi
 else

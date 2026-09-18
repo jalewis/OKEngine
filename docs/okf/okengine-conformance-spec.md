@@ -112,8 +112,10 @@ ascii-fold → lowercase → hyphenated; bounded length). Two kinds:
 
 5.4 **Convergence:** when a writer creates a page whose authority id already exists
 in the vault, the writer **MUST** merge into the existing canonical page rather than
-create a duplicate. Minted-slug collisions **MUST NOT** auto-merge (they are flagged
-for review). See §10 for ownership during merge.
+create a duplicate. Minted-slug collisions **MUST NOT** auto-merge on `create`; the
+writer returns the existing canonical identity without creating or queuing a phantom
+path. A caller may explicitly `converge` that identity, which then
+applies the authorization, ownership, schema, and conflict rules in §10.
 
 ## 6. Tombstones
 

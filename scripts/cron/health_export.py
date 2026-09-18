@@ -5,8 +5,8 @@ Closes the detect→notify loop. The operator dashboard SHOWS health; this EXPOR
   - METRICS: writes a Prometheus textfile (<METRICS_DIR>/okengine.prom) — point the node_exporter
     textfile collector at it and the existing Prometheus/Alertmanager gives graphs + alerting for
     free (don't rebuild alerting; feed the stack).
-  - ALERTS: transition-based (no fatigue) — on a NEW problem since the last run (overall went red,
-    or a cron lane newly errored/off-model) it appends a timestamped line to wiki/dashboards/
+  - ALERTS: transition-based (no fatigue) — on a NEW problem since the last run (overall escalated,
+    or a cron lane newly critical-stale/errored/off-model) it appends a timestamped line to wiki/dashboards/
     alerts.md and POSTs ALERT_WEBHOOK (Slack-compatible {text}) if set, so a no-Prometheus
     deployment still gets notified.
 
@@ -59,14 +59,15 @@ def _int(rx, text, default=None):
 
 def _parse_fleet(fh: str) -> "dict[str, int | None]":
     """Fleet-lane counts from wiki/dashboards/fleet-health.md. fleet_health.py writes them as
-    PLAIN text ('🔴 stale: 0  ·  🔴 errored: 1'), so the pattern must tolerate 0-2 asterisks
+    PLAIN text ('🟡 stale: 0 · 🟠 critical-stale: 0 · 🔴 errored: 1'), so the pattern must tolerate 0-2 asterisks
     (`\\*{0,2}`). The old bold-only `\\*\\*(\\d+)\\*\\*` matched nothing and silently parsed every
     count as None/0 — a dead-monitor-reads-healthy fail (the fleet Prometheus metrics all read 0
     regardless of real lane state). operator_dashboard.py already parses the plain form; the two
     consumers must agree. Contract pinned by tests/cron/test_health_export_fleet_parse.py."""
     def n(label: str):
         return _int(rf"{label}:\s*\*{{0,2}}(\d+)", fh)
-    return {"stale": n("stale"), "errored": n("errored"),
+    return {"stale": n("stale"), "critical-stale": n("critical-stale"),
+            "errored": n("errored"), "invalid-schedule": n("invalid-schedule"),
             "off-model": n("off-model"), "ok": n("ok")}
 
 
@@ -101,33 +102,46 @@ def _fleet_lane_sets() -> "dict[str, set[str]] | None":
     except (OSError, json.JSONDecodeError):
         return None
     out = {}
-    for key in ("errored", "off-model"):
+    for key in ("stale", "critical-stale", "errored", "off-model"):
         values = data.get(key) if isinstance(data, dict) else None
         if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
             return None
         out[key] = {item for item in values if item}
+    invalid = data.get("invalid-schedule") if isinstance(data, dict) else None
+    if invalid is not None and (not isinstance(invalid, list)
+                                or not all(isinstance(item, str) for item in invalid)):
+        return None
+    out["invalid-schedule"] = {item for item in (invalid or []) if item}
     return out
 
 
 def main() -> int:
     fh, g, rq, cf = _body("fleet-health"), _body("source-grounding"), _body("review-queue"), _body("conformance")
     _fleet = _parse_fleet(fh)
-    stale, errored, offmodel, fleet_ok = _fleet["stale"], _fleet["errored"], _fleet["off-model"], _fleet["ok"]
+    stale = _fleet["stale"]
+    critical_stale = _fleet["critical-stale"]
+    errored, invalid_schedule, offmodel, fleet_ok = (
+        _fleet["errored"], _fleet["invalid-schedule"], _fleet["off-model"], _fleet["ok"])
     grounding = _int(r"grounded: \*\*\d+\*\* \((\d+)%\)", g)
     review = _int(r"\*\*(\d+) item\(s\) awaiting", rq)
     conf = _int(r"source-refs-are-pages: \*\*(\d+)\*\*", cf)
-    attention = (stale or 0) + (errored or 0) + (offmodel or 0)
+    warnings = stale or 0
+    critical = critical_stale or 0
+    failures = (errored or 0) + (invalid_schedule or 0) + (offmodel or 0)
+    attention = warnings + critical + failures
     # Freshness gate (#9): fleet-health is the PRIMARY source. If it is missing or older than
-    # OKENGINE_HEALTH_MAX_AGE_H (default 6h = 2x the 3h cadence), the upstream monitor is DEAD —
+    # OKENGINE_HEALTH_MAX_AGE_H (default 1h = 4x the 15m cadence), the upstream monitor is DEAD —
     # force RED rather than exporting a frozen last-green. A dead monitor must never read healthy.
-    max_age_h = float(os.environ.get("OKENGINE_HEALTH_MAX_AGE_H") or 6)
+    max_age_h = float(os.environ.get("OKENGINE_HEALTH_MAX_AGE_H") or 1)
     fh_age = _dash_age_h("fleet-health")
     monitor_dead = fh_age is None or fh_age > max_age_h
-    # overall: 0 green / 1 yellow / 2 red
+    # overall: 0 green / 1 yellow / 2 orange / 3 red
     overall = 0
-    if attention or (grounding is not None and grounding < 50) or monitor_dead:
+    if failures or (grounding is not None and grounding < 50) or monitor_dead:
+        overall = 3
+    elif critical:
         overall = 2
-    elif (review or 0) or (conf or 0) or (grounding is not None and grounding < 80):
+    elif warnings or (review or 0) or (conf or 0) or (grounding is not None and grounding < 80):
         overall = 1
 
     # --- Prometheus textfile ---
@@ -140,11 +154,16 @@ def main() -> int:
         ("okengine_health_export_timestamp_seconds",
          "unix time health_export last wrote (heartbeat; alert if time()-this exceeds ~2x the cadence)",
          int(datetime.now(timezone.utc).timestamp())),
-        ("okengine_health_overall", "0=green 1=yellow 2=red", overall),
+        ("okengine_health_overall", "0=green 1=yellow 2=orange 3=red", overall),
         ("okengine_health_monitor_stale", "1=fleet-health dashboard missing/stale (monitor dead)",
          1 if monitor_dead else 0),
         ("okengine_fleet_lanes_ok", "cron lanes healthy", fleet_ok),
-        ("okengine_fleet_lanes_attention", "cron lanes stale+errored+off-model", attention),
+        ("okengine_fleet_lanes_stale", "cron lanes stale (warning)", warnings),
+        ("okengine_fleet_lanes_critical_stale", "cron lanes critically stale", critical),
+        ("okengine_fleet_lanes_invalid_schedule", "cron lanes with unschedulable expressions",
+         invalid_schedule),
+        ("okengine_fleet_lanes_failures", "cron lanes errored+invalid-schedule+off-model", failures),
+        ("okengine_fleet_lanes_attention", "all cron lanes needing attention", attention),
         ("okengine_grounding_pct", "% synthesized pages citing a resolving source", grounding),
         ("okengine_review_queue", "pages awaiting human review", review),
         ("okengine_conformance_violations", "content-rule violations", conf),
@@ -166,24 +185,32 @@ def main() -> int:
         last = {}
     lane_sets = _fleet_lane_sets()
     newly = []
-    if overall == 2 and last.get("overall", 0) < 2:
+    if overall == 3 and last.get("overall", 0) < 3:
         reasons = []
         if monitor_dead:
             reasons.append("fleet-health monitor is stale/missing — lanes may be dead (no data)")
-        if attention:
-            reasons.append(f"{attention} cron lane(s) need attention")
+        if failures:
+            reasons.append(f"{failures} cron lane failure(s)")
         if grounding is not None and grounding < 50:
             reasons.append(f"grounding {grounding}%")
         newly.append("overall health is RED — " + "; ".join(reasons or ["see operator dashboard"]))
     if lane_sets is not None:
         previous_errored = set(last.get("errored_lanes") or [])
         previous_offmodel = set(last.get("offmodel_lanes") or [])
+        previous_critical = set(last.get("critical_stale_lanes") or [])
+        previous_invalid = set(last.get("invalid_schedule_lanes") or [])
         new_errored = sorted(lane_sets["errored"] - previous_errored)
         new_offmodel = sorted(lane_sets["off-model"] - previous_offmodel)
+        new_critical = sorted(lane_sets["critical-stale"] - previous_critical)
+        new_invalid = sorted(lane_sets["invalid-schedule"] - previous_invalid)
         if new_errored:
             newly.append("cron lane(s) newly ERRORED: " + ", ".join(new_errored))
         if new_offmodel:
             newly.append("synthesis lane(s) newly OFF-MODEL: " + ", ".join(new_offmodel))
+        if new_critical:
+            newly.append("cron lane(s) escalated to CRITICAL-STALE: " + ", ".join(new_critical))
+        if new_invalid:
+            newly.append("cron lane(s) newly INVALID-SCHEDULE: " + ", ".join(new_invalid))
     else:
         # Mixed-version rollout/backward compatibility: retain the old count signal until
         # fleet_health has emitted its first identity sidecar. It cannot detect set swaps, but is
@@ -192,6 +219,10 @@ def main() -> int:
             newly.append(f"a cron lane newly ERRORED (now {errored})")
         if (offmodel or 0) > last.get("offmodel", 0):
             newly.append(f"a synthesis lane fell OFF-MODEL (now {offmodel})")
+        if (critical_stale or 0) > last.get("critical_stale", 0):
+            newly.append(f"a cron lane escalated to CRITICAL-STALE (now {critical_stale})")
+        if (invalid_schedule or 0) > last.get("invalid_schedule", 0):
+            newly.append(f"a cron lane has an INVALID-SCHEDULE (now {invalid_schedule})")
     webhook_failed = False
     if newly:
         alerts = DDIR / "alerts.md"
@@ -218,11 +249,16 @@ def main() -> int:
     # the RED alert is lost for the whole incident (the transition test never fires again), leaving
     # only a stderr line and an alerts.md row the push exists to avoid needing (okengine#178).
     if not webhook_failed:
-        state = {"overall": overall, "errored": errored or 0, "offmodel": offmodel or 0,
+        state = {"overall": overall, "stale": stale or 0,
+                 "critical_stale": critical_stale or 0,
+                 "errored": errored or 0, "invalid_schedule": invalid_schedule or 0,
+                 "offmodel": offmodel or 0,
                  "at": now}
         if lane_sets is not None:
             state["errored_lanes"] = sorted(lane_sets["errored"])
             state["offmodel_lanes"] = sorted(lane_sets["off-model"])
+            state["critical_stale_lanes"] = sorted(lane_sets["critical-stale"])
+            state["invalid_schedule_lanes"] = sorted(lane_sets["invalid-schedule"])
         sf.write_text(json.dumps(state), encoding="utf-8")
     else:
         print("  health-state NOT advanced (webhook undelivered) — will retry the alert next run",
@@ -241,7 +277,7 @@ def main() -> int:
             urllib.request.urlopen(urllib.request.Request(heartbeat_url), timeout=8)  # nosec B310
         except Exception as e:                       # noqa: BLE001 — a dead-man's ping must never fail the lane
             print(f"  heartbeat ping failed: {e}", file=sys.stderr)
-    states = {0: "🟢", 1: "🟡", 2: "🔴"}
+    states = {0: "🟢", 1: "🟡", 2: "🟠", 3: "🔴"}
     print(f"health-export: overall {states[overall]} -> {MDIR / 'okengine.prom'} "
           f"({sum(1 for _, _, v in metrics if v is not None)} metrics); "
           f"{len(newly)} new alert(s)")

@@ -64,6 +64,124 @@ def test_fold_own_reuse_extend(tmp_path):
     assert o["enum_values"]["source_kind.forecast"] == "ext:demo.pred"
 
 
+def test_owned_namespace_preserves_extension_partition_strategy(tmp_path):
+    s = _sl()
+    fragment = {"owns": {"namespaces": {
+        "assessments": {"strategy": "by-letter", "reshard_by": "second-letter"},
+    }}}
+    composed, errors = s.compose_schema(_pack(tmp_path), [("ext:assessments", fragment)])
+    assert errors == []
+    assert composed["partitioning"]["namespaces"]["assessments"] == {
+        "strategy": "by-letter", "reshard_by": "second-letter",
+    }
+    assert composed["owners"]["namespaces"]["assessments"] == "ext:assessments"
+
+
+def test_owned_namespace_rejects_non_mapping_partition_strategy(tmp_path):
+    s = _sl()
+    _, errors = s.compose_schema(_pack(tmp_path), [
+        ("ext:bad", {"owns": {"namespaces": {"bad": "flat"}}}),
+    ])
+    assert any("partition must be a mapping" in error for error in errors)
+
+
+@pytest.mark.parametrize("unknown", ["own", "field_shape", "required"])
+def test_unknown_top_level_fragment_key_fails_loudly(tmp_path, unknown):
+    s = _sl()
+    composed, errors = s.compose_schema(_pack(tmp_path), [
+        ("ext:typo", {unknown: {"types": {"silently_lost": {}}}}),
+    ])
+    assert errors and "unknown top-level schema fragment key" in errors[0]
+    assert repr(unknown) in errors[0] and "ext:typo" in errors[0]
+    assert "silently_lost" not in composed["types"]
+
+
+def test_every_documented_top_level_fragment_key_is_recognized(tmp_path):
+    s = _sl()
+    fragment = {
+        "owns": {}, "enums": {}, "field_enums": {}, "field_shapes": {},
+        "extends": {}, "field_items": {}, "partitioning": {}, "tier": {},
+    }
+    _, errors = s.compose_schema(_pack(tmp_path), [("ext:grammar", fragment)])
+    assert errors == []
+
+
+def test_extension_can_set_tier_policy_for_its_owned_namespace(tmp_path):
+    s = _sl()
+    fragment = {
+        "owns": {"namespaces": {"inquiry": {"strategy": "flat"}}},
+        "tier": {"namespaces": {
+            "inquiry": {"status_field": "status", "open_values": ["open"],
+                        "open_floor": "hot"},
+        }},
+    }
+    composed, errors = s.compose_schema(_pack(tmp_path), [("ext:inquiry", fragment)])
+    assert errors == []
+    assert composed["tier"]["namespaces"]["inquiry"]["open_floor"] == "hot"
+
+
+def test_extension_cannot_set_tier_policy_for_anothers_namespace(tmp_path):
+    s = _sl()
+    _, errors = s.compose_schema(_pack(tmp_path), [
+        ("ext:intruder", {"owns": {"namespaces": {"owned": {}}},
+                          "tier": {"namespaces": {
+                              "entities": {"open_floor": "hot"},
+                              "owned": {"open_floor": "warm"},
+                          }}}),
+    ])
+    assert any("owned by the same extension" in error for error in errors)
+
+
+def test_legacy_partition_policy_is_limited_to_owned_namespace(tmp_path):
+    s = _sl()
+    valid_pack = _pack(tmp_path / "valid")
+    fragment = {
+        "owns": {"namespaces": ["inquiry"]},
+        "partitioning": {"namespaces": {"inquiry": {"strategy": "flat"}}},
+    }
+    composed, errors = s.compose_schema(valid_pack, [("ext:inquiry", fragment)])
+    assert errors == []
+    assert composed["partitioning"]["namespaces"]["inquiry"] == {"strategy": "flat"}
+
+    invalid_composed, errors = s.compose_schema(_pack(tmp_path / "invalid"), [
+        ("ext:intruder", {"owns": {"namespaces": {"owned": {}}},
+                          "partitioning": {"namespaces": {
+                              "entities": {}, "owned": {"strategy": "by-letter"},
+                          }}}),
+    ])
+    assert any("owned by the same extension" in error for error in errors)
+    assert invalid_composed["partitioning"]["namespaces"]["owned"] == {
+        "strategy": "by-letter",
+    }
+
+
+def test_invalid_partition_and_tier_policy_do_not_hide_later_valid_policy(tmp_path):
+    s = _sl()
+    fragment = {
+        "owns": {"namespaces": {"bad": {}, "good": {}}},
+        "partitioning": {"namespaces": {"bad": "flat", "good": {"strategy": "flat"}}},
+        "tier": {"namespaces": {"bad": "hot", "good": {"open_floor": "hot"}}},
+    }
+    composed, errors = s.compose_schema(_pack(tmp_path), [("ext:demo", fragment)])
+    assert any("partitioning.namespaces.bad must be a mapping" in error for error in errors)
+    assert any("tier.namespaces.bad must be a mapping" in error for error in errors)
+    assert composed["partitioning"]["namespaces"]["good"] == {"strategy": "flat"}
+    assert composed["tier"]["namespaces"]["good"] == {"open_floor": "hot"}
+
+
+@pytest.mark.parametrize("section,value,error", [
+    ("partitioning", "flat", "partitioning must be a mapping"),
+    ("partitioning", {"namespaces": ["bad"]}, "partitioning.namespaces must be a mapping"),
+    ("tier", "hot", "tier must be a mapping"),
+    ("tier", {"namespaces": ["bad"]}, "tier.namespaces must be a mapping"),
+])
+def test_extension_namespace_policy_containers_must_be_mappings(
+        tmp_path, section, value, error):
+    s = _sl()
+    _, errors = s.compose_schema(_pack(tmp_path), [("ext:bad", {section: value})])
+    assert any(error in item for item in errors)
+
+
 def test_own_conflict_fails(tmp_path):
     s = _sl()
     _, errors = s.compose_schema(_pack(tmp_path),

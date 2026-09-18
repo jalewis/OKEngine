@@ -42,7 +42,7 @@ review token are all configured. See [human review](../docs/human-review.md).
 - **Competitors** *(optional)* — renders a pack-named set of generated dashboard
   pages.
 - **Search** — ripgrep across the vault. **Backlinks** — "what links here" from
-  the IWE wikilink graph. **Export** — any page as `md` / `docx` / `pdf`.
+  the precomputed wikilink graph. **Export** — any page as `md` / `docx` / `pdf`.
 
 ## The `cockpit:` config block
 
@@ -128,7 +128,7 @@ docker run --rm \
 For local dev without Docker:
 
 ```bash
-pip install -r okengine-cockpit/requirements.txt   # + pandoc, ripgrep, iwe on PATH
+pip install -r okengine-cockpit/requirements.txt   # + pandoc and ripgrep on PATH
 VAULT_DIR=/path/to/vault uvicorn app:app --app-dir okengine-cockpit --port 9200
 ```
 
@@ -138,11 +138,10 @@ VAULT_DIR=/path/to/vault uvicorn app:app --app-dir okengine-cockpit --port 9200
 |-----|---------|---------|
 | `VAULT_DIR` | `/vault` | read-only vault root (wiki at `$VAULT_DIR/wiki`) |
 | `PORT` | `9200` | listen port |
-| `IWE_BIN` | `iwe` | IWE binary for the backlink graph |
 
 ### Optional runtime tools
 
-`pandoc` + `weasyprint` (docx/pdf export), `ripgrep` (search), and `iwe`
+`pandoc` + `weasyprint` (docx/pdf export) and `ripgrep` (search)
 (backlinks) are baked into the image. Each endpoint degrades gracefully (503 /
 empty) if its tool is missing, so the core read paths work without them.
 

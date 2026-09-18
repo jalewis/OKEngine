@@ -27,8 +27,10 @@ def test_sandbox_is_loopback_only_and_fixture_vault_is_read_only():
     assert "127.0.0.1:9880:9200" in compose
     assert "127.0.0.1:9881:9200" in compose
     assert "127.0.0.1:8880:8730" in compose
-    assert compose.count("./vault:/vault:ro") >= 2
-    assert "./vault:/opt/vault:ro" in compose
+    # Release E2E overrides SMOKE_VAULT with a disposable copy; the contributor sandbox leaves it
+    # unset and therefore uses the frozen fixture. Every read-plane mount remains read-only.
+    assert compose.count("${SMOKE_VAULT:-./vault}:/vault:ro") >= 2
+    assert "${SMOKE_VAULT:-./vault}:/opt/vault:ro" in compose
 
 
 def test_sandbox_workflow_and_boundaries_are_documented():

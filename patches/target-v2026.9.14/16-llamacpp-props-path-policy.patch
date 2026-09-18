@@ -1,0 +1,211 @@
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index c9a7824a8..6bf58e06e 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -121,6 +121,13 @@ _ENDPOINT_PROBE_TTL_SECONDS = 3600.0
+ # up, key being fixed) recoverable within minutes instead of pinning "undetected" for an hour.
+ _ENDPOINT_PROBE_FAILURE_TTL_SECONDS = 300.0
+ _endpoint_probe_path_cache: Dict[str, tuple] = {}
++# llama.cpp's props URL differs by build and router mode. A bounded in-process
++# path memo avoids a guaranteed 404 on every metadata refresh without pinning
++# a negative answer forever after a server restart. Parameterized router probes
++# are keyed by model so one unloaded/missing child cannot hide another.
++_LLAMACPP_PROPS_POSITIVE_TTL_SECONDS = 3600.0
++_LLAMACPP_PROPS_FAILURE_TTL_SECONDS = 300.0
++_llamacpp_props_path_cache: Dict[Tuple[str, Optional[str]], Tuple[Optional[str], float]] = {}
+ # Routable-but-dead endpoints (corp LAN off-VPN) blackhole TCP: once ANY probe paid
+ # a full connect timeout, later probes short-circuit for a while.
+ _ENDPOINT_BLACKHOLE_TTL_SECONDS = 30.0
+@@ -916,14 +923,30 @@ def _apply_llamacpp_props(cache: Dict[str, Dict[str, Any]], request_candidate: s
+     via ``/props?model=``; unloaded children are skipped — probing could autoload them."""
+     base = request_candidate.rstrip("/").replace("/v1", "")
+     def _props(params=None):
+-        resp = requests.get(base + "/v1/props", params=params, headers=headers, timeout=5, verify=verify)
+-        if not resp.ok:
+-            resp = requests.get(base + "/props", params=params, headers=headers, timeout=5, verify=verify)
++        model_key = str(params.get("model")) if isinstance(params, dict) and params.get("model") else None
++        key = (base, model_key)
++        cached = _llamacpp_props_path_cache.get(key)
++        fresh = cached is not None and (time.monotonic() - cached[1]) < (
++            _LLAMACPP_PROPS_POSITIVE_TTL_SECONDS if cached[0] else
++            _LLAMACPP_PROPS_FAILURE_TTL_SECONDS)
++        if fresh and cached[0] is None:
++            return None
++        paths = [base + "/v1/props", base + "/props"]
++        if fresh and cached[0] in paths:
++            paths.remove(cached[0])
++            paths.insert(0, cached[0])
++        resp = None
++        for url in paths:
++            resp = requests.get(url, params=params, headers=headers, timeout=5, verify=verify)
++            if resp.ok:
++                _llamacpp_props_path_cache[key] = (url, time.monotonic())
++                return resp
++        _llamacpp_props_path_cache[key] = (None, time.monotonic())
+         return resp
+     def _n_ctx(props: Dict[str, Any]) -> Any:
+         return (props.get("default_generation_settings") or {}).get("n_ctx")
+     props_resp = _props()
+-    if props_resp.ok:
++    if props_resp is not None and props_resp.ok:
+         props = props_resp.json()
+         n_ctx, model_alias = _n_ctx(props), props.get("model_alias", "")
+         if n_ctx and model_alias and model_alias in cache:
+@@ -937,7 +960,7 @@ def _apply_llamacpp_props(cache: Dict[str, Dict[str, Any]], request_candidate: s
+         if not child_id or child_id not in cache or (child.get("status") or {}).get("value") not in ("loaded", "ready"):
+             continue
+         pr = _props({"model": child_id})
+-        child_ctx = _n_ctx(pr.json()) if pr.ok else None
++        child_ctx = _n_ctx(pr.json()) if pr is not None and pr.ok else None
+         if child_ctx:
+             cache[child_id]["context_length"] = child_ctx
+ 
+@@ -1476,7 +1499,11 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
+         "lm-studio": lambda client: _lmstudio_context(client, lmstudio_url, model),
+         "llamacpp": lambda client: _llamacpp_context(client, server_url, model),
+     }.get(server_type)
+-    probes = ([typed] if typed else []) + [_model_detail_ctx, lambda client: _openai_models_list_context(client, server_url, model)]
++    # llama.cpp has no per-model detail route; keep the /v1/models LIST fallback,
++    # which may still report a usable runtime n_ctx for a lazily loaded child.
++    probes = ([typed] if typed else []) + (
++        [] if server_type == "llamacpp" else [_model_detail_ctx]
++    ) + [lambda client: _openai_models_list_context(client, server_url, model)]
+     try:
+         with httpx.Client(timeout=3.0, headers=_auth_headers(api_key)) as client:
+             return next((ctx for ctx in (probe(client) for probe in probes) if ctx is not None), None)
+diff --git a/tests/agent/test_okengine_llamacpp_props_paths.py b/tests/agent/test_okengine_llamacpp_props_paths.py
+new file mode 100644
+index 000000000..4229060f2
+--- /dev/null
++++ b/tests/agent/test_okengine_llamacpp_props_paths.py
+@@ -0,0 +1,130 @@
++"""Bounded llama.cpp path learning without losing router children."""
++
++import json
++import time
++from unittest.mock import patch
++
++import httpx
++import pytest
++import requests
++
++from agent import model_metadata as metadata
++
++
++def _response(status, payload=None):
++    response = requests.Response()
++    response.status_code = status
++    response._content = json.dumps(payload or {}).encode("utf-8")
++    return response
++
++
++@pytest.fixture(autouse=True)
++def _clear_props_path_cache():
++    metadata._llamacpp_props_path_cache.clear()
++    yield
++    metadata._llamacpp_props_path_cache.clear()
++
++
++@pytest.mark.parametrize("supported_path,first_urls", [
++    ("/v1/props", ["/v1/props"]),
++    ("/props", ["/v1/props", "/props"]),
++])
++def test_current_and_old_props_paths_are_reused_without_repeat_404(supported_path, first_urls):
++    metadata._ensure_requests()
++    urls = []
++
++    def get(url, **_kwargs):
++        urls.append(url)
++        return _response(200 if url.removeprefix("http://127.0.0.1:8841") == supported_path else 404, {
++            "model_alias": "fixture", "default_generation_settings": {"n_ctx": 32768}})
++
++    cache = {"fixture": {"context_length": 0}}
++    with patch("agent.model_metadata.requests.get", autospec=True, side_effect=get):
++        metadata._apply_llamacpp_props(cache, "http://127.0.0.1:8841/v1", {}, True)
++        assert cache["fixture"]["context_length"] == 32768
++        metadata._apply_llamacpp_props(cache, "http://127.0.0.1:8841/v1", {}, True)
++    assert [url.removeprefix("http://127.0.0.1:8841") for url in urls] == (
++        first_urls + [supported_path]), "the learned success path must be first on refresh"
++
++
++def test_neither_props_path_is_negative_cached_then_recovers_after_ttl():
++    metadata._ensure_requests()
++    available = False
++    urls = []
++
++    def get(url, **_kwargs):
++        urls.append(url)
++        if url.endswith("/models"):
++            return _response(404)
++        return _response(200 if available and url == "http://127.0.0.1:8842/props" else 404, {
++            "model_alias": "fixture", "default_generation_settings": {"n_ctx": 16384}})
++
++    cache = {"fixture": {"context_length": 0}}
++    base = "http://127.0.0.1:8842"
++    with patch("agent.model_metadata.requests.get", autospec=True, side_effect=get):
++        metadata._apply_llamacpp_props(cache, base + "/v1", {}, True)
++        assert len(urls) == 3, "two props paths plus native router check"
++        metadata._apply_llamacpp_props(cache, base + "/v1", {}, True)
++        assert len(urls) == 4, "fresh negative should skip both guaranteed misses"
++        metadata._llamacpp_props_path_cache[(base, None)] = (
++            None, time.monotonic() - metadata._LLAMACPP_PROPS_FAILURE_TTL_SECONDS - 1)
++        available = True
++        metadata._apply_llamacpp_props(cache, base + "/v1", {}, True)
++    assert cache["fixture"]["context_length"] == 16384
++    assert urls[-2:] == [base + "/v1/props", base + "/props"]
++
++
++def test_router_bare_negative_does_not_hide_distinct_loaded_children():
++    metadata._ensure_requests()
++    urls = []
++
++    def get(url, *, params=None, **_kwargs):
++        urls.append((url, params))
++        if url.endswith("/models"):
++            return _response(200, {"data": [
++                {"id": "missing", "status": {"value": "loaded"}},
++                {"id": "ready", "status": {"value": "ready"}},
++                {"id": "unloaded", "status": {"value": "unloaded"}}]})
++        if params and params.get("model") == "ready" and url == "http://127.0.0.1:8843/props":
++            return _response(200, {"default_generation_settings": {"n_ctx": 65536}})
++        return _response(404)
++
++    base = "http://127.0.0.1:8843"
++    cache = {name: {"context_length": 0} for name in ("missing", "ready", "unloaded")}
++    with patch("agent.model_metadata.requests.get", autospec=True, side_effect=get):
++        metadata._apply_llamacpp_props(cache, base + "/v1", {}, True)
++        assert cache["ready"]["context_length"] == 65536
++        assert cache["missing"]["context_length"] == 0
++        assert cache["unloaded"]["context_length"] == 0
++        assert (base + "/props", {"model": "ready"}) in urls
++        assert not any(params == {"model": "unloaded"} for _url, params in urls)
++        before = len(urls)
++        metadata._apply_llamacpp_props(cache, base + "/v1", {}, True)
++    assert len(urls) - before == 2, (
++        "fresh bare/child negatives skip props; only /models and the ready child recheck")
++
++
++def test_llamacpp_context_skips_unsupported_detail_but_keeps_list_fallback():
++    base = "http://127.0.0.1:8844"
++    seen = []
++
++    def handle(request):
++        seen.append(request.url.path)
++        if request.url.path == "/v1/models":
++            return httpx.Response(200, json={"data": [{"id": "fixture", "meta": {"n_ctx": 49152}}]})
++        return httpx.Response(404, json={"error": "not found"})
++
++    transport = httpx.MockTransport(handle)
++    real_client = httpx.Client
++
++    def client_factory(*_args, **kwargs):
++        return real_client(transport=transport, timeout=kwargs.get("timeout", 3.0),
++                           headers=kwargs.get("headers"))
++
++    with (patch("agent.model_metadata.detect_local_server_type", autospec=True,
++                return_value="llamacpp"),
++          patch("httpx.Client", autospec=True, side_effect=client_factory)):
++        result = metadata._query_local_context_length_uncached("fixture", base + "/v1")
++    assert result == 49152, "the supported /v1/models list may supply runtime context"
++    assert "/v1/models/fixture" not in seen, (
++        "known llama.cpp does not implement the per-model detail endpoint")

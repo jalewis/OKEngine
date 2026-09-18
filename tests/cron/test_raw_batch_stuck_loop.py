@@ -20,19 +20,46 @@ pytestmark = pytest.mark.skipif(not MOD.is_file(), reason="script absent")
 
 
 def _load(vault: Path):
-    os.environ["WIKI_PATH"] = str(vault)
-    os.environ["CRON_DEFER_UTC_HOURS"] = ""          # never off-peak-defer in the test
-    spec = importlib.util.spec_from_file_location("select_raw_batch", MOD)
-    m = importlib.util.module_from_spec(spec)
-    sys.modules["select_raw_batch"] = m
-    spec.loader.exec_module(m)
-    return m
+    values = {
+        "WIKI_PATH": str(vault),
+        "CRON_DEFER_UTC_HOURS": "",          # never off-peak-defer in the test
+        "OKENGINE_LANE_ID": "raw-backfill-test",
+        "OKENGINE_CONTRACT_DIGEST": "sha256:test-contract",
+        "OKENGINE_SELECTION_MANIFEST": str(vault / "raw" / ".selection.json"),
+    }
+    previous = {key: os.environ.get(key) for key in values}
+    try:
+        os.environ.update(values)
+        spec = importlib.util.spec_from_file_location("select_raw_batch", MOD)
+        m = importlib.util.module_from_spec(spec)
+        sys.modules["select_raw_batch"] = m
+        spec.loader.exec_module(m)
+        return m
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _run(m):
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        m.main()
+    previous = {
+        key: os.environ.get(key)
+        for key in ("OKENGINE_LANE_ID", "OKENGINE_CONTRACT_DIGEST")
+    }
+    try:
+        os.environ["OKENGINE_LANE_ID"] = "raw-backfill-test"
+        os.environ["OKENGINE_CONTRACT_DIGEST"] = "sha256:test-contract"
+        with contextlib.redirect_stdout(buf):
+            m.main()
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
     return buf.getvalue()
 
 

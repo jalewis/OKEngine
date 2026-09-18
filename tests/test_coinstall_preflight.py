@@ -2,6 +2,8 @@
 from the host's — else a private guest's content is served on a public host's unauthenticated reader
 (the reader/cockpit serve one global trust, frozen from the HOST at first deploy)."""
 import importlib.util
+import json
+import runpy
 import sys
 from pathlib import Path
 
@@ -72,7 +74,9 @@ def test_extension_owned_type_collision_flagged(tmp_path):  # okengine#326 [10]
         "owners:\n  types: {assessment: 'ext:okengine.assessments', gadget: 'ext:demo.gadgets'}\n"
         "  namespaces: {gadgets: 'ext:demo.gadgets'}\n")
     pack = tmp_path / "pack"; pack.mkdir()
-    (pack / "pack.yaml").write_text("name: p\ntrust: private\n")
+    (pack / "pack.yaml").write_text(
+        "name: p\ntrust: private\nowns:\n  namespaces: [gadgets]\n"
+    )
     (pack / "schema.yaml").write_text(
         "types: {assessment: {required: [x]}}\n"          # collides with an ext-owned type
         "partitioning: {namespaces: {gadgets: {}}}\n")     # collides with an ext-owned namespace
@@ -85,6 +89,59 @@ def test_extension_owned_type_collision_flagged(tmp_path):  # okengine#326 [10]
     m.check_extension_collisions(host, pack, subtree=True)
     assert not any(lvl == "FAIL" for lvl, _, _ in m.FINDINGS), m.FINDINGS
     assert any(lvl == "WARN" and "assessment" in msg for lvl, _, msg in m.FINDINGS), m.FINDINGS
+
+    # Taxonomy installs merge host-schema-additions.yaml, not the standalone schema. A collision
+    # that exists only in the materialized additions must still block before install.
+    additions = pack / "subdomain" / "host-schema-additions.yaml"
+    additions.parent.mkdir()
+    additions.write_text(
+        "types: {gadget: {required: [name]}}\n"
+    )
+    (pack / "schema.yaml").write_text("types: {}\npartitioning: {namespaces: {}}\n")
+    m.FINDINGS.clear()
+    m.check_extension_collisions(host, pack, additions)
+    assert any(lvl == "FAIL" and "gadgets" in msg for lvl, _, msg in m.FINDINGS)
+
+
+def test_extension_namespace_collision_matches_exact_installer_landing_set(tmp_path):
+    m = _mod()
+    host = tmp_path / "host"
+    (host / ".okengine").mkdir(parents=True)
+    (host / ".okengine/composed-schema.yaml").write_text(
+        "owners:\n  types: {}\n  namespaces: {gadgets: 'ext:demo.gadgets'}\n"
+    )
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "schema.yaml").write_text(
+        "types: {}\npartitioning: {namespaces: {gadgets: {}, reports: {}}}\n"
+    )
+
+    # Taxonomy with no owns block lands no namespace and must not false-fail.
+    (pack / "pack.yaml").write_text("name: p\n")
+    m.check_extension_collisions(host, pack)
+    assert not m.FINDINGS
+
+    # Mapping-form ownership lands its keys just like list-form ownership.
+    (pack / "pack.yaml").write_text("name: p\nowns:\n  namespaces: {gadgets: {}}\n")
+    m.check_extension_collisions(host, pack)
+    assert any(level == "FAIL" and "gadgets" in message
+               for level, _, message in m.FINDINGS)
+
+    # Subtree landing is driven by the supplied subdomain schema, not pack ownership.
+    m.FINDINGS.clear()
+    additions = pack / "subdomain/schema.yaml"
+    additions.parent.mkdir()
+    additions.write_text("types: {}\npartitioning: {namespaces: {gadgets: {}}}\n")
+    (pack / "pack.yaml").write_text("name: p\nowns:\n  namespaces: [reports]\n")
+    m.check_extension_collisions(host, pack, additions, subtree=True)
+    assert any(level == "WARN" and "gadgets" in message
+               for level, _, message in m.FINDINGS)
+
+    # Invalid ownership shapes land no namespaces rather than iterating a string.
+    m.FINDINGS.clear()
+    (pack / "pack.yaml").write_text("name: p\nowns:\n  namespaces: gadgets\n")
+    m.check_extension_collisions(host, pack)
+    assert not m.FINDINGS
 
 
 def test_no_composed_schema_produces_no_false_fail(tmp_path):  # okengine#326 [10] regression
@@ -99,3 +156,261 @@ def test_no_composed_schema_produces_no_false_fail(tmp_path):  # okengine#326 [1
     (pack / "schema.yaml").write_text("types: {gadget: {}}\npartitioning: {namespaces: {gadgets: {}}}\n")
     m.check_extension_collisions(host, pack)
     assert m.FINDINGS == [], m.FINDINGS
+
+
+def test_full_preflight_surfaces_every_collision_family(tmp_path, capsys):
+    m = _mod()
+    host = _pack(tmp_path / "host", "public")
+    pack = _pack(tmp_path / "okpack-demo", "private")
+    (host / "schema.yaml").write_text(
+        "types:\n"
+        "  same: {required: [x]}\n"
+        "  different: {required: [host]}\n"
+        "  owned: {required: []}\n"
+        "type_aliases: {shadowed: product}\n"
+        "partitioning: {namespaces: {custom: {strategy: flat}}}\n"
+    )
+    (pack / "schema.yaml").write_text(
+        "types:\n"
+        "  same: {required: [x]}\n"
+        "  different: {required: [pack]}\n"
+        "  shadowed: {required: []}\n"
+        "type_aliases: {owned: replacement}\n"
+        "partitioning: {namespaces: {custom: {strategy: by-letter}}}\n"
+    )
+    domain_schema = host / "wiki" / "domain" / "schema.yaml"
+    domain_schema.parent.mkdir(parents=True)
+    domain_schema.write_text("types: {same: {}}\n")
+    (host / "wiki" / "custom").mkdir()
+
+    for root in (host, pack):
+        (root / "crons").mkdir()
+        (root / "config").mkdir()
+        (root / "feeds").mkdir()
+    (host / "crons" / "domain-crons.json").write_text(json.dumps([
+        {"id": "same", "name": "installed"},
+        {"id": "host-id", "name": "host-name"},
+    ]))
+    (pack / "crons" / "domain-crons.json").write_text(json.dumps([
+        {"id": "same", "name": "installed"},
+        {"id": "new-id", "name": "host-name"},
+        {"id": "host-id", "name": "new-name"},
+    ]))
+    (host / "crons" / "engine-template-prompts.json").write_text('{"shared": "h"}')
+    (pack / "crons" / "engine-template-prompts.json").write_text('{"shared": "p"}')
+
+    host_rules = {"rules": [{"id": "same", "x": 1}, {"id": "different", "x": 1}]}
+    pack_rules = {"rules": [{"id": "same", "x": 1}, {"id": "different", "x": 2}]}
+    (host / "config" / "rules.yaml").write_text(__import__("yaml").safe_dump(host_rules))
+    (pack / "config" / "rules.yaml").write_text(__import__("yaml").safe_dump(pack_rules))
+    (host / "feeds" / "h.opml").write_text('<outline xmlUrl="https://same"/>')
+    (pack / "feeds" / "p.opml").write_text('<outline xmlUrl="https://same"/>')
+
+    scripts = pack / "crons" / "scripts"
+    scripts.mkdir()
+    (scripts / "writer.py").write_text(
+        'stream = "raw/shared"\ndash = "dashboards/shared.md"\n'
+    )
+    (host / "raw" / "shared").mkdir(parents=True)
+    dashboard = host / "wiki" / "dashboards" / "shared.md"
+    dashboard.parent.mkdir(parents=True)
+    dashboard.write_text("host")
+
+    assert m.main([str(host), str(pack)]) == 1
+    out = capsys.readouterr().out
+    for token in ("[trust]", "[types]", "[namespaces]", "[crons]",
+                  "[configs]", "[feeds]", "[raw-streams]", "[dashboards]"):
+        assert token in out
+    assert "already installed" in out
+    assert "rule id(s) already merged" in out and "rule id collision" in out
+
+
+def test_subtree_idempotency_streams_and_namespace_paths(tmp_path):
+    m = _mod()
+    host = _pack(tmp_path / "host", "private")
+    pack = _pack(tmp_path / "okpack-demo", "private")
+    (host / "schema.yaml").write_text("types: {x: {required: [a]}}\n")
+    (pack / "schema.yaml").write_text("types: {x: {required: [b]}}\n")
+    sub = pack / "subdomain" / "schema.yaml"
+    sub.parent.mkdir()
+    sub.write_text("types: {x: {}}\n")
+    installed = host / "wiki" / "demo"
+    installed.mkdir(parents=True)
+    (installed / "schema.yaml").write_bytes(sub.read_bytes())
+    m.check_types(host, pack, None, subtree=True)
+    m.check_namespaces(host, pack, subtree=True)
+    assert any(level == "WARN" and area == "types" for level, area, _ in m.FINDINGS)
+    assert any(level == "INFO" and area == "namespaces" for level, area, _ in m.FINDINGS)
+
+    m.FINDINGS.clear()
+    script = pack / "crons" / "scripts" / "writer.py"
+    script.parent.mkdir(parents=True)
+    script.write_text('raw/owned dashboards/owned.md')
+    host_script = host / "crons" / "scripts" / "writer.py"
+    host_script.parent.mkdir(parents=True)
+    host_script.write_bytes(script.read_bytes())
+    (host / "raw" / "owned").mkdir(parents=True)
+    dash = host / "wiki" / "dashboards" / "owned.md"
+    dash.parent.mkdir(parents=True)
+    dash.write_text("x")
+    m.check_streams_dashboards(host, pack)
+    assert {area for level, area, _ in m.FINDINGS if level == "INFO"} == {
+        "raw-streams", "dashboards"
+    }
+
+
+def test_clean_main_usage_parse_fallbacks_and_entrypoint(tmp_path, capsys, monkeypatch):
+    m = _mod()
+    host = _pack(tmp_path / "host", "private")
+    pack = _pack(tmp_path / "pack", "public")
+    (pack / "schema.yaml").write_text("types: {unique: {required: []}}\n")
+    assert m.main([str(host), str(pack)]) == 0
+    assert "clean — no collisions" in capsys.readouterr().out
+    assert m.main([str(tmp_path / "missing"), str(pack)]) == 2
+
+    malformed = tmp_path / "malformed.yaml"
+    malformed.write_text("[")
+    m.FINDINGS.clear()
+    assert m._yaml(malformed) == {}
+    assert any(area == "parse" for _, area, _ in m.FINDINGS)
+    (host / "crons").mkdir()
+    (pack / "crons").mkdir()
+    (host / "crons" / "domain-crons.json").write_text("{")
+    (pack / "crons" / "domain-crons.json").write_text("[]")
+    m.check_crons(host, pack)
+    assert any(area == "crons" for _, area, _ in m.FINDINGS)
+
+    monkeypatch.setattr(sys, "argv", [str(MOD), str(host), str(pack)])
+    with pytest.raises(SystemExit) as exc:
+        runpy.run_path(str(MOD), run_name="__main__")
+    assert exc.value.code == 1
+
+
+def test_preflight_remaining_empty_idempotent_and_parse_edges(tmp_path, monkeypatch):
+    m = _mod()
+    host = _pack(tmp_path / "host", "private")
+    pack = _pack(tmp_path / "okpack-demo", "private")
+    (host / "schema.yaml").write_text("types: {}\n")
+    (pack / "schema.yaml").write_text("types: {}\n")
+    m.check_types(host, pack, None)
+    assert any("no types found" in message for _, _, message in m.FINDINGS)
+
+    (pack / "pack.yaml").write_text("domain: /explicit-domain/\ntrust: private\n")
+    assert m._domain_slug(pack) == "explicit-domain"
+    # Missing subtree target is a clean early return.
+    m.check_namespaces(host, pack, subtree=True)
+    conflict = host / "wiki" / "explicit-domain"
+    conflict.mkdir(parents=True)
+    m.check_namespaces(host, pack, subtree=True)
+    assert any(level == "FAIL" and area == "namespaces" for level, area, _ in m.FINDINGS)
+
+    # Standalone namespace already occupied by this exact subdomain schema.
+    (pack / "schema.yaml").write_text(
+        "partitioning: {namespaces: {custom: {strategy: flat}}}\n"
+    )
+    sub = pack / "subdomain" / "schema.yaml"
+    sub.parent.mkdir()
+    sub.write_text("types: {}\n")
+    custom = host / "wiki" / "custom"
+    custom.mkdir()
+    (custom / "schema.yaml").write_bytes(sub.read_bytes())
+    m.check_namespaces(host, pack)
+    assert any(level == "INFO" and "sub-domain" in message for level, _, message in m.FINDINGS)
+
+    # Shape equality alone is not identity: an unrelated occupied namespace must fail.
+    (pack / "schema.yaml").write_text(
+        "partitioning: {namespaces: {absent: {strategy: flat}, taxo: {strategy: flat}}}\n"
+    )
+    (host / "schema.yaml").write_text(
+        "types: {}\npartitioning: {namespaces: {taxo: {strategy: flat}}}\n"
+    )
+    (host / "wiki/taxo").mkdir()
+    m.check_namespaces(host, pack)
+    assert any(level == "FAIL" and "wiki/taxo" in message
+               for level, _, message in m.FINDINGS)
+
+    # Once an ownership manifest records the namespace for THIS pack, the same contract is an
+    # idempotent reinstall rather than a collision.
+    owned = host / ".okengine" / "installed-domains" / "okpack-demo.json"
+    owned.parent.mkdir(parents=True)
+    owned.write_text(json.dumps({"pack": "okpack-demo", "owned_namespaces": {
+        "taxo": {"partitioning": {"strategy": "flat"}, "permissions": None, "tier": None}
+    }}))
+    m.FINDINGS.clear()
+    m.check_namespaces(host, pack)
+    assert any(level == "INFO" and "host partitioning" in message
+               for level, _, message in m.FINDINGS)
+
+    owned.unlink()
+    original_read = Path.read_text
+    reads = {host / "schema.yaml": 0}
+    def unreadable_schema(path, *args, **kwargs):
+        if path == host / "schema.yaml":
+            reads[path] += 1
+            if reads[path] == 2:
+                raise OSError("unreadable")
+        return original_read(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", unreadable_schema)
+    m.FINDINGS.clear()
+    m.check_namespaces(host, pack)
+    assert any(level == "FAIL" and "already exists" in message
+               for level, _, message in m.FINDINGS)
+    monkeypatch.setattr(Path, "read_text", original_read)
+
+    # Prompt parse failures are deliberately ignored.
+    for root in (host, pack):
+        (root / "crons").mkdir(exist_ok=True)
+        (root / "crons/domain-crons.json").write_text("[]")
+        (root / "crons/engine-template-prompts.json").write_text("{")
+    m.check_crons(host, pack)
+
+    # Config iteration includes directories/non-collisions and malformed colliding rule files.
+    hc, pc = host / "config", pack / "config"
+    hc.mkdir(); pc.mkdir()
+    (pc / "directory").mkdir()
+    (pc / "pack-only.yaml").write_text("x: 1\n")
+    (hc / "rules.yaml").write_text("{")
+    (pc / "rules.yaml").write_text("{")
+    (hc / "shared.txt").write_text("host")
+    (pc / "shared.txt").write_text("pack")
+    m.check_configs(host, pack)
+    assert any(level == "WARN" and area == "configs" for level, area, _ in m.FINDINGS)
+
+
+def test_stream_dashboard_loops_with_absent_and_unowned_targets(tmp_path):
+    m = _mod()
+    host = _pack(tmp_path / "host", "private")
+    pack = _pack(tmp_path / "pack", "private")
+    scripts = pack / "crons/scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "a.py").write_text("raw/absent dashboards/absent.md")
+    (scripts / "b.py").write_text("raw/shared dashboards/shared.md")
+    (host / "raw/shared").mkdir(parents=True)
+    dash = host / "wiki/dashboards/shared.md"
+    dash.parent.mkdir(parents=True)
+    dash.write_text("host")
+    m.check_streams_dashboards(host, pack)
+    assert {area for level, area, _ in m.FINDINGS if level == "FAIL"} == {
+        "raw-streams", "dashboards",
+    }
+
+
+def test_type_and_extension_loops_include_noncolliding_entries(tmp_path):
+    m = _mod()
+    host = _pack(tmp_path / "host", "private")
+    pack = _pack(tmp_path / "pack", "private")
+    (host / "schema.yaml").write_text("types: {owned: {}}\n")
+    (pack / "schema.yaml").write_text(
+        "types: {guest: {}}\ntype_aliases: {owned: guest, harmless: guest}\n"
+    )
+    for name, types in (("a", "guest"), ("b", "other")):
+        path = host / "wiki" / name / "schema.yaml"
+        path.parent.mkdir(parents=True)
+        path.write_text(f"types: {{{types}: {{}}}}\n")
+    m.check_types(host, pack, None)
+    assert any("incoming type_alias" in message for _, _, message in m.FINDINGS)
+
+    composed = host / ".okengine/composed-schema.yaml"
+    composed.parent.mkdir()
+    composed.write_text("owners: {types: {base: engine}, namespaces: {core: pack}}\n")
+    m.check_extension_collisions(host, pack)

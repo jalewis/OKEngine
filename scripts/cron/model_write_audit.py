@@ -25,6 +25,19 @@ def _contract_module():
     return module
 
 
+def _link_module():
+    """Use the live enforcer's resolver, not an independently drifting guess."""
+    source = Path(__file__).resolve().parents[2] / "okengine-mcp" / "output_contract_enforce.py"
+    if source.is_file():
+        spec = importlib.util.spec_from_file_location("audit_output_contract_enforce", source)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    # Deployed cron script: the gateway's baked wheel carries the live module.
+    import output_contract_enforce
+    return output_contract_enforce
+
+
 def _page(path: Path) -> tuple[dict, str] | None:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -37,6 +50,7 @@ def _page(path: Path) -> tuple[dict, str] | None:
 
 def audit(vault: Path, jobs_path: Path, *, now: str | None = None) -> dict:
     oc = _contract_module()
+    links = _link_module()
     doc = json.loads(jobs_path.read_text())
     jobs = doc.get("jobs", []) if isinstance(doc, dict) else doc
     findings = []
@@ -55,15 +69,7 @@ def audit(vault: Path, jobs_path: Path, *, now: str | None = None) -> dict:
             contracts[job.get("name")] = contract
             audit_markers[job.get("name")] = job.get("audit_markers") or []
     wiki = vault / "wiki"
-    rels: set[str] = set()
-    by_base: dict[str, set[str]] = {}
-    for indexed in wiki.rglob("*.md"):
-        try:
-            indexed_rel = indexed.relative_to(wiki).as_posix()[:-3]
-        except (OSError, ValueError):
-            continue
-        rels.add(indexed_rel)
-        by_base.setdefault(indexed.stem, set()).add(indexed_rel)
+    link_paths = links.link_index(wiki)
     for path in wiki.rglob("*.md"):
         parsed = _page(path)
         if not parsed:
@@ -124,20 +130,14 @@ def audit(vault: Path, jobs_path: Path, *, now: str | None = None) -> dict:
         if contract.get("unresolved_links") == "reject":
             bad = []
             for target in _LINK.findall(body):
-                target = target.strip().strip("/").removesuffix(".md")
-                base = target.rsplit("/", 1)[-1]
-                # Canonical refs omit physical shard directories (entities/q/qilin is linked as
-                # entities/qilin). A unique basename is therefore resolvable even when exact rel
-                # differs; ambiguous basenames remain findings.
-                if target not in rels and len(by_base.get(base, set())) != 1:
+                target = target.strip().removesuffix(".md")
+                # Share live resolver semantics: shard-omitting links are valid only
+                # when uniquely grounded within their logical parent/namespace.
+                if not links.link_resolves(wiki, target, link_paths):
                     bad.append(target)
             if bad:
                 reasons.append(("unresolved_link", ", ".join(dict.fromkeys(bad))))
-        for field in contract.get("required_relationships", []):
-            values = fm.get(field)
-            values = values if isinstance(values, list) else ([values] if values else [])
-            if not values:
-                reasons.append(("required_relationship_missing", field))
+        reasons.extend(links.relationship_findings(fm, contract, wiki, link_paths))
         for reason, detail in reasons:
             try:
                 page_digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()

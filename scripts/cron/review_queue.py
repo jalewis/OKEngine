@@ -63,12 +63,17 @@ def main() -> int:
         return 1
     review_types = set(schema_lib.governing_schema(VAULT).get("review_required_types") or [])
     items = []          # (prio, reason, rel, detail)
-    for p in WIKI.rglob("*.md"):
+    for p in sorted(WIKI.rglob("*.md")):
         n = p.name
         if n.startswith(("_", ".")) or n == "INDEX.md" or n.startswith("INDEX-") or ".bak." in n:
             continue
         fm, body = _split(p)
         if not fm:
+            continue
+        # A tombstone is a completed lifecycle decision, not pending human work. The
+        # autoverify lane clears stale latches, while this independent guard keeps the
+        # generated dashboard truthful before that cleanup has run.
+        if str(fm.get("status") or "").strip().lower() == "tombstoned":
             continue
         reviewed = _d(fm.get("reviewed_on"))
         updated = _d(fm.get("last_updated") or fm.get("created"))

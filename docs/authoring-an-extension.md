@@ -37,6 +37,10 @@ extensions/<id>/                 # tier-1 engine (extensions/), tier-2 pack (<pa
 `id` is reverse-DNS-ish (`^[a-z0-9][a-z0-9.-]{1,126}[a-z0-9]$`, no underscores). `okengine.*`
 is **reserved for first-party** (engine-tier) extensions.
 
+Schema ownership cannot claim the engine-reserved `dashboards` or `operational`
+namespaces. Extensions may write permitted derived artifacts there without owning
+those namespaces; composition rejects either name under `owns.namespaces`.
+
 ## 2. The manifest (`extension.yaml`)
 
 The full field reference is [extension-system.md §6](design/extension-system.md). The minimum:
@@ -81,6 +85,7 @@ operations:
     entrypoint: select_candidates.py        # wake-gate selector
     prompt_file: prompts/candidate-watch.md  # bundled agent prompt
     toolsets: [hermes-cron, okengine-write, okengine]
+    max_iterations: 6                     # optional bounded model/tool-turn ceiling
     tier: predictions                        # optional kickstart-stage hint (#129)
     # model: <a stronger-tier model>         # optional per-lane model — pick by task profile,
                                              #   see docs/model-selection.md (omit to inherit default)
@@ -92,7 +97,7 @@ the same dir (it's staged too).
 
 **Drop-in form (#63 P1, preferred for new extensions).** Instead of an `operations:` map in
 the manifest, drop one file per op into `crons/<op>.cron.json` — each file is the same operation
-block (`schedule` / `entrypoint` / `prompt_file` / `toolsets`), and the op name is the filename
+block (`schedule` / `entrypoint` / `prompt_file` / `toolsets` / `max_iterations`), and the op name is the filename
 stem. The composer collects them forward-only (no central block to edit, no merge conflicts), so
 adding a lane is adding a file. Drop-ins and a manifest `operations:` block may coexist; a name
 in both is a fail-loud collision. (This is the drop-in contribution model from
@@ -196,8 +201,8 @@ framework extensions list   <pack>                       # discovered (present !
 framework extensions enable <pack> <id>                   # mint scoped token, regen, compose schema
 ENGINE_DIR=… CRON_PACK_DIR=<pack> bash scripts/deploy-cron-scripts.sh      # stage *.py into the gateway
 ENGINE_DIR=… CRON_PACK_DIR=<pack> bash scripts/deploy-cron-plus-jobs.sh    # fold <id>[:<op>] jobs into the fleet
-# trigger a lane on demand (id from jobs.json):
-HERMES_UID=… bash scripts/cron-plus.sh run <job-id>
+# trigger a lane on demand by its stable composed name:
+bin/framework jobs run <deployment> <job-name>
 framework extensions disable <pack> <id>                  # opt-out (also turns OFF a core extension)
 framework extensions purge   <pack> <id>                  # remove staged scripts + token
 ```

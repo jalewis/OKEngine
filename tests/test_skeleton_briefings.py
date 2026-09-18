@@ -42,7 +42,8 @@ def test_skeleton_brief_cron_writes_briefings_with_briefing_type():
     jobs = crons["jobs"] if isinstance(crons, dict) else crons
     assert not [j for j in jobs if "brief" in j["name"].lower()], \
         "brief cron must not be a skeleton DOMAIN job (it's engine-template since #169)"
-    p = json.loads(SK.joinpath("crons/engine-template-prompts.json").read_text())["daily-brief"]
+    spec = json.loads(SK.joinpath("crons/engine-template-prompts.json").read_text())["daily-brief"]
+    p = SK.joinpath(spec["prompt_file"]).read_text()
     assert "wiki/briefings/" in p
     assert "type: briefing" in p
     assert "type: dashboard" not in p   # the old model — must be gone

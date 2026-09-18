@@ -1,0 +1,711 @@
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 4c49896d5..3fffa70e1 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -2271,6 +2271,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
+ 
+         def _execute(next_args: dict) -> Any:
+             result = inline_executor(agent, next_args, inline_ctx)
++            from tools.tool_execution_telemetry import record_completed_tool_handler
++            record_completed_tool_handler(function_name)
+             emit_terminal_post_tool_call(
+                 agent, function_name=function_name,
+                 function_args=next_args if isinstance(next_args, dict) else function_args,
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index 3fc5f6b8b..5cf046037 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -1496,6 +1496,16 @@ class _SequentialDispatch:
+     finish_in_finally: bool = True  # inline tools print their completion line only on success
+ 
+ 
++def _recording_nonregistry_call(name: str, call: Callable[[dict], Any]) -> Callable[[dict], Any]:
++    """Count an inline handler only after it returned, not a blocked/raised call."""
++    def _run(args: dict) -> Any:
++        result = call(args)
++        from tools.tool_execution_telemetry import record_completed_tool_handler
++        record_completed_tool_handler(name)
++        return result
++    return _run
++
++
+ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _SequentialDispatch:
+     """Pick the execute callable for one sequential call and start its spinner. Precedence:
+     inline agent-level tools, delegate_task, context-engine tools, memory-provider tools,
+@@ -1507,14 +1517,21 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
+         # Agent-level tools that need live AIAgent state; table shared with invoke_tool.
+         inline_executor = INLINE_TOOL_EXECUTORS[function_name]
+         inline_ctx = InlineToolContext(effective_task_id=effective_task_id, tool_call_id=tool_call_id, messages=messages)
+-        return _SequentialDispatch(lambda next_args: inline_executor(agent, next_args, inline_ctx), finish_in_finally=False)
++        return _SequentialDispatch(
++            _recording_nonregistry_call(
++                function_name, lambda next_args: inline_executor(agent, next_args, inline_ctx)),
++            finish_in_finally=False)
+     if function_name == "delegate_task":
+         spinner = _start_quiet_tool_spinner(agent, function_name, function_args, label=_delegate_spinner_label(function_args))
+         agent._delegate_spinner = spinner
+-        return _SequentialDispatch(agent._dispatch_delegate_task, spinner=spinner, is_delegate=True)
++        return _SequentialDispatch(
++            _recording_nonregistry_call(function_name, agent._dispatch_delegate_task),
++            spinner=spinner, is_delegate=True)
+     if agent._context_engine_tool_names and function_name in agent._context_engine_tool_names:
+         return _SequentialDispatch(
+-            execute=lambda next_args: agent.context_compressor.handle_tool_call(function_name, next_args, messages=messages),
++            execute=_recording_nonregistry_call(
++                function_name, lambda next_args: agent.context_compressor.handle_tool_call(
++                    function_name, next_args, messages=messages)),
+             spinner=_start_quiet_tool_spinner(agent, function_name, function_args, gate=False),
+             error_result=lambda e: json.dumps({"error": f"Context engine tool '{function_name}' failed: {e}"}),
+             error_log="context_engine.handle_tool_call raised for %s: %s",
+@@ -1522,7 +1539,8 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
+     if agent._memory_manager and agent._memory_manager.has_tool(function_name):
+         # Memory-provider tools (hindsight_retain, honcho_search, ...) are not in the registry.
+         return _SequentialDispatch(
+-            execute=lambda next_args: agent._memory_manager.handle_tool_call(function_name, next_args),
++            execute=_recording_nonregistry_call(
++                function_name, lambda next_args: agent._memory_manager.handle_tool_call(function_name, next_args)),
+             spinner=_start_quiet_tool_spinner(agent, function_name, function_args),
+             error_result=lambda e: json.dumps({"error": f"Memory tool '{function_name}' failed: {e}"}),
+             error_log="memory_manager.handle_tool_call raised for %s: %s",
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 3d745e136..4cb61166c 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2315,7 +2315,10 @@ def run_job(
+     """
+     job_id = job["id"]
+     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
++    # The same dict is passed to cron-plus receipt verification after run_job.
++    # Clear a prior fire's telemetry before any early-return gate can fire.
++    job["_okengine_executed_tool_calls"] = 0
+ 
+     early, prompt, script_failed = _prepare_job_prompt(
+         job, job_id, job_name, extra_prompt, cancel_event)
+     if early is not None:
+@@ -2352,9 +2355,20 @@ def run_job(
+             session_db=_session_db, report_only=script_failed)
+         _audit = _FireAudit(job, job_id, model)
+ 
+-        result = _run_agent_with_watchdog(
+-            agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
+-            worker_state=_worker_state)
++        from tools.tool_execution_telemetry import capture_completed_tool_handlers
++        _completed_count = 0
++        _completed_lock = threading.Lock()
++
++        def _record_completed(_name: str) -> None:
++            nonlocal _completed_count
++            with _completed_lock:
++                _completed_count += 1
++
++        with capture_completed_tool_handlers(_record_completed):
++            result = _run_agent_with_watchdog(
++                agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
++                worker_state=_worker_state)
++        job["_okengine_executed_tool_calls"] = _completed_count
+         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
+         # Keep final_response clean for delivery logic (empty = no delivery).
+         logged_response = final_response if final_response else "(No response generated)"
+diff --git a/model_tools.py b/model_tools.py
+index 4193fb221..d5c979acc 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -820,7 +820,10 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
+         from tools.tool_gateway.names import is_connector_name
+         if is_connector_name(function_name):
+             from model_tools_connectors import dispatch_connector_call
+-            return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
++            result = dispatch_connector_call(function_name, next_args, ids.tool_call_id)
++            from tools.tool_execution_telemetry import record_completed_connector_handler
++            record_completed_connector_handler(function_name, result)
++            return result
+         return registry.dispatch(function_name, next_args, **dispatch_kwargs)
+ 
+     with _approval_observability(ids):
+diff --git a/tests/cron/test_okengine_completed_tool_receipt.py b/tests/cron/test_okengine_completed_tool_receipt.py
+new file mode 100644
+index 000000000..bd0358eea
+--- /dev/null
++++ b/tests/cron/test_okengine_completed_tool_receipt.py
+@@ -0,0 +1,72 @@
++"""The same cron job dict reaches receipt verification with handler telemetry."""
++
++from unittest.mock import patch
++
++from tools.registry import ToolRegistry
++
++
++def _fake_turn(*, dispatch=None):
++    def _run(self, prompt, task_id=None):
++        if dispatch is not None:
++            dispatch()
++        # A model-emitted tool call is deliberately present in both fixtures:
++        # only the positive fixture executes a real registered handler.
++        return {
++            "completed": True, "failed": False, "final_response": "done",
++            "turn_exit_reason": "", "messages": [
++                {"role": "assistant", "tool_calls": [{"function": {"name": "receipt_probe"}}]},
++                {"role": "tool", "name": "receipt_probe", "content": "fixture result"},
++            ],
++        }
++    return _run
++
++
++def _run_disposable_cron(monkeypatch, tmp_path, fake_turn):
++    import cron.scheduler as scheduler
++    from tests.cron import test_scheduler_completion_verification as existing_fixture
++
++    audits = []
++
++    def _capture_audit(self, result, error):
++        audits.append((self.job, result, error))
++
++    with (
++        patch.object(existing_fixture._FakeCronAgent, "run_conversation", autospec=True,
++                     side_effect=fake_turn),
++        patch.object(scheduler._FireAudit, "write", autospec=True,
++                     side_effect=_capture_audit),
++    ):
++        existing_fixture._run_booked_job(monkeypatch, tmp_path)
++    assert audits, "the disposable run must reach cron audit/receipt handoff"
++    return audits[0]
++
++
++def test_synthetic_assistant_tool_call_cannot_satisfy_receipt_gate(monkeypatch, tmp_path):
++    job, result, error = _run_disposable_cron(monkeypatch, tmp_path, _fake_turn())
++    assert error is None
++    assert result["messages"][0]["tool_calls"]
++    assert job["_okengine_executed_tool_calls"] == 0
++
++
++def test_completed_registered_handler_publishes_count_on_same_job(monkeypatch, tmp_path):
++    registry = ToolRegistry()
++    handler_calls = []
++
++    def handler(args, **_kwargs):
++        handler_calls.append(args)
++        return '{"ok":true}'
++
++    registry.register(
++        name="receipt_probe", toolset="fixture",
++        schema={"name": "receipt_probe", "description": "fixture",
++                "parameters": {"type": "object", "properties": {}}},
++        handler=handler,
++    )
++
++    job, _result, error = _run_disposable_cron(
++        monkeypatch, tmp_path,
++        _fake_turn(dispatch=lambda: registry.dispatch("receipt_probe", {"key": "selected"})),
++    )
++    assert error is None
++    assert handler_calls == [{"key": "selected"}]
++    assert job["_okengine_executed_tool_calls"] == 1
+diff --git a/tests/cron/test_scheduler_completion_verification.py b/tests/cron/test_scheduler_completion_verification.py
+index 85bb51c27..d787ee84e 100644
+--- a/tests/cron/test_scheduler_completion_verification.py
++++ b/tests/cron/test_scheduler_completion_verification.py
+@@ -16,3 +16,4 @@
+ import os
++from unittest.mock import create_autospec
+ 
+ import pytest
+@@ -24,7 +24,7 @@ class _FakeCronAgent:
+     def __init__(self, *args, **kwargs):
+         pass
+ 
+-    def run_conversation(self, prompt):
++    def run_conversation(self, prompt, task_id=None):
+         return {
+             "completed": True,
+             "failed": False,
+@@ -67,3 +68,4 @@
+     import hermes_state
+     import run_agent
++    from tools.mcp_tool_discovery import discover_mcp_tools
+ 
+@@ -99,3 +101,7 @@
+-    monkeypatch.setattr("tools.mcp_tool_discovery.discover_mcp_tools", lambda: [])
++    discovery_mock = create_autospec(discover_mcp_tools, return_value=[])
++    monkeypatch.setattr(
++        "tools.mcp_tool_discovery.discover_mcp_tools",
++        discovery_mock,
++    )
+     monkeypatch.setattr(cron_scheduler, "_get_hermes_home", lambda: tmp_path)
+     monkeypatch.setattr(cron_scheduler, "get_fallback_chain", lambda _cfg: [])
+@@ -108,8 +112,12 @@ def _run_booked_job(monkeypatch, tmp_path):
+             "id": "verify-complete",
+             "name": "Verification",
+             "prompt": "Do the thing",
++            "model": "fixture-model",
+             "schedule_display": "manual",
+         }
+     )
++    assert discovery_mock.call_args is not None, "agent job must reach scoped MCP discovery"
++    assert len(discovery_mock.call_args.args) == 1
++    assert isinstance(discovery_mock.call_args.args[0], list)
+     return instances
+ 
+diff --git a/tests/tools/test_okengine_completed_tool_telemetry.py b/tests/tools/test_okengine_completed_tool_telemetry.py
+new file mode 100644
+index 000000000..882feac6c
+--- /dev/null
++++ b/tests/tools/test_okengine_completed_tool_telemetry.py
+@@ -0,0 +1,392 @@
++"""Completion telemetry is tied to concrete handler returns, not model intent."""
++
++import asyncio
++import concurrent.futures
++import json
++import threading
++from types import SimpleNamespace
++from unittest.mock import create_autospec, patch
++
++import pytest
++
++from agent.tool_executor import (
++    _ToolCallRef, _recording_nonregistry_call, _resolve_sequential_dispatch,
++)
++from agent.agent_runtime_helpers import invoke_tool
++from agent.context_engine import ContextEngine
++from agent.memory_manager import MemoryManager
++from tools.todo_tool import TodoStore
++from tools.registry import ToolRegistry
++from tools.thread_context import propagate_context_to_thread
++from tools.tool_execution_telemetry import (
++    capture_completed_tool_handlers, record_completed_connector_handler)
++
++
++def _schema(name):
++    return {"name": name, "description": "disposable fixture tool",
++            "parameters": {"type": "object", "properties": {}}}
++
++
++def _registry_with_probe(handler, *, is_async=False):
++    registry = ToolRegistry()
++    registry.register(
++        name="receipt_probe", toolset="fixture", schema=_schema("receipt_probe"),
++        handler=handler, is_async=is_async,
++    )
++    return registry
++
++
++def test_completed_registry_handler_is_counted_once():
++    calls = []
++
++    def handler(args, **_kwargs):
++        calls.append(args)
++        return '{"ok":true}'
++
++    registry = _registry_with_probe(handler)
++    completed = []
++    with capture_completed_tool_handlers(completed.append):
++        result = registry.dispatch("receipt_probe", {"key": "selected"})
++
++    assert json.loads(result) == {"ok": True}
++    assert calls == [{"key": "selected"}]
++    assert completed == ["receipt_probe"]
++
++
++def test_completed_handler_sink_failure_does_not_retry_tool(caplog):
++    calls = []
++
++    def handler(args, **_kwargs):
++        calls.append(args)
++        return '{"ok":true}'
++
++    def broken_sink(_name):
++        raise RuntimeError("disposable completion sink failure")
++
++    registry = _registry_with_probe(handler)
++    with capture_completed_tool_handlers(broken_sink):
++        result = registry.dispatch("receipt_probe", {"key": "selected"})
++    assert json.loads(result) == {"ok": True}
++    assert calls == [{"key": "selected"}], (
++        "telemetry failure must not cause a second concrete tool execution")
++    assert any("Completed-tool telemetry sink failed" in row.message
++               for row in caplog.records)
++
++
++def test_unknown_or_raising_tool_cannot_satisfy_completion_gate():
++    def failing_handler(_args, **_kwargs):
++        raise RuntimeError("handler failed before a result")
++
++    registry = _registry_with_probe(failing_handler)
++    completed = []
++    # The old patch would count this assistant turn merely because a call was
++    # present, even if validation supplied a synthetic error-result row.
++    messages = [{"role": "assistant", "tool_calls": [{"function": {"name": "missing"}}]}]
++    assert sum(bool(m.get("tool_calls")) for m in messages) == 1
++
++    with capture_completed_tool_handlers(completed.append):
++        missing = registry.dispatch("not_registered", {})
++        failed = registry.dispatch("receipt_probe", {})
++
++    assert "error" in json.loads(missing)
++    assert "error" in json.loads(failed)
++    assert completed == [], "neither model intent nor a non-returning handler ran to completion"
++
++
++def test_async_registry_handler_completion_is_counted():
++    async def handler(_args, **_kwargs):
++        return '{"ok":true}'
++
++    registry = _registry_with_probe(handler, is_async=True)
++    completed = []
++    with (
++        capture_completed_tool_handlers(completed.append),
++        patch("model_tools._run_async", autospec=True, side_effect=asyncio.run),
++    ):
++        result = registry.dispatch("receipt_probe", {})
++    assert json.loads(result) == {"ok": True}
++    assert completed == ["receipt_probe"]
++
++
++def test_inline_handler_counts_only_after_return():
++    completed = []
++    good = _recording_nonregistry_call("delegate_task", lambda args: {"done": args["key"]})
++
++    def fail(_args):
++        raise RuntimeError("no result")
++
++    bad = _recording_nonregistry_call("delegate_task", fail)
++    with capture_completed_tool_handlers(completed.append):
++        assert good({"key": "selected"}) == {"done": "selected"}
++        with pytest.raises(RuntimeError, match="no result"):
++            bad({})
++    assert completed == ["delegate_task"]
++
++
++def test_connector_transport_error_or_malformed_envelope_is_not_counted():
++    completed = []
++    with capture_completed_tool_handlers(completed.append):
++        record_completed_connector_handler("mcp__probe__read", '{"error":{"code":"UNAVAILABLE"}}')
++        record_completed_connector_handler("mcp__probe__read", "not json")
++        record_completed_connector_handler("mcp__probe__read", '{"response":{"content":"ok"}}')
++    assert completed == ["mcp__probe__read"], (
++        "only a dispatched connector response may be positive execution telemetry")
++
++
++def test_execute_code_dispatch_uses_caller_tool_scope_not_process_global(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    import model_tools
++
++    registry = ToolRegistry()
++    registry.register(
++        name="execute_code", toolset="fixture", schema=_schema("execute_code"),
++        handler=lambda args, **kwargs: json.dumps({
++            "args": args, "enabled_tools": kwargs.get("enabled_tools"),
++        }),
++    )
++    monkeypatch.setattr(model_tools, "registry", registry)
++    monkeypatch.setattr(model_tools, "_last_resolved_tool_names", ["write_file"])
++    ids = model_tools._CallIds(task_id="disposable-task", session_id="disposable-session")
++    completed = []
++    with capture_completed_tool_handlers(completed.append):
++        result = model_tools._execute_tool(
++            "execute_code", {"code": "noop"}, {"code": "noop"}, ids,
++            user_task=None, enabled_tools=["read_file"],
++            skip_tool_execution_middleware=True,
++        )
++
++    assert json.loads(result) == {
++        "args": {"code": "noop"}, "enabled_tools": ["read_file"],
++    }
++    assert completed == ["execute_code"]
++
++
++def test_connector_dispatch_counts_only_returned_envelope(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    import model_tools
++
++    ids = model_tools._CallIds(
++        task_id="disposable-task", session_id="disposable-session",
++        tool_call_id="disposable-call",
++    )
++    response = '{"response":{"content":"ok"}}'
++    completed = []
++    with (
++        patch("model_tools_connectors.dispatch_connector_call", autospec=True,
++              return_value=response) as connector,
++        capture_completed_tool_handlers(completed.append),
++    ):
++        result = model_tools._execute_tool(
++            "connectors__fixture__read", {"key": "selected"}, {"key": "selected"}, ids,
++            user_task="disposable request", enabled_tools=None,
++            skip_tool_execution_middleware=True,
++        )
++
++    assert result == response
++    connector.assert_called_once_with(
++        "connectors__fixture__read", {"key": "selected"}, "disposable-call")
++    assert completed == ["connectors__fixture__read"]
++
++
++def test_worker_context_carries_completion_sink_without_cross_fire_leak():
++    registry = _registry_with_probe(lambda _args, **_kwargs: '{"ok":true}')
++    completed = []
++    lock = threading.Lock()
++
++    def record(name):
++        with lock:
++            completed.append(name)
++
++    with capture_completed_tool_handlers(record):
++        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
++            futures = [pool.submit(propagate_context_to_thread(registry.dispatch),
++                                   "receipt_probe", {}) for _ in range(40)]
++            assert all(json.loads(f.result()) == {"ok": True} for f in futures)
++
++    assert len(completed) == 40, "all 40 real concurrent completions must be counted"
++    registry.dispatch("receipt_probe", {})
++    assert len(completed) == 40, "the sink must be reset after the scoped fire"
++
++
++@pytest.fixture
++def invoke_agent(tmp_path, monkeypatch):
++    import model_tools
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
++    registry = _registry_with_probe(lambda args, **_kwargs: json.dumps({"args": args}))
++    monkeypatch.setattr(model_tools, "registry", registry)
++    agent = SimpleNamespace(
++        session_id="disposable-session", _current_turn_id="disposable-turn",
++        _current_api_request_id="disposable-api", _memory_manager=None,
++        _todo_store=TodoStore(), valid_tool_names=["receipt_probe", "todo_list"],
++        enabled_toolsets=None, disabled_toolsets=None,
++    )
++    return agent
++
++
++def test_concurrent_registry_invoke_dispatches_real_handler_and_counts_completion(invoke_agent):
++    completed = []
++    with capture_completed_tool_handlers(completed.append):
++        result = invoke_tool(
++            invoke_agent, "receipt_probe", {"key": "selected"}, "disposable-task",
++            tool_call_id="disposable-call",
++        )
++    assert json.loads(result) == {"args": {"key": "selected"}}
++    assert completed == ["receipt_probe"]
++
++
++def test_concurrent_inline_todo_invoke_persists_real_store_and_counts_completion(invoke_agent):
++    todos = [{"id": "selected", "content": "Check retained receipt", "status": "pending"}]
++    completed = []
++    with capture_completed_tool_handlers(completed.append):
++        result = invoke_tool(
++            invoke_agent, "todo_list", {"todos": todos}, "disposable-task",
++            tool_call_id="inline-call", pre_tool_block_checked=True,
++        )
++    assert json.loads(result)["todos"] == todos
++    assert invoke_agent._todo_store.read() == todos
++    assert completed == ["todo_list"]
++
++
++def test_sequential_inline_todo_dispatch_persists_real_store_and_counts_completion(
++    invoke_agent,
++):
++    invoke_agent._context_engine_tool_names = set()
++    todos = [{"id": "sequential", "content": "Check retained receipt", "status": "pending"}]
++    ref = _ToolCallRef("todo_list", {"todos": todos}, "disposable-task", "todo-call", [])
++    completed = []
++    with capture_completed_tool_handlers(completed.append):
++        dispatch = _resolve_sequential_dispatch(invoke_agent, ref, [])
++        result = dispatch.execute(ref.args)
++    assert json.loads(result)["todos"] == todos
++    assert invoke_agent._todo_store.read() == todos
++    assert completed == ["todo_list"]
++
++
++def test_sequential_delegate_dispatch_counts_only_returned_handler(invoke_agent):
++    invoke_agent._context_engine_tool_names = set()
++    invoke_agent._should_emit_quiet_tool_messages = lambda: False
++    calls = []
++
++    def delegate(args):
++        calls.append(args)
++        if args.get("fail"):
++            raise RuntimeError("disposable delegate failure")
++        return {"accepted": args["goal"]}
++
++    invoke_agent._dispatch_delegate_task = delegate
++    ref = _ToolCallRef(
++        "delegate_task", {"goal": "selected"}, "disposable-task", "delegate-call", []
++    )
++    completed = []
++    with capture_completed_tool_handlers(completed.append):
++        dispatch = _resolve_sequential_dispatch(invoke_agent, ref, [])
++        assert dispatch.is_delegate
++        assert dispatch.execute(ref.args) == {"accepted": "selected"}
++        with pytest.raises(RuntimeError, match="disposable delegate failure"):
++            dispatch.execute({"fail": True})
++    assert calls == [{"goal": "selected"}, {"fail": True}]
++    assert completed == ["delegate_task"]
++
++
++def test_sequential_context_engine_dispatch_counts_returned_contract_handler(invoke_agent):
++    invoke_agent._should_emit_quiet_tool_messages = lambda: False
++    invoke_agent._context_engine_tool_names = {"context_probe"}
++    engine = create_autospec(ContextEngine, instance=True)
++    engine.handle_tool_call.side_effect = (
++        lambda name, args, *, messages: json.dumps({"name": name, "args": args})
++    )
++    invoke_agent.context_compressor = engine
++    ref = _ToolCallRef(
++        "context_probe", {"key": "selected"}, "disposable-task", "context-call", []
++    )
++    completed = []
++    with capture_completed_tool_handlers(completed.append):
++        dispatch = _resolve_sequential_dispatch(invoke_agent, ref, [])
++        result = dispatch.execute(ref.args)
++    assert json.loads(result) == {"name": "context_probe", "args": {"key": "selected"}}
++    assert completed == ["context_probe"]
++
++
++def test_sequential_memory_dispatch_counts_return_and_excludes_handler_exception(invoke_agent):
++    invoke_agent._should_emit_quiet_tool_messages = lambda: False
++    invoke_agent._context_engine_tool_names = set()
++    manager = create_autospec(MemoryManager, instance=True)
++    manager.has_tool.side_effect = lambda name: name == "memory_probe"
++
++    def memory_call(name, args):
++        if args.get("fail"):
++            raise RuntimeError("disposable memory failure")
++        return json.dumps({"name": name, "args": args})
++
++    manager.handle_tool_call.side_effect = memory_call
++    invoke_agent._memory_manager = manager
++    ref = _ToolCallRef(
++        "memory_probe", {"key": "selected"}, "disposable-task", "memory-call", []
++    )
++    completed = []
++    with capture_completed_tool_handlers(completed.append):
++        dispatch = _resolve_sequential_dispatch(invoke_agent, ref, [])
++        result = dispatch.execute(ref.args)
++        with pytest.raises(RuntimeError, match="disposable memory failure"):
++            dispatch.execute({"fail": True})
++    assert json.loads(result) == {"name": "memory_probe", "args": {"key": "selected"}}
++    assert completed == ["memory_probe"]
++
++
++def test_sequential_registry_dispatch_uses_real_tool_registry_and_counts_completion(
++    invoke_agent,
++):
++    invoke_agent._context_engine_tool_names = set()
++    invoke_agent.quiet_mode = False
++    ref = _ToolCallRef(
++        "receipt_probe", {"key": "selected"}, "disposable-task", "registry-call", []
++    )
++    completed = []
++    with capture_completed_tool_handlers(completed.append):
++        dispatch = _resolve_sequential_dispatch(invoke_agent, ref, [])
++        result = dispatch.execute(ref.args)
++    assert json.loads(result) == {"args": {"key": "selected"}}
++    assert completed == ["receipt_probe"]
++
++
++def test_concurrent_invalid_arguments_take_direct_real_registry_path(invoke_agent):
++    completed = []
++    with capture_completed_tool_handlers(completed.append):
++        result = invoke_tool(
++            invoke_agent, "receipt_probe", None, "disposable-task",
++            tool_call_id="invalid-call", pre_tool_block_checked=True,
++            skip_tool_request_middleware=True, skip_tool_execution_middleware=True,
++        )
++    assert json.loads(result) == {"args": {}}
++    assert completed == ["receipt_probe"]
++
++
++def test_concurrent_request_middleware_failure_does_not_retry_real_handler(invoke_agent):
++    completed = []
++    with (
++        capture_completed_tool_handlers(completed.append),
++        patch("hermes_cli.middleware.apply_tool_request_middleware", autospec=True,
++              side_effect=RuntimeError("disposable request middleware failure")),
++    ):
++        result = invoke_tool(
++            invoke_agent, "receipt_probe", {"key": "selected"}, "disposable-task",
++            tool_call_id="middleware-call", pre_tool_block_checked=True,
++        )
++    assert json.loads(result) == {"args": {"key": "selected"}}
++    assert completed == ["receipt_probe"], "a failed request hook must not duplicate execution"
++
++
++def test_concurrent_plugin_block_prevents_real_registry_handler(invoke_agent):
++    completed = []
++    with (
++        capture_completed_tool_handlers(completed.append),
++        patch("hermes_cli.plugins._dispatch_pre_tool_call_hooks", autospec=True,
++              return_value=("blocked by disposable plugin", None)),
++    ):
++        result = invoke_tool(
++            invoke_agent, "receipt_probe", {"key": "selected"}, "disposable-task",
++            tool_call_id="blocked-call", skip_tool_request_middleware=True,
++        )
++    assert json.loads(result) == {"error": "blocked by disposable plugin"}
++    assert completed == [], "plugin-blocked model intent must not count as completed execution"
+diff --git a/tools/registry.py b/tools/registry.py
+index f2469d413..5436e388d 100644
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -836,6 +836,8 @@ class ToolRegistry:
+                 result = _run_async(entry.handler(args, **kwargs))
+             else:
+                 result = entry.handler(args, **kwargs)
++            from tools.tool_execution_telemetry import record_completed_tool_handler
++            record_completed_tool_handler(name)
+             return self._normalize_handler_result(name, result)
+         except Exception as e:
+             # exc_info already renders the exception, so keep the message copy bounded.
+diff --git a/tools/tool_execution_telemetry.py b/tools/tool_execution_telemetry.py
+new file mode 100644
+index 000000000..cfb7c60b9
+--- /dev/null
++++ b/tools/tool_execution_telemetry.py
+@@ -0,0 +1,47 @@
++"""Per-fire completion sink for real tool handlers, propagated with ContextVars.
++
++No sink is installed for ordinary agent turns. Cron installs one while its
++conversation runs, and worker-thread context copies carry the same callback.
++"""
++
++from contextlib import contextmanager
++from contextvars import ContextVar
++import json
++import logging
++from typing import Callable, Iterator, Optional
++
++logger = logging.getLogger(__name__)
++_completed_sink: ContextVar[Optional[Callable[[str], None]]] = ContextVar(
++    "hermes_completed_tool_handler_sink", default=None)
++
++
++@contextmanager
++def capture_completed_tool_handlers(sink: Callable[[str], None]) -> Iterator[None]:
++    token = _completed_sink.set(sink)
++    try:
++        yield
++    finally:
++        _completed_sink.reset(token)
++
++
++def record_completed_tool_handler(name: str) -> None:
++    """Record only after a concrete handler returned, never a model request."""
++    sink = _completed_sink.get()
++    if sink is None:
++        return
++    try:
++        sink(name)
++    except Exception:
++        # Telemetry must not turn a completed tool into a duplicate retry.
++        logger.exception("Completed-tool telemetry sink failed for %s", name)
++
++
++def record_completed_connector_handler(name: str, result: object) -> None:
++    """Count only a connector response, not a transport/error envelope."""
++    try:
++        envelope = json.loads(result) if isinstance(result, str) else result
++    except (TypeError, ValueError):
++        return
++    if (isinstance(envelope, dict) and "response" in envelope
++            and "error" not in envelope):
++        record_completed_tool_handler(name)

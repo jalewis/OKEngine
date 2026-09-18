@@ -38,7 +38,7 @@ import yaml         # noqa: E402
 
 _FM_RE = re.compile(r"\A(---\s*\n)(.*?\n)(---\s*(?:\n|\Z))", re.DOTALL)
 _ID_LINE = re.compile(r"^id:\s", re.MULTILINE)
-_RESERVED = {"index.md", "log.md", "agents.md", "hot.md", "bundle.md", "health.md"}
+_RESERVED = {"index.md", "log.md", "agents.md", "readme.md", "hot.md", "bundle.md", "health.md"}
 
 
 def _skip(p: Path) -> bool:

@@ -28,6 +28,16 @@ def test_bandit_has_zero_debt_baseline():
     assert "zero accepted findings" in audit
 
 
+def test_bandit_blocks_on_every_shipped_python_runtime_surface():
+    audit = (REPO / "scripts" / "audit.sh").read_text()
+    ci = (REPO / ".github/workflows/ci.yml").read_text()
+    roots = ("scripts", "tools", "okengine-mcp", "okengine-reader", "okengine-cockpit",
+             "okengine-operations", "okengine-projection", "extensions", "plugins")
+    for root in roots:
+        assert root in audit and root in ci
+    assert "continue-on-error: true" not in ci[ci.index("name: bandit"):ci.index("typecheck:")]
+
+
 def test_scrub_check_scans_whole_tracked_tree_not_a_glob_subset():  # invariant-audit #55
     """The pre-commit scrub must scan the whole tracked tree (like the publish scrub), or shipped
     non-glob files (static/*.js, Dockerfiles, patches/*.patch) go unscanned at commit time."""

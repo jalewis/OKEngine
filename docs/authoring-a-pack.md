@@ -169,8 +169,9 @@ The scaffold ships a sane generic contract; edit it to your domain. The blocks:
   with worked examples in comments.
 - **Scope & guards** — what the contract applies to and protects:
   `apply_under` (the dir roots this schema governs — a page outside them is
-  out-of-scope and skipped, not failed), `exclude` (non-knowledge / derived dirs
-  to skip, e.g. `wiki/<ns>/`), and `reserved_files` (paths the MCP write path
+  out-of-scope and skipped, not failed), `exclude` (whole non-knowledge/derived
+  namespaces as `<ns>` or `wiki/<ns>/`; explicit globs remain page-scoped; an
+  ambiguous bare multi-segment path is rejected), and `reserved_files` (paths the MCP write path
   refuses — overrides the engine default set like `CLAUDE.md`/log).
 - **Field-value validation** — constrain values without a code change:
   `common_optional` (optional fields allowed on *every* type, merged with the

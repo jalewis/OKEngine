@@ -27,7 +27,10 @@ def apply(pack: pathlib.Path, dry_run: bool) -> list[str]:
 - **Engine migrations** live here (`migrations/`) — they apply to every pack on the version bump.
 - **Pack-local migrations** live in `<pack>/.okengine/migrations/` — for a transform specific to
   one pack's schema/content. `framework upgrade` merges both, ordered by `to_version`; a
-  pack-local migration with the same `ID` as an engine one **overrides** it.
+  pack-local migration with the same `ID` and `TO` as an engine one **overrides** it. New
+  applications record the selected tier, path, content SHA-256, and target version. Removing or
+  changing an applied override fails planning loudly; it never silently substitutes or reruns the
+  engine implementation. Legacy ID-only state remains readable.
 
 ## Phases (#66)
 
@@ -39,11 +42,16 @@ def apply(pack: pathlib.Path, dry_run: bool) -> list[str]:
   the registry baseline (nothing to migrate *from* within it); the contract is exercised by tests.
 - **Phase 3 (done):** `--apply` **snapshots the pack source** to `.okengine/snapshots/<ts>/` before
   running migrations, and if the roll-forward gate fails it **automatically rolls back** (reverts
-  modified files, deletes added ones, recreates deleted ones) so a bad migration never leaves a
-  half-upgraded pack. `--no-snapshot` disables it (then a gate failure is not auto-recovered);
-  `--keep-snapshots N` bounds retention (default 3). The snapshot scope is the pack source —
-  runtime/VCS trees (`.git`, `.hermes-data`, `data`, `logs`, …) are excluded, so migrations should
-  only transform source.
+  modified files, quarantines added ones, recreates deleted ones) so a bad migration never leaves a
+  half-upgraded pack. A retained successful snapshot also carries a post-migration rollback plan;
+  `framework upgrade <pack> --restore-snapshot <timestamp>` restores only migration-owned paths and
+  refuses the entire operation when a later cron/MCP write changed one. `--no-snapshot` disables
+  both paths. Successful snapshots remain protected until the observation owner runs
+  `framework upgrade <pack> --confirm-snapshot-good <timestamp>`; only confirmed-good snapshots
+  participate in `--keep-snapshots N` count pruning (default 3). Unconfirmed and legacy snapshots
+  are never count-pruned. The snapshot scope is distributable pack source, including
+  `<pack>/data/`; runtime/VCS trees such as `.git`, `.hermes-data`, `logs`, caches, and nested
+  snapshots are excluded.
 
 ## Pack-VERSION migrations on update (okengine#312)
 

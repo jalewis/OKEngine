@@ -37,6 +37,30 @@ import okf_migrate  # noqa: E402  — single source of the canonical-path logic
 _FM_RE = re.compile(r"\A---[ \t]*\n(.*?\n)---[ \t]*\n?(.*)\Z", re.S)
 _UNION = frozenset({"aliases", "tags", "related", "sources", "platforms", "related_actors"})
 _SKIP = {"index", "log", "README"}
+# Scalars that legitimately differ between copies of the same page (stamps, counters, the review
+# flag itself). Any OTHER scalar that disagrees between LIVE copies is a material conflict:
+# `status: live` vs `retracted`, two different `id`s. Depth must not decide those silently
+# (okengine#663 — the assessments incident: 9 of 48 duplicated records disagreed about whether a
+# judgment was live or retracted, and the answer depended on which directory a consumer walked).
+_VOLATILE = frozenset({
+    "updated", "last_updated", "created", "modified", "last_modified", "last_modified_by",
+    "maintained_by", "discovered_by", "version", "page_version", "content_hash", "sha256",
+    "needs_review", "reviewed_by", "reviewed_on", "reviewed_at", "tier", "activity_tier",
+})
+
+
+def _scalar_conflicts(copies: list[dict]) -> dict[str, list]:
+    """{field: [distinct values]} for every non-volatile, non-union scalar that LIVE copies
+    disagree on. Empty values never count as a disagreement."""
+    seen: dict[str, list] = {}
+    for fm in copies:
+        for k, v in fm.items():
+            if k in _UNION or k in _VOLATILE or isinstance(v, (list, dict)) or v in (None, ""):
+                continue
+            vals = seen.setdefault(k, [])
+            if v not in vals:
+                vals.append(v)
+    return {k: v for k, v in seen.items() if len(v) > 1}
 
 
 def _is_content(slug: str) -> bool:
@@ -80,25 +104,7 @@ def _merge_fm(copies: list[dict]) -> dict:
 def _namespaces(root: Path, only: str | None) -> list[str]:
     if only:
         return [only]
-    nss: list[str] = []
-
-    def add(sp: Path, prefix: str):
-        try:
-            sch = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}
-        except Exception:
-            return
-        for leaf, cfg in ((sch.get("partitioning") or {}).get("namespaces") or {}).items():
-            if (cfg or {}).get("strategy", "flat") != "flat":
-                nss.append(f"{prefix}{leaf}")
-
-    if (root / "schema.yaml").is_file():
-        add(root / "schema.yaml", "")
-    wiki = root / "wiki"
-    if wiki.is_dir():
-        for sd in sorted(p for p in wiki.iterdir() if p.is_dir()):
-            if (sd / "schema.yaml").is_file():
-                add(sd / "schema.yaml", f"{sd.name}/")
-    return nss
+    return okf_migrate.partitioned_namespaces(root)
 
 
 def dedup_namespace(root: Path, ns: str, apply: bool) -> tuple[dict[str, str], list[str], int]:
@@ -123,25 +129,59 @@ def dedup_namespace(root: Path, ns: str, apply: bool) -> tuple[dict[str, str], l
         # deterministic order: deepest (most-canonical-looking) first, then lexical
         paths = sorted(paths, key=lambda p: (-len(p.parts), p.as_posix()))
         parsed = [(p, *_read(p)) for p in paths]
-        merged_fm = _merge_fm([fm for _p, fm, _b in parsed])
-        canonical = okf_migrate.write_key(root, ns, slug, merged_fm)   # writer/reshard contract
+        key_of = lambda p: p.relative_to(wiki).as_posix()[:-3]  # noqa: E731
+        # A tombstone never occupies a seat and never wins a merge (okengine#663) — the same rule
+        # okf_migrate.build_map applies. Only LIVE copies are merge candidates.
+        live = [t for t in parsed if not okf_migrate.is_tombstoned(t[1])]
+        tombs = [t for t in parsed if okf_migrate.is_tombstoned(t[1])]
+        if not live:
+            continue        # duplicate tombstones: redirects are load-bearing, not this drain's call
+        merged_fm = _merge_fm([fm for _p, fm, _b in live])
+        conflicts = _scalar_conflicts([fm for _p, fm, _b in live])
+        survivor_id = str(merged_fm.get("id") or "").strip()
+        live_keys = {key_of(p) for p, _fm, _b in live}
+        # A REDUNDANT tombstone points at the survivor (by path or id): once the live page holds
+        # the seat the redirect is superfluous, so it is a loser like any other copy. This is the
+        # exact call build_map defers to the dedup pass. Anything else the tombstone points at is
+        # still load-bearing: never overwritten, never merged, only reported.
+        redundant, blocking = [], []
+        for p, fm, _b in tombs:
+            sup = str(fm.get("superseded_by") or "").strip()
+            hits_survivor = bool(sup) and (sup in live_keys or (bool(survivor_id) and sup == survivor_id))
+            (redundant if hits_survivor else blocking).append(p)
+        desired = okf_migrate.desired_key(root, ns, slug, merged_fm)
+        if (wiki / (desired + ".md")) in {p for p in redundant}:
+            canonical = desired                      # take the seat a redundant redirect held
+        else:
+            canonical = okf_migrate.write_key(root, ns, slug, merged_fm)   # writer/reshard contract
+        # redundant tombstones ELSEWHERE point at the survivor too: retired, links rewritten below
         dest = wiki / (canonical + ".md")
-        bodies = [b.strip() for _p, _fm, b in parsed if b.strip()]
+        for p in blocking:
+            print(f"   blocked: {ns}/{slug} — tombstone {key_of(p)} points elsewhere "
+                  f"({(_read(p)[0].get('superseded_by') or '?')}); left in place", file=sys.stdout)
+        if len(live) < 2 and not redundant:
+            continue                                  # one live page + load-bearing redirect(s): nothing to collapse
+        bodies = [b.strip() for _p, _fm, b in live if b.strip()]
         winner_body = max(bodies, key=len) if bodies else ""
-        # materially different bodies among copies -> do not silently drop; flag for review
+        # materially different bodies among live copies -> do not silently drop; flag for review
         if len({b for b in bodies}) > 1:
             merged_fm["needs_review"] = True
             review.append(slug)
-        for p, _fm, _b in parsed:
-            key = p.relative_to(wiki).as_posix()[:-3]
-            if key != canonical:
-                move_map[key] = canonical
+        if conflicts:
+            merged_fm["needs_review"] = True
+            review.append(f"{slug}[{','.join(sorted(conflicts))}]")
+            print(f"   conflict: {ns}/{slug} live copies disagree on "
+                  + "; ".join(f"{k}={vals}" for k, vals in sorted(conflicts.items())), file=sys.stdout)
+        losers = [p for p, _fm, _b in live if p.resolve() != dest.resolve()] + redundant
+        for p in losers:
+            if key_of(p) != canonical:
+                move_map[key_of(p)] = canonical
         if apply:
             merged_fm = {k: v for k, v in merged_fm.items() if v not in (None, "", [], {})}
             head = yaml.safe_dump(merged_fm, sort_keys=False, allow_unicode=True).rstrip()
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(f"---\n{head}\n---\n\n{winner_body}\n", encoding="utf-8")
-            for p, _fm, _b in parsed:
+            for p in losers:
                 if p.resolve() != dest.resolve():
                     try:
                         p.unlink()

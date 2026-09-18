@@ -43,7 +43,7 @@ def _pack_with_schema_ext(tmp_path):
         "requires": {"engine": ">=0.3.0"},
         "capabilities": {"read": ["wiki/**"], "write": ["forecasts/**"]},
         "schema": ["schema/forecasts.schema.yaml"],
-        "operation": {"schedule": {"kind": "cron", "expr": "0 4 * * *"},
+        "operation": {"schedule": {"kind": "cron", "expr": "@jitter:daily@4"},
                       "entrypoint": {"script": "run.py"}},
     }), encoding="utf-8")
     # the extension OWNS a non-core namespace/type (core predictions/prediction are engine-owned
@@ -72,6 +72,23 @@ def test_enable_generates_composed_schema_then_disable_removes(tmp_path):
     disc.set_enabled(pack, "demo.pred", False)
     assert comp.write_composed_schema(pack) == []
     assert not artifact.is_file()
+
+
+def test_composed_schema_replace_is_atomic_on_failure(tmp_path, monkeypatch):
+    comp = _load("extension_compose", COMP)
+    disc = _load("extension_discovery", DISC)
+    pack = _pack_with_schema_ext(tmp_path)
+    artifact = pack / ".okengine" / "composed-schema.yaml"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("previous: valid\n", encoding="utf-8")
+    disc.set_enabled(pack, "demo.pred", True)
+    monkeypatch.setattr(comp.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("stop")))
+
+    with pytest.raises(OSError, match="stop"):
+        comp.write_composed_schema(pack)
+
+    assert artifact.read_text(encoding="utf-8") == "previous: valid\n"
+    assert not artifact.with_name(artifact.name + ".tmp").exists()
 
 
 def test_composer_loads_schema_lib_from_flat_gateway_staging(tmp_path):
@@ -146,3 +163,35 @@ def test_recompose_without_artifact_or_fragments_is_base_pack_only(tmp_path):
     art.write_text("_fragments: 'not a list'\n", encoding="utf-8")
     live2, errors2 = schema_lib.compose_schema(pack)
     assert errors2 == [] and "forecast" not in live2["types"]
+
+
+def test_loader_ignores_auxiliary_json_schema_but_keeps_following_okf_fragment(tmp_path):
+    comp = _load("extension_compose_aux_schema", COMP)
+    ext = tmp_path / "extension"
+    (ext / "schema").mkdir(parents=True)
+    (ext / "schema" / "result.schema.yaml").write_text(yaml.safe_dump({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object", "properties": {"result": {"type": "string"}},
+    }), encoding="utf-8")
+    (ext / "schema" / "okf.schema.yaml").write_text(yaml.safe_dump({
+        "owns": {"namespaces": ["demo"]},
+    }), encoding="utf-8")
+    resolved = {"demo": {"dir": ext, "manifest": {
+        "schema": ["schema/result.schema.yaml", "schema/okf.schema.yaml"],
+    }}}
+    fragments, errors = comp._fragments_from_resolved(resolved)
+    assert errors == []
+    assert fragments == [("ext:demo", {"owns": {"namespaces": ["demo"]}})]
+
+
+def test_loader_does_not_hide_non_json_schema_with_object_type(tmp_path):
+    comp = _load("extension_compose_not_json_schema", COMP)
+    ext = tmp_path / "extension"
+    (ext / "schema").mkdir(parents=True)
+    (ext / "schema" / "broken.schema.yaml").write_text("type: object\n", encoding="utf-8")
+    resolved = {"demo": {"dir": ext, "manifest": {
+        "schema": ["schema/broken.schema.yaml"],
+    }}}
+    fragments, errors = comp._fragments_from_resolved(resolved)
+    assert errors == []
+    assert fragments == [("ext:demo", {"type": "object"})]

@@ -1,0 +1,267 @@
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 3d745e136..92a3553ac 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -396,46 +396,38 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
+ 
+ 
+ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]:
+-    """Layer enabled MCP servers onto a per-job ``enabled_toolsets`` allowlist (else a per-job list
+-    silently drops every MCP server). Mirrors ``_get_platform_tools``: ``no_mcp`` sentinel -> none
+-    (stripped); any MCP server already listed -> allowlist, add nothing; else union all enabled."""
+-    result = [t for t in per_job if t != "no_mcp"]
+-    if "no_mcp" in per_job:
+-        return result
+-    # lazy: avoid heavy hermes_cli import at module load; shares MCP-membership with gateway/CLI
+-    from hermes_cli.tools_config import enabled_mcp_server_names
+-    enabled_mcp = enabled_mcp_server_names(cfg)
+-    if set(result) & enabled_mcp:
+-        return result
+-    for name in sorted(enabled_mcp):
+-        if name not in result:
+-            result.append(name)
+-    return result
++    """A per-job allowlist is authoritative; strip only the ``no_mcp`` sentinel.
++
++    Globally enabled MCP servers belong in the inherited cron-platform setting,
++    not in a job that explicitly selected only built-in tools.
++    """
++    return [name for name in per_job if name != "no_mcp"]
+ 
+ 
+ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
+-    """Toolset list for a cron job. Precedence: per-job ``enabled_toolsets`` (+ MCP merge) >
+-    ``cron`` platform config (``_get_platform_tools``, which strips _DEFAULT_OFF_TOOLSETS so fresh
+-    installs run without ``moa``) > ``None`` on any failure (full default set).
++    """Toolset list for a cron job. Precedence: per-job ``enabled_toolsets`` >
++    ``cron`` platform config (``_get_platform_tools``). Explicit empty remains empty;
++    malformed lists or platform-resolution failures block instead of loading full defaults.
+ 
+     1. Per-job ``enabled_toolsets`` (set via ``cronjob`` tool on create/update). Keeps the agent's
+-    job-scoped toolset override intact — #6130. Enabled MCP servers are layered on per
+-    ``_merge_mcp_into_per_job_toolsets`` so a native-toolset allowlist does not silently strip MCP tools. 2.
++    job-scoped toolset override intact — #6130. No globally enabled MCP server
++    is added to an explicit job allowlist; ``no_mcp`` remains an opt-out. 2.
+     Mirrors gateway behavior (``_get_platform_tools(cfg, platform_key)``) so users can gate cron toolsets
+-    globally without recreating every job. 3. ``None`` on any lookup failure — AIAgent loads the full
+-    default set (legacy behavior before this change, preserved as the safety net).
++    globally without recreating every job. A resolution failure is not permission
++    to widen the agent's tool surface.
+     """
+-    per_job = job.get("enabled_toolsets")
+-    if per_job:
+-        return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
++    if "enabled_toolsets" in job:
++        per_job = job["enabled_toolsets"]
++        if not isinstance(per_job, list) or any(
++            not isinstance(name, str) or not name.strip() for name in per_job
++        ):
++            raise RuntimeError("Cron enabled_toolsets must be an explicit list of nonempty names")
++        return _merge_mcp_into_per_job_toolsets(per_job, cfg or {})
+     try:
+         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
+         return sorted(_get_platform_tools(cfg or {}, "cron"))
+     except Exception as exc:
+-        logger.warning(
+-            "Cron toolset resolution failed, falling back to full default toolset: %s",
+-            exc)
+-        return None
++        raise RuntimeError("Cron toolset resolution failed; refusing the full default toolset") from exc
+ 
+ 
+ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | None:
+@@ -1588,21 +1580,53 @@ def _load_credential_pool(runtime: dict, job_id: str):
+     return None
+ 
+ 
+-def _init_cron_mcp_tools(job_id: str) -> None:
+-    """Register MCP servers for the agent's tool registry. Idempotent across ticks; non-fatal so a
+-    broken MCP server never kills a working job."""
++def _required_cron_mcp_surfaces(enabled_toolsets: list[str], cfg: dict) -> list[str]:
++    """Named MCP toolsets (including disabled OKEngine surfaces) require real tools."""
++    from hermes_cli.tools_config import enabled_mcp_server_names
++
++    configured = cfg.get("mcp_servers") if isinstance(cfg, dict) else None
++    known = set(enabled_mcp_server_names(cfg if isinstance(cfg, dict) else {}))
++    if isinstance(configured, dict):
++        known.update(str(name) for name in configured)
++    return [name for name in enabled_toolsets if name in known or name.startswith("okengine")]
++
++
++def _init_cron_mcp_tools(job_id: str, enabled_toolsets: list[str], cfg: dict) -> list[str]:
++    """Discover only admitted servers; fail closed if any named MCP surface is empty."""
++    required = _required_cron_mcp_surfaces(enabled_toolsets, cfg)
+     try:
+-        # Initialize MCP servers so configured mcp_servers are available to the agent's tool registry before
+-        # AIAgent is constructed. Without this, cron jobs never saw any MCP tools — only the gateway / CLI
+-        # paths called discover_mcp_tools() at startup. Idempotent: subsequent ticks short-circuit on
+-        # already-connected servers inside register_mcp_servers(). Non-fatal on failure: a broken MCP server
+-        # shouldn't kill an otherwise-working cron job. See #4219.
++        # Register only servers admitted by this job before AIAgent construction.
++        # Existing connections are reused; a failed required surface blocks the fire.
+         from tools.mcp_tool_discovery import discover_mcp_tools
+-        _mcp_tools = discover_mcp_tools()
++        _mcp_tools = discover_mcp_tools(enabled_toolsets)
+         if _mcp_tools:
+             logger.info("Job '%s': %d MCP tool(s) available", job_id, len(_mcp_tools))
+-    except Exception as _mcp_exc:
+-        logger.warning("Job '%s': MCP initialization failed (non-fatal): %s", job_id, _mcp_exc)
++    except Exception as mcp_exc:
++        if required:
++            raise RuntimeError(
++                f"Job '{job_id}' requires MCP server(s) {required}, but discovery failed"
++            ) from mcp_exc
++        logger.warning("Job '%s': optional MCP initialization failed: %s", job_id, mcp_exc)
++        return []
++
++    from tools.mcp_tool_schema import sanitize_mcp_name_component
++    from tools.registry import registry
++    from toolsets import resolve_toolset
++
++    def offered_for(server: str) -> bool:
++        prefix = f"mcp__{sanitize_mcp_name_component(server)}__"
++        # Discovery returns the physical names, but an already-registered tool in this
++        # profile may be omitted by a reconnect pass. Check the scoped registry too.
++        names = set(str(tool) for tool in _mcp_tools)
++        names.update(name for name in resolve_toolset(server) if registry.get_entry(name))
++        return any(name.startswith(prefix) for name in names)
++
++    absent = [name for name in required if not offered_for(name)]
++    if absent:
++        raise RuntimeError(
++            f"Job '{job_id}' requires MCP server(s) {absent}, but their canonical tools were not offered"
++        )
++    return _mcp_tools
+ 
+ 
+ def _open_cron_session_db(job: dict):
+@@ -2131,6 +2155,7 @@ def _reload_dotenv_and_publish_delivery_target(job: dict) -> None:
+ @dataclass
+ class _CronAgentSetup:
+     """Everything ``AIAgent(...)`` needs that is resolved from job + config (or a preflight block)."""
++    enabled_toolsets: Any = None
+     blocked: Optional[_RunResult] = None
+     model: str = ""
+     runtime: dict = None
+@@ -2169,8 +2194,17 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
+     )
+     setup.fallback_model = get_fallback_chain(_cfg) or None
+     setup.credential_pool = _load_credential_pool(setup.runtime, job_id)
++    try:
++        setup.enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
++    except Exception as exc:
++        setup.blocked = _blocked_config_result(job_id, job_name, str(exc))
++        return setup
+     # MCP servers must be registered before AIAgent is constructed.
+-    _init_cron_mcp_tools(job_id)
++    try:
++        _init_cron_mcp_tools(job_id, setup.enabled_toolsets, _cfg)
++    except Exception as exc:
++        setup.blocked = _blocked_config_result(job_id, job_name, str(exc))
++        return setup
+     # Only now can a requested MCP toolset be judged: its alias is process-global but its tools live
+     # in this profile's registry overlay, and quiet_mode hides the empty resolution (#109050).
+     if _cron_preflight_enabled(_cfg):
+@@ -2220,10 +2254,10 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
+         providers_order=pr.get("order"),
+         provider_sort=pr.get("sort"),
+         openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
+         # A failed collection script is already quoted in the prompt. The agent
+         # only reports it; an empty allowlist denies *all* tools, including MCP
+         # writers, browser/terminal composites, plugins, and newly added sets.
+-        enabled_toolsets=[] if report_only else _resolve_cron_enabled_toolsets(job, _cfg),
++        enabled_toolsets=[] if report_only else setup.enabled_toolsets,
+         disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+         quiet_mode=True,
+         # Project context files only with a configured workdir; SOUL.md always.
+diff --git a/tests/cron/test_okengine_mcp_scope.py b/tests/cron/test_okengine_mcp_scope.py
+new file mode 100644
+index 000000000..58770b1f0
+--- /dev/null
++++ b/tests/cron/test_okengine_mcp_scope.py
+@@ -0,0 +1,85 @@
++"""Cron's MCP allowlist and required surfaces are verified before agent spend."""
++
++from unittest.mock import patch
++
++import pytest
++
++from cron.scheduler import (
++    _init_cron_mcp_tools, _resolve_cron_enabled_toolsets,
++)
++
++
++CFG = {"mcp_servers": {
++    "okengine-read": {"url": "http://127.0.0.1:9001"},
++    "okengine-write": {"url": "http://127.0.0.1:9002"},
++    "unrelated": {"url": "http://127.0.0.1:9003"},
++}}
++
++
++def test_explicit_empty_and_no_mcp_never_inherit_configured_servers():
++    assert _resolve_cron_enabled_toolsets({"enabled_toolsets": []}, CFG) == []
++    assert _resolve_cron_enabled_toolsets({"enabled_toolsets": ["no_mcp"]}, CFG) == []
++    with patch("tools.mcp_tool_discovery.discover_mcp_tools", autospec=True,
++               return_value=[]) as discover:
++        assert _init_cron_mcp_tools("empty", [], CFG) == []
++    discover.assert_called_once_with([])
++
++
++def test_builtin_only_job_allowlist_does_not_add_global_read_or_write():
++    assert _resolve_cron_enabled_toolsets({"enabled_toolsets": ["terminal"]}, CFG) == [
++        "terminal"]
++    assert _resolve_cron_enabled_toolsets(
++        {"enabled_toolsets": ["terminal", "okengine-read"]}, CFG
++    ) == ["terminal", "okengine-read"]
++
++
++@pytest.mark.parametrize("value", [None, "okengine-read", [None], [""], [42], {}])
++def test_malformed_job_allowlist_refuses_full_default(value):
++    with pytest.raises(RuntimeError, match="explicit list"):
++        _resolve_cron_enabled_toolsets({"enabled_toolsets": value}, CFG)
++
++
++def test_discovery_receives_only_the_resolved_job_allowlist():
++    admitted = ["terminal", "okengine-read"]
++    with patch("tools.mcp_tool_discovery.discover_mcp_tools", autospec=True,
++               return_value=["mcp__okengine_read__get_page"]) as discover:
++        assert _init_cron_mcp_tools("reader", admitted, CFG) == [
++            "mcp__okengine_read__get_page"]
++    discover.assert_called_once_with(admitted)
++
++
++def test_unrelated_connected_server_cannot_satisfy_required_reader():
++    with patch("tools.mcp_tool_discovery.discover_mcp_tools", autospec=True,
++               return_value=["mcp__unrelated__search"]) as discover:
++        with pytest.raises(RuntimeError, match="okengine-read.*canonical tools"):
++            _init_cron_mcp_tools("reader", ["okengine-read"], CFG)
++    discover.assert_called_once_with(["okengine-read"])
++
++
++def test_one_required_surface_does_not_cover_another():
++    with patch("tools.mcp_tool_discovery.discover_mcp_tools", autospec=True,
++               return_value=["mcp__okengine_read__get_page"]):
++        with pytest.raises(RuntimeError, match="okengine-write.*canonical tools"):
++            _init_cron_mcp_tools("writer", ["okengine-read", "okengine-write"], CFG)
++
++
++def test_discovery_failure_is_fatal_only_for_required_surface():
++    with patch("tools.mcp_tool_discovery.discover_mcp_tools", autospec=True,
++               side_effect=OSError("disposable disconnect")):
++        with pytest.raises(RuntimeError, match="requires MCP"):
++            _init_cron_mcp_tools("reader", ["okengine-read"], CFG)
++        assert _init_cron_mcp_tools("local", ["terminal"], CFG) == []
++
++
++def test_missing_config_cannot_make_an_okengine_surface_optional():
++    with patch("tools.mcp_tool_discovery.discover_mcp_tools", autospec=True,
++               return_value=[]):
++        with pytest.raises(RuntimeError, match="okengine-write.*canonical tools"):
++            _init_cron_mcp_tools("writer", ["okengine-write"], {})
++
++
++def test_platform_toolset_resolution_failure_refuses_full_default_tool_surface():
++    with patch("hermes_cli.tools_config._get_platform_tools", autospec=True,
++               side_effect=RuntimeError("disposable platform lookup failure")):
++        with pytest.raises(RuntimeError, match="refusing the full default toolset"):
++            _resolve_cron_enabled_toolsets({}, CFG)

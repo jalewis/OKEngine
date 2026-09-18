@@ -19,6 +19,7 @@ import argparse
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 from datetime import date
@@ -95,6 +96,28 @@ def hermes_pin() -> str:
         return v
     raise SystemExit("ERROR: cannot read the Hermes pin (pinned_tag) from engine-manifest.yaml — "
                      "refusing to stamp a guessed pin")
+
+
+def _warn_busy_host_ports(dest: Path) -> None:
+    """Warn when a rendered host port is already owned by another stack."""
+    compose = dest / "docker-compose.yml"
+    if not compose.is_file():
+        return
+    text = compose.read_text(encoding="utf-8")
+    ports = sorted({int(match) for match in re.findall(r":(\d+):(?:9200|8730)\b", text)})
+    busy: list[int] = []
+    for port in ports:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            busy.append(port)
+        finally:
+            sock.close()
+    if busy:
+        print(f"  ⚠ host port(s) already in use: {', '.join(map(str, busy))} — another stack "
+              "holds them. Pick a --port-offset spaced ≥10 from other packs, or free the "
+              "port(s) before `docker compose up`.")
 
 
 def _tokens(dest: Path, domain: str, offset: int) -> dict[str, str]:
@@ -249,6 +272,8 @@ def main(argv: list[str]) -> int:
 
     if args.no_compose:
         (dest / "docker-compose.yml").unlink(missing_ok=True)
+    else:
+        _warn_busy_host_ports(dest)
     if args.feeds and Path(args.feeds).is_file():
         shutil.copy(args.feeds, dest / "feeds" / "feeds.opml")
 

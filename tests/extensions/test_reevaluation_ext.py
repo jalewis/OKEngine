@@ -116,3 +116,34 @@ def test_main_writes_artifact_atomically(tmp_path, monkeypatch):
     art = json.loads((v / "wiki" / ".reevaluation-edges.json").read_text(encoding="utf-8"))
     assert art["edge_count"] == 1 and "sources/a" in art["edges"]
     assert not (v / "wiki" / ".reevaluation-edges.json.tmp").exists()
+
+
+def test_normalization_refs_scan_races_and_missing_vault_edges(tmp_path, monkeypatch, capsys):
+    mod = _load()
+    assert mod._norm("/wiki/sources/a.md#part|alias") == "sources/a"
+    refs = mod._refs(
+        {"sources": [None, ""], "evidence": ["bad", {"source": None}]},
+        "[[]] [[#anchor]]",
+    )
+    assert refs == {}
+    v = _vault(tmp_path)
+    plain = v / "wiki/plain.md"
+    plain.write_text("body")
+    broken = v / "wiki/broken.md"
+    broken.write_text("---\n[broken\n---\n")
+    shaped = v / "wiki/shaped.md"
+    shaped.write_text("---\n- list\n---\n")
+    raced = v / "wiki/raced.md"
+    raced.write_text("---\ntype: prediction\nstatus: open\n---\n")
+    original = Path.read_text
+    monkeypatch.setattr(
+        Path, "read_text",
+        lambda path, *args, **kwargs: (_ for _ in ()).throw(OSError("vanished"))
+        if path == raced else original(path, *args, **kwargs),
+    )
+    assert mod.build(v)["proposition_count"] == 0
+
+    monkeypatch.setattr(mod, "VAULT", tmp_path / "missing")
+    monkeypatch.setattr(mod, "WIKI", tmp_path / "missing/wiki")
+    assert mod.main() == 0
+    assert "nothing to index" in capsys.readouterr().out

@@ -1,0 +1,113 @@
+# okengine#590 — which file identifies each engine-built image, and where it lands inside it.
+#
+# The gateway image carries an `org.okengine.git_sha` label (build-engine-image.sh stamps it) and
+# deploy.sh rebuilds on drift. The compose-built images cannot use that mechanism: docker-compose.yml
+# belongs to the PACK, so the engine cannot add `build.labels` to it without editing every pack.
+# So these are verified by CONTENT instead — hash declared baked files and trees in the running
+# container against the same source in ENGINE_DIR. One entrypoint alone can stay byte-identical
+# while the implementation or policy it imports changes.
+#
+# The representative file must be one the image COPIES from ENGINE_DIR (not generated, not vendored),
+# because the question being answered is "was this image built from this source". Chosen per service
+# and confirmed present in a live container on 2026-08-15.
+services:
+  # okengine-mcp was MISSING here until okengine#596, and it is the one that went stale: a
+  # fleet-wide rebuild had one deployment build correctly, three fail with `unable to prepare
+  # context` while their `up -d` reused the existing tag anyway, and one build against a
+  # six-week-old tree and re-tag the shared image to it. Three deployments served search from
+  # that image and nothing said so — the drift check that exists for exactly this covered five
+  # services and not this one. `tests/test_image_drift.py` now pins the manifest to the compose
+  # skeleton so a service can no longer be built from ENGINE_DIR without being listed here.
+  okengine-mcp:
+    source: okengine-mcp/server.py
+    container: /app/server.py
+    also:
+      # server.py alone was byte-identical across the six weeks the stale image spanned, so it
+      # would have reported clean. These are what actually moved: the schema the served search
+      # tier-filters on, and the libs the image shells out to.
+      - source: config/base-schema.yaml
+        container: /app/config/base-schema.yaml
+      - source: scripts/cron/kb_search.py
+        container: /app/scripts/kb_search.py
+      - source: scripts/cron/schema_lib.py
+        container: /app/scripts/schema_lib.py
+      - source: scripts/cron/tier_lib.py
+        container: /app/scripts/tier_lib.py
+      # The image installs a wheel built from the whole src/okengine tree. Probe that package as
+      # a unit so a stale shared library cannot hide behind an unchanged MCP entrypoint.
+      - source_dir: src/okengine
+        container_dir: /usr/local/lib/python3.13/site-packages/okengine
+        exclude: [data/base-schema.yaml]
+  okengine-cockpit:
+    source: okengine-cockpit/app.py
+    container: /app/app.py
+    also:
+      - source_dir: src/okengine
+        container_dir: /usr/local/lib/python3.13/site-packages/okengine
+        exclude: [data/base-schema.yaml]
+  okengine-reader:
+    source: okengine-reader/app.py
+    container: /app/app.py
+    also:
+      - source_dir: src/okengine
+        container_dir: /usr/local/lib/python3.13/site-packages/okengine
+        exclude: [data/base-schema.yaml]
+  okengine-review-write:
+    source: okengine-mcp/write_server.py
+    container: /engine/okengine-mcp/write_server.py
+    also:
+      - source: config/policy/catalog.yaml
+        container: /engine/config/policy/catalog.yaml
+      - source: tools/policy_plane.py
+        container: /usr/local/lib/python3.13/site-packages/tools/policy_plane.py
+      - source: tools/schema_validator.py
+        container: /usr/local/lib/python3.13/site-packages/tools/schema_validator.py
+      - source: src/okengine/write_services/convergence.py
+        container: /usr/local/lib/python3.13/site-packages/okengine/write_services/convergence.py
+      - source: src/okengine/write_services/review.py
+        container: /usr/local/lib/python3.13/site-packages/okengine/write_services/review.py
+      # Dockerfile.review builds a wheel from the whole src/okengine tree. Probe the tree as a
+      # unit so adding a write-service module cannot silently create an ungoverned dependency.
+      - source_dir: src/okengine
+        container_dir: /usr/local/lib/python3.13/site-packages/okengine
+        # The wheel injects this runtime member from config/; it has its own file probe above.
+        exclude: [data/base-schema.yaml]
+      # scripts/build_engine_wheel.py maps these non-package runtime members into the wheel.
+      - source: okengine-mcp/output_contract_enforce.py
+        container: /usr/local/lib/python3.13/site-packages/output_contract_enforce.py
+      - source: okengine-mcp/converge.py
+        container: /usr/local/lib/python3.13/site-packages/converge.py
+      - source: scripts/cron/id_lib.py
+        container: /usr/local/lib/python3.13/site-packages/id_lib.py
+      - source: scripts/cron/schema_lib.py
+        container: /usr/local/lib/python3.13/site-packages/schema_lib.py
+      - source: scripts/cron/id_index.py
+        container: /usr/local/lib/python3.13/site-packages/id_index.py
+      - source: scripts/cron/okf_migrate.py
+        container: /usr/local/lib/python3.13/site-packages/okf_migrate.py
+      - source: config/base-schema.yaml
+        container: /usr/local/lib/python3.13/site-packages/okengine/data/base-schema.yaml
+  okengine-operation-runner:
+    source: okengine-operations/app.py
+    container: /engine/okengine-operations/app.py
+    also:
+      - source: src/okengine/operations/run.py
+        container: /usr/local/lib/python3.13/site-packages/okengine/operations/run.py
+      - source: src/okengine/operations/framework.py
+        container: /usr/local/lib/python3.13/site-packages/okengine/operations/framework.py
+      - source: tools/policy_plane.py
+        container: /usr/local/lib/python3.13/site-packages/tools/policy_plane.py
+      - source: engine-manifest.yaml
+        container: /engine/engine-manifest.yaml
+      - source_dir: src/okengine
+        container_dir: /usr/local/lib/python3.13/site-packages/okengine
+        exclude: [data/base-schema.yaml]
+      - source_dir: extensions
+        container_dir: /engine/extensions
+  okengine-projection:
+    source: okengine-projection/service.py
+    container: /app/service.py
+    also:
+      - source_dir: src/okengine
+        container_dir: /usr/local/lib/python3.13/site-packages/okengine
+        exclude: [data/base-schema.yaml]

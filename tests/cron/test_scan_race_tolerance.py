@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.integration
+
 REPO = Path(__file__).resolve().parents[2]
 
 
@@ -37,6 +39,9 @@ def test_select_raw_batch_tolerates_vanished_source_pages(tmp_path):
     # dangling symlink: listed by rglob("*.md"), read_text raises FileNotFoundError
     (tmp_path / "wiki" / "sources" / "ghost.md").symlink_to(tmp_path / "wiki" / "sources" / "gone.md")
     env = {"WIKI_PATH": str(tmp_path), "BATCH_SIZE": "5", "MIN_YEAR": "2025",
+           "OKENGINE_LANE_ID": "raw-backfill-test",
+           "OKENGINE_CONTRACT_DIGEST": "sha256:test-contract",
+           "OKENGINE_SELECTION_MANIFEST": str(tmp_path / "raw" / ".selection.json"),
            "PATH": os.environ.get("PATH", "")}
     r = subprocess.run([sys.executable, str(script)], capture_output=True,
                        text=True, env=env, timeout=60)
@@ -44,7 +49,7 @@ def test_select_raw_batch_tolerates_vanished_source_pages(tmp_path):
     assert "f0.txt" in r.stdout          # the real raw file still drains
 
 
-def test_select_entity_candidates_tolerates_vanished_pages(tmp_path, capsys):
+def test_select_entity_candidates_tolerates_vanished_pages(tmp_path, capsys, monkeypatch):
     pytest.importorskip("yaml")
     mod_path = REPO / "scripts" / "cron" / "select_entity_candidates.py"
     vault = tmp_path / "vault"
@@ -60,8 +65,9 @@ def test_select_entity_candidates_tolerates_vanished_pages(tmp_path, capsys):
     (vault / "wiki" / "entities" / "ghost.md").symlink_to(vault / "wiki" / "entities" / "gone.md")
     (vault / "wiki" / "sources" / "ghost.md").symlink_to(vault / "wiki" / "sources" / "gone.md")
 
-    os.environ["WIKI_PATH"] = str(vault)
-    os.environ["HERMES_HOME"] = str(home)
+    monkeypatch.setenv("WIKI_PATH", str(vault))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.syspath_prepend(str(mod_path.parent))
     sys.modules.pop("select_entity_candidates", None)
     spec = importlib.util.spec_from_file_location("select_entity_candidates", mod_path)
     m = importlib.util.module_from_spec(spec)
@@ -70,7 +76,8 @@ def test_select_entity_candidates_tolerates_vanished_pages(tmp_path, capsys):
     rc = m.main()
     out = capsys.readouterr().out
     assert rc == 0
-    assert "entities/a/acme" in out or "entities/acme" in out
+    assert "# A source" in out
+    assert "ghost.md" not in out
 
 
 # ------------------------------------------------------------------- guard

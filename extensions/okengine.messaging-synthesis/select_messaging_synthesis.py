@@ -127,7 +127,7 @@ def main() -> int:
           f"({'none — first brief' if prior is None else Path(prior[0]).name})"
           + ("  [STEADY-STATE: no material change since the last brief — reaffirm current "
              "messaging from the anchor + prior brief; do NOT invent news]" if steady else ""))
-    print(f"  write via mcp_okengine_write_create_entity to: {out_path}")
+    print(f"  write via mcp__okengine_write__create_entity to: {out_path}")
     print(f"  frontmatter: type: messaging-brief, title: \"Messaging brief — {today}\", "
           f"published: {today}, updated: {today}")
     print()

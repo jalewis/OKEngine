@@ -77,5 +77,8 @@ out.append(f"- [[{rel}]]")
 ```
 
 For a flat namespace this is byte-identical to the old `"<namespace>/<slug>"`
-form; for a sharded namespace it is the only form that resolves
-(`[[entities/weapon/m/m777]]`, not the now-nonexistent `[[entities/m777]]`).
+form. For a sharded namespace the physical path is explicit and does not depend
+on a basename fallback (`[[entities/weapon/m/m777]]`). The reader can resolve a
+shard-omitting form only when its basename is unambiguous within the namespace;
+scanners should still emit the physical path because a new same-name page can
+make a formerly unique fallback ambiguous.

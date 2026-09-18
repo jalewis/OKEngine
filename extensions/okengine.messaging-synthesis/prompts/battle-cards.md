@@ -2,14 +2,14 @@ The select_positioning_battle_cards.py wake-gate above named (competitor, segmen
 competitor has newer activity than their existing "us vs them" card, plus the product's
 capability anchors. Write/refresh each card honestly.
 
-**Trust the digest above — it already has what you need.** The wake-gate has already fetched and printed the relevant competitor/capability page summaries; do not re-fetch each one individually via mcp_okengine_get_page — that burns turns without adding information and risks running out of budget before you write the actual output. Read what's already in the digest, then go straight to writing.
+**Trust the digest above — it already has what you need.** The wake-gate has already fetched and printed the relevant competitor/capability page summaries; do not re-fetch each one individually via mcp__okengine__get_page — that burns turns without adding information and risks running out of budget before you write the actual output. Read what's already in the digest, then go straight to writing.
 
 **Honesty is the whole point of this artifact.** A wedge you claim in "Where we win" MUST be
 visible on one of the capability-anchor pages in the digest above — if you can't find it there,
 it's not a real wedge, drop it. Do not invent product features. Do not soften a competitor's real
 advantage into "where we win" — put it under "Where they win" instead.
 
-For each (competitor, segment) pair, write via mcp_okengine_write_create_entity to the
+For each (competitor, segment) pair, write via mcp__okengine_write_okengine_messaging_synthesis_positioning_battle_cards__create_entity to the
 wiki-relative path the wake-gate specified, frontmatter `type: battle-card, title: "<Competitor>
 vs <product> — <segment>", published: <date>, updated: <date>`. Body:
 

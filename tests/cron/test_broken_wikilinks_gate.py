@@ -39,6 +39,10 @@ def test_single_ref_source_link_stays_below_gate(tmp_path):
     _page(tmp_path, "sources/2026/06/report.md", "mentions [[entities/nope-nothing]]")
     wake, _ = _run(tmp_path)
     assert not wake
+    manifest = json.loads(
+        (tmp_path / ".hermes/cron-plus/selections/broken-wikilinks-drain.json").read_text()
+    )
+    assert manifest["selected"] == []
 
 
 def test_single_ref_briefing_link_wakes_the_drain(tmp_path):

@@ -16,13 +16,15 @@ the evidence.
 Env:
   WIKI_PATH                 vault root (default /opt/vault)
   HERMES_HOME               state dir (default /opt/data)
-  PQ_ENRICH_BATCH           pages per run (default 6)
+  PQ_ENRICH_BATCH           pages per run (default 1)
   PQ_ENRICH_CTX             inbound sources surfaced per page (default 6)
+  PQ_ENRICH_QUEUE           queue path override (default wiki/operational/page-quality-queue.json)
   ENRICH_COOLDOWN_DAYS      don't re-enrich within N days (default 21)
 """
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sys
@@ -36,8 +38,11 @@ from selection_manifest import write_selection_manifest  # noqa: E402
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
 STATE = Path(os.environ.get("HERMES_HOME", "/opt/data")) / "scripts" / "page-quality-enrich-state.json"
-QUEUE = WIKI / "operational" / "page-quality-queue.json"
-BATCH = int(os.environ.get("PQ_ENRICH_BATCH", "6"))
+_queue_override = os.environ.get("PQ_ENRICH_QUEUE")
+QUEUE = Path(_queue_override) if _queue_override else WIKI / "operational" / "page-quality-queue.json"
+if not QUEUE.is_absolute():
+    QUEUE = VAULT / QUEUE
+BATCH = int(os.environ.get("PQ_ENRICH_BATCH", "1"))
 CTX = int(os.environ.get("PQ_ENRICH_CTX", "6"))
 COOLDOWN = int(os.environ.get("ENRICH_COOLDOWN_DAYS", "21"))
 
@@ -58,6 +63,37 @@ def _save_state(state: dict) -> None:
         STATE.write_text(json.dumps(state, indent=0))
     except OSError:
         pass
+
+
+def _import_receipts(state: dict, today) -> int:
+    """Start cooldown only after a verified terminal receipt."""
+    lane_id = os.environ.get("OKENGINE_LANE_ID", "")
+    if not lane_id:
+        return 0
+    receipt_dir = Path(os.environ.get("HERMES_HOME", "/opt/data")) / \
+        "cron-plus" / "receipts" / lane_id
+    imported = set(state.get("_imported_receipts") or [])
+    count = 0
+    # glob-ok: receipt files are intentionally flat under one lane-id directory.
+    for path in sorted(receipt_dir.glob("*.json")):
+        key = str(path.resolve())
+        if key in imported:
+            continue
+        try:
+            document = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if document.get("valid") is False:
+            continue
+        receipt = document.get("receipt") or document
+        for item in receipt.get("items") or []:
+            if item.get("disposition") in {"accepted", "duplicate", "skipped"}:
+                key = str(item.get("key") or "").split("|", 1)[0]
+                state[key.removeprefix("wiki:").removeprefix("wiki/").removesuffix(".md")] = today.isoformat()
+                count += 1
+        imported.add(key)
+    state["_imported_receipts"] = sorted(imported)
+    return count
 
 
 def _days_since(iso: str, today) -> int:
@@ -88,7 +124,7 @@ def _excerpt_around(text: str, stem: str) -> str:
 def main() -> int:
     today = datetime.now(timezone.utc).date()
     if not QUEUE.is_file():
-        print("# no page-quality-queue.json — run page-quality-audit first")
+        print(f"# no page-quality queue at {QUEUE} — run page-quality-audit first")
         print(json.dumps({"wakeAgent": False}))
         return 0
     try:
@@ -98,6 +134,8 @@ def main() -> int:
         return 0
 
     state = _load_state()
+    _import_receipts(state, today)
+    _save_state(state)
     def _nskey(s: str) -> str:
         # <namespace>/<slug> from a page path or wikilink target — collapse partition/shard/alias/
         # anchor so an entity and a concept sharing a slug never share an inbound bucket (the bare-
@@ -107,9 +145,19 @@ def main() -> int:
         return f"{parts[0]}/{parts[-1]}" if len(parts) >= 2 else ""
 
     # candidates: deficient, inbound>=1, not enriched within cooldown; keep queue order (inbound desc)
-    cands = [q for q in queue
-             if q.get("inbound", 0) >= 1
-             and _days_since(state.get(q["page"], "2000-01-01"), today) >= COOLDOWN]
+    cands = []
+    seen_pages = set()
+    for q in queue:
+        page = str(q.get("page") or "")
+        if (
+            page
+            and page not in seen_pages
+            and Path(page).name.casefold() != "index"
+            and q.get("inbound", 0) >= 1
+            and _days_since(state.get(page, "2000-01-01"), today) >= COOLDOWN
+        ):
+            cands.append(q)
+            seen_pages.add(page)
     targets = {_nskey(q["page"]): q for q in cands[:BATCH * 3] if _nskey(q["page"])}  # over-select
 
     # one pass over sources: collect inbound (source path, excerpt) per target <ns>/<slug>
@@ -133,7 +181,8 @@ def main() -> int:
     batch = []
     for q in cands:
         key = _nskey(q["page"])
-        if key in inbound_ctx and inbound_ctx[key]:
+        target = WIKI / f"{q['page']}.md"
+        if target.is_file() and key in inbound_ctx and inbound_ctx[key]:
             batch.append((q, inbound_ctx[key]))
         if len(batch) >= BATCH:
             break
@@ -145,18 +194,15 @@ def main() -> int:
         print(json.dumps({"wakeAgent": False}))
         return 0
 
+    selected = []
+    for q, _ in batch:
+        target = WIKI / f"{q['page']}.md"
+        revision = "sha256:" + hashlib.sha256(target.read_bytes()).hexdigest()
+        selected.append(f"wiki/{q['page']}.md|{revision}")
     manifest = write_selection_manifest(
-        [q["page"] for q, _ in batch],
+        selected,
         Path(os.environ.get("HERMES_HOME", "/opt/data")) / "cron-plus" / "selections" / "page-quality-enrich.json",
     )
-
-    # Optimistic cooldown: mark batched pages NOW so the queue rotates instead
-    # of re-surfacing the same top-inbound pages every day. The daily audit
-    # re-derives the deficient set, so a page that actually got fixed drops off
-    # on its own; this only prevents same-day re-hammering of a page we just
-    # handed to the agent (even if that agent run partially fails).
-    state.update({q["page"]: today.isoformat() for q, _ in batch})
-    _save_state(state)
 
     print()
     print("Deepen each page from its OWN citing sources (local evidence — no web "
@@ -176,9 +222,23 @@ def main() -> int:
             print(f"      - [[{src[:-3]}]]" + (f" — \"{ex}\"" if ex else ""))
     print(f"selection input_digest: {manifest['input_digest']}")
     print()
-    print("After enriching, append one `wiki/log.md` line: "
-          "`## [YYYY-MM-DD HH:MM UTC] page-quality-enrich | deepened N pages`. "
-          "Then respond `[SILENT]`.")
+    receipt = {
+        "api": 1,
+        "lane_id": manifest["lane_id"],
+        "contract_digest": manifest["contract_digest"],
+        "input_digest": manifest["input_digest"],
+        "items": [{
+            "key": selected[index],
+            "disposition": "<accepted|duplicate|skipped|rejected|failed|deferred>",
+            "writes": [{"path": f"wiki/{q['page']}.md", "sha256": None}],
+            "reason": "<required unless accepted>",
+        } for index, (q, _) in enumerate(batch)],
+    }
+    print("FINAL RESPONSE CONTRACT (MANDATORY): return ONLY this fenced receipt. "
+          "Remove placeholder writes from non-accepted items.")
+    print("```okengine-receipt")
+    print(json.dumps(receipt, indent=2))
+    print("```")
     print(json.dumps({"wakeAgent": True}))
     return 0
 

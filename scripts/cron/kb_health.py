@@ -132,7 +132,7 @@ def knowledge_namespaces() -> list[str]:
     (schema.yaml `partitioning.namespaces`, minus `exclude:` dirs); on-disk
     top-level wiki dirs (minus excluded + dot/underscore + dashboards/operational)
     as a fallback when the pack declares none. The engine ships no hardcoded list."""
-    schema = schema_lib.governing_schema(VAULT)
+    schema = schema_lib.merged_schema(VAULT)
     excluded = schema_lib.excluded_dirs(schema) | {"operational", "dashboards"}
     names = schema_lib.knowledge_namespaces(schema) - excluded
     if not names:

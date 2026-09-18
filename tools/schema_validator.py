@@ -3,7 +3,8 @@
 Single source of truth for "is this file conformant?", read from a `schema.yaml`
 discovered by walking up from the target file (like `.editorconfig`). Used by:
 
-  - the write-time guard (`tools/file_operations.write_file` / `patch_replace`) —
+  - the write-time guard (`tools/file_operations.write_file` / `patch_replace` /
+    move replacement) —
     rejects non-conformant content before it ever lands, and
   - a pre-commit gate / drift-lint via the CLI: `python -m tools.schema_validator <files...>`.
 
@@ -26,14 +27,17 @@ TWO PROFILES (see the conformance spec, docs/okf/okengine-conformance-spec.md):
 from __future__ import annotations
 
 import fnmatch
+from okengine.schema_exclusions import exclusion_globs_from_schema, excluded_namespaces_from_schema
 import os
 import re
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
+yaml: Any
 try:
-    import yaml
+    import yaml as _yaml
+    yaml = _yaml
 except Exception:  # pragma: no cover - yaml always present in the runtime venv
     yaml = None
 
@@ -190,15 +194,12 @@ def _load_schema(sp: Path) -> Optional[dict]:
 
 
 def _excluded(rel_posix: str, schema: dict) -> bool:
+    namespace = rel_posix.removeprefix("wiki/").split("/", 1)[0]
+    if namespace in excluded_namespaces_from_schema(schema):
+        return True
     base = rel_posix.rsplit("/", 1)[-1]
-    for pat in schema.get("exclude") or []:
-        pat = str(pat)
-        if pat.endswith("/"):
-            if rel_posix.startswith(pat) or rel_posix == pat[:-1]:
-                return True
-        elif fnmatch.fnmatch(rel_posix, pat) or fnmatch.fnmatch(base, pat):
-            return True
-    return False
+    return any(fnmatch.fnmatch(rel_posix, pattern) or fnmatch.fnmatch(base, pattern)
+               for pattern in exclusion_globs_from_schema(schema))
 
 
 def _present(fm: dict, key: str) -> bool:
@@ -309,7 +310,108 @@ def _enum_reject_reason(schema: dict, typ: str, fm: dict) -> Optional[str]:
     return None
 
 
-def _evaluate(abs_path: str, content: str) -> tuple[str, Optional[str]]:
+_BASIS_GRADE_RE = re.compile(r"(\d+)\s+([A-F])-grade")
+
+
+def _contradicting_grade_reason(rel_posix: str, fm: dict) -> Optional[str]:
+    """Reject an entity page whose own Admiralty `reliability` is WORSE than the grade its
+    `auto_verified_basis` cites (okengine#563).
+
+    Admiralty reliability grades a SOURCE. Stamped onto a knowledge page it is a snapshot of
+    whatever produced that page and never moves as evidence accumulates, so the trust strip ends up
+    showing a stale, lower grade beside a basis naming A-grade authorities: the page argues with
+    itself and the reader is shown the weaker claim. 71 pages on one live vault, 21 of them
+    asserting `F` ("unreliable") while citing MITRE ATT&CK and Microsoft.
+
+    The page already states its trust three ways — `auto_verified_basis`, `attribution_confidence`
+    and `consensus` — so the fix is to DROP the field, which is what the message asks for. A grade
+    that agrees with the evidence is untouched; only self-contradiction is rejected.
+    """
+    if "entities" not in rel_posix.split("/"):
+        return None
+    grade = str(fm.get("reliability") or "").strip().upper()[:1]
+    if not grade or grade not in "ABCDEF":
+        return None
+    best = min((g for _, g in _BASIS_GRADE_RE.findall(str(fm.get("auto_verified_basis") or ""))),
+               default=None)
+    if not best or grade <= best:        # 'A' <= 'A'; only a WORSE page grade contradicts
+        return None
+    return (f"page-level `reliability: {grade}` contradicts its own `auto_verified_basis`, which "
+            f"cites {best}-grade evidence. Admiralty reliability grades a SOURCE, not a knowledge "
+            f"page — remove `reliability`/`credibility` here; the page's trust is already carried "
+            f"by auto_verified_basis, attribution_confidence and consensus.")
+
+
+_BODY_SOURCE_LINK = re.compile(r"\[\[\s*(sources/[^\]|#]+)")
+# kept in lockstep with scripts/cron/source_normalize._EXEMPT_TYPES — a guard and its repair that
+# disagree about scope leave pages permanently rejectable with no legal fix
+_CITATION_EXEMPT_TYPES = frozenset({"source", "dashboard"})
+
+
+def _body_only_citation_reason(rel_posix: str, fm: dict, body: str, root: Path) -> Optional[str]:
+    """Reject an entity page whose evidence exists ONLY in body prose (okengine#563).
+
+    `sources:` frontmatter is the single location every consumer reads — the grading lane
+    (review_autoverify._grade_evidence) and both render surfaces. A page citing `[[sources/...]]`
+    in a `## Sources` section with no `sources:` key therefore carries real, checkable evidence
+    that nothing can see: on one live vault 40 entity pages graded as unsourced and rendered
+    quarantined while citing named publishers.
+
+    Enforced here rather than asked for in a prompt, because prompts guide and the write path
+    enforces — and nothing instructs this shape in the first place (no lane in the engine or any
+    pack emits a `## Sources` body section; the prompts already ask for the field). It is emergent
+    model behaviour, so no prompt edit reaches it.
+
+    SCOPE — deliberately NARROWER than the repair (scripts/cron/source_normalize), which runs over
+    every non-dashboard type. This guard REJECTS a write, so its scope is limited to `entities/`,
+    where `sources:` is the provenance contract that drives evidence grading and the render trust
+    gate. Outside it, body links are an ESTABLISHED, tested contract — a briefing narrates and cites
+    inline, and okengine-mcp already enforces that those links resolve (the briefing dead-link
+    guard). Rejecting that shape would break a working lane.
+
+    The asymmetry is safe in this direction only: the repair fixing MORE than the guard enforces
+    just means extra pages get their evidence made visible. The reverse — a guard rejecting shapes
+    the repair cannot produce — would leave pages permanently unwritable with no legal fix.
+
+    Also exempt: a `source` record IS the primary document (its own url/raw is its grounding, and
+    body links on it are references, not provenance), and a `dashboard` is a GENERATED aggregate
+    view whose body list is a rendering rather than a citation.
+    """
+    if "entities" not in rel_posix.split("/"):
+        return None
+    if str(fm.get("type") or "") in _CITATION_EXEMPT_TYPES:
+        return None
+    if _present(fm, "sources"):
+        return None
+    # Only RESOLVING refs count, matching what scripts/cron/source_normalize.py will lift. If the
+    # guard fired on dangling refs too, those pages could never reach a clean state: the repair
+    # refuses to promote a link to a page that does not exist (that would manufacture a citation to
+    # nothing), so the guard would reject them forever with no legal fix. A guard and its repair
+    # must agree on scope. A dangling body ref is a separate data-quality problem, reported by the
+    # dangling-ref detector, not by this rule.
+    refs = []
+    for raw in _BODY_SOURCE_LINK.findall(body or ""):
+        ref = raw.strip().removesuffix(".md")
+        parts = Path(ref).parts
+        if (not parts or Path(ref).is_absolute()
+                or any(x in {"", ".", ".."} for x in parts)
+                or any(len(x.encode("utf-8")) > 255 for x in parts)):
+            continue
+        try:
+            if (root / "wiki" / (ref + ".md")).is_file() and ref not in refs:
+                refs.append(ref)
+        except OSError:
+            continue
+    if not refs:
+        return None
+    shown = ", ".join(refs[:3])
+    return (f"cites {len(refs)} source(s) only in body prose ({shown}"
+            f"{', …' if len(refs) > 3 else ''}) — move them into the `sources:` frontmatter list. "
+            f"Every consumer (evidence grading, reader, cockpit) reads `sources:`; a body-only "
+            f"citation is invisible to all of them and the page will grade and render as unsourced.")
+
+
+def _evaluate(abs_path: str, content: str, *, follow_final_symlink: bool = True) -> tuple[str, Optional[str]]:
     """Core conformance evaluation. Returns (kind, reason):
 
       ok     — conformant.
@@ -337,7 +439,10 @@ def _evaluate(abs_path: str, content: str) -> tuple[str, Optional[str]]:
         # relative to the vault, not to .okengine/ (okengine#133).
         root = sp.parent.parent if sp.parent.name == ".okengine" else sp.parent
         try:
-            rel = Path(abs_path).resolve().relative_to(root)
+            page = Path(abs_path)
+            effective = (page.resolve() if follow_final_symlink else
+                         page.parent.resolve() / page.name)
+            rel = effective.relative_to(root)
         except (ValueError, OSError):
             return ("skip", None)                       # not under the schema root
         rel_posix = rel.as_posix()
@@ -353,7 +458,9 @@ def _evaluate(abs_path: str, content: str) -> tuple[str, Optional[str]]:
         # HOT/HEALTH/BUNDLE.md, the INDEX tree, and any `_`/`.`-prefixed scaffold).
         bn = rel_posix.rsplit("/", 1)[-1]
         reserved = schema.get("reserved_files")
-        reserved = tuple(str(r).lower() for r in reserved) if reserved else _OKF_RESERVED_DEFAULT
+        reserved = set(_OKF_RESERVED_DEFAULT) | {
+            str(r).lower() for r in (reserved or [])
+        }
         if bn.lower() in reserved or _is_generated_structural(bn):
             return ("skip", None)
 
@@ -401,6 +508,12 @@ def _evaluate(abs_path: str, content: str) -> tuple[str, Optional[str]]:
         enum_reason = _enum_reject_reason(eff, t, fm)
         if enum_reason:
             return ("fail", enum_reason)
+        cite_reason = _body_only_citation_reason(rel_posix, fm, content[m.end():], root)
+        if cite_reason:
+            return ("fail", cite_reason)
+        grade_reason = _contradicting_grade_reason(rel_posix, fm)
+        if grade_reason:
+            return ("fail", grade_reason)
         return ("ok", None)
     except Exception as e:
         return ("error", f"validator error: {str(e)[:120]}")
@@ -412,6 +525,17 @@ def schema_reject_reason(abs_path: str, content: str) -> Optional[str]:
     validator error passes (None) so a write is never bricked by infra. Out of
     scope and conformant both return None. Never raises."""
     kind, reason = _evaluate(abs_path, content)
+    return reason if kind == "fail" else None
+
+
+def schema_reject_reason_for_link_replacement(abs_path: str, content: str) -> Optional[str]:
+    """Runtime verdict for an ``mv`` destination that replaces its final symlink.
+
+    Normal writes follow the symlink target; ``mv src link.md`` replaces the
+    link at its vault name. Resolve parents but evaluate that lexical basename.
+    Keep the runtime validator's usual fail-open policy for schema errors.
+    """
+    kind, reason = _evaluate(abs_path, content, follow_final_symlink=False)
     return reason if kind == "fail" else None
 
 
@@ -476,7 +600,7 @@ def governing_policy(abs_path: str) -> dict:
 
 def reserved_files_for(abs_path: str) -> frozenset:
     """The RESERVED basenames (lowercased) for the schema governing `abs_path`: the pack's schema.yaml
-    `reserved_files` if declared, else the OKF engine default (_OKF_RESERVED_DEFAULT). These are the
+    engine defaults UNION any pack-declared `reserved_files`. These are the
     files the MCP write path REFUSES and the conformance gate EXEMPTS. The file-tool write-guard
     (patch 01) reads this so it mirrors the write path's PACK-reserved refusal, not just the hardcoded
     engine set — otherwise declaring a file reserved makes it MORE writable via the file tool
@@ -486,7 +610,9 @@ def reserved_files_for(abs_path: str) -> frozenset:
         sp = _find_schema(abs_path)
         schema = (_load_schema(sp) or {}) if sp is not None else {}
         reserved = schema.get("reserved_files")
-        return frozenset(str(r).lower() for r in reserved) if reserved else frozenset(_OKF_RESERVED_DEFAULT)
+        return frozenset(_OKF_RESERVED_DEFAULT) | frozenset(
+            str(r).lower() for r in (reserved or [])
+        )
     except Exception:
         return frozenset()
 

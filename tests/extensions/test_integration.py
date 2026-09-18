@@ -71,7 +71,7 @@ def _ingateway_ext(pack, ext_id, namespace, type_name):
         "requires": {"engine": ">=0.3.0"},
         "capabilities": {"read": ["wiki/**"], "write": [f"{namespace}/**"]},
         "schema": ["schema/frag.yaml"],
-        "operation": {"schedule": {"kind": "cron", "expr": "0 4 * * *"},
+        "operation": {"schedule": {"kind": "cron", "expr": "@jitter:daily@4"},
                       "entrypoint": {"script": "run.py"}},
     }), encoding="utf-8")
     (d / "schema" / "frag.yaml").write_text(yaml.safe_dump({
@@ -88,7 +88,7 @@ def _sidecar_ext(pack, ext_id, namespace):
         "id": ext_id, "kind": "operation", "version": "0.1.0", "trust": "sidecar",
         "requires": {"engine": ">=0.3.0"},
         "capabilities": {"read": ["wiki/**"], "write": [f"{namespace}/**"]},
-        "operation": {"schedule": {"kind": "cron", "expr": "0 5 * * *"},
+        "operation": {"schedule": {"kind": "cron", "expr": "@jitter:daily@5"},
                       "entrypoint": {"image": {"registry": f"r/{ext_id}", "digest": "sha256:abc"}}},
     }), encoding="utf-8")
     return d
@@ -106,15 +106,15 @@ def test_two_extensions_compose_consistently(tmp_path):
     _enable(cli, pack, "demo.alpha")
     _enable(cli, pack, "demo.side")
 
-    # cron fleet: both jobs, namespaced by id, no collision
+    # Cron fleet: only the runnable in-gateway job is installed. Sidecar artifacts
+    # remain available for the documented operator-opt-in flow, but deploy must not
+    # create a dead job whose wrapper/runner transport is absent.
     exts, derr = disc.discover(pack)
     assert derr == []
     jobs, jerr = comp.extension_jobs(pack, existing_names={"build-hot-set"})
     assert jerr == []
     names = {j["name"] for j in jobs}
-    assert names == {"demo.alpha", "demo.side"}
-    side_job = next(j for j in jobs if j["name"] == "demo.side")
-    assert side_job["script"].endswith("demo.side/trigger.sh")     # sidecar -> trigger wrapper
+    assert names == {"demo.alpha"}
 
     # schema: only the in-gateway one brings schema here; composed has its type
     assert comp.write_composed_schema(pack) == []
@@ -177,3 +177,23 @@ def test_full_teardown_to_no_artifacts(tmp_path):
     import json
     store = json.loads((pack / ".okengine" / "extension-tokens.json").read_text())
     assert store.get("tokens") == []
+
+
+def test_a_sidecar_trigger_with_an_unusable_timeout_is_refused(tmp_path):
+    """okengine#561's whole point: a timeout nobody honours is indistinguishable from one nobody
+    set. A sidecar trigger launches a container — the deadline is the only thing bounding it — so a
+    declared-but-unusable value has to fail composition rather than silently inherit the default and
+    read, in the extension's own manifest, as if a limit were in force."""
+    disc, comp, cli = _disc(), _comp(), _cli()
+    pack = _pack(tmp_path)
+    d = _sidecar_ext(pack, "demo.side", "sides")
+    _enable(cli, pack, "demo.side")
+    # written AFTER enabling: enable validates the manifest, so this is the case where an already
+    # enabled extension is edited in place — composition is then the only thing left to catch it.
+    manifest = yaml.safe_load((d / "extension.yaml").read_text(encoding="utf-8"))
+    manifest["operation"]["timeout"] = "not-a-number"
+    (d / "extension.yaml").write_text(yaml.safe_dump(manifest), encoding="utf-8")
+
+    jobs, jerr = comp.extension_jobs(pack, existing_names=set())
+    assert jobs == []
+    assert any("operation.timeout must be a positive integer" in e for e in jerr), jerr

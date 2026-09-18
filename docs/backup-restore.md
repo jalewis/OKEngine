@@ -23,7 +23,9 @@ digests + a roll-up digest:
 - **Excluded:** `.git`, `__pycache__`/`node_modules`/`.venv`, transient `.okengine/snapshots` and
   `.okengine/backups`, heavy `.hermes-data/logs`, and **secrets** (`.env`, `.hermes-data/auth.json`).
 
-Secrets are excluded by default — **restore re-provisions keys** (set `.env` on the new host). Pass
+Secrets are excluded by default. The non-secret fixed `HERMES_UID`/`HERMES_GID` deployment identity
+is recorded in the manifest and restored into a minimal `.env`, preventing identity drift during
+DR; add the deployment keys to that file on the new host. Pass
 `--include-secrets` to capture them; the archive is then sensitive, so store it accordingly.
 
 ## Where backups go

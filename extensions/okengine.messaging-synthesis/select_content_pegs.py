@@ -88,7 +88,7 @@ def main() -> int:
     print(f"  product: {product}  |  window: published since {since.isoformat()}")
     print(f"  {len(hits)} candidate source(s) — turn the strongest 3-7 into outbound content "
           "angles (blog/LinkedIn/podcast/newsletter); skip the rest")
-    print(f"  write via mcp_okengine_write_create_entity to: {out_path}")
+    print(f"  write via mcp__okengine_write__create_entity to: {out_path}")
     print(f"  frontmatter: type: marketing-pulse, title: \"Content pegs — week of "
           f"{week_ending}\", published: {week_ending}, updated: {week_ending}")
     print()

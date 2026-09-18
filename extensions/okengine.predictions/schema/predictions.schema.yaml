@@ -23,3 +23,20 @@ field_items:
     confidence_after: {shape: number}
     date: {shape: date}
     source: {shape: str}
+
+enums:
+  prediction_confidence: [very-low, low, medium-low, medium, medium-high, high, very-high]
+
+field_shapes:
+  confidence:
+    # NUMERIC, not a band (okengine#563). This extension's own calibration lane computes a Brier
+    # score -- `sum((confidence - outcome) ** 2) / n` in calibration_refresh.py -- so `confidence`
+    # on a prediction MUST be a number. The corpus agrees: 91% numeric on one live vault, 79% on
+    # another. The previous `field_enums` binding to the 7-value `prediction_confidence` band
+    # therefore contradicted both the data and this extension's own consumer.
+    #
+    # The `prediction_confidence` vocabulary above stays DEFINED: a pack that carries a qualitative
+    # band alongside the probability (as assessments do, via `confidence_band`) can bind it to that
+    # field explicitly. It just must not govern the probability itself.
+    by_type:
+      prediction: number

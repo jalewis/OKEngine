@@ -16,7 +16,7 @@ import yaml
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
-BATCH = int(os.environ.get("REVIEW_DRAIN_BATCH", "20"))
+BATCH = int(os.environ.get("REVIEW_DRAIN_BATCH", "5"))
 _FM = re.compile(r"\A---[ \t]*\n(.*?\n)---(.*)\Z", re.S)
 
 

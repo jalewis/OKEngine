@@ -7,14 +7,14 @@ correct AT THE TIME OF INGEST. This library computes the effective
 score AS A SOURCE FOR CURRENT CLAIMS — which decays with age.
 
 Half-lives by `source_kind`:
-  filing      1095 days  (point-in-time facts that don't unmake themselves)
-  report      547  days  (12-18 month half-life; 18mo conservative end)
-  article     547  days  (same as report)
-  blog        180  days  (6-month half-life)
-  thread      180  days
-  primary     1825 days  (5-year half-life — primary document;
-                          very slow until contradicted)
-  default     365  days  (unknown / unset source_kind)
+  filing        1095 days  (point-in-time facts that don't unmake themselves)
+  report        547  days  (12-18 month half-life; 18mo conservative end)
+  article/news  547  days  (same as report; `news` is the schema-declared spelling)
+  blog/post     180  days  (6-month half-life; `post` is the schema-declared spelling)
+  thread        180  days
+  primary       1825 days  (5-year half-life — primary document;
+                            very slow until contradicted)
+  default       365  days  (unknown / unset / undeclared source_kind)
 
 Decay function: effective = base × 0.5 ** (age_days / half_life)
 
@@ -36,11 +36,26 @@ import os
 from datetime import date
 
 # Half-lives in days, keyed by source_kind. Env-overridable for tuning.
+#
+# This table was written against ONE vault's vocabulary and four of its six keys — `article`,
+# `blog`, `thread`, `primary` — are values the base schema has never declared. On a vault that
+# uses the declared spellings instead, every source fell through to DEFAULT_HALF_LIFE and the
+# tuning here did nothing at all: measured on a live 51,022-page vault, only `report` (1,378
+# pages) matched, while `news` (1,465) and `post` (274) silently took the default (okengine#595).
+#
+# So the declared spellings share their synonym's env var and default: `news` IS `article` and
+# `post` IS `blog`, and reading one number from two places is how they drift apart. The other
+# base values (`paper`, `release`, `reference-data`) are deliberately left on the default rather
+# than given an invented half-life — a number nobody chose is worse than an honest fallback.
+_ARTICLE_HL = int(os.environ.get("DECAY_HL_ARTICLE", "547"))
+_BLOG_HL = int(os.environ.get("DECAY_HL_BLOG", "180"))
 HALF_LIVES: dict[str, int] = {
     "filing":  int(os.environ.get("DECAY_HL_FILING", "1095")),
     "report":  int(os.environ.get("DECAY_HL_REPORT", "547")),
-    "article": int(os.environ.get("DECAY_HL_ARTICLE", "547")),
-    "blog":    int(os.environ.get("DECAY_HL_BLOG", "180")),
+    "article": _ARTICLE_HL,
+    "news":    _ARTICLE_HL,     # the declared spelling of `article`
+    "blog":    _BLOG_HL,
+    "post":    _BLOG_HL,        # the declared spelling of `blog`
     "thread":  int(os.environ.get("DECAY_HL_THREAD", "180")),
     "primary": int(os.environ.get("DECAY_HL_PRIMARY", "1825")),
 }

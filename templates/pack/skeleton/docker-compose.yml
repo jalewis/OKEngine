@@ -1,4 +1,9 @@
 # docker-compose for {{PACK}} — {{TITLE}} (engine okengine {{ENGINE_VERSION}}).
+x-okengine-compose-contract:
+  version: 1
+  engine_release: {{ENGINE_VERSION}}
+  pack: {{PACK}}
+
 # The pack dir IS the vault (schema.yaml + CLAUDE.md + wiki/ + crons/feeds/data).
 # Set ENGINE_DIR to your engine checkout, then:
 #   # HERMES_UID/HERMES_GID default to your uid via deploy.sh (you own the vault). Export a
@@ -17,10 +22,68 @@
 # packs); the gateway is on the per-pack bridge (no host port) and reaches okengine-mcp by service
 # name, and okengine-mcp needs no host port for the engine itself (okengine#138).
 services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    # A copied pre-v0.13.9 .env.example contains public, non-empty placeholders;
+    # Compose interpolation alone cannot distinguish them from a real secret.
+    # Refuse them BEFORE the official entrypoint initializes or opens PGDATA.
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        case "$$POSTGRES_PASSWORD" in
+          ""|okengine-projection-local|REPLACE_BEFORE_ENABLING)
+            echo "PostgreSQL refuses an unset or example projection writer credential" >&2
+            exit 1
+            ;;
+        esac
+        exec docker-entrypoint.sh postgres
+    environment:
+      POSTGRES_DB: okengine
+      POSTGRES_USER: okengine
+      POSTGRES_PASSWORD: ${OKENGINE_PROJECTION_WRITER_PASSWORD:?Set a distinct projection writer credential}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: ${TZ:-UTC}
+    volumes:
+      - projection-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U okengine -d okengine"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources: {limits: {cpus: "2.0", memory: 2048M}}
+
+  okengine-projection:
+    build:
+      context: ${ENGINE_DIR:-../engine}
+      dockerfile: okengine-projection/Dockerfile
+    image: okengine-projection
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      WIKI_PATH: /opt/vault
+      OKENGINE_PROJECTION_WRITER_DSN: postgresql://okengine:${OKENGINE_PROJECTION_WRITER_PASSWORD:?Set a distinct projection writer credential}@postgres:5432/okengine
+      OKENGINE_PROJECTION_READER_PASSWORD: ${OKENGINE_PROJECTION_READER_PASSWORD:?Set a distinct projection reader credential}
+      OKENGINE_PROJECTION_INTERVAL_SECONDS: ${OKENGINE_PROJECTION_INTERVAL_SECONDS:-3600}
+      OKENGINE_PROJECTION_MAX_DELETE_PCT: ${OKENGINE_PROJECTION_MAX_DELETE_PCT:-2}
+      OKENGINE_PROJECTION_MAX_DELETE_ABS: ${OKENGINE_PROJECTION_MAX_DELETE_ABS:-50}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./:/opt/vault:ro
+    deploy:
+      resources: {limits: {cpus: "2.0", memory: 2048M}}
+
   gateway:
     # gateway image = pinned Hermes + patches + engine overlay; build it ONCE
     # with scripts/build-engine-image.sh (OKEngine has no root Dockerfile).
-    image: hermes-agent
+    # deploy.sh persists this immutable release+git-sha reference in .env and an
+    # engine-managed Compose override. The fallback is intentionally non-moving: a
+    # bare compose run before deploy must fail to find an image, not select :latest.
+    image: ${OKENGINE_GATEWAY_IMAGE:-hermes-agent:okengine-unpinned}
     container_name: {{PACK}}-gateway
     restart: unless-stopped
     # On the compose default bridge (a per-pack network), NOT host-net (okengine#138). The gateway
@@ -55,6 +118,9 @@ services:
       # (maintained_by / discovered_by) with this on every write, so a composed
       # multi-pack vault records which pack maintains each page (okengine#90 P3).
       - OKENGINE_PACK={{PACK}}
+      # Deployment identity for inference-pool attribution. Unlike OKENGINE_PACK this names the
+      # installed/composed deployment, so traffic remains distinguishable across pack ownership.
+      - OKENGINE_DEPLOYMENT=${OKENGINE_DEPLOYMENT:-{{PACK}}}
       # Hermes v0.17.0 bakes ENV HERMES_WRITE_SAFE_ROOT=/opt/data and DENIES every agent
       # file-tool write outside it as a "protected system/credential file" — which silently
       # blocks the agent from writing the vault at /opt/vault (okengine#140). Widen the safe
@@ -84,13 +150,54 @@ services:
       # - API_SERVER_HOST=0.0.0.0
       # - API_SERVER_MODEL_NAME=OKEngine Agent
     command: ["gateway", "run"]
-    # Outbound only (Telegram long-poll + model API) + reaches okengine-mcp by service name; no
-    # inbound host port, so no healthcheck (limits + backoff still apply).
+    # Scheduler-independent liveness: every in-scheduler monitor dies with cron-plus. Docker runs
+    # this probe outside the scheduler and marks the gateway unhealthy when the tick lock is stale,
+    # cron-plus has declared its job store stalled, a corpus fence exceeds five minutes, a running
+    # receipt exceeds one hour, or a child remains in uninterruptible I/O. Three one-minute retries
+    # tolerate a short legitimate write/I/O interval while making a persistent wedge fail loud.
+    # The stale-run probe is bounded to the CURRENT scheduler generation: PID 1's real start time.
+    # A run record is written when a lane starts and rewritten when it ends; a lane KILLED
+    # instead of completed — container stop, force-recreate, OOM — leaves its record saying
+    # "running" forever, and nothing reconciles it at the next start. Unbounded, one interrupted
+    # lane therefore fails this probe permanently: measured 2026-09-12, every gateway on one host
+    # was unhealthy, five with failing streaks over 1500, against 79 orphan records on
+    # ai-research whose oldest dated from 2026-08-25.
+    #
+    # A health signal that is always red carries no information — a real stall becomes
+    # indistinguishable from the background state, which is the exact condition this probe was
+    # added to detect. A record older than the scheduler's start cannot belong to a live run and
+    # can only be an orphan.
+    #
+    # The start is computed, not read off a timestamp: btime from /proc/stat plus PID 1's starttime
+    # (/proc/1/stat field 22, in clock ticks). The first version of this bound used `-newer
+    # /proc/1`, on the belief that /proc/1's mtime is the process start. It is not. procfs stamps
+    # an inode when the kernel CREATES the inode, and an evicted inode is recreated on its next
+    # access with the current time. Measured 2026-09-13: on two of four gateways /proc/1's mtime
+    # read 31.5 hours after the container started, and the bound saw 2 of 1620 and 1 of 1367 of
+    # the runs that generation had written -- so a genuinely stuck run would have reported
+    # HEALTHY. That is worse than the always-red probe it replaced. The computed start matched
+    # Docker's StartedAt to the second on all four. `sed 's/.*) //'` drops everything through the
+    # last ") " first, because field 2 (the command name) may itself contain spaces or parens.
+    #
+    # This is the containment half. Reconciling orphans to a terminal state at scheduler start
+    # belongs to cron-plus, an external pinned dependency (okengine#747).
+    healthcheck:
+      test: ["CMD-SHELL", "now=$$(date +%s); tick=$$(stat -c %Y /opt/data/cron-plus/.tick.lock 2>/dev/null) || exit 1; [ $$((now-tick)) -le 180 ] || exit 1; [ ! -s /opt/data/cron-plus/.scheduler-stalled ] || exit 1; owner=/opt/vault/.okengine/corpus/lock-owner.json; [ ! -e $$owner ] || { mtime=$$(stat -c %Y $$owner) || exit 1; [ $$((now-mtime)) -le 300 ] || exit 1; }; gen=$$(( $$(awk '/^btime/{print $$2}' /proc/stat) + $$(sed 's/.*) //' /proc/1/stat | awk '{print $$20}') / $$(getconf CLK_TCK) )); ! find /opt/data/cron-plus/runs -type f -mmin +60 -newermt @$$gen -exec grep -lE '\"status\"[[:space:]]*:[[:space:]]*\"running\"' {} + 2>/dev/null | grep -q . || exit 1; for stat in /proc/[0-9]*/stat; do grep -q ') D ' $$stat 2>/dev/null && exit 1; done; exit 0"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
     deploy:
-      restart_policy: {condition: on-failure, delay: 10s, max_attempts: 5, window: 120s}
-      resources: {limits: {cpus: "2.0", memory: 2048M}}
+      # NO restart_policy here. In non-swarm Compose its `condition:` OVERRIDES the
+      # top-level `restart: unless-stopped` and silently forces on-failure, which does
+      # not recover a clean stop -- the June 2026 13-hour outage. Every live deployment
+      # had this block removed after that incident; the skeleton kept it, so every pack
+      # created since re-introduced the bug. Keep resources.limits (crash-loop bound).
+      resources: {limits: {cpus: "2.0", memory: 6144M}}
   okengine-reader:
-    build: ${ENGINE_DIR:-../engine}/okengine-reader
+    build:
+      context: ${ENGINE_DIR:-../engine}
+      dockerfile: okengine-reader/Dockerfile
     image: okengine-reader
     container_name: {{PACK}}-reader
     user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
@@ -106,6 +213,7 @@ services:
       - OKENGINE_TRUST=${OKENGINE_TRUST:-private}
       - OKENGINE_BIND=${OKENGINE_BIND:-127.0.0.1}
       - OKENGINE_PROJECT_URL=${OKENGINE_PROJECT_URL:-}   # About-panel repo link (optional)
+      - OKENGINE_UI_DISPLAY_NAME=${OKENGINE_UI_DISPLAY_NAME:-} # optional deployment identity in header/title
       - TZ=${TZ:-UTC}                                    # match the gateway clock (page timestamps)
       # Agent Chat (opt-in — see the gateway api_server block + docs/agent-chat.md). Both required;
       # the gateway is reached by SERVICE NAME on the bridge (private + stable, no host.docker.internal):
@@ -121,7 +229,11 @@ services:
       retries: 3
       start_period: 30s
     deploy:
-      restart_policy: {condition: on-failure, delay: 10s, max_attempts: 5, window: 120s}
+      # NO restart_policy here. In non-swarm Compose its `condition:` OVERRIDES the
+      # top-level `restart: unless-stopped` and silently forces on-failure, which does
+      # not recover a clean stop -- the June 2026 13-hour outage. Every live deployment
+      # had this block removed after that incident; the skeleton kept it, so every pack
+      # created since re-introduced the bug. Keep resources.limits (crash-loop bound).
       resources: {limits: {cpus: "4.0", memory: 3584M}}
   okengine-mcp:
     build:
@@ -152,6 +264,15 @@ services:
       # Must be listed here or the documented `OKENGINE_MCP_INDEX_REFRESH_HOURS=0` .env override never
       # reaches the container (explicit environment: list, no env_file on this service) — invariant-audit #35.
       - OKENGINE_MCP_INDEX_REFRESH_HOURS=${OKENGINE_MCP_INDEX_REFRESH_HOURS:-6}
+      # Shared qmd admission control: interactive search and background updates consume the same
+      # bounded pool. Queue/execute budgets prevent a model lane from pinning this container.
+      - OKENGINE_MCP_QMD_CONCURRENCY=${OKENGINE_MCP_QMD_CONCURRENCY:-2}
+      - OKENGINE_MCP_SEARCH_QUEUE_SECONDS=${OKENGINE_MCP_SEARCH_QUEUE_SECONDS:-10}
+      - OKENGINE_MCP_SEARCH_TIMEOUT_SECONDS=${OKENGINE_MCP_SEARCH_TIMEOUT_SECONDS:-120}
+      # Optional typed PostgreSQL projection. Start the `projection` Compose profile to make this
+      # endpoint available; otherwise tools fail explicitly as unconfigured.
+      - OKENGINE_PROJECTION_READER_DSN=${OKENGINE_PROJECTION_READER_DSN:-postgresql://okengine_reader:okengine-reader-local@postgres:5432/okengine}
+      - OKENGINE_PROJECTION_MAX_AGE_HOURS=${OKENGINE_PROJECTION_MAX_AGE_HOURS:-6}
     volumes:
       - ./:/opt/vault:ro
       - ./.hermes-data/qmd:/opt/data/qmd
@@ -163,7 +284,11 @@ services:
       retries: 3
       start_period: 30s
     deploy:
-      restart_policy: {condition: on-failure, delay: 10s, max_attempts: 5, window: 120s}
+      # NO restart_policy here. In non-swarm Compose its `condition:` OVERRIDES the
+      # top-level `restart: unless-stopped` and silently forces on-failure, which does
+      # not recover a clean stop -- the June 2026 13-hour outage. Every live deployment
+      # had this block removed after that incident; the skeleton kept it, so every pack
+      # created since re-introduced the bug. Keep resources.limits (crash-loop bound).
       resources: {limits: {cpus: "2.0", memory: 2560M}}
   okengine-review-write:
     profiles: ["review"]
@@ -194,7 +319,11 @@ services:
       retries: 3
       start_period: 10s
     deploy:
-      restart_policy: {condition: on-failure, delay: 10s, max_attempts: 5, window: 120s}
+      # NO restart_policy here. In non-swarm Compose its `condition:` OVERRIDES the
+      # top-level `restart: unless-stopped` and silently forces on-failure, which does
+      # not recover a clean stop -- the June 2026 13-hour outage. Every live deployment
+      # had this block removed after that incident; the skeleton kept it, so every pack
+      # created since re-introduced the bug. Keep resources.limits (crash-loop bound).
       resources: {limits: {cpus: "0.5", memory: 256M}}
   okengine-operation-runner:
     profiles: ["review"]
@@ -220,10 +349,16 @@ services:
       retries: 3
       start_period: 10s
     deploy:
-      restart_policy: {condition: on-failure, delay: 10s, max_attempts: 5, window: 120s}
+      # NO restart_policy here. In non-swarm Compose its `condition:` OVERRIDES the
+      # top-level `restart: unless-stopped` and silently forces on-failure, which does
+      # not recover a clean stop -- the June 2026 13-hour outage. Every live deployment
+      # had this block removed after that incident; the skeleton kept it, so every pack
+      # created since re-introduced the bug. Keep resources.limits (crash-loop bound).
       resources: {limits: {cpus: "4.0", memory: 3584M}}
   okengine-cockpit:
-    build: ${ENGINE_DIR:-../engine}/okengine-cockpit
+    build:
+      context: ${ENGINE_DIR:-../engine}
+      dockerfile: okengine-cockpit/Dockerfile
     image: okengine-cockpit
     container_name: {{PACK}}-cockpit
     user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
@@ -268,5 +403,14 @@ services:
       retries: 3
       start_period: 30s
     deploy:
-      restart_policy: {condition: on-failure, delay: 10s, max_attempts: 5, window: 120s}
+      # NO restart_policy here. In non-swarm Compose its `condition:` OVERRIDES the
+      # top-level `restart: unless-stopped` and silently forces on-failure, which does
+      # not recover a clean stop -- the June 2026 13-hour outage. Every live deployment
+      # had this block removed after that incident; the skeleton kept it, so every pack
+      # created since re-introduced the bug. Keep resources.limits (crash-loop bound).
       resources: {limits: {cpus: "2.0", memory: 2048M}}
+
+volumes:
+  projection-data:
+    # Disposable derived state. Do not include this volume in vault backups; recovery rebuilds it
+    # from canonical Markdown and weekly verification proves that path.

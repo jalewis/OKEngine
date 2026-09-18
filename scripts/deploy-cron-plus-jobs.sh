@@ -6,6 +6,12 @@
 #
 # Usage:
 #   CRON_PACK_DIR=/path/to/pack bash scripts/deploy-cron-plus-jobs.sh
+#   RESUME_PAUSED=1 CRON_PACK_DIR=... bash scripts/deploy-cron-plus-jobs.sh   # re-arm paused lanes
+#
+# Operator pause survives a deploy (okengine#517): a lane held with `cron-plus.sh pause` keeps
+# `enabled: false` across regeneration, because pause is runtime state and the source always
+# declares `enabled: true`. Paused lanes are named in the deploy output. RESUME_PAUSED=1 is the
+# deliberate opt-out.
 #
 # Snapshots the existing jobs.json in-container before overwriting.
 # As of cron-plus v0.1.2 the scheduler self-heals null next_run_at on
@@ -20,6 +26,18 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -n "${OKENGINE_HOST_PYTHON:-}" ]; then
+    HOST_PYTHON="$OKENGINE_HOST_PYTHON"
+elif [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+    HOST_PYTHON="$REPO_ROOT/.venv/bin/python"
+else
+    HOST_PYTHON=python3
+fi
+if ! "$HOST_PYTHON" -c 'import yaml, croniter' >/dev/null 2>&1; then
+    echo "ERROR: host Python '$HOST_PYTHON' lacks PyYAML/croniter; cron jobs will not be deployed unchecked." >&2
+    echo "       Create $REPO_ROOT/.venv and install $REPO_ROOT/requirements-host.txt before retrying." >&2
+    exit 1
+fi
 SRC="$REPO_ROOT/config/cron-plus-jobs.json"
 PACK_DIR="${CRON_PACK_DIR:-/path/to/pack}"
 # Write into the container as the SAME uid the gateway runs as (compose
@@ -44,7 +62,7 @@ DEST_IN="/opt/data/cron-plus/jobs.json"
 # on a multi-pack host, could be a DIFFERENT pack's job set (invariant-audit #12). The old guard
 # skipped regen when a pack lacked crons/ and deployed whatever was lying around.
 if [ -f "$REPO_ROOT/config/engine-crons.json" ]; then
-    CRON_PACK_DIR="$PACK_DIR" python3 "$REPO_ROOT/scripts/cron_pack_split.py" regen
+    CRON_PACK_DIR="$PACK_DIR" "$HOST_PYTHON" "$REPO_ROOT/scripts/cron_pack_split.py" regen
 else
     # No engine-crons.json = a broken/partial engine checkout, NOT a valid DR source. The artifact is
     # gitignored, so any $SRC present is a stale leftover — refuse rather than deploy it blind.
@@ -64,7 +82,7 @@ fi
 # slipped through (invariant-audit #12). Cheap earliest-gate check before touching the live store.
 TARGET_PACK="$(grep -oE '^name:[[:space:]]*[A-Za-z0-9._-]+' "$PACK_DIR/pack.yaml" 2>/dev/null | head -1 | awk '{print $2}' || true)"
 if [ -n "$TARGET_PACK" ]; then
-    FOREIGN="$(python3 -c '
+    FOREIGN="$("$HOST_PYTHON" -c '
 import json, sys
 target = sys.argv[2]
 print("\n".join(sorted({j.get("pack") for j in json.load(open(sys.argv[1]))["jobs"]
@@ -94,6 +112,11 @@ trap 'rm -f "$DEPLOY_JOBS"' EXIT
 # morning without forking any schedule (okengine#177). Default 7.
 BRIEF_HOUR="$(_okengine_env_file_val "$PACK_DIR" OKENGINE_BRIEF_HOUR || true)"
 BRIEF_HOUR="${BRIEF_HOUR:-7}"
+# Match the gateway's actual scheduler environment. CRON_TZ from the pack env_file wins inside
+# cron-plus; otherwise Compose's explicit TZ uses the operator shell value before the pack .env.
+PACK_CRON_TZ="$(_okengine_env_file_val "$PACK_DIR" CRON_TZ || true)"
+PACK_TZ="$(_okengine_env_file_val "$PACK_DIR" TZ || true)"
+DEPLOY_TZ="${PACK_CRON_TZ:-${TZ:-${PACK_TZ:-UTC}}}"
 case "$BRIEF_HOUR" in
     *[!0-9]*|"") echo "ERROR: OKENGINE_BRIEF_HOUR must be an integer from 0 to 23 (got '$BRIEF_HOUR')" >&2; exit 1 ;;
 esac
@@ -101,11 +124,30 @@ if [ "$BRIEF_HOUR" -gt 23 ]; then
     echo "ERROR: OKENGINE_BRIEF_HOUR must be from 0 to 23 (got '$BRIEF_HOUR')" >&2
     exit 1
 fi
-PYTHONPATH="$REPO_ROOT/scripts" python3 - "$SRC" "$DEPLOY_JOBS" "$PACK_DIR" "$BRIEF_HOUR" <<'PY'
-import sys, json, hashlib, random, cron_jitter, model_profiles
-src, out, pack_dir, brief_hour = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+PYTHONPATH="$REPO_ROOT/scripts" "$HOST_PYTHON" - "$SRC" "$DEPLOY_JOBS" "$PACK_DIR" "$BRIEF_HOUR" "$DEPLOY_TZ" <<'PY'
+import sys, json, hashlib, os, random, cron_jitter, model_profiles
+src, out, pack_dir, brief_hour, deploy_tz = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
+pack_dir = os.path.realpath(pack_dir)
 d = json.load(open(src, encoding="utf-8"))
 jobs = d.get("jobs", [])
+# Per-lane SCHEDULE overrides for non-extension lanes, applied BEFORE the sentinel expanders so
+# an override may itself be a sentinel and still expand (a concrete expr passes through untouched).
+# The counterpart to cron-models.json below; extension lanes use extension-schedules.json at
+# compose. A deployment needs this because cron exprs are read in its TZ while a provider's
+# peak-price window is fixed UTC — only the deployment knows that mapping.
+try:
+    lane_schedules = cron_jitter.load_lane_schedules(pack_dir)
+except (ValueError, OSError) as e:
+    print(f"ERROR: cron-schedules.json: {e}", file=sys.stderr); sys.exit(1)
+sn, serr = cron_jitter.apply_lane_schedules(jobs, lane_schedules)
+if serr:
+    print("ERROR: cron-schedules.json (not deploying):\n  " + "\n  ".join(serr), file=sys.stderr)
+    sys.exit(1)
+dst_errors = cron_jitter.morning_dst_errors(jobs, brief_hour, deploy_tz)
+if dst_errors:
+    print("ERROR: morning schedule crosses a DST gap (not deploying):\n  "
+          + "\n  ".join(dst_errors), file=sys.stderr)
+    sys.exit(1)
 bn = cron_jitter.expand_brief_jobs(jobs, brief_hour)
 # ENGINE crons ship @jitter sentinels and are re-expanded on EVERY deploy; with an unseeded
 # random.Random() each redeploy re-rolls every jittered lane's minute, and because the deploy strips
@@ -137,9 +179,22 @@ pn, jerr = model_profiles.expand_jobs(jobs, profiles)
 if jerr:
     print("ERROR: model-profile references (not deploying):\n  " + "\n  ".join(jerr), file=sys.stderr)
     sys.exit(1)
+# Hermes fallback providers are global, including for lanes expanded from @local.
+# Fail before touching the live store if any Qwen Coder path can activate one.
+try:
+    import yaml
+    config_path = __import__("pathlib").Path(pack_dir) / ".hermes-data" / "config.yaml"
+    runtime_config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+except (OSError, ValueError, TypeError) as e:
+    print(f"ERROR: cannot validate Qwen fallback policy: {e}", file=sys.stderr); sys.exit(1)
+qerr = model_profiles.validate_qwen_no_fallback(runtime_config, jobs)
+if qerr:
+    print("ERROR: Qwen Coder fallback policy (not deploying):\n  " + "\n  ".join(qerr),
+          file=sys.stderr)
+    sys.exit(1)
 json.dump(d, open(out, "w", encoding="utf-8"), indent=2)
 print(f"  expanded {bn} @morning brief(s) @{brief_hour:02d}:MM + {n} @jitter sentinel(s) "
-      f"+ {ln} lane override(s) + {pn} model-profile ref(s) for deploy")
+      f"+ {sn} schedule override(s) + {ln} lane override(s) + {pn} model-profile ref(s) for deploy")
 PY
 
 # Target THIS pack's gateway via its compose project — NOT the first gateway on the host,
@@ -185,6 +240,57 @@ if [ -n "$MISSING_SCRIPTS" ]; then
     exit 1
 fi
 
+# PRESERVE OPERATOR PAUSE (okengine#517). Pause is RUNTIME state: it lives in the deployed
+# jobs.json as `enabled: false` + `paused_at`, while the SOURCE always declares `enabled: true`.
+# Regeneration therefore overwrote runtime state with declared state and silently re-armed a held
+# lane — twice on one pack, once ~40 minutes before a reshelve that would then have moved 988
+# pages unattended. It is the worst shape of bug: silent, time-delayed to the job's next fire, and
+# it punishes pausing, which is the careful thing to do.
+# Matched on the stable job `id` (source-assigned, survives regeneration), so a renamed lane keeps
+# its pause and a re-used name does not inherit one.
+# RESUME_PAUSED=1 is the deliberate "yes, re-arm everything" path.
+LIVE_JOBS_TMP="$DEPLOY_JOBS.live"
+if docker exec -u "$HERMES_UID" "$CONTAINER" sh -c "cat '$DEST_IN' 2>/dev/null" > "$LIVE_JOBS_TMP" \
+        && [ -s "$LIVE_JOBS_TMP" ]; then
+    RESUME_PAUSED="${RESUME_PAUSED:-0}" "$HOST_PYTHON" - "$DEPLOY_JOBS" "$LIVE_JOBS_TMP" <<'PY'
+import json, os, sys
+new_path, live_path = sys.argv[1], sys.argv[2]
+resume = os.environ.get("RESUME_PAUSED", "0").strip().lower() not in ("", "0", "false", "no", "off")
+try:
+    live = json.load(open(live_path, encoding="utf-8"))
+except (OSError, ValueError):
+    sys.exit(0)                       # unreadable live store: deploy as generated
+live_jobs = live if isinstance(live, list) else (live.get("jobs") or [])
+paused = {j["id"]: j for j in live_jobs
+          if j.get("id") and j.get("enabled") is False}
+if not paused:
+    sys.exit(0)
+names = sorted((j.get("name") or j["id"]) for j in paused.values())
+if resume:
+    print(f"  RESUME_PAUSED=1 — re-arming {len(paused)} operator-paused lane(s): "
+          + ", ".join(names))
+    sys.exit(0)
+new = json.load(open(new_path, encoding="utf-8"))
+kept = []
+for job in (new.get("jobs") or []):
+    held = paused.get(job.get("id"))
+    if not held:
+        continue
+    job["enabled"] = False
+    if held.get("paused_at"):
+        job["paused_at"] = held["paused_at"]
+    kept.append(job.get("name") or job["id"])
+json.dump(new, open(new_path, "w", encoding="utf-8"), indent=2)
+if kept:
+    print(f"  preserved operator pause on {len(kept)} lane(s): " + ", ".join(sorted(kept)))
+dropped = len(paused) - len(kept)
+if dropped:
+    print(f"  note: {dropped} paused lane(s) are no longer in the source and were not carried "
+          "forward")
+PY
+fi
+rm -f "$LIVE_JOBS_TMP"
+
 # Create the runtime dir, snapshot any existing jobs.json, then stream the new one
 # in as `hermes` (so the cron-plus subprocess, also hermes, can read it).
 # Reconcile model-slot artifacts as root first: an operator diagnostic may have
@@ -199,7 +305,7 @@ docker exec -u "$HERMES_UID" "$CONTAINER" sh -c \
 docker exec -i -u "$HERMES_UID" "$CONTAINER" sh -c "cat > '$DEST_IN' && chmod 600 '$DEST_IN'" < "$DEPLOY_JOBS"
 echo "  deployed: $CONTAINER:$DEST_IN"
 
-JOB_COUNT=$(python3 -c "import json; print(len(json.load(open('$SRC'))['jobs']))")
+JOB_COUNT=$("$HOST_PYTHON" -c "import json; print(len(json.load(open('$SRC'))['jobs']))")
 echo "  jobs: $JOB_COUNT (all lane scripts staged — validated pre-write)"
 
 echo ""

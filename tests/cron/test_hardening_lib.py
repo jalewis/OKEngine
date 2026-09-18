@@ -13,7 +13,8 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent.parent
 LIB = REPO / "scripts" / "cron" / "hardening_lib.py"
-DV = REPO / "scripts" / "cron" / "deployment_validate.py"
+# okengine#405: check_auth (the hardened-posture wiring under test) moved to the shared checks library.
+DV = REPO / "scripts" / "cron" / "deployment_checks.py"
 
 
 def _lib():
@@ -122,6 +123,21 @@ def test_is_hardened_and_is_public_helpers():
     assert m.is_public({"OKENGINE_TRUST": "public"})
     assert m.is_public({"OKENGINE_READER_PUBLIC": "on"})
     assert not m.is_public({"OKENGINE_TRUST": "private"})
+    assert not m.is_public({"OKENGINE_TRUST": "zzz"})
+
+
+def test_hardening_value_comparisons_use_equality_not_order_or_identity():
+    m = _lib()
+    env = dict(SAFE)
+    env["OKENGINE_MCP_TOKEN"] = "aaa-generated-token"
+    env["OKENGINE_READER_RATE"] = "5"
+    assert m.hardened_posture_violations(env) == []
+
+    dynamic_default = "".join(["okengine", "-local"])
+    assert id(dynamic_default) != id(m.DEFAULT_LOCAL_TOKEN)
+    env["OKENGINE_MCP_TOKEN"] = dynamic_default
+    assert any("built-in default" in item for item in m.hardened_posture_violations(env))
+
 
 
 # ---- okengine#257: UI-editing switch ----
@@ -157,9 +173,9 @@ def test_editing_off_clears_the_violation():
 # ---- wiring: deployment_validate.check_auth must honor the flag ----
 
 def _dv():
-    spec = importlib.util.spec_from_file_location("deployment_validate", DV)
+    spec = importlib.util.spec_from_file_location("deployment_checks", DV)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["deployment_validate"] = m
+    sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     return m
 

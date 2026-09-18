@@ -1,0 +1,184 @@
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index b304342ca..cb1640b40 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2241,8 +2241,15 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
+                           report_only: bool = False):
+     runtime = setup.runtime
+     pr = _cfg.get("provider_routing") or {}
++    ollama_num_ctx = job.get("ollama_num_ctx")
++    if "ollama_num_ctx" in job and (
++        isinstance(ollama_num_ctx, bool) or not isinstance(ollama_num_ctx, int)
++        or ollama_num_ctx <= 0
++    ):
++        raise ValueError("cron ollama_num_ctx must be a positive integer")
+     return AIAgent(
+         model=setup.model,
++        ollama_num_ctx=ollama_num_ctx,
+         api_key=runtime.get("api_key"),
+         base_url=runtime.get("base_url"),
+         provider=runtime.get("provider"),
+diff --git a/run_agent.py b/run_agent.py
+index 5744825cf..446ce767a 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -235,6 +235,7 @@ class AIAgent(
+         base_url: str = None, api_key: str = None, provider: str = None, api_mode: str = None,
+         acp_command: str = None, acp_args: list[str] | None = None, command: str = None, args: list[str] | None = None,
+         model: str = "",
++        ollama_num_ctx: int | None = None,
+         max_iterations: int = sys.maxsize,  # unlimited tool-calling iterations by default (shared with subagents)
+         tool_delay: float = None,  # deprecated: accepted for compatibility, ignored
+         enabled_toolsets: List[str] = None, disabled_toolsets: List[str] = None,
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 6113f2198..cfda7b437 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -2001,11 +2001,18 @@ def _inject_context_engine_tools(agent):
+             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
+ 
+ 
+-def _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length):
++def _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length, ollama_num_ctx=None):
+     # Ollama defaults num_ctx to 2048, so detect the max window and send num_ctx per request.
+     # model.ollama_num_ctx overrides; model.context_length caps the detected value (VRAM).
++    # A task-local override takes precedence over the shared model setting.
++    if ollama_num_ctx is not None and (
++        isinstance(ollama_num_ctx, bool) or not isinstance(ollama_num_ctx, int)
++        or ollama_num_ctx <= 0
++    ):
++        raise ValueError("ollama_num_ctx must be a positive integer")
+     agent._ollama_num_ctx: int | None = None
+-    _override = _model_cfg.get("ollama_num_ctx") if isinstance(_model_cfg, dict) else None
++    _override = ollama_num_ctx if ollama_num_ctx is not None else (
++        _model_cfg.get("ollama_num_ctx") if isinstance(_model_cfg, dict) else None)
+     if _override is not None:
+         try:
+             agent._ollama_num_ctx = int(_override)
+@@ -2197,7 +2204,8 @@ _CALLBACK_PARAMS = (
+ def init_agent(
+     agent, base_url: str = None, api_key: str = None, provider: str = None, api_mode: str = None,
+     acp_command: str = None, acp_args: list[str] | None = None, command: str = None,
+-    args: list[str] | None = None, model: str = "", max_iterations: int = sys.maxsize,
++    args: list[str] | None = None, model: str = "", ollama_num_ctx: int | None = None,
++    max_iterations: int = sys.maxsize,
+     enabled_toolsets: List[str] = None, disabled_toolsets: List[str] = None,
+     save_trajectories: bool = False, verbose_logging: bool = False, quiet_mode: bool = False,
+     tool_progress_mode: str = "all", ephemeral_system_prompt: str = None,
+@@ -2327,7 +2335,7 @@ def init_agent(
+     _warn_nonagentic_hermes_model(agent)
+     _inject_context_engine_tools(agent)
+     _init_usage_state(agent)
+-    _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
++    _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length, ollama_num_ctx)
+     _emit_compression_summary(agent, cs)
+     _snapshot_primary_runtime(agent)
+ 
+diff --git a/tests/cron/test_okengine_per_job_ollama_num_ctx.py b/tests/cron/test_okengine_per_job_ollama_num_ctx.py
+new file mode 100644
+index 000000000..70fc9f0f8
+--- /dev/null
++++ b/tests/cron/test_okengine_per_job_ollama_num_ctx.py
+@@ -0,0 +1,102 @@
++"""A cron lane's Ollama context override must reach the effective agent window."""
++
++from types import SimpleNamespace
++from unittest.mock import create_autospec
++
++import pytest
++
++from cron.scheduler import _construct_cron_agent, _CronAgentSetup
++from run_agent import AIAgent
++
++
++def _construct(job):
++    captured = []
++    agent_class = create_autospec(AIAgent, side_effect=lambda **kwargs: captured.append(kwargs))
++    setup = _CronAgentSetup(
++        model="local-model", runtime={"api_key": "local", "base_url": "http://localhost:11434/v1",
++                               "provider": "local", "requested_provider": "local"},
++        max_iterations=90, enabled_toolsets=[],
++    )
++    _construct_cron_agent(agent_class, job, {}, setup, workdir=None,
++                          session_id="cron-test", session_db=None)
++    return captured[0]
++
++
++def test_cron_job_threads_its_num_ctx_to_agent_constructor():
++    assert _construct({"ollama_num_ctx": 32768})["ollama_num_ctx"] == 32768
++
++
++def test_cron_job_without_override_leaves_agent_config_default():
++    assert _construct({})["ollama_num_ctx"] is None
++
++
++@pytest.mark.parametrize("value", [True, False, 0, -1, "32768", 32768.5, [], {}])
++def test_invalid_explicit_cron_num_ctx_fails_before_agent_creation(value):
++    with pytest.raises(ValueError, match="ollama_num_ctx"):
++        _construct({"ollama_num_ctx": value})
++
++
++def test_explicit_num_ctx_clamps_compressor_to_served_window(monkeypatch):
++    from agent.agent_init import _configure_ollama_num_ctx
++
++    changes = []
++    compressor = SimpleNamespace(context_length=131072,
++                                 update_model=lambda **kwargs: changes.append(kwargs))
++    agent = SimpleNamespace(base_url="http://localhost:11434/v1", model="local-model",
++                            api_key="local", provider="local", api_mode="chat_completions",
++                            quiet_mode=True, context_compressor=compressor)
++    monkeypatch.setattr("agent.agent_init.query_ollama_num_ctx", lambda *_a, **_k: 131072)
++    _configure_ollama_num_ctx(agent, {"ollama_num_ctx": 65536}, None, 32768)
++    assert agent._ollama_num_ctx == 32768
++    assert changes[0]["context_length"] == 32768
++
++
++def test_absent_per_job_override_preserves_model_config(monkeypatch):
++    from agent.agent_init import _configure_ollama_num_ctx
++
++    compressor = SimpleNamespace(context_length=131072, update_model=lambda **_k: None)
++    agent = SimpleNamespace(base_url=None, model="local-model", api_key="local",
++                            provider="local", api_mode="chat_completions", quiet_mode=True,
++                            context_compressor=compressor)
++    _configure_ollama_num_ctx(agent, {"ollama_num_ctx": 65536}, None, None)
++    assert agent._ollama_num_ctx == 65536
++
++
++@pytest.mark.parametrize("value", [True, 0, -1, "32768", 32768.5])
++def test_invalid_direct_agent_num_ctx_is_rejected(value):
++    from agent.agent_init import _configure_ollama_num_ctx
++
++    agent = SimpleNamespace()
++    with pytest.raises(ValueError, match="ollama_num_ctx"):
++        _configure_ollama_num_ctx(agent, {}, None, value)
++
++
++def test_real_agent_constructor_uses_per_job_window(monkeypatch):
++    import agent.context_compressor as compressor_module
++    import agent.model_metadata as metadata
++    import agent.process_bootstrap as bootstrap
++    import hermes_cli.config as config
++    import model_tools
++
++    cfg = {"agent": {}, "model": {"ollama_num_ctx": 65536}}
++    monkeypatch.setattr(model_tools, "get_tool_definitions",
++                        create_autospec(model_tools.get_tool_definitions, return_value=[]))
++    monkeypatch.setattr(model_tools, "check_toolset_requirements",
++                        create_autospec(model_tools.check_toolset_requirements, return_value={}))
++    monkeypatch.setattr(bootstrap, "OpenAI", create_autospec(bootstrap.OpenAI))
++    monkeypatch.setattr(config, "load_config",
++                        create_autospec(config.load_config, return_value=cfg))
++    monkeypatch.setattr(config, "load_config_readonly",
++                        create_autospec(config.load_config_readonly, return_value=cfg))
++    monkeypatch.setattr(metadata, "get_model_context_length",
++                        create_autospec(metadata.get_model_context_length, return_value=131072))
++    monkeypatch.setattr(compressor_module, "get_model_context_length",
++                        create_autospec(compressor_module.get_model_context_length, return_value=131072))
++    agent = AIAgent(model="local-model", api_key="local", base_url="http://localhost:11434/v1",
++                    ollama_num_ctx=32768, quiet_mode=True, skip_context_files=True,
++                    skip_memory=True)
++    try:
++        assert agent._ollama_num_ctx == 32768
++        assert agent.context_compressor.context_length == 32768
++    finally:
++        agent.close()

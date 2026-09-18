@@ -27,7 +27,7 @@ The framework = **Runtime + Engine**. A deployment = framework + **one pack defi
 |---|---|
 | `tools/schema_validator.py` | OKF conformance contract (validator + write-guard). Lives inside the upstream `tools/` dir today. |
 | `scripts/cron/` — the `engine` + `engine-template` tier scripts (`config/cron-tiers.yaml`) | wake-gates / selectors / drains: `reshelve.py`, `reshard_oversized.py`, `build_index_tree.py`, `build_hot_set.py`, `okf_migrate.py`, `schema_*_drain.py`, `repair_*`, `normalize_entity_schema.py`, source-hygiene + index/health refreshers, etc. (forecasting/event/classification jobs are pack-supplied) |
-| `scripts/cron/kb_search.py`, `kb_graph.py`, `kb_health.py` | qmd + IWE integration (retrieval + graph) |
+| `scripts/cron/kb_search.py`, `backlink_lib.py`, `backlinks_refresh.py`, `kb_health.py` | qmd retrieval + bounded graph artifact |
 | `scripts/cron/corpus_indexer.py` | JSONL index builder over any OKF vault |
 | `scripts/backfill_source_fields.py`, `backfill_typeless_type.py`, `normalize_publishers.py`, `restore_clobbered_tags.py`, `render-dataview-blocks.py` | generic corpus-maintenance helpers |
 | `scripts/cron-plus*.sh`, `deploy-cron-*.sh`, `dump-cron-plus-jobs.sh` | deploy/ops tooling |

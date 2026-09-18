@@ -1,0 +1,7 @@
+# A unified diff encodes a blank CONTEXT line as a single space, so trailing whitespace in a .patch
+# file is load-bearing: strip it and the patch stops applying. `git diff --check` (the diff-check
+# gate) flags those as errors, which made adding or editing ANY carried patch fail CI.
+#
+# It was latent rather than new: after-ordering.patch and cli-null-next-run.patch already carry
+# blank context lines and were simply never part of a diff after the gate was introduced.
+patches/**/*.patch -whitespace

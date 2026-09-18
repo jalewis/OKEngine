@@ -4,7 +4,7 @@ The deployment timezone (`$TZ`) governs the reader/cockpit CLOCKS and the dates 
 onto content. A container only receives `$TZ` if its compose service declares `TZ=${TZ:-UTC}` in its
 environment. When the skeleton omits that for a service, every deployment generated from it ships a
 container silently pinned to UTC even though `.env` sets a real zone — the live drift that shipped to
-cyber-market/competitive/ai-research readers (their compose predated the reader's TZ passthrough).
+market-intel/competitive/ai-research readers (their compose predated the reader's TZ passthrough).
 
 This locks the ROOT fix: every service the skeleton defines must carry the TZ passthrough, so a newly
 generated deployment can never regress the class. (The complementary LIVE catch for already-drifted

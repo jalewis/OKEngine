@@ -181,6 +181,11 @@ def main() -> int:
     print(f"  candidates ({catchall_label}bare entity, age>={MIN_AGE_DAYS}d): {len(candidates)}")
 
     if not candidates:
+        write_selection_manifest(
+            [],
+            Path(os.environ.get("HERMES_HOME", "/opt/data"))
+            / "cron-plus" / "selections" / "schema-classify-drain.json",
+        )
         print("  → SKIP: nothing to classify")
         print(json.dumps({"wakeAgent": False}))
         return 0

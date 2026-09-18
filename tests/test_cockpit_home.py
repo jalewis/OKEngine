@@ -10,6 +10,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import datetime as _dt
+
 import pytest
 
 pytest.importorskip("fastapi")
@@ -50,8 +52,13 @@ def test_home_composes_live_surfaces_and_omits_empty(tmp_path, monkeypatch):
         "  dashboards: [top-actors-by-activity]\n"
         "  tabs: [home, briefings]\n", encoding="utf-8")
     _mk(tmp_path, "briefings/daily-2026-07-06.md", "type: briefing\ntitle: D\n")
+    # `last_updated` must stay inside the cockpit's "Recently moved (<=30d)" window, so derive it
+    # from now rather than pinning a literal. The old fixed 2026-07-06 was 30 days old on
+    # 2026-08-05 and 31 on 2026-08-06 -- a time bomb that expired mid-run and read as a timezone
+    # flake because UTC crossed the boundary ~4h before EDT (okengine#560).
+    _recent = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
     _mk(tmp_path, "entities/a/apt-x.md",
-        "type: actor\nname: APT X\nactivity_tier: hot\nlast_updated: '2026-07-06T00:00:00Z'\n")
+        f"type: actor\nname: APT X\nactivity_tier: hot\nlast_updated: '{_recent}'\n")
     _mk(tmp_path, "predictions/p1.md",
         "type: prediction\nstatus: open\nsubject: APT X pivots\nresolves_by: 2026-08-01\n")
     _mk(tmp_path, "lacuna/gap-1.md", "type: lacuna\nname: coverage gap\ncreated: '2026-07-05'\n")
@@ -112,7 +119,7 @@ def test_cockpit_open_status_matches_pred_lib_contract():
 
 
 def test_home_dashboard_chips_handle_the_grouped_config_shape(tmp_path, monkeypatch):
-    """Regression (cyber-market): its `dashboards:` config uses the GROUPED shape
+    """Regression (market-intel): its `dashboards:` config uses the GROUPED shape
     ([{group, items: [{path, title?}]}]) — the flat-slug chips code rendered raw dict
     reprs as chip labels/targets. Grouped items chip per item with namespace-qualified
     paths; flat slugs keep the dashboards/ prefix."""

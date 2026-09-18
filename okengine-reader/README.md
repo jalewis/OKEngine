@@ -15,7 +15,7 @@ it keeps working even if the rest of the stack is down.
   click one to list its pages (title · type · updated).
 - **Render** — any page as HTML, with Obsidian `![[embeds]]` inlined and
   `[[wikilinks]]` turned into click-through navigation.
-- **Backlinks** — a "↩ what links here" panel per page, from the IWE wikilink
+- **Backlinks** — a "↩ what links here" panel per page, from the precomputed wikilink
   graph (built once at startup, cached).
 - **Search** — ripgrep across the whole vault.
 - **Export** — download any page as `md` / `docx` / `pdf` (pandoc + weasyprint).
@@ -76,7 +76,7 @@ content (review-flagged, not human-verified) landing in the agent's memory.
 - **Bounded expensive work.** The endpoints that spawn subprocesses
   (`/api/download` docx/pdf → pandoc/WeasyPrint, `/api/search` → ripgrep) are
   concurrency-capped and per-IP rate-limited, and `/api/backlinks` never blocks a
-  request on the heavy IWE graph build (it serves the cached map and refreshes in
+  request on a graph build (it serves the cached map and refreshes in
   the background). `OKENGINE_READER_PUBLIC=1` turns on safe defaults for an
   internet-facing reader — see [Public deployments](#public-deployments).
 
@@ -86,9 +86,9 @@ content (review-flagged, not human-verified) landing in the agent's memory.
 |---|---|---|
 | `VAULT_DIR` | `/vault` | read-only vault root (expects a `wiki/` subdir) |
 | `PORT` | `9200` | listen port |
+| `OKENGINE_UI_DISPLAY_NAME` | `vault reader` | deployment identity shown in the browser title and header |
 | `OKENGINE_READER_PASSWORD` | _(unset → open)_ | if set, require HTTP Basic auth |
 | `OKENGINE_READER_USER` | `okengine` | Basic-auth username |
-| `IWE_BIN` | `iwe` | path to the IWE binary (backlinks) |
 | `OKENGINE_READER_PUBLIC` | `0` | `1` = internet-facing defaults (exports off, rate limit on) |
 | `OKENGINE_READER_EXPORTS` | `1` (local) / `0` (public) | allow docx/pdf export (pandoc/WeasyPrint); `md` is always allowed |
 | `OKENGINE_READER_MAX_EXPORT` | `2` | max concurrent docx/pdf conversions (over → `503`) |
@@ -109,7 +109,7 @@ content (review-flagged, not human-verified) landing in the agent's memory.
 | `GET /api/tree` | top-level directories + page counts |
 | `GET /api/pages?dir=<dir>` | pages under a directory (path · title · type · updated) |
 | `GET /api/page?path=<key>` | one page rendered to sanitized HTML |
-| `GET /api/backlinks?path=<key>` | pages that link to `<key>` (IWE graph) |
+| `GET /api/backlinks?path=<key>` | pages that link to `<key>` (precomputed graph) |
 | `GET /api/search?q=<query>` | ripgrep matches across the vault |
 | `GET /api/download?fmt=md\|docx\|pdf&path=<key>` | export a page |
 | `POST /api/chat` | relay a chat turn to the agent, streaming SSE — only when an agent endpoint is configured (see [Agent chat](#agent-chat-optional)) |
@@ -147,10 +147,10 @@ vault it is pointed at).
 ## Run
 
 ```bash
-# Local (needs pandoc, ripgrep, and optionally the IWE binary on PATH):
+# Local (needs pandoc and ripgrep):
 VAULT_DIR=/path/to/vault uvicorn app:app --port 9200
 
-# Container (bundles pandoc + ripgrep + IWE):
+# Container (bundles pandoc + ripgrep):
 docker build -t okengine-reader .
 docker run --rm -p 9200:9200 -v /path/to/vault:/vault:ro okengine-reader
 ```

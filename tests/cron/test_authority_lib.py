@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -59,3 +60,26 @@ def test_authority_policy_fails_closed(updates, reason):
 def test_timestamp_requires_utc_seconds():
     with pytest.raises(ValueError, match="second precision"):
         authority_lib.disposition(record(), POLICY, reviewed_at="2026-07-19")
+
+
+def test_policy_structure_regex_and_automatic_timestamp(monkeypatch):
+    missing = dict(POLICY)
+    missing.pop("authority")
+    assert authority_lib.evaluate(record(), missing)["reasons"] == ["policy missing: authority"]
+
+    invalid_regex = dict(POLICY, id_pattern="[")
+    assert authority_lib.evaluate(record(), invalid_regex)["reasons"] == [
+        "policy id_pattern is invalid"
+    ]
+
+    invalid_values = dict(POLICY, required_values=["not", "a", "mapping"])
+    assert "policy required_values must be an object" in authority_lib.evaluate(
+        record(), invalid_values)["reasons"]
+
+    fixed = __import__("datetime").datetime(2026, 7, 20, 1, 2, 3,
+                                             tzinfo=__import__("datetime").timezone.utc)
+    monkeypatch.setattr(authority_lib, "dt", SimpleNamespace(
+        datetime=SimpleNamespace(now=lambda _tz: fixed),
+        timezone=SimpleNamespace(utc=__import__("datetime").timezone.utc),
+    ))
+    assert authority_lib.disposition(record(), POLICY)["reviewed_at"] == "2026-07-20T01:02:03Z"

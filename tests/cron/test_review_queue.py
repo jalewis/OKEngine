@@ -39,6 +39,10 @@ def test_queue(tmp_path, monkeypatch):
     assert "entities/a/clean" not in d                # clean -> not queued
     assert "briefings/vetted" not in d                # signed off at current version -> cleared
     assert "entities/a/needs-vetted" not in d         # needs_review but signed off -> cleared
+    assert "GROUNDING: **1**" in d
+    assert "NEEDS-REVIEW: **1**" in d
+    assert "UNVETTED: **2**" in d
+    assert "**4 item(s) awaiting a human**" in d
 
 def test_queue_rows_are_wikilinks_not_relative_md_links(tmp_path, monkeypatch):
     """The reader renders [[wikilinks]] as in-app navigation; a file-relative
@@ -58,3 +62,62 @@ def test_queue_rows_are_wikilinks_not_relative_md_links(tmp_path, monkeypatch):
     out = (wiki / "dashboards" / "review-queue.md").read_text()
     assert "[[lacuna/x]]" in out, out
     assert "](lacuna/x.md)" not in out
+
+
+def test_tombstoned_pages_never_enter_dashboard(tmp_path, monkeypatch):
+    wiki = tmp_path / "wiki"
+    entities = wiki / "entities"
+    entities.mkdir(parents=True)
+    (entities / "retired.md").write_text(
+        "---\ntype: entity\nstatus: tombstoned\nneeds_review: true\n---\nbody\n")
+    # This sorts after the tombstone and its status is lexically greater than "tombstoned".
+    # It proves the filter is equality-based and that encountering a tombstone continues the
+    # whole scan rather than terminating it.
+    (entities / "z-active.md").write_text(
+        "---\ntype: entity\nstatus: verified\nneeds_review: true\n---\nbody\n")
+    (tmp_path / "schema.yaml").write_text(
+        yaml.safe_dump({"okf": {"required": ["type"]},
+                        "review_required_types": ["entity"]}))
+
+    dashboard = _run(tmp_path, monkeypatch)
+
+    assert "entities/retired" not in dashboard
+    assert "NEEDS-REVIEW | [[entities/z-active]]" in dashboard
+
+
+def test_split_and_main_edge_paths_and_overflow(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    spec = importlib.util.spec_from_file_location(
+        "review_queue_edges", REPO / "scripts/cron/review_queue.py")
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    unreadable = tmp_path / "unreadable.md"; unreadable.write_text("x")
+    original = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda path, *args, **kwargs:
+                        (_ for _ in ()).throw(OSError("race"))
+                        if path == unreadable else original(path, *args, **kwargs))
+    assert m._split(unreadable) == ({}, "")
+    plain = tmp_path / "plain.md"; plain.write_text("body")
+    assert m._split(plain) == ({}, "body")
+    bad = tmp_path / "bad.md"; bad.write_text("---\n[broken\n---\nbody")
+    bad_fm, bad_body = m._split(bad)
+    assert bad_fm == {} and bad_body.strip() == "body"
+    scalar = tmp_path / "scalar.md"; scalar.write_text("---\n- x\n---\nbody")
+    scalar_fm, scalar_body = m._split(scalar)
+    assert scalar_fm == {} and scalar_body.strip() == "body"
+    assert m.main() == 1
+    assert "wiki not found" in capsys.readouterr().err
+
+    wiki = tmp_path / "wiki/entities"; wiki.mkdir(parents=True)
+    (wiki / "INDEX.md").write_text("ignored")
+    (wiki / "plain.md").write_text("body")
+    monkeypatch.setattr(m, "WIKI", tmp_path / "wiki")
+    monkeypatch.setattr(m, "VAULT", tmp_path)
+    monkeypatch.setattr(m, "DASH", tmp_path / "wiki/dashboards/review-queue.md")
+    assert m.main() == 0
+    assert "empty — all clear" in m.DASH.read_text()
+    for index in range(3):
+        (wiki / f"p{index}.md").write_text(
+            "---\ntype: entity\nneeds_review: true\n---\nbody")
+    monkeypatch.setattr(m, "SAMPLES", 1)
+    assert m.main() == 0
+    assert "…and 2 more" in m.DASH.read_text()

@@ -197,3 +197,32 @@ def test_direction_vocab_does_not_drift_across_copies():  # okengine#326 [23]
     assert penalty_vocab == sanctioned, (
         f"_DIRECTION_PENALTY vocab {sorted(penalty_vocab)} drifted from the sanctioned "
         f"evidence[].direction enum {sorted(sanctioned)}")
+
+
+def test_recommender_io_normalization_and_prediction_filter_edges(tmp_path, monkeypatch):
+    mod = _load()
+    assert mod._norm("/wiki/sources/a.md") == "sources/a"
+    missing = tmp_path / "missing.jsonl"
+    monkeypatch.setenv("PREDICTION_RECOMMENDER_EVENT_SCORES", str(missing))
+    assert mod._event_scores(tmp_path) == {}
+    scores = tmp_path / "scores.jsonl"
+    scores.write_text("not-json\n[]\n{}\n")
+    monkeypatch.setenv("PREDICTION_RECOMMENDER_EVENT_SCORES", str(scores))
+    assert mod._event_scores(tmp_path) == {}
+
+    pred = tmp_path / "wiki/predictions/p.md"
+    pred.parent.mkdir(parents=True)
+    monkeypatch.setattr(mod, "_event_scores", lambda vault: {})
+    monkeypatch.setattr(mod.P, "predictions", lambda vault: [
+        (pred, {"status": "confirmed", "confidence": .5}),
+        (pred, {"status": "open", "confidence": "bad"}),
+        (pred, {"status": "open", "confidence": .5, "evidence": ["bad"]}),
+    ])
+    assert mod.recommendations(tmp_path) == []
+
+    row = {
+        "proposition": "predictions/p", "confidence_before": .5,
+        "confidence_after_suggested": .6, "delta_suggested": .1, "events": [{"id": 1}],
+    }
+    _jsonl, dashboard = mod.write_outputs(tmp_path, [row])
+    assert "| [[predictions/p]] | 0.500 | 0.600 | +0.100 | 1 |" in dashboard.read_text()

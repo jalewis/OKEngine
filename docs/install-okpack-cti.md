@@ -9,7 +9,8 @@ security KB — actors, campaigns, malware, tools, ATT&CK techniques, exploited 
 metrics/publishers, indicators (IOCs), infrastructure, detections, mitigations, incidents, and
 identities — with STIX/legacy type names resolving to the friendly canonical types via `type_aliases`.
 
-The recipe (see [`pack.yaml`](../../okpacks-library/packs/okpack-cti/pack.yaml)):
+The recipe is defined in the pack library's
+[`okpack-cti/pack.yaml`](https://github.com/jalewis/okpacks-library/blob/main/packs/okpack-cti/pack.yaml):
 
 | Pack | Owns | Seed |
 |------|------|------|

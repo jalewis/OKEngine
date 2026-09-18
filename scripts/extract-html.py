@@ -194,7 +194,7 @@ def main(argv: list[str]) -> int:
     print(f"  failed (thin/unreadable): {failed}")
     if backends.get("heuristic") and "trafilatura" not in backends:
         print("  note: used the stdlib heuristic — `pip install trafilatura` for better extraction.")
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

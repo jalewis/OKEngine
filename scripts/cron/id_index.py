@@ -39,7 +39,7 @@ VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 INDEX_PATH = Path(os.environ.get("HERMES_DATA", "/opt/data")) / "state" / "id-index.json"
 
 _FM_RE = re.compile(r"\A---\s*\n(.*?\n)---\s*(?:\n|\Z)", re.DOTALL)
-_RESERVED = {"index.md", "log.md", "agents.md", "hot.md", "bundle.md", "health.md"}
+_RESERVED = {"index.md", "log.md", "agents.md", "readme.md", "hot.md", "bundle.md", "health.md"}
 
 
 def _skip(p: Path) -> bool:
@@ -72,6 +72,12 @@ class IdIndex:
         # catch their duplicates too). Populated by _add_identity for entities/ pages only.
         self.name_to_rels: dict[str, list[str]] = {}
         self.alias_to_rels: dict[str, list[str]] = {}
+        # Qualified namespace + separator-insensitive filename identity -> live pages.
+        # This catches two slugs for one human subject even when their stamped ids differ
+        # (authority id beside minted id, or title-derived ids). It is collision evidence
+        # only: callers refuse/flag; they never auto-merge on this weak key (#592).
+        self.slug_identity_to_rels: dict[str, list[str]] = {}
+        self.has_slug_identity_index = True
 
     def resolve(self, page_id: str) -> str | None:
         """The wiki-relative path for `page_id`, consulting `aliases:`. None if unknown."""
@@ -84,6 +90,20 @@ class IdIndex:
         """ids claimed by more than one LIVE page — surfaced for review, never
         auto-merged (slug ids collide by design; §5a)."""
         return dict(self._collisions)
+
+    def slug_identity_hits(self, qualified_namespace: str, stem: str) -> list[str]:
+        identity = id_lib.slug_identity(stem)
+        return list(self.slug_identity_to_rels.get(f"{qualified_namespace}:{identity}", []))
+
+    def _add_slug_identity(self, qualified_namespace: str, rel: str, stem: str) -> None:
+        identity = id_lib.slug_identity(stem)
+        if not qualified_namespace or not identity:
+            return
+        bucket = self.slug_identity_to_rels.setdefault(
+            f"{qualified_namespace}:{identity}", []
+        )
+        if rel not in bucket:
+            bucket.append(rel)
 
     def _add(self, page_id: str, rel: str, fm: dict) -> None:
         if str(fm.get("status") or "").strip().lower() == "tombstoned":
@@ -115,7 +135,8 @@ class IdIndex:
         if stem.endswith(".md"):
             stem = stem[:-3]
         name = id_lib.normalize_key(str(fm.get("name") or fm.get("title") or stem))
-        if name:
+        # normalize_key always returns either a slug or deterministic x-<hash> fallback.
+        if name:  # pragma: no branch
             bucket = self.name_to_rels.setdefault(name, [])
             if rel not in bucket:
                 bucket.append(rel)
@@ -126,27 +147,31 @@ class IdIndex:
             aliases = []
         for a in aliases:
             na = id_lib.normalize_key(str(a))
-            if na:
+            if na:  # pragma: no branch - normalize_key has the same non-empty contract
                 bucket = self.alias_to_rels.setdefault(na, [])
                 if rel not in bucket:
                     bucket.append(rel)
 
     def to_dict(self) -> dict:
         return {
-            "norm_version": 2,                  # v2 adds name_to_rels/alias_to_rels (okengine#324)
+            "norm_version": 3,                  # v3 adds strict slug identities (okengine#592)
             "by_id": self.by_id,
             "aliases": self.aliases,
             "tombstoned": sorted(self.tombstoned),
             "collisions": self._collisions,
             "name_to_rels": self.name_to_rels,
             "alias_to_rels": self.alias_to_rels,
+            "slug_identity_to_rels": self.slug_identity_to_rels,
         }
 
 
 def from_dict(d: dict) -> IdIndex:
-    """Reconstruct an IdIndex from a persisted `to_dict()` payload. A pre-v2 artifact has no
-    name_to_rels/alias_to_rels — they default empty, and write_server._dedup_on_create FALLS BACK to
-    a live scan until the refresh cron rewrites a v2 artifact (okengine#324), so dedup is never blind."""
+    """Reconstruct an index, retaining safe rolling-upgrade fallbacks.
+
+    A pre-v2 artifact has no name/alias maps; a pre-v3 artifact has no strict
+    slug map. The write path detects either absence and scans the relevant
+    namespace until a refresh persists the current shape.
+    """
     idx = IdIndex()
     idx.by_id = dict(d.get("by_id") or {})
     idx.aliases = dict(d.get("aliases") or {})
@@ -154,6 +179,10 @@ def from_dict(d: dict) -> IdIndex:
     idx._collisions = dict(d.get("collisions") or {})
     idx.name_to_rels = {k: list(v) for k, v in (d.get("name_to_rels") or {}).items()}
     idx.alias_to_rels = {k: list(v) for k, v in (d.get("alias_to_rels") or {}).items()}
+    idx.slug_identity_to_rels = {
+        k: list(v) for k, v in (d.get("slug_identity_to_rels") or {}).items()
+    }
+    idx.has_slug_identity_index = "slug_identity_to_rels" in d
     return idx
 
 
@@ -209,6 +238,8 @@ def _scan(vault: Path) -> IdIndex:
             rel = p.resolve().relative_to(base).as_posix()
         except (ValueError, OSError):
             continue
+        if str(fm.get("status") or "").strip().lower() != "tombstoned":
+            idx._add_slug_identity(id_lib.qualified_namespace(wiki, p), rel, p.stem)
         # Name/alias identity for entities/ dedup (okengine#324) — indexed for LIVE entity pages even
         # WITHOUT an id (the dedup must catch their duplicates), so this runs BEFORE the id skip below.
         # Sub-domain-aware: a walk-up page <sub>/entities/x is namespace 'entities' too. The rel (with
@@ -232,9 +263,14 @@ def _refresh_into(idx: IdIndex, vault: Path, key: str) -> None:
         with _REFRESH_LOCK:
             for pid, rel in list(idx.by_id.items()):
                 fresh.by_id.setdefault(pid, rel)
+            for identity, rels in list(idx.slug_identity_to_rels.items()):
+                bucket = fresh.slug_identity_to_rels.setdefault(identity, [])
+                bucket.extend(rel for rel in rels if rel not in bucket)
             idx.by_id, idx.aliases = fresh.by_id, fresh.aliases
             idx.tombstoned, idx._collisions = fresh.tombstoned, fresh._collisions
             idx.name_to_rels, idx.alias_to_rels = fresh.name_to_rels, fresh.alias_to_rels
+            idx.slug_identity_to_rels = fresh.slug_identity_to_rels
+            idx.has_slug_identity_index = True
         try:
             write_index(fresh)
         except OSError:

@@ -29,7 +29,7 @@ map→force→sort treatment. If lacuna is not enabled or no force is nameable, 
 whitespace-thesis stands alone.
 
 If the candidate yields a real whitespace, write ONE page at `frontier/<slug>`
-(`type: whitespace-thesis`) via `mcp_okengine_write_create_entity`, frontmatter:
+(`type: whitespace-thesis`) via `mcp__okengine_write_okengine_frontier_watch_whitespace_sweep__create_entity`, frontmatter:
 - `capability` (the wanted-but-unsupplied capability, e.g. `[[concepts/<slug>]]`),
   `demand_signal` (the evidence it's wanted), `supply_state` (who/what thinly provides it),
   `thesis` (the whitespace claim as a noun phrase), `confidence` (`low`|`medium`|`high`),

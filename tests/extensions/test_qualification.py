@@ -1,4 +1,5 @@
 import importlib.util
+import datetime as dt
 from pathlib import Path
 
 import pytest
@@ -29,3 +30,30 @@ def test_qualification_result_is_deterministic_and_rejects_role_confusion():
     bad = [dict(examined[0], outcome="support")]
     with pytest.raises(ValueError):
         q.qualification_result(**{**kwargs, "examined": bad})
+
+    with pytest.raises(ValueError, match="unsupported recommendation"):
+        q.qualification_result(**{**kwargs, "recommendation": "invented"})
+    for key in ("artifact", "reason_code"):
+        malformed = [dict(examined[0])]
+        malformed[0].pop(key)
+        with pytest.raises(ValueError, match="examined lead requires"):
+            q.qualification_result(**{**kwargs, "examined": malformed})
+
+
+def test_digest_dates_and_candidate_validation_edges():
+    value = {"day": dt.date(2026, 8, 4), "instant": dt.datetime(2026, 8, 4, 1, 2, 3),
+             "unicode": "café"}
+    assert q.digest(value).startswith("sha256:")
+    with pytest.raises(TypeError, match="set is not JSON serializable"):
+        q.digest({"unsupported": {1}})
+    base = dict(
+        artifact="sources/report", artifact_digest="sha256:" + "b" * 64,
+        source_identity=None, publisher="Publisher", evidence_access="local",
+        evidence_lineage="publisher:report", subject_match_basis="canonical",
+        discovery_reason="named-subject",
+    )
+    lead = q.candidate_lead(**base)
+    assert lead["publisher"] == "Publisher" and lead["retrieval_state"] == "local"
+    for bad in ({**base, "artifact": ""}, {**base, "artifact_digest": "md5:bad"}):
+        with pytest.raises(ValueError, match="sha256"):
+            q.candidate_lead(**bad)

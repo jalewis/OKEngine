@@ -116,6 +116,23 @@ def test_merge_unions_lists_and_fills_scalars():
     assert out["title"] == "Long"                        # present scalar NOT overwritten
 
 
+def test_malformed_input_and_url_boundaries():
+    m = _load()
+    assert m._split("plain body") == ({}, "plain body")
+    malformed = "---\nkey: [\n---\nbody"
+    assert m._split(malformed) == ({}, malformed)
+    assert m._raw_basenames("one.md,, two.md") == ["one", "two"]
+    assert m._raw_basenames([""]) == []
+    invalid = "http://["
+    assert m._unwrap_redirect(invalid) == invalid
+    assert m._norm_url(invalid) is None
+    redirect = "https://google.com/url?url=no-scheme&q=also-no-scheme"
+    assert m._unwrap_redirect(redirect) == redirect
+    assert m._norm_url("https:///story") is None
+    assert m._url_slug_key("https://example.com/story", None) is None
+    assert m.merge_fm({}, {"status": "tombstoned"}) == {}
+
+
 # ------------------------------------------------------------- behavior
 
 
@@ -255,3 +272,51 @@ def test_scan_tolerates_vanished_pages(tmp_path):
     (wiki / "sources" / "2026" / "07" / "ghost.md").symlink_to(
         wiki / "sources" / "2026" / "07" / "gone.md")   # dangling: rglob lists, read raises
     assert m.main(["--vault", str(tmp_path)]) == 0        # must not crash
+
+
+def test_no_sources_directory_and_skip_named_page(tmp_path):
+    m = _load()
+    assert m.main(["--vault", str(tmp_path)]) == 0
+    sources = tmp_path / "wiki" / "sources"
+    sources.mkdir(parents=True)
+    (sources / "INDEX.md").write_text("not frontmatter")
+    assert m.main(["--vault", str(tmp_path)]) == 0
+
+
+def test_all_duplicate_candidates_can_be_title_vetoed(tmp_path, capsys):
+    m = _load()
+    wiki = tmp_path / "wiki"
+    shared = {"type": "source", "published": "2026-07-11", "raw": "raw/shared.md",
+              "url": "https://example.com/story.html"}
+    _write(wiki, "sources/a", {**shared, "title": "Alpha ransomware campaign analysis"},
+           body="same size")
+    _write(wiki, "sources/b", {**shared, "title": "Quantum processor benchmark results"},
+           body="same size")
+    assert m.main(["--vault", str(tmp_path)]) == 0
+    assert "VETO title-disjoint" in capsys.readouterr().out
+    assert _fm(wiki, "sources/a").get("status") != "tombstoned"
+    assert _fm(wiki, "sources/b").get("status") != "tombstoned"
+
+
+def test_bad_version_defaults_and_unwritable_inbound_ref_is_tolerated(tmp_path, monkeypatch):
+    m = _load()
+    wiki = _vault_with_pairs(tmp_path)
+    loser = wiki / "sources/2026/07/story-short.md"
+    text = loser.read_text().replace("type: source\n", "type: source\nversion: invalid\n")
+    loser.write_text(text)
+    _write(wiki, "sources/2026/07/raw-only", {
+        "type": "source", "published": "2026-07-11",
+        "raw": "raw/another-tree/2026-07-11-hack.md",
+        "url": "https://different.example/unrelated.html",
+    })
+    (wiki / "INDEX.md").write_text("[[sources/2026/07/story-short]]")
+    original = Path.write_text
+
+    def selective_write(path, data, *args, **kwargs):
+        if path.name == "apt42.md":
+            raise OSError("read-only reference")
+        return original(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", selective_write)
+    assert m.main(["--vault", str(tmp_path)]) == 0
+    assert _fm(wiki, "sources/2026/07/story-short")["version"] == 2

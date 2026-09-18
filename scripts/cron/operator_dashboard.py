@@ -87,10 +87,16 @@ def main() -> int:
     fh = dashes.get("fleet-health")
     if fh:
         b = fh["body"]
-        bad = sum(int(_num(rf"{k}: \*\*(\d+)\*\*", b, "0")) for k in ("stale", "errored", "off-model"))
+        def count(key):
+            return int(_num(rf"{key}:\s*\*{{0,2}}(\d+)", b, "0"))
+        red = count("errored") + count("off-model")
+        orange = count("critical-stale")
+        yellow = count("stale") + count("never-run")
+        bad = red + orange + yellow
         ok = _num(r'ok: (\d+)', b, '?')
         add("Fleet (cron lanes)", "fleet-health",
-            "🔴" if bad else "🟢", f"{ok} ok, {bad} need attention")
+            "🔴" if red else ("🟠" if orange else ("🟡" if yellow else "🟢")),
+            f"{ok} ok, {bad} need attention")
     g = dashes.get("source-grounding")
     if g:
         pct = _num(r"grounded: \*\*\d+\*\* \((\d+)%\)", g["body"], "?")
@@ -112,7 +118,8 @@ def main() -> int:
     stale = [(n, d) for n, d in dashes.items() if d["age"] is not None and d["age"] > STALE_H]
 
     worst = "🔴" if any(s == "🔴" for s, *_ in rollup) else \
-            ("🟡" if (any(s == "🟡" for s, *_ in rollup) or stale) else "🟢")
+            ("🟠" if any(s == "🟠" for s, *_ in rollup) else
+             ("🟡" if (any(s == "🟡" for s, *_ in rollup) or stale) else "🟢"))
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     L = ["---", "type: dashboard", 'title: "Operator — engine & vault health"', f"updated: {now}",
          "rail_top: true", "---", "",

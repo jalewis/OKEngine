@@ -152,6 +152,11 @@ def apply_decisions(root: Path, decisions: dict) -> None:
     merged = renamed = skipped = 0
     log_lines = []
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    def _list_value(value):
+        if value is None:
+            return []
+        return value if isinstance(value, list) else [value]
+
     def _merge(a_key, b_key, dest_key):
         """Fold a+b into the canonical seat: longer body wins; frontmatter from the page
         already at dest (else the longer one); sources/tags unioned; merged_from provenance."""
@@ -161,10 +166,10 @@ def apply_decisions(root: Path, decisions: dict) -> None:
         keep_body = body_a if a_longer else body_b
         fm = dict(fm_b if b_key == dest_key or not a_longer else fm_a)
         for k in ("sources", "tags"):
-            u = list(dict.fromkeys((fm_b.get(k) or []) + (fm_a.get(k) or [])))
+            u = list(dict.fromkeys(_list_value(fm_b.get(k)) + _list_value(fm_a.get(k))))
             if u:
                 fm[k] = u
-        fm["merged_from"] = list(dict.fromkeys((fm.get("merged_from") or [])
+        fm["merged_from"] = list(dict.fromkeys(_list_value(fm.get("merged_from"))
                                                + [k for k in (a_key, b_key) if k != dest_key]))
         fm["updated"] = today
         (root / "wiki" / (dest_key + ".md")).parent.mkdir(parents=True, exist_ok=True)

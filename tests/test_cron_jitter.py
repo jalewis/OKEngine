@@ -25,6 +25,11 @@ def test_expand_one_bases():
     assert m.expand_one("@jitter:daily", 59) == "59 13 * * *"
     assert m.expand_one("@jitter:weekly", 5) == "5 13 * * 1"
     assert m.expand_one("@jitter:6h", 61) == "1 */6 * * *"  # minute wraps mod 60
+    assert m.expand_one("@jitter:daily@6", 17) == "17 6 * * *"
+    assert m.expand_one("@jitter:weekly@14,5", 23) == "23 14 * * 5"
+    assert m.expand_one("@jitter:daily@24", 17) is None
+    assert m.expand_one("@jitter:2h@6", 17) is None
+    assert m.expand_one("@jitter:daily@3,1", 17) is None
 
 
 def test_non_sentinel_is_left_alone():
@@ -95,6 +100,11 @@ def test_expand_file_roundtrip(tmp_path):
 def test_expand_file_missing_is_noop(tmp_path):
     m = _load()
     assert m.expand_file(tmp_path / "nope.json") == 0
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text("{bad")
+    assert m.expand_file(malformed) == 0
+    malformed.write_text("{}")
+    assert m.expand_file(malformed) == 0
 
 
 def test_unsupported_jitter_base_fails_loud():  # invariant-audit #14
@@ -105,6 +115,24 @@ def test_unsupported_jitter_base_fails_loud():  # invariant-audit #14
     for bad in ("@jitter:3h", "@jitter:8h", "@jitter:30m"):
         with pytest.raises(ValueError, match="unsupported @jitter base"):
             m.expand_jobs([{"schedule": {"expr": bad}}])
+
+
+def test_semantically_invalid_jitter_suffix_fails_without_nulling_schedule(tmp_path):
+    import pytest
+    m = _load()
+    bad_values = ("@jitter:2h@6", "@jitter:daily@3,1", "@jitter:weekly@24,1")
+    for bad in bad_values:
+        jobs = [{"schedule": {"expr": bad}}]
+        with pytest.raises(ValueError, match="invalid @jitter suffix"):
+            m.expand_jobs(jobs, random.Random(1))
+        assert jobs[0]["schedule"]["expr"] == bad
+
+    path = tmp_path / "domain-crons.json"
+    path.write_text(json.dumps([{"schedule": {"expr": bad_values[0]}}]))
+    before = path.read_text()
+    with pytest.raises(ValueError, match="invalid @jitter suffix"):
+        m.expand_file(path, random.Random(1))
+    assert path.read_text() == before
 
 
 def test_supported_jitter_bases_still_expand():
@@ -166,6 +194,9 @@ def test_expand_jobs_handles_all_three_schedule_shapes():
     assert jobs[1]["schedule"] == "0 13 * * SUN"                 # concrete string preserved (shape kept)
     assert jobs[2]["schedule"].endswith("13 * * *") and not m.is_sentinel(jobs[2]["schedule"])
     assert jobs[3]["expr"].endswith("*/6 * * *") and not m.is_sentinel(jobs[3]["expr"])
+    empty = {}
+    m._set_job_expr(empty, "5 * * * *")
+    assert empty["schedule"] == {"expr": "5 * * * *"}
 
 
 def test_expand_brief_jobs_handles_all_three_schedule_shapes():

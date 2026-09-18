@@ -84,3 +84,20 @@ def test_baseline_commit_refuses_non_pending_candidate(tmp_path, monkeypatch):
     assert result == 1
     state = json.loads(m.STATE_PATH.read_text())
     assert state["last_baseline_mtime"] == 0.0
+
+
+def test_corrupt_state_missing_and_empty_wiki_and_large_sample(tmp_path, monkeypatch):
+    m = _load(tmp_path, monkeypatch)
+    m.STATE_PATH.parent.mkdir(parents=True)
+    m.STATE_PATH.write_text("{broken")
+    assert m.load_state() == {"last_baseline_mtime": 0.0}
+    result, output = _run(m)
+    assert result == 0 and "does not exist" in output
+
+    wiki = tmp_path / "wiki"; wiki.mkdir()
+    result, output = _run(m)
+    assert result == 0 and "no markdown pages yet" in output
+    for index in range(27):
+        (wiki / f"page-{index}.md").write_text("# page\n")
+    result, output = _run(m)
+    assert result == 0 and "and 2 more" in output

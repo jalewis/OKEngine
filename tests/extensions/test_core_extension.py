@@ -114,7 +114,7 @@ def test_manifest_core_must_be_bool():
     base = {"id": "okengine.x", "kind": "operation", "version": "0.1.0", "trust": "in-gateway",
             "requires": {"engine": ">=0.4.0"},
             "capabilities": {"read": ["wiki/**"], "write": ["x/**"]},
-            "operation": {"schedule": {"kind": "cron", "expr": "0 4 * * *"}, "entrypoint": "r.py"}}
+            "operation": {"schedule": {"kind": "cron", "expr": "@jitter:daily@4"}, "entrypoint": "r.py"}}
     ok, _ = mod.validate_manifest({**base, "core": True})
     assert not ok, ok
     bad, _ = mod.validate_manifest({**base, "core": "yes"})

@@ -10,6 +10,7 @@ unreachable cockpit is a FAILURE, never a skip: the DOM layer is the whole reaso
 so a release must not report green with it silently omitted (issue okengine#204, gap 1).
 """
 import os
+from pathlib import Path
 
 import pytest
 
@@ -23,7 +24,15 @@ else:
 from playwright.sync_api import sync_playwright  # noqa: E402
 
 COCKPIT = os.environ.get("SMOKE_COCKPIT_URL", "http://127.0.0.1:9881")
-_LAUNCH = {"channel": "chrome", "args": ["--no-sandbox", "--disable-gpu"]}
+_ARTIFACTS = Path(os.environ.get("SMOKE_ARTIFACT_DIR", "artifacts/e2e-release"))
+_BROWSER = os.environ.get("SMOKE_BROWSER_EXECUTABLE", "").strip()
+_LAUNCH = {"args": ["--no-sandbox", "--disable-gpu"]}
+if _BROWSER:
+    _LAUNCH["executable_path"] = _BROWSER
+else:
+    _LAUNCH["channel"] = "chrome"
+
+pytestmark = pytest.mark.e2e
 
 
 def _unavailable(reason: str):
@@ -35,18 +44,30 @@ def _unavailable(reason: str):
 
 @pytest.fixture(scope="module")
 def page():
+    pw = None
+    browser = None
     try:
         pw = sync_playwright().start()
         browser = pw.chromium.launch(**_LAUNCH)
     except Exception as e:  # chrome missing / launch failure
+        if browser is not None:
+            browser.close()
+        if pw is not None:
+            pw.stop()
         _unavailable(f"cannot launch system chrome via playwright ({e})")
-    pg = browser.new_page()
+    _ARTIFACTS.mkdir(parents=True, exist_ok=True)
+    context = browser.new_context()
+    context.tracing.start(screenshots=True, snapshots=True, sources=True)
+    pg = context.new_page()
     try:
         pg.goto(COCKPIT + "/", wait_until="networkidle", timeout=15000)
     except Exception as e:
         browser.close(); pw.stop()
         _unavailable(f"smoke cockpit not reachable at {COCKPIT} ({e}) — run smoke-e2e.sh")
     yield pg
+    pg.screenshot(path=str(_ARTIFACTS / "cockpit-final.png"), full_page=True)
+    context.tracing.stop(path=str(_ARTIFACTS / "playwright-trace.zip"))
+    context.close()
     browser.close()
     pw.stop()
 
@@ -98,6 +119,9 @@ def test_no_raw_markup_visible_on_actor_page(page):
 
 
 def _open_tid(page):
+    # Tests share one production browser context. The responsive-layout case narrows the viewport;
+    # reset it before the next workflow so the desktop tab control remains actionable.
+    page.set_viewport_size({"width": 1280, "height": 900})
     page.locator('#tabs button[data-tab="tid"]').click()
     page.wait_for_selector(".tid-trace-record", timeout=10000)
 

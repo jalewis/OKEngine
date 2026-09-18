@@ -4,7 +4,8 @@ The pack config defines a tab as DATASET BOXES (dataset + view); the engine rend
 Views: table (sort/require/limit, tones, defang, list-max), bars (group_by with value
 LABELS for opaque codes, or label/value fields), chips, bignums (count/top, per-item
 dataset override), cards (direction glyph + status + series mini-bars), coverage (join:
-list_field vs a versus-dataset key, grouped), doc (latest dated file rendered inline).
+list_field vs a versus-dataset key, grouped), doc (latest dated file rendered inline),
+doc-summary (named section or bounded fallback excerpt, linked to the full document).
 Empty dataset + `empty:` note → the note renders (pipeline state is information);
 empty without a note → the box is omitted."""
 import importlib.util
@@ -181,7 +182,8 @@ def test_drilldown_targets_and_filtered_pages(vault):
     assert 'data-dval="622110"' in by["Sectors"]["html"]
     assert 'data-drill data-dtab="threats" data-dbox="0"' in by["Pulse"]["html"]
     assert 'data-ditem="0"' in by["Pulse"]["html"]
-    # tables/cards are not aggregate drill targets; coverage is.
+    # tables/cards carry no PER-ROW drill target (there is no bucket to filter on); coverage does.
+    # Their whole-list drill hangs off the meta line instead — see meta_drill tests below.
     assert "data-drill" not in by["Most active"]["html"]
     assert 'data-drill data-dtab="threats" data-dbox="4"' in by["Coverage"]["html"]
     assert 'data-dval="stealth"' in by["Coverage"]["html"]
@@ -204,9 +206,14 @@ def test_drilldown_targets_and_filtered_pages(vault):
     assert {p["path"] for p in coverage["pages"]} == {
         "techniques/t1000", "techniques/t2000"}
 
+    # okengine#564: a table IS drillable now — its full row set in the box's own sort order. It
+    # takes no bucket, so `value` is ignored rather than rejected.
+    t = vault.api_drill("threats", 1, value="ignored")
+    assert t["count"] == 1 and {p["path"] for p in t["pages"]} == {"entities/a/apt-a"}
+    assert t["truncated"] is False
     from fastapi import HTTPException
     with pytest.raises(HTTPException):
-        vault.api_drill("threats", 1, value="x")           # box 1 is a table -> not drillable
+        vault.api_drill("threats", 99, value="x")          # no such box
 
 
 def test_value_field_bar_opens_its_page(tmp_path, monkeypatch):
@@ -377,6 +384,8 @@ def test_assessment_backed_rollup_separates_epistemic_states_and_drills_both_rec
             f"type: actor\ntitle: {slug.title()}\norigin_country: {canonical}\n")
     _mk(tmp_path, "entities/r/retired.md",
         "type: actor\ntitle: Retired duplicate\nstatus: tombstoned\nredirect_to: entities/a/alpha\n")
+    _mk(tmp_path, "entities/r/redirect.md",
+        "type: actor\ntitle: Redirect alias\nredirect_to: entities/a/alpha\n")
     _mk(tmp_path, "assessments/a/alpha-old.md",
         "type: assessment\ntitle: Alpha old\nassessment_kind: actor-country-linkage\n"
         "subject: entities/a/alpha\nstatus: active\nepistemic_status: assessed\n"
@@ -400,18 +409,45 @@ def test_assessment_backed_rollup_separates_epistemic_states_and_drills_both_rec
     assert "China ◇ 60% avg ⚠1" in html
     assert "Disputed" in html and "Review not run" in html
     assert "Retired duplicate" not in html
+    assert "Redirect alias" not in html
     assert "Russia ◇" not in html  # no canonical fallback and newest record wins
+
     assert "Assessment-backed rollup" in html
     assert 'data-page="assessments/_about"' in html
     assert 'data-dval="IR"' in html and 'data-dpage="IR"' not in html
 
     iran = m.api_drill("t", 0, value="IR")
     assert iran["count"] == 1
+    assert iran["count_label"] == "1 actor"
+    assert [(section["title"], section["count"]) for section in iran["sections"]] == [
+        ("Actors", 1), ("Supporting assessments", 1)]
+    assert [page["path"] for page in iran["sections"][0]["pages"]] == ["entities/a/alpha"]
+    assert [page["path"] for page in iran["sections"][1]["pages"]] == [
+        "assessments/a/alpha-current"]
     assert {page["path"] for page in iran["pages"]} == {
         "entities/a/alpha", "assessments/a/alpha-current"}
     unassessed = m.api_drill("t", 0, value="__review_not_run__")
     assert unassessed["count"] == 1
+    assert unassessed["count_label"] == "1 actor" and "sections" not in unassessed
     assert [page["path"] for page in unassessed["pages"]] == ["entities/d/delta"]
+
+
+def test_table_dataset_excludes_tombstoned_actor(tmp_path, monkeypatch):
+    (tmp_path / "schema.yaml").write_text(
+        "cockpit:\n  tabs: [t]\n  tab_defs:\n    t:\n      label: T\n      boxes:\n"
+        "        - title: Actors\n          view: table\n"
+        "          dataset: {dir: entities, type: actor}\n"
+        "          columns: [{field: title, label: Actor}]\n",
+        encoding="utf-8",
+    )
+    _mk(tmp_path, "entities/l/live.md", "type: actor\ntitle: Live Actor\n")
+    _mk(tmp_path, "entities/u/unsafe.md",
+        "type: actor\ntitle: Unsafe\nstatus: tombstoned\n")
+
+    html = _load(tmp_path, monkeypatch).api_tab("t")["boxes"][0]["html"]
+
+    assert "Live Actor" in html
+    assert "Unsafe" not in html
 
 
 def test_assessed_origin_uses_bounded_terminal_states_when_no_record_exists(tmp_path, monkeypatch):
@@ -445,6 +481,78 @@ def test_assessed_origin_uses_bounded_terminal_states_when_no_record_exists(tmp_
     assert 'data-page="dashboards/actor-review-status"' in html
 
 
+def _terminal_vault(tmp_path, monkeypatch, subjects, pages=("entities/q/qilin.md",)):
+    (tmp_path / "schema.yaml").write_text(
+        "cockpit:\n  tabs: [t]\n  tab_defs:\n    t:\n      label: T\n      boxes:\n"
+        "        - title: Actors\n          view: table\n"
+        "          dataset: {dir: entities, type: actor}\n          columns:\n"
+        "            - {field: title, label: Actor}\n"
+        "            - label: Assessed origin\n              assessment:\n"
+        "                kind: actor-country-linkage\n                value_field: assessed_value\n",
+        encoding="utf-8")
+    for page in pages:
+        _mk(tmp_path, page, "type: actor\ntitle: Qilin\n")
+    state = tmp_path / ".okengine/actor-country-review-coverage.json"
+    state.parent.mkdir(exist_ok=True)
+    state.write_text(json.dumps({"subjects": subjects}), encoding="utf-8")
+    return _load(tmp_path, monkeypatch)
+
+
+def test_a_reshard_between_the_lane_and_the_view_does_not_orphan_the_terminal_state(
+        tmp_path, monkeypatch):
+    """The projection stores the subject path AS IT WAS when the lane ran.
+
+    A reshard moves the page afterwards -- `entities/q/i/qilin` collapsed to `entities/q/qilin` on
+    the live vault -- and a raw-path lookup then misses, so a measured bounded no-finding silently
+    reads as "Review not run": a verdict that WAS computed, presented as never computed. This is the
+    same orphaning `_subject_key` already fixes for assessment records; the sibling lookup was left
+    on the raw path.
+    """
+    m = _terminal_vault(tmp_path, monkeypatch, {
+        "entities/q/i/qilin": {"state": "collection-required",
+                               "reason": "declared source page is missing"}})
+    html = m.api_tab("t")["boxes"][0]["html"]
+    assert "Collection required" in html, "the state survives the page moving shard"
+    assert "Review not run" not in html
+
+
+def test_an_exact_path_match_still_wins(tmp_path, monkeypatch):
+    """The fallback must not change behaviour when the projection is current."""
+    m = _terminal_vault(tmp_path, monkeypatch, {
+        "entities/q/qilin": {"state": "collection-required", "reason": "exact"},
+        "entities/q/x/qilin": {"state": "no-association-established", "reason": "stale shard"}})
+    html = m.api_tab("t")["boxes"][0]["html"]
+    assert "Collection required" in html and "exact" in html
+    assert "No association established" not in html
+
+
+def test_two_shards_disagreeing_about_one_slug_refuse_to_pick_a_winner(tmp_path, monkeypatch):
+    """A slug at two paths in one namespace is a partition duplicate `check_partition_dups()` owns
+    as a FAIL. Resolving it by picking one would publish one of two contradictory verdicts as fact,
+    and the reader could not tell it had been guessed. Falling through to "Review not run" is the
+    honest answer -- the duplicate is a corpus fault, not a display decision."""
+    m = _terminal_vault(tmp_path, monkeypatch, {
+        "entities/q/i/qilin": {"state": "collection-required", "reason": "one"},
+        "entities/q/x/qilin": {"state": "no-association-established", "reason": "two"}})
+    html = m.api_tab("t")["boxes"][0]["html"]
+    assert "Review not run" in html
+    assert "Collection required" not in html and "No association established" not in html
+
+
+def test_two_shards_that_agree_are_not_ambiguous(tmp_path, monkeypatch):
+    record = {"state": "collection-required", "reason": "same verdict twice"}
+    m = _terminal_vault(tmp_path, monkeypatch, {
+        "entities/q/i/qilin": dict(record), "entities/q/x/qilin": dict(record)})
+    assert "Collection required" in m.api_tab("t")["boxes"][0]["html"]
+
+
+def test_a_malformed_projection_entry_is_skipped_not_crashed(tmp_path, monkeypatch):
+    m = _terminal_vault(tmp_path, monkeypatch, {
+        "entities/q/i/qilin": ["not", "a", "record"],
+        "entities/z/z/other": {"state": "collection-required", "reason": "unrelated"}})
+    assert "Review not run" in m.api_tab("t")["boxes"][0]["html"]
+
+
 def test_plain_columns_do_not_receive_assessment_legend(vault):
     assert "Assessed judgment" not in vault.api_tab("threats")["boxes"][1]["html"]
 
@@ -465,6 +573,25 @@ def test_doc_summary_named_section_default_excerpt_and_full_link(tmp_path, monke
     assert "Alpha" in by["Daily"]["html"] and "Beta" not in by["Daily"]["html"]
     assert "One" in by["Weekly"]["html"] and "Two" not in by["Weekly"]["html"]
     assert 'data-page="briefings/daily-2026-07-16"' in by["Daily"]["html"]
+    # `section` selects markdown content; it is not a layout group. Leaking it into the
+    # response used to insert a full-width heading between two span-6 brief cards.
+    assert "section" not in by["Weekly"]
+
+
+def test_dataset_box_layout_section_is_explicit(tmp_path, monkeypatch):
+    (tmp_path / "schema.yaml").write_text(
+        "cockpit:\n  tabs: [t]\n  tab_defs:\n    t:\n      label: T\n      boxes:\n"
+        "        - title: Grouped\n"
+        "          view: table\n"
+        "          dataset: {dir: entities}\n"
+        "          layout_section: Attention\n"
+        "          columns: [{field: title, label: Actor}]\n",
+        encoding="utf-8")
+    _mk(tmp_path, "entities/alpha.md", "type: actor\n")
+    m = _load(tmp_path, monkeypatch)
+    box = m.api_tab("t")["boxes"][0]
+    assert box["layout_section"] == "Attention"
+    assert "section" not in box
 
 
 def test_doc_view_links_the_original_article(tmp_path, monkeypatch):
@@ -497,6 +624,64 @@ def test_doc_view_links_the_original_article(tmp_path, monkeypatch):
     assert "Local-only note" in html
     assert 'data-page="sources/2026/07/no-url"' in html
     assert html.count("https://securelist.example") == 1
+
+
+def test_doc_summary_extracts_named_section_and_links_full_page(tmp_path, monkeypatch):
+    (tmp_path / "schema.yaml").write_text(
+        "cockpit:\n  tabs: [t]\n  tab_defs:\n    t:\n      label: T\n      boxes:\n"
+        "        - {title: Weekly, view: doc-summary, section: 'Themes at a glance', "
+        "dir: briefings, glob: 'weekly-*'}\n", encoding="utf-8")
+    p = tmp_path / "wiki" / "briefings" / "weekly-2026-07-14.md"
+    p.parent.mkdir(parents=True)
+    p.write_text("---\ntype: briefing\ntitle: Weekly Brief\n---\n# Weekly Brief\n\n"
+                 "## Themes at a glance\n\n- Rising: AI.\n- Flat: ransomware.\n\n"
+                 "## News Pulse\n\n" + ("Long detail. " * 200), encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    html = m.api_tab("t")["boxes"][0]["html"]
+    assert "Rising: AI" in html and "Flat: ransomware" in html
+    assert "Long detail" not in html
+    assert 'data-page="briefings/weekly-2026-07-14"' in html
+    assert "Read full brief: Weekly Brief" in html
+
+
+def test_doc_summary_uses_first_available_ordered_section(tmp_path, monkeypatch):
+    (tmp_path / "schema.yaml").write_text(
+        "cockpit:\n  tabs: [t]\n  tab_defs:\n    t:\n      label: T\n      boxes:\n"
+        "        - {title: Weekly, view: doc-summary, "
+        "section: ['Themes at a glance', 'Executive summary'], "
+        "dir: briefings, glob: 'weekly-*'}\n", encoding="utf-8")
+    p = tmp_path / "wiki" / "briefings" / "weekly-2026-08-03.md"
+    p.parent.mkdir(parents=True)
+    p.write_text("---\ntype: briefing\ntitle: Weekly Brief\n---\n"
+                 "## Executive summary\n\nCurrent-format summary.\n\n"
+                 "## Cross-signal findings\n\nLong detail.\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    html = m.api_tab("t")["boxes"][0]["html"]
+    assert "Current-format summary" in html
+    assert "Long detail" not in html
+    assert "Summary section unavailable" not in html
+
+
+def test_doc_summary_section_stops_at_thematic_break(tmp_path, monkeypatch):
+    (tmp_path / "wiki").mkdir()
+    m = _load(tmp_path, monkeypatch)
+    body = "## Summary\n\nOne paragraph.\n\n---\n\n### Detail\nShould not render."
+    assert m._markdown_section(body, "Summary") == "One paragraph."
+
+
+def test_doc_summary_fallback_is_bounded_and_explicit(tmp_path, monkeypatch):
+    (tmp_path / "schema.yaml").write_text(
+        "cockpit:\n  tabs: [t]\n  tab_defs:\n    t:\n      label: T\n      boxes:\n"
+        "        - {title: Daily, view: doc-summary, section: Summary, max_chars: 240, "
+        "dir: briefings, glob: 'daily-*'}\n", encoding="utf-8")
+    p = tmp_path / "wiki" / "briefings" / "daily-2026-07-15.md"
+    p.parent.mkdir(parents=True)
+    p.write_text("---\ntype: briefing\ntitle: Daily\n---\n# Daily\n\n" + ("Detail sentence. " * 100),
+                 encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    html = m.api_tab("t")["boxes"][0]["html"]
+    assert "Summary section unavailable" in html and "Read full brief" in html
+    assert len(html) < 1200
 
 
 def test_bars_flags_unmapped_group_values(tmp_path, monkeypatch):
@@ -553,6 +738,72 @@ def test_unmapped_values_are_demoted_below_mapped(tmp_path, monkeypatch):
     # with no labels map, plain most-common ordering is unchanged (cn-dup wins on count)
     top = m._ds_pairs({"group_by": "origin", "limit": 1}, rows)[0]
     assert top[0] == "cn-dup", top
+
+
+def test_group_aliases_merge_duplicate_display_buckets_and_drill_both(tmp_path, monkeypatch):
+    (tmp_path / "schema.yaml").write_text(
+        "cockpit:\n  tabs: [t]\n  tab_defs:\n    t:\n      label: T\n      boxes:\n"
+        "        - title: Origins\n          view: bars\n          dataset: {dir: entities}\n"
+        "          group_by: origin\n          aliases: {China: CN}\n          labels: {CN: China}\n",
+        encoding="utf-8")
+    _mk(tmp_path, "entities/a.md", "type: actor\norigin: CN\n")
+    _mk(tmp_path, "entities/b.md", "type: actor\norigin: China\n")
+    m = _load(tmp_path, monkeypatch)
+    html = m.api_tab("t")["boxes"][0]["html"]
+    assert html.count('class="bl"') == 1 and "China" in html and ">2<" in html
+    assert m.api_drill("t", 0, value="CN")["count"] == 2
+
+
+def test_numeric_table_column_marks_legacy_non_numeric_value(tmp_path, monkeypatch):
+    (tmp_path / "schema.yaml").write_text(
+        "cockpit:\n  tabs: [t]\n  tab_defs:\n    t:\n      label: T\n      boxes:\n"
+        "        - title: P\n          view: table\n          dataset: {dir: predictions}\n"
+        "          columns: [{field: confidence, label: Confidence, numeric: true}]\n",
+        encoding="utf-8")
+    _mk(tmp_path, "predictions/a.md", "type: prediction\nconfidence: 0.7\n")
+    _mk(tmp_path, "predictions/b.md", "type: prediction\nconfidence: medium-high\n")
+    m = _load(tmp_path, monkeypatch)
+    html = m.api_tab("t")["boxes"][0]["html"]
+    assert "0.7" in html and "⚠ medium-high" in html and "invalid-value" in html
+
+
+def test_table_column_value_labels_and_semantic_meta(tmp_path, monkeypatch):
+    (tmp_path / "schema.yaml").write_text(
+        "cockpit:\n  tabs: [t]\n  tab_defs:\n    t:\n      label: T\n      boxes:\n"
+        "        - title: Recent\n          view: table\n          limit: 1\n"
+        "          dataset: {dir: events}\n"
+        "          sort: {field: state, desc: false}\n"
+        "          columns: [{field: state, label: State, labels: {new: Newly observed}}]\n"
+        "        - title: Origins\n          view: bars\n          limit: 1\n"
+        "          dataset: {dir: events}\n          group_by: origin\n"
+        "          meta_template: 'Top {groups} origins across {total} observations'\n",
+        encoding="utf-8")
+    _mk(tmp_path, "events/a.md", "state: new\norigin: CN\n")
+    _mk(tmp_path, "events/b.md", "state: old\norigin: US\n")
+    m = _load(tmp_path, monkeypatch)
+    by = {b["title"]: b for b in m.api_tab("t")["boxes"]}
+    assert "Newly observed" in by["Recent"]["html"]
+    assert by["Recent"]["meta"] == "showing 1 of 2 records"
+    assert by["Origins"]["meta"] == "Top 1 origins across 2 observations"
+
+
+def test_partial_period_cards_suppress_misleading_direction(vault):
+    rows = vault._ds_rows({"dir": "trends", "has": ["report_theme"]})
+    html = vault._v_cards({"comparison": "partial-period"}, rows)
+    assert "partial period" in html and "▲ rising" not in html
+    assert 'title="comparison: partial-period"' in html
+
+
+def test_ytd_and_full_period_cards_expose_their_analytical_clock(vault):
+    rows = vault._ds_rows({"dir": "trends", "has": ["report_theme"]})
+    rows[0].update({"comparison": "ytd", "comparison_as_of": "07-15",
+                    "count_ytd_by_year": {"2025": 2, "2026": 3}})
+    html = vault._v_cards({}, rows)
+    assert "YTD through 07-15" in html and 'title="comparison: ytd"' in html
+    assert "2025: 2" in html and "2026: 3" in html
+    rows[0].pop("comparison")
+    html = vault._v_cards({"comparison": "full-period"}, rows)
+    assert "full-period comparison" in html and "▲ rising" in html
 
 
 def test_page_links_carry_the_sharded_path(tmp_path, monkeypatch):
@@ -642,3 +893,29 @@ def test_bucket_unmapped_collapses_drift_and_drills_offenders(tmp_path, monkeypa
     vis = re.sub(r'data-dval="[^"]*"', '', sect["html"])
     assert "unmapped (2)" in vis and "923120" not in vis and "'92'" not in vis
     assert "unmapped" not in sect                            # not double-surfaced on the card
+
+
+def test_a_supporting_assessment_always_states_at_least_its_status(tmp_path, monkeypatch):
+    """A supporting record is shown to explain WHY the subject sits in that bucket, so it has to say
+    something. This is also the invariant that keeps the empty-facts case out of reach: the record
+    is selected by its `status`, so a selected record always has one to state."""
+    (tmp_path / "schema.yaml").write_text(
+        "cockpit:\n  tabs: [t]\n  tab_defs:\n    t:\n      label: T\n      boxes:\n"
+        "        - title: Top assessed origins\n          view: bars\n"
+        "          dataset: {dir: entities, type: actor}\n          limit: 6\n"
+        "          assessment:\n            kind: actor-country-linkage\n"
+        "            value_field: assessed_value\n"
+        "            labels: {CN: China}\n",
+        encoding="utf-8")
+    _mk(tmp_path, "entities/b/beta.md", "type: actor\ntitle: Beta\n")
+    # everything optional omitted: no epistemic_status, no confidence_band, no as_of
+    _mk(tmp_path, "assessments/b/bare.md",
+        "type: assessment\ntitle: Bare\nassessment_kind: actor-country-linkage\n"
+        "subject: entities/b/beta\nstatus: active\nassessed_value: CN\n"
+        "last_updated: 2026-07-17T12:00:00Z\n")
+    m = _load(tmp_path, monkeypatch)
+    drill = m.api_drill("t", 0, value="CN")
+    supporting = next(p for p in drill["pages"] if p["path"] == "assessments/b/bare")
+    assert supporting["type"] == "assessment"
+    assert supporting["facts"] == [{"label": "Status", "value": "active"},
+                                   {"label": "Evidence state", "value": "assessed"}], supporting

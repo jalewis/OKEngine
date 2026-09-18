@@ -5,10 +5,13 @@ completion. The selector writes a runner-owned JSON manifest containing `selecte
 optional `input_digest`; the generated job names it with `selection_manifest`. The agent must end its
 response with one fenced `okengine-receipt` JSON object.
 
-Each selected key must occur exactly once with `accepted`, `duplicate`, `skipped`, `rejected`,
-`failed`, or `deferred`. Accepted records carry written paths and SHA-256 hashes, which the runner
-reads back. Duplicate and skipped records require a verifiable reason. Lane ID, contract digest, and
-input digest must match runner-owned values. Rejected, failed, and deferred keys form the retry set.
+Each selected key must occur exactly once with `accepted`, `merged`, `updated`,
+`rejected-out-of-scope`, `insufficient-evidence`, `duplicate`, `deferred-for-review`, or `failed`.
+Accepted, merged, and updated records carry written paths and SHA-256 hashes, which the runner reads
+back. Every non-write record requires a verifiable reason. Lane ID, contract digest, and input digest
+must match runner-owned values. Insufficient-evidence, failed, and deferred-for-review keys form the
+retry set. Legacy skipped/rejected/deferred receipts remain readable during migration and normalize
+to the canonical vocabulary; new prompts and producers must use canonical values.
 
 The canonical fence remains preferred. If a model adds prose or uses a `json`/unlabelled fence, the
 runner may recover the receipt only when exactly one JSON object matches the runner-owned lane ID,
@@ -26,3 +29,11 @@ receipt fail the run. Deterministic `no_agent` jobs retain ordinary process comp
 
 Receipts live under `cron-plus/receipts/<lane-id>/`; fleet status aggregates selected, accepted,
 rejected, deferred, and undisposed counts.
+
+For a whole-run writer (`completion: run`), transport completion is likewise insufficient. The
+runner requires at least one execution-time write record and reads every reported target back from
+the mounted wiki before marking the job successful. A lane that must publish one predictable
+artifact may declare `required_write_path`, using `{date}` for the UTC run date (for example,
+`briefings/daily-{date}.md`). Iteration exhaustion, fallback prose, and a stale prior-day artifact
+therefore fail closed. These lanes must set `max_iterations` to at least 6 so ordinary
+read/synthesize/write work retains a bounded write and recovery budget.

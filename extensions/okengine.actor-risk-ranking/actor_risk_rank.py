@@ -256,9 +256,6 @@ def score_actor(actor: str, folded: list, target: dict, edges: dict, pages: dict
         band = "elevated"
         if score >= 65 and not unknowns:
             band = "high"
-    if len(domains) < min_dom and band in ("elevated", "high"):
-        band = "moderate"   # syndication gate (belt and braces)
-
     return {"actor": actor, "folded": folded, "score": score, "band": band,
             "drivers": drivers, "parts": parts, "domains": sorted(domains),
             "unknowns": unknowns}

@@ -45,10 +45,12 @@ def test_cockpit_lifespan_starts_cache_workers(monkeypatch, tmp_path):
     module = _load("cockpit_lifespan_app", REPO / "okengine-cockpit")
     calls = []
     monkeypatch.setattr(module, "_warm_initial_tab_datasets", lambda: calls.append("landing-tab"))
+    monkeypatch.setattr(
+        module, "_schedule_remaining_tab_warmup", lambda: calls.append("post-ready-tabs"))
     monkeypatch.setattr(module.threading, "Thread", lambda **_kwargs: (_ for _ in ()).throw(
-        AssertionError("lifespan must not start whole-vault background scans")))
+        AssertionError("lifespan must delegate background scans to the paced scheduler")))
     _enter_lifespan(module)
-    assert calls == ["landing-tab"]
+    assert calls == ["landing-tab", "post-ready-tabs"]
 
 
 def test_supported_apps_declare_no_deprecated_event_hooks():

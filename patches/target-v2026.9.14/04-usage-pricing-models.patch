@@ -1,0 +1,251 @@
+diff --git a/agent/insights.py b/agent/insights.py
+index 568dee0e4..b590217d6 100644
+--- a/agent/insights.py
++++ b/agent/insights.py
+@@ -9,8 +9,9 @@ from datetime import datetime
+ from decimal import Decimal
+ from typing import Any, Dict, List, Optional
+ 
+-from agent.usage_pricing import CanonicalUsage, estimate_usage_cost, format_cost_label, format_duration_compact, has_known_pricing
++from agent.usage_pricing import CanonicalUsage, estimate_usage_cost, format_cost_label, format_duration_compact, has_known_pricing, resolve_billing_route
+ from hermes_cli.timefmt import coerce_epoch
++from utils import base_url_host_matches
+ 
+ _TOKEN_KEYS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+ _SKILL_TOOLS = {"skill_view", "skill_manage"}
+@@ -33,9 +34,27 @@ def _estimate_cost(session_or_model: Dict[str, Any] | str, input_tokens: int = 0
+         model = s.get("model") or ""
+         usage = CanonicalUsage(**{k: s.get(k) or 0 for k in _TOKEN_KEYS})
+         provider, base_url = s.get("billing_provider"), s.get("billing_base_url")
++        stored_cost, stored_status = s.get("estimated_cost_usd"), s.get("cost_status")
+     else:
+         model = session_or_model or ""
+         usage = CanonicalUsage(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
++        stored_cost = stored_status = None
++    route = resolve_billing_route(model, provider=provider, base_url=base_url)
++    if (
++        route.provider == "deepseek"
++        and (not route.base_url or base_url_host_matches(route.base_url, "api.deepseek.com"))
++    ):
++        # Only direct DeepSeek has a time-of-use multiplier. A durable response-
++        # time estimate preserves its original window; other providers retain
++        # their existing Insights recomputation contract.
++        if stored_cost is not None and stored_status:
++            return float(stored_cost), str(stored_status)
++        if not usage.total_tokens:
++            return 0.0, "estimated"
++        # Old aggregate-only rows have no per-response UTC billing timestamps.
++        # Unknown is honest; neither current off-peak nor flat peak is the
++        # historical invoice. The caller exposes this in unknown-cost counts.
++        return 0.0, "unknown"
+     result = estimate_usage_cost(model, usage, provider=provider, base_url=base_url)
+     return float(result.amount_usd or 0.0), result.status
+ 
+diff --git a/agent/usage_pricing.py b/agent/usage_pricing.py
+index 172374bf6..a5960ab9c 100644
+--- a/agent/usage_pricing.py
++++ b/agent/usage_pricing.py
+@@ -449,7 +449,15 @@ def get_pricing_entry(
+     if route.provider == "openrouter":
+         return _openrouter_pricing_entry(route)
+ 
+-    bundled_entry = _lookup_official_docs_pricing(route)
++    # A custom DeepSeek-labelled endpoint is not necessarily billed by DeepSeek.
++    # Only the native API host (or the provider's implicit default URL) may use
++    # the official direct-provider snapshot; other hosts must supply /models
++    # pricing or remain unknown rather than inherit a fabricated vendor bill.
++    native_deepseek = (
++        route.provider != "deepseek" or not route.base_url
++        or base_url_host_matches(route.base_url, "api.deepseek.com")
++    )
++    bundled_entry = _lookup_official_docs_pricing(route) if native_deepseek else None
+     if bundled_entry:
+         return bundled_entry
+     if route.base_url:
+@@ -552,6 +560,7 @@ def _unknown_cost(source: CostSource, *notes: str) -> CostResult:
+ def estimate_usage_cost(
+     model_name: str, usage: CanonicalUsage, *, provider: Optional[str] = None,
+     base_url: Optional[str] = None, api_key: Optional[str] = None,
++    at_time: Optional[datetime] = None,
+ ) -> CostResult:
+     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+     if route.billing_mode == "subscription_included":
+@@ -587,6 +596,19 @@ def estimate_usage_cost(
+         amount += Decimal(usage.request_count) * entry.request_cost
+ 
+     notes: list[str] = []
++    if (
++        route.provider == "deepseek"
++        and entry.source == "official_docs_snapshot"
++        and entry.source_url == "https://api-docs.deepseek.com/quick_start/pricing"
++    ):
++        moment = at_time if at_time is not None else _UTC_NOW()
++        if not isinstance(moment, datetime) or moment.tzinfo is None or moment.utcoffset() is None:
++            raise ValueError("DeepSeek pricing at_time must be timezone-aware")
++        utc = moment.astimezone(timezone.utc)
++        peak = utc.weekday() < 5 and (1 <= utc.hour < 4 or 6 <= utc.hour < 10)
++        if peak:
++            amount *= 2
++        notes.append("DeepSeek direct-provider peak-hours rate" if peak else "DeepSeek direct-provider off-peak rate")
+     status: CostStatus = "estimated"
+     label = format_cost_label(amount)
+     if entry.source == "none" and amount == _ZERO:
+diff --git a/tests/agent/test_okengine_deepseek_pricing.py b/tests/agent/test_okengine_deepseek_pricing.py
+new file mode 100644
+index 000000000..d83e3ff18
+--- /dev/null
++++ b/tests/agent/test_okengine_deepseek_pricing.py
+@@ -0,0 +1,153 @@
++"""Direct DeepSeek estimates follow official peak/off-peak and route contracts."""
++
++from datetime import datetime, timedelta, timezone
++from decimal import Decimal
++from unittest.mock import patch
++
++import pytest
++
++from agent.usage_pricing import CanonicalUsage, estimate_usage_cost, get_pricing_entry
++from agent.insights import InsightsEngine, _estimate_cost
++from hermes_state import SessionDB
++
++
++USAGE = CanonicalUsage(
++    input_tokens=1_000_000, cache_read_tokens=1_000_000, output_tokens=1_000_000
++)
++
++
++@pytest.mark.parametrize(
++    ("moment", "pro", "flash"),
++    [
++        (datetime(2026, 9, 15, 0, tzinfo=timezone.utc), "2.662", "0.753"),
++        (datetime(2026, 9, 15, 1, tzinfo=timezone.utc), "5.324", "1.506"),
++        (datetime(2026, 9, 15, 3, 59, tzinfo=timezone.utc), "5.324", "1.506"),
++        (datetime(2026, 9, 15, 4, tzinfo=timezone.utc), "2.662", "0.753"),
++        (datetime(2026, 9, 15, 6, tzinfo=timezone.utc), "5.324", "1.506"),
++        (datetime(2026, 9, 15, 9, 59, tzinfo=timezone.utc), "5.324", "1.506"),
++        (datetime(2026, 9, 15, 10, tzinfo=timezone.utc), "2.662", "0.753"),
++        (datetime(2026, 9, 19, 2, tzinfo=timezone.utc), "2.662", "0.753"),
++        (
++            datetime(2026, 9, 15, 4, tzinfo=timezone(timedelta(hours=2))),
++            "5.324", "1.506",
++        ),
++    ],
++)
++def test_native_direct_model_price_tracks_published_utc_billing_window(moment, pro, flash):
++    for model, expected in (("deepseek-v4-pro", pro), ("deepseek-flash", flash)):
++        result = estimate_usage_cost(
++            model, USAGE, provider="deepseek", base_url="https://api.deepseek.com/v1",
++            at_time=moment,
++        )
++
++        assert result.amount_usd == Decimal(expected), (model, moment, result)
++        assert result.status == "estimated"
++        assert any("DeepSeek direct-provider" in note for note in result.notes)
++
++
++def test_implicit_native_route_uses_aware_current_time_when_not_supplied():
++    with patch(
++        "agent.usage_pricing._UTC_NOW", autospec=True,
++        return_value=datetime(2026, 9, 15, 2, tzinfo=timezone.utc),
++    ) as now:
++        result = estimate_usage_cost("deepseek-v4-pro", USAGE, provider="deepseek")
++
++    now.assert_called_once()
++    assert result.amount_usd == Decimal("5.324")
++
++
++@pytest.mark.parametrize("bad", ["2026-09-15T02:00:00Z", datetime(2026, 9, 15, 2)])
++def test_malformed_or_timezone_naive_billing_time_fails_closed(bad):
++    with pytest.raises(ValueError, match="timezone-aware"):
++        estimate_usage_cost("deepseek-v4-pro", USAGE, provider="deepseek", at_time=bad)
++
++
++def test_deepseek_label_on_non_native_endpoint_does_not_get_vendor_snapshot():
++    with patch(
++        "agent.usage_pricing.fetch_endpoint_model_metadata", autospec=True, return_value={}
++    ) as metadata:
++        entry = get_pricing_entry(
++            "deepseek-v4-pro", provider="deepseek",
++            base_url="https://api.deepseek.com.evil.example/v1",
++        )
++
++    assert entry is None, "a lookalike host must not inherit native DeepSeek billing"
++    metadata.assert_called_once()
++
++
++def test_fireworks_rate_is_not_multiplied_by_native_deepseek_peak_window():
++    peak = datetime(2026, 9, 15, 2, tzinfo=timezone.utc)
++    offpeak = datetime(2026, 9, 15, 5, tzinfo=timezone.utc)
++
++    first = estimate_usage_cost("deepseek-v4-pro", USAGE, provider="fireworks", at_time=peak)
++    second = estimate_usage_cost("deepseek-v4-pro", USAGE, provider="fireworks", at_time=offpeak)
++
++    assert first.amount_usd == second.amount_usd == Decimal("5.365")
++    assert not any("DeepSeek direct-provider" in note for note in first.notes)
++
++
++def test_historical_session_uses_its_durable_response_time_cost():
++    session = {
++        "model": "deepseek-v4-pro", "billing_provider": "deepseek",
++        "input_tokens": 1_000_000, "cache_read_tokens": 1_000_000,
++        "output_tokens": 1_000_000, "estimated_cost_usd": 5.324,
++        "cost_status": "estimated",
++    }
++
++    assert _estimate_cost(session) == (5.324, "estimated")
++
++
++def test_non_deepseek_insights_keeps_existing_recomputation_contract():
++    session = {
++        "model": "gpt-4o", "billing_provider": "openai",
++        "input_tokens": 1_000_000, "output_tokens": 1_000_000,
++        "estimated_cost_usd": 99.0, "cost_status": "estimated",
++    }
++
++    assert _estimate_cost(session) == (12.5, "estimated")
++
++
++def test_tokenless_direct_native_session_is_zero_estimated_not_unknown():
++    session = {
++        "model": "deepseek-v4-pro", "billing_provider": "deepseek",
++        "input_tokens": 0, "output_tokens": 0,
++    }
++
++    assert _estimate_cost(session) == (0.0, "estimated")
++
++
++def test_historical_direct_aggregate_without_billing_time_is_reported_unknown():
++    session = {
++        "model": "deepseek-v4-pro", "billing_provider": "deepseek",
++        "input_tokens": 1_000_000, "cache_read_tokens": 1_000_000,
++        "output_tokens": 1_000_000,
++    }
++
++    assert _estimate_cost(session) == (0.0, "unknown")
++    assert _estimate_cost(
++        "deepseek-v4-pro", 1_000_000, 1_000_000,
++        cache_read_tokens=1_000_000, provider="deepseek",
++    ) == (0.0, "unknown")
++
++
++def test_disposable_insights_exposes_unknown_legacy_cost_and_preserves_stored_cost(tmp_path):
++    db = SessionDB(db_path=tmp_path / "insights.db")
++    try:
++        db.create_session(session_id="legacy", source="cli", model="deepseek-v4-pro")
++        db.update_token_counts(
++            "legacy", input_tokens=1_000_000, model="deepseek-v4-pro",
++            billing_provider="deepseek", api_call_count=1,
++        )
++        db.create_session(session_id="recorded", source="cli", model="deepseek-v4-pro")
++        db.update_token_counts(
++            "recorded", input_tokens=1_000_000, model="deepseek-v4-pro",
++            billing_provider="deepseek", estimated_cost_usd=5.324,
++            cost_status="estimated", cost_source="official_docs_snapshot", api_call_count=1,
++        )
++
++        report = InsightsEngine(db).generate(days=30)
++
++        assert report["overview"]["unknown_cost_sessions"] == 1
++        assert report["overview"]["estimated_cost"] == pytest.approx(5.324)
++    finally:
++        db.close()

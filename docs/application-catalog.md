@@ -24,7 +24,7 @@ engine and tier-1 extensions supply the operations.
 
 ## What already exists (the real primitives)
 
-Seventeen tier-1 extensions ship in `extensions/` today. Grouped by pipeline
+Nineteen tier-1 extensions ship in `extensions/` today. Grouped by pipeline
 stage:
 
 | Stage | Extension ids | What they own |
@@ -32,9 +32,9 @@ stage:
 | ingest scope | `okengine.relevance-gate` | flag off-thesis source pages against operator-owned scope config (deterministic pass + cheap-model pass); never deletes |
 | graph hygiene | `okengine.dedupe`, `okengine.embeddings` | name/alias duplicate detection + merge proposals; semantic near-duplicate candidates (the sidecar exemplar) |
 | link / structure | `okengine.glossary`, `okengine.viz` | term synthesis from `[[glossary/*]]` references; strategic maps (evolution × value-chain) over the concept graph |
-| score / analyze | `okengine.competitive-analytics`, `okengine.events`, `okengine.lacuna`, `okengine.frontier-watch` | quadrants/battle-cards/acquirer-movement signals (watchlist is pack config); scored append-only event ledger (event types + weights are pack config); structural-gap discovery with fill proposals; demand/supply whitespace theses |
+| score / analyze | `okengine.assessments`, `okengine.competitive-analytics`, `okengine.events`, `okengine.lacuna`, `okengine.frontier-watch` | evidence-backed assessment records; quadrants/battle-cards/acquirer-movement signals (watchlist is pack config); scored append-only event ledger; structural-gap discovery with fill proposals; demand/supply whitespace theses |
 | forecast | `okengine.predictions` | falsifiable dated forecasts: candidate filing, grading at resolution, re-grading on new evidence |
-| audit | `okengine.grounding`, `okengine.contradictions`, `okengine.completeness`, `okengine.critic` | claim-vs-citation audits; ACTIVE/EMPTY/RESOLVED contradiction dashboard; pack-declared completeness rules → explainable gap queue; wake-gated LLM critique of the flagship deliverable |
+| audit / revisit | `okengine.grounding`, `okengine.contradictions`, `okengine.completeness`, `okengine.critic`, `okengine.reevaluation` | claim-vs-citation audits; ACTIVE/EMPTY/RESOLVED contradiction dashboard; pack-declared completeness rules → explainable gap queue; wake-gated critique; evidence-change-driven reassessment |
 | expose / present | `okengine.timeline`, `okengine.messaging-synthesis` | reverse-chronological vault-wide dated-content dashboard; positioning/battle-card/value-prop synthesis over a competitive graph |
 
 Engine facilities that are **not** extensions but count as coverage:

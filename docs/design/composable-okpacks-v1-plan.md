@@ -97,14 +97,14 @@ duplicating — with the engine owning a base schema, a stable `id`, and an
     today uses `glob` and silently omits sharded pages.
   - one-shot **stamp-if-absent** backfill across the vault (`okf_migrate`-style; no
     link rewrite — `id` is path-independent). Never recomputes an existing `id`.
-  - the resolver consults `aliases:`; a **collision report** routes slug collisions
-    to review (never auto-merge).
+  - the resolver consults `aliases:`; create-time slug collisions resolve to the
+    existing canonical identity without auto-merging or creating a phantom review row.
 - **Files:** new `scripts/cron/id_index.py` (resolver + batch build), new shared
   normalizer util, a one-shot `scripts/backfill_ids.py`, `corpus_indexer.py`
   (`glob`→`rglob`), `schema_lib`.
 - **Acceptance:** every non-reserved page has a unique `id`; `resolve(id)` returns
   its path including **sharded** pages; reclassifying a page's `type` does **not**
-  change its `id`; slug collisions are flagged, not merged.
+  change its `id`; create-time slug collisions resolve to the canonical but are not merged.
 
 ### P2 — Converge-on-write (the core change)
 - **Goal:** a new **`converge_entity`** tool upserts by `id`: existing **authority**
@@ -115,10 +115,10 @@ duplicating — with the engine owning a base schema, a stable `id`, and an
 - **New work in `write_server.py`:**
   - add a **caller `pack` parameter** to the write tools (owner-arbitration is
     undecidable without it).
-  - `converge_entity` resolves `id` (P1, write-synchronous, atomic claim); existing
-    **authority** id ⇒ a real **`merge(prev_fm, incoming, owner, caller)`** (net-new,
-    not the field-loss guard); minted-slug collision ⇒ create-time review-flag, never
-    auto-merge.
+  - `converge_entity` resolves `id` (P1, write-synchronous, atomic claim); an existing
+    id ⇒ a real **`merge(prev_fm, incoming, owner, caller)`** (net-new, not the
+    field-loss guard). The explicit converge call distinguishes this from create-time
+    minted-slug resolution, which never auto-merges.
   - **provenance union:** `maintained_by: [pack…]` / `discovered_by` (a set; trimmed
     on pack uninstall — see removal guard).
   - **page+field conflict rule (RFC §5a):** only the **owner** mutates existing

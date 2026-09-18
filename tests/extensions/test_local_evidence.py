@@ -1,4 +1,5 @@
 import importlib.util
+import datetime as dt
 from pathlib import Path
 
 import yaml
@@ -121,3 +122,55 @@ def test_generic_operator_evidence_carries_fail_closed_attestation(tmp_path):
         tmp_path, "entities/f/fsb-center-16", "country")["resolved"]
         if x["artifact"] == "sources/operator")
     assert item["authority_record_attested"] is False
+
+
+def test_defensive_page_digest_and_reference_shape_edges(tmp_path, monkeypatch):
+    assert resolver._digest({"day": dt.date(2026, 8, 4)}).startswith("sha256:")
+    try:
+        resolver._digest({"bad": {1}})
+        assert False, "unsupported digest value should fail"
+    except TypeError as exc:
+        assert "set is not JSON serializable" in str(exc)
+    assert resolver._page(tmp_path / "missing.md") is None
+    malformed = tmp_path / "bad.md"
+    malformed.write_text("---\n[broken\n---\n")
+    assert resolver._page(malformed) is None
+
+    build(tmp_path)
+    entity = tmp_path / "wiki/entities/f/fsb-center-16.md"
+    fm, body = resolver._page(entity)
+    fm["evidence"] = [
+        {"path": "sources/vendor"}, {"unknown": "shape"}, 17,
+        "sources/vendor",  # duplicate path exercises deterministic de-duplication
+    ]
+    fm["repository_recent_articles"] = [
+        "bad embedded shape",
+        {"id": "vendor-copy", "url": "https://vendor.example/report"},
+        {"id": "local-only", "url": "https://extra.example/report", "title": "FSB Center 16"},
+        {"id": "remote", "url": "https://remote.example/report", "title": "Static Tundra"},
+    ]
+    page(tmp_path, "entities/f/fsb-center-16", fm, body)
+    page(tmp_path, "sources/extra", {"type": "source", "url": "https://extra.example/report"},
+         "FSB Center 16")
+    page(tmp_path, "assessments/matching", {
+        "type": "assessment", "subject_ref": "entities/f/fsb-center-16",
+        "sources": ["sources/cisa", 9],
+        "adversarial_evidence": [{"source": "sources/mitre"}, {}, "bad"],
+    })
+    page(tmp_path, "assessments/other", {
+        "type": "assessment", "subject": "entities/other", "sources": ["sources/extra"],
+    })
+
+    result = resolver.resolve(tmp_path, "wiki/entities/f/fsb-center-16.md", "country")
+    assert {item["artifact"] for item in result["resolved"]} >= {
+        "sources/vendor", "sources/extra", "sources/cisa", "sources/mitre",
+    }
+    assert len([item for item in result["resolved"] if item["artifact"] == "sources/vendor"]) == 1
+    assert any(item["reason"] == "malformed-reference" for item in result["malformed"])
+    assert any(item["reason"] == "malformed-embedded-article" for item in result["malformed"])
+    remote = next(item for item in result["resolved"] if item["source_id"] == "remote")
+    assert remote["identity_transfer"] == "required"
+
+    index = resolver.build_index(tmp_path)
+    assert index.lookup("random-token") == ([], "unrecognized-reference")
+    assert index.lookup("https://absent.example/") == ([], "url-not-local")

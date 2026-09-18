@@ -32,6 +32,8 @@ minimums, or strengthen `allow → review → reject`; it cannot weaken an engin
 It must contain a reason and must not be used for new lanes. Runtime enforcement and verified
 per-item receipts are separate layers that consume this contract.
 
+A lane may also narrow the MCP tools its server-bound writer exposes with `write_tools` beside its cron definition (`"write_tools": ["update_entity"]`). `ensure-runtime.sh` forwards it as `OKENGINE_WRITE_TOOLS` on that lane's `okengine-write-<lane>` server and `write_server.py` prunes to exactly that set. Policy still guards every call server-side; the allowlist only stops a local model from spending turns on tools it cannot use. Engine lanes carry their allowlist in the engine; a pack lane's belongs here, never in engine code (okengine#664).
+
 Generated jobs receive a stable `id` derived from the composed lane name and an
 `output_contract_digest` (`sha256:<hex>`) over canonical JSON. Writers and receipts must carry both
 values so a write cannot be credited to a different lane or contract revision.

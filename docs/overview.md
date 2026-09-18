@@ -3,6 +3,10 @@
 *Start here if you want the short version: what OKEngine is, why it exists, how
 packs work, and where to read next.*
 
+For the complete executive view—including the operating model, knowledge
+concepts, governance, extensions, operators, applications, and current pack
+catalog—read the [`executive guide`](executive-guide.md).
+
 ---
 
 ## What It Is
@@ -198,6 +202,7 @@ See [`kb-tooling.md`](kb-tooling.md).
 
 | Topic | File |
 |---|---|
+| Executive system guide | [`executive-guide.md`](executive-guide.md) |
 | Concept defense: agent+wiki vs RAG | [`okf/guide-1-agent-wiki-pattern.md`](okf/guide-1-agent-wiki-pattern.md) |
 | Build a vault end-to-end | [`okf/guide-2-building-an-agent-vault.md`](okf/guide-2-building-an-agent-vault.md) |
 | Connect data sources | [`okf/guide-3-integration-catalog.md`](okf/guide-3-integration-catalog.md) |

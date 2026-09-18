@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import sys
+import types
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -76,12 +77,34 @@ def test_candidate_watch_skips_below_threshold(tmp_path, monkeypatch):
     assert wake is False
 
 
+def test_candidate_watch_honors_pack_type_filter(tmp_path, monkeypatch):
+    _vault(tmp_path, monkeypatch)
+    monkeypatch.setenv("PREDICTION_CANDIDATE_TYPES", "vendor")
+    monkeypatch.setenv("PREDICTION_CANDIDATE_MIN", "1")
+    wake, output = _run(_load("select_prediction_candidates"))
+    assert wake is False
+    assert "no open prediction: 0" in output
+
+
 def test_grade_lists_only_overdue_open(tmp_path, monkeypatch):
     _vault(tmp_path, monkeypatch)
     wake, out = _run(_load("select_predictions_for_grading"))
     assert wake is True
     assert "past resolves_by: 1" in out                  # p-overdue only
     assert "APT42 Y" in out and "Akira X" not in out      # not-yet-due/closed excluded
+
+
+def test_grade_skips_without_overdue_and_handles_subjectless_prediction(tmp_path, monkeypatch):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-06-19")
+    wake, output = _run(_load("select_predictions_for_grading"))
+    assert wake is False and "no overdue predictions" in output
+
+    _mk(tmp_path, "predictions", "subjectless",
+        "type: prediction\nstatus: open\nresolves_by: '2026-01-01'\ntitle: Subjectless\n")
+    wake, output = _run(_load("select_predictions_for_grading"))
+    assert wake is True and "Subjectless" in output
+    assert "subject:" not in output
 
 
 def test_regrade_needs_open_and_recent_sources(tmp_path, monkeypatch):
@@ -245,7 +268,7 @@ def test_regrade_wakes_for_recommendation_without_new_source(tmp_path, monkeypat
         "confidence_after_suggested": .6, "delta_suggested": .1,
         "events": [{"evidence_index": 0, "event_id": "events/e",
                     "update_driver": {"signal_strength": .8}}],
-    }) + "\n")
+    }) + "\n" + json.dumps({"proposition": "predictions/not-open"}) + "\n")
     monkeypatch.setenv("HERMES_DATA", str(data))
     wake, out = _run(_load("select_regrade_batch"))
     assert wake is True and "deterministic recommendation" in out
@@ -263,6 +286,82 @@ def test_skeptic_fallback_blocks_third_raise_until_counterevidence(monkeypatch):
     raises["evidence"].append({"direction": "neutral", "confidence_before": .7,
                                 "confidence_after": .7, "note": "skeptic pass"})
     assert mod.skeptic_fallback_allows_raise(raises) is True
+
+
+def test_regrade_helpers_tolerate_malformed_optional_inputs(tmp_path, monkeypatch):
+    mod = _load("select_regrade_batch")
+
+    broken_schema = types.SimpleNamespace(merged_schema=lambda _vault: (_ for _ in ()).throw(
+        RuntimeError("schema unavailable")))
+    monkeypatch.setitem(sys.modules, "schema_lib", broken_schema)
+    assert mod.direction_enum(tmp_path) == list(mod._DIRECTION_FALLBACK)
+    custom_schema = types.SimpleNamespace(
+        merged_schema=lambda _vault: {},
+        item_rules=lambda _schema: {
+            "evidence": {"direction": {"enum": ["neutral", "reinforces", "novel"]}}
+        },
+    )
+    monkeypatch.setitem(sys.modules, "schema_lib", custom_schema)
+    assert mod.direction_enum(tmp_path) == ["reinforces", "neutral", "novel"]
+
+    data = tmp_path / "data"
+    recs = data / "state" / "okengine.predictions" / "confidence-recommendations.jsonl"
+    recs.parent.mkdir(parents=True)
+    recs.write_text("not-json\n[]\n" + json.dumps({"proposition": "predictions/p"}) + "\n")
+    monkeypatch.setenv("HERMES_DATA", str(data))
+    assert mod.confidence_recommendations(tmp_path) == {
+        "predictions/p": {"proposition": "predictions/p"}
+    }
+
+    assert mod.skeptic_fallback_allows_raise({"evidence": [None]}) is True
+    assert mod.skeptic_fallback_allows_raise({
+        "evidence": [{"confidence_before": "bad", "confidence_after": 0.6}]
+    }) is True
+    assert mod.skeptic_fallback_allows_raise({
+        "evidence": [{"confidence_before": 0.7, "confidence_after": 0.6}]
+    }) is True
+
+
+def test_regrade_dependency_tolerates_bad_state_sources_and_edges(tmp_path, monkeypatch):
+    _vault(tmp_path, monkeypatch)
+    _edges(tmp_path, {"sources/missing": "bad", "sources/s-new": [None, {}, {"page": 3}]})
+    _state(tmp_path, watermark_ns="bad", last_fallback_ns=0)
+    mod = _load("select_regrade_batch")
+    prediction = tmp_path / "wiki" / "predictions" / "p-akira.md"
+
+    class Unstatable:
+        def stat(self):
+            raise OSError("vanished during scan")
+
+    calls = iter([[Unstatable()], []])
+    monkeypatch.setattr(mod.P, "iter_pages", lambda *_args: iter(next(calls)))
+    batch, edge_mode, reason = mod.dependency_batch(
+        tmp_path, [(prediction, mod.P.read_fm(prediction))]
+    )
+    assert batch == [] and edge_mode is True
+    assert "fallback=not-used" in reason
+
+    _edges(tmp_path, {"sources/missing": [{"page": "predictions/p-akira"}]})
+    monkeypatch.setattr(mod.P, "iter_pages", lambda *_args: iter(()))
+    batch, edge_mode, reason = mod.dependency_batch(
+        tmp_path, [(prediction, mod.P.read_fm(prediction))]
+    )
+    assert batch == [] and edge_mode is True
+    assert "fallback=not-used" in reason
+
+
+def test_regrade_prints_hold_after_consecutive_unscored_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-06-19")
+    monkeypatch.setenv("PREDICTION_RECOMMENDER_SKEPTIC_AFTER_RAISES", "2")
+    _mk(tmp_path, "predictions", "p", "type: prediction\nstatus: open\nconfidence: 0.7\n"
+        "subject: entities/x\ntitle: repeatedly raised\nevidence:\n"
+        "- {direction: reinforces, confidence_before: 0.5, confidence_after: 0.6}\n"
+        "- {direction: reinforces, confidence_before: 0.6, confidence_after: 0.7}\n")
+    _mk(tmp_path, "sources", "fresh", "type: source\npublished: '2026-06-19'\ntitle: fresh\n")
+    wake, output = _run(_load("select_regrade_batch"))
+    assert wake is True
+    assert "fallback confidence action: HOLD" in output
 
 
 def test_empty_vault_all_skip(tmp_path, monkeypatch):

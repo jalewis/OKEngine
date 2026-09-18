@@ -31,6 +31,60 @@ def _load():
 mod = _load()
 
 
+def test_low_level_edge_paths(tmp_path, capsys):
+    import xml.etree.ElementTree as ET
+    assert mod._safe_xml(b"<opml/>").tag == "opml"
+    with pytest.raises(ET.ParseError, match="10 MiB"):
+        mod._safe_xml(b"x" * (mod.MAX_OPML_BYTES + 1))
+    with pytest.raises(ET.ParseError, match="DTD"):
+        mod._safe_xml("<!DOCTYPE opml><opml/>")
+    assert mod._yaml(tmp_path/"missing.yaml") == {}
+    assert mod._insert_under("a: 1\n", r"^missing:", "x") is None
+    assert mod._insert_under("a:\n  old: 1\n", r"^a:", "  new: 2\n").startswith("a:\n  new: 2")
+    assert mod._dump_entry("x", "value", 2) == "  x: value\n"
+
+    ran=[]
+    plan=mod.Plan(False);plan.info("i");plan.warn("w");plan.step("s",lambda:ran.append(1))
+    assert plan.run()==0 and ran==[]
+    plan=mod.Plan(True);plan.step("none");plan.step("call",lambda:ran.append(1))
+    assert plan.run()==0 and ran==[1]
+    plan=mod.Plan(True);plan.fail("bad")
+    assert plan.run()==1
+    assert "blocked by FAIL" in capsys.readouterr().out
+
+
+def test_shape_and_slug_remaining_forms(tmp_path):
+    pack=tmp_path/"plain";sub=pack/"subdomain";sub.mkdir(parents=True)
+    assert mod.detect_shape(pack,None) is None
+    (sub/"schema.yaml").write_text("{}")
+    assert mod.detect_shape(pack,"subtree")=="subtree"
+    assert mod.detect_shape(pack,"taxonomy") is None
+    (sub/"host-schema-additions.yaml").write_text("{}")
+    assert mod.detect_shape(pack,None)=="both"
+    (pack/"pack.yaml").write_text("domain: /declared/\nname: named\n")
+    assert mod.domain_slug(pack,None)=="declared"
+    assert mod.domain_slug(pack,"nested/domain")=="nested/domain"
+    assert mod.pack_name(pack)=="named"
+    (pack/"pack.yaml").write_text("{}")
+    assert mod.domain_slug(pack,None)=="plain" and mod.pack_name(pack)=="plain"
+
+
+def test_merge_rules_missing_destination_and_all_skipped(tmp_path):
+    host=tmp_path/"host";pack=tmp_path/"pack"
+    (pack/"config").mkdir(parents=True)
+    (pack/"config/completeness-rules.yaml").write_text(
+        "rules:\n- id: keep\n  when: {type: owned}\n- id: skip\n  when: {type: foreign}\n")
+    plan=mod.Plan(True);mod.merge_rules(host,pack,{"owned"},plan)
+    assert plan.run()==0
+    rules=mod._yaml(host/"config/completeness-rules.yaml")["rules"]
+    assert [r["id"] for r in rules]==["keep"]
+    plan=mod.Plan(True);mod.merge_rules(host,pack,{"owned"},plan)
+    assert plan.steps==[] and plan.warns==["completeness rules NOT merged (host-owned/entity-world types, see INSTALL doc): ['skip']"]
+    empty=tmp_path/"empty";empty.mkdir()
+    plan=mod.Plan(True);mod.merge_rules(host,empty,{"owned"},plan)
+    assert plan.steps==[]
+
+
 def _host(tmp_path) -> Path:
     h = tmp_path / "host"
     (h / "wiki").mkdir(parents=True)
@@ -412,6 +466,7 @@ def test_pack_contributes_sections_to_existing_tab_without_adding_navigation(tmp
     assert response["key"] == "legacy-tax"
     assert response["canonical_key"] == "overview"
     assert response["boxes"][0]["section"] == "Threat coverage"
+    assert response["boxes"][0]["layout_section"] == "Threat coverage"
     assert "<details" in response["boxes"][0]["html"]
 
 

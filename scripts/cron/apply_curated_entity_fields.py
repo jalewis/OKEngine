@@ -190,7 +190,7 @@ def enforce(text: str, fields: dict) -> tuple[str | None, list[str]]:
         out = block + slines
 
     new_fm = "\n".join(out)
-    if not new_fm.endswith("\n"):
+    if not new_fm.endswith("\n"):  # pragma: no branch - splitlines()+join cannot retain a final newline
         new_fm += "\n"
     if not parses_with_type(new_fm):
         return None, []

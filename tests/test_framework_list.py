@@ -43,3 +43,8 @@ def test_json_flag_emits_valid_catalog(tmp_path, capsys):
     out = capsys.readouterr().out
     parsed = json.loads(out)
     assert parsed["catalog"] == "okpacks-library" and len(parsed["packs"]) == 2
+
+
+def test_unreadable_catalog_is_an_error(tmp_path, capsys):
+    assert _load().main(["--catalog", str(tmp_path / "missing.json")]) == 1
+    assert "could not read the catalog" in capsys.readouterr().err

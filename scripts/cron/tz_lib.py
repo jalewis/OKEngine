@@ -18,18 +18,15 @@ from __future__ import annotations
 
 import os
 from datetime import date, datetime, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 
 def deployment_tz() -> timezone | ZoneInfo:
-    """The deployment's zone from $TZ (else UTC). Never raises — an unknown TZ falls back to UTC."""
+    """The deployment's zone from $TZ (else UTC); invalid configured zones fail loudly."""
     name = (os.environ.get("TZ") or "").strip()
     if not name or name.upper() == "UTC":
         return timezone.utc
-    try:
-        return ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError, OSError):
-        return timezone.utc
+    return ZoneInfo(name)
 
 
 def deployment_now() -> datetime:

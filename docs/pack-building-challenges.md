@@ -34,7 +34,7 @@ The enforced MCP write path only governs agents that (a) have the `okengine-writ
 (b) are told to use it. Three packs shipped brief lanes with **no write toolset** and prompts
 saying "write the brief to wiki/briefings/…" — raw `file_write` was the only way to comply, so the
 schema/field-loss/review guards never ran. Checklist: every agent lane that writes wiki pages needs
-`okengine-write` in `enabled_toolsets` **and** a prompt naming the `mcp_okengine_write_*` tool.
+`okengine-write` in `enabled_toolsets` **and** a prompt naming the `mcp__okengine_write__*` tool.
 Watch for the half-fixed variant too: a "use the MCP path" addendum bolted onto a legacy prompt
 whose step-by-step body still instructs `file_write`.
 

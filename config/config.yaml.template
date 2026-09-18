@@ -16,6 +16,17 @@ model:
   default: nvidia/nemotron-3-super-120b-a12b:free
   provider: openrouter
 
+  # Output budget for ONE turn. LEAVE THIS SET (okengine#478). Unset, Hermes sends
+  # max_tokens = the whole context window, which authorises a single generation of tens of
+  # thousands of tokens. Measured on a live agent lane: one turn ran ~42,000 output tokens
+  # over 14 minutes and was then TRUNCATED MID-TOOL-CALL, corrupting that call's arguments
+  # and losing the work; raising a lane's batch size later killed a run outright with
+  # "Response truncated due to output length limit" after 19 successful writes.
+  # In practice a turn emits 30-1,200 output tokens, so this is generous headroom while
+  # bounding a runaway to ~2 minutes rather than ~15. Raise it only for a lane that
+  # genuinely emits long prose (a brief), and prefer a per-lane override to raising it here.
+  max_tokens: 8192
+
 # Fallback chain, in order, when the primary errors / is rate-limited / unreachable.
 # Free OpenRouter tiers first, then a known PAID escape (deepseek) — used only when every
 # free tier above is rate-limited. No openrouter/auto: it auto-routes to an unpredictable
@@ -29,19 +40,23 @@ fallback_providers:
   model: openrouter/free                 # Free Models Router — routes to ANY available free
                                          #   model (the free counterpart of openrouter/auto)
 - provider: deepseek
-  model: deepseek-v4-pro                 # PAID escape hatch — needs DEEPSEEK_API_KEY. Remove
+  model: deepseek-flash                  # V4.1 Flash PAID escape hatch — needs DEEPSEEK_API_KEY. Remove
                                          #   this entry for a strictly-free deployment (then a
                                          #   run fails if every free tier above is rate-limited).
 # A local model (no rate limits) is the better paid-free workhorse if you have the hardware:
 #   - {provider: custom, model: qwen3.5:27b, base_url: http://YOUR_OLLAMA_HOST:11434/v1}
+# IMPORTANT: when the primary is Qwen Coder, use `fallback_providers: []`. A local capacity
+# error must fail visibly instead of silently converting a bulk lane into paid cloud traffic.
+# `framework validate` rejects any configured fallback on a Qwen Coder deployment.
 
 # Shared local pools may publish an HTTP load-shedding contract. Configure its
 # request deadline under the provider and exact retry/fallback behavior under
-# the agent. Example for a pool that queues 30s, runs up to 300s, uses 503 for
+# the agent. Example for the shared Qwen pool on :11436, which queues up to 180s,
+# then permits 300s of server inactivity, uses 503 for
 # capacity, permits one retry on 500, and declares 404/504 deterministic:
 # providers:
 #   custom:
-#     request_timeout_seconds: 350
+#     request_timeout_seconds: 500
 # agent:
 #   http_status_policy:
 #     404: {max_attempts: 1, fallback: false}
@@ -92,6 +107,8 @@ mcp_servers:
     command: /opt/hermes/.venv/bin/python
     args:
     - /opt/hermes/okengine-mcp/write_server.py
+    env:
+      OKENGINE_POLICY_CATALOG: /opt/hermes/config/policy/catalog.yaml
 
   # Dedicated, server-bound identity for the source-quality scheduler lane.
   # The agent cannot select this identity through a tool argument: its toolset
@@ -100,8 +117,13 @@ mcp_servers:
     command: /opt/hermes/.venv/bin/python
     args:
     - /opt/hermes/okengine-mcp/write_server.py
+    tools:
+      resources: false
+      prompts: false
     env:
       OKENGINE_WRITE_ACTOR: cron:source-quality-backfill
+      OKENGINE_POLICY_CATALOG: /opt/hermes/config/policy/catalog.yaml
+      OKENGINE_CRON_JOBS: /opt/data/cron-plus/jobs.json
       OKENGINE_OUTPUT_CONTRACT_MODE: enforce
 
 # Cron jobs opt into MCP explicitly. This keeps maintenance drains and pure

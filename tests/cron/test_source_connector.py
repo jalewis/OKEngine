@@ -3,8 +3,11 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import socket
 import sys
+import urllib.error
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -33,6 +36,7 @@ def test_reference_manifest_for_every_mode_is_conformant(mode):
     assert m.validate_manifest(_manifest(m, mode)) == []
 
 
+@pytest.mark.contract
 def test_machine_schema_and_runtime_agree_on_modes_and_required_blocks():
     m = _load()
     schema = yaml.safe_load((REPO / "config/source-connector.schema.yaml").read_text())
@@ -211,6 +215,203 @@ def test_runtime_validator_enforces_schema_required_nested_keys():
     assert "missing required key: request.method" in errors
 
 
+def test_validator_reports_every_malformed_contract_shape():
+    m = _load()
+    manifest = {
+        "connector_version": 99,
+        "id": "X",
+        "mode": "bad",
+        "trust": {
+            "permission": "bad",
+            "data_sensitivity": "bad",
+            "source_authority": "",
+            "extra": True,
+        },
+        "permissions": {
+            "network": False,
+            "allowed_hosts": ["UPPER.EXAMPLE", ""],
+            "write_raw": "yes",
+            "allow_private_network": "yes",
+        },
+        "auth": {
+            "type": "bad",
+            "secret_refs": {"token": "not env"},
+        },
+        "inputs": "bad",
+        "request": {
+            "method": "POST",
+            "url": "ftp://user:pass@example.test/path",
+            "timeout_seconds": 0,
+            "max_bytes": m.MAX_BYTES + 1,
+            "headers": [],
+            "query": [],
+        },
+        "response": {
+            "format": "xml",
+            "records_path": 3,
+            "stable_id_path": "",
+            "revision_path": 3,
+            "deleted_path": [],
+        },
+        "pagination": {
+            "type": "bad",
+            "max_pages": 0,
+            "start": -1,
+        },
+        "checkpoint": {"path": ""},
+        "conditional_requests": {"enabled": "yes"},
+        "rate_limit": {"max_requests": 0, "per_seconds": -1},
+        "archive": {
+            "enabled": "yes",
+            "raw_responses": "yes",
+            "path": "/absolute",
+            "retention_days": -1,
+        },
+        "license": {
+            "name": "",
+            "url": 3,
+            "redistribution": "bad",
+            "max_retention_days": -1,
+        },
+        "health": {"path": "../escape"},
+        "extra": True,
+    }
+    errors = m.validate_manifest(manifest)
+    joined = "\n".join(errors)
+    for expected in (
+        "unknown top-level",
+        "connector_version",
+        "id must",
+        "mode must",
+        "unknown key under trust",
+        "trust.permission",
+        "data_sensitivity",
+        "source_authority",
+        "permissions.network",
+        "allowed_hosts",
+        "write_raw",
+        "allow_private_network",
+        "auth.type",
+        "secret_refs",
+        "inputs must",
+        "request.method",
+        "http(s)",
+        "timeout_seconds",
+        "max_bytes",
+        "headers",
+        "query",
+        "response.format",
+        "records_path",
+        "stable_id_path",
+        "revision_path",
+        "deleted_path",
+        "pagination.type",
+        "max_pages",
+        "pagination.start",
+        "checkpoint.path",
+        "conditional_requests.enabled",
+        "rate_limit.max_requests",
+        "rate_limit.per_seconds",
+        "archive.enabled",
+        "archive.path",
+        "retention_days",
+        "license.name",
+        "license.url",
+        "license.redistribution",
+        "max_retention_days",
+        "health.path",
+    ):
+        assert expected in joined
+
+
+def test_validator_enrichment_pagination_auth_and_template_edges():
+    m = _load()
+    base = _manifest(m, "query")
+    base["enrich"] = "bad"
+    assert {"enrich: only valid for mode: enrichment", "enrich: must be a mapping"} <= set(
+        m.validate_manifest(base)
+    )
+
+    manifest = _manifest(m, "enrichment")
+    manifest["enrich"] = {
+        "authority": "BAD!",
+        "id_path": "",
+        "match": {
+            "query_input": "undeclared",
+            "page_field": "",
+            "candidate_paths": [],
+        },
+        "targets": {},
+        "extra": True,
+    }
+    errors = "\n".join(m.validate_manifest(manifest))
+    for expected in (
+        "unknown key",
+        "enrich.authority",
+        "enrich.id_path",
+        "page_field",
+        "candidate_paths",
+        "not a required manifest input",
+        "targets.types",
+    ):
+        assert expected in errors
+
+    manifest = _manifest(m, "query")
+    manifest["auth"] = {"type": "none", "secret_refs": {"token": "TOKEN"}}
+    manifest["request"]["url"] = "https://query.example/${input.missing}/${runtime.bad}"
+    manifest["request"]["headers"] = {
+        "X-Test": "${secret.missing}",
+        "X-Bad": "${unsupported.value}",
+    }
+    errors = "\n".join(m.validate_manifest(manifest))
+    assert "auth.type none cannot declare" in errors
+    assert "input not declared" in errors
+    assert "unsupported runtime" in errors
+    assert "undeclared secret" in errors
+    assert "unsupported or malformed template" in errors
+
+    for kind, block, expected in (
+        ("page", {"type": "page", "max_pages": 1}, "page pagination requires"),
+        ("cursor", {"type": "cursor", "max_pages": 1}, "cursor pagination requires"),
+    ):
+        manifest = _manifest(m, "bundle")
+        manifest["pagination"] = block
+        assert expected in "\n".join(m.validate_manifest(manifest))
+
+
+def test_validator_remaining_cross_field_edges():
+    m = _load()
+    manifest = _manifest(m, "enrichment")
+    manifest["enrich"] = {
+        "authority": "authority",
+        "id_path": "id",
+        "match": "bad",
+        "targets": {"types": ["entity"]},
+    }
+    assert "enrich.match: required mapping" in m.validate_manifest(manifest)
+
+    manifest = _manifest(m, "bundle")
+    del manifest["health"]
+    assert "missing required key: health" in m.validate_manifest(manifest)
+
+    manifest = _manifest(m, "query")
+    manifest["inputs"] = {"required": [3]}
+    assert "inputs.required must be a list of names" in m.validate_manifest(manifest)
+
+    manifest = _manifest(m, "query")
+    manifest["request"]["url"] = "https://user:pass@query.example/x"
+    assert "request.url must not contain credentials" in m.validate_manifest(manifest)
+
+    manifest = _manifest(m, "bundle")
+    manifest["archive"]["enabled"] = True
+    manifest["permissions"]["write_raw"] = True
+    manifest["license"]["redistribution"] = "prohibited"
+    manifest["trust"]["data_sensitivity"] = "clear"
+    assert "prohibited redistribution cannot use clear" in "\n".join(
+        m.validate_manifest(manifest)
+    )
+
+
 def test_private_network_permission_is_explicit_and_internal_only(monkeypatch):
     m = _load()
     monkeypatch.setattr(m.socket, "getaddrinfo", lambda *_args, **_kwargs: [
@@ -218,6 +419,333 @@ def test_private_network_permission_is_explicit_and_internal_only(monkeypatch):
     with pytest.raises(m.ConnectorError, match="non-public"):
         m._validate_network_url("https://internal.example/api", ["internal.example"])
     m._validate_network_url("https://internal.example/api", ["internal.example"], True)
+
+
+def test_yaml_lookup_render_state_and_decode_failure_edges(tmp_path, monkeypatch):
+    m = _load()
+    monkeypatch.setattr(m, "yaml", None)
+    with pytest.raises(m.ConnectorError, match="PyYAML"):
+        m.load_yaml(tmp_path / "x.yaml")
+    monkeypatch.setattr(m, "yaml", yaml)
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("invalid: [")
+    with pytest.raises(m.ConnectorError, match="cannot read"):
+        m.load_yaml(bad)
+    bad.write_text("- item\n")
+    with pytest.raises(m.ConnectorError, match="expected a YAML mapping"):
+        m.load_yaml(bad)
+
+    errors = []
+    assert m._mapping([], "request", errors) == {}
+    assert "must be a mapping" in errors[0]
+    errors.clear()
+    m._relative_path(None, "optional", errors, required=False)
+    assert errors == []
+    assert m._url_host(3) == ""
+    assert m._url_host("https://EXAMPLE.test/x") == "example.test"
+
+    value = {"rows": [{"name": "first"}]}
+    assert m._lookup(value, "rows.0.name") == "first"
+    assert m._lookup(value, "rows.9.name", "fallback") == "fallback"
+    with pytest.raises(m.ConnectorError, match="unresolved template"):
+        m._render("${input.missing}", {}, {}, {})
+    assert m._render("${input.term}", {"term": "a/b"}, {}, {}, url_component=True) == "a%2Fb"
+
+    state = tmp_path / "state.json"
+    state.write_text("{bad")
+    with pytest.raises(m.ConnectorError, match="invalid checkpoint"):
+        m._load_state(state)
+    state.write_text("[]")
+    with pytest.raises(m.ConnectorError, match="expected an object"):
+        m._load_state(state)
+
+    invalid_fixture = tmp_path / "fixture.json"
+    invalid_fixture.write_text("{bad")
+    with pytest.raises(m.ConnectorError, match="invalid fixture"):
+        m._load_fixture(invalid_fixture)
+    invalid_fixture.write_text('{"fixture_version":2,"pages":[]}')
+    with pytest.raises(m.ConnectorError, match="fixture requires"):
+        m._load_fixture(invalid_fixture)
+    invalid_fixture.write_text('{"fixture_version":1,"pages":[{"body":3}]}')
+    with pytest.raises(m.ConnectorError, match=r"pages\[0\]"):
+        m._load_fixture(invalid_fixture)
+
+    response = {"format": "json", "records_path": ""}
+    with pytest.raises(m.ConnectorError, match="not valid json"):
+        m._decode_records(m.ResponsePage(200, {}, b"{bad", "x"), response)
+    with pytest.raises(m.ConnectorError, match="did not resolve"):
+        m._decode_records(m.ResponsePage(200, {}, b"3", "x"), response)
+    decoded, records = m._decode_records(
+        m.ResponsePage(200, {}, b'{"id":"one"}', "x"), response
+    )
+    assert records == [{"id": "one"}] and decoded == {"id": "one"}
+    ndjson = {"format": "jsonl", "records_path": ""}
+    assert len(m._decode_records(
+        m.ResponsePage(200, {}, b'{"id":1}\n\n{"id":2}\n', "x"), ndjson
+    )[1]) == 2
+
+
+def test_network_and_http_transport_edges(monkeypatch):
+    m = _load()
+    for url in ("ftp://example.test", "https://other.test"):
+        with pytest.raises(m.ConnectorError, match="network permissions"):
+            m._validate_network_url(url, ["example.test"])
+    with pytest.raises(m.ConnectorError, match="credentials"):
+        m._validate_network_url(
+            "https://user:pass@example.test", ["example.test"], True
+        )
+    monkeypatch.setattr(
+        m.socket,
+        "getaddrinfo",
+        lambda *_a, **_kw: (_ for _ in ()).throw(socket.gaierror("dns")),
+    )
+    with pytest.raises(m.ConnectorError, match="cannot resolve"):
+        m._validate_network_url("https://example.test", ["example.test"])
+    monkeypatch.setattr(
+        m.socket,
+        "getaddrinfo",
+        lambda *_a, **_kw: [
+            (m.socket.AF_INET, m.socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))
+        ],
+    )
+    m._validate_network_url("https://example.test", ["example.test"])
+
+    redirect = m._SafeRedirect(["example.test"], True)
+    monkeypatch.setattr(
+        m.urllib.request.HTTPRedirectHandler,
+        "redirect_request",
+        lambda self, req, fp, code, msg, headers, newurl: newurl,
+    )
+    assert redirect.redirect_request(None, None, 302, "", {}, "https://example.test/x") \
+        == "https://example.test/x"
+
+    manifest = _manifest(m, "bundle")
+    manifest["permissions"]["allow_private_network"] = True
+    manifest["request"]["max_bytes"] = 4
+
+    class Response:
+        status = 201
+        headers = {"Content-Length": "4", "X-Test": "yes"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def geturl(self):
+            return "https://sources.example/final"
+
+        def read(self, _limit):
+            return b"data"
+
+    opener = SimpleNamespace(open=lambda *_a, **_kw: Response())
+    monkeypatch.setattr(m.urllib.request, "build_opener", lambda *_a: opener)
+    page = m._open_http("https://sources.example/start", {}, manifest)
+    assert page.status == 201 and page.headers["x-test"] == "yes"
+
+    Response.headers = {"Content-Length": "5"}
+    with pytest.raises(m.ConnectorError, match="Content-Length"):
+        m._open_http("https://sources.example/start", {}, manifest)
+    Response.headers = {}
+    Response.read = lambda self, _limit: b"12345"
+    with pytest.raises(m.ConnectorError, match="response exceeds"):
+        m._open_http("https://sources.example/start", {}, manifest)
+
+    for error, expected in (
+        (urllib.error.HTTPError("x", 304, "", {}, None), m.NotModified),
+        (urllib.error.HTTPError("x", 500, "", {}, None), m.ConnectorError),
+        (urllib.error.URLError("down"), m.ConnectorError),
+    ):
+        opener.open = lambda *_a, _error=error, **_kw: (_ for _ in ()).throw(_error)
+        with pytest.raises(expected):
+            m._open_http("https://sources.example/start", {}, manifest)
+
+
+def test_normalize_request_and_parameter_edges():
+    m = _load()
+    manifest = _manifest(m, "bundle")
+    for invalid in (None, [], {}, ""):
+        record = {"id": invalid}
+        with pytest.raises(m.ConnectorError, match="stable ID"):
+            m._normalize(manifest, record, "now")
+    envelope = m._normalize(manifest, {"id": "x", "modified": []}, "now")
+    assert len(envelope["source_revision"]) == 64
+    assert len(m._safe_component("!!!")) == 16
+
+    request_manifest = _manifest(m, "query")
+    request_manifest["request"].setdefault("headers", {})["X-Bad"] = "${input.term}"
+    with pytest.raises(m.ConnectorError, match="newline"):
+        m._request_parts(
+            request_manifest, {"term": "a\nb"}, {}, {"page": 1, "cursor": ""}, {}
+        )
+    with pytest.raises(m.ConnectorError, match="invalid --param"):
+        m._params(["bad"])
+    with pytest.raises(m.ConnectorError, match="invalid --param"):
+        m._params(["=value"])
+    assert m._params(["a=1", "a=2"]) == {"a": "2"}
+
+
+def test_execute_network_paging_fixture_exhaustion_policy_and_error_ledger(
+    tmp_path, monkeypatch
+):
+    m = _load()
+    invalid = _manifest(m, "bundle")
+    invalid["mode"] = "bad"
+    with pytest.raises(m.ConnectorError, match="manifest invalid"):
+        m.execute(
+            invalid,
+            state_root=tmp_path / "state-invalid",
+            archive_root=tmp_path / "archive-invalid",
+            health_root=tmp_path / "health-invalid",
+        )
+
+    manifest = _manifest(m, "bundle")
+    manifest["pagination"] = {
+        "type": "page",
+        "request_param": "page",
+        "start": 1,
+        "max_pages": 2,
+    }
+    manifest["rate_limit"] = {"max_requests": 2, "per_seconds": 2}
+    pages = iter(
+        [
+            m.ResponsePage(
+                200, {}, b'{"objects":[{"id":"one","modified":"v1"}]}', "fixture"
+            ),
+            m.ResponsePage(200, {}, b'{"objects":[]}', "fixture"),
+        ]
+    )
+    monkeypatch.setattr(m, "_open_http", lambda *_a, **_kw: next(pages))
+    sleeps = []
+    result = m.execute(
+        manifest,
+        state_root=tmp_path / "state",
+        archive_root=tmp_path / "archive",
+        health_root=tmp_path / "health",
+        sleep=sleeps.append,
+    )
+    assert result["requests"] == 2 and sleeps == [1.0]
+
+    manifest["rate_limit"]["per_seconds"] = 0
+    pages = iter(
+        [
+            m.ResponsePage(
+                200, {}, b'{"objects":[{"id":"two","modified":"v1"}]}', "fixture"
+            ),
+            m.ResponsePage(200, {}, b'{"objects":[]}', "fixture"),
+        ]
+    )
+    monkeypatch.setattr(m, "_open_http", lambda *_a, **_kw: next(pages))
+    assert m.execute(
+        manifest,
+        state_root=tmp_path / "state-zero",
+        archive_root=tmp_path / "archive-zero",
+        health_root=tmp_path / "health-zero",
+        sleep=lambda _delay: (_ for _ in ()).throw(AssertionError("must not sleep")),
+    )["requests"] == 2
+
+    fixture = tmp_path / "one-page.json"
+    fixture.write_text(json.dumps({
+        "fixture_version": 1,
+        "pages": [{"body": {"objects": [{"id": "three", "modified": "v1"}]}}],
+    }))
+    assert m.execute(
+        manifest,
+        state_root=tmp_path / "state-fixture",
+        archive_root=tmp_path / "archive-fixture",
+        health_root=tmp_path / "health-fixture",
+        fixture=fixture,
+    )["requests"] == 1
+
+    fixture.write_text(json.dumps({
+        "fixture_version": 1,
+        "pages": [{"status": 500, "body": {"objects": []}}],
+    }))
+    with pytest.raises(m.ConnectorError, match="fixture HTTP 500"):
+        m.execute(
+            manifest,
+            state_root=tmp_path / "state-http",
+            archive_root=tmp_path / "archive-http",
+            health_root=tmp_path / "health-http",
+            fixture=fixture,
+        )
+
+    fixture.write_text(json.dumps({
+        "fixture_version": 1,
+        "pages": [{"body": {"objects": [{"id": "four", "modified": "v1"}]}}],
+    }))
+    monkeypatch.setattr(
+        m,
+        "policy_plane",
+        SimpleNamespace(
+            validate_importer_envelope=lambda *_a, **_kw: {"blocked": True},
+            finding_message=lambda _result: "policy blocked",
+        ),
+    )
+    monkeypatch.setattr(
+        m.collection_ledger,
+        "append_attempt",
+        lambda *_a, **_kw: (_ for _ in ()).throw(OSError("ledger down")),
+    )
+    with pytest.raises(m.ConnectorError, match="policy blocked"):
+        m.execute(
+            manifest,
+            state_root=tmp_path / "state-policy",
+            archive_root=tmp_path / "archive-policy",
+            health_root=tmp_path / "health-policy",
+            ledger_root=tmp_path / "ledger-policy",
+            fixture=fixture,
+        )
+
+
+def test_main_connector_error_summary_and_wake_modes(tmp_path, monkeypatch, capsys):
+    m = _load()
+    manifest = tmp_path / "manifest.yaml"
+    manifest.write_text("invalid: [")
+    assert m.main(["--manifest", str(manifest)]) == 2
+    assert "ERROR:" in capsys.readouterr().err
+
+    monkeypatch.setattr(m, "load_yaml", lambda _path: {})
+    monkeypatch.setattr(
+        m,
+        "execute",
+        lambda *_a, **_kw: {"items": [1], "new_revisions": 1, "ok": True},
+    )
+    assert m.main([
+        "--manifest", str(manifest), "--wake-on-new", "--summary-only",
+    ]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["wakeAgent"] is True and "items" not in output
+    assert m.main([
+        "--manifest", str(manifest), "--wake-on-new", "--dry-run",
+    ]) == 0
+    assert json.loads(capsys.readouterr().out)["wakeAgent"] is False
+
+
+def test_execute_zero_request_guard_and_no_policy_adapter(tmp_path, monkeypatch):
+    m = _load()
+    manifest = _manifest(m, "bundle")
+    monkeypatch.setattr(m, "validate_manifest", lambda _manifest: [])
+    manifest["rate_limit"]["max_requests"] = 0
+    result = m.execute(
+        manifest,
+        state_root=tmp_path / "state-zero",
+        archive_root=tmp_path / "archive-zero",
+        health_root=tmp_path / "health-zero",
+    )
+    assert result["requests"] == 0
+
+    manifest = _manifest(m, "bundle")
+    monkeypatch.setattr(m, "policy_plane", None)
+    result = m.execute(
+        manifest,
+        state_root=tmp_path / "state-no-policy",
+        archive_root=tmp_path / "archive-no-policy",
+        health_root=tmp_path / "health-no-policy",
+        fixture=FIXTURES / "bundle.fixture.json",
+    )
+    assert result["records"] == 2
 
 
 def test_runtime_refuses_symlink_escape_from_state_root(tmp_path):

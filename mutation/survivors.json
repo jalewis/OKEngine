@@ -1,0 +1,1043 @@
+{
+  "schema_version": 1,
+  "patterns": [
+    {
+      "pattern": "okengine-reader/search.py:10:44:core/ReplaceBinaryOperator_Mul_Div:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "This mutation changes the keyword-only separator to a positional-only separator before the injected dependencies. Every production caller supplies request/query/limit positionally and the injected dependencies by keyword, so both signatures accept exactly the reachable call contract."
+    },
+    {
+      "pattern": "src/okengine/cockpit_services/page_metadata.py:377:*:core/ReplaceComparisonOperator_Is_Eq:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "reliability_recognized is constructed locally as only None, True, or False; identity and equality with True are identical over that closed domain."
+    },
+    {
+      "pattern": "src/okengine/cockpit_services/page_metadata.py:38[45]:*:core/ReplaceComparisonOperator_Is_Eq:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "reliability_recognized is constructed locally as only None, True, or False; identity and equality with either boolean are identical over that closed domain."
+    },
+    {
+      "pattern": "migrations/m_v0_13_8_v0_14_0_deepseek_v4_1_flash.py:121:*:core/ReplaceComparisonOperator_Eq_LtE:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "re.subn returns a nonnegative replacement count, so replaced == 0 and replaced <= 0 are identical over every reachable apply() result."
+    },
+    {
+      "pattern": "okengine-reader/backlinks.py:*",
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "rationale": "The first complete merged-main campaign measured four reachable skip-source assertion gaps at 90.24%; they remain in the score and are owned under #612."
+    },
+    {
+      "pattern": "okengine-reader/page_metadata.py:*",
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "rationale": "The first complete merged-main campaign measured three reachable shape-conflict assertion gaps at 90.32%; they remain in the score and are owned under #612."
+    },
+    {
+      "pattern": "migrations/m_v0_13_8_v0_14_0_deepseek_v4_1_flash.py:*",
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "rationale": "Residual reachable parser mutations after the focused V4.1 migration ratchet remain counted and owned under #782; no survivor is removed from the score."
+    },
+    {
+      "pattern": "src/okengine/schema_exclusions.py:22:*:core/NumberReplacer:1",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "This replacement changes raw[5:] to raw[4:] after the confirmed wiki/ prefix. It retains only one additional leading slash, and the next operation is raw.strip('/'), so every accepted wiki/<namespace>/ spelling produces the same namespace. Other numeric replacements that remove namespace characters are killed by the focused tests."
+    },
+    {
+      "pattern": "src/okengine/corpus_transaction.py:109:*:core/ReplaceBinaryOperator_BitOr_Add:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "fcntl.LOCK_EX and fcntl.LOCK_NB are distinct single-bit POSIX flock flags, so bitwise OR and addition produce the same flag mask for every call to _acquire."
+    },
+    {
+      "pattern": "src/okengine/corpus_transaction.py:109:*:core/ReplaceBinaryOperator_BitOr_BitXor:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "fcntl.LOCK_EX and fcntl.LOCK_NB have no overlapping bits, so OR and XOR produce the same flag mask for every supported _acquire mode."
+    },
+    {
+      "pattern": "scripts/cron/id_lib.py:100:*:core/ReplaceBinaryOperator_Sub_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "qualified_namespace receives a Markdown page path, while each continued prefix must be a directory containing schema.yaml. The full page path can never satisfy that directory predicate, so every surviving terminal-bound replacement stops on the same first non-container prefix."
+    },
+    {
+      "pattern": "scripts/cron/id_lib.py:100:*:core/ReplaceComparisonOperator_Lt_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "An extra terminal comparison can only test the full Markdown page path for a child schema.yaml; that predicate is necessarily false. The maximal nested-container test distinguishes every comparison that can change a reachable prefix."
+    },
+    {
+      "pattern": "scripts/cron/id_lib.py:100:*:core/NumberReplacer:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "The surviving numeric replacements shift only the terminal lookahead. Since a page file cannot also be a schema container directory, both bounds stop at the same prefix; mutations that truncate a real nested container are killed by the maximal-nesting regression test."
+    },
+    {
+      "pattern": "scripts/cron/id_index.py:233:*:core/ReplaceBinaryOperator_Sub_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "This is only the terminal bound len(parts)-1 in _qualified_ns. containers contains resolved schema-parent directories, while rel names a scanned .md file, so the full rel can never be a container; every surviving replacement still reaches the first non-container prefix and returns the same qualified namespace."
+    },
+    {
+      "pattern": "scripts/cron/id_index.py:233:*:core/ReplaceComparisonOperator_Lt_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "At the terminal _qualified_ns bound, an extra comparison can only test the full Markdown file path against a set populated exclusively by schema directories. That membership is necessarily false, so each surviving comparison replacement leaves i and the returned namespace unchanged."
+    },
+    {
+      "pattern": "scripts/cron/id_index.py:233:*:core/NumberReplacer:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "The surviving numeric replacements alter only the terminal lookahead by one position. A scanned .md rel cannot equal a schema-parent directory in containers, so both bounds stop at the same first non-container prefix; deeper/reduced reachable bounds are distinguished by the maximal-nesting regression test."
+    },
+    {
+      "pattern": "scripts/reid_sources_by_url.py:354:*:core/ReplaceComparisonOperator_Gt_NotEq:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "targets_by_old values are constructed only by setdefault(...).add(new), so they are non-empty; on that domain len(targets) > 1 and len(targets) != 1 are identical."
+    },
+    {
+      "pattern": "scripts/reid_sources_by_url.py:357:*:core/ReplaceComparisonOperator_Eq_LtE:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "targets_by_old values are necessarily non-empty sets, so len(targets) == 1 and len(targets) <= 1 are identical over every reachable input."
+    },
+    {
+      "pattern": "scripts/reid_sources_by_url.py:357:*:core/ReplaceComparisonOperator_Eq_GtE:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "The >= variant can add only ambiguous old ids, and the immediately following dictionary merge overwrites every ambiguous entry with its old->old sentinel. The scan input is therefore byte-for-byte identical."
+    },
+    {
+      "pattern": "scripts/reid_sources_by_url.py:164:*:core/ReplaceContinueWithBreak:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "read_fm returns a truthy mapping only after the same _FM expression matched. After the preceding `if not fm: continue`, the `if not match` branch is unreachable, so replacing its continue cannot affect any input."
+    },
+    {
+      "pattern": "scripts/reid_sources_by_url.py:167:*:core/NumberReplacer:31",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "_FM group 0 is exactly group 1 plus the two frontmatter fence lines. Those fences contain no source-id token, and the expression scans tokens only, so groups 0 and 1 yield the same set."
+    },
+    {
+      "pattern": "scripts/reid_sources_by_url.py:266:*:core/NumberReplacer:69",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "_FM group 0 is exactly group 1 plus token-free fence lines. Removing id lines and scanning source-id tokens therefore produces the same present set from either group."
+    },
+    {
+      "pattern": "src/okengine/write_services/state.py:172:*:core/ReplaceBinaryOperator_BitOr_Add:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "re.I and re.S are disjoint single-bit RegexFlag values, so integer addition and bitwise OR both produce the exact flag mask 18. The mixed-case multiline behavioral assertion independently pins both required semantics."
+    },
+    {
+      "pattern": "src/okengine/write_services/state.py:172:*:core/ReplaceBinaryOperator_BitOr_BitXor:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "re.I and re.S have no overlapping bits, so XOR and OR both produce the exact flag mask 18. The mixed-case multiline behavioral assertion independently pins both required semantics."
+    },
+    {
+      "pattern": "tools/policy_plane.py:247:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Postponed parameter annotation only; the replacement is never evaluated at runtime."
+    },
+    {
+      "pattern": "tools/policy_plane.py:253:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Postponed parameter annotation only; the replacement is never evaluated at runtime."
+    },
+    {
+      "pattern": "tools/policy_plane.py:254:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Postponed parameter annotation only; the replacement is never evaluated at runtime."
+    },
+    {
+      "pattern": "tools/policy_plane.py:295:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Postponed return annotation only; the replacement is never evaluated at runtime."
+    },
+    {
+      "pattern": "tools/policy_plane.py:358:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Postponed return annotation only; the replacement is never evaluated at runtime."
+    },
+    {
+      "pattern": "tools/policy_plane.py:517:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Postponed CLI parameter annotation only; the replacement is never evaluated at runtime."
+    },
+    {
+      "pattern": "scripts/cron/schema_lib.py:120:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Postponed return annotation only; the replacement is never evaluated at runtime."
+    },
+    {
+      "pattern": "scripts/cron/schema_lib.py:143:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Postponed return annotation only; the replacement is never evaluated at runtime."
+    },
+    {
+      "pattern": "scripts/cron/schema_lib.py:644:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Postponed nested return annotation only; the replacement is never evaluated at runtime."
+    },
+    {
+      "pattern": "scripts/cron/schema_lib.py:663:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Postponed return annotation only; the replacement is never evaluated at runtime."
+    },
+    {
+      "pattern": "src/okengine/mcp/scope.py:60:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, each replacement changes only the unevaluated dict-or-None return annotation on resolve() and cannot affect authorization behavior."
+    },
+    {
+      "pattern": "scripts/cron/output_contract.py:90:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, each replacement changes only one unevaluated PEP 604 union token in compose()'s annotations and cannot affect runtime behavior."
+    },
+    {
+      "pattern": "tools/policy_plane.py:259:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, each replacement changes only the unevaluated evidence dict-or-None annotation and cannot affect runtime policy behavior."
+    },
+    {
+      "pattern": "tools/policy_plane.py:260:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, each replacement changes only the unevaluated evaluated_at string-or-None annotation and cannot affect runtime policy behavior."
+    },
+    {
+      "pattern": "tools/policy_plane.py:301:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, each replacement changes only evaluate_capability's unevaluated dict-or-None return annotation."
+    },
+    {
+      "pattern": "tools/policy_plane.py:364:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, each replacement changes only validate_importer_envelope's unevaluated dict-or-None return annotation."
+    },
+    {
+      "pattern": "tools/policy_plane.py:523:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, each replacement changes only main's unevaluated list-or-None parameter annotation."
+    },
+    {
+      "pattern": "tools/policy_plane.py:*",
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "rationale": "Reachable survivor retained in the mutation denominator after the #530 assertion-strengthening pass; the policy target remains above the 90% critical floor and these exact survivors remain visible in the retained report for the next ratchet."
+    },
+    {
+      "pattern": "tools/schema_validator.py:*",
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "rationale": "Reachable survivors remain counted after the #535 assertion-strengthening pass raised this critical schema target from 80.50% to 91.91%; exact fingerprints stay visible in the retained report for the next non-decreasing ratchet."
+    },
+    {
+      "pattern": "scripts/cron/schema_lib.py:*",
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "rationale": "Reachable survivor retained in the mutation denominator after the #530 assertion-strengthening pass; the schema target remains above the 90% critical floor and these exact survivors remain visible in the retained report for the next ratchet."
+    },
+    {
+      "pattern": "scripts/cron/output_contract.py:*",
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "rationale": "Reachable survivor retained in the mutation denominator after the #530 assertion-strengthening pass; the target remains above the 90% critical floor and this disposition must be revisited by the next ratchet."
+    },
+    {
+      "pattern": "scripts/cron_jitter.py:*:core/ReplaceBinaryOperator_BitOr_*:*",
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "The module enables postponed annotations; replacing the union operator in these return and parameter annotations cannot change runtime scheduling behavior."
+    },
+    {
+      "pattern": "scripts/cron/postgres_projection.py:*",
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "rationale": "Reachable survivors remain counted during the first #566 mutation baseline; the noncritical projector target must remain above the repository 80% floor."
+    },
+    {
+      "pattern": "src/okengine/mcp/projection.py:*",
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "rationale": "Reachable survivors remain counted after #566 boundary-focused strengthening; the freshness and authorization target must clear the 90% critical floor."
+    },
+    {
+      "pattern": "okengine-mcp/server.py:*",
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "rationale": "Reachable server survivors remain counted after #566 wrapper argument and scope assertions; the target must clear the 90% critical floor."
+    },
+    {
+      "pattern": "scripts/framework_ingest_rebuild.py:*",
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "rationale": "Reachable survivors remain counted after #566 exact subprocess and opt-in selection assertions; the target must clear the 90% critical floor."
+    },
+    {
+      "pattern": "scripts/*",
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "rationale": "Reachable survivors in newly mapped script targets remain in each target denominator and are retained with their exact fingerprints in the mutation artifact for assertion-strengthening follow-up."
+    },
+    {
+      "pattern": "okengine-mcp/write_server.py:*",
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "rationale": "Reachable write-path survivors remain in the target denominator and are retained with exact fingerprints in the mutation artifact for assertion-strengthening follow-up."
+    },
+    {
+      "pattern": "src/okengine/write_services/*",
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Reachable survivors in the #612 extracted write-service targets remain fully counted in each score. This ownership disposition makes every residual gap explicit while the dated target-floor waivers and survivor-driven tests ratchet the newly measured surface upward."
+    }
+  ],
+  "survivors": {
+    "okengine-mcp/output_contract_enforce.py:104:59:core/NumberReplacer:1": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "The mutated expression is `meaningful < int(bspec.get('min_non_whitespace') or -1)`, replacing a default of 0. `meaningful` is len() over a string and is therefore never negative, so both 0 and -1 are unreachable lower bounds and the comparison is False for every possible input - including the `min_non_whitespace: 0` case, where the falsy 0 makes the default apply. Verified exhaustively over the reachable input space rather than argued. The sibling mutant at the same site (NumberReplacer:0, default 1) IS observable and is killed by test_an_empty_body_without_a_declared_minimum_is_accepted, so the site is not blanket-waived."
+    },
+    "src/okengine/actor_identity.py:79:28:core/ReplaceOrWithAnd:5": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "When evidence text is empty, changing the second OR to AND can only fall through to the two actor-pattern searches; both necessarily remain false on empty text, so the public result is still false for every input. The separate missing-title branch remains behaviorally tested."
+    },
+    "scripts/cron/hardening_lib.py:98:58:core/ReplaceComparisonOperator_Eq_Is:2": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "The value is normalized through str(...).strip() and CPython interns the one-character string '0', so equality and identity have the same reachable result on this normalized comparison."
+    },
+    "scripts/model_profiles.py:59:61:core/ReplaceBinaryOperator_BitOr_Add:0": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, replacing the union token changes only an unevaluated annotation AST and cannot affect runtime behavior."
+    },
+    "scripts/model_profiles.py:59:61:core/ReplaceBinaryOperator_BitOr_Sub:0": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, replacing the union token changes only an unevaluated annotation AST and cannot affect runtime behavior."
+    },
+    "scripts/model_profiles.py:59:61:core/ReplaceBinaryOperator_BitOr_Mul:0": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, replacing the union token changes only an unevaluated annotation AST and cannot affect runtime behavior."
+    },
+    "scripts/model_profiles.py:59:61:core/ReplaceBinaryOperator_BitOr_Div:0": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, replacing the union token changes only an unevaluated annotation AST and cannot affect runtime behavior."
+    },
+    "scripts/model_profiles.py:59:61:core/ReplaceBinaryOperator_BitOr_FloorDiv:0": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, replacing the union token changes only an unevaluated annotation AST and cannot affect runtime behavior."
+    },
+    "scripts/model_profiles.py:59:61:core/ReplaceBinaryOperator_BitOr_Mod:0": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, replacing the union token changes only an unevaluated annotation AST and cannot affect runtime behavior."
+    },
+    "scripts/model_profiles.py:59:61:core/ReplaceBinaryOperator_BitOr_Pow:0": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, replacing the union token changes only an unevaluated annotation AST and cannot affect runtime behavior."
+    },
+    "scripts/model_profiles.py:59:61:core/ReplaceBinaryOperator_BitOr_RShift:0": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, replacing the union token changes only an unevaluated annotation AST and cannot affect runtime behavior."
+    },
+    "scripts/model_profiles.py:59:61:core/ReplaceBinaryOperator_BitOr_LShift:0": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, replacing the union token changes only an unevaluated annotation AST and cannot affect runtime behavior."
+    },
+    "scripts/model_profiles.py:59:61:core/ReplaceBinaryOperator_BitOr_BitAnd:0": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, replacing the union token changes only an unevaluated annotation AST and cannot affect runtime behavior."
+    },
+    "scripts/model_profiles.py:59:61:core/ReplaceBinaryOperator_BitOr_BitXor:0": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "With postponed annotations, replacing the union token changes only an unevaluated annotation AST and cannot affect runtime behavior."
+    },
+    "scripts/model_profiles.py:89:77:core/ReplaceComparisonOperator_Gt_NotEq:0": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "The preceding startswith('@') condition requires length at least one, so length > 1 and length != 1 are identical on every reachable value."
+    },
+    "scripts/cron/review_autoverify.py:60:91:core/ReplaceBinaryOperator_BitOr_Add:0": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "re.S and re.I are disjoint single-bit flags, so |, + and ^ produce the identical RegexFlag. No input can distinguish them."
+    },
+    "scripts/cron/review_autoverify.py:60:91:core/ReplaceBinaryOperator_BitOr_BitXor:0": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "re.S and re.I are disjoint single-bit flags, so |, + and ^ produce the identical RegexFlag. No input can distinguish them."
+    },
+    "scripts/cron/review_autoverify.py:50:16:core/NumberReplacer:0": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "sys.path.insert position for the script's own directory. schema_lib resolves from that entry regardless of index, so no observable behaviour depends on the position."
+    },
+    "scripts/cron/review_autoverify.py:50:16:core/NumberReplacer:1": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "sys.path.insert position for the script's own directory. schema_lib resolves from that entry regardless of index, so no observable behaviour depends on the position."
+    },
+    "scripts/cron/review_autoverify.py:285:12:core/ReplaceComparisonOperator_Eq_Lt:3": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "The `if __name__ == \"__main__\"` dispatch guard. Under pytest __name__ is the module name, so every comparison variant is falsey; process dispatch is interpreter glue with no behavioural decision (same rationale as the coverage exclude_also entry in pyproject.toml)."
+    },
+    "scripts/cron/review_autoverify.py:285:12:core/ReplaceComparisonOperator_Eq_LtE:3": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "The `if __name__ == \"__main__\"` dispatch guard — see the Eq_Lt disposition on the same line."
+    },
+    "scripts/cron/review_autoverify.py:285:12:core/ReplaceComparisonOperator_Eq_Is:2": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "The `if __name__ == \"__main__\"` dispatch guard — see the Eq_Lt disposition on the same line."
+    },
+    "scripts/cron/review_autoverify.py:138:43:core/NumberReplacer:8": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Byte-length ceiling on a source ref. Verified unobservable: Path.is_file() returns False for an over-length name rather than raising, and the surrounding `except OSError` also returns None — so shifting or loosening the boundary yields the identical None for every input. The guard is a cheap short-circuit, not a behavioural branch."
+    },
+    "scripts/cron/review_autoverify.py:138:43:core/NumberReplacer:9": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Byte-length ceiling on a source ref. Verified unobservable: Path.is_file() returns False for an over-length name rather than raising, and the surrounding `except OSError` also returns None — so shifting or loosening the boundary yields the identical None for every input. The guard is a cheap short-circuit, not a behavioural branch."
+    },
+    "scripts/cron/review_autoverify.py:138:43:core/ReplaceComparisonOperator_Gt_Eq:4": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Byte-length ceiling on a source ref. Verified unobservable: Path.is_file() returns False for an over-length name rather than raising, and the surrounding `except OSError` also returns None — so shifting or loosening the boundary yields the identical None for every input. The guard is a cheap short-circuit, not a behavioural branch."
+    },
+    "scripts/cron/review_autoverify.py:138:43:core/ReplaceComparisonOperator_Gt_GtE:4": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Byte-length ceiling on a source ref. Verified unobservable: Path.is_file() returns False for an over-length name rather than raising, and the surrounding `except OSError` also returns None — so shifting or loosening the boundary yields the identical None for every input. The guard is a cheap short-circuit, not a behavioural branch."
+    },
+    "scripts/cron/review_autoverify.py:139:38:core/NumberReplacer:10": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Byte-length ceiling on a source ref. Verified unobservable: Path.is_file() returns False for an over-length name rather than raising, and the surrounding `except OSError` also returns None — so shifting or loosening the boundary yields the identical None for every input. The guard is a cheap short-circuit, not a behavioural branch."
+    },
+    "scripts/cron/review_autoverify.py:139:38:core/NumberReplacer:11": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Byte-length ceiling on a source ref. Verified unobservable: Path.is_file() returns False for an over-length name rather than raising, and the surrounding `except OSError` also returns None — so shifting or loosening the boundary yields the identical None for every input. The guard is a cheap short-circuit, not a behavioural branch."
+    },
+    "scripts/cron/review_autoverify.py:139:38:core/ReplaceComparisonOperator_Gt_Eq:5": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Byte-length ceiling on a source ref. Verified unobservable: Path.is_file() returns False for an over-length name rather than raising, and the surrounding `except OSError` also returns None — so shifting or loosening the boundary yields the identical None for every input. The guard is a cheap short-circuit, not a behavioural branch."
+    },
+    "scripts/cron/review_autoverify.py:139:38:core/ReplaceComparisonOperator_Gt_GtE:5": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Byte-length ceiling on a source ref. Verified unobservable: Path.is_file() returns False for an over-length name rather than raising, and the surrounding `except OSError` also returns None — so shifting or loosening the boundary yields the identical None for every input. The guard is a cheap short-circuit, not a behavioural branch."
+    },
+    "scripts/cron/review_autoverify.py:186:83:core/ReplaceComparisonOperator_NotEq_Gt:1": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Reached only inside `if graded.get(g):`, so len(graded[g]) >= 1 always. `!= 1` and `> 1` therefore agree on every reachable input; the len==0 case that would distinguish them cannot occur."
+    },
+    "scripts/cron/review_autoverify.py:225:34:core/ReplaceComparisonOperator_IsNot_NotEq:1": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Reached only after _NEEDS_RE matched a literal `needs_review: true` line, which YAML parses to the True singleton. `is not True` and `!= True` agree for that sole reachable value."
+    },
+    "scripts/cron/review_autoverify.py:226:12:core/ReplaceContinueWithBreak:5": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "The continue guarded by `fm.get('needs_review') is not True`, which is unreachable: the page only reaches this line because _NEEDS_RE matched a literal true, so the branch never executes and continue-vs-break cannot be observed."
+    },
+    "scripts/cron/review_autoverify.py:136:8:core/ReplaceOrWithAnd:6": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "The `or Path(key).is_absolute()` link. Unreachable: the function already returned unless the key startswith('sources/'), so no surviving key can be absolute and this disjunct is never the deciding one."
+    },
+    "scripts/cron/review_autoverify.py:154:16:core/NumberReplacer:13": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Index into `hits` on the branch guarded by len(hits) == 1. With exactly one element hits[0] and hits[-1] are the same object, so the mutated index returns an identical result."
+    },
+    "scripts/cron/review_autoverify.py:222:57:core/NumberReplacer:29": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "_FM_RE group index in the skip test. group(0) is group(1) plus the surrounding `---` delimiters, and _NEEDS_RE.search finds the flag line in either, so the skip decision is unchanged."
+    },
+    "scripts/cron/review_autoverify.py:138:41:core/ReplaceComparisonOperator_Gt_Eq:0": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Byte-length ceiling on a source ref. Verified unobservable: Path.is_file() returns False for an over-length name rather than raising, and the surrounding `except OSError` returns None too, so tightening or loosening the comparison yields the identical None for every input."
+    },
+    "scripts/cron/review_autoverify.py:138:41:core/ReplaceComparisonOperator_Gt_GtE:0": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Byte-length ceiling on a source ref. Verified unobservable: Path.is_file() returns False for an over-length name rather than raising, and the surrounding `except OSError` returns None too, so tightening or loosening the comparison yields the identical None for every input."
+    },
+    "scripts/cron/review_autoverify.py:139:36:core/ReplaceComparisonOperator_Gt_Eq:1": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Byte-length ceiling on a source ref. Verified unobservable: Path.is_file() returns False for an over-length name rather than raising, and the surrounding `except OSError` returns None too, so tightening or loosening the comparison yields the identical None for every input."
+    },
+    "scripts/cron/review_autoverify.py:139:36:core/ReplaceComparisonOperator_Gt_GtE:1": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Byte-length ceiling on a source ref. Verified unobservable: Path.is_file() returns False for an over-length name rather than raising, and the surrounding `except OSError` returns None too, so tightening or loosening the comparison yields the identical None for every input."
+    },
+    "scripts/cron/review_autoverify.py:139:8:core/ReplaceOrWithAnd:9": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "The `or len(key.encode()) > 4096` link in the same guard chain — unobservable for the reason recorded on line 139's comparison mutants."
+    },
+    "scripts/cron/condition_recheck.py:55:16:core/NumberReplacer:0": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "sys.path.insert position for the script's own directory — schema_lib resolves from that entry regardless of index."
+    },
+    "scripts/cron/condition_recheck.py:55:16:core/NumberReplacer:1": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "sys.path.insert position for the script's own directory — schema_lib resolves from that entry regardless of index."
+    },
+    "scripts/cron/condition_recheck.py:64:91:core/ReplaceBinaryOperator_BitOr_Add:0": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "re.S and re.I are disjoint single-bit flags, so |, + and ^ yield the identical RegexFlag."
+    },
+    "scripts/cron/condition_recheck.py:64:91:core/ReplaceBinaryOperator_BitOr_BitXor:0": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "re.S and re.I are disjoint single-bit flags, so |, + and ^ yield the identical RegexFlag."
+    },
+    "scripts/cron/condition_recheck.py:313:12:core/ReplaceComparisonOperator_Eq_Lt:3": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "The `if __name__ == \"__main__\"` dispatch guard — interpreter glue with no behavioural decision."
+    },
+    "scripts/cron/condition_recheck.py:313:12:core/ReplaceComparisonOperator_Eq_LtE:3": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "The `if __name__ == \"__main__\"` dispatch guard — interpreter glue with no behavioural decision."
+    },
+    "scripts/cron/condition_recheck.py:313:12:core/ReplaceComparisonOperator_Eq_Is:3": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "The `if __name__ == \"__main__\"` dispatch guard — interpreter glue with no behavioural decision."
+    },
+    "scripts/cron/condition_recheck.py:289:34:core/ReplaceComparisonOperator_IsNot_NotEq:0": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Reached only after _NEEDS_RE matched a literal `needs_review: true`, which YAML parses to the True singleton; `is not True` and `!= True` agree for that sole reachable value."
+    },
+    "scripts/cron/condition_recheck.py:286:49:core/NumberReplacer:39": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "_FM_RE group index in the skip test: group(0) is group(1) plus the surrounding `---`, and _NEEDS_RE.search finds the flag line in either, so the decision is unchanged."
+    },
+    "scripts/cron/condition_recheck.py:220:53:core/ReplaceComparisonOperator_NotEq_IsNot:0": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Identity-vs-equality on the `type` filter. Unreachable: `type` is present on every page that reaches this line (the frontmatter parsed and carries it), so including or excluding it from the required list cannot change `missing`."
+    },
+    "scripts/cron/condition_recheck.py:242:25:core/AddNot:27": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "`m` is always truthy here — the scan only reaches this line after _FM_RE matched — so the conditional's else arm is unreachable."
+    },
+    "scripts/cron/condition_recheck.py:245:15:core/ReplaceComparisonOperator_Eq_GtE:1": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "`cls` ranges over {collision, degenerate, wikilink}. Only 'wikilink' satisfies >= 'wikilink', which is exactly the == case."
+    },
+    "scripts/cron/condition_recheck.py:245:15:core/ReplaceComparisonOperator_Eq_Is:1": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "`cls` is always one of the interned _RETESTABLE literals, so `is` and `==` agree."
+    },
+    "scripts/cron/condition_recheck.py:249:17:core/ReplaceComparisonOperator_Eq_GtE:2": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "Reached only when cls != 'wikilink' (the preceding if consumed that case), leaving 'collision' and 'degenerate'; neither distinguishes >= from ==."
+    },
+    "scripts/cron/condition_recheck.py:249:17:core/ReplaceComparisonOperator_Eq_Is:2": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "`cls` is always one of the interned _RETESTABLE literals, so `is` and `==` agree."
+    },
+    "scripts/cron/condition_recheck.py:116:79:core/NumberReplacer:24": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "The `default=0` of the max() over split segments. re.split always returns at least one segment, so the generator is never empty and the default is unreachable."
+    },
+    "scripts/cron/condition_recheck.py:116:79:core/NumberReplacer:25": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "The `default=0` of the max() over split segments — unreachable for the same reason."
+    },
+    "scripts/cron/condition_recheck.py:238:54:core/NumberReplacer:30": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "`detail[:70]` truncation inside the held message. The message is bucketed by its prefix before the first colon, so the truncated tail never reaches any output and no input can observe the width."
+    },
+    "scripts/cron/condition_recheck.py:238:54:core/NumberReplacer:31": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "`detail[:70]` truncation — unobservable for the same reason."
+    },
+    "scripts/cron/condition_recheck.py:302:72:core/NumberReplacer:52": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "`count=1` in the flag substitution. The frontmatter carries a single `needs_review: true` line on every page that reaches this write, so count 0, 1 or 2 replace the same one line."
+    },
+    "scripts/cron/condition_recheck.py:302:72:core/NumberReplacer:53": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "`count=1` in the flag substitution — same single-occurrence argument."
+    },
+    "scripts/cron/condition_recheck.py:87:21:core/ReplaceComparisonOperator_Gt_NotEq:0": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "`len(base) > 1` vs `!= 1`. They differ only at len 0, which is unreachable: this line is guarded by `parts[-1][:1].isalnum()`, so base always has at least one character. For every reachable length the two agree."
+    },
+    "scripts/cron/condition_recheck.py:290:12:core/ReplaceContinueWithBreak:9": {
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "disposition": "equivalent",
+      "rationale": "The continue guarded by that unreachable non-True branch — it never executes, so continue-vs-break cannot be observed."
+    },
+    "src/okengine/write_services/authorization.py:87:29:core/ReplaceBinaryOperator_Mul_Div:0": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:138:4:core/ReplaceBinaryOperator_Mul_Div:1": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:170:14:core/ReplaceBinaryOperator_Mul_Div:2": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:96:26:core/ReplaceComparisonOperator_Eq_LtE:0": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:103:26:core/ReplaceComparisonOperator_Eq_LtE:1": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:186:26:core/ReplaceComparisonOperator_Eq_LtE:2": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:253:66:core/ReplaceComparisonOperator_Eq_LtE:5": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:271:47:core/ReplaceComparisonOperator_Eq_LtE:6": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:186:26:core/ReplaceComparisonOperator_Eq_GtE:2": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:271:47:core/ReplaceComparisonOperator_Eq_GtE:6": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:314:14:core/ReplaceComparisonOperator_Eq_GtE:8": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:103:26:core/ReplaceComparisonOperator_Eq_Is:1": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:310:15:core/ReplaceComparisonOperator_Eq_Is:4": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:162:110:core/ReplaceComparisonOperator_NotEq_Gt:1": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:164:65:core/ReplaceComparisonOperator_NotEq_Gt:2": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:261:42:core/ReplaceComparisonOperator_Gt_NotEq:0": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:320:25:core/ReplaceUnaryOperator_USub_UAdd:6": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:320:25:core/ReplaceUnaryOperator_USub_Invert:6": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:320:25:core/ReplaceUnaryOperator_USub_Not:6": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:320:25:core/ReplaceUnaryOperator_Delete_USub:6": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:100:51:core/AddNot:8": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:309:70:core/ReplaceTrueWithFalse:5": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:144:47:core/ReplaceAndWithOr:2": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:186:41:core/ReplaceAndWithOr:3": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:271:31:core/ReplaceAndWithOr:9": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:77:45:core/ReplaceOrWithAnd:1": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:110:65:core/ReplaceOrWithAnd:3": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:112:50:core/ReplaceOrWithAnd:4": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:126:67:core/ReplaceOrWithAnd:5": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:312:12:core/ReplaceBreakWithContinue:0": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:145:62:core/NumberReplacer:0": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:253:47:core/NumberReplacer:9": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:261:55:core/NumberReplacer:31": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:319:31:core/NumberReplacer:34": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:320:26:core/NumberReplacer:38": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "src/okengine/write_services/authorization.py:320:26:core/NumberReplacer:39": {
+      "disposition": "assertion-gap-counted",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Exact surviving behavioral variant retained as counted mutation debt after the authorization suite reached the 90% critical floor; no equivalence or wildcard waiver is claimed."
+    },
+    "ci/registry_canary.py:182:12:core/ReplaceComparisonOperator_Eq_Is:1": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Mutates `if __name__ == \"__main__\":` to `is`. CPython sets __name__ for a script to the interned string \"__main__\", and an identifier-shaped string literal is interned too, so `is` and `==` agree whenever the script runs directly -- confirmed under CPython, where `__name__ is \"__main__\"` evaluated True. For an import, __name__ is the module's name, a different string, so both are False. The CI job runs this file with CPython. The sibling `<=` mutant at the same site is NOT equivalent (uppercase import names sort below \"__main__\") and is killed by test_importing_the_module_under_any_name_does_not_run_it, so the site is not blanket-waived."
+    },
+    "ci/registry_canary.py:69:33:core/NumberReplacer:8": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Mutates `line.split(\"#\", 1)[0]` to maxsplit 2. Only element [0] is used, and str.split's first element is the text before the first separator for ANY maxsplit >= 1 -- the maxsplit only limits how the remainder is divided. Verified over 400,000 random (string, separator) cases, not argued. The sibling maxsplit 0 mutant, which does change [0] (it stops splitting at all), is killed by test_an_inline_comment_attached_to_the_address_is_stripped."
+    },
+    "ci/registry_canary.py:88:37:core/NumberReplacer:18": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Mutates the port argument to socket.getaddrinfo from 443 to 444. resolve_ipv4 returns only info[4][0], the address; a numeric port selects no service entry and only fills the port field of each sockaddr, which is discarded. The address set is therefore independent of the port -- verified: getaddrinfo returned identical addresses for ports 442, 443 and 444. The TLS layer connects on its own literal 443 in tls_handshake, which is asserted by test_tls_handshake_connects_to_the_address_but_verifies_the_hostname."
+    },
+    "ci/registry_canary.py:88:37:core/NumberReplacer:19": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Mutates the port argument to socket.getaddrinfo from 443 to 442. Same reasoning as NumberReplacer:18 at this site: only the address (info[4][0]) is returned, and the numeric port does not affect which addresses resolve -- verified identical for ports 442, 443 and 444."
+    },
+    "ci/registry_canary.py:164:71:core/NumberReplacer:28": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Mutates `__doc__.split(\"\\n\\n\", 1)[0]` to maxsplit 2. Only element [0] (the docstring's first paragraph) is used, and it is identical for any maxsplit >= 1 -- verified over the same 400,000-case check as the resolv.conf split. The sibling mutants that DO change the help text (maxsplit 0, and index [1]) are killed by test_help_shows_the_summary_line_and_not_the_whole_docstring."
+    },
+    "ci/registry_canary.py:178:55:core/NumberReplacer:32": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Mutates `json.dumps(report, indent=2)` to indent 3. Indentation changes whitespace only; the report is consumed as JSON, and json.loads yields an identical object -- verified for indent 1, 2 and 3 on a report containing nested lists, booleans and escaped quotes/newlines. Nothing reads the artifact as text."
+    },
+    "ci/registry_canary.py:178:55:core/NumberReplacer:33": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Mutates `json.dumps(report, indent=2)` to indent 1. Same as NumberReplacer:32 at this site: whitespace only, and json.loads round-trips to an identical object for indent 1, 2 and 3."
+    },
+    "scripts/cron/fleet_health.py:237:12:core/ReplaceComparisonOperator_Is_Eq:0": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Mutates the `_READ_TELEMETRY` sentinel test from `is` to `==`. The sentinel is a bare `object()`, whose equality is identity, and every other value reaching this check (None, a dict, a list, a scalar) returns NotImplemented or False against it, so `==` and `is` agree for every argument. The sibling `is not` mutant is killed by test_explicitly_absent_telemetry_is_unknown_without_rereading."
+    },
+    "scripts/cron/fleet_health.py:390:55:core/ReplaceComparisonOperator_Eq_LtE:7": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "At this branch `verdict` is exactly \"PASS\" or \"FAIL\": _deployment_verdict returns only a regex group of (PASS|FAIL) or None, and None was classified by the preceding branch. \"FAIL\" <= \"FAIL\" is True and \"PASS\" <= \"FAIL\" is False, the same as `==` for both. The `>=`, `!=` and `<` siblings are killed by test_a_fail_verdict_on_a_completed_run_is_errored_not_ok and test_silent_pass_reads_the_verdict_from_the_report_this_run_wrote."
+    },
+    "scripts/cron/observability_validate.py:93:22:core/ReplaceComparisonOperator_Eq_LtE:0": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "`published` lists which of the two percentile keys are present, so its length is 0, 1 or 2, and length 0 has already returned above. For the remaining lengths `<= 1` and `== 1` agree. The `!=`/`>=` siblings are killed by test_percentiles_are_published_together and test_fresh_nonempty_consistent_surfaces_pass."
+    },
+    "okengine-reader/page_metadata.py:65:56:core/ReplaceComparisonOperator_Is_Eq:0": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "`reliability_recognized` is constructed immediately above as exactly None, True, or False. On those singleton values `is True` and `== True` agree; the ranked known, unknown, and blank-grade cases are all asserted by test_conflict_reliability_distinguishes_unrated_from_out_of_vocabulary."
+    },
+    "okengine-reader/page_metadata.py:75:57:core/ReplaceComparisonOperator_Is_Eq:1": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Every source record receives `reliability_recognized` from the local tri-state expression, so its reachable domain is only None/True/False. `is True` and `== True` therefore select the same records for rank_known; behavioral cases cover each tri-state value."
+    },
+    "okengine-reader/page_metadata.py:78:57:core/ReplaceComparisonOperator_Is_Eq:2": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "Every source record receives `reliability_recognized` from the local tri-state expression, so its reachable domain is only None/True/False. `is False` and `== False` therefore select the same records for reliability_oov; behavioral cases cover each tri-state value."
+    }
+  }
+}

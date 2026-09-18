@@ -36,7 +36,12 @@ def load_scope(vault: Path) -> dict | None:
         d = yaml.safe_load(f.read_text(encoding="utf-8", errors="replace")) or {}
     except yaml.YAMLError:
         return None
-    scope = (d.get("pack_config") or {}).get("scope")
+    if not isinstance(d, dict):
+        return None
+    pack_config = d.get("pack_config") or {}
+    if not isinstance(pack_config, dict):
+        return None
+    scope = pack_config.get("scope")
     if not isinstance(scope, dict) or not (scope.get("in_scope") or scope.get("out_of_scope")):
         return None
     return scope
@@ -83,7 +88,7 @@ def page_blob(path: Path, excerpt_chars: int = 400) -> tuple[dict, str]:
 
 def score(blob: str, in_terms: set[str], out_terms: set[str]) -> tuple[int, int, list[str]]:
     """(in_hits, out_hits, matched_out_terms) — distinct-term counts."""
-    words = set(re.split(r"[^a-z0-9-]+", blob))
+    words = set(re.split(r"[^a-z0-9-]+", blob.lower()))
     ins = len(in_terms & words)
     outs = sorted(out_terms & words)
     return ins, len(outs), outs
