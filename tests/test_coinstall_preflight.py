@@ -414,3 +414,228 @@ def test_type_and_extension_loops_include_noncolliding_entries(tmp_path):
     composed.parent.mkdir()
     composed.write_text("owners: {types: {base: engine}, namespaces: {core: pack}}\n")
     m.check_extension_collisions(host, pack)
+
+
+# --- okengine#812: a namespace the host does not declare, holding the incoming pack's own content,
+# is an ADOPTION rather than a collision. Refusing it is what pushes a co-install off the supported
+# path (okengine#811: 524 pages in a namespace no schema declared, outside every partition guard).
+
+
+def _adoption_case(tmp_path, *, host_owns=(), pack_owns=("t-guest",), pages=(("a.md", "t-guest"),),
+                   host_declares=False):
+    host = _pack(tmp_path / "host", "private")
+    pack = _pack(tmp_path / "okpack-demo", "private")
+    (host / "pack.yaml").write_text(
+        "name: okpack-host\ntrust: private\nowns:\n  types: [%s]\n" % ", ".join(host_owns))
+    (pack / "pack.yaml").write_text(
+        "name: okpack-demo\ntrust: private\nowns:\n  types: [%s]\n" % ", ".join(pack_owns))
+    (pack / "schema.yaml").write_text(
+        "partitioning:\n  namespaces:\n    hyp: {strategy: by-letter}\n")
+    (host / "schema.yaml").write_text(
+        "partitioning:\n  namespaces:\n    hyp: {strategy: flat}\n" if host_declares
+        else "types: {}\n")
+    ns = host / "wiki" / "hyp"
+    ns.mkdir(parents=True)
+    for name, typ in pages:
+        (ns / name).write_text(f"---\ntype: {typ}\nid: x\n---\n\nbody\n")
+    return host, pack
+
+
+def test_undeclared_namespace_holding_only_pack_types_is_adopted(tmp_path):
+    m = _mod()
+    host, pack = _adoption_case(tmp_path)
+    m.check_namespaces(host, pack)
+    assert not any(level == "FAIL" for level, _, _ in m.FINDINGS), m.FINDINGS
+    warn = [msg for level, area, msg in m.FINDINGS if level == "WARN" and area == "namespaces"]
+    assert warn and "ADOPTING" in warn[0], m.FINDINGS
+    assert "reshelve drain" in warn[0] and "--refresh is runtime-only" in warn[0], warn
+
+
+def test_adoption_refused_when_namespace_holds_foreign_types(tmp_path):
+    m = _mod()
+    host, pack = _adoption_case(tmp_path, pages=(("a.md", "t-guest"), ("b.md", "t-other")))
+    m.check_namespaces(host, pack)
+    fail = [msg for level, area, msg in m.FINDINGS if level == "FAIL" and area == "namespaces"]
+    assert fail and "t-other" in fail[0], m.FINDINGS
+
+
+def test_adoption_refused_while_both_packs_claim_the_type(tmp_path):
+    """The exclusivity requirement: a type both pack.yamls claim cannot attribute the directory, so
+    the collision stands until a human reconciles owns.types (the okcti case in okengine#811)."""
+    m = _mod()
+    host, pack = _adoption_case(tmp_path, host_owns=("t-guest",))
+    m.check_namespaces(host, pack)
+    fail = [msg for level, area, msg in m.FINDINGS if level == "FAIL" and area == "namespaces"]
+    assert fail and "BOTH packs claim" in fail[0], m.FINDINGS
+
+
+def test_empty_namespace_directory_is_adopted(tmp_path):
+    m = _mod()
+    host, pack = _adoption_case(tmp_path, pages=())
+    m.check_namespaces(host, pack)
+    assert not any(level == "FAIL" for level, _, _ in m.FINDINGS), m.FINDINGS
+    assert any("empty of pages" in msg for _, _, msg in m.FINDINGS), m.FINDINGS
+
+
+def test_generated_artifacts_never_veto_an_adoption(tmp_path):
+    """INDEX.md and dashboards are engine-written into whatever namespace they describe; counting
+    them as foreign content would veto every adoption."""
+    m = _mod()
+    host, pack = _adoption_case(
+        tmp_path, pages=(("a.md", "t-guest"), ("INDEX.md", "index"), ("d.md", "dashboard")))
+    m.check_namespaces(host, pack)
+    assert not any(level == "FAIL" for level, _, _ in m.FINDINGS), m.FINDINGS
+    assert any("1 page(s)" in msg for _, _, msg in m.FINDINGS), m.FINDINGS
+
+
+def test_namespace_the_host_declares_differently_still_fails(tmp_path):
+    """Adoption applies only where the host schema is SILENT. A host that declares the namespace
+    with its own partitioning is a real ownership conflict, unchanged by okengine#812."""
+    m = _mod()
+    host, pack = _adoption_case(tmp_path, host_declares=True)
+    m.check_namespaces(host, pack)
+    assert any(level == "FAIL" and area == "namespaces" for level, area, _ in m.FINDINGS), m.FINDINGS
+
+
+# --- okengine#812 (same class, second surface): ownership of a dashboard/stream cannot be proven
+# by byte-identity on a REFRESH, whose whole point is that the pack's script has moved ahead.
+
+
+def _dashboard_case(tmp_path, *, job_name: str):
+    host = _pack(tmp_path / "host", "private")
+    pack = _pack(tmp_path / "okpack-demo", "private")
+    (pack / "pack.yaml").write_text("name: okpack-demo\ntrust: private\n")
+    script = pack / "crons" / "scripts" / "writer.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("# v2 — moved ahead of the deployed copy\ndashboards/board.md\n")
+    staged = host / "crons" / "scripts" / "writer.py"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("# v1 — what the host currently runs\ndashboards/board.md\n")
+    (host / "crons" / "domain-crons.json").write_text(json.dumps(
+        [{"id": "aa", "name": job_name, "script": "/opt/data/scripts/writer.py"}]))
+    board = host / "wiki" / "dashboards" / "board.md"
+    board.parent.mkdir(parents=True)
+    board.write_text("---\ntype: dashboard\n---\n")
+    return host, pack
+
+
+def test_a_drifted_script_is_still_this_packs_when_a_host_job_names_it(tmp_path):
+    m = _mod()
+    host, pack = _dashboard_case(tmp_path, job_name="okpack-demo-board-refresh")
+    m.check_streams_dashboards(host, pack)
+    assert not any(level == "FAIL" for level, _, _ in m.FINDINGS), m.FINDINGS
+    assert any(level == "INFO" and area == "dashboards" for level, area, _ in m.FINDINGS), m.FINDINGS
+
+
+def test_a_dashboard_driven_by_another_packs_job_is_still_a_collision(tmp_path):
+    """Attribution is by the host's own job-name prefix. A same-named script driven by somebody
+    else's lane proves nothing about this pack."""
+    m = _mod()
+    host, pack = _dashboard_case(tmp_path, job_name="okpack-somebody-else-board-refresh")
+    m.check_streams_dashboards(host, pack)
+    assert any(level == "FAIL" and area == "dashboards" for level, area, _ in m.FINDINGS), m.FINDINGS
+
+
+def test_an_unreadable_entry_does_not_derail_the_type_scan(tmp_path):
+    """A namespace can contain something that is not a readable page — here a directory named
+    `*.md`, which `rglob` matches and `open()` refuses. One unreadable entry must not decide
+    ownership for the 500 pages beside it."""
+    m = _mod()
+    host, pack = _adoption_case(tmp_path)
+    (host / "wiki" / "hyp" / "not-a-page.md").mkdir()
+    m.check_namespaces(host, pack)
+    assert not any(level == "FAIL" for level, _, _ in m.FINDINGS), m.FINDINGS
+    assert any("1 page(s)" in msg for _, _, msg in m.FINDINGS), m.FINDINGS
+
+
+def test_a_pack_owning_no_types_cannot_claim_a_populated_namespace(tmp_path):
+    """Attribution is by owned type. A pack that owns none has nothing to attribute the content
+    with, so the collision stands rather than resolving in its favour by default."""
+    m = _mod()
+    host, pack = _adoption_case(tmp_path, pack_owns=())
+    m.check_namespaces(host, pack)
+    fail = [msg for level, area, msg in m.FINDINGS if level == "FAIL" and area == "namespaces"]
+    assert fail and "declares no owned types" in fail[0], m.FINDINGS
+# --- okengine#813: an exposure an operator has considered and accepted is recorded, keyed to the
+# exact trust pair, and still reported. A gate that cannot be satisfied gets bypassed instead.
+
+
+def _exposed(tmp_path):
+    host = _pack(tmp_path / "host", "public")
+    guest = _pack(tmp_path / "guest", "private")
+    (guest / "pack.yaml").write_text("name: okpack-guest\ntrust: private\n")
+    return host, guest
+
+
+def test_recorded_override_downgrades_the_exposure_to_a_reported_warning(tmp_path):
+    m = _mod()
+    host, guest = _exposed(tmp_path)
+    m.record_trust_override(host, "okpack-guest", "private", "public", "trusted-LAN reader only")
+    m.check_trust(host, guest)
+    assert not any(level == "FAIL" for level, _, _ in m.FINDINGS), m.FINDINGS
+    warn = [msg for level, area, msg in m.FINDINGS if level == "WARN" and area == "trust"]
+    assert warn and "ACCEPTED" in warn[0] and "trusted-LAN reader only" in warn[0], m.FINDINGS
+
+
+def test_override_does_not_carry_to_a_different_guest_trust(tmp_path):
+    """Consent was to ONE exposure. A guest that later declares a more restrictive trust is a
+    different exposure than the one accepted, so the gate blocks again."""
+    m = _mod()
+    host, guest = _exposed(tmp_path)
+    m.record_trust_override(host, "okpack-guest", "private", "public", "trusted-LAN reader only")
+    (guest / "pack.yaml").write_text("name: okpack-guest\ntrust: secret\n")
+    m.check_trust(host, guest)
+    assert any(level == "FAIL" and area == "trust" for level, area, _ in m.FINDINGS), m.FINDINGS
+
+
+def test_override_recorded_against_a_different_host_trust_does_not_apply(tmp_path):
+    """The record is keyed to BOTH sides. An acceptance carried over from when the host was private
+    (an exposure that did not then exist) must not satisfy the host being public now."""
+    m = _mod()
+    host, guest = _exposed(tmp_path)
+    m.record_trust_override(host, "okpack-guest", "private", "private", "recorded pre-flip")
+    m.check_trust(host, guest)
+    assert any(level == "FAIL" and area == "trust" for level, area, _ in m.FINDINGS), m.FINDINGS
+
+
+def test_hand_written_override_without_a_reason_is_ignored(tmp_path):
+    """record_trust_override() cannot produce this; a hand-edited file can. An acceptance with no
+    stated reason is not one."""
+    m = _mod()
+    host, guest = _exposed(tmp_path)
+    path = host / m.OVERRIDES_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("trust_exposure:\n  okpack-guest:\n    guest_trust: private\n"
+                    "    host_trust: public\n")
+    m.check_trust(host, guest)
+    assert any(level == "FAIL" and area == "trust" for level, area, _ in m.FINDINGS), m.FINDINGS
+
+
+def test_override_for_another_pack_does_not_apply(tmp_path):
+    m = _mod()
+    host, guest = _exposed(tmp_path)
+    m.record_trust_override(host, "okpack-somebody-else", "private", "public", "unrelated")
+    m.check_trust(host, guest)
+    assert any(level == "FAIL" and area == "trust" for level, area, _ in m.FINDINGS), m.FINDINGS
+
+
+def test_override_without_a_reason_is_refused_and_writes_nothing(tmp_path):
+    """An exposure accepted for no stated reason cannot be reviewed later, which is the only thing
+    that makes a recorded override better than a bypass."""
+    m = _mod()
+    host, _ = _exposed(tmp_path)
+    with pytest.raises(ValueError):
+        m.record_trust_override(host, "okpack-guest", "private", "public", "   ")
+    assert not (host / m.OVERRIDES_REL).exists()
+
+
+def test_recorded_override_round_trips_and_keeps_earlier_entries(tmp_path):
+    m = _mod()
+    host, _ = _exposed(tmp_path)
+    m.record_trust_override(host, "okpack-one", "private", "public", "first")
+    m.record_trust_override(host, "okpack-two", "private", "public", "second")
+    entries = m.load_overrides(host)["trust_exposure"]
+    assert set(entries) == {"okpack-one", "okpack-two"}
+    assert entries["okpack-one"]["reason"] == "first"
+    assert entries["okpack-one"]["accepted_at"].endswith("Z")
+    assert m.trust_override(host, "okpack-two", "private", "public")["reason"] == "second"

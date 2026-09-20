@@ -1113,6 +1113,83 @@ def _fails(pack):
     return [(c, d) for s, c, d in v.validate(pack).rows if s == "FAIL"]
 
 
+def _resharding_pack(tmp_path, reshard_by="second-letter"):
+    pack, sdir = _partitioned_pack(tmp_path)
+    sp = pack / "schema.yaml"
+    sch = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}
+    sch["partitioning"]["namespaces"]["things"]["reshard_by"] = reshard_by
+    sp.write_text(yaml.safe_dump(sch, sort_keys=False), encoding="utf-8")
+    return pack, sdir
+
+
+def test_a_lane_seating_pages_by_canonical_key_fails(tmp_path):
+    """okengine#818. canonical_key() is the drain's BASE bucket; reshard_oversized keeps a split
+    bucket one level deeper and sweeps stragglers nightly, so a writer using the base key re-mints
+    them one level up all day. On a live vault that left 448 pages loose in 23 already-split
+    buckets between sweeps, and every consumer that had stored a page path held a stale one."""
+    pack, sdir = _resharding_pack(tmp_path)
+    (sdir / "lane.py").write_text(
+        "rel = okf_migrate.canonical_key(root, ns, slug, fm)\n", encoding="utf-8")
+    hits = [d for c, d in _fails(pack) if c == "cron reshard-aware writes"]
+    assert hits and "lane.py" in hits[0] and "write_key()" in hits[0], _fails(pack)
+
+
+def test_a_bare_canonical_key_call_is_caught_too(tmp_path):
+    """The helper is imported both ways: `okf_migrate.canonical_key(...)` and a bare
+    `canonical_key(...)` from `from okf_migrate import canonical_key`."""
+    pack, sdir = _resharding_pack(tmp_path)
+    (sdir / "lane.py").write_text(
+        "from okf_migrate import canonical_key\nkey = canonical_key(vault, ns, slug)\n",
+        encoding="utf-8")
+    assert [d for c, d in _fails(pack) if c == "cron reshard-aware writes"], _fails(pack)
+
+
+def test_write_key_is_the_contract_and_passes(tmp_path):
+    pack, sdir = _resharding_pack(tmp_path)
+    (sdir / "lane.py").write_text(
+        "rel = okf_migrate.write_key(root, ns, slug, fm)\n", encoding="utf-8")
+    assert [d for c, d in _fails(pack) if c == "cron reshard-aware writes"] == [], _fails(pack)
+
+
+def _no_reshard_pack(tmp_path, reshard_by=None):
+    """A pack whose governing schema reshards NOTHING. The scaffold inherits the engine core
+    (entities/sources/concepts), which all declare `reshard_by`, so every declaration has to be
+    cleared for this case to exist at all — which is itself the point: on a real vault the base
+    key is almost never the seat."""
+    pack, sdir = _partitioned_pack(tmp_path)
+    sp = pack / "schema.yaml"
+    sch = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}
+    for cfg in (sch.get("partitioning") or {}).get("namespaces", {}).values():
+        if isinstance(cfg, dict):
+            cfg.pop("reshard_by", None)
+            if reshard_by:
+                cfg["reshard_by"] = reshard_by
+    sp.write_text(yaml.safe_dump(sch, sort_keys=False), encoding="utf-8")
+    return pack, sdir
+
+
+def test_canonical_key_is_fine_where_no_namespace_reshards(tmp_path):
+    """Without a `reshard_by` directive anywhere, the base key IS the seat, so the call is correct
+    and must not be reported."""
+    pack, sdir = _no_reshard_pack(tmp_path)
+    (sdir / "lane.py").write_text(
+        "rel = okf_migrate.canonical_key(root, ns, slug, fm)\n", encoding="utf-8")
+    assert [d for c, d in _fails(pack) if c == "cron reshard-aware writes"] == [], _fails(pack)
+
+
+def test_not_applicable_reshard_by_is_not_a_resharding_namespace(tmp_path):
+    pack, sdir = _no_reshard_pack(tmp_path, reshard_by="not-applicable")
+    (sdir / "lane.py").write_text(
+        "rel = okf_migrate.canonical_key(root, ns, slug, fm)\n", encoding="utf-8")
+    assert [d for c, d in _fails(pack) if c == "cron reshard-aware writes"] == [], _fails(pack)
+
+
+def test_a_syntactically_broken_lane_is_not_a_reshard_finding(tmp_path):
+    pack, sdir = _resharding_pack(tmp_path)
+    (sdir / "lane.py").write_text("def broken(:\n", encoding="utf-8")
+    assert [d for c, d in _fails(pack) if c == "cron reshard-aware writes"] == [], _fails(pack)
+
+
 def test_hand_built_path_into_a_partitioned_namespace_fails(tmp_path):
     """okengine#54. `canonical_key`/`write_key` exist so an importer and the reshelve drain 'can
     never disagree and re-open the loop'. A lane that hand-builds the path re-creates the page at

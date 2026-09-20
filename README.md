@@ -1,6 +1,6 @@
 # OKEngine
 
-[Release qualification](docs/qualification.md)
+[![CI](https://github.com/jalewis/OKEngine/actions/workflows/ci.yml/badge.svg)](https://github.com/jalewis/OKEngine/actions/workflows/ci.yml)
 ![status: pre-1.0, active development](https://img.shields.io/badge/status-pre--1.0%20active-orange)
 ![license: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![python: 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)

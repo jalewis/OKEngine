@@ -27,6 +27,7 @@ import argparse
 import json
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -125,6 +126,68 @@ def _namespace_owned_by_incoming_pack(host: Path, pack: Path, namespace: str) ->
         return False
 
 
+_GENERATED_TYPES = {"dashboard"}
+
+
+def _page_types(directory: Path) -> tuple[set[str], int]:
+    """Frontmatter `type:` of every non-generated page under `directory`, and how many were read.
+
+    Cheap by construction: only the head of each file is read, because `type:` is frontmatter and
+    frontmatter is first. Generated per-directory artifacts (INDEX.md, dashboards) are skipped --
+    they are written by the engine into whatever namespace they describe, so they say nothing about
+    who owns it, and counting them as foreign content would veto every adoption.
+    """
+    types: set[str] = set()
+    read = 0
+    for page in sorted(directory.rglob("*.md")):  # rglob-ok: bounded by one namespace, run by hand
+        if page.name == "INDEX.md":
+            continue
+        try:
+            with page.open(encoding="utf-8", errors="replace") as fh:
+                head = fh.read(512)
+        except OSError:
+            continue
+        match = re.search(r"^type:\s*(\S+)", head, re.M)
+        value = match.group(1).strip().strip("\"'") if match else ""
+        if value in _GENERATED_TYPES:
+            continue
+        read += 1
+        types.add(value or "<untyped>")
+    return types, read
+
+
+def _owned_types(pack: Path) -> set[str]:
+    owns = (_yaml(pack / "pack.yaml").get("owns") or {}).get("types") or []
+    return {str(t).strip() for t in owns if str(t).strip()} if isinstance(owns, list) else set()
+
+
+def _namespace_content_is_incoming_packs(host: Path, pack: Path, namespace: str) -> tuple[bool, str]:
+    """Is `wiki/<namespace>/` this pack's own content, on the evidence of what is in it?
+
+    A namespace the host schema does not declare, holding only pages whose types the incoming pack
+    owns EXCLUSIVELY, is this pack's content composed in ahead of its declaration -- an adoption,
+    not a collision (okengine#812). The exclusivity requirement is the whole safety argument: if
+    the host's pack.yaml claims the type too, ownership is genuinely ambiguous and no directory
+    scan can resolve it, so the FAIL stands and a human reconciles `owns.types` first.
+    """
+    incoming = _owned_types(pack)
+    if not incoming:
+        return False, "the pack declares no owned types to attribute the content to"
+    contested = incoming & _owned_types(host)
+    types, read = _page_types(host / "wiki" / namespace)
+    if not read:
+        return True, "empty of pages"
+    foreign = types - incoming
+    if foreign:
+        return False, f"holds {read} page(s) with type(s) the pack does not own: " \
+                      f"{', '.join(sorted(foreign)[:4])}"
+    ambiguous = types & contested
+    if ambiguous:
+        return False, (f"holds {read} page(s) whose type(s) BOTH packs claim in owns.types "
+                       f"({', '.join(sorted(ambiguous)[:4])}) -- reconcile ownership first")
+    return True, f"holds {read} page(s), all of types this pack owns exclusively"
+
+
 def check_namespaces(host: Path, pack: Path, subtree: bool = False) -> None:
     sub_schema = pack / "subdomain" / "schema.yaml"
     if subtree:
@@ -167,6 +230,25 @@ def check_namespaces(host: Path, pack: Path, subtree: bool = False) -> None:
                 and _namespace_owned_by_incoming_pack(host, pack, ns)):
             add("INFO", "namespaces", f"'wiki/{ns}/' already installed (host partitioning "
                                       "matches the pack's) — no action")
+            continue
+        # The host schema does not declare this namespace, yet its directory exists and holds
+        # nothing but this pack's own types: the pack was composed in ahead of its declaration
+        # (okengine#811 found 524 such pages on a live vault, in a namespace no schema declared and
+        # therefore outside every partition guard). Refusing here is what pushed that install off
+        # the supported path in the first place; adopting it is what lets the declaration finally
+        # land. WARN, never silence -- the merge that follows will reshelve the content under the
+        # declared strategy, which is a real change to a live vault.
+        if ns not in host_part:
+            adoptable, why = _namespace_content_is_incoming_packs(host, pack, ns)
+            if adoptable:
+                add("WARN", "namespaces",
+                    f"'wiki/{ns}/' exists but the host schema does not declare it; {why} — "
+                    f"ADOPTING into this pack's declared namespace. An INITIAL install merges the "
+                    f"declaration, after which the reshelve drain files that content under the "
+                    f"pack's declared strategy; --refresh is runtime-only and merges no schema.")
+                continue
+            add("FAIL", "namespaces", f"pack namespace 'wiki/{ns}/' already exists in host and "
+                                      f"{why} — reconcile ownership or pick a subtree name")
             continue
         add("FAIL", "namespaces", f"pack namespace 'wiki/{ns}/' already exists in host — "
                                   "pick a subtree name or reconcile ownership")
@@ -254,14 +336,43 @@ def check_feeds(host: Path, pack: Path) -> None:
                              "(double-fetch = double raws)")
 
 
+def _host_lane_scripts(host: Path, pack: Path) -> set[str]:
+    """Script basenames the HOST's own cron jobs attribute to this pack, by job-name prefix.
+
+    `<pack>-<lane>` is the required naming for a co-installed job (check_crons enforces the prefix),
+    so it is the host's own record of who owns a lane script -- independent of the script's current
+    contents, and available even when no ownership manifest was ever written.
+    """
+    name = str(_yaml(pack / "pack.yaml").get("name") or pack.name)
+    path = host / "crons" / "domain-crons.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    rows = raw.get("jobs", []) if isinstance(raw, dict) else raw
+    return {Path(str(row.get("script"))).name for row in rows
+            if isinstance(row, dict) and str(row.get("name") or "").startswith(f"{name}-")
+            and row.get("script")}
+
+
 def check_streams_dashboards(host: Path, pack: Path) -> None:
     scripts = list((pack / "crons" / "scripts").glob("*.py")) if (pack / "crons" / "scripts").is_dir() else []  # glob-ok: pack crons/scripts/ is a flat dir, not a sharded content namespace
     # idempotency: a pack script whose byte-identical copy is already staged in the
     # host is a previous install of THIS pack — the streams/dashboards it references
     # are its own, not a foreign collision.
+    lanes = _host_lane_scripts(host, pack)
+
     def _installed(s: Path) -> bool:
         h = host / "crons" / "scripts" / s.name
-        return h.is_file() and h.read_bytes() == s.read_bytes()
+        if h.is_file() and h.read_bytes() == s.read_bytes():
+            return True
+        # Byte-identity cannot be the only proof of ownership on a REFRESH, whose whole purpose is
+        # that the pack's script has changed and should replace the host's. Keying ownership to
+        # bytes means a pack can never refresh a script that writes a dashboard: the moment it
+        # moves ahead of the deployed copy, its own dashboard reads as a foreign collision. The
+        # host's cron jobs name their owner, so a script driven by a job named `<pack>-...` is this
+        # pack's however far its contents have drifted (okengine#812).
+        return s.name in lanes
     streams: dict[str, bool] = {}
     dashes: dict[str, bool] = {}
     for s in scripts:
@@ -292,7 +403,60 @@ def check_streams_dashboards(host: Path, pack: Path) -> None:
 _TRUST_RANK = {"public": 0, "private": 1}   # higher = more restrictive
 
 
-def check_trust(host: Path, pack: Path) -> None:
+OVERRIDES_REL = Path(".okengine") / "coinstall-overrides.yaml"
+
+
+def load_overrides(host: Path) -> dict:
+    """Operator decisions recorded for this deployment. Absent file = no overrides, never an error."""
+    path = host / OVERRIDES_REL
+    return _yaml(path) if path.is_file() else {}
+
+
+def trust_override(host: Path, pack_name: str, guest_trust: str, host_trust: str) -> dict | None:
+    """The recorded acceptance for THIS exposure, or None.
+
+    Consent is to one specific (guest, host) trust pair, not to a pack. If either side's declared
+    trust later changes, the operator accepted a different exposure than the one now proposed and
+    the override no longer applies -- re-consent is required. That is the whole difference between
+    this and editing `trust:` in a pack file, where the decision vanishes into a one-word diff.
+    """
+    entry = ((load_overrides(host).get("trust_exposure") or {}) or {}).get(pack_name)
+    if not isinstance(entry, dict):
+        return None
+    if str(entry.get("guest_trust") or "").strip().lower() != guest_trust:
+        return None
+    if str(entry.get("host_trust") or "").strip().lower() != host_trust:
+        return None
+    return entry if str(entry.get("reason") or "").strip() else None
+
+
+def record_trust_override(host: Path, pack_name: str, guest_trust: str, host_trust: str,
+                          reason: str) -> Path:
+    """Write the operator's acceptance. A reason is mandatory: an exposure accepted for no stated
+    reason cannot be reviewed later, which is the only thing that makes this better than a bypass."""
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValueError("a recorded trust-exposure override requires a reason")
+    path = host / OVERRIDES_REL
+    data = load_overrides(host)
+    data.setdefault("trust_exposure", {})[pack_name] = {
+        "guest_trust": guest_trust,
+        "host_trust": host_trust,
+        "accepted_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "reason": reason,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "# Recorded by `framework install-domain --accept-trust-exposure`. Each entry is an\n"
+        "# operator's explicit acceptance of ONE exposure: serving a more-private guest at this\n"
+        "# host's trust. It is keyed to both trust values, so changing either one revokes it.\n"
+        "# Every standing entry is reported by `framework validate` — accepted is not invisible.\n"
+        + yaml.safe_dump(data, sort_keys=True, default_flow_style=False),
+        encoding="utf-8")
+    return path
+
+
+def check_trust(host: Path, pack: Path, pending_acceptance: str = "") -> None:
     """The reader/cockpit serve ONE global trust — the HOST's, frozen at first deploy by
     ensure-runtime. Co-installing a guest serves its content at the HOST's trust, so a guest that is
     MORE RESTRICTIVE than the host (a `private` guest on a `public` host) is exposed on the
@@ -302,10 +466,25 @@ def check_trust(host: Path, pack: Path) -> None:
     ht = str((_yaml(host / "pack.yaml") or {}).get("trust") or "private").strip().lower()
     gt = str((_yaml(pack / "pack.yaml") or {}).get("trust") or "private").strip().lower()
     if _TRUST_RANK.get(ht, 1) < _TRUST_RANK.get(gt, 1):
+        name = str((_yaml(pack / "pack.yaml") or {}).get("name") or pack.name)
+        # A dry run must not write to the host, so an acceptance being made in THIS invocation is
+        # passed in rather than recorded first. Previewing the plan and consenting are different
+        # acts, and the default mode of this command is a preview.
+        accepted = ({"accepted_at": "on --apply", "reason": pending_acceptance}
+                    if pending_acceptance else trust_override(host, name, gt, ht))
+        if accepted:
+            # The exposure is real whether or not it was accepted; what the override changes is
+            # whether it BLOCKS. Keeping it on the report is what stops an accepted exposure from
+            # becoming an invisible one (okengine#813).
+            add("WARN", "trust",
+                f"host trust '{ht}' is MORE PUBLIC than guest trust '{gt}' — ACCEPTED "
+                f"{accepted.get('accepted_at')}: {accepted.get('reason')}")
+            return
         add("FAIL", "trust",
             f"host trust '{ht}' is MORE PUBLIC than guest trust '{gt}' — co-install would serve the "
             f"guest's content at the host's '{ht}' trust, exposing a '{gt}' pack on the host's "
-            f"reader. Raise the guest's declared exposure, or don't co-install it here.")
+            f"reader. Raise the guest's declared exposure, don't co-install it here, or accept the "
+            f"exposure on the record with --accept-trust-exposure --reason '<why>'.")
 
 
 def check_extension_collisions(host: Path, pack: Path, additions: Path | None = None,
@@ -360,6 +539,9 @@ def main(argv) -> int:
     ap.add_argument("--subtree", action="store_true",
                     help="walk-up subtree shape: types don't land in the host root, so a "
                          "root-contract difference is awareness (WARN), not a block")
+    ap.add_argument("--assume-trust-accepted", default="",
+                    help="reason for an acceptance being made in this run but not yet recorded "
+                         "(install-domain passes it on a dry run, which must not write)")
     a = ap.parse_args(argv)
     host, pack = Path(a.host), Path(a.pack)
     if not (host / "schema.yaml").is_file() or not (pack / "schema.yaml").is_file():
@@ -367,7 +549,7 @@ def main(argv) -> int:
         return 2
     additions = Path(a.additions) if a.additions else None
 
-    check_trust(host, pack)
+    check_trust(host, pack, a.assume_trust_accepted)
     check_types(host, pack, additions, subtree=a.subtree)
     check_namespaces(host, pack, subtree=a.subtree)
     check_extension_collisions(host, pack, additions, subtree=a.subtree)

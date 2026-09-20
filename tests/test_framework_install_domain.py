@@ -959,3 +959,58 @@ def test_taxonomy_apply_regenerates_composed_schema_artifact(tmp_path):
     assert "tax-events" in after.get("partitioning", {}).get("namespaces", {}), \
         "composed artifact must be regenerated with the merged namespace (else writes are rejected)"
     assert "forecast" in after.get("types", {}), "extension-owned type must survive the regeneration"
+
+
+# --- okengine#813: accepting a trust exposure on the record, so it is documented instead of
+# bypassed. A gate that cannot be satisfied gets routed around, and the bypass is silent.
+
+
+def _exposing_pair(tmp_path):
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    (h / "pack.yaml").write_text("name: okpack-host\ntrust: public\nowns:\n  types: [vendor]\n")
+    (p / "pack.yaml").write_text(
+        "name: okpack-tax\ntrust: private\nowns:\n  types: [intrusion-set]\n"
+        "  namespaces: [tax-events, tax-register]\n")
+    return h, p
+
+
+def test_exposing_co_install_is_refused_without_an_accepted_override(tmp_path):
+    h, p = _exposing_pair(tmp_path)
+    assert mod.main([str(h), str(p), "--apply"]) == 1
+    assert not (h / ".okengine" / "coinstall-overrides.yaml").exists()
+
+
+def test_accepting_the_exposure_records_it_and_lets_the_install_proceed(tmp_path, capsys):
+    h, p = _exposing_pair(tmp_path)
+    rc = mod.main([str(h), str(p), "--apply", "--accept-trust-exposure",
+                   "--reason", "trusted-LAN reader; judgments stay inside the LAN boundary"])
+    assert rc == 0, capsys.readouterr().out
+    recorded = yaml.safe_load((h / ".okengine" / "coinstall-overrides.yaml").read_text())
+    entry = recorded["trust_exposure"]["okpack-tax"]
+    assert entry["guest_trust"] == "private" and entry["host_trust"] == "public"
+    assert "LAN" in entry["reason"] and entry["accepted_at"].endswith("Z")
+    assert "ACCEPTED" in capsys.readouterr().out
+
+
+def test_a_dry_run_acceptance_writes_nothing_and_still_previews(tmp_path, capsys):
+    """The command's default mode is a preview. Previewing a plan is not consenting to it, so a dry
+    run records nothing — but it must still show the plan the acceptance would unblock."""
+    h, p = _exposing_pair(tmp_path)
+    rc = mod.main([str(h), str(p), "--accept-trust-exposure", "--reason", "trusted LAN"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert not (h / ".okengine" / "coinstall-overrides.yaml").exists()
+    assert "would record" in out and "ACCEPTED" in out
+
+
+def test_accepting_without_a_reason_writes_nothing_and_refuses(tmp_path):
+    h, p = _exposing_pair(tmp_path)
+    assert mod.main([str(h), str(p), "--apply", "--accept-trust-exposure"]) == 2
+    assert mod.main([str(h), str(p), "--accept-trust-exposure"]) == 2
+    assert not (h / ".okengine" / "coinstall-overrides.yaml").exists()
+
+
+def test_reason_without_the_accept_flag_is_refused(tmp_path):
+    """--reason alone reads like consent but grants none; refuse rather than silently ignore it."""
+    h, p = _exposing_pair(tmp_path)
+    assert mod.main([str(h), str(p), "--apply", "--reason", "looks accepted but is not"]) == 2

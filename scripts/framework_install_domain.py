@@ -1162,7 +1162,15 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--apply", action="store_true", help="write (default: print the plan)")
     ap.add_argument("--refresh", action="store_true",
                     help="replace changed cron jobs/scripts owned by this installed pack")
+    ap.add_argument("--accept-trust-exposure", action="store_true",
+                    help="record an operator acceptance of serving this more-private guest at the "
+                         "host's trust (requires --reason); the exposure is still reported")
+    ap.add_argument("--reason", help="why the trust exposure is acceptable on THIS deployment")
     ns = ap.parse_args(argv)
+
+    if ns.reason and not ns.accept_trust_exposure:
+        print("ERROR: --reason applies to --accept-trust-exposure", file=sys.stderr)
+        return 2
 
     host, pack = Path(ns.deployment).resolve(), Path(ns.pack).resolve()
     for p, what in ((host, "deployment"), (pack, "pack")):
@@ -1185,8 +1193,30 @@ def main(argv: list[str]) -> int:
     # Gate on what actually LANDS: the additions file (taxonomy) or the subdomain
     # schema (subtree) — the pack's standalone schema stays in the pack repo.
     preflight = _load_mod("coinstall_preflight.py")
+    pending = ""
+    if ns.accept_trust_exposure:
+        if not str(ns.reason or "").strip():
+            print('ERROR: --accept-trust-exposure requires --reason "<why this exposure is '
+                  'acceptable here>"', file=sys.stderr)
+            return 2
+        pending = str(ns.reason).strip()
+        # On --apply the acceptance is recorded BEFORE the gate, so the decision is on disk even if
+        # the install then fails for some other reason. A dry run writes nothing at all and passes
+        # the pending acceptance to the gate instead: previewing a plan is not consenting to it.
+        if ns.apply:
+            guest_trust = str((preflight._yaml(pack / "pack.yaml") or {}).get("trust")
+                              or "private").strip().lower()
+            host_trust = str((preflight._yaml(host / "pack.yaml") or {}).get("trust")
+                             or "private").strip().lower()
+            written = preflight.record_trust_override(
+                host, pack_name(pack), guest_trust, host_trust, pending)
+            print(f"  recorded trust-exposure acceptance: {written}")
+        else:
+            print("  would record trust-exposure acceptance (dry run writes nothing)")
     landing = ("host-schema-additions.yaml" if shape == "taxonomy" else "schema.yaml")
     pf_args = [str(host), str(pack), "--additions", str(pack / "subdomain" / landing)]
+    if pending and not ns.apply:
+        pf_args += ["--assume-trust-accepted", pending]
     if shape == "subtree":
         pf_args.append("--subtree")
     print(f"— coinstall preflight ({shape} shape) —")

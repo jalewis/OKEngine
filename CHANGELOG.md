@@ -16,6 +16,20 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
 
 ## Unreleased
 
+### Fixed
+- `install-domain` no longer refuses a pack its own undeclared namespace. A namespace the host
+  schema is silent about, holding only pages whose types the incoming pack owns exclusively, is
+  adopted with a WARN naming the reshelve the merge will cause; a namespace the host declares, or
+  one holding a type both packs claim, still FAILs. `--refresh` was unreachable for every
+  namespace-owning pack before this (okengine#812).
+
+### Added
+- `install-domain --accept-trust-exposure --reason "<why>"` records an operator's acceptance of
+  serving a more-private guest at the host's trust in `<host>/.okengine/coinstall-overrides.yaml`.
+  The record is keyed to both trust values, so changing either revokes it; `framework validate`
+  reports every standing acceptance, and stale ones. A gate that cannot be satisfied gets bypassed
+  silently — this makes the decision reviewable instead (okengine#813).
+
 ## v0.14.5
 
 - Preserve co-installed namespace tier contracts on minimal hosts, keep re-apply

@@ -383,7 +383,7 @@ def validate(pack: Path, probe: bool = False) -> Report:
     check_feeds(pack, r, probe)
     check_source_connectors(pack, r)
     check_crons(pack, r)
-    check_installed_domain_drift(pack, r)
+    framework_validate_runtime.check_composition_state(pack, r)
     check_model_profiles(pack, r)
     check_env(pack, r)
     check_gateway_env(pack, r)

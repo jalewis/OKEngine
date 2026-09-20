@@ -901,3 +901,74 @@ def test_engine_input_facade_delegates(monkeypatch):
     report = v.Report()
     v._check_engine_inputs({"types": {}}, {"entity"}, report)
     assert seen == [({"types": {}}, {"entity"}, report)]
+
+
+# --- okengine#813: an accepted trust exposure stays on the report. The guest's content is served
+# at the host's trust whether or not the exposure was accepted, so the decision belongs on every
+# validate run, not only in the install log that recorded it.
+
+
+RUNTIME = REPO / "scripts" / "framework_validate_runtime.py"
+
+
+def _load_runtime(name: str):
+    """The override reporter lives in the runtime module; framework_validate calls straight through
+    to it (that entrypoint is under a shrinking line ratchet, so it carries no wrapper)."""
+    spec = importlib.util.spec_from_file_location(name, RUNTIME)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
+def _with_override(tmp_path, body: str, *, installed: str | None = None) -> Path:
+    (tmp_path / ".okengine").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".okengine" / "coinstall-overrides.yaml").write_text(body)
+    if installed:
+        domains = tmp_path / ".okengine" / "installed-domains"
+        domains.mkdir(exist_ok=True)
+        (domains / f"{installed}.json").write_text(json.dumps({"pack": installed}))
+    return tmp_path
+
+
+_ENTRY = ("trust_exposure:\n  okpack-guest:\n    guest_trust: private\n"
+          "    host_trust: public\n    accepted_at: 2026-09-20T18:00:00Z\n"
+          "    reason: trusted-LAN reader only\n")
+
+
+def test_standing_trust_exposure_override_is_reported(tmp_path):
+    v = _load("framework_validate_override_standing")
+    rt = _load_runtime("framework_validate_override_standing_rt")
+    r = v.Report()
+    rt.check_trust_exposure_overrides(_with_override(tmp_path, _ENTRY, installed="okpack-guest"), r)
+    messages = _messages(r)
+    assert "okpack-guest" in messages and "trusted-LAN reader only" in messages
+    assert "STALE" not in messages
+
+
+def test_override_for_an_uninstalled_pack_is_reported_stale(tmp_path):
+    v = _load("framework_validate_override_stale")
+    rt = _load_runtime("framework_validate_override_stale_rt")
+    r = v.Report()
+    rt.check_trust_exposure_overrides(_with_override(tmp_path, _ENTRY, installed="okpack-other"), r)
+    assert "STALE" in _messages(r)
+
+
+def test_absent_or_empty_override_file_reports_nothing(tmp_path):
+    v = _load("framework_validate_override_absent")
+    rt = _load_runtime("framework_validate_override_absent_rt")
+    r = v.Report()
+    rt.check_trust_exposure_overrides(tmp_path, r)
+    assert r.rows == []
+    r = v.Report()
+    rt.check_trust_exposure_overrides(_with_override(tmp_path, "trust_exposure: {}\n"), r)
+    assert r.rows == []
+
+
+def test_unreadable_override_file_warns_rather_than_passing(tmp_path):
+    """A file that cannot be parsed is not an absence of overrides."""
+    v = _load("framework_validate_override_unreadable")
+    rt = _load_runtime("framework_validate_override_unreadable_rt")
+    r = v.Report()
+    rt.check_trust_exposure_overrides(_with_override(tmp_path, "trust_exposure: [unclosed\n"), r)
+    assert "unreadable" in _messages(r)

@@ -333,8 +333,55 @@ def check_crons(
         if offenders:
             r.fail("cron partition-aware writes",
                    f"hand-built page path(s) a by-letter namespace can never produce: "
-                   f"{sorted(set(offenders))} — derive the path from okf_migrate.canonical_key() / "
-                   f"write_key() so the writer and the reshelve drain cannot disagree (okengine#54)")
+                   f"{sorted(set(offenders))} — derive the path from okf_migrate.write_key() so "
+                   f"the writer and the reshelve drain cannot disagree (okengine#54)")
         elif _partitioned:
             r.ok("cron partition-aware writes",
                  f"no hand-built paths into {len(_partitioned)} partitioned namespace(s)")
+
+        # canonical_key() AS A WRITE DESTINATION (okengine#818). The previous check's own advice
+        # named canonical_key and write_key as if interchangeable. They are not, and in a namespace
+        # that declares `reshard_by` the difference is a loop:
+        #
+        #   canonical_key -> entities/a/apt29          (the BASE bucket; what the drain calls canonical)
+        #   write_key     -> entities/a/p/apt29        (the seat the layout actually keeps, for a NEW page)
+        #
+        # reshard_oversized files a split bucket two levels deep and sweeps stragglers nightly; a
+        # writer using the base key re-mints them one level up all day. Measured on a live vault:
+        # 448 pages sitting loose in 23 already-split buckets between one nightly sweep and the
+        # next, so every consumer that stored a page path held one that was valid for a few hours.
+        # 26 importer lanes there shared one helper that made this call.
+        #
+        # write_key() is the writer's contract and already does the right thing on both sides:
+        # an existing page is updated IN PLACE (never forked because a reshard has not run yet),
+        # a new one gets the reshard segment immediately (okengine#243).
+        _resharding = sorted(ns for ns, cfg in (_pns.items() if isinstance(_pns, dict) else [])
+                             if isinstance(cfg, dict)
+                             and (cfg.get("reshard_by") or "not-applicable") != "not-applicable")
+        if _resharding:
+            base_key_writers = []
+            for py in sorted(sdir.glob("*.py")):   # glob-ok: flat pack dir, not a content namespace
+                try:
+                    tree = ast.parse(py.read_text(encoding="utf-8", errors="replace"), str(py))
+                except (OSError, SyntaxError):
+                    continue
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    fn = node.func
+                    name = (fn.attr if isinstance(fn, ast.Attribute)
+                            else fn.id if isinstance(fn, ast.Name) else None)
+                    if name == "canonical_key":
+                        base_key_writers.append(f"{py.name}:{node.lineno}")
+                        break
+            if base_key_writers:
+                r.fail("cron reshard-aware writes",
+                       f"pack lane(s) compute a page path with okf_migrate.canonical_key(): "
+                       f"{sorted(base_key_writers)} — that is the drain's BASE bucket, one level "
+                       f"above the seat reshard_oversized keeps for "
+                       f"{', '.join(_resharding[:4])}{'…' if len(_resharding) > 4 else ''}. Use "
+                       f"write_key(), which updates an existing page in place and gives a new one "
+                       f"the reshard segment (okengine#818, #243)")
+            else:
+                r.ok("cron reshard-aware writes",
+                     f"no base-key writers into {len(_resharding)} resharding namespace(s)")

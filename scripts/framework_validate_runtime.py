@@ -35,6 +35,46 @@ def check_installed_domain_drift(pack: Path, report: Any) -> None:
         report.ok("composed pack drift", f"{count} ownership manifest(s) match")
 
 
+def check_composition_state(pack: Path, report: Any) -> None:
+    """What is composed into this host, and on what terms: manifest drift plus every standing
+    trust-exposure acceptance. They answer one question and belong on the report together."""
+    check_installed_domain_drift(pack, report)
+    check_trust_exposure_overrides(pack, report)
+
+
+def check_trust_exposure_overrides(pack: Path, report: Any) -> None:
+    """Report every standing trust-exposure acceptance on this deployment (okengine#813).
+
+    An accepted exposure must not become an invisible one: the guest's content is still served at
+    the host's trust, so the decision belongs on every validate run, not only in the install log
+    that recorded it. An entry naming a pack that is not installed is stale and says so.
+    """
+    path = pack / ".okengine" / "coinstall-overrides.yaml"
+    if not path.is_file():
+        return
+    try:
+        import yaml
+
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        report.warn("trust-exposure override", f"unreadable {path.name}: {str(exc)[:120]}")
+        return
+    entries = (data.get("trust_exposure") or {}) if isinstance(data, dict) else {}
+    if not isinstance(entries, dict) or not entries:
+        return
+    domains = pack / ".okengine" / "installed-domains"
+    installed = {p.stem for p in domains.glob("*.json")} if domains.is_dir() else set()  # glob-ok: flat manifest dir
+    for name, entry in sorted(entries.items()):
+        entry = entry if isinstance(entry, dict) else {}
+        where = (f"guest '{entry.get('guest_trust')}' served at host '{entry.get('host_trust')}' "
+                 f"since {entry.get('accepted_at')}: {entry.get('reason')}")
+        if installed and name not in installed:
+            report.warn("trust-exposure override",
+                        f"{name} is not an installed domain — STALE acceptance ({where})")
+        else:
+            report.warn("trust-exposure override", f"{name}: {where}")
+
+
 def check_env(pack: Path, r: Any, *, required: bool = True) -> None:
     ex = pack / ".env.example"
     if not ex.is_file() and required:

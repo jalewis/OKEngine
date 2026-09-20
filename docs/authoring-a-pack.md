@@ -270,6 +270,25 @@ Check a composition with `python $ENGINE_DIR/scripts/cron_pack_split.py compose
 --packs <dir>` (it discovers every pack with a `pack.yaml` and fails loudly on an
 ownership/trust conflict).
 
+> **Accepting a trust exposure on the record (okengine#813).** The reader and cockpit serve ONE
+> global trust — the *host's* — so co-installing a `private` guest onto a `public` host serves that
+> guest's content on the host's unauthenticated reader. `install-domain` FAILs that pairing. When an
+> operator has considered the exposure and accepts it for a specific deployment (a trusted-LAN
+> reader, say), record it rather than editing either pack's `trust:`:
+>
+> ```bash
+> framework install-domain <host> <pack> --apply \
+>   --accept-trust-exposure --reason "trusted-LAN reader; judgments stay inside the LAN boundary"
+> ```
+>
+> That writes `<host>/.okengine/coinstall-overrides.yaml` and the gate reports the exposure as an
+> accepted WARN instead of blocking. The record is keyed to **both** trust values, so changing
+> either one revokes it and the gate blocks again — consent is to one specific exposure, not to a
+> pack. `--reason` is mandatory, and `framework validate` reports every standing acceptance on
+> every run, so an accepted exposure never becomes an invisible one. Editing `trust:` in a pack
+> file instead would change the answer for every deployment of that pack and leave nothing behind
+> but a one-word diff.
+
 ---
 
 ## 3. Write the persona — `CLAUDE.md`
