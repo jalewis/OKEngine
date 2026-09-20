@@ -399,7 +399,7 @@ def test_dead_cron_plus_plugin_deploy_script_removed():  # invariant-audit #16
     assert not (S / "deploy-cron-plus-plugin.sh").exists(), \
         "the dead deploy-cron-plus-plugin.sh is back — it targets an unvendored source + host ~/.hermes"
     # CLAUDE.md is engine-internal and EXCLUDED from the public snapshot, so only assert its
-    # deploy-surface table when it is present (the GitLab tree / a dev checkout) — never require it
+    # deploy-surface table when it is present (the private_ci tree / a dev checkout) — never require it
     # (public CI runs on the scrubbed snapshot where CLAUDE.md does not exist).
     claude = REPO / "CLAUDE.md"
     if claude.is_file():

@@ -125,7 +125,7 @@ the cron scripts. See #758 and #759 for qualification and per-deployment verific
   wrappers, never the default deploy project. Negative fixtures cover each repaired boundary.
 - **CI reliability gates.** Registry reachability is checked independently of
   earlier stages (#751); the security suite has its own deadline and the
-  Makefile gates have explicit budgets. CI evidence remains GitLab pipeline
+  Makefile gates have explicit budgets. CI evidence remains private CI pipeline
   jobs, not local deployment evidence.
 - **Retained deadline limitation (invariant-audit waiver, #779).** Cron-plus publishes and
   enforces each run deadline, but model-producing lanes do not yet use that signal to stop early
@@ -350,7 +350,7 @@ re-establishes tag ↔ code ↔ image agreement. No breaking engine changes; pac
   subjects from rollups, surface stale references, and leaked-frontmatter detection with line-aware
   review parsing.
 - **Publish / security:** scrub the internal org-name abbreviation on content (not only via
-  file-exclusion); keep PRIVATE pack names and the private repo's GitLab project ids out of the public
+  file-exclusion); keep PRIVATE pack names and the private repo's private CI project ids out of the public
   snapshot, enforced by a dedicated private-pack publish guard.
 - Pre-release invariant-audit backlog captured in #351 (candidates; no v0.13.0 regressions).
 
@@ -610,7 +610,7 @@ took **seven** re-verify rounds to reach a consistent fix across every surface.
   handling (a dotted slug like `openssl-3.0.7-advisory` no longer truncates/desyncs read from write).
 
 ### Notes
-- Remaining audit mediums (30) + lows (33) are tracked in GitLab issues #203 / #202 with per-item
+- Remaining audit mediums (30) + lows (33) are tracked in private CI issues #203 / #202 with per-item
   FIX/WAIVE dispositions; batches land on `main` and roll to the fleet per point release.
 
 ## v0.11.0
@@ -1025,7 +1025,7 @@ release-readiness pass.
 - **review-queue dashboard** emitted dead file-relative links instead of `[[wikilinks]]`
   — every queue row walked the browser out of the reader SPA.
 - **Scrub-pattern parity** — the library publish scrub synced to the engine's full pattern
-  set; the internal-tracker (`GitLab #NN`) reference class added; a contract test pins the
+  set; the internal-tracker (`private CI #NN`) reference class added; a contract test pins the
   pre-commit patterns as a subset of the publish scrub.
 
 ## v0.9.0

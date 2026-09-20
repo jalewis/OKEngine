@@ -5,7 +5,7 @@
     "critical": 90
   },
   "runtime_costs": {
-    "basis": "worker-seconds from GitLab job 94246 (2026-09-07), job 105473 (2026-09-10), and schema-exclusions promotion job 116649 (2026-09-16); previously measured write-service mutant counts from job 69571 multiplied by the observed 19 worker-second write-suite rate",
+    "basis": "worker-seconds from private CI job 94246 (2026-09-07), job 105473 (2026-09-10), and schema-exclusions promotion job 116649 (2026-09-16); previously measured write-service mutant counts from job 69571 multiplied by the observed 19 worker-second write-suite rate",
     "worker_seconds": {
       "extensions/okengine.relevance-gate/llm_lib.py": 1451,
       "extensions/okengine.viz/llm_lib.py": 1313,
@@ -2379,6 +2379,16 @@
       "timeout_seconds": 45,
       "session_deadline_seconds": 3600,
       "test_command": "{python} -m pytest tests/ci/test_registry_canary.py -q",
+      "min_mutants": 1
+    },
+    {
+      "path": "scripts/public_boundary.py",
+      "category": "supply-chain-governance",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_public_boundary.py -q",
       "min_mutants": 1
     }
   ]

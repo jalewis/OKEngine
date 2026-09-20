@@ -127,18 +127,18 @@ def test_gateway_assembly_installs_the_revision_wheel_immutably():
 
 
 def test_ci_installs_the_revision_wheel_before_every_gate():
-    pipeline_path = ROOT / ".gitlab-ci.yml"
+    pipeline_path = ROOT / "private pipeline configuration"
     if not pipeline_path.is_file():
-        pytest.skip("private GitLab pipeline is not part of the public snapshot")
+        pytest.skip("private private_ci pipeline is not part of the public snapshot")
     pipeline = pipeline_path.read_text()
     assert "python scripts/build_engine_wheel.py --out artifacts/wheel" in pipeline
     assert "pip install -q --no-deps artifacts/wheel/*.whl" in pipeline
 
 
 def test_coverage_runs_against_canonical_sources_after_wheel_correctness_gate():
-    pipeline_path = ROOT / ".gitlab-ci.yml"
+    pipeline_path = ROOT / "private pipeline configuration"
     if not pipeline_path.is_file():
-        pytest.skip("private GitLab pipeline is not part of the public snapshot")
+        pytest.skip("private private_ci pipeline is not part of the public snapshot")
     pipeline = pipeline_path.read_text()
     assert 'PYTHONPATH="$SUITE_SOURCE_ROOT"' in pipeline
     assert 'SUITE_SOURCE_ROOT: "$CI_PROJECT_DIR/src"' in pipeline

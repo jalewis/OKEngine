@@ -51,7 +51,7 @@ UNMEASURED_TREES: dict[str, str] = {
     "overlays": (
         "the v0.21.3 Hermes provider overlays are target-only while the production manifest "
         "pins v0.18.2. They execute in the pinned Python 3.13 external Hermes clone, not in "
-        "this Python 3.12 engine suite; the exact-target GitLab lane runs their real provider "
+        "this Python 3.12 engine suite; the exact-target private_ci lane runs their real provider "
         "contracts. This exemption must be retired when the production pin switches."
     ),
 }

@@ -69,7 +69,7 @@ each, so their aggregate worker count does not exceed the verified four-CPU allo
 ## Live progress and shard diagnosis
 
 The runner writes flushed JSON records to stderr, each prefixed with
-`mutation-progress `. GitLab therefore exposes progress before artifacts are
+`mutation-progress `. private CI therefore exposes progress before artifacts are
 available. The lifecycle is:
 
 - `shard_start`: manifest digest, shard index/count, selected target count,

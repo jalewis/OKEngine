@@ -25,7 +25,7 @@ EXCL=(
   ':!docs/release-checklist.md' ':!CLAUDE.md' ':!scripts/audit'
   ':!docs/testing-and-audit.md' ':!docs/hermes-upgrades'
   ':!docs/design/sec-threat-hunting-prd.md' ':!docs/design/sec-threat-hunting-technical-spec.md'
-  ':!.gitlab-ci.yml'   # legitimately names the internal group runner (org-abbrev pattern); publish-excluded, never ships
+  ':!private pipeline configuration'   # legitimately names the internal group runner (org-abbrev pattern); publish-excluded, never ships
 )
 # `git grep` sees TRACKED files only, so a brand-new file is invisible to this gate until it is
 # staged -- and a new file is exactly where a fresh leak lives. A private product name sat in a new

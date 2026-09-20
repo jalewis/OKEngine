@@ -5,7 +5,7 @@ Each artifact must pass `git apply --check` against the exact clean target and
 retain its negative behavioral fixtures.
 
 `inventory.json` maps every original carried ID to its final port or retirement.
-The existing GitLab patch-inventory
+The existing private CI patch-inventory
 command now audits this target registry as well as the live v0.18.2 set. Its
 final mode requires all decisions to be `ported` or `retired` and an actual
 checkout at the peeled target SHA to verify the 24-artifact/30-existing-file
@@ -51,7 +51,7 @@ and labels native direct-provider aggregate-only usage **unknown** when there
 is no per-response UTC billing time. A disposable real-`SessionDB` Insights
 fixture proves that the unknown bucket remains visible. Older stored estimates
 can still reflect outdated rates; actual invoice reconciliation and
-dependency-complete GitLab gates remain required before final disposition.
+dependency-complete private CI gates remain required before final disposition.
 
 `18-cron-max-iterations.patch` restores the per-job cap consumed by cron-plus.
 An explicit value must be an integer in `[1, 90]` (bool, null, strings, floats,
@@ -105,7 +105,7 @@ recovery/restarts instead of the documented six; the ported target makes six.
 Fresh-target tests cover 404/500/503/504, mixed statuses, 429 eager fallback
 true/false, 401 authentication fallback false, malformed policy shapes, and
 generic no-policy behavior (39 focused/adjacent tests passed). This is **not**
-an approved local-pool deployment: full GitLab gates, pack/extension policy
+an approved local-pool deployment: full private CI gates, pack/extension policy
 reconciliation, and endpoint-observable retry/fallback evidence remain open.
 An additional target-source check found that candidate output-cap recovery
 called `_compress_context` even with `compression.enabled: false`, then
@@ -118,7 +118,7 @@ refusal and relay-wrapped HTTP 429 output-cap correction with compaction both
 on and off; disposable mutations separately prove that disabled-mode history
 compaction, enabled-mode behavior loss, and false reset signals are rejected.
 These additions are locally tested but
-not yet GitLab-qualified or endpoint-observed.
+not yet private CI-qualified or endpoint-observed.
 
 `12-mcp-resource-uri-guidance.patch` ports the useful distinction between an
 MCP resource URI and a host-local path into candidate v0.21.3's split schema
@@ -133,7 +133,7 @@ listed or template-derived `file://` reads and transport failures keep their
 normal behavior. Pristine-target negative fixtures fail the missing guidance;
 the port passes 7 focused plus 22 adjacent MCP tests. The broader upstream
 `test_mcp_tool.py` module cannot collect on this host because optional MCP SDK
-sampling types are absent; GitLab dependency-complete evidence remains open.
+sampling types are absent; private CI dependency-complete evidence remains open.
 
 `13-cron-completed-tool-handlers.patch` changes the per-fire cron-plus execution
 counter from assistant rows containing `tool_calls` to concrete handler returns.
@@ -149,7 +149,7 @@ neither item relevance nor durable write; cron-plus receipt/write verification
 remains a separate hard gate. Its `executed_tool_call_turns` stored field and
 other consumers must be reconciled with this new handler-count meaning before
 promotion. Broader host tests hit an independently reproduced upstream
-Python 3.14 daemon-pool incompatibility; dependency-complete GitLab evidence
+Python 3.14 daemon-pool incompatibility; dependency-complete private CI evidence
 remains open. In the eight-port combined run, the existing disposable cron
 fixture needed an explicit model to satisfy the staged turn-limit policy;
 the port adds that model rather than bypassing the gate. All 97 staged-port
@@ -167,7 +167,7 @@ result renderer contract and 27 focused/adjacent tests pass. The nine staged
 ports also pass 119 focused tests together. Cron-plus must
 still read back the target page and reconcile selected-item identity; this
 telemetry alone is not durable-write evidence. A successful response followed
-by a late client-visible read remains required in GitLab/canary evidence.
+by a late client-visible read remains required in private CI/canary evidence.
 
 `16-llamacpp-props-path-policy.patch` learns the successful `/v1/props` or
 `/props` route during candidate metadata refreshes, with positive/negative TTLs
@@ -179,7 +179,7 @@ URL but retains the useful `/v1/models` list fallback. A pristine-target
 negative fixture made that guaranteed detail request; the port did not.
 Five new real HTTP-boundary tests plus adjacent native metadata tests passed
 42/42 against a disposable target and `HERMES_HOME`; the ten staged ports pass
-124 focused tests together. Full GitLab contracts and
+124 focused tests together. Full private CI contracts and
 measured canary 404-rate evidence remain open.
 
 `21-responses-attribution.patch` adds bounded, header-safe OKEngine client and
@@ -206,7 +206,7 @@ an optional local-only lane can survive MCP discovery failure. Three disposable
 pristine-target negative fixtures fail at empty-list widening, built-in-only
 MCP widening, and missing required-surface refusal. The port passes 32
 focused/adjacent cron tests.
-This gate still requires dependency-complete GitLab tests, pack/job allowlist
+This gate still requires dependency-complete private CI tests, pack/job allowlist
 reconciliation, and scheduled read/write evidence before promotion.
 
 `23-mcp-registry-recovery.patch` ports the carried reconnect/registry invariant
@@ -223,7 +223,7 @@ for a tool in its advertised snapshot, and cron rejects any retained loss
 before writing a successful audit outcome. Pristine-target negative fixtures
 fail live-handler republish and permit a clean cron fire despite a retained
 registry loss; ten focused target tests include the observable failed
-`run_job` result and its disposable `usage_audit.jsonl` error row. Full GitLab,
+`run_job` result and its disposable `usage_audit.jsonl` error row. Full private CI,
 The same staged artifact now records terminal OKEngine read/write transport
 failure at structural handler paths: disconnected session, transport-only
 open breaker, host-generated retry failure, or unrecovered RPC exception.
@@ -234,7 +234,7 @@ agent response produces a failed cron result and durable audit error; removing
 the handler signal makes that fixture fail. The merged patch applies after the
 other ordered target artifacts in a disposable v0.21.3 source, and 16 adjacent
 transport/registry/breaker tests pass locally. This is not runner or live
-reconnect evidence. Full GitLab, real transport drop/reconnect, standing `fleet_status`
+reconnect evidence. Full private CI, real transport drop/reconnect, standing `fleet_status`
 read-MCP diagnosis (#608), and scheduled-path evidence are still required.
 The inventory's separate `upstream_contract_tests` list includes pristine
 v0.21.3's TaskGroup transport-reconnect regression. It is run beside the
@@ -278,7 +278,7 @@ script's agent all three requested mutating toolsets; the port gives it no
 tools while a successful script retains the requested list. Five focused and
 adjacent cron tests pass. This patch must apply **after** `09-22` and `23` in
 the target manifest because its scheduler hunks use their resolved-agent and
-registry-telemetry context. Full GitLab and scheduled-path evidence remain
+registry-telemetry context. Full private CI and scheduled-path evidence remain
 required before disposition.
 
 `01-file-operations-vault-guard.patch` ports the carried vault-file boundary
@@ -298,7 +298,7 @@ failed on the nineteen-port target before the guard, and later move/schema
 and symlink fixtures caught two partial-port bypasses. The final target with
 the actual engine overlay passes 15 focused real-subprocess tests plus 102
 adjacent native file/V4A tests (two Windows-only tests are not runnable on
-this Linux host). Full GitLab, built-image, remote-backend contract, late
+this Linux host). Full private CI, built-image, remote-backend contract, late
 client-visible readback, and canary evidence remain open; the probe/write
 gap is a residual race requiring review.
 
@@ -314,7 +314,7 @@ the write handler, while a normal `reports/index.md` is passed as the correct
 absolute sibling path. Thirteen focused/adjacent path tests pass. Like the
 original, this guard covers `write_file_tool`, while patch01 now covers direct
 `ShellFileOperations` and V4A mutation. Other mutation surfaces and the
-probe/write race need final safety review. GitLab and canary evidence remain open.
+probe/write race need final safety review. private CI and canary evidence remain open.
 
 Original patch `05-delegate-tool-session-end.patch` is a **retirement
 candidate**, not a target port. Pristine v0.21.3 moves child cleanup to
@@ -352,7 +352,7 @@ hardening port**: it keys both memory and disk by normalized URL plus a
 non-reversible credential fingerprint, preserves the native TTL and legacy
 unauthenticated keys, and avoids caching callable/minted tokens without a
 stable identity. A token-rotation fixture and existing native probe/disk
-fixtures pass together (23 tests). Full GitLab, image, and cross-profile
+fixtures pass together (23 tests). Full private CI, image, and cross-profile
 canary behavior are required before production disposition.
 
 `06-cron-per-job-ollama-num-ctx.patch` restores the carried per-job Ollama
@@ -369,7 +369,7 @@ focused/native tests. The engine profile pre-deploy validator now rejects
 malformed context values too (an eight-shape negative fixture plus the
 framework validation path). This does not establish an approved fleet-wide context
 size or prove a serving endpoint accepts every requested value; profile/job
-policy, GitLab, and live request/compaction evidence remain open.
+policy, private CI, and live request/compaction evidence remain open.
 
 `07-api-server-default-runtime.patch` restores an API-chat-only default
 provider/model without changing the bulk gateway default. It resolves and
@@ -381,7 +381,7 @@ the bulk route or to paid OpenRouter. Provider-only configuration uses that
 provider's default model or fails closed if none exists. Three original
 negative fixtures failed on the staged target before this port; nine focused
 boundary tests and three adjacent routing/creation tests pass after it.
-The provider alias and model policy, GitLab gates, image artifact, and live
+The provider alias and model policy, private CI gates, image artifact, and live
 API-versus-bulk evidence remain open before production disposition.
 
 `08-web-search-rotation.patch` ports the opt-in `web.backend: rotate`
@@ -401,7 +401,7 @@ disposable test venv. The carried default ring remains the old cohort
 registered nonlegacy plugins; new native keyed Perplexity/KeEnable are **not**
 automatically admitted, to avoid surprising paid routing. That boundary
 needs explicit policy/allowlist reconciliation before production promotion;
-full GitLab, overlay registration, and canary web-search/extract evidence are
+full private CI, overlay registration, and canary web-search/extract evidence are
 still open.
 
 `24-deepseek-flash-eager-local-tools.patch` adds a cron-only compatibility
@@ -415,5 +415,5 @@ proves they remain fail-closed. A positive fixture registers a real shortened
 writer name, verifies it is direct only inside the qualified scope, and routes
 one call through the normal registry handler. Provider/model negatives keep
 OpenRouter and non-Flash DeepSeek jobs on the standard bridge. Dependency-
-complete GitLab evidence and two authorized live scheduled writes with late
+complete private CI evidence and two authorized live scheduled writes with late
 reader readback remain required.

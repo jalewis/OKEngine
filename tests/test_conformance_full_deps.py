@@ -28,7 +28,7 @@ TESTS = Path(__file__).resolve().parent
 # those modules silently skip. httpx is used by the reader/cockpit TestClient path; mcp gates the
 # 5 MCP-server modules INCLUDING the security-boundary regressions (test_mcp_auth's
 # exposed-default-token-fails-closed, graph subprocess process-group kill) — invisible to this
-# guard until 2026-07-19, so the GitLab merge gate skipped them silently while GitHub CI (which
+# guard until 2026-07-19, so the private_ci merge gate skipped them silently while GitHub CI (which
 # installs mcp) only runs post-publish (invariant-audit HIGH #10). croniter gates fleet_health;
 # the remaining entries cover document extraction, DOM smoke, and Starlette's TestClient.
 REQUIRED_FULL_DEPS = ("fastapi", "markdown", "nh3", "httpx", "mcp", "croniter", "docx", "pptx", "openpyxl", "striprtf", "playwright", "starlette")

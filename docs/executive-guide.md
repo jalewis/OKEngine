@@ -315,10 +315,10 @@ necessary; operational green alone does not prove analytical quality.
 
 ### Merge is not fleet deployment
 
-An engine change merged to GitLab is available to every pack, but it does not
+An engine change merged to private CI is available to every pack, but it does not
 automatically rebuild or restart every deployed pack. Each deployment records an
 engine commit in `.hermes-data/engine-runtime.yaml`; fleet governance must compare
-that marker with the approved GitLab commit, roll the same engine through every
+that marker with the approved private CI commit, roll the same engine through every
 enabled pack, and run post-deploy verification per pack. “Merged,” “deployed to one
 pack,” and “deployed fleet-wide” are three different states and must be reported
 separately.

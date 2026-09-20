@@ -44,7 +44,7 @@ rm -f -- \
   "$ARTIFACT_DIR/git-sha.txt" "$ARTIFACT_DIR/resilience-junit.xml" \
   "$ARTIFACT_DIR/service-logs.txt" "$ARTIFACT_DIR/teardown.txt"
 # Docker-in-Docker resolves bind-mount sources in the daemon service container, not in this job
-# container. GitLab shares CI_PROJECT_DIR with both containers, while their /tmp filesystems are
+# container. private CI shares CI_PROJECT_DIR with both containers, while their /tmp filesystems are
 # distinct. Keep the disposable vault inside that shared directory in CI so the production-like
 # services receive the seeded files instead of an empty daemon-side directory.
 if [ "${SMOKE_CI:-0}" = 1 ]; then

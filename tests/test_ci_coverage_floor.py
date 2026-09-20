@@ -10,7 +10,7 @@ This asserts the INVARIANT (the two numbers match) rather than pinning a literal
 a ratchet is a two-file edit rather than three, and the guard keeps working at every
 future floor instead of needing to be rewritten each time.
 
-`.gitlab-ci.yml` is publish-EXCLUDED — it names internal infrastructure and never
+`private pipeline configuration` is publish-EXCLUDED — it names internal infrastructure and never
 ships in the public snapshot — so the CI-side assertions SKIP when the file is absent
 rather than erroring there.
 """
@@ -20,7 +20,7 @@ import re
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
-CI = REPO / ".gitlab-ci.yml"
+CI = REPO / "private pipeline configuration"
 PYPROJECT = REPO / "pyproject.toml"
 BRANCH_CHECK = REPO / "scripts" / "check_branch_coverage.py"
 MAKEFILE = REPO / "Makefile"
@@ -50,9 +50,9 @@ def test_coverage_floor_and_ratchet_policy_are_documented():
     assert declared_branch_floor() == 100
 
 
-def test_gitlab_full_suite_publishes_and_enforces_branch_aware_coverage():
+def test_private_ci_full_suite_publishes_and_enforces_branch_aware_coverage():
     if not CI.is_file():
-        pytest.skip(".gitlab-ci.yml is publish-excluded and absent from this snapshot")
+        pytest.skip("private pipeline configuration is publish-excluded and absent from this snapshot")
     ci = CI.read_text(encoding="utf-8")
     assert "pip install -q -r requirements-dev.txt" in ci
     assert "pytest-cov" in DEV_REQUIREMENTS.read_text(encoding="utf-8")
@@ -99,7 +99,7 @@ def test_ci_flag_matches_the_declared_floor():
     """The half-applied-ratchet guard: the CLI flag wins, so a mismatch means the
     lower of the two is silently the real bar."""
     if not CI.is_file():
-        pytest.skip(".gitlab-ci.yml is publish-excluded and absent from this snapshot")
+        pytest.skip("private pipeline configuration is publish-excluded and absent from this snapshot")
 
     flags = re.findall(r"--cov-fail-under=(\d+)", CI.read_text(encoding="utf-8"))
     assert flags, "the CI full-suite job must pass an explicit --cov-fail-under"
@@ -180,7 +180,7 @@ def test_coverage_checker_can_enforce_every_category_per_file(tmp_path, capsys):
 def test_coverage_is_part_of_the_automatic_full_suite():
     """Coverage must gate the authoritative automatic suite, never a blocking duplicate job."""
     if not CI.is_file():
-        pytest.skip(".gitlab-ci.yml is publish-excluded and absent from this snapshot")
+        pytest.skip("private pipeline configuration is publish-excluded and absent from this snapshot")
     yaml = pytest.importorskip("yaml")
     doc = yaml.safe_load(CI.read_text(encoding="utf-8"))
     assert "coverage-floor" not in doc

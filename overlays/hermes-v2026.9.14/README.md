@@ -41,6 +41,6 @@ that justifies replacing the target module. Final qualification must also verify
 Serper's
 registration and routing from the immutable image artifact; isolated class
 tests are not live gateway evidence. The staged `hermes-target-contracts`
-GitLab lane executes all registered patch tests and these three provider/plugin
+private CI lane executes all registered patch tests and these three provider/plugin
 contracts against a fresh pinned clone; its JUnit and summary must be green
 and attributable before this overlay set can qualify for a pin switch.

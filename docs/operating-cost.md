@@ -48,7 +48,7 @@ work; the agent fires only if so). Only the **daily brief** fires unconditionall
 
 These counts describe code at one release, not what a running pack has deployed.
 Check `.hermes-data/engine-runtime.yaml` for the pack's engine commit and compare it
-with the approved GitLab commit before using this inventory for operational or cost
+with the approved private CI commit before using this inventory for operational or cost
 decisions. Engine fixes do not become fleet-wide merely because they merged.
 
 So the schedule frequency is an **upper bound on gate checks**, not on LLM calls.

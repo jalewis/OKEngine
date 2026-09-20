@@ -41,7 +41,7 @@ a concrete mechanism, it is named.
 | Section | Status | Evidence / Issue |
 |---|---|---|
 | §1 Trust rules | **Adopted** | table above |
-| §2 Quality objectives | **Adopted** | `.gitlab-ci.yml` stages: `lint, gates, audit, e2e` |
+| §2 Quality objectives | **Adopted** | `private pipeline configuration` stages: `lint, gates, audit, e2e` |
 | §3 Ownership | **Adopted** | `mutation/targets.json` — 173/173 targets owned, 0 `TBD` |
 | §4 Risk classification | **Adopted with exception** | `critical: true/false` per mutation target with a stricter floor (90 vs 80). No broader risk-tier taxonomy beyond that binary |
 | §5 Selecting a layer | **Adopted** | unit / conformance / integration / contract / e2e / smoke / resilience / performance lanes exist as separate CI jobs |
@@ -78,7 +78,7 @@ a concrete mechanism, it is named.
 
 | Item | Value |
 |---|---|
-| CI control plane and runner tags | GitLab CI; a privileged dind-tagged group runner (`tags: [dind]`) plus a shared instance runner. Runner identities live in the private CI config, not here |
+| CI control plane and runner tags | private CI CI; a privileged dind-tagged group runner (`tags: [dind]`) plus a shared instance runner. Runner identities live in the private CI config, not here |
 | Production packages measured | all of `scripts/`, `okengine-mcp/`, `okengine-cockpit/`, `okengine-reader/`, `tools/`, `extensions/`, `ci/`. Exact pipeline 7205 measured **45,551 statements and 17,170 branches with zero misses or partial branches** (2026-08-29) |
 | Mutation shards and their targets | 173 targets in `mutation/targets.json`; four isolated workers per target |
 | Minimum mutant count per shard | `min_mutants` on every manifest target, enforced in full campaigns |
@@ -102,14 +102,14 @@ retain the applicable correctness, pack composition/conformance, projection,
 mutation-registration, and behavioral security gates.
 
 The authoritative Python 3.12 source suite emits JUnit plus line and branch
-coverage in one GitLab execution. `public-snapshot` qualifies the assembled
-public tree in GitLab; `public-compatibility` consumes that exact bundle on
+coverage in one private CI execution. `public-snapshot` qualifies the assembled
+public tree in private CI; `public-compatibility` consumes that exact bundle on
 Python 3.11 and 3.13. These are distinct interpreter contracts, not duplicate
 reporting. GitHub hosts owner-approved releases and runs no second CI pipeline.
 README qualification links describe release-scoped evidence, not live branch
 status. Publication approval must be recorded separately from passing tests.
 
-Baseline measured 2026-09-18: MR !1053 changed only `CHANGELOG.md`; GitLab
+Baseline measured 2026-09-18: MR !1053 changed only `CHANGELOG.md`; private CI
 pipeline #10393 ran for about 66 minutes and included broad test, pack, mutation,
 projection, and security jobs. The initial docs-only wall-clock budget is 300
 seconds from `CI_PIPELINE_CREATED_AT` to the final verdict. The verdict writes
@@ -151,7 +151,7 @@ they are added here.
 §16 requires measured figures to carry a date and expire. Two in-repo figures are
 undated and at least one is wrong:
 
-- `.gitlab-ci.yml` states *"full-suite was 13.6 min of an 18.5 min pipeline (74%
+- `private pipeline configuration` states *"full-suite was 13.6 min of an 18.5 min pipeline (74%
   of wall clock)"* — undated. `coverage-floor` measured **~17.5 min** on
   2026-08-12 (pipelines 4857, 4870). The margin argument built on that comment
   should be re-measured before it is relied on again.
