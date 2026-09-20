@@ -59,7 +59,7 @@ def test_reader_cockpit_share_every_common_dependency_pin():
                        "sync them; a CVE fix to one twin must reach the other")
 
 
-def test_cve_sensitive_deps_are_audited_in_ci_and_makefile():
+def test_cve_sensitive_deps_are_audited_by_canonical_makefile_gate():
     """The lag hid because the cockpit is a separate image/venv that no audit surface scanned.
     Every requirements file that ships in an image must be pip-audited in BOTH CI and the engine's
     audit gate — a new image whose deps aren't scanned fails HERE. The Makefile `audit` target
@@ -67,10 +67,8 @@ def test_cve_sensitive_deps_are_audited_in_ci_and_makefile():
     coverage lives there; assert the delegation chain is intact and every req is covered."""
     must = ("okengine-reader/requirements.txt", "okengine-cockpit/requirements.txt",
             "okengine-mcp/requirements.txt")
-    ci = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     mk = (REPO / "Makefile").read_text(encoding="utf-8")
     audit_sh = (REPO / "scripts" / "audit.sh").read_text(encoding="utf-8")
     assert "scripts/audit.sh" in mk, "the Makefile `audit` target must delegate to the canonical scripts/audit.sh gate"
     for req in must:
-        assert req in ci, f"CI pip-audit does not scan {req} — a shipped image's deps are unaudited"
         assert req in audit_sh, f"scripts/audit.sh (the Makefile + CI audit gate) does not scan {req}"

@@ -101,10 +101,13 @@ diff is classified as `mixed-or-code`; positive `rules:changes` selectors then
 retain the applicable correctness, pack composition/conformance, projection,
 mutation-registration, and behavioral security gates.
 
-The authoritative Python 3.12 suite emits JUnit plus line and branch coverage in
-one execution in both private GitLab CI and the public GitHub snapshot workflow.
-Python 3.11 and 3.13 remain separate compatibility executions because they test
-different interpreter contracts, not duplicate reporting.
+The authoritative Python 3.12 source suite emits JUnit plus line and branch
+coverage in one GitLab execution. `public-snapshot` qualifies the assembled
+public tree in GitLab; `public-compatibility` consumes that exact bundle on
+Python 3.11 and 3.13. These are distinct interpreter contracts, not duplicate
+reporting. GitHub hosts owner-approved releases and runs no second CI pipeline.
+README qualification links describe release-scoped evidence, not live branch
+status. Publication approval must be recorded separately from passing tests.
 
 Baseline measured 2026-09-18: MR !1053 changed only `CHANGELOG.md`; GitLab
 pipeline #10393 ran for about 66 minutes and included broad test, pack, mutation,

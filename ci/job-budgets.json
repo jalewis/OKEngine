@@ -19,6 +19,13 @@
   ],
   "headroom_factor": 2.0,
   "jobs": {
+    "publication-policy": {
+      "measured_s": 19.51,
+      "timeout": "5m",
+      "job_id": 122299,
+      "measured_on": "2026-09-20",
+      "note": "Initial complete 106-test execution took 19.505943s including shared wheel setup; 104 passed and two configuration-contract assertions failed. This is timing evidence, not a passing qualification claim. The repair removes unused wheel setup and retains the same test population."
+    },
     "diff-check": {
       "measured_s": 14.0,
       "timeout": "5m",

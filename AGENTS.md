@@ -23,6 +23,16 @@ requested.
 
 ## OKEngine deployment
 
+- GitHub publication requires the user's explicit approval for the exact public
+  repository, snapshot SHA, release tag, and requested push/release actions.
+  Green CI, merge approval, release preparation, and local rebuild/recreate
+  authorization are not publication approval. Record the user's approval in
+  the GitLab release issue before any GitHub write; never self-approve.
+- GitLab is the only CI control plane. Prepare and qualify changes there.
+  Do not push, tag, create/edit a release, or trigger GitHub workflows without
+  the user's separate explicit authorization. These are instructions, not a
+  credential-level interception mechanism.
+
 - GitLab CI and GitLab environments are not the deployment mechanism for this
   repository.
 - This directory is the live engine checkout used to deploy a local fleet; any

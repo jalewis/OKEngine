@@ -1,6 +1,6 @@
 # OKEngine
 
-[![CI](https://github.com/jalewis/okengine/actions/workflows/ci.yml/badge.svg)](https://github.com/jalewis/okengine/actions/workflows/ci.yml)
+[Qualification evidence](docs/qualification.md) · CI runs in GitLab; GitHub hosts approved releases.
 ![status: pre-1.0, active development](https://img.shields.io/badge/status-pre--1.0%20active-orange)
 ![license: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![python: 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
