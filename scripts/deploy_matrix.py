@@ -134,7 +134,12 @@ def _install(host: Path, pack: Path, shape: str, shapes: list[str]):
     args = ["install-domain", str(host), str(pack), "--apply"]
     if len(shapes) > 1:
         args += ["--shape", shape]
-    return framework(*args)
+    result = framework(*args)
+    if result.returncode:
+        print(f"== failed install-domain: {pack.name} ({shape}), exit {result.returncode} ==")
+        print(result.stdout)
+        print(result.stderr, file=sys.stderr)
+    return result
 
 
 def t1_coinstall(packs: list[Path]) -> None:

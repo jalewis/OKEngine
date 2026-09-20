@@ -12,7 +12,7 @@
 # (schema.yaml + persona + feeds + crons + content). See INSTALL.md and
 # docs/deploy-a-new-domain.md.
 version: 1
-engine_release: v0.14.4  # PATCH: make the public source-layout test deterministic
+engine_release: v0.14.5  # PATCH: stabilize prerequisite checks and DeepSeek Flash cron writers
 
 runtime:
   # Hermes is a PINNED DEPENDENCY, not vendored into this repo. You clone Hermes
@@ -22,7 +22,7 @@ runtime:
   pinned_version: v0.21.3          # upstream git tag v2026.9.14
   pinned_tag: v2026.9.14
   pinned_sha: 345cd2b057a452236de401d3534b8502a7465e8d   # commit the tag resolves to; build-engine-image.sh verifies the clone matches
-  carried_patches: patches/target-v2026.9.14/  # 22 carried patch artifacts selected by apply.sh (23 original IDs; 09+22 share one artifact; 05 is test-only retirement evidence)
+  carried_patches: patches/target-v2026.9.14/  # 23 carried patch artifacts selected by apply.sh (23 original IDs plus target-native 24; 09+22 share one artifact; 05 is test-only retirement evidence)
 
 dependencies:
   # External plugins the engine REQUIRES at runtime — cloned separately by the

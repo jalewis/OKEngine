@@ -9,13 +9,35 @@ The existing GitLab patch-inventory
 command now audits this target registry as well as the live v0.18.2 set. Its
 final mode requires all decisions to be `ported` or `retired` and an actual
 checkout at the peeled target SHA to verify the 24-artifact/30-existing-file
-adapter threshold. The final set has 22 artifacts, touches exactly 32 files
+adapter threshold. The final set has 23 artifacts, touches exactly 35 files
 that exist in pristine v0.21.3, and retires patch 05 while preserving patch
-17's forced Responses behavior. The two-file excess records the #630
+17's forced Responses behavior. Five governed exceptions exceed the adapter
+threshold: two record the #630
 maintained-runtime decision: Hermes mutates config and SOUL state before an
 external adapter can preserve the operator-selected values, so patch 18 also
-guards those migrations. The negative inventory fixtures reject
+guards those migrations; three let native terminal and code-execution
+requirement surfaces distinguish documented fail-closed absence from an
+unexpected probe failure for #789.
+The negative inventory fixtures reject
 unregistered artifacts, missing declared tests, and budget breaches.
+
+The #789 extension to `23-mcp-registry-recovery.patch` removes the file tool availability check's
+startup-sensitive import through the `tools` package namespace and imports the
+terminal requirement from its owning module. It also separates an ordinary
+optional `False` result from an unexpected exception: only the exception
+publishes the profile-scoped, size-bounded, time-bounded
+`hermes.tool_check.degraded` diagnostic. Checks without a stable profile scope
+emit the named log signal without retaining a shared diagnostic-map entry, so
+one request cannot clear another's failure. The terminal and code-execution
+requirement wrappers preserve documented configuration and missing-dependency
+results as ordinary `False`, while
+allowing unexpected backend probe failures to reach that classifier. Negative
+fixtures remove the current owning symbol, distinguish normal absence, prove
+cross-profile success cannot erase another profile's failure, cap retained
+diagnostics, expire stale entries, prove unscoped checks cannot alias retained
+state, and prove recovery clears the diagnostic. An AST audit of every
+registered check in the fully patched target found no other check importing
+from the old `tools` package surface.
 
 `04-usage-pricing-models.patch` does **not** replay the old flat-peak table.
 Candidate v0.21.3 already matches the [current native DeepSeek off-peak
@@ -381,3 +403,17 @@ automatically admitted, to avoid surprising paid routing. That boundary
 needs explicit policy/allowlist reconciliation before production promotion;
 full GitLab, overlay registration, and canary web-search/extract evidence are
 still open.
+
+`24-deepseek-flash-eager-local-tools.patch` adds a cron-only compatibility
+scope for DeepSeek V4.1 Flash. Within that run context, local plugin and MCP
+tools—including hashed governed-writer names—remain direct provider tools. The
+scope is a ContextVar, participates in the tool-definition cache key, remains fixed for
+the conversation, and is reset after the fire, so concurrent gateway sessions
+and process-wide configuration are unchanged. A captured Chat Completions
+response fixture reproduces the observed multi-local `tool_call` arguments and
+proves they remain fail-closed. A positive fixture registers a real shortened
+writer name, verifies it is direct only inside the qualified scope, and routes
+one call through the normal registry handler. Provider/model negatives keep
+OpenRouter and non-Flash DeepSeek jobs on the standard bridge. Dependency-
+complete GitLab evidence and two authorized live scheduled writes with late
+reader readback remain required.

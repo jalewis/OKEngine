@@ -3,24 +3,19 @@
 import re
 from pathlib import Path
 
+# The migration loader exposes scripts/, including its cron namespace package.
+from cron.deepseek_policy import ACTIVE_CONFIGS
+from cron.deepseek_policy import active_config_paths as _active_config_paths
+
 ID = "okengine-deepseek-v4-1-flash"
 FROM = "v0.13.8"
 TO = "v0.14.0"
 DESCRIPTION = "Replace active legacy DeepSeek model selections with deepseek-flash"
+_ACTIVE_CONFIGS = ACTIVE_CONFIGS
 
-_ACTIVE_CONFIGS = (
-    Path(".okengine/model-profiles.yaml"),
-    Path(".okengine/cron-models.json"),
-    Path(".okengine/extension-models.json"),
-    Path("crons/domain-crons.json"),
-    Path(".hermes-data/config.yaml"),
-    Path(".env"),
-    Path(".hermes/config.yaml"),
-    Path(".hermes/config.yml"),
-    Path("config.yaml"),
-    Path("config.yml"),
-)
 _MODEL_REPLACEMENTS = (
+    ("openrouter/deepseek/deepseek-v4-flash-vision-exp", "openrouter/deepseek/deepseek-v4.1-flash"),
+    ("openrouter/deepseek/deepseek-reasoner", "openrouter/deepseek/deepseek-v4.1-flash"),
     ("openrouter/deepseek/deepseek-v4-pro", "openrouter/deepseek/deepseek-v4.1-flash"),
     ("openrouter/deepseek/deepseek-v4-flash", "openrouter/deepseek/deepseek-v4.1-flash"),
     ("openrouter/deepseek/deepseek-chat", "openrouter/deepseek/deepseek-v4.1-flash"),
@@ -36,16 +31,6 @@ _MODEL_REPLACEMENTS = (
     ("deepseek-chat", "deepseek-flash"),
 )
 _TARGET_ID = "deepseek-flash"
-
-
-def _active_config_paths(pack: Path) -> list[Path]:
-    relative = set(_ACTIVE_CONFIGS)
-    for root in (Path("extensions"), Path(".okengine/extensions")):
-        base = pack / root
-        if base.is_dir():
-            relative.update(path.relative_to(pack) for path in base.rglob("extension.yaml"))
-            relative.update(path.relative_to(pack) for path in base.rglob("*.cron.json"))
-    return sorted(relative)
 
 
 def _replace_active_values(path: Path, text: str) -> tuple[str, int]:
@@ -75,7 +60,7 @@ def _replace_active_values(path: Path, text: str) -> tuple[str, int]:
                 pattern = rf'(?P<prefix>:\s*["\']){re.escape(legacy)}(?P<suffix>["\'])'
             elif is_env:
                 pattern = (
-                    rf'(?P<prefix>^(?:export\s+)?[A-Z0-9_]*MODEL[A-Z0-9_]*=\s*)'
+                    rf'(?P<prefix>^\s*(?:export\s+)?[A-Z0-9_]*MODEL[A-Z0-9_]*\s*=\s*)'
                     rf'(?:(?P<double>"){re.escape(legacy)}"|'
                     rf"(?P<single>'){re.escape(legacy)}'|(?P<bare>{re.escape(legacy)}))"
                     rf'(?=\s*(?:#\s.*)?$)'

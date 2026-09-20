@@ -71,3 +71,13 @@ def test_acquirer_signals_fires_on_movement(tmp_path):
                {"WIKI_PATH": str(tmp_path), "TREND_NOW": "2026-06-26", "ACQUIRER_MIN_HITS": "2"})
     assert "entities/a/acme" in out
     assert json.loads(out.strip().splitlines()[-1]) == {"wakeAgent": True}
+
+
+def test_acquirer_signal_write_is_bounded_by_prompt_and_enforced_contract():
+    manifest = yaml.safe_load((EXT / "extension.yaml").read_text(encoding="utf-8"))
+    operation = manifest["operations"]["acquirer-signals"]
+    assert operation["output_contract"]["body"]["max_non_whitespace"] == 8000
+    prompt = (EXT / operation["prompt_file"]).read_text(encoding="utf-8")
+    assert "at most 12 signals" in prompt
+    assert "below 8,000 non-whitespace characters" in prompt
+    assert "exactly one bounded create/update/converge call" in prompt

@@ -62,7 +62,7 @@ a concrete mechanism, it is named.
 | §10 Flake policy | **Adopted** | `docs/testing-flake-policy.md`; no automatic test/job retries; failures remain red and are classified; bounded prerequisite acquisition is distinct; `config/test-quarantine.yaml` requires an owner, issue, evidence, and <=14-day expiry; `ci/flake_policy.py` validates it and publishes the standing count |
 | §11 Observability validation | **Adopted** | `observability-validation` runs after `fleet-health` and `health-export` against each live deployment; it fails on absent/stale/empty signals and verifies fleet identities/counts, qmd search-vs-maintenance telemetry, deployment-validation visibility, and Prometheus heartbeat agreement |
 | §12 Change-to-test mapping | **Adopted** | `mutation-targets` fails when a changed production module has no registered target — the mapping is enforced, not documented |
-| §13 CI execution model | **Adopted** | `.automatic-gates` (every MR) vs `.layer-gates` / `.release-gates` / `.campaign-gates` (main, tags, schedules; manual on MR). `coverage-floor` deliberately diverges: blocking-manual |
+| §13 CI execution model | **Adopted** | `.code-gates` and `.pack-gates` select affected evidence; `.docs-change-gates` provides the narrow docs path; `.layer-gates` / `.release-gates` / `.campaign-gates` retain main, tag, and schedule evidence. `full-suite` is the single correctness+coverage execution; no separate `coverage-floor` population exists. See #788. |
 | §14 Environments and data | **Adopted** | `tmp_path` fixtures throughout; disposable Postgres service for `postgres-projection-integration`; no test depends on pre-existing production-like data |
 | §15 Evidence and release gates | **Adopted** | `docs/release-checklist.md` (145 lines), `scripts/post_deploy_verify.sh`, the invariant audit (checklist step 2b), `staged_drift.py` for deploy verification |
 | §15.1 Retain per pipeline | **Adopted** | JUnit + coverage + mutation artifacts retained 30 days |
@@ -91,6 +91,45 @@ a concrete mechanism, it is named.
 | Artifact retention and schedule cadence | 30 days; `mutation-full` and release lanes on schedule |
 | Release verification and rollback thresholds | **Adopted** — `docs/release-checklist.md`: named release owner, immediate artifact/health/critical-path verification, one stable repeat, signal inventory, objective rollback thresholds, and post-rollback evidence; no default fixed observation window |
 | Named owners per §3 | `okengine-maintainers` |
+
+## CI change routing and duration budget
+
+Documentation-only diffs run `diff-check`, `docs-validation`, `secret-scan`, and
+`docs-duration-budget`. The exact classifier in `ci/change_scope.py` fails closed
+when the diff base is missing, invalid, or empty. A mixed documentation and code
+diff is classified as `mixed-or-code`; positive `rules:changes` selectors then
+retain the applicable correctness, pack composition/conformance, projection,
+mutation-registration, and behavioral security gates.
+
+The authoritative Python 3.12 suite emits JUnit plus line and branch coverage in
+one execution in both private GitLab CI and the public GitHub snapshot workflow.
+Python 3.11 and 3.13 remain separate compatibility executions because they test
+different interpreter contracts, not duplicate reporting.
+
+Baseline measured 2026-09-18: MR !1053 changed only `CHANGELOG.md`; GitLab
+pipeline #10393 ran for about 66 minutes and included broad test, pack, mutation,
+projection, and security jobs. The initial docs-only wall-clock budget is 300
+seconds from `CI_PIPELINE_CREATED_AT` to the final verdict. The verdict writes
+`artifacts/docs-duration-budget.json` before passing or failing. The first
+post-merge docs-only pipeline must be recorded here with its pipeline/job IDs
+and measured duration; the budget may tighten from evidence but never increase
+automatically. Tracking: #788.
+
+The authoritative measurement uses a `TESTING.md`-only merge request. Its final
+pipeline must execute only the four narrow jobs named above, identify the exact
+candidate SHA in the scope and duration artifacts, and finish within the budget.
+Optional manual qualification jobs may remain startable but consume no runner
+time. The measured pipeline is recorded below rather than inferred from local
+timing.
+
+First post-merge measurement, 2026-09-18: MR !1063 pipeline #10462 at candidate
+`2a1126ff259c100c9ba4fbf383e61b8da25d2c06` executed `diff-check` #120516,
+`docs-validation` #120517, `secret-scan` #120523, and
+`docs-duration-budget` #120528. Its exact-SHA duration artifact reported 241.683
+seconds from pipeline creation to verdict, inside the 300-second budget. Broad
+correctness, pack, projection, mutation, behavioral-security, and release jobs
+did not execute. The final documentation commit repeats this path to verify the
+result is stable.
 
 ---
 

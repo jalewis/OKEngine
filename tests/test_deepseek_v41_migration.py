@@ -1,9 +1,33 @@
 import importlib.util
 from pathlib import Path
+import subprocess
+import sys
+
+import pytest
 
 
 REPO = Path(__file__).resolve().parent.parent
 MIGRATION = REPO / "migrations" / "m_v0_13_8_v0_14_0_deepseek_v4_1_flash.py"
+
+
+@pytest.fixture(autouse=True)
+def migration_loader_import_path(monkeypatch):
+    """Match the real migration loader, not pytest's repository-root import path."""
+    monkeypatch.syspath_prepend(str(REPO / "scripts"))
+
+
+def test_registry_loads_with_only_documented_scripts_import_path(tmp_path):
+    program = (
+        "import sys; sys.path.insert(0, sys.argv[1]); "
+        "from pathlib import Path; import framework_upgrade; "
+        "entries = framework_upgrade.load_migrations(Path(sys.argv[2])); "
+        "assert any(item.id == 'okengine-deepseek-v4-1-flash' for item in entries)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", program, str(REPO / "scripts"),
+         str(REPO / "migrations")], cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def _load_migration():
@@ -11,6 +35,41 @@ def _load_migration():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("relative", [".env", ".hermes-data/.env", ".hermes/.env"])
+@pytest.mark.parametrize("prefix", ["OKENGINE_LLM_MODEL=", "  OKENGINE_LLM_MODEL=",
+                                    "OKENGINE_LLM_MODEL = ", " export MODEL = "])
+def test_migration_repairs_every_dotenv_selection_format(tmp_path, relative, prefix):
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(prefix + '"deepseek-chat" # retain\nTOKEN=private\n')
+    migration = _load_migration()
+    assert len(migration.apply(tmp_path, False)) == 1
+    assert path.read_text() == prefix + '"deepseek-flash" # retain\nTOKEN=private\n'
+    assert migration.apply(tmp_path, False) == []
+
+
+@pytest.mark.parametrize("notes", [
+    "upgrade_notes: 'v0.13.8 pinned OKENGINE_LLM_MODEL: deepseek-chat'\n",
+    "upgrade_notes: |\n  v0.13.8 pinned OKENGINE_LLM_MODEL: deepseek-chat\n",
+    "upgrade_notes: >\n  v0.13.8 pinned OKENGINE_LLM_MODEL: deepseek-chat\n",
+])
+def test_migration_preserves_descriptive_environment_key_prose(tmp_path, notes):
+    path = tmp_path / "config.yaml"
+    path.write_text("model: deepseek-v4-pro\n" + notes)
+    assert len(_load_migration().apply(tmp_path, False)) == 1
+    assert path.read_text() == "model: deepseek-flash\n" + notes
+
+
+@pytest.mark.parametrize("model", ["deepseek-reasoner", "deepseek-v4-flash-vision-exp"])
+def test_openrouter_legacy_aliases_migrate_idempotently(tmp_path, model):
+    path = tmp_path / "config.yaml"
+    path.write_text(f"model: openrouter/deepseek/{model}\n")
+    migration = _load_migration()
+    assert len(migration.apply(tmp_path, False)) == 1
+    assert path.read_text() == "model: openrouter/deepseek/deepseek-v4.1-flash\n"
+    assert migration.apply(tmp_path, False) == []
 
 
 def test_migrates_all_active_legacy_ids_without_changing_qwen(tmp_path):

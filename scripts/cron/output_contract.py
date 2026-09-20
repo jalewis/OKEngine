@@ -20,7 +20,7 @@ KEYS = {
     "unresolved_links", "placeholder_links", "completion",
     "required_write_path",
 }
-BODY_KEYS = {"required", "min_non_whitespace"}
+BODY_KEYS = {"required", "min_non_whitespace", "max_non_whitespace"}
 
 
 def digest(contract: dict) -> str:
@@ -86,6 +86,13 @@ def validate(contract: object, where: str = "output_contract") -> list[str]:
         minimum = body.get("min_non_whitespace", 0)
         if not isinstance(minimum, int) or isinstance(minimum, bool) or minimum < 0:
             errors.append(f"{where}.body.min_non_whitespace must be a non-negative integer")
+        maximum = body.get("max_non_whitespace")
+        if maximum is not None and (
+            not isinstance(maximum, int) or isinstance(maximum, bool) or maximum <= 0
+        ):
+            errors.append(f"{where}.body.max_non_whitespace must be a positive integer")
+        if isinstance(minimum, int) and isinstance(maximum, int) and maximum < minimum:
+            errors.append(f"{where}.body.max_non_whitespace must be at least the minimum")
         if minimum and body.get("required") is False:
             errors.append(f"{where}.body cannot set a minimum while required is false")
     for key in ("unknown_fields", "unresolved_links", "placeholder_links"):
@@ -167,6 +174,13 @@ def compose(floor: dict | None, policy: dict | None, where: str = "output_contra
         "min_non_whitespace": max(fb.get("min_non_whitespace", 0),
                                     pb.get("min_non_whitespace", 0)),
     }
+    floor_max = fb.get("max_non_whitespace")
+    policy_max = pb.get("max_non_whitespace")
+    if floor_max is not None and policy_max is not None and policy_max > floor_max:
+        raise ValueError(f"{where}.body.max_non_whitespace policy may not weaken the engine floor")
+    effective_max = policy_max if policy_max is not None else floor_max
+    if effective_max is not None:
+        out["body"]["max_non_whitespace"] = effective_max
     if floor["completion"] == "per-selected-item" and policy["completion"] != "per-selected-item":
         raise ValueError(f"{where}.completion policy may not weaken the engine floor")
     out["completion"] = policy["completion"]

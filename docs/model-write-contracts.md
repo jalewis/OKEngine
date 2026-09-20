@@ -14,7 +14,7 @@ own namespace, type, field, and relationship names.
     "operations": ["create", "update"],
     "required_fields": ["type", "title", "raw"],
     "required_relationships": [],
-    "body": {"required": true, "min_non_whitespace": 80},
+    "body": {"required": true, "min_non_whitespace": 80, "max_non_whitespace": 8000},
     "unknown_fields": "reject",
     "unresolved_links": "reject",
     "placeholder_links": "reject",
@@ -26,7 +26,9 @@ own namespace, type, field, and relationship names.
 Policy values are `allow`, `review`, or `reject`. Completion is either `run` or
 `per-selected-item`. Engine-template prompts retain the legacy string form, or may use an object
 with `prompt` and `output_contract`. A pack may narrow allowed values, add requirements, raise body
-minimums, or strengthen `allow → review → reject`; it cannot weaken an engine floor.
+minimums, lower a declared body maximum, or strengthen `allow → review → reject`; it cannot weaken
+an engine floor. `max_non_whitespace` is optional; when present, the governed writer rejects an
+oversized body before it reaches the vault.
 
 `output_contract_exempt` is a temporary, explicit migration marker for a legacy model-writing lane.
 It must contain a reason and must not be used for new lanes. Runtime enforcement and verified

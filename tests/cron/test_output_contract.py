@@ -184,6 +184,46 @@ def test_body_spec_is_validated():
         assert any("min_non_whitespace must be a non-negative integer" in e
                    for e in oc.validate(contract(body={"required": True,
                                                        "min_non_whitespace": bad})))
+    for bad in (0, -1, "8000", 1.5, True):
+        assert any("max_non_whitespace must be a positive integer" in e
+                   for e in oc.validate(contract(body={"required": True,
+                                                       "max_non_whitespace": bad})))
+    assert any("must be at least the minimum" in e for e in oc.validate(contract(
+        body={"required": True, "min_non_whitespace": 100, "max_non_whitespace": 99})))
+
+
+def test_pack_policy_can_tighten_body_maximum_but_not_raise_floor_cap():
+    floor = contract(body={"required": True, "min_non_whitespace": 40,
+                           "max_non_whitespace": 1000})
+    policy = contract(body={"required": True, "min_non_whitespace": 80,
+                            "max_non_whitespace": 800})
+    assert oc.compose(floor, policy)["body"] == {
+        "required": True,
+        "min_non_whitespace": 80,
+        "max_non_whitespace": 800,
+    }
+    try:
+        oc.compose(floor, contract(body={"required": True, "min_non_whitespace": 80,
+                                         "max_non_whitespace": 1200}))
+    except ValueError as exc:
+        assert "max_non_whitespace policy may not weaken" in str(exc)
+    else:
+        raise AssertionError("weaker maximum accepted")
+
+
+def test_body_maximum_accepts_positive_one_and_equal_minimum():
+    assert oc.validate(contract(body={"required": True, "min_non_whitespace": 1,
+                                      "max_non_whitespace": 1})) == []
+
+
+def test_pack_policy_can_preserve_body_maximum():
+    floor = contract(body={"required": True, "min_non_whitespace": 40,
+                           "max_non_whitespace": 1000})
+    policy = contract(body={"required": True, "min_non_whitespace": 80,
+                            "max_non_whitespace": 1000})
+    assert oc.compose(floor, policy)["body"] == {
+        "required": True, "min_non_whitespace": 80, "max_non_whitespace": 1000,
+    }
 
 
 def test_enforcement_policies_and_completion_are_closed_enums():

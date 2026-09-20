@@ -31,6 +31,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # depending on some earlier test having imported extension_compose into sys.modules.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from hardening_lib import hardened_posture_violations, is_hardened, is_editing  # noqa: E402
+from deepseek_policy import (  # noqa: E402
+    MODEL_ENV_KEY, env_model_values, model_values,
+    legacy_deepseek_model as _legacy_deepseek_model,
+)
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 DATA = Path(os.environ.get("OKENGINE_DATA", "/opt/data"))
@@ -38,7 +42,6 @@ DATA = Path(os.environ.get("OKENGINE_DATA", "/opt/data"))
 # Hermes sets to the DATA dir (/opt/data). Fixed /opt/hermes; overridable for tests.
 HERMES = Path(os.environ.get("OKENGINE_HERMES_DIR", "/opt/hermes"))
 F: list[tuple[str, str, str]] = []
-
 
 def add(level, area, msg):
     F.append((level, area, msg))
@@ -389,6 +392,19 @@ def _check_model_routing(jobs):
 
 
 def check_crons():
+    environments = [("process environment", os.environ.items())]
+    for dotenv in sorted({VAULT / ".env", DATA / ".env"}):
+        if dotenv.is_file():
+            try:
+                environments.append((str(dotenv), list(env_model_values(
+                    dotenv.read_text(encoding="utf-8")))))
+            except (OSError, ValueError):
+                add("FAIL", "DeepSeek model policy", f"{dotenv}: cannot inspect model assignments")
+    for source, entries in environments:
+        for key, value in entries:
+            if MODEL_ENV_KEY.fullmatch(key) and (legacy := _legacy_deepseek_model(value)):
+                add("FAIL", "DeepSeek model policy", f"{source} {key} selects legacy model "
+                    f"'{legacy}' — use deepseek-flash")
     jf = DATA / "cron-plus" / "jobs.json"
     if not jf.is_file():
         add("FAIL", "crons", "deployed jobs.json missing — dead scheduler?")
@@ -431,6 +447,32 @@ def check_crons():
     except Exception as e:
         add("FAIL", "crons", f"jobs.json unparseable ({e})")
         return
+    legacy_jobs = sorted({
+        (str(j.get("name") or j.get("id") or "<unnamed>"), model)
+        for j in jobs if j.get("enabled", True)
+        for value in model_values(j)
+        if (model := _legacy_deepseek_model(value))
+    })
+    for name, model in legacy_jobs:
+        add("FAIL", "DeepSeek model policy", f"enabled job '{name}' selects legacy model "
+            f"'{model}' — redeploy it with deepseek-flash")
+
+    runtime_path = DATA / "config.yaml"
+    runtime = _yaml(runtime_path) if runtime_path.is_file() else {}
+    runtime = runtime or {}
+    model_config = runtime.get("model") if isinstance(runtime, dict) else {}
+    if not isinstance(model_config, dict):
+        model_config = {}
+    if legacy_default := _legacy_deepseek_model(model_config.get("default")):
+        add("FAIL", "DeepSeek model policy", f"config.yaml default selects legacy model "
+            f"'{legacy_default}' — use deepseek-flash")
+    fallbacks = runtime.get("fallback_providers", []) if isinstance(runtime, dict) else []
+    for index, fallback in enumerate(fallbacks if isinstance(fallbacks, list) else []):
+        if isinstance(fallback, dict) and (
+            legacy_fallback := _legacy_deepseek_model(fallback.get("model"))
+        ):
+            add("FAIL", "DeepSeek model policy", f"config.yaml fallback_providers[{index}] "
+                f"selects legacy model '{legacy_fallback}' — use deepseek-flash")
     seen_id, seen_name = set(), set()
     for j in jobs:
         if j.get("id") in seen_id:

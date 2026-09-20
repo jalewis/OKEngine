@@ -16,6 +16,33 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
 
 ## Unreleased
 
+## v0.14.5
+
+- Preserve co-installed namespace tier contracts on minimal hosts, keep re-apply
+  idempotent, and retain complete failed co-install diagnostics in runner logs.
+- Strengthen output-size boundary tests for the DeepSeek writer repair (#803).
+- Preserve existing partitioning, permission, and tier contracts when co-installing
+  into inline or block YAML mappings. DeepSeek prevention shares the migration's
+  active-file inventory and checks environment and extension model selections.
+
+PATCH — preserve the file-requirement tool surface across Hermes startup import
+ordering, distinguish ordinary unavailable prerequisites from broken check
+contracts, and publish profile-scoped, size-bounded named diagnostics that
+expire when stale and clear when the same scoped check recovers. Unscoped checks
+emit the named signal without sharing retained state. Unexpected terminal and
+code-execution backend probe exceptions now reach that classifier; malformed
+operator configuration, fail-closed secret scoping, policy refusal, and
+documented missing dependencies remain ordinary unavailable prerequisites.
+
+DeepSeek V4.1 Flash scheduled writers now keep selected local and MCP tools,
+including shortened governed-writer names, directly visible during cron runs
+instead of routing them through the model's unreliable multi-local bridge.
+The compatibility scope is provider-, model-, and conversation-qualified so
+other models and sessions retain progressive tool disclosure. Malformed bridge
+calls remain fail-closed, acquirer-signal writes have a bounded body, and the
+release procedure now qualifies model-writing changes with two distinct
+disposable inputs and client-visible readback (okengine#803).
+
 ## v0.14.4
 
 PATCH — restore governed-writer startup with Hermes MCP 2.x while retaining the

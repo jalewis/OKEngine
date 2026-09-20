@@ -6,7 +6,14 @@ import json
 import re
 from pathlib import Path
 
+import yaml
+from yaml import YAMLError
+
 from scripts.framework_validate_report import Report
+from scripts.cron.deepseek_policy import (
+    active_config_paths, env_model_values, model_values as _model_values,
+    legacy_deepseek_model as _legacy_deepseek_model,
+)
 
 
 class ModelChecks:
@@ -69,6 +76,7 @@ class ModelChecks:
         """Validate the optional model-profiles registry (okengine#151) and that every `@<profile>`
         reference the operator wrote (pack domain crons + extension-models.json) resolves — fail
         BEFORE deploy, where an undefined reference would otherwise abort the fold."""
+        self.check_deepseek_model_policy(pack, r)
         mp = self.model_profiles()
         f = pack / ".okengine" / "model-profiles.yaml"
         try:
@@ -105,6 +113,47 @@ class ModelChecks:
             )
         else:
             r.ok("model profiles", f"{len(profiles)} profile(s); {len(refs)} reference(s) resolve")
+
+    def check_deepseek_model_policy(self, pack: Path, r: Report) -> None:
+        """Reject active legacy DeepSeek selections before migration or deployment.
+
+        Exact scalar matching is deliberate: profile names, comments, prose, and dated/qualified
+        third-party IDs are not active model selections and must not become false positives.
+        """
+        findings: list[tuple[Path, set[str]]] = []
+        unreadable = False
+        for relative in active_config_paths(pack):
+            path = pack / relative
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+                if path.name == ".env":
+                    values = [value for _key, value in env_model_values(text)]
+                else:
+                    document = json.loads(text) if path.suffix == ".json" else yaml.safe_load(text)
+                    if relative in (Path(".okengine/cron-models.json"),
+                                    Path(".okengine/extension-models.json")):
+                        values = document.values() if isinstance(document, dict) else []
+                    else:
+                        values = list(_model_values(document))
+            except (OSError, ValueError, YAMLError):
+                unreadable = True
+                r.fail("DeepSeek model policy", f"{relative}: cannot inspect active configuration")
+                continue
+            legacy = {model for value in values
+                      if (model := _legacy_deepseek_model(value))}
+            if legacy:
+                findings.append((path, legacy))
+        if not findings and not unreadable:
+            r.ok("DeepSeek model policy", "active selections use current model IDs")
+            return
+        for path, models in findings:
+            r.fail(
+                "DeepSeek model policy",
+                f"{path.relative_to(pack)} selects legacy model(s) {sorted(models)}; "
+                "use deepseek-flash (native) or deepseek/deepseek-v4.1-flash (OpenRouter)",
+            )
 
     def _collect_model_refs(self, pack: Path, mp) -> set[str]:
         """Profile names referenced (`@name`) across the pack's operator-facing model hooks: domain

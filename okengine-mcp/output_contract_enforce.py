@@ -207,6 +207,12 @@ def evaluate(caller: dict, *, operation: str, namespace: str, page_type: str,
         out.append(finding("body_required", "a non-empty body is required"))
     if meaningful < int(bspec.get("min_non_whitespace") or 0):
         out.append(finding("body_too_short", f"body has {meaningful} meaningful characters"))
+    maximum = bspec.get("max_non_whitespace")
+    if maximum is not None and meaningful > int(maximum):
+        out.append(finding(
+            "body_too_long",
+            f"body has {meaningful} meaningful characters; maximum is {int(maximum)}",
+        ))
     if unknown_fields and contract.get("unknown_fields") == "reject":
         out.append(finding("unknown_fields", "unknown model-authored field(s): " + ", ".join(unknown_fields)))
     body_links_changed = caller.get("body_links_changed", True)

@@ -272,6 +272,16 @@
   },
   "targets": [
     {
+      "path": "scripts/deploy_matrix.py",
+      "category": "deployment",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_deploy_matrix_diagnostics.py tests/test_uncovered_maintenance_tools.py tests/test_policy_dedup_deploy_coverage.py -q",
+      "min_mutants": 1
+    },
+    {
       "path": "ci/flake_policy.py",
       "category": "ci-policy",
       "critical": false,
@@ -1578,7 +1588,7 @@
       "owner": "okengine-maintainers",
       "timeout_seconds": 60,
       "session_deadline_seconds": 14400,
-      "test_command": "{python} -m pytest tests/test_framework_install_domain.py tests/test_framework_install_domain_branch_edges.py -q",
+      "test_command": "{python} -m pytest tests/test_namespace_mapping_merge.py tests/test_framework_install_domain.py tests/test_framework_install_domain_branch_edges.py -q",
       "min_mutants": 1
     },
     {
@@ -1702,13 +1712,23 @@
       "min_mutants": 1
     },
     {
+      "path": "scripts/cron/deepseek_policy.py",
+      "category": "validation",
+      "critical": false,
+      "owner": "okengine-maintainers",
+      "timeout_seconds": 45,
+      "session_deadline_seconds": 3600,
+      "test_command": "{python} -m pytest tests/test_framework_validate_models.py -q -k model_policy",
+      "min_mutants": 1
+    },
+    {
       "path": "scripts/framework_validate_models.py",
       "category": "validation",
       "critical": false,
       "owner": "okengine-maintainers",
       "timeout_seconds": 60,
       "session_deadline_seconds": 14400,
-      "test_command": "{python} -m pytest tests/test_framework_validate.py tests/test_framework_validate_branch_edges.py -q",
+      "test_command": "{python} -m pytest tests/test_framework_validate_models.py tests/test_framework_validate.py tests/test_framework_validate_branch_edges.py -q -k 'model_policy or model_profile or model_schedule or cron_without_usable_schedule or domain_cron_rejects_spring_forward_loss_patterns or scaffolded_pack_validates_clean'",
       "min_mutants": 1
     },
     {

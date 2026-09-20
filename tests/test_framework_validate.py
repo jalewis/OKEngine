@@ -102,6 +102,72 @@ def test_runtime_config_accepts_qwen_coder_with_empty_fallback(tmp_path):
                    for s, c, _d in report.rows)
 
 
+def test_model_policy_rejects_legacy_deepseek_selections(tmp_path):
+    pack = tmp_path / "pack"
+    (pack / ".okengine").mkdir(parents=True)
+    (pack / "crons").mkdir()
+    (pack / ".hermes-data").mkdir()
+    (pack / ".okengine" / "model-profiles.yaml").write_text(
+        "profiles:\n  reasoning: {provider: deepseek, model: deepseek-v4-pro}\n",
+        encoding="utf-8",
+    )
+    (pack / "crons" / "domain-crons.json").write_text(
+        json.dumps([{"name": "brief", "model": "deepseek-v4-flash"}]), encoding="utf-8"
+    )
+    (pack / ".hermes-data" / "config.yaml").write_text(
+        yaml.safe_dump({"fallback_providers": [
+            {"provider": "deepseek", "model": "deepseek-reasoner"}
+        ]}), encoding="utf-8",
+    )
+    (pack / ".okengine" / "cron-models.json").write_text(
+        json.dumps({"extract": "deepseek-flash"}), encoding="utf-8"
+    )
+    (pack / ".okengine" / "extension-models.json").write_text(
+        json.dumps({"grade": "deepseek/deepseek-v4-pro"}), encoding="utf-8"
+    )
+    v = _load("framework_validate_legacy_deepseek", VAL)
+    report = v.Report()
+
+    v._model_checks().check_deepseek_model_policy(pack, report)
+
+    failures = [detail for severity, check, detail in report.rows
+                if severity == "FAIL" and check == "DeepSeek model policy"]
+    assert len(failures) == 4, failures
+    assert any("model-profiles.yaml" in detail and "deepseek-v4-pro" in detail
+               for detail in failures)
+    assert any("domain-crons.json" in detail and "deepseek-v4-flash" in detail
+               for detail in failures)
+    assert any("config.yaml" in detail and "deepseek-reasoner" in detail
+               for detail in failures)
+    assert any("extension-models.json" in detail and "deepseek/deepseek-v4-pro" in detail
+               for detail in failures)
+
+
+def test_model_policy_accepts_v41_and_ignores_descriptive_legacy_text(tmp_path):
+    pack = tmp_path / "pack"
+    (pack / ".okengine").mkdir(parents=True)
+    (pack / ".hermes-data").mkdir()
+    (pack / ".okengine" / "model-profiles.yaml").write_text(
+        "profiles:\n  deepseek-v4-pro:\n    model: deepseek-flash\n"
+        "    note: migrated from deepseek-v4-pro\n",
+        encoding="utf-8",
+    )
+    (pack / ".hermes-data" / "config.yaml").write_text(
+        yaml.safe_dump({"model": {"default": "deepseek-flash"},
+                        "fallback_providers": [{"provider": "openrouter",
+                        "model": "deepseek/deepseek-v4.1-flash"}]}), encoding="utf-8",
+    )
+    (pack / ".okengine" / "cron-models.json").write_text("{}", encoding="utf-8")
+    (pack / ".okengine" / "extension-models.json").write_text("[]", encoding="utf-8")
+    v = _load("framework_validate_current_deepseek", VAL)
+    report = v.Report()
+
+    v._model_checks().check_deepseek_model_policy(pack, report)
+
+    assert not [row for row in report.rows if row[0] == "FAIL"], report.rows
+    assert ("OK", "DeepSeek model policy", "active selections use current model IDs") in report.rows
+
+
 def test_compose_drift_ignores_commented_base_port(tmp_path):
     """Regression (library deploy-matrix): the port-offset drift check greps the RAW compose
     text, so a commented-out example binding that shows the un-offset base port — e.g. a doc

@@ -38,8 +38,30 @@ jobs:
       - run: pip install -r okengine-mcp/requirements.txt
       - run: pip install -e .
       - run: python -c "import mcp"
-      - name: pytest
-        run: python -m pytest
+      - run: mkdir -p artifacts
+      - name: pytest (compatibility)
+        if: matrix.python-version != '3.12'
+        run: python -m pytest --junitxml=artifacts/junit-${{ matrix.python-version }}.xml
+      - name: pytest (authoritative correctness + coverage)
+        if: matrix.python-version == '3.12'
+        run: >-
+          python -m pytest tests/ -q --import-mode=importlib
+          --junitxml=artifacts/junit-3.12.xml --cov
+          --cov-config=pyproject.toml --cov-report=term-missing
+          --cov-report=xml:artifacts/coverage.xml
+          --cov-report=json:coverage.json --cov-fail-under=100
+      - name: branch and per-file coverage floor
+        if: matrix.python-version == '3.12'
+        run: python scripts/check_branch_coverage.py coverage.json --config pyproject.toml --line-min 100 --per-file
+      - name: retain test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-python-${{ matrix.python-version }}
+          path: |
+            artifacts/
+            coverage.json
+          if-no-files-found: error
 
   scaffold:
     name: scaffold validates clean
@@ -104,23 +126,6 @@ jobs:
       - run: pip install -e .
       - name: mypy (core tools + MCP — blocking)
         run: python -m mypy
-
-  coverage:
-    name: test coverage report (okengine#56)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install -r requirements-dev.txt -r okengine-mcp/requirements.txt
-      - run: pip install -e .
-      - name: pytest --cov (100% line and branch gate)
-        run: >-
-          python -m pytest tests/ -q --import-mode=importlib --cov
-          --cov-config=pyproject.toml --cov-report=term-missing
-          --cov-report=json:coverage.json --cov-fail-under=100
-      - run: python scripts/check_branch_coverage.py coverage.json --config pyproject.toml --line-min 100 --per-file
 
   docker-build:
     name: build service images (okengine#55)

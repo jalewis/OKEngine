@@ -551,6 +551,40 @@ def merge_list_contracts(host: Path, pack: Path, plan: Plan) -> None:
     plan.step(f"merge {len(pending)} additive enforcement list contract(s): {sorted(pending)}", _do)
 
 
+def _insert_mapping_entries(text: str, node, entries: dict, marker: str) -> str:
+    """Add absent keys without rewriting existing YAML values or comments."""
+    if isinstance(node, yaml.MappingNode) and node.flow_style:
+        rendered = yaml.safe_dump(entries, default_flow_style=True,
+                                  sort_keys=False, width=10**6).strip()[1:-1]
+        at = node.start_mark.index + 1  # after the opening brace
+        return text[:at] + rendered + (", " if node.value else "") + text[at:]
+    if isinstance(node, yaml.MappingNode):
+        indent = node.start_mark.column
+        at = text.rfind("\n", 0, node.start_mark.index) + 1
+        block = " " * indent + marker + "\n"
+        block += "".join(_dump_entry(key, value, indent) for key, value in entries.items())
+        return text[:at] + block + text[at:]
+    # Empty/null mapping slots have no existing entries to preserve.
+    rendered = yaml.safe_dump(entries, default_flow_style=True,
+                              sort_keys=False, width=10**6).strip()
+    prefix = " " if node.start_mark.index == node.end_mark.index else ""
+    return text[:node.start_mark.index] + prefix + rendered + text[node.end_mark.index:]
+
+
+def _merge_namespace_entries(text: str, section: str, entries: dict, marker: str) -> str:
+    document = yaml.compose(text)
+    section_node = next((value for key, value in document.value if key.value == section), None)
+    if section_node is None:
+        block = "".join(_dump_entry(key, value, 4) for key, value in entries.items())
+        return text.rstrip("\n") + f"\n{section}:\n  namespaces:\n    {marker}\n" + block
+    namespace_node = next((value for key, value in section_node.value
+                           if key.value == "namespaces"), None) \
+        if isinstance(section_node, yaml.MappingNode) else None
+    if namespace_node is None:
+        return _insert_mapping_entries(text, section_node, {"namespaces": entries}, marker)
+    return _insert_mapping_entries(text, namespace_node, entries, marker)
+
+
 def merge_namespaces(host: Path, pack: Path, plan: Plan) -> None:
     """Taxonomy shape: the pack's OWNED namespaces (pack.yaml owns.namespaces) must
     land in the host schema, or every page written into them is refused by the
@@ -602,51 +636,19 @@ def merge_namespaces(host: Path, pack: Path, plan: Plan) -> None:
 
     def _do(add_part=add_part, add_perm=add_perm, add_tier=add_tier):
         t = hschema.read_text(encoding="utf-8")
-        mark = f"    # co-installed ({pack_name(pack)}, framework install-domain)\n"
-        blk = mark + "".join(_dump_entry(k, v, 4) for k, v in sorted(add_part.items()))
-        if re.search(r"^partitioning:\s*(#.*)?$", t, re.M):
-            m = re.search(r"^partitioning:\s*(#.*)?$", t, re.M)
-            seg = t[m.end():]
-            m2 = re.search(r"^  namespaces:\s*(#.*)?$", seg, re.M)
-            if m2:
-                at = m.end() + seg.index("\n", m2.end()) + 1
-                t = t[:at] + blk + t[at:]
-            else:
-                at = t.index("\n", m.end()) + 1
-                t = t[:at] + "  namespaces:\n" + blk + t[at:]
-        else:
-            # host schema has no partitioning block at all — append one (top-level
-            # append is always valid YAML)
-            t = t.rstrip("\n") + "\npartitioning:\n  namespaces:\n" + blk
-        if add_perm:
-            blk = mark + "".join(_dump_entry(k, v, 4) for k, v in sorted(add_perm.items()))
-            m = re.search(r"^permissions:\s*(#.*)?$", t, re.M)
-            if m:
-                seg = t[m.end():]
-                m2 = re.search(r"^  namespaces:\s*(#.*)?$", seg, re.M)
-                if m2:
-                    at = m.end() + seg.index("\n", m2.end()) + 1
-                    t = t[:at] + blk + t[at:]
-                else:
-                    at = t.index("\n", m.end()) + 1
-                    t = t[:at] + "  namespaces:\n" + blk + t[at:]
-            else:
-                t = t.rstrip("\n") + "\npermissions:\n  namespaces:\n" + blk
-        if add_tier:
-            m = re.search(r"^tier:\s*(#.*)?$", t, re.M)
-            if m:
-                seg = t[m.end():]
-                m2 = re.search(r"^  namespaces:\s*(#.*)?$", seg, re.M)
-                if m2:
-                    at = m.end() + seg.index("\n", m2.end()) + 1
-                    t = t[:at] + mark + "".join(_dump_entry(k, v, 4)
-                                                for k, v in sorted(add_tier.items())) + t[at:]
+        before = yaml.safe_load(t)
+        mark = f"# co-installed ({pack_name(pack)}, framework install-domain)"
+        for section, additions in (("partitioning", add_part), ("permissions", add_perm),
+                                   ("tier", add_tier)):
+            if additions:
+                t = _merge_namespace_entries(t, section, dict(sorted(additions.items())), mark)
         got = yaml.safe_load(t)
-        assert set(add_part) <= set((got.get("partitioning") or {}).get("namespaces") or {}), \
-            "namespace merge failed to parse back"
-        if add_perm:
-            assert set(add_perm) <= set((got.get("permissions") or {}).get("namespaces") or {}), \
-                "permission merge failed to parse back"
+        for section, additions in (("partitioning", add_part), ("permissions", add_perm),
+                                   ("tier", add_tier)):
+            prior = before.get(section) or {}
+            expected = {**prior, "namespaces": {**(prior.get("namespaces") or {}), **additions}}
+            if additions:
+                assert got.get(section) == expected, f"{section} merge failed to preserve contracts"
         hschema.write_text(t, encoding="utf-8")
         wiki = host / "wiki"
         for ns in add_part:

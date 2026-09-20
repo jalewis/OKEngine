@@ -236,6 +236,69 @@ def test_subtree_idempotent(tmp_path):
 
 
 # ── taxonomy shape ───────────────────────────────────────────────────────────
+@pytest.mark.parametrize("host_tier", ["", "tier:\n  hot_days: 30\n",
+                                       "tier: {hot_days: 30} # keep tier comment\n",
+                                       "tier:\n  namespaces: {entities: {date_field: updated}}\n",
+                                       "tier: {namespaces: {entities: {date_field: updated}}}\n",
+                                       "tier:\n  namespaces:\n    entities: {date_field: updated}\n"])
+def test_taxonomy_carries_tier_contract_and_reapply_is_stable(tmp_path, host_tier):
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    schema_path = h / "schema.yaml"
+    schema_path.write_text(schema_path.read_text() + "# keep host comment\n" + host_tier)
+    pack_schema = p / "schema.yaml"
+    pack_schema.write_text(pack_schema.read_text() +
+                          "tier:\n  namespaces:\n    tax-events: {date_field: date}\n")
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    installed = schema_path.read_text()
+    assert yaml.safe_load(installed)["tier"]["namespaces"]["tax-events"] == {"date_field": "date"}
+    assert "# keep host comment" in installed
+    if "hot_days" in host_tier:
+        assert yaml.safe_load(installed)["tier"]["hot_days"] == 30
+    if "# keep tier comment" in host_tier:
+        assert "# keep tier comment" in installed
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    assert schema_path.read_text() == installed
+    schema_path.write_text(installed.replace("tax-events: {date_field: date}",
+                                            "tax-events: {date_field: updated}"))
+    drifted = schema_path.read_text()
+    assert mod.main([str(h), str(p), "--apply"]) == 1
+    assert schema_path.read_text() == drifted
+
+
+@pytest.mark.parametrize("layout", ["root-flow", "child-flow", "block", "empty", "null"])
+def test_namespace_merge_preserves_host_partition_and_permission_contracts(tmp_path, layout):
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    schemas = h / "schema.yaml"
+    original = schemas.read_text()
+    for section, value in (("partitioning", "{strategy: by-letter}"),
+                           ("permissions", "{create: false, update: false}")):
+        if layout == "root-flow":
+            original += f"{section}: {{namespaces: {{host-archive: {value}}}}} # keep {section}\n"
+        elif layout == "child-flow":
+            original += f"{section}:\n  namespaces: {{host-archive: {value}}} # keep {section}\n"
+        elif layout == "block":
+            original += f"{section}:\n  namespaces:\n    host-archive: {value} # keep {section}\n"
+        elif layout == "empty":
+            original += f"{section}: {{}} # keep {section}\n"
+        else:
+            original += f"{section}:\n  namespaces: # keep {section}\n"
+    schemas.write_text(original)
+    before = yaml.safe_load(original)
+
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+
+    installed = schemas.read_text()
+    after = yaml.safe_load(installed)
+    for section in ("partitioning", "permissions"):
+        assert f"# keep {section}" in installed
+        prior = before[section].get("namespaces") or {}
+        for key, value in prior.items():
+            assert after[section]["namespaces"][key] == value
+        assert installed.count(f"\n{section}:") == 1
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    assert schemas.read_text() == installed
+
+
 def test_taxonomy_apply(tmp_path):
     h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
     assert mod.main([str(h), str(p), "--apply"]) == 0
@@ -398,7 +461,7 @@ def test_taxonomy_merges_guest_cockpit_tab(tmp_path):
     assert ck2["tabs"].count("taxtab") == 1
 
 
-def test_merged_guest_tab_is_consumed_by_cockpit_api(tmp_path):
+def test_merged_guest_tab_is_consumed_by_cockpit_api(tmp_path, monkeypatch):
     """Bind install-domain's producer to the cockpit consumer: the merged schema must make the
     guest key a real /api/tab/<key> response, not merely leave parseable but unused YAML."""
     pytest.importorskip("fastapi")
@@ -406,6 +469,7 @@ def test_merged_guest_tab_is_consumed_by_cockpit_api(tmp_path):
     assert mod.main([str(h), str(p), "--apply"]) == 0
 
     app_path = REPO / "okengine-cockpit" / "app.py"
+    monkeypatch.syspath_prepend(str(app_path.parent))
     spec = importlib.util.spec_from_file_location("cockpit_app_issue186", app_path)
     cockpit = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cockpit)
@@ -419,7 +483,7 @@ def test_merged_guest_tab_is_consumed_by_cockpit_api(tmp_path):
     assert response["boxes"][0]["title"] == "Events"
 
 
-def test_pack_contributes_sections_to_existing_tab_without_adding_navigation(tmp_path):
+def test_pack_contributes_sections_to_existing_tab_without_adding_navigation(tmp_path, monkeypatch):
     h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
     additions_path = p / "subdomain" / "host-schema-additions.yaml"
     additions = yaml.safe_load(additions_path.read_text())
@@ -456,6 +520,7 @@ def test_pack_contributes_sections_to_existing_tab_without_adding_navigation(tmp
     assert (h / "schema.yaml").read_text() == before
 
     app_path = REPO / "okengine-cockpit" / "app.py"
+    monkeypatch.syspath_prepend(str(app_path.parent))
     spec = importlib.util.spec_from_file_location("cockpit_app_issue315", app_path)
     cockpit_app = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cockpit_app)

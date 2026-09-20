@@ -187,5 +187,5 @@ def test_coverage_is_part_of_the_automatic_full_suite():
     job = doc["full-suite"]
     extends = job.get("extends") or []
     extends = [extends] if isinstance(extends, str) else list(extends)
-    assert ".automatic-gates" in extends
+    assert ".code-gates" in extends
     assert "--cov-fail-under=100" in job["variables"]["SUITE_COV"]

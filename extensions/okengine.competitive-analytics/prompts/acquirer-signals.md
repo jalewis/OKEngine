@@ -12,6 +12,9 @@ Write/update `dashboards/competitive/acquirer-signals.md` (`type: dashboard`):
   capability grab, exit), with `[[wikilinks]]` to the entities + the source.
 - **Filter noise** — a keyword match that isn't a real movement (a passing mention) gets dropped.
 - Order most-significant first.
+- Include at most 12 signals. Give each signal one implication sentence and keep the complete body
+  below 8,000 non-whitespace characters. Make exactly one bounded create/update/converge call for
+  the dashboard; do not put a second copy of the dashboard in the final response.
 
 Practitioner-grade and terse. Write via the MCP write path. LOCAL-ONLY: no web tools. End with a
 one-line summary of the signals captured.

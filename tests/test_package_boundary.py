@@ -16,7 +16,7 @@ from okengine import cli, compat
 
 
 def test_package_version_matches_project():
-    assert __version__ == "0.14.4"
+    assert __version__ == "0.14.5"
     assert 'okengine-framework = "okengine.cli:framework"' in (
         ROOT / "pyproject.toml").read_text()
 

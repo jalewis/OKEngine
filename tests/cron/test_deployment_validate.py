@@ -1377,6 +1377,87 @@ def test_missing_config_yaml_does_not_crash_the_check(tmp_path, monkeypatch):
     assert [x for x in m.F if "model_concurrency disagrees" in x[2]]
 
 
+def test_live_validation_rejects_legacy_deepseek_job_default_and_fallback(tmp_path, monkeypatch):
+    jobs = [{"id": "a", "name": "brief", "enabled": True,
+             "provider": "deepseek", "model": "deepseek-v4-pro"}]
+    _crons_with_config(
+        tmp_path, monkeypatch, jobs,
+        {"provider": "deepseek", "default": "deepseek-v4-flash"},
+    )
+    data = tmp_path / "data"
+    (data / "config.yaml").write_text(yaml.safe_dump({
+        "model": {"provider": "deepseek", "default": "deepseek-chat"},
+        "fallback_providers": [
+            {"provider": "deepseek", "model": "deepseek-reasoner"},
+            {"provider": "deepseek", "model": "deepseek-flash"},
+        ],
+    }), encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("deployment_checks_legacy_models", MOD)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.F.clear()
+    module.VAULT, module.DATA = tmp_path / "vault", data
+    module.check_crons()
+    findings = list(module.F)
+
+    policy = [detail for severity, area, detail in findings
+              if severity == "FAIL" and area == "DeepSeek model policy"]
+    assert len(policy) == 3, findings
+    assert any("brief" in detail and "deepseek-v4-pro" in detail for detail in policy)
+    assert any("default" in detail and "deepseek-chat" in detail for detail in policy)
+    assert any("fallback_providers[0]" in detail and "deepseek-reasoner" in detail
+               for detail in policy)
+
+
+@pytest.mark.parametrize("source", ["process", "dotenv", "runtime-dotenv", "script-job"])
+@pytest.mark.parametrize("model, rejected", [("deepseek-v4-pro", True),
+                                           ("deepseek-flash", False)])
+def test_live_model_policy_covers_environment_and_no_agent(tmp_path, monkeypatch, source,
+                                                         model, rejected):
+    jobs = []
+    if source == "process":
+        monkeypatch.setenv("OKENGINE_LLM_MODEL", model)
+    elif source in ("dotenv", "runtime-dotenv"):
+        vault = tmp_path / ("data" if source == "runtime-dotenv" else "vault")
+        vault.mkdir()
+        (vault / ".env").write_text(f'OKENGINE_LLM_MODEL="{model}"\n')
+    else:
+        jobs = [{"id": "script", "name": "classifier", "enabled": True,
+                 "no_agent": True, "env": {"OKENGINE_LLM_MODEL": model}}]
+    findings = _crons_with_config(tmp_path, monkeypatch, jobs, _CFG)
+    policy = [row for row in findings if row[1] == "DeepSeek model policy"]
+    assert bool(policy) is rejected, findings
+    if rejected:
+        assert all(row[0] == "FAIL" and model in row[2] for row in policy)
+
+
+def test_live_model_policy_rejects_malformed_dotenv(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / ".env").write_text('OKENGINE_LLM_MODEL="unterminated')
+    findings = _crons_with_config(tmp_path, monkeypatch, [], _CFG)
+    assert any(level == "FAIL" and area == "DeepSeek model policy"
+               for level, area, _detail in findings)
+
+
+def test_live_model_policy_ignores_disabled_script_job(tmp_path, monkeypatch):
+    jobs = [{"id": "disabled", "name": "disabled", "enabled": False,
+             "no_agent": True, "env": {"OKENGINE_LLM_MODEL": "deepseek-v4-pro"}}]
+    findings = _crons_with_config(tmp_path, monkeypatch, jobs, _CFG)
+    assert not [row for row in findings if row[1] == "DeepSeek model policy"]
+
+
+def test_live_validation_accepts_v41_deepseek_models(tmp_path, monkeypatch):
+    jobs = [{"id": "a", "name": "brief", "enabled": True,
+             "provider": "deepseek", "model": "deepseek-flash"}]
+    findings = _crons_with_config(
+        tmp_path, monkeypatch, jobs,
+        {"provider": "deepseek", "default": "deepseek-flash"},
+    )
+
+    assert not [finding for finding in findings if finding[1] == "DeepSeek model policy"], findings
+
+
 # --- model routing: a lane must not claim one model and be served by another ---
 
 _RCFG = {"provider": "custom", "base_url": "http://gpu:11436/v1", "default": "local-model:30b"}

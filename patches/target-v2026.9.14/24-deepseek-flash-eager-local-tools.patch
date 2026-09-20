@@ -1,0 +1,230 @@
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 5f007c5..690e35c 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2292,6 +2292,21 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
+     )
+ 
+ 
++def _requires_eager_local_tools(setup: _CronAgentSetup) -> bool:
++    """DeepSeek V4.1 Flash cron runs avoid its unstable generic local bridge.
++
++    This is deliberately provider-qualified and model-qualified: other models
++    keep progressive disclosure, and connector calls remain deferred.
++    """
++    candidate_runtime = getattr(setup, "runtime", None)
++    runtime = candidate_runtime if isinstance(candidate_runtime, dict) else {}
++    provider = str(runtime.get("provider") or "").strip().lower()
++    model = str(setup.model or "").strip().lower()
++    return provider == "deepseek" and model in {
++        "deepseek-flash", "deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash",
++    }
++
++
+ class _FireAudit:
+     """One usage_audit.jsonl line per fire (created once the agent exists; fire id + start clock)."""
+ 
+@@ -2378,6 +2392,7 @@ def run_job(
+     _session_db = None
+     _audit: Optional[_FireAudit] = None
+     _worker_state: dict = {}
++    _eager_local_tools_token = None
+     scope = _CronRunScope(job, job_id, execution_id)
+     try:
+         scope.enter()
+@@ -2395,6 +2410,8 @@ def run_job(
+ 
+         # Open state.db only after every early-return gate has passed.
+         _session_db = _open_cron_session_db(job)
++        from model_tools import set_eager_local_tools
++        _eager_local_tools_token = set_eager_local_tools(_requires_eager_local_tools(setup))
+         agent = _construct_cron_agent(
+             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
+             session_db=_session_db, report_only=script_failed)
+@@ -2465,6 +2482,9 @@ def run_job(
+ 
+     finally:
+         from cron.scheduler_detached_worker import defer_teardown_to_running_worker
++        if _eager_local_tools_token is not None:
++            from model_tools import reset_eager_local_tools
++            reset_eager_local_tools(_eager_local_tools_token)
+         _worker_teardown_deferred = defer_teardown_to_running_worker(
+             _worker_state.get("future"), _session_db, agent, job_id, job_name, _cron_session_id)
+         scope.exit()
+diff --git a/model_tools.py b/model_tools.py
+index d5c979a..9e4c98d 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -26,6 +26,7 @@ from tools.arg_coercion import coerce_tool_args
+ logger = logging.getLogger(__name__)
+ 
+ _post_tool_call_hook_suppressed: ContextVar[bool] = ContextVar("post_tool_call_hook_suppressed", default=False)
++_eager_local_tools: ContextVar[bool] = ContextVar("eager_local_tools", default=False)
+ 
+ 
+ @contextmanager
+@@ -37,6 +38,16 @@ def suppress_post_tool_call_hook():
+     finally:
+         _post_tool_call_hook_suppressed.reset(token)
+ 
++
++def set_eager_local_tools(enabled: bool):
++    """Keep this conversation's selected local tools provider-visible."""
++    return _eager_local_tools.set(bool(enabled))
++
++
++def reset_eager_local_tools(token) -> None:
++    """Restore a token returned by :func:`set_eager_local_tools`."""
++    _eager_local_tools.reset(token)
++
+ # Platform-bundle names already flagged in disabled_toolsets (advisory logged once per name).
+ _WARNED_DISABLED_BUNDLES: set = set()
+ 
+@@ -269,10 +280,12 @@ def _tool_defs_cache_key(
+         cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
+     except (FileNotFoundError, OSError, ImportError):
+         cfg_fp = None
++    eager_local_tools = _eager_local_tools.get()
+     return (
+         registry.current_scope_key(), frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
+         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
+         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
++        eager_local_tools,
+         _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
+     )
+ 
+@@ -517,7 +530,7 @@ def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disa
+     try:
+         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
+         ts_cfg = _load_ts_config()
+-        if not skip_tool_search_assembly and ts_cfg.enabled != "off":
++        if not skip_tool_search_assembly and not _eager_local_tools.get() and ts_cfg.enabled != "off":
+             assembly = assemble_tool_defs(filtered_tools, context_length=_resolve_active_context_length(), config=ts_cfg)
+             if assembly.activated and not quiet_mode:
+                 print(f"🔎 Tool Search (tier {assembly.tier}): {assembly.deferred_count} "
+diff --git a/tests/fixtures/deepseek_flash_multi_local_tool_call.json b/tests/fixtures/deepseek_flash_multi_local_tool_call.json
+new file mode 100644
+index 0000000..3bd7af6
+--- /dev/null
++++ b/tests/fixtures/deepseek_flash_multi_local_tool_call.json
+@@ -0,0 +1,22 @@
++{
++  "id": "captured-contract-shape",
++  "choices": [
++    {
++      "message": {
++        "role": "assistant",
++        "content": null,
++        "tool_calls": [
++          {
++            "id": "call_captured",
++            "type": "function",
++            "function": {
++              "name": "tool_call",
++              "arguments": "{\"calls\":[{\"name\":\"mcp__okengine_write_market_intelligence_worker__update_entity\",\"arguments\":{\"path\":\"entities/a\"}},{\"name\":\"mcp__okengine_write_market_intelligence_worker__update_entity\",\"arguments\":{\"path\":\"entities/b\"}}]}"
++            }
++          }
++        ]
++      },
++      "finish_reason": "tool_calls"
++    }
++  ]
++}
+diff --git a/tests/tools/test_okengine_deepseek_eager_local.py b/tests/tools/test_okengine_deepseek_eager_local.py
+new file mode 100644
+index 0000000..0f25263
+--- /dev/null
++++ b/tests/tools/test_okengine_deepseek_eager_local.py
+@@ -0,0 +1,92 @@
++"""DeepSeek Flash cron sessions keep governed local writers off the generic bridge."""
++
++import json
++from pathlib import Path
++
++from cron.scheduler import _CronAgentSetup, _requires_eager_local_tools
++from model_tools import (
++    get_tool_definitions, handle_function_call, reset_eager_local_tools,
++    set_eager_local_tools,
++)
++from tools.mcp_tool_schema import mcp_prefixed_tool_name
++from tools.registry import registry
++from tools.tool_search import resolve_underlying_call
++
++
++FIXTURE = Path(__file__).parents[1] / "fixtures" / "deepseek_flash_multi_local_tool_call.json"
++SERVER = "okengine-write-market-intelligence-classification-worker"
++TOOLSET = f"mcp-{SERVER}"
++
++
++def _name(tool_def):
++    return tool_def["function"]["name"]
++
++
++def test_captured_deepseek_multi_local_bridge_response_remains_fail_closed():
++    response = json.loads(FIXTURE.read_text(encoding="utf-8"))
++    raw = response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
++    name, arguments, error = resolve_underlying_call(json.loads(raw))
++    assert name is None
++    assert arguments == {}
++    assert "one entry per tool_call" in error
++
++
++def test_deepseek_flash_provider_qualification_is_narrow():
++    assert not _requires_eager_local_tools(type("MinimalSetup", (), {"model": "deepseek-flash"})())
++    assert _requires_eager_local_tools(_CronAgentSetup(
++        model="deepseek-flash", runtime={"provider": "deepseek"}))
++    assert not _requires_eager_local_tools(_CronAgentSetup(
++        model="deepseek-flash", runtime={"provider": "openrouter"}))
++    assert not _requires_eager_local_tools(_CronAgentSetup(
++        model="another-model", runtime={"provider": "deepseek"}))
++
++
++def test_single_hashed_writer_is_direct_and_reaches_registered_handler(monkeypatch, capsys):
++    from tools.tool_search import ToolSearchConfig
++
++    tool_search_config = ToolSearchConfig(
++        enabled="on", threshold_pct=10, search_default_limit=5, max_search_limit=20)
++    monkeypatch.setattr("tools.tool_search.load_config", lambda: tool_search_config)
++    monkeypatch.setattr("tools.tool_search.load_config_readonly", lambda: tool_search_config)
++    physical_name = mcp_prefixed_tool_name(SERVER, "update_entity_with_governed_evidence")
++    assert len(physical_name) <= 64
++    calls = []
++
++    def writer(arguments, **_kwargs):
++        calls.append(arguments)
++        return json.dumps({"response": "updated entities/a v2"})
++
++    registry.register(
++        name=physical_name,
++        toolset=TOOLSET,
++        schema={
++            "name": physical_name,
++            "description": "Update one governed entity.",
++            "parameters": {
++                "type": "object",
++                "properties": {"path": {"type": "string"}},
++                "required": ["path"],
++            },
++        },
++        handler=writer,
++    )
++    try:
++        ordinary = get_tool_definitions(enabled_toolsets=[TOOLSET], quiet_mode=False)
++        assert "Tool Search" in capsys.readouterr().out
++        assert physical_name not in {_name(item) for item in ordinary}
++        assert "tool_call" in {_name(item) for item in ordinary}
++
++        token = set_eager_local_tools(True)
++        try:
++            eager = get_tool_definitions(enabled_toolsets=[TOOLSET], quiet_mode=True)
++            names = {_name(item) for item in eager}
++            assert physical_name in names
++            assert "tool_call" not in names
++            result = json.loads(handle_function_call(
++                physical_name, {"path": "entities/a"}, enabled_toolsets=[TOOLSET]))
++        finally:
++            reset_eager_local_tools(token)
++        assert result == {"response": "updated entities/a v2"}
++        assert calls == [{"path": "entities/a"}]
++    finally:
++        registry.deregister(physical_name)

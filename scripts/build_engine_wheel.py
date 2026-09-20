@@ -11,7 +11,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.14.4"
+VERSION = "0.14.5"
 DIST_INFO = f"okengine-{VERSION}.dist-info"
 STAMP = (2026, 1, 1, 0, 0, 0)
 RUNTIME_MEMBERS = {

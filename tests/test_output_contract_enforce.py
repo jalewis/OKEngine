@@ -205,6 +205,25 @@ def test_body_below_minimum_meaningful_length_is_rejected(lane, tmp_path):
     assert "body_too_short" in codes(ev(caller, tmp_path, body="x" + " " * 200))
 
 
+@pytest.mark.parametrize("body", ["x" * 10, "x" * 19, "x" * 20,
+                                   " \n\t".join("x" * 19)])
+def test_body_within_maximum_meaningful_length_is_accepted(lane, tmp_path, body):
+    caller = lane("bounded", output_contract=contract(
+        body={"required": True, "min_non_whitespace": 10, "max_non_whitespace": 20}))
+    assert ev(caller, tmp_path, body=body) == []
+
+
+def test_body_above_maximum_meaningful_length_is_rejected(lane, tmp_path):
+    caller = lane("bounded", output_contract=contract(
+        body={"required": True, "min_non_whitespace": 10, "max_non_whitespace": 20}))
+    assert ev(caller, tmp_path, body="x" * 19) == []
+    assert ev(caller, tmp_path, body="x" * 20) == []
+    found = ev(caller, tmp_path, body="x" * 21)
+    assert "body_too_long" in codes(found)
+    assert "maximum is 20" in next(
+        item["message"] for item in found if item["code"] == "body_too_long")
+
+
 def test_frontmatter_only_update_does_not_reject_legacy_body_links(lane, tmp_path):
     caller = lane("metadata-update", output_contract=contract(
         unresolved_links="reject", placeholder_links="reject"))

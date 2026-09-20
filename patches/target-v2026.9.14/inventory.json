@@ -21,9 +21,9 @@
   ],
   "policy": {
     "maximum_patch_count": 24,
-    "maximum_touched_upstream_files": 32,
+    "maximum_touched_upstream_files": 35,
     "adapter_issue": 630,
-    "adapter_decision": "Keep the maintained-runtime patch set for v0.14.0: the two additional config surfaces enforce explicit operator decisions that cannot be implemented by an external adapter before Hermes mutates mounted state.",
+    "adapter_decision": "Keep the maintained-runtime patch set for v0.14.5: two config surfaces enforce explicit operator decisions before Hermes mutates mounted state, and three native capability-check surfaces preserve the distinction between documented fail-closed absence and an internal probe failure. None can be implemented by an external adapter after startup.",
     "measured_existing_upstream_files": [
     "agent/agent_init.py",
     "agent/agent_runtime_helpers.py",
@@ -48,6 +48,7 @@
     "tests/agent/test_codex_responses_adapter.py",
     "tests/cron/test_scheduler_completion_verification.py",
       "tests/tools/test_cronjob_tools.py",
+      "tools/code_execution_tool.py",
       "tools/cronjob_prompt_scan.py",
       "tools/file_operations.py",
       "tools/file_tools.py",
@@ -55,6 +56,8 @@
       "tools/mcp_tool_handlers.py",
       "tools/mcp_tool_schema.py",
       "tools/registry.py",
+      "tools/terminal_tool.py",
+      "tools/terminal_tool_backends.py",
       "tools/web_tools.py",
       "toolsets.py"
     ]
@@ -473,20 +476,44 @@
       "upstream_surfaces": [
         "agent/conversation_loop.py",
         "cron/scheduler.py",
+        "tools/code_execution_tool.py",
+        "tools/file_tools.py",
         "tools/mcp_registry_loss_telemetry.py",
         "tools/mcp_tool_discovery.py",
         "tools/mcp_tool_handlers.py",
         "tools/mcp_transport_failure_telemetry.py",
-        "tools/registry.py"
+        "tools/registry.py",
+        "tools/terminal_tool.py",
+        "tools/terminal_tool_backends.py"
       ],
       "tests": [
         "tests/agent/test_okengine_mcp_registry_loss_turn.py",
         "tests/cron/test_okengine_mcp_registry_run_status.py",
         "tests/cron/test_okengine_mcp_transport_run_status.py",
         "tests/cron/test_okengine_cron_prompt_gates.py",
+        "tests/tools/test_check_fn_diagnostics.py",
         "tests/tools/test_okengine_mcp_registry_recovery.py"
       ],
       "retirement_criteria": "Retire when upstream atomically preserves or republishes advertised MCP tools across transport reconnects and scheduled runs fail on unrecovered registry loss.",
+      "conflict_risk": "high"
+    },
+    {
+      "original_id": "24",
+      "introduced_for_target": true,
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/24-deepseek-flash-eager-local-tools.patch",
+      "owner": "okengine-maintainers",
+      "classification": "temporary-compatibility",
+      "purpose": "Expose selected cron tools directly to DeepSeek V4.1 Flash while preserving fail-closed bridge semantics for other sessions.",
+      "rationale": "Captured provider-contract output shows DeepSeek Flash combining multiple local invocations into the generic tool_call bridge. A provider- and model-qualified ContextVar keeps local schemas direct for one cron conversation without mutating global configuration or changing other sessions.",
+      "upstream_surfaces": [
+        "cron/scheduler.py",
+        "model_tools.py"
+      ],
+      "tests": [
+        "tests/tools/test_okengine_deepseek_eager_local.py"
+      ],
+      "retirement_criteria": "Retire when the supported DeepSeek production endpoint reliably emits one local bridge invocation per tool call or supports validated strict schemas for the bridge.",
       "conflict_risk": "high"
     }
   ]

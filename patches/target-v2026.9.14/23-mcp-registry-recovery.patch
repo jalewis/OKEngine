@@ -1231,3 +1231,684 @@ new file mode 100644
 +            result = _make_tool_handler("okengine-read", "get_page", 0.01)({})
 +    assert "MCP call failed" in json.loads(result)["error"]
 +    assert seen == ["okengine-read"]
+diff --git a/tools/file_tools.py b/tools/file_tools.py
+index 3efe395..402b79a 100644
+--- a/tools/file_tools.py
++++ b/tools/file_tools.py
+@@ -1028,9 +1028,14 @@ def search_files(
+ 
+ 
+ def _check_file_reqs():
+-    """Lazy wrapper to avoid circular import with tools/__init__.py."""
+-    from tools import check_file_requirements
+-    return check_file_requirements()
++    """File tools require the configured terminal backend.
++
++    Import the owning module directly. Importing this through the package
++    namespace raced startup paths that temporarily exposed ``tools`` as a
++    namespace package, silently removing the entire file tool surface.
++    """
++    from tools.terminal_tool import check_terminal_requirements
++    return check_terminal_requirements()
+ 
+ READ_FILE_SCHEMA = {
+     "name": "read_file",
+diff --git a/tools/registry.py b/tools/registry.py
+index 42a8d18..3179dbc 100644
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -210,6 +210,7 @@ _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
+ _CHECK_FN_CACHE_MAX = 512
+ _check_fn_cache: Dict[tuple[Callable, Optional[str]], tuple[float, bool]] = {}
+ _check_fn_last_good: Dict[tuple[Callable, Optional[str]], float] = {}
++_check_fn_failures: Dict[Callable, dict] = {}
+ _check_fn_cache_lock = threading.Lock()
+ CHECK_FN_CACHE_BYPASS = ""
+ _NO_CACHE_CHECK_FNS: Set[Callable] = set()
+@@ -229,6 +230,30 @@ def _fn_label(fn: Callable) -> object:
+     return getattr(fn, "__qualname__", fn)
+ 
+ 
++def _record_check_fn_failure(fn: Callable, exc: Exception) -> None:
++    """Publish a bounded, named diagnostic for an unexpected probe crash."""
++    with _check_fn_cache_lock:
++        _check_fn_failures[fn] = {
++            "signal": "hermes.tool_check.degraded",
++            "check": str(_fn_label(fn)),
++            "error_type": type(exc).__name__,
++        }
++    logger.error(
++        "diagnostic=hermes.tool_check.degraded check_fn=%s error_type=%s",
++        _fn_label(fn), type(exc).__name__)
++
++
++def _clear_check_fn_failure(fn: Callable) -> None:
++    with _check_fn_cache_lock:
++        _check_fn_failures.pop(fn, None)
++
++
++def get_check_fn_diagnostics() -> List[dict]:
++    """Return active unexpected check failures without running any probes."""
++    with _check_fn_cache_lock:
++        return [dict(item) for item in _check_fn_failures.values()]
++
++
+ def _prune_check_fn_caches(now: float) -> None:
+     """Expire stale entries and cap profile-dimensional cache growth. Caller holds the lock."""
+     for cache, ttl, stamp in (
+@@ -271,7 +296,9 @@ def _run_check_fn_uncached(fn: Callable, *, unresolved_scope: bool = False) -> bo
+     """Run an availability check without cache/grace handling."""
+     from agent.secret_scope import UnscopedSecretError
+     try:
+-        return bool(fn())
++        value = bool(fn())
++        _clear_check_fn_failure(fn)
++        return value
+     except UnscopedSecretError:
+         if unresolved_scope:
+             # Expected fail-closed probe: with multiplexing on, boot-time check_fns run before
+@@ -289,7 +316,8 @@ def _run_check_fn_uncached(fn: Callable, *, unresolved_scope: bool = False) -> bo
+                 "check_fn %s raised UnscopedSecretError while the profile cache "
+                 "scope was resolved; dependent tools will be unavailable this turn",
+                 _fn_label(fn), exc_info=True)
+-    except Exception:
++    except Exception as exc:
++        _record_check_fn_failure(fn, exc)
+         detail = " while profile cache scope was unresolved" if unresolved_scope else ""
+         logger.warning(
+             "check_fn %s raised%s; dependent tools will be unavailable this turn",
+@@ -314,11 +342,13 @@ def _check_fn_cached(fn: Callable) -> bool:
+     exc_info = None
+     try:
+         value, outcome = bool(fn()), "returned False"
++        _clear_check_fn_failure(fn)
+     except Exception as exc:
+         # Keep the exception for the verdict log below (emitted outside this block, where
+         # ``exc_info=True`` would resolve to nothing): a check_fn that raises is a bug in the probe
+         # or its resolver, and a bare "raised" verdict reads as "nothing configured" (#87950).
+         value, outcome, exc_info = False, "raised", exc
++        _record_check_fn_failure(fn, exc)
+     with _check_fn_cache_lock:
+         _prune_check_fn_caches(now)
+         if value:
+@@ -355,6 +385,7 @@ def invalidate_check_fn_cache() -> None:
+     with _check_fn_cache_lock:
+         _check_fn_cache.clear()
+         _check_fn_last_good.clear()
++        _check_fn_failures.clear()
+ 
+ 
+ def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
+diff --git a/tests/tools/test_check_fn_diagnostics.py b/tests/tools/test_check_fn_diagnostics.py
+new file mode 100644
+index 0000000..92021ca
+--- /dev/null
++++ b/tests/tools/test_check_fn_diagnostics.py
+@@ -0,0 +1,114 @@
++"""Availability checks distinguish normal absence from internal breakage."""
++from __future__ import annotations
++
++import pytest
++
++from tools import file_tools
++from tools import registry as registry_module
++
++
++@pytest.fixture(autouse=True)
++def clean_check_state():
++    registry_module.invalidate_check_fn_cache()
++    yield
++    registry_module.invalidate_check_fn_cache()
++
++
++def test_file_requirement_uses_the_owning_terminal_module(monkeypatch):
++    import tools
++    from tools import terminal_tool
++
++    monkeypatch.delattr(tools, "check_file_requirements", raising=False)
++    monkeypatch.setattr(terminal_tool, "check_terminal_requirements", lambda: True)
++    assert file_tools._check_file_reqs() is True
++
++
++def test_missing_current_terminal_contract_is_an_import_failure(monkeypatch):
++    from tools import terminal_tool
++
++    monkeypatch.delattr(terminal_tool, "check_terminal_requirements")
++    with pytest.raises(ImportError):
++        file_tools._check_file_reqs()
++
++
++def test_optional_false_is_normal_absence_without_degraded_signal():
++    def optional_unavailable():
++        return False
++
++    assert registry_module._run_check_fn_uncached(optional_unavailable) is False
++    assert registry_module.get_check_fn_diagnostics() == []
++
++
++def test_unexpected_check_error_emits_named_degraded_diagnostic(caplog):
++    def broken_check():
++        raise ImportError("required adapter symbol drifted")
++
++    assert registry_module._run_check_fn_uncached(broken_check) is False
++    assert registry_module.get_check_fn_diagnostics() == [{
++        "signal": "hermes.tool_check.degraded",
++        "check": "test_unexpected_check_error_emits_named_degraded_diagnostic.<locals>.broken_check",
++        "error_type": "ImportError",
++    }]
++    assert "diagnostic=hermes.tool_check.degraded" in caplog.text
++
++
++def test_success_clears_a_previous_degraded_diagnostic():
++    state = {"broken": True}
++
++    def recovering_check():
++        if state["broken"]:
++            raise RuntimeError("temporary internal failure")
++        return True
++
++    assert registry_module._run_check_fn_uncached(recovering_check) is False
++    state["broken"] = False
++    assert registry_module._run_check_fn_uncached(recovering_check) is True
++    assert registry_module.get_check_fn_diagnostics() == []
++
++
++@pytest.mark.parametrize("unresolved_scope", [False, True])
++def test_unscoped_secret_is_expected_fail_closed_not_degraded(
++    unresolved_scope, caplog,
++):
++    from agent.secret_scope import UnscopedSecretError
++
++    caplog.set_level("DEBUG", logger="tools.registry")
++
++    def scoped_check():
++        raise UnscopedSecretError("fixture has no active profile scope")
++
++    assert registry_module._run_check_fn_uncached(
++        scoped_check, unresolved_scope=unresolved_scope,
++    ) is False
++    assert registry_module.get_check_fn_diagnostics() == []
++    expected = (
++        "multiplex fail-closed path"
++        if unresolved_scope
++        else "profile cache scope was resolved"
++    )
++    assert expected in caplog.text
++
++
++def test_cached_check_exception_records_degraded_signal(monkeypatch):
++    def broken_check():
++        raise LookupError("fixture dependency contract drifted")
++
++    monkeypatch.setattr(registry_module, "check_fn_cache_scope", lambda: None)
++    assert registry_module._check_fn_cached(broken_check) is False
++    assert registry_module.get_check_fn_diagnostics() == [{
++        "signal": "hermes.tool_check.degraded",
++        "check": "test_cached_check_exception_records_degraded_signal.<locals>.broken_check",
++        "error_type": "LookupError",
++    }]
++
++
++def test_cached_check_success_clears_existing_degraded_signal(monkeypatch):
++    def recovered_check():
++        return True
++
++    monkeypatch.setattr(registry_module, "check_fn_cache_scope", lambda: None)
++    registry_module._record_check_fn_failure(
++        recovered_check, RuntimeError("fixture prior failure"),
++    )
++    assert registry_module._check_fn_cached(recovered_check) is True
++    assert registry_module.get_check_fn_diagnostics() == []
+diff --git a/tests/tools/test_check_fn_diagnostics.py b/tests/tools/test_check_fn_diagnostics.py
+index 347c430..28465fc 100644
+--- a/tests/tools/test_check_fn_diagnostics.py
++++ b/tests/tools/test_check_fn_diagnostics.py
+@@ -112,3 +112,57 @@ def test_cached_check_success_clears_existing_degraded_signal(monkeypatch):
+     )
+     assert registry_module._check_fn_cached(recovered_check) is True
+     assert registry_module.get_check_fn_diagnostics() == []
++
++
++def test_diagnostic_is_scoped_and_normal_false_clears_only_its_scope(monkeypatch):
++    scope = {"value": "profile-a"}
++
++    def scoped_check():
++        if scope["value"] == "profile-a":
++            raise RuntimeError("profile-a probe crashed")
++        return False
++
++    monkeypatch.setattr(
++        registry_module, "check_fn_cache_scope", lambda: scope["value"],
++    )
++    assert registry_module._check_fn_cached(scoped_check) is False
++    assert len(registry_module.get_check_fn_diagnostics()) == 1
++
++    scope["value"] = "profile-b"
++    assert registry_module._check_fn_cached(scoped_check) is False
++    assert len(registry_module.get_check_fn_diagnostics()) == 1
++
++
++def test_diagnostic_store_is_bounded(monkeypatch):
++    monkeypatch.setattr(registry_module, "_CHECK_FN_CACHE_MAX", 2)
++    probes = []
++    for index in range(3):
++        def broken(index=index):
++            raise RuntimeError(f"probe {index} crashed")
++
++        probes.append(broken)
++        assert registry_module._run_check_fn_uncached(broken) is False
++
++    assert len(registry_module.get_check_fn_diagnostics()) == 2
++
++
++def test_terminal_probe_exception_reaches_registry_diagnostic(monkeypatch):
++    from tools import terminal_tool
++
++    monkeypatch.setattr(
++        terminal_tool, "_get_env_config", lambda: {"env_type": "docker"},
++    )
++    monkeypatch.setitem(
++        terminal_tool._REQUIREMENT_CHECKERS,
++        "docker",
++        lambda _config: (_ for _ in ()).throw(TimeoutError("docker probe hung")),
++    )
++
++    assert registry_module._run_check_fn_uncached(
++        terminal_tool.check_terminal_requirements,
++    ) is False
++    assert registry_module.get_check_fn_diagnostics() == [{
++        "signal": "hermes.tool_check.degraded",
++        "check": "check_terminal_requirements",
++        "error_type": "TimeoutError",
++    }]
+diff --git a/tools/registry.py b/tools/registry.py
+index 8729f92..434d0c4 100644
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -210,7 +210,7 @@ _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
+ _CHECK_FN_CACHE_MAX = 512
+ _check_fn_cache: Dict[tuple[Callable, Optional[str]], tuple[float, bool]] = {}
+ _check_fn_last_good: Dict[tuple[Callable, Optional[str]], float] = {}
+-_check_fn_failures: Dict[Callable, dict] = {}
++_check_fn_failures: Dict[tuple[Callable, Optional[str]], tuple[float, dict]] = {}
+ _check_fn_cache_lock = threading.Lock()
+ CHECK_FN_CACHE_BYPASS = ""
+ _NO_CACHE_CHECK_FNS: Set[Callable] = set()
+@@ -230,28 +230,34 @@ def _fn_label(fn: Callable) -> object:
+     return getattr(fn, "__qualname__", fn)
+ 
+ 
+-def _record_check_fn_failure(fn: Callable, exc: Exception) -> None:
++def _record_check_fn_failure(
++    fn: Callable, exc: Exception, scope: Optional[str] = None,
++) -> None:
+     """Publish a bounded, named diagnostic for an unexpected probe crash."""
++    now = time.monotonic()
++    key = (fn, scope)
+     with _check_fn_cache_lock:
+-        _check_fn_failures[fn] = {
++        _check_fn_failures[key] = (now, {
+             "signal": "hermes.tool_check.degraded",
+             "check": str(_fn_label(fn)),
+             "error_type": type(exc).__name__,
+-        }
++        })
++        while len(_check_fn_failures) > _CHECK_FN_CACHE_MAX:
++            _check_fn_failures.pop(next(iter(_check_fn_failures)))
+     logger.error(
+         "diagnostic=hermes.tool_check.degraded check_fn=%s error_type=%s",
+         _fn_label(fn), type(exc).__name__)
+ 
+ 
+-def _clear_check_fn_failure(fn: Callable) -> None:
++def _clear_check_fn_failure(fn: Callable, scope: Optional[str] = None) -> None:
+     with _check_fn_cache_lock:
+-        _check_fn_failures.pop(fn, None)
++        _check_fn_failures.pop((fn, scope), None)
+ 
+ 
+ def get_check_fn_diagnostics() -> List[dict]:
+     """Return active unexpected check failures without running any probes."""
+     with _check_fn_cache_lock:
+-        return [dict(item) for item in _check_fn_failures.values()]
++        return [dict(item) for _, item in _check_fn_failures.values()]
+ 
+ 
+ def _prune_check_fn_caches(now: float) -> None:
+@@ -295,9 +301,10 @@ def check_fn_cache_scope() -> Optional[str]:
+ def _run_check_fn_uncached(fn: Callable, *, unresolved_scope: bool = False) -> bool:
+     """Run an availability check without cache/grace handling."""
+     from agent.secret_scope import UnscopedSecretError
++    scope = CHECK_FN_CACHE_BYPASS if unresolved_scope else check_fn_cache_scope()
+     try:
+         value = bool(fn())
+-        _clear_check_fn_failure(fn)
++        _clear_check_fn_failure(fn, scope)
+         return value
+     except UnscopedSecretError:
+         if unresolved_scope:
+@@ -317,7 +324,7 @@ def _run_check_fn_uncached(fn: Callable, *, unresolved_scope: bool = False) -> b
+                 "scope was resolved; dependent tools will be unavailable this turn",
+                 _fn_label(fn), exc_info=True)
+     except Exception as exc:
+-        _record_check_fn_failure(fn, exc)
++        _record_check_fn_failure(fn, exc, scope)
+         detail = " while profile cache scope was unresolved" if unresolved_scope else ""
+         logger.warning(
+             "check_fn %s raised%s; dependent tools will be unavailable this turn",
+@@ -342,13 +349,13 @@ def _check_fn_cached(fn: Callable) -> bool:
+     exc_info = None
+     try:
+         value, outcome = bool(fn()), "returned False"
+-        _clear_check_fn_failure(fn)
++        _clear_check_fn_failure(fn, scope)
+     except Exception as exc:
+         # Keep the exception for the verdict log below (emitted outside this block, where
+         # ``exc_info=True`` would resolve to nothing): a check_fn that raises is a bug in the probe
+         # or its resolver, and a bare "raised" verdict reads as "nothing configured" (#87950).
+         value, outcome, exc_info = False, "raised", exc
+-        _record_check_fn_failure(fn, exc)
++        _record_check_fn_failure(fn, exc, scope)
+     with _check_fn_cache_lock:
+         _prune_check_fn_caches(now)
+         if value:
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 46ceeb5..cbe2349 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -1255,14 +1255,21 @@ def terminal_tool(
+ 
+ 
+ def check_terminal_requirements() -> bool:
+-    """Check if all requirements for the terminal tool are met."""
++    """Check whether the configured terminal backend is available.
++
++    Requirement checkers return ``False`` for documented absence. Unexpected
++    exceptions propagate to the registry so it can distinguish a broken probe
++    from an optional capability that is simply not configured.
++    """
+     try:
+         config = _get_env_config()
+-        checker = _REQUIREMENT_CHECKERS.get(config["env_type"], _check_plugin_requirements)
+-        return checker(config)
+-    except Exception as e:
+-        logger.error("Terminal requirements check failed: %s", e, exc_info=True)
++    except ValueError as exc:
++        # Invalid operator input is a documented prerequisite failure, not an
++        # internal probe crash. Keep it on the ordinary False path.
++        logger.error("Terminal requirements check failed: %s", exc)
+         return False
++    checker = _REQUIREMENT_CHECKERS.get(config["env_type"], _check_plugin_requirements)
++    return checker(config)
+ 
+ 
+ from tools.registry import registry
+diff --git a/tools/terminal_tool_backends.py b/tools/terminal_tool_backends.py
+index 335bb1c..f58ae98 100644
+--- a/tools/terminal_tool_backends.py
++++ b/tools/terminal_tool_backends.py
+@@ -286,7 +286,10 @@ _BACKEND_SPECS: Dict[str, Dict[str, Any]] = {
+     "modal": {"pre": _modal_pre,
+               "module": ("modal", "modal is required for direct modal terminal backend: pip install modal")},
+     "vercel_sandbox": {"pre": _check_vercel},
+-    "daytona": {"post": _daytona_post},
++    "daytona": {
++        "module": ("daytona", "daytona is required for the Daytona terminal backend: pip install daytona"),
++        "post": _daytona_post,
++    },
+ }
+ 
+ 
+diff --git a/tests/tools/test_check_fn_diagnostics.py b/tests/tools/test_check_fn_diagnostics.py
+index 28465fc..8ee959f 100644
+--- a/tests/tools/test_check_fn_diagnostics.py
++++ b/tests/tools/test_check_fn_diagnostics.py
+@@ -166,3 +166,16 @@ def test_terminal_probe_exception_reaches_registry_diagnostic(monkeypatch):
+         "check": "check_terminal_requirements",
+         "error_type": "TimeoutError",
+     }]
++
++
++def test_invalid_terminal_configuration_is_normal_absence(monkeypatch):
++    from tools import terminal_tool
++
++    def invalid_config():
++        raise ValueError("TERMINAL_CONTAINER_DISK must be an integer")
++
++    monkeypatch.setattr(terminal_tool, "_get_env_config", invalid_config)
++    assert registry_module._run_check_fn_uncached(
++        terminal_tool.check_terminal_requirements,
++    ) is False
++    assert registry_module.get_check_fn_diagnostics() == []
+
+diff --git a/tests/tools/test_check_fn_diagnostics.py b/tests/tools/test_check_fn_diagnostics.py
+index 8ee959f..5c43d16 100644
+--- a/tests/tools/test_check_fn_diagnostics.py
++++ b/tests/tools/test_check_fn_diagnostics.py
+@@ -179,3 +179,94 @@ def test_invalid_terminal_configuration_is_normal_absence(monkeypatch):
+         terminal_tool.check_terminal_requirements,
+     ) is False
+     assert registry_module.get_check_fn_diagnostics() == []
++
++
++def test_terminal_policy_refusal_is_normal_absence(monkeypatch):
++    from tools import terminal_tool
++    from tools.terminal_scope import TerminalPolicyUnavailable
++
++    def refused_config():
++        raise TerminalPolicyUnavailable("profile config is unreadable")
++
++    monkeypatch.setattr(terminal_tool, "_get_env_config", refused_config)
++    assert registry_module._run_check_fn_uncached(
++        terminal_tool.check_terminal_requirements,
++    ) is False
++    assert registry_module.get_check_fn_diagnostics() == []
++
++
++def test_cached_unscoped_secret_is_expected_not_degraded(monkeypatch):
++    from agent.secret_scope import UnscopedSecretError
++
++    def unscoped_check():
++        raise UnscopedSecretError("no active routed profile")
++
++    monkeypatch.setattr(registry_module, "check_fn_cache_scope", lambda: "profile-a")
++    assert registry_module._check_fn_cached(unscoped_check) is False
++    assert registry_module.get_check_fn_diagnostics() == []
++
++
++def test_bypass_scope_never_aliases_retained_diagnostics(monkeypatch):
++    def probe():
++        raise TimeoutError("profile-a backend hung")
++
++    monkeypatch.setattr(registry_module, "check_fn_cache_scope", lambda: "profile-a")
++    assert registry_module._check_fn_cached(probe) is False
++    assert len(registry_module.get_check_fn_diagnostics()) == 1
++
++    monkeypatch.setattr(
++        registry_module, "check_fn_cache_scope",
++        lambda: registry_module.CHECK_FN_CACHE_BYPASS,
++    )
++    assert registry_module._check_fn_cached(lambda: False) is False
++    assert len(registry_module.get_check_fn_diagnostics()) == 1
++    assert registry_module._check_fn_cached(probe) is False
++    assert len(registry_module.get_check_fn_diagnostics()) == 1
++
++
++def test_diagnostic_ttl_expires_stale_callable(monkeypatch):
++    now = {"value": 100.0}
++    monkeypatch.setattr(registry_module.time, "monotonic", lambda: now["value"])
++
++    def broken():
++        raise RuntimeError("stale probe")
++
++    assert registry_module._run_check_fn_uncached(broken) is False
++    assert len(registry_module.get_check_fn_diagnostics()) == 1
++    now["value"] += registry_module._CHECK_FN_DIAGNOSTIC_TTL_SECONDS
++    assert registry_module.get_check_fn_diagnostics() == []
++
++
++def test_execute_code_unexpected_config_error_is_degraded(monkeypatch):
++    from tools import code_execution_tool, terminal_tool
++
++    monkeypatch.setattr(code_execution_tool, "SANDBOX_AVAILABLE", True)
++    monkeypatch.setattr(
++        terminal_tool, "_get_env_config",
++        lambda: (_ for _ in ()).throw(ImportError("config adapter drifted")),
++    )
++    assert registry_module._run_check_fn_uncached(
++        code_execution_tool.check_sandbox_requirements,
++    ) is False
++    assert registry_module.get_check_fn_diagnostics() == [{
++        "signal": "hermes.tool_check.degraded",
++        "check": "check_sandbox_requirements",
++        "error_type": "ImportError",
++    }]
++
++
++def test_execute_code_policy_refusal_is_normal_absence(monkeypatch):
++    from tools import code_execution_tool, terminal_tool
++    from tools.terminal_scope import TerminalPolicyUnavailable
++
++    monkeypatch.setattr(code_execution_tool, "SANDBOX_AVAILABLE", True)
++    monkeypatch.setattr(
++        terminal_tool, "_get_env_config",
++        lambda: (_ for _ in ()).throw(
++            TerminalPolicyUnavailable("profile config is unreadable")
++        ),
++    )
++    assert registry_module._run_check_fn_uncached(
++        code_execution_tool.check_sandbox_requirements,
++    ) is False
++    assert registry_module.get_check_fn_diagnostics() == []
+diff --git a/tools/code_execution_tool.py b/tools/code_execution_tool.py
+index 37799ac..a477e7c 100644
+--- a/tools/code_execution_tool.py
++++ b/tools/code_execution_tool.py
+@@ -105,12 +105,14 @@ def check_sandbox_requirements() -> bool:
+     """check_fn: available unless the vercel_sandbox backend fails its own checks."""
+     if not SANDBOX_AVAILABLE:
+         return False
++    from tools.terminal_scope import TerminalPolicyUnavailable
++    from tools.terminal_tool import _get_env_config
++    from tools.terminal_tool_backends import _check_vercel_sandbox_requirements
++
+     try:
+-        from tools.terminal_tool import _get_env_config
+-        from tools.terminal_tool_backends import _check_vercel_sandbox_requirements
+         config = _get_env_config()
+-    except Exception:
+-        logger.debug("Could not resolve terminal config for execute_code availability", exc_info=True)
++    except (ValueError, TerminalPolicyUnavailable) as exc:
++        logger.error("Could not resolve terminal config for execute_code availability: %s", exc)
+         return False
+     return config.get("env_type") != "vercel_sandbox" or _check_vercel_sandbox_requirements(config)
+ 
+diff --git a/tools/registry.py b/tools/registry.py
+index 434d0c4..4a8fca3 100644
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -207,6 +207,7 @@ _CHECK_FN_TTL_SECONDS = 30.0
+ # Grace window after a success in which a failure counts as a flake; kept short
+ # so a genuinely-down backend is reflected within a couple of turns.
+ _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
++_CHECK_FN_DIAGNOSTIC_TTL_SECONDS = 300.0
+ _CHECK_FN_CACHE_MAX = 512
+ _check_fn_cache: Dict[tuple[Callable, Optional[str]], tuple[float, bool]] = {}
+ _check_fn_last_good: Dict[tuple[Callable, Optional[str]], float] = {}
+@@ -235,21 +236,28 @@ def _record_check_fn_failure(
+ ) -> None:
+     """Publish a bounded, named diagnostic for an unexpected probe crash."""
+     now = time.monotonic()
++    logger.error(
++        "diagnostic=hermes.tool_check.degraded check_fn=%s error_type=%s",
++        _fn_label(fn), type(exc).__name__)
++    # A bypass scope deliberately has no stable request/profile identity. The
++    # named log above remains the diagnostic; retaining it under the shared
++    # sentinel would let one browser/profile clear another's active failure.
++    if scope == CHECK_FN_CACHE_BYPASS:
++        return
+     key = (fn, scope)
+     with _check_fn_cache_lock:
++        _check_fn_failures.pop(key, None)
+         _check_fn_failures[key] = (now, {
+             "signal": "hermes.tool_check.degraded",
+             "check": str(_fn_label(fn)),
+             "error_type": type(exc).__name__,
+         })
+-        while len(_check_fn_failures) > _CHECK_FN_CACHE_MAX:
+-            _check_fn_failures.pop(next(iter(_check_fn_failures)))
+-    logger.error(
+-        "diagnostic=hermes.tool_check.degraded check_fn=%s error_type=%s",
+-        _fn_label(fn), type(exc).__name__)
++        _prune_check_fn_failures(now)
+ 
+ 
+ def _clear_check_fn_failure(fn: Callable, scope: Optional[str] = None) -> None:
++    if scope == CHECK_FN_CACHE_BYPASS:
++        return
+     with _check_fn_cache_lock:
+         _check_fn_failures.pop((fn, scope), None)
+ 
+@@ -257,9 +265,19 @@ def _clear_check_fn_failure(fn: Callable, scope: Optional[str] = None) -> None:
+ def get_check_fn_diagnostics() -> List[dict]:
+     """Return active unexpected check failures without running any probes."""
+     with _check_fn_cache_lock:
++        _prune_check_fn_failures(time.monotonic())
+         return [dict(item) for _, item in _check_fn_failures.values()]
+ 
+ 
++def _prune_check_fn_failures(now: float) -> None:
++    """Expire stale diagnostics and cap retained callable references. Caller holds the lock."""
++    for key, (stamp, _) in list(_check_fn_failures.items()):
++        if now - stamp >= _CHECK_FN_DIAGNOSTIC_TTL_SECONDS:
++            _check_fn_failures.pop(key, None)
++    while len(_check_fn_failures) > _CHECK_FN_CACHE_MAX:
++        _check_fn_failures.pop(next(iter(_check_fn_failures)))
++
++
+ def _prune_check_fn_caches(now: float) -> None:
+     """Expire stale entries and cap profile-dimensional cache growth. Caller holds the lock."""
+     for cache, ttl, stamp in (
+@@ -270,6 +288,7 @@ def _prune_check_fn_caches(now: float) -> None:
+                 cache.pop(key, None)
+         while len(cache) >= _CHECK_FN_CACHE_MAX:
+             cache.pop(next(iter(cache)))
++    _prune_check_fn_failures(now)
+ 
+ 
+ def check_fn_cache_scope() -> Optional[str]:
+@@ -334,6 +353,7 @@ def _run_check_fn_uncached(fn: Callable, *, unresolved_scope: bool = False) -> b
+ 
+ def _check_fn_cached(fn: Callable) -> bool:
+     """Return bool(fn()), TTL-cached across calls."""
++    from agent.secret_scope import UnscopedSecretError
+     now = time.monotonic()
+     if fn in _NO_CACHE_CHECK_FNS:
+         return _run_check_fn_uncached(fn)
+@@ -350,6 +370,9 @@ def _check_fn_cached(fn: Callable) -> bool:
+     try:
+         value, outcome = bool(fn()), "returned False"
+         _clear_check_fn_failure(fn, scope)
++    except UnscopedSecretError:
++        value, outcome = False, "hit expected fail-closed secret scope"
++        _clear_check_fn_failure(fn, scope)
+     except Exception as exc:
+         # Keep the exception for the verdict log below (emitted outside this block, where
+         # ``exc_info=True`` would resolve to nothing): a check_fn that raises is a bug in the probe
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index cbe2349..7db7d45 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -1261,9 +1261,11 @@ def check_terminal_requirements() -> bool:
+     exceptions propagate to the registry so it can distinguish a broken probe
+     from an optional capability that is simply not configured.
+     """
++    from tools.terminal_scope import TerminalPolicyUnavailable
++
+     try:
+         config = _get_env_config()
+-    except ValueError as exc:
++    except (ValueError, TerminalPolicyUnavailable) as exc:
+         # Invalid operator input is a documented prerequisite failure, not an
+         # internal probe crash. Keep it on the ordinary False path.
+         logger.error("Terminal requirements check failed: %s", exc)

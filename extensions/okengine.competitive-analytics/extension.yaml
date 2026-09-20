@@ -65,7 +65,9 @@ operations:
     entrypoint: select_acquirer_signals.py
     prompt_file: prompts/acquirer-signals.md
     max_iterations: 12
-    output_contract: *competitive_contract
+    output_contract:
+      <<: *competitive_contract
+      body: {required: true, min_non_whitespace: 100, max_non_whitespace: 8000}
     adversarial_fixtures: *model_fixtures
     toolsets: [todo, okengine-write, okengine]
   discover-competitors:
