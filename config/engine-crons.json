@@ -519,7 +519,7 @@
   {
     "id": "da91e3a7b8ca",
     "name": "raw-backfill",
-    "max_iterations": 4,
+    "max_iterations": 6,
     "output_contract": {
       "api": 1,
       "allowed_namespaces": [
@@ -571,6 +571,97 @@
       "okengine-write"
     ],
     "workdir": "/opt/vault"
+  },
+  {
+    "id": "5f87bd320c1d",
+    "name": "raw-compile",
+    "no_agent": true,
+    "output_contract": {
+      "api": 1,
+      "allowed_namespaces": [
+        "sources"
+      ],
+      "allowed_types": [
+        "source"
+      ],
+      "operations": [
+        "create",
+        "update",
+        "converge"
+      ],
+      "required_fields": [
+        "type",
+        "raw",
+        "publisher",
+        "published"
+      ],
+      "required_relationships": [],
+      "body": {
+        "required": true,
+        "min_non_whitespace": 80
+      },
+      "unknown_fields": "reject",
+      "unresolved_links": "reject",
+      "placeholder_links": "reject",
+      "completion": "run"
+    },
+    "adversarial_fixtures": [
+      "tests/cron/test_raw_compile.py"
+    ],
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "7,27,47 * * * *"
+    },
+    "workdir": "/opt/vault",
+    "script": "raw_compile.py",
+    "deliver": "local"
+  },
+  {
+    "id": "5ddecc51b560",
+    "name": "entity-link",
+    "no_agent": true,
+    "output_contract": {
+      "api": 1,
+      "allowed_namespaces": [
+        "entities"
+      ],
+      "allowed_types": [
+        "*"
+      ],
+      "operations": [
+        "update"
+      ],
+      "required_fields": [
+        "type"
+      ],
+      "required_relationships": [],
+      "body": {
+        "required": false,
+        "min_non_whitespace": 0
+      },
+      "unknown_fields": "review",
+      "unresolved_links": "review",
+      "placeholder_links": "reject",
+      "completion": "run",
+      "identity_edit": {
+        "fields": [
+          "citations"
+        ]
+      }
+    },
+    "adversarial_fixtures": [
+      "tests/cron/test_entity_link.py"
+    ],
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "15 5 * * *"
+    },
+    "workdir": "/opt/vault",
+    "expect": {"maintains": {"artifact": "wiki/operational/entity-link-snapshots.md", "max_age": "3x"}},
+    "script": "entity_link.py",
+    "deliver": "local"
   },
   {
     "id": "4bea2f322232",
@@ -712,7 +803,16 @@
       "unknown_fields": "reject",
       "unresolved_links": "review",
       "placeholder_links": "reject",
-      "completion": "per-selected-item"
+      "completion": "per-selected-item",
+      "identity_edit": {
+        "fields": [
+          "type"
+        ],
+        "retype_from": [
+          "entity",
+          "@classify_catchall"
+        ]
+      }
     },
     "adversarial_fixtures": [
       "tests/cron/test_model_write_contract_inventory.py"
@@ -1339,7 +1439,7 @@
   {
     "id": "b554841c2a05",
     "name": "daily-brief",
-    "max_iterations": 12,
+    "max_iterations": 24,
     "output_contract": {
       "api": 1,
       "allowed_namespaces": [
@@ -1512,5 +1612,54 @@
     "prompt": "[SILENT]",
     "deliver": "local",
     "no_agent": true
+  },
+  {
+    "id": "d0204f68b139",
+    "name": "dedup-same-url",
+    "no_agent": true,
+    "output_contract": {
+      "api": 1,
+      "allowed_namespaces": [
+        "*"
+      ],
+      "allowed_types": [
+        "*"
+      ],
+      "operations": [
+        "update",
+        "converge",
+        "tombstone",
+        "flag"
+      ],
+      "required_fields": [
+        "type"
+      ],
+      "required_relationships": [],
+      "body": {
+        "required": false,
+        "min_non_whitespace": 0
+      },
+      "unknown_fields": "reject",
+      "unresolved_links": "review",
+      "placeholder_links": "reject",
+      "completion": "run",
+      "identity_edit": {
+        "fields": [
+          "citations"
+        ]
+      }
+    },
+    "adversarial_fixtures": [
+      "tests/cron/test_dedup_same_url.py"
+    ],
+    "enabled": true,
+    "schedule": {
+      "kind": "cron",
+      "expr": "15 5 * * 0"
+    },
+    "workdir": "/opt/vault",
+    "expect": {"drains": {"max_stalled_runs": 2}},
+    "script": "dedup_same_url.py",
+    "deliver": "local"
   }
 ]

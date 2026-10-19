@@ -8,6 +8,10 @@ import re
 from pathlib import Path
 from typing import Any, Callable
 
+from scripts import framework_validate_expect
+
+UNDETECTABLE = "UNDETECTABLE, not a pass"
+
 
 def prompt_text(pack: Path, value: Any) -> str:
     """Resolve an inline prompt or a pack-relative prompt_file reference."""
@@ -28,6 +32,54 @@ def prompt_text(pack: Path, value: Any) -> str:
     if not target.is_file():
         raise ValueError(f"prompt_file not found: {reference}")
     return target.read_text(encoding="utf-8")
+
+
+def _borrowed_rule(rule: str, defs: list, what: str) -> list:
+    """Run a composed-fleet rule borrowed from cron_pack_split, so the pack gate and the deploy
+    gate cannot drift apart.
+
+    Loaded by path, not imported by name: `scripts/` is not a package, so a plain import works
+    only when the caller happens to have it on sys.path. If the module cannot be loaded the
+    check reports itself UNDETECTABLE rather than passing vacuously.
+    """
+    import importlib.util
+    mod_path = Path(__file__).resolve().parent / "cron_pack_split.py"
+    try:
+        spec = importlib.util.spec_from_file_location("okengine_cron_pack_split", mod_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return list(getattr(mod, rule)(defs))
+    except Exception as exc:
+        # An unloadable rule is UNDETECTABLE, never a silent pass: a missing engine file or a
+        # broken import would otherwise report this lane as clean.
+        return [f"cannot verify {what} ({mod_path.name}: "
+                f"{str(exc)[:80]}) — {UNDETECTABLE}"]
+
+
+def _writer_name_errors(defs: list) -> list:
+    """The write-server name-length rule (okengine#840)."""
+    return _borrowed_rule("validate_contract_writer_names", defs, "write-server name length")
+
+
+def _domain_name_errors(defs: list) -> list:
+    """No `@` in a domain job name (okengine#969): every def in domain-crons.json is
+    pack-authored, so the rule applies to each one, with no provenance marker needed."""
+    return _borrowed_rule("domain_job_name_errors", defs, "domain job name")
+
+
+def _check_engine_shadows(defs: list, r: Any) -> None:
+    """No domain job may take an engine lane's identity (okengine#969): not its bare name, and not
+    its write server, whether derived (a name that folds to it, e.g. `Trends-Refresh`) or listed
+    explicitly in enabled_toolsets. The rules and the engine cron list come from cron_pack_split.
+    If either cannot be loaded the check WARNs that it is UNDETECTABLE, like the engine-script
+    shadow check when the engine dir is absent: an unreadable engine list is an incomplete engine
+    checkout, not a defect in the pack."""
+    dicts = [d for d in defs if isinstance(d, dict)]   # the shape check reports the rest
+    for rule, what, check in (
+            ("engine_shadow_errors", "engine-lane shadowing", "cron domain job shadows engine lane"),
+            ("engine_writer_errors", "write-server identity", "cron write-server identity")):
+        for problem in _borrowed_rule(rule, dicts, what):
+            (r.warn if problem.endswith(UNDETECTABLE) else r.fail)(check, problem)
 
 
 def check_crons(
@@ -55,9 +107,13 @@ def check_crons(
         ac_spec.loader.exec_module(ac)
     except Exception as exc:
         r.fail("cron output contracts", f"validator failed: {exc}")
+    # okengine#969: a pack/operator-tier extension operation binds only its own write server.
+    for problem in _borrowed_rule("pack_extension_writer_errors", pack, "extension write servers"):
+        (r.warn if problem.endswith(UNDETECTABLE) else r.fail)("extension write servers", problem)
     cdir = pack / "crons"
     if not cdir.is_dir():
         r.warn("crons/", "absent — pack contributes no cron defs")
+        framework_validate_expect.check_pack(pack, r, [])
         return
     dc = cdir / "domain-crons.json"
     defs = []
@@ -73,6 +129,7 @@ def check_crons(
             r.fail("crons/domain-crons.json parses", f"JSON error: {str(e)[:120]}")
     else:
         r.info("crons/domain-crons.json", "absent (no domain crons)")
+    framework_validate_expect.check_pack(pack, r, defs)  # okengine#890: every lane declares expect:
     etp = cdir / "engine-template-prompts.json"
     if etp.is_file():
         try:
@@ -115,6 +172,7 @@ def check_crons(
     # shape + script existence for domain defs
     sdir = cdir / "scripts"
     engine_sdir = engine_cron_dir
+    _check_engine_shadows(defs, r)
     for d in defs:
         if not isinstance(d, dict) or not d.get("name"):
             r.fail("domain cron shape", f"entry missing name: {str(d)[:80]}")
@@ -133,6 +191,18 @@ def check_crons(
             problems.append("no script or prompt")
         if problems:
             r.fail(f"cron '{d.get('name')}'", " + ".join(problems))
+        # Same rule the composed-fleet validator applies (okengine#840); imported rather than
+        # restated so the pack gate and the deploy gate cannot drift to different limits. Every
+        # def, not only contracted ones: a derived name is bounded, so the live risk is a writer a
+        # def names explicitly in enabled_toolsets, and an uncontracted def can do that too.
+        for problem in _writer_name_errors([d]):
+            r.fail("cron write-server name", problem)
+        for problem in _domain_name_errors([d]):
+            r.fail("cron domain job name", problem)
+        # okengine#1044 [8]/[18]: the deploy gate's own `write_tools` rule, borrowed so a malformed
+        # declaration fails here first instead of widening or emptying the lane's writer later.
+        for problem in _borrowed_rule("validate_write_tools", [d], "lane write_tools"):
+            (r.warn if problem.endswith(UNDETECTABLE) else r.fail)("cron write_tools", problem)
         if not d.get("no_agent") and d.get("enabled_toolsets") is None:
             r.fail("cron tool surface",
                    f"agent cron {d.get('name')!r} must declare enabled_toolsets explicitly; "

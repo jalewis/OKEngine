@@ -366,6 +366,47 @@ def test_raw_backfill_and_selected_url_edges(tmp_path, monkeypatch):
     assert m._selected_raw_url(["raw/vanished.md"]) == ""
 
 
+def test_selected_url_recovered_from_json_connector_record(tmp_path, monkeypatch):
+    """REGRESSION: connector records are JSON with the item under `payload`. The line-oriented
+    `url:` match never fired on them, so every record whose model omitted `url` was rejected
+    `source url is required` — 100 of 248 runs on one live vault in 10 days."""
+    m = _load(tmp_path, monkeypatch)
+    raw = tmp_path / "raw/connectors/news/records/a/1.json"
+    raw.parent.mkdir(parents=True)
+    raw.write_text('{"connector_id": "news", "payload": {"title": "T",'
+                   ' "source_url": "https://arxiv.org/abs/2604.18584"}}')
+    assert m._selected_raw_url(["raw/connectors/news/records/a/1.json"]) == \
+        "https://arxiv.org/abs/2604.18584"
+
+
+def test_selected_url_json_top_level_and_single_nested(tmp_path, monkeypatch):
+    m = _load(tmp_path, monkeypatch)
+    raw = tmp_path / "raw/x.json"
+    raw.parent.mkdir(parents=True)
+    raw.write_text('{"url": "https://a.test/top", "payload": {"url": "https://a.test/p"}}')
+    assert m._selected_raw_url(["raw/x.json"]) == "https://a.test/top"
+    raw.write_text('{"data": {"articles": [{"source_url": "https://a.test/only"}]}}')
+    assert m._selected_raw_url(["raw/x.json"]) == "https://a.test/only"
+    raw.write_text('[{"url": "https://a.test/l"}]')
+    assert m._selected_raw_url(["raw/x.json"]) == "https://a.test/l"
+
+
+def test_selected_url_json_never_guesses(tmp_path, monkeypatch):
+    """NEGATIVE: a multi-item response has no single identity — binding the page to one of its
+    URLs would file an arbitrary article under the capture. Malformed JSON and non-URL values
+    recover nothing either."""
+    m = _load(tmp_path, monkeypatch)
+    raw = tmp_path / "raw/x.json"
+    raw.parent.mkdir(parents=True)
+    raw.write_text('{"data": {"articles": [{"source_url": "https://a.test/1"},'
+                   ' {"source_url": "https://a.test/2"}]}}')
+    assert m._selected_raw_url(["raw/x.json"]) == ""
+    raw.write_text('{"payload": {"source_url": "not a url", "url": 7}}')
+    assert m._selected_raw_url(["raw/x.json"]) == ""
+    raw.write_text('{"payload": ')
+    assert m._selected_raw_url(["raw/x.json"]) == ""
+
+
 def test_queue_spacing_and_same_url_read_failures(tmp_path, monkeypatch):
     m = _load(tmp_path, monkeypatch)
     assert m._prepend_queue_row("header", "- row\n") == "header\n\n- row\n"

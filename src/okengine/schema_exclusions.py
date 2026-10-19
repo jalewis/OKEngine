@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-_NAMESPACE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_NAMESPACE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _GLOB_META = re.compile(r"[*?[]")
 
 # Engine-generated/operational surfaces are walked under separate contracts.

@@ -24,7 +24,7 @@ EVENT_INDEX = (
     / "okengine.events"
     / "event-scores.jsonl"
 )
-_KIND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_KIND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _PREDICTION_LINK_RE = re.compile(r"\[\[(?:predictions/)?([^|\]#]+)")
 
 

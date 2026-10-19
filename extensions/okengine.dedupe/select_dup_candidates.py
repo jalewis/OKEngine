@@ -6,6 +6,7 @@ writes here — the agent reviews each group and merges true duplicates via the 
 LOCAL-ONLY; deterministic name/alias matching (the okengine.embeddings sidecar adds semantic
 candidates later)."""
 import json
+from json import JSONDecodeError
 import os
 import re
 import hashlib
@@ -99,7 +100,7 @@ def _select_rotating(groups: list, limit: int, state_path: Path) -> list:
     try:
         state = json.loads(state_path.read_text())
         cursor = int(state.get("cursor", 0))
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (OSError, ValueError, TypeError, JSONDecodeError):
         cursor = 0
     cursor %= len(groups)
     count = min(limit, len(groups))

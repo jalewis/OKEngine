@@ -29,6 +29,8 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from okengine.file_fingerprint import fingerprint, token as fingerprint_token
+
 _FM_SCAN_BYTES = 262_144
 
 
@@ -178,7 +180,12 @@ def _render_deck_pdf(md: Path) -> "Path | None":
         return None
     try:
         _DECK_CACHE.mkdir(parents=True, exist_ok=True)
-        out = _DECK_CACHE / f"{md.stem}.{int(md.stat().st_mtime)}.pdf"
+        # Named after the deck's file fingerprint, not its whole-second mtime: a deck rewritten within
+        # the same second kept serving the previous render (okengine#1017).
+        key = fingerprint(md)
+        if key is None:
+            return None
+        out = _DECK_CACHE / f"{md.stem}.{fingerprint_token(key)}.pdf"
         if out.is_file() and out.stat().st_size > 0:
             return out
         # glob-ok: ephemeral deck-render cache, not a vault namespace
@@ -485,11 +492,16 @@ def api_prediction(id: str = Query(...)):
 
 
 def _esc(s: Any) -> str:
+    """HTML-escape for element text AND quoted attribute values. Quotes are escaped too: callers
+    interpolate vault-derived text into `title="..."` / `aria-label="..."`, where an unescaped `"`
+    closes the attribute and injects markup (v0.15.4 release audit)."""
     return (
         ("" if s is None else str(s))
         .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#x27;")
     )
 
 

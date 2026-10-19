@@ -411,10 +411,12 @@ def test_forecast_review_surfaces_open_reevaluation_and_dashboard_context(tmp_pa
     for name in ("calibration.md", "prediction-date-audit.md", "prediction-schema-audit.md"):
         (dashboards / name).write_text(f"context from {name}\n")
     monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_WRITE_TOOL_PREFIX", "mcp__okengine_write_lane_fr__")
     module = _load("select_forecast_review")
     assert module.main() == 0
     output = capsys.readouterr().out
     assert "0 resolved, 1 re-evaluated" in output
+    assert "write via mcp__okengine_write_lane_fr__create_entity" in output, "the lane's writer (#852)"
     assert "[[predictions/open-touched]]" in output
     assert "context from calibration.md" in output
     assert "old-resolved" not in output

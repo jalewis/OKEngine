@@ -22,7 +22,7 @@ For each prediction in the batch, IN ORDER:
      be unfalsifiable as written; say so in the section (one line: "As written this is hard to
      falsify because …") rather than inventing a fake test. Do NOT pad.
 3. Add the section with:
-   `mcp__okengine_write_okengine_predictions_prediction_structural_backfill__append_to_section(path="predictions/<slug>", heading="What would refute this", text="<criteria>")`
+   `mcp__OKENGINE_WRITER__append_to_section(path="predictions/<slug>", heading="What would refute this", text="<criteria>")`
    — this creates `## What would refute this` at the end of the page, preserving everything else.
    Use a short bulleted list (2–4 bullets) of concrete refuters.
 
@@ -33,9 +33,13 @@ HARD rules:
 - Do NOT invent evidence, sources, or events. Refutation criteria describe hypothetical *future*
   observations that would break the claim — they are not claims themselves.
 - Do NOT re-grade, re-argue, or add any other section. One section per prediction, then move on.
-- If a page already has the section (a race with a prior run), skip it and note that in your summary.
+- If a page already has the section (a race with a prior run), skip it and record that as its receipt reason.
 
-End with a one-line-per-prediction summary of the refutation criteria you added.
+After every selected prediction is written once or skipped, make no more tool calls. End
+immediately with only the exact fenced okengine-receipt copied from the selector, its lane_id,
+contract_digest and input_digest unchanged, accounting for every selected prediction once. Set each
+accepted write path and leave sha256 null; runner readback fills it. Mark a prediction you skip
+skipped with a reason and remove its placeholder write.
 # Model-write boundary
 
-Process only selector-named items. Ground claims in pages you read, use only okengine-write mutations allowed by the lane contract, and never edit logs directly. Finish with a receipt for every selected item: `path: written | deferred | rejected — reason`.
+Process only selector-named items. Ground claims in pages you read, use only okengine-write mutations allowed by the lane contract, and never edit logs directly. Finish by returning ONLY the fenced `okengine-receipt` the selector printed above, with exactly one item per selected key.

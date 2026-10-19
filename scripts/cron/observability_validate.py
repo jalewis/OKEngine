@@ -10,6 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+sys.path.append(str(Path(__file__).resolve().parent))  # staged sibling libs
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
+
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 DATA = Path(os.environ.get("HERMES_HOME", "/opt/data"))
@@ -257,7 +260,7 @@ def _write(errors: List[str]) -> None:
         "- Prometheus export and monitor heartbeat are fresh and parseable.",
     ])
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    generated_page.write(OUTPUT, "\n".join(lines) + "\n")
 
 
 def main() -> int:

@@ -63,25 +63,50 @@ def _append_log(line: str) -> None:
 
 
 def _rel(p: Path) -> str:
+    """The vault-relative key for a page, e.g. ``entities/a/p/apt-c-27.md``.
+
+    Must mirror ``_safe``'s resolution exactly (okengine#832). ``_safe`` returns ``p.resolve()``
+    and checks containment against ``wiki.resolve()``; this relativized against the UNRESOLVED
+    ``_wiki()``. Wherever the vault path traverses a symlink -- an operator whose ``~/Source`` links
+    to ``~/MEGA/Source``, the shape that exposed this -- the two disagree, ``relative_to`` raises,
+    and the fallback returns an ABSOLUTE path as if it were a key. The review ledger stores that as
+    a record `subject`, and the Cockpit worklist joins records to pages by exactly that key, so the
+    decision becomes permanently unjoinable: the page reads as reviewed while its decision cannot be
+    found by page. In-container the vault is ``/opt/vault`` with no symlink, so every gateway lane
+    agreed and only host-run callers (``framework review``) diverged.
+
+    Resolved-vs-resolved first, then the unresolved pair for a wiki that cannot be resolved (a
+    broken or racing mount), and only a page genuinely outside the vault falls through to the
+    absolute form."""
+    wiki = _wiki()
+    for page, base in ((p, wiki), (_resolved(p), _resolved(wiki))):
+        try:
+            return page.relative_to(base).as_posix()
+        except ValueError:
+            continue
+    return p.as_posix()
+
+
+def _resolved(p: Path) -> Path:
+    """``p.resolve()``, or ``p`` unchanged when the filesystem refuses (missing/looping path)."""
     try:
-        return p.relative_to(_wiki()).as_posix()
-    except ValueError:
-        return p.as_posix()
+        return p.resolve()
+    except OSError:
+        return p
 
 
 def _reserved_refuse(p: Path) -> Optional[str]:
-    n = p.name.lower()
-    # Mirror schema_validator._is_generated_structural EXACTLY: the validator exempts these basenames
-    # from conformance, so the write path MUST refuse the same set or the two guards compose into zero
-    # protection — an agent forges a conformance-invisible page (invariant-audit M17). That predicate
-    # is: any `_`- or `.`-prefixed file, and the whole INDEX family (INDEX.md + INDEX-<anything>, incl.
-    # the paginated INDEX-pNN.md). `index-` (lowercased) covers INDEX-glossary etc., not just index-p.
-    if (
-        n in _RESERVED_NAMES
-        or n.startswith("index-")
-        or p.name.startswith("_")
-        or p.name.startswith(".")
-    ):
+    # ONE predicate with the validator's conformance exemption, the minting guard and the detector
+    # (schema_validator.is_reserved_basename, okengine#997): exempt-but-writable composes into zero
+    # protection — an agent forges a conformance-invisible page (invariant-audit M17) — and
+    # refused-but-not-exempt is a valid page nothing can maintain. This used to refuse EVERY
+    # lowercase `index-*` (dd5e9fa7 widened `index-p` to `index-` only to cover the validator's
+    # `INDEX-<x>` family case-insensitively), which refused ordinary pages such as `index-funds`.
+    # Imported here, not at module level: write-service functions run rebound onto the
+    # write_server facade's globals (write_services.binding), which carry no such name.
+    from tools.schema_validator import is_reserved_basename
+
+    if is_reserved_basename(p.name):
         return (
             f"refused: {_rel(p)} is an engine-managed structural/reserved file "
             "— not agent-writable via the MCP write tools (use the file tool only "
@@ -98,7 +123,7 @@ def _reserved_refuse(p: Path) -> Optional[str]:
         reserved = _governing(p).get("reserved_files")
     except Exception:
         reserved = None
-    if reserved and n in {str(r).lower() for r in reserved}:
+    if is_reserved_basename(p.name, reserved or ()):
         return (
             f"refused: {_rel(p)} is a pack-reserved file (schema `reserved_files`) "
             "— not agent-writable via the MCP write tools"
@@ -119,6 +144,25 @@ def _tombstone_refuse(cur_fm: dict, p: Path) -> Optional[str]:
     return None
 
 
+def _tombstone_transition_refuse(cur_fm: dict, new_fm: dict, p: Path) -> Optional[str]:
+    """Retiring a page is tombstone_entity's job alone (okengine#863). `status`, `tombstone_reason`
+    and `superseded_by` are ordinary frontmatter keys and `status: tombstoned` is valid for every
+    type, so update/patch/converge could set all three in one call -- skipping the okengine#101
+    reason/successor guard that runs only inside tombstone_entity. That is exactly how a live
+    vault lost actors to "Different entity from X" retirements and to successors that were malware
+    pages, themselves, or other tombstones. Refuse the live -> tombstoned transition anywhere else;
+    edits that leave the status alone, and edits to an already-tombstoned page (refused separately
+    by _tombstone_refuse), are unaffected."""
+    was = str(cur_fm.get("status") or "").strip().lower() == "tombstoned"
+    becomes = str(new_fm.get("status") or "").strip().lower() == "tombstoned"
+    if becomes and not was:
+        return (
+            f"refused: {_rel(p)} would become tombstoned — retire a page with tombstone_entity, "
+            "which checks the tombstone reason and its superseded_by successor (okengine#101)"
+        )
+    return None
+
+
 def _source_receipt_refuse(fm: dict, p: Path) -> Optional[str]:
     """A processing receipt is operational state, never canonical source intelligence."""
     if (
@@ -129,7 +173,31 @@ def _source_receipt_refuse(fm: dict, p: Path) -> Optional[str]:
             f"rejected: {_rel(p)} cannot store status duplicate-receipt as a source page — "
             "append the duplicate raw provenance to the canonical source instead"
         )
-    return None
+    return _placeholder_url_refuse(fm, p)
+
+
+def _placeholder_url_refuse(fm: dict, p: Path) -> Optional[str]:
+    """A source `url` is identity; a placeholder there fuses unrelated documents (okengine#886).
+
+    Refuses only a write that INTRODUCES the placeholder: a page already stored with it stays
+    writable (so its other fields and its repair are never blocked), and a URL-less source is
+    the schema's business, not this guard's.
+    """
+    if str(fm.get("type") or "").strip().lower() != "source":
+        return None
+    url = str(fm.get("url") or "").strip()
+    if not url or not _PLACEHOLDER_URL.search(url):
+        return None
+    try:
+        stored = str((_read_page(p)[0] or {}).get("url") or "").strip() if p.is_file() else ""
+    except (OSError, ValueError):
+        stored = ""
+    if stored == url:
+        return None
+    return (
+        f"rejected: {_rel(p)} url {url!r} is a placeholder, not an address — a source's URL is "
+        "its identity, so leave `url` unset until the real one is known"
+    )
 
 
 def _namespace(p: Path) -> str:

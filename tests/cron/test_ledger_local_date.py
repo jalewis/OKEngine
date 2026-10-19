@@ -27,6 +27,7 @@ LEDGER_SITES = [
     ("detect_field_loss.py", "today = datetime.now()"),
     ("kb_health.py", "today = datetime.now()"),
     ("page_quality_audit.py", "today = datetime.now()"),
+    ("entity_link.py", "today = datetime.now()"),
 ]
 
 

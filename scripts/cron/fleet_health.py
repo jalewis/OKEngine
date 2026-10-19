@@ -24,6 +24,7 @@ Env: WIKI_PATH (/opt/vault) · CRON_JOBS (/opt/data/cron-plus/jobs.json) ·
 from __future__ import annotations
 
 import json
+from json import JSONDecodeError
 import os
 import re
 import sys
@@ -31,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import slot_starvation  # noqa: E402
 import knowledge_quality  # noqa: E402
 
@@ -225,6 +227,30 @@ def memory_pressure(path: Path = MEMORY_EVENTS) -> tuple[str, str]:
     return "ok", "no memory-cap hits or OOM kills recorded"
 
 
+def entity_linkage() -> tuple[str, str]:
+    """(state, detail) from entity_link's ledger (okengine#888): the share of recent sources any
+    entity cites. Every entity-frequency reader (trends movers, lacuna density) runs on it; it
+    sat near 4% on a vault whose entity lanes never revisited an entity, and nothing showed it.
+    No snapshot, or no parseable row, is `unknown` — never a measured zero."""
+    snap = WIKI / "operational" / "entity-link-snapshots.md"
+    try:
+        lines = snap.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return "unknown", "no entity-link snapshot yet (the entity-link lane has not run)"
+    last = None
+    for line in lines:
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) >= 4 and cells[0][:1] == "2" and cells[1].isdigit() and cells[2].isdigit():
+            last = cells
+    if last is None:
+        return "unknown", "entity-link snapshot has no parseable row"
+    cited, recent = int(last[1]), int(last[2])
+    pct = 100.0 * cited / recent if recent else 0.0
+    state = "ok" if pct >= 20 else "warn"
+    return state, (f"{pct:.1f}% of recent sources are cited by an entity ({cited:,} / {recent:,}, "
+                   f"{last[0]}) — below 20% the entity graph cannot carry trend or field signals")
+
+
 def read_qmd_telemetry():
     """The published search telemetry, or None when it is absent or not JSON.
 
@@ -336,7 +362,7 @@ def _escalation_state(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
+    except (OSError, JSONDecodeError):
         return {}                      # no history is "first sighting", never "nothing is wrong"
 
 
@@ -546,6 +572,10 @@ def main() -> int:
           "_Saturation means a lane was refused, not merely delayed. `unknown` means unmeasured, "
           "which is not the same as healthy (okengine#410, #568)._", ""]
     L += ["## Gateway memory", "", f"{memory_icon} **{memory_state}** — {memory_detail}", ""]
+    link_state, link_detail = entity_linkage()
+    L += ["## Entity linkage", "",
+          f"{ {'ok': '🟢', 'warn': '🟡', 'unknown': '⚪'}[link_state]} **{link_state}** — "
+          f"{link_detail}", ""]
     quality = knowledge_quality.rollup(
         data_dir / "cron-plus" / "receipts", QUALITY_ADJUDICATION)
     L += knowledge_quality.markdown(quality)
@@ -557,7 +587,7 @@ def main() -> int:
     out = WIKI / "dashboards" / "fleet-health.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     try:
-        out.write_text("\n".join(L), encoding="utf-8")
+        generated_page.write(out, "\n".join(L))
         # Atomic producer/consumer handoff: health_export must never parse a half-written JSON file
         # and silently fall back to count transitions during a real composition change.
         sidecar = out.parent / ".fleet-lanes.json"

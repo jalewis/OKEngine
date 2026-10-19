@@ -109,6 +109,22 @@ def test_all_four_expectation_kinds(tmp_path, monkeypatch, capsys):
     assert "frontmatter field `owner` is missing/empty" in g and "[[risks/r1]]" in g
 
 
+def test_gap_page_keeps_declared_field_order_unicode_and_an_id(tmp_path, monkeypatch):
+    """The gap frontmatter is written in declaration order with readable unicode, and carries the
+    id backfill_ids would stamp so a later rewrite can go through the write path (okengine#933)."""
+    (tmp_path / "config").mkdir(parents=True)
+    (tmp_path / "config" / "completeness-rules.yaml").write_text(
+        "rules:\n  - id: risk-owner\n    when: {type: risk}\n    expect: field\n    field: owner\n"
+        "    severity: medium\n    resolution_hint: \"Assign an owner — café ✓\"\n", encoding="utf-8")
+    _page(tmp_path, "risks/r1", "type: risk\n")
+    _run(tmp_path, monkeypatch)
+    text = (tmp_path / "wiki" / "gaps" / "risk-owner--risks-r1.md").read_text(encoding="utf-8")
+    keys = [line.split(":", 1)[0] for line in text.split("---")[1].strip().splitlines()]
+    assert keys[:6] == ["id", "type", "rule", "subject", "severity", "status"]
+    assert keys[0] == "id" and text.splitlines()[1].startswith('id: "gaps:')
+    assert "resolution_hint: Assign an owner — café ✓" in text
+
+
 def test_auto_resolve_and_dismiss_respected(tmp_path, monkeypatch):
     _vault(tmp_path)
     _run(tmp_path, monkeypatch)
@@ -339,3 +355,128 @@ def test_satisfied_rules_render_dashboard_without_gap_directory(tmp_path, monkey
     _run(tmp_path, monkeypatch)
     dashboard = (tmp_path / "wiki/dashboards/completeness.md").read_text()
     assert "Open gaps" not in dashboard and "Rule precision" in dashboard
+
+
+# --- okengine#878: gap-drain reports PER-GAP dispositions ----------------------------------------
+# An honestly skipped gap is a valid outcome, so gap-drain is judged per selected gap rather than
+# failed for writing nothing. That needs the selector to write the selection manifest on EVERY
+# path (a fresh empty one on each no-work exit) and to print the receipt template.
+
+import json as _json
+import re as _re
+
+_RECEIPT = _re.compile(r"```okengine-receipt\n(\{.*?\})\n```", _re.S)
+
+
+def _drain_env(tmp_path, monkeypatch):
+    manifest = tmp_path / "selection.json"
+    manifest.write_text(_json.dumps({"api": 1, "selected": ["stale-key"]}))
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_SELECTION_MANIFEST", str(manifest))
+    monkeypatch.setenv("OKENGINE_LANE_ID", "okengine.completeness:gap-drain")
+    monkeypatch.setenv("OKENGINE_CONTRACT_DIGEST", "sha256:contract")
+    return manifest
+
+
+def test_gap_drain_declares_per_selected_item_completion():
+    operation = yaml.safe_load((EXT / "extension.yaml").read_text())["operations"]["gap-drain"]
+    assert operation["output_contract"]["completion"] == "per-selected-item"
+    assert operation["entrypoint"] == "select_gap_fixes.py"
+
+
+def test_gap_drain_writes_manifest_keyed_by_gap_and_receipt_writes_subject(
+        tmp_path, monkeypatch, capsys):
+    manifest = _drain_env(tmp_path, monkeypatch)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/completeness-rules.yaml").write_text(
+        "rules:\n  - id: fixme\n    fix: agent\n")
+    gaps = tmp_path / "wiki/gaps"
+    gaps.mkdir(parents=True)
+    for slug in ("a", "b"):   # two gaps on ONE subject: the gap page, not the subject, is the key
+        (gaps / f"fixme-{slug}.md").write_text(
+            "---\ntype: gap\nrule: fixme\nstatus: open\nsubject: '[[risks/r1]]'\n"
+            f"expectation: owner missing\nfirst_seen: 2026-07-0{1 if slug == 'a' else 2}\n---\n")
+    module = _load("select_gap_fixes_manifest", EXT / "select_gap_fixes.py")
+
+    assert module.main() == 0
+
+    out = capsys.readouterr().out
+    written = _json.loads(manifest.read_text())
+    assert written["selected"] == ["wiki/gaps/fixme-a.md", "wiki/gaps/fixme-b.md"]
+    assert written["lane_id"] == "okengine.completeness:gap-drain"
+    receipt = _json.loads(_RECEIPT.findall(out)[0])
+    assert [i["key"] for i in receipt["items"]] == written["selected"]
+    assert receipt["input_digest"] == written["input_digest"]
+    assert {i["writes"][0]["path"] for i in receipt["items"]} == {"risks/r1.md"}
+    assert '"wakeAgent": true' in out
+
+
+@pytest.mark.parametrize("rules", [
+    None,                                              # no rules file
+    "[broken",                                         # unparseable
+    "rules:\n  - id: r\n    fix: human\n",             # nothing agent-fixable
+    "rules:\n  - id: r\n    fix: agent\n",             # fixable rule, no open gaps
+])
+def test_gap_drain_every_no_work_exit_refreshes_an_empty_manifest(
+        tmp_path, monkeypatch, capsys, rules):
+    manifest = _drain_env(tmp_path, monkeypatch)
+    if rules is not None:
+        (tmp_path / "config").mkdir()
+        (tmp_path / "config/completeness-rules.yaml").write_text(rules)
+    module = _load("select_gap_fixes_idle", EXT / "select_gap_fixes.py")
+
+    assert module.main() == 0
+
+    out = capsys.readouterr().out
+    assert '"wakeAgent": false' in out
+    assert _json.loads(manifest.read_text())["selected"] == []
+    assert "okengine-receipt" not in out
+
+
+def test_gap_drain_prompt_asks_for_the_printed_receipt():
+    prompt = (EXT / "prompts" / "gap_drain.md").read_text(encoding="utf-8")
+    assert "okengine-receipt" in prompt and "insufficient-evidence" in prompt
+    assert "written | deferred | rejected" not in prompt
+    assert "fixed | drafted (needs_review) | skipped" not in prompt
+
+
+def test_gap_drain_receipt_write_target_drops_a_wikilink_alias(tmp_path, monkeypatch, capsys):
+    _drain_env(tmp_path, monkeypatch)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/completeness-rules.yaml").write_text("rules:\n  - id: fixme\n    fix: agent\n")
+    gaps = tmp_path / "wiki/gaps"
+    gaps.mkdir(parents=True)
+    (gaps / "fixme-a.md").write_text(
+        "---\ntype: gap\nrule: fixme\nstatus: open\nsubject: '[[wiki/risks/r1|Risk One]]'\n"
+        "expectation: owner missing\nfirst_seen: 2026-07-01\n---\n")
+    module = _load("select_gap_fixes_alias", EXT / "select_gap_fixes.py")
+
+    assert module.main() == 0
+
+    receipt = _json.loads(_RECEIPT.findall(capsys.readouterr().out)[0])
+    assert receipt["items"][0]["writes"][0]["path"] == "risks/r1.md"
+
+
+@pytest.mark.parametrize("staged", [False, True], ids=["repo-layout", "staged-layout"])
+def test_gap_drain_selector_runs_standalone(tmp_path, staged):
+    """A fresh interpreter with no PYTHONPATH must resolve selection_manifest in both layouts."""
+    import os
+    import shutil
+    import subprocess
+    selector = EXT / "select_gap_fixes.py"
+    if staged:
+        scripts = tmp_path / "scripts"
+        shutil.copytree(EXT, scripts / "okengine.completeness")
+        shutil.copy(REPO / "scripts" / "cron" / "selection_manifest.py", scripts)
+        selector = scripts / "okengine.completeness" / "select_gap_fixes.py"
+    vault = tmp_path / "vault"
+    (vault / "wiki").mkdir(parents=True)
+    manifest = tmp_path / "selection.json"
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env.update(WIKI_PATH=str(vault), OKENGINE_SELECTION_MANIFEST=str(manifest))
+
+    proc = subprocess.run([sys.executable, str(selector)], env=env, cwd=str(vault),
+                          capture_output=True, text=True, timeout=60)
+
+    assert proc.returncode == 0, proc.stderr
+    assert _json.loads(manifest.read_text())["selected"] == []

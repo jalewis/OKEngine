@@ -136,3 +136,16 @@ def test_load_schema_caches_by_mtime_and_reloads_on_change(sv, tmp_path):
     os.utime(path, (0, 0))          # force a distinct mtime
     reloaded = sv._load_schema(path)
     assert "entity" in reloaded["types"], "a changed schema must not serve a stale cache"
+
+
+def test_load_schema_sees_a_same_size_rewrite_within_one_tick(sv, tmp_path):
+    """okengine#1017: the cache was keyed on mtime alone, so a schema rewritten within one
+    timestamp tick kept validating against the previous version."""
+    import os
+    path = tmp_path / "schema.yaml"
+    path.write_text("types:\n  aaaaaa: {}\n", encoding="utf-8")
+    assert "aaaaaa" in sv._load_schema(path)["types"]
+    before = path.stat()
+    path.write_text("types:\n  bbbbbb: {}\n", encoding="utf-8")
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert "bbbbbb" in sv._load_schema(path)["types"]

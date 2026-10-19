@@ -180,3 +180,34 @@ def test_migration_rejects_extra_services_and_unsupported_differences():
             {"services": {"gateway": {"command": ["bad"]}}},
             {"services": {"gateway": {}}},
         )
+
+
+def test_discover_packs_ignores_pack_copies_inside_a_pack(tmp_path):
+    """okengine#1032 QA N2: a killed `framework backup create` left a staging dir holding the
+    pack's pack.yaml, and upgrade snapshots hold one too; neither is a deployment."""
+    root = tmp_path / "deployments"
+    pack = root / "alpha"
+    (pack / ".okengine/backups/.staging/.staging-x").mkdir(parents=True)
+    (pack / ".okengine/snapshots/s1/tree").mkdir(parents=True)
+    (pack / "pack.yaml").write_text("name: alpha\n")
+    (pack / ".okengine/backups/.staging/.staging-x/pack.yaml").write_text("name: alpha\n")
+    (pack / ".okengine/snapshots/s1/tree/pack.yaml").write_text("name: alpha\n")
+    (root / "beta/backups").mkdir(parents=True)
+    (root / "beta/backups/pack.yaml").write_text("name: beta\n")   # only .okengine/backups is a copy
+    (root / "gamma/.archive/snapshots").mkdir(parents=True)          # not under .okengine
+    (root / "gamma/.archive/snapshots/pack.yaml").write_text("name: gamma\n")
+    assert MODULE.discover_packs([root]) == [pack.resolve(), (root / "beta/backups").resolve(),
+                                             (root / "gamma/.archive/snapshots").resolve()]
+
+
+def test_discover_packs_rooted_inside_okengine_finds_no_nested_copy(tmp_path):
+    """QA N9: a scan rooted at `<pack>/.okengine` still found the copies, and descended into them."""
+    pack = tmp_path / "alpha"
+    staged = pack / ".okengine/backups/.staging/.staging-x"
+    snap = pack / ".okengine/snapshots/s1/tree"
+    for where in (pack, staged, snap):
+        where.mkdir(parents=True, exist_ok=True)
+        (where / "pack.yaml").write_text("name: alpha\n")
+    assert MODULE.discover_packs([pack / ".okengine"]) == []
+    assert MODULE.discover_packs([staged]) == []
+    assert MODULE.discover_packs([pack]) == [pack.resolve()]

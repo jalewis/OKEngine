@@ -31,7 +31,7 @@ import okf_migrate  # noqa: E402
 import schema_lib  # noqa: E402
 
 NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-_CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$")
+_CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}\Z")
 _HIGH = {"high", "critical"}
 _OWNED = {"cvss_base", "cvss_version", "severity", "cwe", "last_updated"}
 

@@ -1,0 +1,136 @@
+diff --git a/tests/tools/test_okengine_mcp_cron_plus_child.py b/tests/tools/test_okengine_mcp_cron_plus_child.py
+new file mode 100644
+index 0000000..735400f
+--- /dev/null
++++ b/tests/tools/test_okengine_mcp_cron_plus_child.py
+@@ -0,0 +1,112 @@
++"""OKEngine #1010: a cron-plus runner is never tracked as a stdio MCP server process.
++
++cron-plus runners are direct children of the gateway: its ticker thread calls
++``subprocess.Popen([python, <plugins>/cron-plus/runner.py, --job-id, <id>])``. A runner
++spawned while an MCP stdio server is being connected lands in the transport's
++``_snapshot_child_pids()`` delta. Unless ``_filter_mcp_children`` drops it, the runner is
++ledgered as that server's process and is killed by the stale-connection cleanup, leaving
++its run record ``running`` (four runners were killed at once on one gateway start).
++
++These tests use real child processes, the real ``/proc`` snapshot, the real ``psutil``
++argv filter, and the real reaper. Only the transport's ledger insert is reproduced, so
++the gateway's death supervisor and spawn ledger are not touched.
++"""
++
++from __future__ import annotations
++
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++# The gateway reaches stdio spawning through discovery, which carries the OKEngine marker.
++from tools import mcp_tool_discovery  # noqa: F401
++from tools import mcp_tool_lifecycle as lifecycle
++
++_SLEEPER = "import time\ntime.sleep(60)\n"
++
++
++def _write_script(path: Path) -> Path:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(_SLEEPER, encoding="utf-8")
++    return path
++
++
++@pytest.fixture
++def children(tmp_path):
++    """Spawn a cron-plus runner and an MCP-server stand-in exactly as the gateway does."""
++    runner = _write_script(tmp_path / "plugins" / "cron-plus" / "runner.py")
++    server = _write_script(tmp_path / "servers" / "stdio_server.py")
++    before = lifecycle._snapshot_child_pids()
++    procs = {
++        "runner": subprocess.Popen([sys.executable, str(runner), "--job-id", "fixture-lane"],
++                                   start_new_session=True),
++        "server": subprocess.Popen([sys.executable, str(server)], start_new_session=True),
++    }
++    yield before, procs
++    for proc in procs.values():
++        if proc.poll() is None:
++            proc.kill()
++        proc.wait(timeout=10)
++
++
++def _delta(before: set, procs: dict) -> set:
++    """Wait until both children are visible with their final argv, then return the delta."""
++    wanted = {proc.pid for proc in procs.values()}
++    import psutil
++    deadline = time.monotonic() + 10
++    while time.monotonic() < deadline:
++        delta = lifecycle._snapshot_child_pids() - before
++        try:
++            ready = wanted <= delta and all(
++                len(psutil.Process(pid).cmdline()) > 1 for pid in wanted)
++        except psutil.NoSuchProcess:
++            ready = False
++        if ready:
++            return delta
++        time.sleep(0.05)
++    raise AssertionError(f"children {wanted} never appeared in the gateway child snapshot")
++
++
++def test_cron_plus_runner_is_in_the_raw_spawn_delta(children):
++    """Precondition: the runner really is a direct child that races into the delta."""
++    before, procs = children
++
++    delta = _delta(before, procs)
++
++    assert procs["runner"].pid in delta, "runner must be a direct child for this contract to matter"
++
++
++def test_cron_plus_runner_is_excluded_from_the_mcp_child_delta(children):
++    before, procs = children
++
++    tracked = lifecycle._filter_mcp_children(_delta(before, procs))
++
++    assert procs["runner"].pid not in tracked, "a cron-plus runner was tracked as an MCP server process"
++    assert procs["server"].pid in tracked, "the real MCP server child must still be tracked"
++
++
++def test_cron_plus_runner_survives_the_mcp_cleanup(children):
++    before, procs = children
++    tracked = lifecycle._filter_mcp_children(_delta(before, procs))
++    # The transport's ledger insert (MCPServerTask._track_spawned_children), minus side ledgers.
++    lifecycle._stdio_pids.update(dict.fromkeys(tracked, "okengine-1010-probe"))
++
++    lifecycle._kill_orphaned_mcp_children(include_active=True, server_name="okengine-1010-probe")
++
++    assert procs["server"].wait(timeout=10) is not None, "the tracked MCP child must be reaped"
++    assert procs["runner"].poll() is None, "the cleanup killed a cron-plus runner"
++    assert "okengine-1010-probe" not in lifecycle._stdio_pids.values()
++
++
++def test_marker_is_specific_to_the_cron_plus_runner_path():
++    """A bare ``runner.py`` or another plugin's runner is not excluded."""
++    markers = lifecycle._NON_MCP_CHILD_CMDLINE_MARKERS
++
++    assert "cron-plus/runner.py" in markers
++    assert markers.count("cron-plus/runner.py") == 1
++    for argv1 in ("/srv/runner.py", "/opt/data/plugins/other-plugin/runner.py",
++                  "/opt/data/plugins/cron-plus/runner_helper_server.py"):
++        assert not any(marker in argv1 for marker in markers), argv1
+diff --git a/tools/mcp_tool_discovery.py b/tools/mcp_tool_discovery.py
+index c41b7f0..04facf2 100644
+--- a/tools/mcp_tool_discovery.py
++++ b/tools/mcp_tool_discovery.py
+@@ -21,6 +21,13 @@ from tools.mcp_tool_scope import _key_name, _key_scope, _resolve_server_key, _se
+ 
+ logger = logging.getLogger("tools.mcp_tool")
+ 
++# OKEngine #1010: cron-plus runners are direct gateway children (its ticker thread Popens
++# ``<plugins>/cron-plus/runner.py``), so a runner spawned during an MCP stdio connect lands in
++# the transport's child-PID delta and is killed with that server. Discovery is the gateway's MCP
++# entry point, so the marker is added here (keeps the carried patch inside the file budget).
++_lifecycle._NON_MCP_CHILD_CMDLINE_MARKERS = (
++    *_lifecycle._NON_MCP_CHILD_CMDLINE_MARKERS, "cron-plus/runner.py")
++
+ 
+ def _record_connect_failure(server_name: str) -> None:
+     """Stamp a geometric, capped retry cooldown after a failed connect (under ``_lock``)."""

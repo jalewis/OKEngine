@@ -143,7 +143,7 @@ def test_policy_discovery_uses_runtime_scripts_when_installed_package_has_no_hel
 
     monkeypatch.setattr(Path, "is_file", installed_without_source_helpers)
     monkeypatch.setitem(sys.modules, "extension_discovery", type("Discovery", (), {
-        "resolve_for_pack": staticmethod(lambda _vault: ({}, [])),
+        "resolve_for_pack": staticmethod(lambda _vault, **_kw: ({}, [])),
     }))
     assert p.discover_documents(tmp_path) == [p.engine_catalog_path()]
 
@@ -768,3 +768,56 @@ def test_policy_last_small_branch_edges(tmp_path):
     doc={"schema_version":1,"rules":[valid_rule],"capabilities":{},"waivers":[waiver,dict(waiver)]}
     path=tmp_path/"waivable.yaml";path.write_text(yaml.safe_dump(doc))
     assert len(p.compose_documents([path])["waivers"])==2
+
+
+# ---- okengine#875: first-party extensions are found where THIS process's deploy put them ------
+
+def test_tier1_root_intervenes_only_when_the_module_default_cannot_work(monkeypatch, tmp_path):
+    p = _policy()
+    module_root, runtime = tmp_path / "hermes", tmp_path / "data"
+    module_root.mkdir(), runtime.mkdir()
+    monkeypatch.delenv("OKENGINE_ENGINE_ROOT", raising=False)
+    assert p._tier1_root(module_root, runtime) is None          # nowhere to go: keep the default
+    (runtime / "extensions").mkdir()
+    assert p._tier1_root(module_root, runtime) == runtime       # gateway: staged to the runtime root
+    (module_root / "extensions").mkdir()
+    assert p._tier1_root(module_root, runtime) is None          # the default works: leave it alone
+    (module_root / "extensions").rmdir()
+    monkeypatch.setenv("OKENGINE_ENGINE_ROOT", str(tmp_path))
+    assert p._tier1_root(module_root, runtime) is None          # explicit env: discovery honors it
+
+
+def test_gateway_layout_discovers_staged_first_party_extensions(monkeypatch, tmp_path):
+    """The exact v0.14.6 fleet failure: discovery code baked under /opt/hermes (no extensions/),
+    first-party extensions staged under /opt/data/extensions, no OKENGINE_ENGINE_ROOT. policy-audit
+    raised 'enabled extension okengine.completeness is not discovered in any tier' on 5 of 6
+    gateways; only the one with the variable set by hand passed."""
+    import shutil
+    hermes, data, vault = tmp_path / "hermes", tmp_path / "data", tmp_path / "vault"
+    (hermes / "tools").mkdir(parents=True)
+    (hermes / "scripts").mkdir()
+    shutil.copy(POLICY, hermes / "tools" / "policy_plane.py")
+    for script in (REPO / "scripts").glob("*.py"):        # the baked scripts/ tree, as in the image
+        shutil.copy(script, hermes / "scripts" / script.name)
+    shutil.copytree(REPO / "scripts" / "cron", hermes / "scripts" / "cron")
+    (hermes / "config" / "policy").mkdir(parents=True)
+    shutil.copy(REPO / "config" / "policy" / "catalog.yaml", hermes / "config" / "policy" / "catalog.yaml")
+    shutil.copytree(REPO / "extensions" / "okengine.completeness", data / "extensions" / "okengine.completeness")
+    (vault / ".okengine").mkdir(parents=True)
+    (vault / "schema.yaml").write_text("okf: {required: [type]}\ntypes: {}\n", encoding="utf-8")
+    (vault / ".okengine" / "extensions.yaml").write_text(
+        "enabled:\n  okengine.completeness: {}\n", encoding="utf-8")
+    monkeypatch.delenv("OKENGINE_ENGINE_ROOT", raising=False)
+    monkeypatch.delenv("OKENGINE_POLICY_CATALOG", raising=False)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("OKENGINE_DATA", str(data))
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    for name in ("extension_discovery", "extension_manifest"):
+        sys.modules.pop(name, None)
+    try:
+        baked = _load("policy_plane_gateway_layout", hermes / "tools" / "policy_plane.py")
+        paths = baked.discover_documents(vault)
+    finally:
+        for name in ("extension_discovery", "extension_manifest"):
+            sys.modules.pop(name, None)
+    assert paths[0] == hermes / "config" / "policy" / "catalog.yaml"

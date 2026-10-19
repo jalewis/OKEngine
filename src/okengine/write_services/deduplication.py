@@ -29,6 +29,7 @@ from tools.schema_validator import (
 )
 from tools import policy_plane
 from okengine.mcp import scope as _scope
+from okengine.list_scalars import split_list_scalar
 import output_contract_enforce as _output_contract
 
 import id_lib, schema_lib, id_index, converge, okf_migrate
@@ -108,7 +109,7 @@ def _alias_matches(cur_fm: dict, stem: str, incoming_name: str, incoming_aliases
     cur_name = id_lib.normalize_key(str(cur_fm.get("name") or cur_fm.get("title") or stem))
     cur_aliases = cur_fm.get("aliases") or []
     if isinstance(cur_aliases, str):
-        cur_aliases = [a.strip() for a in cur_aliases.split(",") if a.strip()]
+        cur_aliases = split_list_scalar(cur_aliases)   # as the write path coerces it (#1042 [19])
     elif not isinstance(cur_aliases, list):
         cur_aliases = []
     cur_aliases = {id_lib.normalize_key(str(a)) for a in cur_aliases if str(a).strip()}
@@ -212,11 +213,13 @@ def _norm_url(value: object) -> str:
     compare EQUAL to each other, so treating any non-empty string as identity would converge
     every `UNKNOWN` page into one, fusing hundreds of unrelated documents. A placeholder is
     the ABSENCE of identity and must behave exactly like a missing url: undecidable, refuse.
+
+    So is a bare SERVICE ENDPOINT (okengine#901): an ArcGIS `/query` or Socrata
+    `/resource/<id>.json` with no query string is shared by every record read from it, and
+    converging on it fused one property's parcel read into another's page. The rule lives in
+    `state._source_identity_url`, the one function every URL-identity reader calls.
     """
-    text = str(value or "").strip()
-    if not text or not _REAL_URL.match(text):
-        return ""
-    return text[:-1] if text.endswith("/") and len(text) > 1 else text
+    return _source_identity_url(value)
 
 
 def _is_url_derived_source_id(page_id: object) -> bool:
@@ -268,7 +271,25 @@ def _same_source_url(fm: dict, existing_path: Path) -> bool:
     return _norm_url((existing_fm or {}).get("url")) == incoming
 
 
-def _dedup_on_create(path: str, p: Path, fm: dict, body: str) -> Optional[str]:
+def _redirected_create(path: str, fm: dict, body: str, creating: bool, existing_rel: str) -> str:
+    """Converge a create that dedup resolved onto the existing page `existing_rel`.
+
+    A create never replaces (#962). Its capability is then checked as `converge`, and an actor
+    without converge (the chat writer) is refused under a rule whose remediation tells it to
+    create the page: the call that just failed. A chat writer's policy refusal of a genuine create
+    therefore names the existing page and the tools that extend it (okengine#991). Other actors
+    hold other tools, so the advice is not given to them."""
+    with converge.create_redirect(creating):
+        result = _converge(path, fm, body)
+    chat = str(_caller().get("actor") or "").startswith("chat:")  # the advice names chat's tools
+    if creating and chat and result.startswith("rejected: policy["):
+        result += (f" This create resolved to the existing page {existing_rel} (an identity or"
+                   " alias match): extend that page with update_entity or append_to_section"
+                   " instead.")
+    return result
+
+
+def _dedup_on_create(path: str, p: Path, fm: dict, body: str, creating: bool = True) -> Optional[str]:
     """Identity-based dedup for create_entity (okengine#98/#99/#100).
 
     The duplicate-canonical class is caused by `create_entity` keying on the
@@ -326,7 +347,7 @@ def _dedup_on_create(path: str, p: Path, fm: dict, body: str) -> Optional[str]:
                 # lookup below cannot find it by URL. The strict path hit has already located
                 # the page; converge through that exact canonical path using the shared URL as
                 # authority-grade evidence rather than either refusing or creating a duplicate.
-                return _converge(_rel(hit), fm, body)
+                return _redirected_create(_rel(hit), fm, body, creating, _rel(hit))
             if not incoming_ids or incoming_ids.isdisjoint(existing_ids):
                 differing_hits.append(hit)
     if differing_hits:
@@ -350,7 +371,7 @@ def _dedup_on_create(path: str, p: Path, fm: dict, body: str) -> Optional[str]:
         incoming_name = id_lib.normalize_key(str(fm.get("name") or fm.get("title") or p.stem))
         incoming_aliases = fm.get("aliases") or []
         if isinstance(incoming_aliases, str):
-            incoming_aliases = [a.strip() for a in incoming_aliases.split(",") if a.strip()]
+            incoming_aliases = split_list_scalar(incoming_aliases)   # okengine#1042 [19]
         elif not isinstance(incoming_aliases, list):
             incoming_aliases = []
         incoming_aliases = {
@@ -362,8 +383,24 @@ def _dedup_on_create(path: str, p: Path, fm: dict, body: str) -> Optional[str]:
             existing_id, _ = _page_id_and_kind(
                 existing_fm, _governing(existing_path), "entities", existing_path.stem
             )
+            if str(fm.get("id") or "") == existing_id:
+                # Already redirected to this id once, and converge could not resolve it (the
+                # id index does not hold a page a lane wrote straight to disk), so it came back
+                # here through _create. Converging again only recurses until the interpreter's
+                # limit, which surfaced as a bogus "not valid YAML" rejection or an uncaught
+                # RecursionError on Python 3.11 (v0.15.3 qualification). Refuse instead.
+                _flag(
+                    _rel(existing_path),
+                    f"alias match from {path} not converged: id {existing_id} is not in the id "
+                    "index yet",
+                )
+                return (
+                    f"refused: {path} matches the alias-curated canonical "
+                    f"{_rel(existing_path)} (id {existing_id}), which the id index does not "
+                    "hold yet — flagged for review; retry after the id-index refresh"
+                )
             fm["id"] = existing_id
-            return _converge(path, fm, body, _alias_verified=True)
+            return _redirected_create(path, fm, body, creating, _rel(existing_path))
         if len(hits) > 1:
             rels = ", ".join(_rel(hit[0]) for hit in hits[:5])
             _flag(path, f"ambiguous entity alias on create; matches {rels}")
@@ -411,11 +448,11 @@ def _dedup_on_create(path: str, p: Path, fm: dict, body: str) -> Optional[str]:
     # A live page at a different path already owns one of this page's candidate ids.
     if matched == url_id:
         # Same URL => same document, by a strong key. Converge, never duplicate.
-        return _converge(path, fm, body)
+        return _redirected_create(path, fm, body, creating, collision_rel)
     if kind == "authority":
         # Same real-world entity (authority ids are globally unique to the type)
         # -> converge into the canonical instead of duplicating it.
-        return _converge(path, fm, body)
+        return _redirected_create(path, fm, body, creating, collision_rel)
     # A minted-slug id is a WEAK key, and it was deciding BOTH directions wrongly for
     # sources. Measured on one live deployment, 83 collisions:
     #
@@ -437,7 +474,7 @@ def _dedup_on_create(path: str, p: Path, fm: dict, body: str) -> Optional[str]:
     # still deterministic operational routing rather than human review, however, so record it in
     # the ledger without creating a phantom queue row for a path that was never written.
     if collision_path is not None and _same_source_url(fm, collision_path):
-        return _converge(path, fm, body)
+        return _redirected_create(path, fm, body, creating, collision_rel)
     if namespace == "sources":
         _append_log(
             f"- {_today()} mcp-write collision-refused {_rel(p)} -> {collision_rel} (id {pid})"
@@ -459,10 +496,16 @@ def _dedup_on_create(path: str, p: Path, fm: dict, body: str) -> Optional[str]:
 
 
 def _prov_pack() -> str:
-    """The DEPLOYMENT's pack identity (pack.yaml `name`), injected as OKENGINE_PACK at deploy time.
-    Deployment-pinned, never client/agent-supplied, so composition provenance can't be spoofed.
-    Empty in a legacy single-pack deploy without the env (then provenance simply isn't stamped)."""
-    return os.environ.get("OKENGINE_PACK", "").strip()
+    """The pack this write acts for: the deployment's pack.yaml `name` (OKENGINE_PACK only where no
+    pack.yaml declares one), refined to the co-installed pack that owns the caller's server-bound
+    cron lane (okengine#1027, okengine.pack_principal). Never client/agent-supplied, so ownership
+    and composition provenance can't be spoofed. Empty only with neither source (then provenance
+    simply isn't stamped); a served write server refuses to start in that state."""
+    from okengine import pack_principal  # local: rebound service functions keep facade globals
+
+    vault = Path(os.environ.get("WIKI_PATH") or str(VAULT))
+    deployment = pack_principal.deployment_pack(vault, os.environ)
+    return pack_principal.lane_pack(vault, str(_caller().get("actor") or ""), deployment)
 
 
 def _stamp_maintainer(fm: dict, *, creation: bool) -> None:

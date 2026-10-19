@@ -57,6 +57,7 @@ import yaml
 import engine_package  # noqa: E402  — makes `okengine` importable when this file is
 engine_package.ensure()  # loaded BY PATH by an external consumer (okpacks-library#89)
 from okengine.actor_identity import actor_identity_error
+from okengine import actor_grounding, actor_types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import schema_lib  # noqa: E402
@@ -65,7 +66,30 @@ VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
 
 _FM_RE = re.compile(r"\A---[ \t]*\n(.*?\n)---", re.S)
+
+# The stamp keys this lane owns, WITH the continuation lines their values occupy.
+#
+# `^key:.*$` deletes the first physical line only. yaml.safe_dump WRAPS a long scalar, and this
+# lane's own basis string is long -- "1 A-grade source: Microsoft; 2 B-grade sources: MISP galaxy,"
+# / "  Malpedia'" is a real pair from the corpus. Stripping just the first line orphaned the
+# indented remainder; the blank-line squeeze further down then pulled it tight against the
+# PRECEDING key, and YAML folded it into that key's value -- `actor_type: cybercriminal` became
+# "cybercriminal Malpedia'". 88 pages on one live vault, hitting status, actor_type, version,
+# confidence, operator_evidence_refs and more; one of them, `recent_news: 0 Malpedia'`, crashed a
+# consumer's int() and left that lane dead for twenty days.
+#
+# The trailing group consumes the continuation lines belonging to the key and stops at the next
+# top-level key. It must accept BOTH shapes a value can occupy:
+#   - indented lines: a wrapped scalar's remainder, or a nested mapping;
+#   - lines starting `- ` at column 0: yaml.safe_dump emits block sequence items UNINDENTED
+#     (`consensus:\n- one\n- two`), so an indent-only pattern walks straight past them.
+# Getting that wrong is worse than the bug it fixes: orphaned `- item` lines at column 0 make the
+# whole frontmatter unparseable, where an orphaned wrapped scalar merely corrupts one value.
+_STAMP_KEY_RE = re.compile(
+    r"^(?:review_status|auto_verified_basis|auto_verified_at|consensus|review_checked_at):"
+    r".*(?:\n(?:[ \t]+\S|-(?:[ \t]|$)).*)*$", re.M)
 _NEEDS_RE = re.compile(r"^needs_review:[ \t]*[Tt]rue[ \t]*$", re.M)
+_GRADE_KEY_RE = re.compile(r"^(?:reliability|credibility):.*$", re.M)
 # same failure signal the cockpit review view keys on
 _GROUNDING_FAIL = re.compile(
     r"##[ \t]+Grounding check.*?(unsupported|not[- ]found|not in source|contradict)", re.S | re.I)
@@ -165,16 +189,89 @@ def _policy(schema: dict) -> dict:
             #
             # `conflicts` still wins: a page with a recorded conflict is held regardless, so genuine
             # disagreement between sources escalates rather than silently averaging.
+            #
+            # The default is every ACTOR type the page's governing schema declares (`actor`, a
+            # `role: actor` type, an alias of either; see `always_publishes`), so a declared type is
+            # not put back behind the evidence bar #554 removed (v0.15.11 audit). A pack's explicit
+            # list replaces the default.
             "always_publish_types": ({str(x) for x in always} if isinstance(always, list)
                                      else {"actor"}),
+            "always_publish_explicit": isinstance(always, list),
             "exempt_types": {str(x) for x in exempt} if isinstance(exempt, list)
                             else set(_JUDGMENT_TYPES)}
+
+
+def always_publishes(pol: dict, schema: dict, ptype: str) -> bool:
+    """Whether a page of ``ptype`` skips the evidence-bar hold (okengine#554).
+
+    A pack's explicit ``always_publish_types`` is taken as written. Without one, every actor type
+    ``schema`` (the page's governing schema) declares does, exactly as the actor holds see it."""
+    if pol.get("always_publish_explicit"):
+        return str(ptype) in pol["always_publish_types"]
+    return actor_types.is_actor_type(schema, ptype)
+
+
+def unpublished_actor_types(pol: dict, schema: dict) -> list[str]:
+    """Declared actor types a pack's explicit ``always_publish_types`` leaves out: they get the
+    actor holds AND the evidence-bar hold #554 removed for actors (a WARN, never a failure)."""
+    if not pol.get("always_publish_explicit"):
+        return []
+    explicit = {str(x).strip().casefold() for x in pol["always_publish_types"]}
+    return sorted(t for t in actor_types.actor_types(schema) if t not in explicit)
+
+
+def _warn_unpublished(pol: dict, schema: dict, warned: set) -> None:
+    """WARN once per actor type an explicit ``always_publish_types`` leaves out."""
+    for typ in unpublished_actor_types(pol, schema):
+        if typ not in warned:
+            warned.add(typ)
+            print(f"WARN: actor type {typ!r} is not in review_autoverify.always_publish_types: "
+                  f"its pages wait for the evidence bar okengine#554 removed for actors")
+
+
+def _page_schema(page: Path, cache: dict) -> dict:
+    """The schema governing ``page`` (its walk-up sub-domain's, else the root's), cached per
+    governing directory, as the write path and the corpus audit resolve it (v0.15.11 audit)."""
+    ns = page.parent.relative_to(WIKI).as_posix()   # "." at the wiki root: the root schema
+    gov = schema_lib._governing_dir(VAULT, ns)
+    if gov not in cache:
+        cache[gov] = schema_lib.merged_schema(VAULT, ns)
+    return cache[gov]
 
 
 def _self_grade(fm: dict, registry: dict[str, str]) -> tuple[str | None, str]:
     """(grade, publisher) for a page that IS a source, from its own `publisher` field."""
     pub = str(fm.get("publisher") or "").strip()
     return (registry.get(pub) if pub else None), pub
+
+
+def self_grades(fm: dict, pol: dict) -> bool:
+    """Whether the evidence step grades this page by its OWN publisher: a `source` page, when the
+    policy self-grades (okengine#549)."""
+    return str(fm.get("type") or "") == "source" and bool(pol["source_self_grade"])
+
+
+def evidence_verdict(fm: dict, registry: dict[str, str],
+                     pol: dict) -> tuple[bool, str | None, dict, str | None]:
+    """`(ok, why_held, graded, basis_self)`: the lane's evidence step for a page `refusal()` passed.
+
+    A self-graded source page is graded by who published it, not by what it cites; any other page
+    by the graded publishers it cites. registry_coverage calls this too, so the census buckets and
+    ranks a page by the step that actually holds it (okengine#1042 [17]: it ignored the self-grade
+    branch and never named the publisher blocking a held source page)."""
+    if self_grades(fm, pol):
+        own, pub = _self_grade(fm, registry)
+        if own and own <= pol["source_self_grade"]:      # 'A' <= 'A'; 'B' <= 'A' is False
+            return True, None, {}, f"{own}-grade publisher: {pub}"
+        if not own:
+            return False, (f"source publisher {pub!r} is not in source_registry" if pub
+                           else "source page has no publisher"), {}, None
+        return False, (f"source publisher {pub} grades {own}, below the "
+                       f"{pol['source_self_grade']} bar"), {}, None
+    graded = _grade_evidence(fm, registry)
+    ok = (len(graded.get("A", [])) >= pol["a_sources"]
+          or len(graded.get("B", [])) >= pol["b_sources"])
+    return ok, None, graded, None
 
 
 def _required_fields(schema: dict, ptype: str) -> list[str]:
@@ -215,6 +312,68 @@ def _source_page(ref: str) -> Path | None:
         # reason to abort verification for every other page.
         return None
     return hits[0] if len(hits) == 1 else None
+
+
+def _source_ids() -> dict[str, str]:
+    """A source page's `id` -> its path, so an id-shaped citation resolves (okengine#1014)."""
+    ids: dict[str, str] = {}
+    for page in sorted((WIKI / "sources").rglob("*.md")):
+        try:
+            sid = _frontmatter(page.read_text(encoding="utf-8", errors="replace")).get("id")
+        except OSError:
+            continue
+        if isinstance(sid, str):
+            ids.setdefault(sid, page.relative_to(WIKI).as_posix()[:-3])
+    return ids
+
+
+def _grounding_failure(fm: dict, page: Path, schema: dict, cache: dict):
+    """The corpus audit's grounding verdict for an actor page whose cited sources do NOT ground it
+    (okengine#1014). A curated label vouches, as it does there. A page with no resolvable source is
+    unverifiable, not contradicted: okengine#554/#563 publish it with an honest
+    `unverified-no-evidence` stamp, so that verdict is not a hold. Sources are read once per run,
+    and only once an actor needs them."""
+    if "read" not in cache:
+        cache["read"] = actor_grounding.WikiSources(WIKI, _source_ids())
+    failure = actor_grounding.ground_page(fm, cache["read"], fallback_name=page.stem,
+                                          labels_vouch=True,
+                                          non_actor_names=actor_grounding.reserved_titles(schema))
+    unverifiable = (actor_grounding.UNSOURCED, actor_grounding.NO_RESOLVABLE_SOURCE)
+    return None if failure is None or failure.code in unverifiable else failure
+
+
+def refusal(fm: dict, text: str, page: Path, page_schema: dict, pol: dict, sources: dict):
+    """Why the lane keeps this page in the human queue before any evidence grading, or None.
+
+    The ONE refusal ladder: main() applies it, and registry_coverage's census imports it, so the
+    census can never rank publishers for a page the lane holds for another reason (okengine#1032
+    [21]: the census's copy had no actor holds). `sources` is the run's grounding-reader cache."""
+    ptype = str(fm.get("type") or "")
+    title = str(fm.get("title") or fm.get("name") or page.stem)
+    is_actor = actor_types.is_actor_type(page_schema, ptype)
+    actor_contradiction = actor_identity_error(title, text) if is_actor else None
+    ungrounded = _grounding_failure(fm, page, page_schema, sources) if is_actor else None
+    if actor_contradiction:
+        return f"actor evidence defines a {actor_contradiction}, not an adversarial agent"
+    if fm.get("actor_identity_validated") is False:
+        return "actor identity classification is explicitly unvalidated"
+    if ungrounded is not None:
+        # okengine#1014: an always-publish actor no cited source grounds is held, not cleared.
+        return f"actor identity is not grounded in its cited sources ({ungrounded})"
+    if ptype in pol["exempt_types"]:
+        return f"judgment type '{fm.get('type')}' — evidence grade never clears judgment review"
+    if isinstance(fm.get("conflicts"), list) and fm["conflicts"]:
+        return "conflicts present"
+    flagged = [f for f in pol["hold_when_fields"] if fm.get(f)]
+    if flagged:
+        return (f"held by {', '.join(flagged)} — another lane flagged this page for something "
+                f"evidence grade cannot resolve")
+    if _GROUNDING_FAIL.search(text):
+        return "grounding-check failure"
+    missing = [f for f in _required_fields(page_schema, ptype) if fm.get(f) in (None, "", [], {})]
+    if missing:
+        return f"missing required: {', '.join(missing)}"
+    return None
 
 
 def _grade_evidence(fm: dict, registry: dict[str, str]) -> dict[str, list[str]]:
@@ -368,6 +527,10 @@ def main(argv=None) -> int:
                                   pol['defer_confidence_kind_field'],
                                   pol['defer_confidence_kinds'])
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    sources: dict = {}   # the grounding reader, built on the first actor that needs it
+    schemas: dict = {}   # governing directory -> its merged schema
+    warned: set = set()
+    _warn_unpublished(pol, schema, warned)
     for p in sorted(WIKI.rglob("*.md")):
         if p.name.startswith(("_", ".")) or p.name.upper().startswith("INDEX") or ".bak" in p.name:
             continue
@@ -416,8 +579,7 @@ def main(argv=None) -> int:
             # different capture group.
             head, = match.groups()
             rest = text[match.end():]
-            head = re.sub(r"^(review_status|auto_verified_basis|auto_verified_at|consensus"
-                          r"|review_checked_at):.*$", "", head, flags=re.M)
+            head = _STAMP_KEY_RE.sub("", head)
             # Remove every duplicate latch from legacy/corrupt frontmatter. Leaving a second
             # `needs_review: true` would make the lifecycle disposition parser-dependent.
             new_head = _NEEDS_RE.sub("", head)
@@ -431,52 +593,22 @@ def main(argv=None) -> int:
             continue
 
         # refusals — anything else wrong keeps the page in the human queue
-        why_held = None
         ptype = str(fm.get("type") or "")
-        title = str(fm.get("title") or fm.get("name") or p.stem)
-        actor_contradiction = actor_identity_error(title, text) if ptype == "actor" else None
-        if actor_contradiction:
-            why_held = f"actor evidence defines a {actor_contradiction}, not an adversarial agent"
-        elif fm.get("actor_identity_validated") is False:
-            why_held = "actor identity classification is explicitly unvalidated"
-        elif ptype in pol["exempt_types"]:
-            why_held = f"judgment type '{fm.get('type')}' — evidence grade never clears judgment review"
-        elif isinstance(fm.get("conflicts"), list) and fm["conflicts"]:
-            why_held = "conflicts present"
-        elif [f for f in pol["hold_when_fields"] if fm.get(f)]:
-            _hf = [f for f in pol["hold_when_fields"] if fm.get(f)]
-            why_held = (f"held by {', '.join(_hf)} — another lane flagged this page for something "
-                        f"evidence grade cannot resolve")
-        elif _GROUNDING_FAIL.search(text):
-            why_held = "grounding-check failure"
-        else:
-            missing = [f for f in _required_fields(schema, str(fm.get("type") or ""))
-                       if fm.get(f) in (None, "", [], {})]
-            if missing:
-                why_held = f"missing required: {', '.join(missing)}"
+        # Every actor type the page's GOVERNING schema declares (okengine#1020): a sub-domain's
+        # `role: actor` is invisible in the root schema (v0.15.11 audit).
+        page_schema = _page_schema(p, schemas)
+        _warn_unpublished(pol, page_schema, warned)
+        why_held = refusal(fm, text, p, page_schema, pol, sources)
 
         graded, basis_self = {}, None
         ok = False
         if why_held is None:
-            if str(fm.get("type") or "") == "source" and pol["source_self_grade"]:
-                # Grade the document by who published it, not by what it cites.
-                own, pub = _self_grade(fm, registry)
-                if own and own <= pol["source_self_grade"]:      # 'A' <= 'A'; 'B' <= 'A' is False
-                    ok, basis_self = True, f"{own}-grade publisher: {pub}"
-                elif not own:
-                    why_held = (f"source publisher {pub!r} is not in source_registry" if pub
-                                else "source page has no publisher")
-                else:
-                    why_held = f"source publisher {pub} grades {own}, below the {pol['source_self_grade']} bar"
-            else:
-                graded = _grade_evidence(fm, registry)
-                ok = (len(graded.get("A", [])) >= pol["a_sources"]
-                      or len(graded.get("B", [])) >= pol["b_sources"])
+            ok, why_held, graded, basis_self = evidence_verdict(fm, registry, pol)
         # An always-publish type never waits for a human. `conflicts` and the other refusals above
         # still hold it -- what is dropped is only the evidence-bar hold, which was gating
         # publication on the very uncertainty the confidence field exists to express.
         derived = None
-        if not ok and str(fm.get("type") or "") in pol["always_publish_types"] and why_held is None:
+        if not ok and always_publishes(pol, page_schema, ptype) and why_held is None:
             ok = True
             derived = _derive_confidence(graded, _consensus(graded))
 
@@ -574,8 +706,17 @@ def main(argv=None) -> int:
         # last-wins silently kept the STALE values, so the lane logged the right basis while the
         # page kept the old one. That shape is not hypothetical: it is any page an enrichment lane
         # re-flags after this one has already stamped it.
-        head = re.sub(r"^(review_status|auto_verified_basis|auto_verified_at|consensus"
-                      r"|review_checked_at):.*$", "", head, flags=re.M)
+        head = _STAMP_KEY_RE.sub("", head)
+        # A basis that outranks the page's own `reliability` makes the page contradict itself, and
+        # the write path then refuses every later write to it (okengine#563). This lane writes the
+        # basis directly, so it must also drop the stale grade in the same write -- the fix that
+        # rule prescribes. Entities only, as in the validator: on a source the grade IS the point.
+        _contradiction = (schema_lib.contradicting_reliability(fm, basis)
+                          if basis and "entities" in rel.split("/") else None)
+        if _contradiction:
+            head = _GRADE_KEY_RE.sub("", head)
+            print(f"  drop {rel}: page reliability {_contradiction[0]} contradicts the "
+                  f"{_contradiction[1]}-grade basis being stamped")
         if flagged:
             new_head = _NEEDS_RE.sub(stamp, head, count=1)
         else:

@@ -62,6 +62,13 @@ from pathlib import Path
 
 import yaml
 
+# Engine cron libs, appended so this extension's own modules keep precedence: staged one level
+# up (/opt/data/scripts/ holds /opt/data/scripts/<id>/), or scripts/cron/ in a repo checkout.
+_ENGINE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(_ENGINE_ROOT))
+sys.path.append(str(_ENGINE_ROOT.parent / "scripts" / "cron"))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
+
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
 RULES_FILE = os.environ.get(
@@ -268,16 +275,15 @@ def main() -> int:
                       "expectation": why, "first_seen": first_seen, "last_seen": today}
             if rule.get("resolution_hint"):
                 fm_out["resolution_hint"] = rule["resolution_hint"]
-            gp.write_text(
-                "---\n" + yaml.safe_dump(fm_out, sort_keys=False, allow_unicode=True).strip()
+            generated_page.write(
+                gp, "---\n" + yaml.safe_dump(fm_out, sort_keys=False, allow_unicode=True).strip()
                 + "\n---\n"
                 + f"# {rule.get('title') or rid}\n\n"
                 + f"[[{rel}]] — {why}.\n\n"
                 + (f"**Resolve:** {rule['resolution_hint']}\n" if rule.get("resolution_hint") else "")
                 + f"\n_Deterministic completeness gap (rule `{rid}`, okengine.completeness). "
                   "Set `status: dismissed` + `dismiss_reason:` to suppress permanently — "
-                  "dismissals feed the rule-precision table on [[dashboards/completeness]]._\n",
-                encoding="utf-8")
+                  "dismissals feed the rule-precision table on [[dashboards/completeness]]._\n")
 
     # auto-resolve: open gaps whose expectation is no longer unmet (or subject vanished)
     for key, (p, fm) in existing.items():
@@ -332,7 +338,7 @@ def main() -> int:
     L.append("")
     out = WIKI / "dashboards" / "completeness.md"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("\n".join(L), encoding="utf-8")
+    generated_page.write(out, "\n".join(L))
 
     print(f"completeness-audit: {len(rules)} rule(s) over {len(pages)} pages — "
           f"{opened} opened, {refreshed} refreshed, {resolved} auto-resolved, "

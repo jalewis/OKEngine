@@ -127,7 +127,9 @@ def main() -> int:
           f"({'none — first brief' if prior is None else Path(prior[0]).name})"
           + ("  [STEADY-STATE: no material change since the last brief — reaffirm current "
              "messaging from the anchor + prior brief; do NOT invent news]" if steady else ""))
-    print(f"  write via mcp__okengine_write__create_entity to: {out_path}")
+    # the lane's own write server, published by cron_pack_split.bind_contract_writers (okengine#852)
+    print(f"  write via {os.environ.get('OKENGINE_WRITE_TOOL_PREFIX', 'mcp__okengine_write__')}"
+          f"create_entity to: {out_path}")
     print(f"  frontmatter: type: messaging-brief, title: \"Messaging brief — {today}\", "
           f"published: {today}, updated: {today}")
     print()

@@ -156,7 +156,7 @@ def test_patch_entity_enforces_source_provenance_guards(ws):
     page = mod._safe("entities/acme.md")
     page.parent.mkdir(parents=True, exist_ok=True)
     page.write_text(
-        "---\ntype: actor\nid: acme\nsources: []\nversion: 1\n---\nBody.\n", encoding="utf-8")
+        "---\ntype: actor\ntitle: Acme\nid: acme\nsources: []\nversion: 1\n---\nAcme is a threat group.\n", encoding="utf-8")
 
     singular = mod._patch(
         "entities/acme.md", "sources: []", "sources: [source/mandiant/invented]")

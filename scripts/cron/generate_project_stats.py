@@ -26,11 +26,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from json import JSONDecodeError
 import os
 import re
 import shutil
 import sqlite3
 import subprocess
+from subprocess import SubprocessError
 import sys
 from collections import Counter
 from datetime import datetime, timezone, timedelta
@@ -39,6 +41,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import schema_lib  # noqa: E402
 import tz_lib  # noqa: E402
 
@@ -136,7 +139,7 @@ def corpus_stats() -> dict:
         last = out.stdout.strip().split("|", 1)
         git_info["last_commit_at"] = last[0]
         git_info["last_commit_subject"] = last[1] if len(last) > 1 else ""
-    except (subprocess.SubprocessError, ValueError, FileNotFoundError):
+    except (SubprocessError, ValueError, FileNotFoundError):
         pass
 
     return {
@@ -229,7 +232,7 @@ def cron_health() -> dict:
         return {"available": False}
     try:
         data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, JSONDecodeError):
         return {"available": False}
     jobs = data.get("jobs", []) if isinstance(data, dict) else data
     if not isinstance(jobs, list):
@@ -559,7 +562,7 @@ def main() -> int:
     if OUT.exists():
         bak = OUT.parent / (OUT.name + ".bak")   # single overwritten sidecar, not indexed (#165 sweep)
         shutil.copy2(OUT, bak)
-    OUT.write_text(body)
+    generated_page.write(OUT, body)
     print(f"wrote {OUT} ({len(body)} bytes)", file=sys.stderr)
     print('{"wakeAgent": false}')
     return 0

@@ -151,3 +151,9 @@ def test_derive_id_authority_vs_minted_slug():
     pid, kind = idl.derive_id(authority="mitre", local_id="",
                               minted_scope="entities", slug_source="Acme Corp")
     assert kind == "slug" and pid == "entities:acme-corp"
+
+
+def test_vault_root_itself_has_no_qualified_namespace(tmp_path):
+    wiki = tmp_path / 'wiki'
+    wiki.mkdir()
+    assert idl.qualified_namespace(wiki, wiki) == ''

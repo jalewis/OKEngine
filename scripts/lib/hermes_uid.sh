@@ -14,30 +14,17 @@
 #   3. the runtime tree owner                              (stat .hermes-data, else the pack dir)
 #   4. last-resort 10000 + a LOUD warning                  (old behaviour, but no longer silent)
 
-_okengine_env_file_val() {   # $1=pack_dir  $2=VAR  -> stdout dotenv value, or non-zero
+# The pack .env value of $2 as compose gives it to the containers, through the ONE dotenv parser
+# (scripts/cron/dotenv_lib.py): last assignment wins, inline comments, quotes and `export` handled,
+# `${X}` resolved from the invoking environment then the file (okengine#994 A). A private
+# first-wins parser here once disagreed with compose on a duplicated key, splitting the uid the
+# deploy wrote as from the uid the gateway ran as, and cron expansion from the container TZ.
+# Resolved to an absolute path when this file is sourced, so a caller that later changes directory
+# still finds it.
+_OKENGINE_DOTENV_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../cron" && pwd)/dotenv_lib.py"
+_okengine_env_file_val() {   # $1=pack_dir  $2=VAR  -> stdout dotenv value, or non-zero (unset/empty)
     [ -f "$1/.env" ] || return 1
-    python3 - "$1/.env" "$2" <<'PY'
-import re
-import shlex
-import sys
-from pathlib import Path
-
-path, key = Path(sys.argv[1]), sys.argv[2]
-rx = re.compile(rf"^\s*(?:export\s+)?{re.escape(key)}\s*=\s*(.*?)\s*$")
-for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-    match = rx.match(line)
-    if not match:
-        continue
-    try:
-        parts = shlex.split(match.group(1), comments=True, posix=True)
-    except ValueError:
-        sys.exit(1)
-    if parts:
-        print(" ".join(parts), end="")
-        sys.exit(0)
-    sys.exit(1)
-sys.exit(1)
-PY
+    python3 "$_OKENGINE_DOTENV_LIB" get "$1/.env" "$2"
 }
 
 _okengine_tree_owner() {     # $1=pack_dir  $2=stat_fmt (%u|%g)  -> non-root owner of the runtime tree

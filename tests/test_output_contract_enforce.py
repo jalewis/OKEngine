@@ -135,6 +135,16 @@ def test_capability_is_derived_only_from_resolved_job_contract(lane):
     assert oce.capability({"kind": "user", "actor": "operator"}) is None
 
 
+def test_only_a_job_caller_resolves_its_lane_contract(lane):
+    """A non-job caller that carries a lane's `cron:` actor resolves no contract, whichever side
+    of "job" its kind sorts on (the `!=` -> `<` survivor of nightly 12756, okengine#1047)."""
+    caller = lane("daily", output_contract=contract())
+    assert oce.resolve(caller)[0] == contract()
+    for kind in ("admin", "extension", "operator", "user"):
+        assert oce.resolve({**caller, "kind": kind}) == (None, None), kind
+        assert oce.capability({**caller, "kind": kind}) is None, kind
+
+
 def test_capability_maps_explicit_all_namespace_to_all_paths(lane):
     caller = lane("all", output_contract=contract(allowed_namespaces=["*"]))
 
@@ -554,3 +564,192 @@ def test_every_missing_relationship_is_reported_not_just_the_first(lane, tmp_pat
     missing = [f for f in findings if f["code"] == "required_relationship_missing"]
     assert len(missing) == 2, f"expected both relationships reported, got {missing}"
     assert "operator" in missing[0]["message"] and "sponsor" in missing[1]["message"]
+
+
+# ---- okengine#876: an "any type" contract admits every page type ------------------------------
+
+def _policy_plane():
+    spec = importlib.util.spec_from_file_location("policy_plane_876", REPO / "tools" / "policy_plane.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _composed_with(pp, caller):
+    policy = pp.compose_documents([pp.engine_catalog_path()])
+    policy.setdefault("capabilities", {})[caller["actor"]] = oce.capability(caller)
+    return policy
+
+
+def test_an_any_type_contract_admits_a_typed_page(lane):
+    """orphans-drain, entity-backfill, concept-backfill ... declare allowed_types ["*"]; the policy
+    compared the page type to the literal "*" and refused every typed write fleet-wide."""
+    pp = _policy_plane()
+    caller = lane("wild", output_contract=contract(
+        allowed_namespaces=["*"], allowed_types=["*"], operations=["update", "append"]))
+    policy = _composed_with(pp, caller)
+    for page_type in ("concept", "actor", "source"):
+        assert pp.evaluate_capability(policy, caller["actor"], "update", f"concepts/a/{page_type}.md",
+                                      page_type=page_type, changed_fields=["related"]) is None, page_type
+
+
+def test_a_concrete_type_contract_still_refuses_an_unlisted_type(lane):
+    pp = _policy_plane()
+    caller = lane("narrow", output_contract=contract(allowed_namespaces=["*"], allowed_types=["actor"]))
+    finding = pp.evaluate_capability(_composed_with(pp, caller), caller["actor"], "update",
+                                     "concepts/a/x.md", page_type="concept", changed_fields=["title"])
+    assert finding and "page type 'concept' is not allowed" in finding["message"], finding
+
+
+# ---- okengine#783 nightly critical campaign: the link resolvers --------------------------------
+#
+# link_resolves() has two implementations of one contract: the live enforcer probes the filesystem,
+# the offline audit consults a prebuilt link_index(). Scheduled pipeline 11512 measured both at
+# 76% with 86 undispositioned survivors, almost all in link_index() and the resolver branches no
+# test reached. Every case below runs through BOTH implementations, because a link the audit calls
+# grounded while the write path calls it dangling (or the reverse) is itself the defect.
+
+
+def _vault(tmp_path, pages=(), dirs=()):
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    for rel in pages:
+        page = wiki / rel
+        page.parent.mkdir(parents=True, exist_ok=True)
+        page.write_text(f"# {page.stem}\n", encoding="utf-8")
+    for rel in dirs:
+        (wiki / rel).mkdir(parents=True, exist_ok=True)
+    return wiki
+
+
+def _both_resolvers(wiki, target):
+    return {
+        "live": oce.link_resolves(wiki, target),
+        "index": oce.link_resolves(wiki, target, oce.link_index(wiki)),
+    }
+
+
+RESOLVER_CASES = [
+    # (id, pages, dirs, link, expected)
+    ("exact-namespace-page", ["entities/x.md"], [], "entities/x", True),
+    ("exact-path-despite-ambiguous-basename",
+     ["entities/a/x.md", "entities/b/x.md"], [], "entities/a/x", True),
+    ("unique-shard-omitting-link", ["entities/q/x.md"], [], "entities/x", True),
+    ("unique-shard-omitting-link-under-nested-scope",
+     ["entities/a/q/x.md"], [], "entities/a/x", True),
+    ("basename-only-in-a-sibling-shard",
+     ["entities/a/y.md", "entities/b/x.md"], [], "entities/a/x", False),
+    ("unique-in-scope-but-ambiguous-in-namespace",
+     ["entities/a/p/x.md", "entities/b/x.md"], [], "entities/a/x", False),
+    ("two-way-ambiguous-basename", ["entities/a/x.md", "entities/b/x.md"], [], "entities/x", False),
+    ("three-way-ambiguous-basename",
+     ["entities/a/x.md", "entities/b/x.md", "entities/c/x.md"], [], "entities/x", False),
+    ("parent-scope-does-not-exist", ["entities/b/x.md"], [], "entities/nope/x", False),
+    ("root-level-page-is-not-a-namespaced-link", ["root.md", "entities/y.md"], [], "root", False),
+    ("backslash-in-a-segment-is-refused", ["entities/a\\b.md"], [], "entities/a\\b", False),
+    ("basename-in-a-different-namespace", ["other/x.md", "entities/y.md"], [], "entities/x", False),
+    ("directory-named-like-a-page-is-not-a-page",
+     ["entities/y.md"], ["entities/q/x.md"], "entities/x", False),
+]
+
+
+@pytest.mark.parametrize(
+    "pages,dirs,link,expected",
+    [case[1:] for case in RESOLVER_CASES],
+    ids=[case[0] for case in RESOLVER_CASES],
+)
+def test_live_and_indexed_resolvers_agree_on_the_link_contract(tmp_path, pages, dirs, link, expected):
+    wiki = _vault(tmp_path, pages, dirs)
+    assert _both_resolvers(wiki, link) == {"live": expected, "index": expected}
+
+
+def test_a_parent_scope_symlinked_out_of_the_wiki_is_not_evidence(tmp_path):
+    """A shard directory that resolves OUTSIDE the wiki must fail closed, even when the only page
+    with that basename sits inside the wiki and the escaped parent happens to contain it."""
+    wiki = _vault(tmp_path, ["entities/q/x.md"])
+    (wiki / "entities" / "up").symlink_to(tmp_path, target_is_directory=True)
+    assert _both_resolvers(wiki, "entities/up/x") == {"live": False, "index": False}
+
+
+def test_a_namespace_symlinked_out_of_the_wiki_is_not_evidence_even_when_its_parent_points_back(
+        tmp_path):
+    """The namespace probe refuses a namespace that resolves outside the wiki on its own. Here the
+    parent scope passes its probe (a symlink inside the escaped namespace points back into the
+    wiki) and the only matching page is a symlink to a real page under that parent, so without
+    the namespace check the escaped directory would be accepted as evidence. Unlike the vanished-
+    namespace test below, this does not depend on how a Python version's rglob probes its root."""
+    wiki = _vault(tmp_path, ["real/deeper/x.md"])
+    outside = tmp_path / "outside"
+    (outside / "other").mkdir(parents=True)
+    (outside / "sub").symlink_to(wiki / "real", target_is_directory=True)
+    (outside / "other" / "x.md").symlink_to(wiki / "real" / "deeper" / "x.md")
+    (wiki / "entities").symlink_to(outside, target_is_directory=True)
+    assert (wiki / "entities" / "sub").resolve().is_relative_to(wiki.resolve())
+    assert oce.link_resolves(wiki, "entities/sub/x") is False
+
+
+def test_live_resolver_fails_closed_if_namespace_vanishes_while_its_page_is_still_listed(
+        tmp_path, monkeypatch):
+    """The namespace probe must refuse on its own: a vanished namespace is not evidence even when
+    a stale directory listing still yields exactly one matching page under the parent."""
+    wiki = _vault(tmp_path, ["entities/nested/deep/x.md"])
+    namespace = wiki / "entities"
+    real_is_dir = Path.is_dir
+    monkeypatch.setattr(Path, "is_dir",
+                        lambda path: False if path == namespace else real_is_dir(path))
+    assert oce.link_resolves(wiki, "entities/nested/x") is False
+
+
+@pytest.mark.parametrize("entry", ["root-level-page", "directory-named-like-a-page",
+                                   "symlink-escaping-the-wiki"])
+def test_index_skips_an_unusable_entry_without_dropping_the_pages_after_it(tmp_path, entry):
+    """Root-level entries are enumerated before any namespace, so an entry the index must skip
+    has to be skipped, not treated as the end of the vault."""
+    wiki = _vault(tmp_path, ["entities/q/x.md", "entities/a/y.md"])
+    if entry == "root-level-page":
+        (wiki / "readme.md").write_text("# not namespaced\n", encoding="utf-8")
+    elif entry == "directory-named-like-a-page":
+        (wiki / "junk.md").mkdir()
+    else:
+        outside = tmp_path / "outside.md"
+        outside.write_text("# outside\n", encoding="utf-8")
+        (wiki / "escape.md").symlink_to(outside)
+    index = oce.link_index(wiki)
+    assert oce.link_resolves(wiki, "entities/x", index)
+    assert oce.link_resolves(wiki, "entities/a/y", index)
+
+
+def test_index_treats_a_page_that_errors_mid_audit_as_absent_and_keeps_indexing(
+        tmp_path, monkeypatch):
+    """A page that becomes unreadable during the read-only audit is not evidence; it must neither
+    abort the audit nor hide the pages indexed after it."""
+    wiki = _vault(tmp_path, ["entities/q/x.md", "entities/locked/z.md"]).resolve()
+    locked = wiki / "locked.md"
+    locked.write_text("# locked\n", encoding="utf-8")
+    locked_page = wiki / "entities" / "locked" / "z.md"
+    real_is_file = Path.is_file
+
+    def flaky_is_file(path, *args, **kwargs):
+        if path in (locked, locked_page):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_is_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_file", flaky_is_file)
+    index = oce.link_index(wiki)
+    assert oce.link_resolves(wiki, "entities/x", index)
+    assert not oce.link_resolves(wiki, "entities/locked/z", index)
+
+
+def test_the_jobs_store_rewritten_within_one_tick_is_reloaded(tmp_path, monkeypatch):
+    """okengine#1017: the jobs cache was keyed on mtime alone, so a lane contract changed within
+    the same timestamp tick as the previous load kept being enforced in its old form."""
+    import os
+    store = tmp_path / "jobs.json"
+    monkeypatch.setenv("OKENGINE_CRON_JOBS", str(store))
+    store.write_text(json.dumps({"jobs": [{"name": "lane-aaa"}]}), encoding="utf-8")
+    oce._cache.update(key=None, jobs={})
+    assert set(oce._jobs()) == {"lane-aaa"}
+    before = store.stat()
+    store.write_text(json.dumps({"jobs": [{"name": "lane-bbb"}]}), encoding="utf-8")
+    os.utime(store, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert set(oce._jobs()) == {"lane-bbb"}

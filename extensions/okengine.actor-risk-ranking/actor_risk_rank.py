@@ -30,6 +30,13 @@ from urllib.parse import urlparse
 
 import yaml
 
+# Engine cron libs, appended so this extension's own modules keep precedence: staged one level
+# up (/opt/data/scripts/ holds /opt/data/scripts/<id>/), or scripts/cron/ in a repo checkout.
+_ENGINE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(_ENGINE_ROOT))
+sys.path.append(str(_ENGINE_ROOT.parent / "scripts" / "cron"))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
+
 FM_RE = re.compile(r"^---\n(.*?)\n(?:---|\.\.\.)", re.S)
 HEAD_BYTES = 4096
 
@@ -295,7 +302,7 @@ def render(vault: Path, cfg: dict, results: dict, unresolved: list,
         lines += [f"- {link(a)} vs {link(b)}" for a, b in unresolved[:20]]
         lines.append("")
     p = outdir / "rankings.md"
-    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    generated_page.write(p, "\n".join(lines) + "\n")
     written.append(p)
 
     for tname, rows in results.items():
@@ -320,7 +327,7 @@ def render(vault: Path, cfg: dict, results: dict, unresolved: list,
                 tl.append(f"- **unknowns**: {'; '.join(r['unknowns'])}")
             tl.append("")
         p = outdir / f"{re.sub(r'[^a-z0-9-]+', '-', tname.lower()).strip('-')}.md"
-        p.write_text("\n".join(tl) + "\n", encoding="utf-8")
+        generated_page.write(p, "\n".join(tl) + "\n")
         written.append(p)
     return written
 

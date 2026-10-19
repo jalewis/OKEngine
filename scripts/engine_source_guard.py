@@ -23,7 +23,9 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
+from subprocess import SubprocessError
 import sys
+import tempfile
 from pathlib import Path
 
 DEFAULT_ALLOWED = ("main",)
@@ -34,7 +36,7 @@ def _git(repo: Path, *args: str) -> str | None:
     try:
         out = subprocess.run(["git", "-C", str(repo), *args],
                              capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, SubprocessError):
         return None
     return out.stdout.strip() if out.returncode == 0 else None
 
@@ -42,7 +44,10 @@ def _git(repo: Path, *args: str) -> str | None:
 def git_state(repo: Path) -> dict:
     """Describe the tree. Every field may be None, which is reported as undetectable, not as ok."""
     inside = _git(repo, "rev-parse", "--is-inside-work-tree")
-    if inside != "true":
+    top_level = _git(repo, "rev-parse", "--show-toplevel") if inside == "true" else None
+    # Git discovers parent repositories from arbitrary subdirectories. A build
+    # context must be the checkout root whose revision we are attributing.
+    if not top_level or Path(top_level).resolve() != repo.resolve():
         return {"is_repo": False, "head": None, "branch": None, "dirty": None, "tag": None}
     status = _git(repo, "status", "--porcelain")
     branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
@@ -62,6 +67,8 @@ def evaluate(state: dict, allowed: tuple[str, ...] = DEFAULT_ALLOWED) -> list[st
     if not state.get("is_repo"):
         return ["not a git checkout — its contents cannot be attributed to any revision"]
     problems: list[str] = []
+    if not state.get("head"):
+        problems.append("could not determine the source revision (git rev-parse HEAD failed)")
     branch, tag, dirty = state.get("branch"), state.get("tag"), state.get("dirty")
     if dirty is None:
         problems.append("could not determine whether the tree is clean (git status failed)")
@@ -90,19 +97,74 @@ def report(path: Path, state: dict, problems: list[str], allowed: tuple[str, ...
           "build, the container health check and the page all report success.", file=sys.stderr)
 
 
+def pin_deployment_source(pack: Path, engine: Path, state: dict) -> bool:
+    """Persist the verified host build context, preserving operator configuration."""
+    if not (pack / "docker-compose.yml").is_file():
+        raise ValueError("deployment has no docker-compose.yml")
+    if evaluate(state) or not state.get("head"):
+        raise ValueError("cannot pin an unverified engine source")
+    path = pack / ".env"
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    source = str(engine.resolve())
+    if any(char in source for char in ("\n", "\r")):
+        raise ValueError("engine source path must be one line")
+    desired = {"ENGINE_DIR": "'" + source.replace("'", "\\'") + "'",
+               "OKENGINE_SOURCE_SHA": state["head"]}
+    out, seen = [], set()
+    for line in lines:
+        key = line.split("=", 1)[0] if "=" in line and not line.lstrip().startswith("#") else None
+        if key in desired:
+            if key not in seen:
+                out.append(f"{key}={desired[key]}")
+                seen.add(key)
+        else:
+            out.append(line)
+    out.extend(f"{key}={value}" for key, value in desired.items() if key not in seen)
+    body = "\n".join(out).rstrip() + "\n"
+    changed = not path.exists() or path.read_text(encoding="utf-8") != body
+    # Stage owner-only content beside the original. Failed writes/rename must not
+    # truncate operator secrets; replace only after the complete file is durable.
+    owner = path.stat() if path.exists() else None
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=pack,
+                                     prefix=".okengine-source-", delete=False) as handle:
+        staged = Path(handle.name)
+        try:
+            if owner is not None:
+                os.fchown(handle.fileno(), owner.st_uid, owner.st_gid)
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.replace(staged, path)
+        finally:
+            staged.unlink(missing_ok=True)
+    return changed
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("engine_dir", nargs="?", default=os.environ.get("ENGINE_DIR", "."))
     parser.add_argument("--allow-branch", action="append", default=None,
                         help="branch that may be built from (repeatable; default: main)")
+    parser.add_argument("--pack", type=Path,
+                        help="persist the verified ENGINE_DIR and source SHA into this deployment")
+    parser.add_argument("--expected-sha", help="refuse a different source revision")
     args = parser.parse_args(argv)
 
     allowed = tuple(args.allow_branch or DEFAULT_ALLOWED)
     path = Path(args.engine_dir).resolve()
     state = git_state(path)
     problems = evaluate(state, allowed)
+    if args.expected_sha and state.get("head") != args.expected_sha:
+        problems.append("source revision differs from the expected qualified SHA")
     report(path, state, problems, allowed)
     if not problems:
+        if args.pack:
+            try:
+                changed = pin_deployment_source(args.pack.resolve(), path, state)
+            except (OSError, ValueError) as exc:
+                print(f"source configuration refused: {exc}", file=sys.stderr)
+                return 1
+            print("  deployment build source pinned" if changed else "  deployment build source current")
         return 0
     if os.environ.get("OKENGINE_ALLOW_UNRELEASED_BUILD") == "1":
         print("  OVERRIDDEN by OKENGINE_ALLOW_UNRELEASED_BUILD=1 — proceeding anyway",

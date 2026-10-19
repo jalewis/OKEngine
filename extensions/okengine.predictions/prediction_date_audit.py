@@ -17,8 +17,15 @@ import os
 import re
 import sys
 from datetime import date, datetime, timezone
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Engine cron libs, appended so this extension's own modules keep precedence: staged one level
+# up (/opt/data/scripts/ holds /opt/data/scripts/<id>/), or scripts/cron/ in a repo checkout.
+_ENGINE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(_ENGINE_ROOT))
+sys.path.append(str(_ENGINE_ROOT.parent / "scripts" / "cron"))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import pred_lib as P  # noqa: E402
 
 OVERDUE = int(os.environ.get("PRED_OVERDUE_DAYS", "30"))
@@ -67,7 +74,7 @@ def main() -> int:
     L.append("")
     dash = v / "wiki" / "dashboards" / "prediction-date-audit.md"
     dash.parent.mkdir(parents=True, exist_ok=True)
-    dash.write_text("\n".join(L), encoding="utf-8")
+    generated_page.write(dash, "\n".join(L))
     print(f"prediction-date-audit: {len(flagged)}/{total} flagged -> "
           "wiki/dashboards/prediction-date-audit.md")
     print(json.dumps({"wakeAgent": False}))

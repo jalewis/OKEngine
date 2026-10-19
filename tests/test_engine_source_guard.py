@@ -13,6 +13,7 @@ import importlib.util
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import create_autospec
 
 import pytest
 
@@ -89,6 +90,174 @@ def test_a_directory_that_is_not_a_checkout_is_refused(tmp_path):
     plain.mkdir()
     problems = mod.evaluate(mod.git_state(plain))
     assert problems and "not a git checkout" in problems[0]
+
+
+def test_source_subdirectory_cannot_pin_the_parent_revision(tmp_path):
+    mod = _load()
+    engine = _repo(tmp_path)
+    child = engine / "plain"
+    child.mkdir()
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "docker-compose.yml").write_text("services: {}\n")
+    env = pack / ".env"
+    env.write_text("KEEP=original\n")
+    assert mod.git_state(engine)["dirty"] is False
+    assert mod.git_state(child)["is_repo"] is False
+    assert mod.main([str(child), "--pack", str(pack)]) == 1
+    assert env.read_text() == "KEEP=original\n"
+
+
+def test_unknown_top_level_probe_refuses_source_without_rewriting_config(tmp_path, monkeypatch):
+    mod = _load()
+    engine = _repo(tmp_path)
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "docker-compose.yml").write_text("services: {}\n")
+    env = pack / ".env"
+    env.write_text("KEEP=original\n")
+    real_run = subprocess.run
+
+    def unavailable_root(command, *args, **kwargs):
+        if command[-2:] == ["rev-parse", "--show-toplevel"]:
+            return subprocess.CompletedProcess(command, 1, "", "root unavailable")
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(mod.subprocess, "run",
+                        create_autospec(subprocess.run, side_effect=unavailable_root))
+    assert mod.git_state(engine)["is_repo"] is False
+    assert mod.main([str(engine), "--pack", str(pack)]) == 1
+    assert env.read_text() == "KEEP=original\n"
+
+
+def test_linked_release_worktree_is_a_valid_source_root(tmp_path):
+    mod = _load()
+    engine = _repo(tmp_path, tag="v9.9.9")
+    linked = tmp_path / "linked"
+    subprocess.run(["git", "-C", str(engine), "worktree", "add", "--detach",
+                    str(linked), "v9.9.9"], check=True, capture_output=True)
+    assert (linked / ".git").is_file()
+    assert mod.evaluate(mod.git_state(linked)) == []
+
+
+def test_canonical_source_alias_is_buildable(tmp_path):
+    mod = _load()
+    engine = _repo(tmp_path)
+    alias = tmp_path / "alias"
+    alias.symlink_to(engine, target_is_directory=True)
+    assert mod.evaluate(mod.git_state(alias)) == []
+
+
+@pytest.mark.parametrize("source_name,foreign_name", [("a", "z"), ("z", "a")])
+def test_inherited_git_context_cannot_attribute_another_source_root(
+        tmp_path, monkeypatch, source_name, foreign_name):
+    mod = _load()
+    source_parent = tmp_path / source_name
+    foreign_parent = tmp_path / foreign_name
+    source_parent.mkdir()
+    foreign_parent.mkdir()
+    source = _repo(source_parent)
+    foreign = _repo(foreign_parent)
+    monkeypatch.setenv("GIT_DIR", str(foreign / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(foreign))
+    assert mod.git_state(source)["is_repo"] is False
+    assert mod.main([str(source)]) == 1
+
+
+def test_malformed_git_worktree_metadata_is_not_a_verified_source(tmp_path, monkeypatch):
+    mod = _load()
+    engine = _repo(tmp_path)
+    real_run = subprocess.run
+
+    def malformed(command, *args, **kwargs):
+        if command[-2:] == ["rev-parse", "--is-inside-work-tree"]:
+            return subprocess.CompletedProcess(command, 0, "unexpected\n", "")
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(mod.subprocess, "run",
+                        create_autospec(subprocess.run, side_effect=malformed))
+    assert mod.git_state(engine)["is_repo"] is False
+    assert mod.main([str(engine)]) == 1
+
+
+def test_unknown_source_revision_refuses_validation_and_config_writes(tmp_path, monkeypatch):
+    mod = _load()
+    engine = _repo(tmp_path)
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "docker-compose.yml").write_text("services: {}\n")
+    env = pack / ".env"
+    env.write_text("KEEP=original\n")
+    real_run = subprocess.run
+
+    def unavailable_head(command, *args, **kwargs):
+        if command[-2:] == ["rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(command, 1, "", "revision unavailable")
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(mod.subprocess, "run",
+                        create_autospec(subprocess.run, side_effect=unavailable_head))
+    assert mod.git_state(engine)["head"] is None
+    assert mod.main([str(engine)]) == 1
+    assert mod.main([str(engine), "--pack", str(pack)]) == 1
+    assert env.read_text() == "KEEP=original\n"
+
+
+@pytest.mark.parametrize("expected", ["0" * 40, "f" * 40])
+def test_any_different_qualified_revision_is_refused_without_rewriting_config(tmp_path, expected):
+    mod = _load()
+    engine = _repo(tmp_path)
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "docker-compose.yml").write_text("services: {}\n")
+    env = pack / ".env"
+    env.write_text("KEEP=original\n")
+    assert mod.git_state(engine)["head"] != expected
+    assert mod.main([str(engine), "--pack", str(pack), "--expected-sha", expected]) == 1
+    assert env.read_text() == "KEEP=original\n"
+
+
+@pytest.mark.parametrize("old_revision", ["0" * 40, "f" * 40])
+def test_repaired_source_pin_reports_change_then_current_state(tmp_path, capsys, old_revision):
+    mod = _load()
+    engine = _repo(tmp_path)
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "docker-compose.yml").write_text("services: {}\n")
+    env = pack / ".env"
+    env.write_text(f"ENGINE_DIR='{engine.resolve()}'\nOKENGINE_SOURCE_SHA={old_revision}\n")
+    assert mod.main([str(engine), "--pack", str(pack)]) == 0
+    assert "deployment build source pinned" in capsys.readouterr().out
+    assert f"OKENGINE_SOURCE_SHA={mod.git_state(engine)['head']}" in env.read_text()
+    assert mod.main([str(engine), "--pack", str(pack)]) == 0
+    assert "deployment build source current" in capsys.readouterr().out
+
+
+def test_source_pin_updates_preserve_operator_comment_associations(tmp_path):
+    mod = _load()
+    engine = _repo(tmp_path)
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "docker-compose.yml").write_text("services: {}\n")
+    env = pack / ".env"
+    env.write_text("# engine context\nENGINE_DIR=/old\n# operator compose\nCOMPOSE_FILE=operator.yml\n")
+    assert mod.main([str(engine), "--pack", str(pack)]) == 0
+    assert env.read_text().splitlines()[:4] == [
+        "# engine context", f"ENGINE_DIR='{engine.resolve()}'",
+        "# operator compose", "COMPOSE_FILE=operator.yml"]
+
+
+def test_a_known_unreleased_revision_cannot_be_pinned_directly(tmp_path):
+    mod = _load()
+    engine = _repo(tmp_path, branch="wip")
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "docker-compose.yml").write_text("services: {}\n")
+    env = pack / ".env"
+    env.write_text("KEEP=original\n")
+    with pytest.raises(ValueError, match="unverified"):
+        mod.pin_deployment_source(pack, engine, mod.git_state(engine))
+    assert env.read_text() == "KEEP=original\n"
 
 
 def test_an_unanswerable_probe_is_refused_not_treated_as_clean(tmp_path):
@@ -183,3 +352,90 @@ def test_a_git_subprocess_error_is_also_unknown(tmp_path, monkeypatch):
                         lambda *a, **k: (_ for _ in ()).throw(
                             mod.subprocess.TimeoutExpired(cmd="git", timeout=30)))
     assert mod._git(real, "status") is None
+
+
+def test_pin_repairs_obsolete_context_preserves_secrets_and_is_idempotent(tmp_path):
+    mod = _load()
+    engine = _repo(tmp_path)
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "docker-compose.yml").write_text("services: {}\n")
+    env = pack / ".env"
+    env.write_text("# keep comment\nSECRET=private=value\nENGINE_DIR=/obsolete\nENGINE_DIR=/duplicate\nCOMPOSE_FILE=docker-compose.yml:operator.yml\n")
+    assert mod.main([str(engine), "--pack", str(pack)]) == 0
+    text = env.read_text()
+    assert text.count("ENGINE_DIR=") == 1
+    assert f"ENGINE_DIR='{engine.resolve()}'" in text
+    assert "SECRET=private=value" in text and "operator.yml" in text
+    assert "# keep comment" in text and env.stat().st_mode & 0o777 == 0o600
+    assert mod.pin_deployment_source(pack, engine, mod.git_state(engine)) is False
+
+
+def test_missing_and_wrong_revision_sources_cannot_rewrite_deployment(tmp_path):
+    mod = _load()
+    engine = _repo(tmp_path)
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "docker-compose.yml").write_text("services: {}\n")
+    (pack / ".env").write_text("KEEP=original\n")
+    for source, extras in ((tmp_path / "missing", []), (engine, ["--expected-sha", "wrong"])):
+        assert mod.main([str(source), "--pack", str(pack), *extras]) == 1
+        assert (pack / ".env").read_text() == "KEEP=original\n"
+
+
+def test_source_pin_refuses_non_deployments_and_unverified_state(tmp_path):
+    mod = _load()
+    engine = _repo(tmp_path)
+    with pytest.raises(ValueError, match="no docker-compose"):
+        mod.pin_deployment_source(tmp_path, engine, mod.git_state(engine))
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n")
+    with pytest.raises(ValueError, match="unverified"):
+        mod.pin_deployment_source(tmp_path, engine, {})
+
+
+def test_source_pin_refuses_a_multiline_host_path(tmp_path):
+    mod = _load()
+    engine = _repo(tmp_path)
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n")
+    with pytest.raises(ValueError, match="one line"):
+        mod.pin_deployment_source(tmp_path, Path("bad\ncontext"), mod.git_state(engine))
+    assert not (tmp_path / ".env").exists()
+
+
+def test_cli_pin_reports_non_deployment_and_write_failure(tmp_path, monkeypatch, capsys):
+    mod = _load()
+    engine = _repo(tmp_path)
+    assert mod.main([str(engine), "--pack", str(tmp_path)]) == 1
+    assert "no docker-compose" in capsys.readouterr().err
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n")
+    def denied(*args, **kwargs):
+        raise PermissionError("fixture denies writing the config")
+    monkeypatch.setattr(mod.os, "open", denied)
+    assert mod.main([str(engine), "--pack", str(tmp_path)]) == 1
+    assert "config" in capsys.readouterr().err
+    assert not (tmp_path / ".env").exists()
+
+
+def test_cli_pin_creates_owner_only_config_and_checks_exact_revision(tmp_path):
+    mod = _load()
+    engine = _repo(tmp_path)
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n")
+    sha = mod.git_state(engine)["head"]
+    assert mod.main([str(engine), "--pack", str(tmp_path), "--expected-sha", sha]) == 0
+    assert f"OKENGINE_SOURCE_SHA={sha}" in (tmp_path / ".env").read_text()
+    assert (tmp_path / ".env").stat().st_mode & 0o777 == 0o600
+
+
+def test_failed_source_config_replace_preserves_original_secrets_and_cleans_staging(
+        tmp_path, monkeypatch):
+    mod = _load()
+    engine = _repo(tmp_path)
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n")
+    env = tmp_path / ".env"
+    env.write_text("SECRET=original\nENGINE_DIR=/obsolete\n")
+    def denied(*args, **kwargs):
+        raise PermissionError("cannot replace config")
+    monkeypatch.setattr(mod.os, "replace", denied)
+    assert mod.main([str(engine), "--pack", str(tmp_path)]) == 1
+    assert env.read_text() == "SECRET=original\nENGINE_DIR=/obsolete\n"
+    assert list(tmp_path.glob(".okengine-source-*")) == []

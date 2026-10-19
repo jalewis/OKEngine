@@ -323,3 +323,39 @@ def test_list_fields_requires_exact_shape_name():
     assert m.list_fields({"field_shapes": {
         "actual": "list", "integer": "int", "mapping": "dict", "text": "str",
     }}) == {"actual"}
+
+
+# okengine#1017: a schema rewritten within one timestamp tick. os.utime restores the previous
+# mtime so the second write lands in the same tick on any disk, fast or slow.
+def _pinned_rewrite(path, text):
+    before = path.stat()
+    path.write_text(text)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+
+def test_yaml_cache_sees_a_same_size_rewrite_within_one_tick(tmp_path):
+    cache = {}
+    path = tmp_path / "schema.yaml"
+    path.write_text("value: aaa\n")
+    assert m._yaml_mtime_cached(path, cache) == {"value": "aaa"}
+    _pinned_rewrite(path, "value: bbb\n")
+    assert m._yaml_mtime_cached(path, cache) == {"value": "bbb"}
+
+
+def test_yaml_cache_sees_a_different_size_rewrite_within_one_tick(tmp_path):
+    cache = {}
+    path = tmp_path / "schema.yaml"
+    path.write_text("value: a\n")
+    assert m._yaml_mtime_cached(path, cache) == {"value": "a"}
+    _pinned_rewrite(path, "value: a longer value\n")
+    assert m._yaml_mtime_cached(path, cache) == {"value": "a longer value"}
+
+
+def test_composed_artifact_cache_sees_a_same_size_rewrite_within_one_tick(tmp_path):
+    artifact = tmp_path / ".okengine" / "composed-schema.yaml"
+    artifact.parent.mkdir()
+    artifact.write_text("value: aaa\n")
+    m._COMPOSED_CACHE.clear()
+    assert m._composed_artifact_at(tmp_path) == {"value": "aaa"}
+    _pinned_rewrite(artifact, "value: bbb\n")
+    assert m._composed_artifact_at(tmp_path) == {"value": "bbb"}

@@ -27,6 +27,11 @@ owns:
                  # the evidence this inquiry groups — soft edges, no hard `requires` on the
                  # extensions that own these types (the lacuna<->predictions convention)
                  assessments, predictions, solutions,
+                 # analysis — the standing questions the inquiry-analyze lane answers, one
+                 # assessment page each (absent: the headline `question` stands in)
+                 questions,
+                 # the concept fields this inquiry bears on — nominated to okengine.lacuna
+                 fields,
                  see_also, sources, needs_review]
 
 tier:
@@ -47,6 +52,8 @@ field_shapes:
   assessments:     list
   predictions:     list
   solutions:       list
+  questions:       list
+  fields:          list
 
 field_items:
   # Each term is a collection query plus the knobs that decide what the connector does with it.
@@ -57,3 +64,8 @@ field_items:
     label:  {shape: str}
     since:  {shape: date}
     params: {shape: dict}
+  # Each standing question is answered by exactly one assessment page, named from its `key`
+  # (derived from the text when omitted), so rewording a question updates its page in place.
+  questions:
+    question: {shape: str}
+    key:      {shape: str}

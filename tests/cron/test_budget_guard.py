@@ -3,10 +3,27 @@ import importlib.util
 import json
 import sqlite3
 import sys
+import types
 from pathlib import Path
+from unittest import mock
+
+import pytest
 
 REPO = Path(__file__).resolve().parent.parent.parent
 MOD = REPO / "scripts" / "cron" / "budget_guard.py"
+
+
+def _patch_module_sqlite_connect(monkeypatch, module, connect):
+    """Swap the module-under-test's ``sqlite3`` reference, never the global ``sqlite3.connect``.
+
+    coverage.py writes its per-test context data through ``sqlite3`` at every test-phase boundary
+    (``--cov-context=test``, okengine#900). Patching the shared module attribute broke that write
+    and errored every later test in the process.
+    """
+    isolated = types.ModuleType("sqlite3")
+    isolated.__dict__.update(vars(sqlite3))
+    isolated.connect = connect
+    monkeypatch.setattr(module, "sqlite3", isolated)
 
 
 def _load():
@@ -53,9 +70,11 @@ def test_tokens_in_window_sums_only_recent(tmp_path):
     assert m.tokens_in_window(db, m.window_seconds("week"), now) == 1800 + 19998
 
 
-def test_tokens_in_window_missing_db_is_zero(tmp_path):
+def test_tokens_in_window_missing_db_is_unknown_not_zero(tmp_path):
+    """okengine#994 [9]: a missing state.db is unknown usage, never zero usage."""
     m = _load()
-    assert m.tokens_in_window(tmp_path / "nope.db", 86400, 1.0) == 0
+    with pytest.raises(m.UsageUnreadable, match="does not exist"):
+        m.tokens_in_window(tmp_path / "nope.db", 86400, 1.0)
 
 
 def test_cost_bearing_ids_excludes_no_agent_and_self():
@@ -508,13 +527,15 @@ def test_token_database_schema_and_error_edges(tmp_path, monkeypatch):
     m = _load()
     db = tmp_path / "state.db"
     sqlite3.connect(db).close()
-    assert m.tokens_in_window(db, 10, 20) == 0
+    with pytest.raises(m.UsageUnreadable, match="no sessions table"):
+        m.tokens_in_window(db, 10, 20)
 
     con = sqlite3.connect(db)
     con.execute("create table sessions (unrelated integer)")
     con.commit()
     con.close()
-    assert m.tokens_in_window(db, 10, 20) == 0
+    with pytest.raises(m.UsageUnreadable, match="no sessions table"):
+        m.tokens_in_window(db, 10, 20)
 
     db.unlink()
     con = sqlite3.connect(db)
@@ -524,10 +545,10 @@ def test_token_database_schema_and_error_edges(tmp_path, monkeypatch):
     con.close()
     assert m.tokens_in_window(db, 10, 20) == 5
 
-    monkeypatch.setattr(
-        m.sqlite3, "connect", lambda *_a, **_k: (_ for _ in ()).throw(sqlite3.Error("no db")),
-    )
-    assert m.tokens_in_window(db, 10, 20) == 0
+    _patch_module_sqlite_connect(
+        monkeypatch, m, lambda *_a, **_k: (_ for _ in ()).throw(sqlite3.Error("no db")))
+    with pytest.raises(m.UsageUnreadable, match="cannot open .*no db"):
+        m.tokens_in_window(db, 10, 20)
 
     class BrokenQuery:
         def execute(self, sql, *_args):
@@ -537,8 +558,191 @@ def test_token_database_schema_and_error_edges(tmp_path, monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(m.sqlite3, "connect", lambda *_a, **_k: BrokenQuery())
-    assert m.tokens_in_window(db, 10, 20) == 0
+    _patch_module_sqlite_connect(monkeypatch, m, lambda *_a, **_k: BrokenQuery())
+    with pytest.raises(m.UsageUnreadable, match="cannot read .*query failed"):
+        m.tokens_in_window(db, 10, 20)
+
+
+# ── okengine#994 [9]: an unreadable state.db is UNKNOWN usage, never zero ────────────────────────
+def test_tokens_in_window_corrupt_db_is_unknown(tmp_path):
+    m = _load()
+    db = tmp_path / "state.db"
+    db.write_bytes(b"this is not an sqlite database" * 100)
+    with pytest.raises(m.UsageUnreadable, match="cannot read"):
+        m.tokens_in_window(db, 86400, 1.0)
+
+
+def test_tokens_in_window_locked_db_is_unknown(tmp_path, monkeypatch):
+    m = _load()
+    db = tmp_path / "state.db"
+    _make_db(db, [(1.0, 10, 10)])
+    monkeypatch.setattr(m, "DB_TIMEOUT_S", 0.05)
+    writer = sqlite3.connect(db, isolation_level=None)
+    writer.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(m.UsageUnreadable, match="locked"):
+            m.tokens_in_window(db, 86400, 1.0)
+    finally:
+        writer.execute("ROLLBACK")
+        writer.close()
+
+
+def test_tokens_in_window_permission_denied_open_is_unknown(tmp_path, monkeypatch):
+    """EACCES on open surfaces from sqlite as OperationalError. Simulated with an autospec'd connect
+    so the contract holds under root too (the mutation lanes run as root, where chmod 000 reads)."""
+    m = _load()
+    db = tmp_path / "state.db"
+    _make_db(db, [(1.0, 10, 10)])
+    connect = mock.create_autospec(
+        sqlite3.connect, side_effect=sqlite3.OperationalError("unable to open database file"))
+    _patch_module_sqlite_connect(monkeypatch, m, connect)
+    with pytest.raises(m.UsageUnreadable, match="unable to open database file"):
+        m.tokens_in_window(db, 86400, 1.0)
+    connect.assert_called_once()
+    assert connect.call_args.kwargs["timeout"] == m.DB_TIMEOUT_S
+
+
+def test_tokens_in_window_unstatable_path_is_unknown(tmp_path, monkeypatch):
+    m = _load()
+    stat_fail = mock.create_autospec(Path.is_file, side_effect=PermissionError(13, "denied"))
+    monkeypatch.setattr(m.Path, "is_file", stat_fail)
+    with pytest.raises(m.UsageUnreadable, match="cannot stat .*denied"):
+        m.tokens_in_window(tmp_path / "state.db", 86400, 1.0)
+
+
+@pytest.mark.skipif(getattr(__import__("os"), "geteuid", lambda: 0)() == 0,
+                    reason="root bypasses file modes; the autospec'd EACCES test covers root lanes")
+def test_tokens_in_window_real_permission_denied_is_unknown(tmp_path):
+    m = _load()
+    db = tmp_path / "state.db"
+    _make_db(db, [(1.0, 10, 10)])
+    db.chmod(0)
+    try:
+        with pytest.raises(m.UsageUnreadable):
+            m.tokens_in_window(db, 86400, 1.0)
+    finally:
+        db.chmod(0o600)
+
+
+def test_decide_unknown_usage_holds():
+    m = _load()
+    for paused in (True, False):
+        for policy in ("auto", "manual"):
+            assert m.decide(over_budget=None, currently_paused=paused, resume_policy=policy) == "noop"
+
+
+def _unreadable_env(tmp_path, monkeypatch, db):
+    monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "10")
+    monkeypatch.setenv("OKENGINE_BUDGET_RESUME", "auto")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_STATE_DB", str(db))
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path / "vault"))
+
+
+@pytest.mark.parametrize("kind", ["missing", "corrupt", "locked", "permission"])
+def test_paused_guard_never_auto_resumes_on_unreadable_state_db(tmp_path, monkeypatch, capsys, kind):
+    """The reported bug: a paused guard read an unreadable state.db as 0 usage and auto-resumed every
+    paid cron. It must hold the pause, log loudly, and exit non-zero."""
+    m = _load()
+    db = tmp_path / "state.db"
+    _unreadable_env(tmp_path, monkeypatch, db)
+    writer = None
+    if kind == "corrupt":
+        db.write_bytes(b"garbage" * 200)
+    elif kind == "locked":
+        _make_db(db, [(1.0, 1, 1)])
+        monkeypatch.setattr(m, "DB_TIMEOUT_S", 0.05)
+        writer = sqlite3.connect(db, isolation_level=None)
+        writer.execute("BEGIN EXCLUSIVE")
+    elif kind == "permission":
+        _make_db(db, [(1.0, 1, 1)])
+        _patch_module_sqlite_connect(monkeypatch, m, mock.create_autospec(
+            sqlite3.connect, side_effect=sqlite3.OperationalError("unable to open database file")))
+    state = {"paused": True, "paused_ids": ["a"], "paused_names": ["lane-a"], "pausing_ids": ["a"]}
+    (tmp_path / "budget-guard-state.json").write_text(json.dumps(state))
+    jobs = tmp_path / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [{"id": "a", "name": "lane-a", "enabled": False}]}))
+    monkeypatch.setenv("OKENGINE_CRON_PLUS_JOBS", str(jobs))
+    calls = []
+    monkeypatch.setattr(m, "_cronplus", lambda action, jid: calls.append((action, jid)) or True)
+    try:
+        rc = m.main([])
+    finally:
+        if writer is not None:
+            writer.execute("ROLLBACK")
+            writer.close()
+    assert rc == 1, "an unreadable state.db must exit non-zero so fleet-health sees it"
+    assert ("resume", "a") not in calls, f"auto-resumed on unknown usage: {calls}"
+    assert json.loads((tmp_path / "budget-guard-state.json").read_text())["paused"] is True
+    out = capsys.readouterr()
+    assert "USAGE UNKNOWN" in out.err and "will NOT resume" in out.err
+    assert "UNKNOWN tok/day" in out.out
+
+
+def test_orphan_self_heal_does_not_run_on_unknown_usage(tmp_path, monkeypatch):
+    """The self-heal path is also a resume; it must not fire while usage is unknown."""
+    m = _load()
+    _unreadable_env(tmp_path, monkeypatch, tmp_path / "missing.db")
+    (tmp_path / "budget-guard-state.json").write_text(json.dumps({"paused": False, "pausing_ids": ["a"]}))
+    jobs = tmp_path / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [{"id": "a", "name": "lane-a", "enabled": False}]}))
+    monkeypatch.setenv("OKENGINE_CRON_PLUS_JOBS", str(jobs))
+    calls = []
+    monkeypatch.setattr(m, "_cronplus", lambda action, jid: calls.append((action, jid)) or True)
+    assert m.main([]) == 1
+    assert calls == []
+
+
+def test_unpaused_guard_does_not_pause_on_unknown_usage(tmp_path, monkeypatch):
+    m = _load()
+    _unreadable_env(tmp_path, monkeypatch, tmp_path / "missing.db")
+    jobs = tmp_path / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [{"id": "a", "name": "lane-a"}]}))
+    monkeypatch.setenv("OKENGINE_CRON_PLUS_JOBS", str(jobs))
+    calls = []
+    monkeypatch.setattr(m, "_cronplus", lambda action, jid: calls.append((action, jid)) or True)
+    assert m.main([]) == 1
+    assert calls == []
+    assert not (tmp_path / "budget-guard-state.json").exists()
+
+
+def test_malformed_budget_still_pauses_when_usage_unknown(tmp_path, monkeypatch):
+    """A malformed budget is fail-closed (pause) and unknown usage must not weaken that."""
+    m = _load()
+    _unreadable_env(tmp_path, monkeypatch, tmp_path / "missing.db")
+    monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "1,000")
+    jobs = tmp_path / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [{"id": "a", "name": "lane-a"}]}))
+    monkeypatch.setenv("OKENGINE_CRON_PLUS_JOBS", str(jobs))
+    calls = []
+    monkeypatch.setattr(m, "_cronplus", lambda action, jid: calls.append((action, jid)) or True)
+    assert m.main([]) == 1
+    assert calls == [("pause", "a")]
+
+
+def test_paused_guard_still_reconciles_on_unknown_usage(tmp_path, monkeypatch):
+    """Holding the pause includes re-pausing a cron a redeploy re-enabled (the fail-closed direction)."""
+    m = _load()
+    _unreadable_env(tmp_path, monkeypatch, tmp_path / "missing.db")
+    (tmp_path / "budget-guard-state.json").write_text(
+        json.dumps({"paused": True, "paused_ids": ["a"], "paused_names": ["lane-a"]}))
+    jobs = tmp_path / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [{"id": "a", "name": "lane-a", "enabled": True}]}))
+    monkeypatch.setenv("OKENGINE_CRON_PLUS_JOBS", str(jobs))
+    calls = []
+    monkeypatch.setattr(m, "_cronplus", lambda action, jid: calls.append((action, jid)) or True)
+    assert m.main([]) == 1
+    assert calls == [("pause", "a")]
+
+
+def test_readable_db_under_budget_still_exits_zero(tmp_path, monkeypatch, capsys):
+    m = _load()
+    db = tmp_path / "state.db"
+    _make_db(db, [(1.0, 1, 1)])
+    _unreadable_env(tmp_path, monkeypatch, db)
+    monkeypatch.setattr(m, "_load_jobs", lambda: [])
+    assert m.main([]) == 0
+    assert "USAGE UNKNOWN" not in capsys.readouterr().err
 
 
 def test_budget_guard_io_and_cronplus_edges(tmp_path, monkeypatch, capsys):
@@ -626,3 +830,83 @@ def test_unreadable_jobs_fail_pause_reconcile_and_orphan_recovery(tmp_path, monk
     monkeypatch.setattr(m, "_load_state", lambda: {"paused": False})
     assert m.main([]) == 1
     assert "orphan recovery" in capsys.readouterr().err
+
+
+# ── boundary and policy edges on the lines okengine#994 [9] reworked ─────────────────────────────
+def _main_with(m, monkeypatch, tmp_path, *, tokens, env, state=None, jobs=None):
+    for key in ("OKENGINE_BUDGET_TOKENS", "OKENGINE_BUDGET_USD", "OKENGINE_BUDGET_PRICE_PER_MTOK",
+                "OKENGINE_BUDGET_RESUME"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path / "vault"))
+    monkeypatch.setattr(m, "tokens_in_window", lambda *_a: tokens)
+    monkeypatch.setattr(m, "_load_state", lambda: dict(state or {}))
+    monkeypatch.setattr(m, "_load_jobs", lambda: list(jobs or []))
+    calls, saved = [], []
+    monkeypatch.setattr(m, "_cronplus", lambda action, jid: calls.append((action, jid)) or True)
+    monkeypatch.setattr(m, "_save_state", lambda value: saved.append(dict(value)))
+    return m.main([]), calls, saved
+
+
+def test_token_usage_exactly_at_the_budget_trips(tmp_path, monkeypatch):
+    m = _load()
+    rc, calls, _ = _main_with(m, monkeypatch, tmp_path, tokens=10,
+                              env={"OKENGINE_BUDGET_TOKENS": "10"}, jobs=[{"id": "a", "name": "a"}])
+    assert rc == 0 and calls == [("pause", "a")]
+
+
+@pytest.mark.parametrize("tokens, trips", [(3_000_000, True), (2_000_000, True), (1_999_999, False)])
+def test_usd_cap_trips_exactly_at_the_budget(tmp_path, monkeypatch, capsys, tokens, trips):
+    """$1/Mtok and a $2 cap: 2,000,000 tokens is exactly $2.00 (trips); one fewer does not."""
+    m = _load()
+    rc, calls, _ = _main_with(
+        m, monkeypatch, tmp_path, tokens=tokens, jobs=[{"id": "a", "name": "a"}],
+        env={"OKENGINE_BUDGET_USD": "2", "OKENGINE_BUDGET_PRICE_PER_MTOK": "1"})
+    assert rc == 0 and (calls == [("pause", "a")]) is trips
+    assert f"(~${tokens / 1_000_000:,.2f})" in capsys.readouterr().out
+
+
+def test_usd_cap_under_budget_with_a_price_does_not_trip(tmp_path, monkeypatch, capsys):
+    m = _load()
+    rc, calls, _ = _main_with(
+        m, monkeypatch, tmp_path, tokens=1_000, jobs=[{"id": "a", "name": "a"}],
+        env={"OKENGINE_BUDGET_USD": "5", "OKENGINE_BUDGET_PRICE_PER_MTOK": "1"})
+    assert rc == 0 and calls == []
+    assert "(~$0.00)" in capsys.readouterr().out
+
+
+def test_usage_line_carries_no_usd_estimate_without_a_price(tmp_path, monkeypatch, capsys):
+    m = _load()
+    _main_with(m, monkeypatch, tmp_path, tokens=1, env={"OKENGINE_BUDGET_TOKENS": "10"})
+    out = capsys.readouterr().out
+    assert "usage 1 tok/day  budget 10 tok" in out and "~$" not in out
+
+
+@pytest.mark.parametrize("policy", ["manual", "aaa"])
+def test_orphan_self_heal_never_runs_outside_auto_resume(tmp_path, monkeypatch, policy):
+    m = _load()
+    rc, calls, _ = _main_with(
+        m, monkeypatch, tmp_path, tokens=0,
+        env={"OKENGINE_BUDGET_TOKENS": "10", "OKENGINE_BUDGET_RESUME": policy},
+        state={"paused": False, "pausing_ids": ["a"]},
+        jobs=[{"id": "a", "name": "a", "enabled": False}])
+    assert rc == 0 and calls == []
+
+
+def test_malformed_budget_with_unknown_usage_records_the_pause(tmp_path, monkeypatch):
+    m = _load()
+    monkeypatch.setenv("OKENGINE_STATE_DB", str(tmp_path / "missing.db"))
+    for key in ("OKENGINE_BUDGET_USD", "OKENGINE_BUDGET_PRICE_PER_MTOK", "OKENGINE_BUDGET_RESUME"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("OKENGINE_BUDGET_TOKENS", "1,000")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path / "vault"))
+    monkeypatch.setattr(m, "_load_jobs", lambda: [{"id": "a", "name": "a"}])
+    monkeypatch.setattr(m, "_cronplus", lambda *_a: True)
+    saved = []
+    monkeypatch.setattr(m, "_save_state", lambda value: saved.append(dict(value)))
+    assert m.main([]) == 1
+    assert saved[-1]["paused"] is True and saved[-1]["usage_tokens"] == 0
+    assert "UNKNOWN tok/day" in saved[-1]["reason"]

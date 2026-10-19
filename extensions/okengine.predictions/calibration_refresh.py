@@ -33,6 +33,12 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Engine cron libs, appended so this extension's own modules keep precedence: staged one level
+# up (/opt/data/scripts/ holds /opt/data/scripts/<id>/), or scripts/cron/ in a repo checkout.
+_ENGINE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(_ENGINE_ROOT))
+sys.path.append(str(_ENGINE_ROOT.parent / "scripts" / "cron"))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import pred_lib as P  # noqa: E402
 
 OUTCOME = {"confirmed": 1.0, "refuted": 0.0, "partial": 0.5}
@@ -436,7 +442,7 @@ def main() -> int:
     history = update_history(_history_path(v), snapshot)
     dash = v / "wiki" / "dashboards" / "calibration.md"
     dash.parent.mkdir(parents=True, exist_ok=True)
-    dash.write_text(render(rows, today, history, _source_classes(v), _watchlist(v)), encoding="utf-8")
+    generated_page.write(dash, render(rows, today, history, _source_classes(v), _watchlist(v)))
     print(f"calibration-refresh: {len(rows)} prediction(s), {cal['n']} resolved+scored -> "
           "wiki/dashboards/calibration.md")
     print(json.dumps({"wakeAgent": False}))

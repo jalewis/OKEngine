@@ -11,12 +11,29 @@ TEST_FAST_DEADLINE ?= 120
 # 83.2s, 94.2s, 94.7s, 95.5s (pipelines 9719/9721/9725/9734) -- about 1.26x headroom under 120s.
 # On a contended runner it reached 89% at the 120s kill (pipeline 9740, job 110495), a projected
 # ~135s. A deadline exists to catch a hang, not to fit the work, so this is sized to 2x that
-# contended figure. Its own variable, so the six genuinely fast layers keep their 120s bound.
+# contended figure. Its own variable, so the genuinely fast layers keep their 120s bound.
+# It then grew with its test count to 252-272s by 2026-10-15 and timed out at 300s on a busy
+# runner (main 13275, job 163393); 560s is 2x the slowest of those passing runs (job 163359).
 # ci/job-budgets.json records the measurement; tests/test_ci_config.py holds the headroom.
-TEST_SECURITY_DEADLINE ?= 300
-TEST_INTEGRATION_DEADLINE ?= 600
+TEST_SECURITY_DEADLINE ?= 560
+# The contract layer followed it (okengine#859): pytest runtime on passing runs 95.2s, 100.3s,
+# 106.5s, 108.2s, 114.1s (jobs 127564/127287/128164/128002/128511) -- 1.05x headroom under 120s.
+# The v0.14.6 qualification run was killed at ~90% at the 120s cap (pipeline 11082, job 128496), a
+# projected ~133s contended, and passed unchanged on retry. Sized to 2x that contended figure, like
+# security; the collection of the whole tree before the marker filter is most of its cost.
+TEST_CONTRACT_DEADLINE ?= 300
+# The integration layer measured up to 826.7s of pytest on a clean CI pass and ~20% more under
+# runner disk-I/O pressure, where the old 840s CI cap killed it at 91% (okengine#1015). Sized to 2x
+# the slowest clean pass, like security and contract. One value for CI and local runs; the CI job
+# passes the same figure explicitly.
+TEST_INTEGRATION_DEADLINE ?= 1700
 TEST_FULL_DEADLINE ?= 1200
 TEST_MUTATION_DEADLINE ?= 43200
+# The nightly critical preflight proves every full-command baseline when the pipeline has no
+# coverage map. That path ran 41 of its 47 groups in 1,194s before the old shared 1200s cap killed
+# it (pipeline 12826, job 154390); its slowest group took 120s, so the remaining six plus one
+# retried group bound it near 2,034s. 4200s is 2x that bound (okengine#1047).
+TEST_MUTATION_PREFLIGHT_DEADLINE ?= 4200
 MUTATION_JOBS ?= 1
 
 help:  ## list targets
@@ -48,7 +65,7 @@ test-integration:  ## real filesystem/database/process/component integration tes
 
 test-contract:  ## versioned request/response/config interface promises
 	mkdir -p artifacts
-	$(TEST_TIMEOUT) $(TEST_FAST_DEADLINE) "$(TEST_PYTHON)" -m pytest tests/ -m "contract and not external" --strict-layer-skips \
+	$(TEST_TIMEOUT) $(TEST_CONTRACT_DEADLINE) "$(TEST_PYTHON)" -m pytest tests/ -m "contract and not external" --strict-layer-skips \
 		--junitxml=artifacts/junit-contract.xml
 
 test-invariant:  ## repository-wide architecture/configuration guarantees
@@ -91,12 +108,14 @@ test-mutation-critical:  ## the declared critical targets — the daily signal (
 		--critical-only --deadline-seconds "$(MUTATION_GATE_BUDGET)" --jobs "$(MUTATION_JOBS)" \
 		--artifacts "$(MUTATION_ARTIFACTS)" --shard-count "$(MUTATION_SHARD_COUNT)" \
 		--shard-index "$(MUTATION_SHARD_INDEX)" \
-		$(if $(MUTATION_BASELINE_PROOF),--baseline-proof "$(MUTATION_BASELINE_PROOF)",)
+		$(if $(MUTATION_BASELINE_PROOF),--baseline-proof "$(MUTATION_BASELINE_PROOF)",) \
+		$(if $(MUTATION_REUSE_PLAN),--reuse-plan "$(MUTATION_REUSE_PLAN)",)
 
-test-mutation-critical-preflight:  ## prove every unique critical baseline once before nightly shards
+test-mutation-critical-preflight:  ## prove each unique critical full-command baseline once before nightly shards (selected targets prove theirs in-campaign)
 	mkdir -p "$(MUTATION_ARTIFACTS)"
-	$(TEST_TIMEOUT) $(TEST_FULL_DEADLINE) "$(TEST_PYTHON)" ci/mutation_gate.py --mode full \
-		--critical-only --preflight-only --jobs 1 --artifacts "$(MUTATION_ARTIFACTS)"
+	$(TEST_TIMEOUT) $(TEST_MUTATION_PREFLIGHT_DEADLINE) "$(TEST_PYTHON)" ci/mutation_gate.py --mode full \
+		--critical-only --preflight-only --jobs 1 --artifacts "$(MUTATION_ARTIFACTS)" \
+		$(if $(filter 1,$(MUTATION_REUSE_EVIDENCE)),--reuse-evidence,)
 
 # How many consecutive runs without a score before a target counts as dropped out. 1 would fire on
 # a single bad night and train everyone to ignore the report, which is how seventeen red nightlies

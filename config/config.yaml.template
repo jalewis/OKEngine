@@ -126,6 +126,22 @@ mcp_servers:
       OKENGINE_CRON_JOBS: /opt/data/cron-plus/jobs.json
       OKENGINE_OUTPUT_CONTRACT_MODE: enforce
 
+  # okengine#983: the Agent Chat (api_server) writer. The chat agent writes ONLY through this
+  # server, bound to the `chat:api_server` capability in the policy catalog (create/update/append in
+  # entities/ and concepts/, frontmatter-only updates, every write queued for review). It must never
+  # bind the generic `okengine-write` above, which has no actor and is therefore admin.
+  okengine-write-chat:
+    command: /opt/hermes/.venv/bin/python
+    args:
+    - /opt/hermes/okengine-mcp/write_server.py
+    tools:
+      resources: false
+      prompts: false
+    env:
+      OKENGINE_WRITE_ACTOR: chat:api_server
+      OKENGINE_POLICY_CATALOG: /opt/hermes/config/policy/catalog.yaml
+      OKENGINE_WRITE_TOOLS: create_entity,update_entity,append_to_section
+
 # Cron jobs opt into MCP explicitly. This keeps maintenance drains and pure
 # script jobs from opening MCP connections unless a job requests them.
 platform_toolsets:
@@ -138,13 +154,18 @@ platform_toolsets:
   # now the default, not a manual step). Add `web` here per-deployment if chat should also
   # research the internet. Inert unless the api_server platform is enabled.
   #
-  # okengine#257 — UI editing switch: `okengine-write` is what lets the reader Chat WRITE BACK to
-  # the vault. Set `OKENGINE_EDITING=0` in `.env` to make an exposed deployment read-only —
-  # ensure-runtime then DROPS `okengine-write` from this list on the next gateway recreate (chat
-  # still answers, just can't edit). OKENGINE_HARDENED=1 requires it off.
+  # okengine#257 — UI editing switch: `okengine-write-chat` is what lets the reader Chat WRITE BACK
+  # to the vault. Set `OKENGINE_EDITING=0` in `.env` to make an exposed deployment read-only —
+  # ensure-runtime then DROPS `okengine-write-chat` from this list on the next gateway recreate
+  # (chat still answers, just can't edit). OKENGINE_HARDENED=1 requires it off.
+  # okengine#983: never list the actor-less `okengine-write` here (deployment validation FAILs it).
+  #
+  # The CLI platform is deliberately NOT listed: an interactive `hermes` session is reachable only
+  # via `docker exec` into the gateway, i.e. by an operator who already holds the container, so it
+  # is an admin-equivalent operator surface and keeps Hermes' default (every MCP server).
   api_server:
     - okengine
-    - okengine-write
+    - okengine-write-chat
 
 # Agent-wide toolset hygiene. OKEngine agents curate the vault through the enforced MCP write
 # path; they never run arbitrary code. `execute_code` is already runtime-blocked for cron jobs,
@@ -152,3 +173,11 @@ platform_toolsets:
 # that is then refused. Disable it globally (defense-in-depth + no wasted turns).
 agent:
   disabled_toolsets: [code_execution]
+
+# Hermes progressive tool disclosure (tool_search/tool_describe/tool_call bridges). OFF for
+# OKEngine: every lane already scopes its tools with enabled_toolsets, so the bridge only costs
+# turns — on one live deployment 285 of 357 raw-backfill runs spent 2 of their 4 iterations
+# locating their write tool (okengine#886). deployment-validate WARNs when this is not "off".
+tools:
+  tool_search:
+    enabled: "off"

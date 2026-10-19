@@ -27,6 +27,12 @@ COMPOSE=(docker compose -f "$HERE/docker-compose.smoke.yml")
 if [ "${SMOKE_CI:-0}" = 1 ]; then
   COMPOSE+=(-f "$HERE/docker-compose.smoke.ci.yml")
   HOSTADDR="${SMOKE_HOST:-docker}"
+  # Fail closed before creating a vault or starting services. Each job pulls and
+  # verifies the producer's exact immutable images into its own fresh daemon.
+  (cd "$ROOT" && "$PY" ci/release_images.py consume)
+  COMPOSE+=(-f "$ROOT/artifacts/release-images/verified.json")
+  COMPOSE+=(-p "okengine-${CI_PIPELINE_ID:?}-${CI_JOB_ID:?}-$MODE")
+  BUILD=0
 fi
 
 ARTIFACT_DIR="${SMOKE_ARTIFACT_DIR:-$ROOT/artifacts/$MODE-release}"
@@ -131,7 +137,7 @@ echo "==> $MODE stack build/up (release=$RELEASE)"
 if [ "$BUILD" = 1 ]; then
   timeout 1200 "${COMPOSE[@]}" build "${services[@]}"
 fi
-timeout 180 "${COMPOSE[@]}" up -d "${services[@]}"
+timeout 180 "${COMPOSE[@]}" up --no-build -d "${services[@]}"
 
 wait_http() {
   name=$1; url=$2; expected=$3
@@ -146,6 +152,11 @@ wait_http() {
     sleep 1
   done
   echo "ERROR: $name did not become ready at $url (last HTTP $code)" >&2
+  # Print the service's own log into the job log, so a refusal to start (a write server with no
+  # pack principal, okengine#1027) is diagnosable without downloading the evidence artifacts.
+  echo "---- last 80 log lines of $name ----" >&2
+  "${COMPOSE[@]}" logs --no-color --tail 80 "$name" >&2 2>&1 \
+    || "${COMPOSE[@]}" logs --no-color --tail 80 >&2 2>&1 || true
   return 1
 }
 

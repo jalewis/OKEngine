@@ -2,6 +2,12 @@
 # over a disposable copy of the frozen seed. Deliberately no gateway/model: the workflows are
 # deterministic and require no external credentials.
 # Ports bind to loopback only. Brought up + torn down by smoke-e2e.sh.
+#
+# Image names are SCOPED to the smoke stack (okengine-smoke-<svc>:<run id>) and must never equal a
+# name a deployment references (okengine#1033). Under the old okengine-reader/-mcp/-cockpit/
+# -review-write names, a local `smoke-e2e.sh` build on a deploy host silently moved the live
+# deployments' :latest tags to unreleased branch code. CI overrides these with the immutable
+# registry digests from ci/release_images.py. Pinned by tests/test_smoke_image_scope.py.
 name: okengine-smoke
 
 services:
@@ -11,7 +17,7 @@ services:
       dockerfile: okengine-reader/Dockerfile
       args:
         PYTHON_BASE_IMAGE: ${OKENGINE_PYTHON_BASE_IMAGE:-python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f}
-    image: okengine-reader
+    image: okengine-smoke-reader:${SMOKE_RUN_ID:-local}
     container_name: okengine-smoke-reader
     restart: "no"
     pids_limit: 256
@@ -34,7 +40,7 @@ services:
       args:
         PYTHON_BASE_IMAGE: ${OKENGINE_PYTHON_BASE_IMAGE:-python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f}
         NODE_BASE_IMAGE: ${OKENGINE_NODE_BASE_IMAGE:-node@sha256:4d676821dff059fd00d277ee4261ef34ea712317fed0737c03941481b5760c96}
-    image: okengine-mcp
+    image: okengine-smoke-mcp:${SMOKE_RUN_ID:-local}
     container_name: okengine-smoke-mcp
     restart: "no"
     user: "${SMOKE_UID:-1000}:${SMOKE_GID:-1000}"
@@ -67,7 +73,7 @@ services:
       args:
         PYTHON_BASE_IMAGE: ${OKENGINE_PYTHON_BASE_IMAGE:-python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f}
         NODE_BASE_IMAGE: ${OKENGINE_NODE_BASE_IMAGE:-node@sha256:4d676821dff059fd00d277ee4261ef34ea712317fed0737c03941481b5760c96}
-    image: okengine-cockpit
+    image: okengine-smoke-cockpit:${SMOKE_RUN_ID:-local}
     container_name: okengine-smoke-cockpit
     restart: "no"
     pids_limit: 256
@@ -95,7 +101,7 @@ services:
       dockerfile: okengine-mcp/Dockerfile.review
       args:
         PYTHON_BASE_IMAGE: ${OKENGINE_PYTHON_BASE_IMAGE:-python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f}
-    image: okengine-review-write
+    image: okengine-smoke-review-write:${SMOKE_RUN_ID:-local}
     container_name: okengine-smoke-review-write
     restart: "no"
     user: "${SMOKE_UID:-1000}:${SMOKE_GID:-1000}"
@@ -122,7 +128,7 @@ services:
       dockerfile: tests/e2e/smoke/Dockerfile.fault-gateway
       args:
         PYTHON_BASE_IMAGE: ${OKENGINE_PYTHON_BASE_IMAGE:-python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f}
-    image: okengine-fault-gateway
+    image: okengine-smoke-fault-gateway:${SMOKE_RUN_ID:-local}
     container_name: okengine-smoke-responses-gateway
     restart: "no"
     # The performance lane creates 100 simultaneous virtual users.  ThreadingHTTPServer uses one

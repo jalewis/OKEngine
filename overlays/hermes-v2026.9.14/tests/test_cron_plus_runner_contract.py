@@ -183,3 +183,42 @@ def test_pinned_runner_persists_failed_advertised_mcp_agent_job(
     record = _record(home, job_id)
     assert record["status"] == "failed"
     assert name in str(record["error"])
+
+
+def test_pinned_scheduler_tick_closes_another_lanes_orphaned_record(tmp_path):
+    """okengine#1010: a runner killed from outside must not hold its record `running` until the
+    same lane next starts. The real installed scheduler's tick closes it on the next tick, and
+    leaves a live worker's record alone."""
+    plugin = Path(os.environ["OKENGINE_CRON_PLUS_SOURCE"]).resolve()
+    actual = subprocess.run(["git", "rev-parse", "HEAD"], cwd=plugin,
+                            capture_output=True, text=True, check=True).stdout.strip()
+    assert actual == CRON_PLUS_SHA
+
+    home = tmp_path / "hermes-home"
+    runs = home / "cron-plus" / "runs"
+    (home / "cron-plus").mkdir(parents=True)
+    (home / "cron-plus" / "jobs.json").write_text(json.dumps({"jobs": []}) + "\n",
+                                                  encoding="utf-8")
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+
+    def running(lane: str, pid: int) -> Path:
+        path = runs / lane / "2026-10-08_09-15-21-000000.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"api": 1, "job_id": lane, "status": "running",
+                                    "ended_at": None, "pid": pid}), encoding="utf-8")
+        return path
+
+    killed = running("policy-audit", gone.pid)
+    live = running("entity-link", os.getpid())
+    env = dict(os.environ, HERMES_HOME=str(home), CRON_PLUS_DISABLED="1", PYTHONPATH=str(plugin))
+    tick = subprocess.run(
+        [sys.executable, "-c", "import json, scheduler; print(json.dumps(scheduler.tick()))"],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60, check=False)
+
+    assert tick.returncode == 0, tick.stderr[-1200:]
+    summary = json.loads(tick.stdout.strip().splitlines()[-1])
+    assert summary["reconciled_orphans"] == 1, summary
+    closed = json.loads(killed.read_text(encoding="utf-8"))
+    assert closed["status"] == "failed" and "orphaned" in closed["error"]
+    assert json.loads(live.read_text(encoding="utf-8"))["status"] == "running"

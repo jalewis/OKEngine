@@ -24,6 +24,8 @@ sys.path.insert(0, _HERE)
 sys.path.append(os.path.join(_HERE, ".."))
 sys.path.append(os.path.join(_HERE, "..", "..", "scripts", "cron"))
 import pred_lib as P   # noqa: E402
+from selection_manifest import (  # noqa: E402
+    page_selection_key, print_receipt_template, write_selection_manifest)
 
 MAX_PRED = int(os.environ.get("PREDICTION_REGRADE_MAX_PRED", "12"))
 MAX_SRC = int(os.environ.get("PREDICTION_REGRADE_MAX_SRC", "25"))
@@ -33,6 +35,8 @@ SKEPTIC_AFTER_RAISES = int(os.environ.get(
     "PREDICTION_RECOMMENDER_SKEPTIC_AFTER_RAISES",
     os.environ.get("OKENGINE_PREDICTIONS_RECOMMENDER_SKEPTIC_AFTER_RAISES", "2"),
 ))
+SELECTION_MANIFEST = Path(os.environ.get(
+    "OKENGINE_SELECTION_MANIFEST", str(P.selection_manifest_path("regrade"))))
 
 # The evidence-record direction vocabulary is DERIVED from the vault's composed schema — the
 # single source is the extension's schema fragment (schema/predictions.schema.yaml), which the
@@ -280,10 +284,12 @@ def main() -> int:
         print(f"  dependency mode: {edge_reason}")
 
     if edge_mode and not batch:
+        write_selection_manifest([], SELECTION_MANIFEST)   # a no-work run refreshes it too
         print("  → SKIP: no cited source changed since the watermark and no edge-less fallback is due")
         print(json.dumps({"wakeAgent": False}))
         return 0
     if not edge_mode and (not open_preds or (not recent_sources and not recs)):
+        write_selection_manifest([], SELECTION_MANIFEST)   # a no-work run refreshes it too
         print("  → SKIP: need both open predictions and recent sources")
         print(json.dumps({"wakeAgent": False}))
         return 0
@@ -298,6 +304,10 @@ def main() -> int:
         preds = (recommended + [(p, fm) for p, fm in open_preds if p not in seen])[:MAX_PRED]
         srcs = recent_sources[:MAX_SRC]
         print(f"  legacy batch: {len(preds)} open prediction(s) vs {len(srcs)} recent source(s)\n")
+    # One receipt item per prediction under review; sources are the evidence each one is read
+    # against, and "no new source bears" is a legitimate deferred-for-review disposition.
+    selected = [page_selection_key(p, v) for p, _ in preds]
+    manifest = write_selection_manifest(selected, SELECTION_MANIFEST)
     print("=== open predictions ===")
     print(  # nosec B608 - prose prompt, not a SQL query
         "For each source below that bears on a claim, update that prediction:\n"
@@ -354,6 +364,7 @@ def main() -> int:
             rel = p.relative_to(v).as_posix()
             print(f"  - {d}  `{rel}`  — {title}")
 
+    print_receipt_template(manifest)
     print(json.dumps({"wakeAgent": True}))
     return 0
 

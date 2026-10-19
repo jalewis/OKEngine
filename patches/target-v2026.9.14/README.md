@@ -9,7 +9,7 @@ The existing private CI patch-inventory
 command now audits this target registry as well as the live v0.18.2 set. Its
 final mode requires all decisions to be `ported` or `retired` and an actual
 checkout at the peeled target SHA to verify the 24-artifact/30-existing-file
-adapter threshold. The final set has 23 artifacts, touches exactly 35 files
+adapter threshold. The final set has 24 artifacts, touches exactly 35 files
 that exist in pristine v0.21.3, and retires patch 05 while preserving patch
 17's forced Responses behavior. Five governed exceptions exceed the adapter
 threshold: two record the #630
@@ -417,3 +417,22 @@ one call through the normal registry handler. Provider/model negatives keep
 OpenRouter and non-Flash DeepSeek jobs on the standard bridge. Dependency-
 complete private CI evidence and two authorized live scheduled writes with late
 reader readback remain required.
+
+`25-mcp-cron-plus-runner-child.patch` (okengine#1010) keeps cron-plus runners
+out of the stdio MCP child-PID delta. The transport identifies a new MCP
+server as the difference between the gateway's direct children before and
+after the spawn, and cron-plus runners are direct gateway children too (its
+ticker thread `Popen`s `<plugins>/cron-plus/runner.py`). A runner spawned during
+an MCP connect was ledgered as that server's process and killed by the
+stale-connection cleanup: on one gateway start, four runners died
+silently and their run records stayed `running`. The patch adds the
+`cron-plus/runner.py` argv marker to the native
+`_NON_MCP_CHILD_CMDLINE_MARKERS`, matched against `argv[1:]` like the TUI and
+jdtls markers. It is added from `tools/mcp_tool_discovery.py`, the gateway's
+MCP entry point and an already-carried surface, rather than by editing
+`tools/mcp_tool_lifecycle.py`, which would be a 36th touched upstream file and
+breach the governed budget. If upstream renames the marker tuple, discovery
+fails to import, which is loud. The real-process fixture (a pristine target
+without this patch fails three of its four cases) spawns a runner and an MCP stand-in, takes the
+real `/proc` snapshot delta, filters it with the real `psutil` argv check, and
+runs the real reaper: the stand-in is reaped and the runner survives.

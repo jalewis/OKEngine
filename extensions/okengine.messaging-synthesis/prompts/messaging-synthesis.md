@@ -13,7 +13,7 @@ invented wedges. No "sounds right" positioning that isn't backed by the corpus. 
 compounding-error risk on a synthesis-of-synthesis is real — the constraints below are the
 load-bearing defenses.
 
-Write via mcp__okengine_write_okengine_messaging_synthesis_messaging_synthesis__create_entity to the wiki-relative path the wake-gate specified,
+Write via mcp__OKENGINE_WRITER__create_entity to the wiki-relative path the wake-gate specified,
 frontmatter `type: messaging-brief, title: "Messaging brief — <date>", published: <date>,
 updated: <date>, prior_brief: "[[<prior-path-or-none>]]", inputs_read: [<wikilinks to each
 delta input>]`. Body:

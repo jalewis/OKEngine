@@ -45,7 +45,14 @@ def test_mcp2_server_fallback_registers_governed_tools(tmp_path, monkeypatch):
 
         def tool(self):
             def register(function):
-                self._tool_manager._tools[function.__name__] = SimpleNamespace(fn=function)
+                # Shaped like the real SDK's tool record (mcp 2.0.0 and 1.x alike): a published JSON
+                # schema and a pydantic argument model the governed-writer fence closes (okengine#879).
+                arg_model = type("ArgModel", (), {"model_config": {}, "rebuilt": False,
+                                                  "model_rebuild": classmethod(
+                                                      lambda cls, force=False: setattr(cls, "rebuilt", force))})
+                self._tool_manager._tools[function.__name__] = SimpleNamespace(
+                    fn=function, parameters={"type": "object", "properties": {}},
+                    fn_metadata=SimpleNamespace(arg_model=arg_model))
                 return function
             return register
 
@@ -61,6 +68,10 @@ def test_mcp2_server_fallback_registers_governed_tools(tmp_path, monkeypatch):
 
     assert isinstance(module.mcp, MCP2Server)
     assert "converge_entity" in module.mcp._tool_manager._tools
+    record = module.mcp._tool_manager._tools["converge_entity"]
+    assert record.parameters["additionalProperties"] is False          # okengine#879
+    assert record.fn_metadata.arg_model.model_config["extra"] == "forbid"
+    assert record.fn_metadata.arg_model.rebuilt is True
 
 
 def test_transactional_tools_preserve_writer_identity_precedence(tmp_path, monkeypatch):

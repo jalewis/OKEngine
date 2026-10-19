@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from json import JSONDecodeError
 import re
 import sys
 from datetime import datetime, timezone
@@ -114,7 +115,7 @@ def _namespace_owned_by_incoming_pack(host: Path, pack: Path, namespace: str) ->
     manifest = host / ".okengine" / "installed-domains" / f"{safe}.json"
     try:
         state = json.loads(manifest.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, JSONDecodeError):
         state = {}
     if namespace in (state.get("owned_namespaces") or {}):
         return True
@@ -230,6 +231,16 @@ def check_namespaces(host: Path, pack: Path, subtree: bool = False) -> None:
                 and _namespace_owned_by_incoming_pack(host, pack, ns)):
             add("INFO", "namespaces", f"'wiki/{ns}/' already installed (host partitioning "
                                       "matches the pack's) — no action")
+            continue
+        # This pack's OWN installed namespace whose partitioning changed upstream: ownership is
+        # the installed-domain record, not partitioning equality, so it is not a collision. Whether
+        # the change may land is install-domain --refresh's call (it applies a partitioning change
+        # only after proving no existing page moves); a plain re-install still refuses the drift.
+        if ns in host_part and _namespace_owned_by_incoming_pack(host, pack, ns):
+            add("WARN", "namespaces", f"'wiki/{ns}/' is this pack's installed namespace but its "
+                                      f"partitioning changed (host {host_part.get(ns)} vs pack "
+                                      f"{pack_part.get(ns)}) — install-domain --refresh applies it "
+                                      "only after proving no existing page moves")
             continue
         # The host schema does not declare this namespace, yet its directory exists and holds
         # nothing but this pack's own types: the pack was composed in ahead of its declaration
@@ -347,7 +358,7 @@ def _host_lane_scripts(host: Path, pack: Path) -> set[str]:
     path = host / "crons" / "domain-crons.json"
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, JSONDecodeError):
         return set()
     rows = raw.get("jobs", []) if isinstance(raw, dict) else raw
     return {Path(str(row.get("script"))).name for row in rows

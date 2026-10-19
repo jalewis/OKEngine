@@ -267,3 +267,166 @@ def test_page_predicates_and_limit_bounds_are_exact():
         assert any(sql.endswith("LIMIT 1") for sql, _ in pool.calls)
         assert any(sql.endswith(f"LIMIT {Q.MAX_LIMIT}") for sql, _ in pool.calls)
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stats", [{"unreadable": ["private: PermissionError"]},
+                                  '{"unreadable":["private: PermissionError"]}'])
+def test_legacy_incomplete_epoch_cannot_certify_a_typed_count(stats):
+    async def scenario():
+        set_pool(Pool(Record(epoch=1, finished_at="now", age_seconds=0, stats=stats)))
+        unchecked = await Q.projection_status()
+        assert unchecked["stats"] == stats
+        with pytest.raises(Q.ProjectionUnavailable, match="unreadable paths"):
+            await Q.count_pages()
+    asyncio.run(scenario())
+
+
+def test_deployment_guard_persists_the_verified_build_context():
+    deploy = (REPO / "scripts/deploy.sh").read_text()
+    assert 'scripts/engine_source_guard.py" "$ENGINE_DIR" --pack "$PACK"' in deploy
+
+
+# --- exact envelopes (okengine#566 critical floor) -------------------------------------------------
+# The read tools report a latency and fixed provenance counters. A scripted clock makes the whole
+# envelope exact, so a changed constant or operator in the latency arithmetic is visible. The start
+# (0.125 s) is below half the end time on purpose: with a start above half the end, `end % start`
+# equals `end - start` and a remainder would pass for a difference.
+
+def _scripted_clock(monkeypatch, *ticks):
+    remaining = list(ticks)
+
+    def monotonic():
+        return remaining.pop(0)
+
+    monkeypatch.setattr(Q, "time", types.SimpleNamespace(monotonic=monotonic))
+    return remaining
+
+
+HEALTH = dict(epoch=3, finished_at="now", age_seconds=5, corpus_epoch=0)
+
+
+def test_query_envelope_is_exact_including_latency_and_scan_counters(tmp_path, monkeypatch):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    remaining = _scripted_clock(monkeypatch, 0.125, 0.4004567)
+
+    async def scenario():
+        set_pool(Pool(Record(**HEALTH), [Record(path="entities/a.md")], 1))
+        return await Q.find_links(target="entities/a", limit=5)
+
+    result = asyncio.run(scenario())
+    assert remaining == [], "the latency is measured from exactly one start and one end tick"
+    assert result == {
+        "results": [{"path": "entities/a.md"}], "matched": 1, "returned": 1, "truncated": False,
+        "filters_applied": {"target": "entities/a"}, "object_classes_searched": ["links"],
+        "projection_epoch": 3, "projection_age_seconds": 5, "limit": 5,
+        "query_latency_ms": 275.457, "projection_hits": 1, "pages_scanned": 0,
+        "bytes_parsed": 0, "corpus_lag": 0,
+    }
+
+
+def test_count_envelope_is_exact_including_latency_and_the_frontmatter_filter(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    remaining = _scripted_clock(monkeypatch, 0.125, 0.4004567)
+
+    async def scenario():
+        set_pool(Pool(Record(**HEALTH), [], 7))
+        return await Q.count_pages("entities", frontmatter={"region": "EU"})
+
+    result = asyncio.run(scenario())
+    assert remaining == []
+    assert result == {
+        "count": 7, "complete": True,
+        "filters_applied": {"namespace": "entities", "type": "", "status": "",
+                            "include_tombstoned": False, "frontmatter": {"region": "EU"},
+                            "published_after": "", "published_before": "",
+                            "updated_after": "", "updated_before": ""},
+        "object_classes_searched": ["pages"], "projection_epoch": 3,
+        "projection_age_seconds": 5, "corpus_lag": 0, "projection_hits": 1,
+        "pages_scanned": 0, "bytes_parsed": 0, "query_latency_ms": 275.457,
+    }
+
+
+def test_page_meta_envelope_is_exact_including_latency(tmp_path, monkeypatch):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    remaining = _scripted_clock(monkeypatch, 0.125, 0.4004567)
+
+    async def scenario():
+        set_pool(Pool(Record(**HEALTH), [Record(path="entities/a.md", title="A")], 0))
+        return await Q.get_page_meta("entities/a")
+
+    result = asyncio.run(scenario())
+    assert remaining == []
+    assert result == {
+        "path": "entities/a.md", "title": "A", "found": True, "projection_epoch": 3,
+        "projection_age_seconds": 5, "corpus_lag": 0, "projection_hits": 1,
+        "pages_scanned": 0, "bytes_parsed": 0, "query_latency_ms": 275.457,
+    }
+
+
+def test_a_count_below_the_returned_rows_is_not_reported_as_truncated():
+    # The count and the row fetch are separate statements, so a page removed between them can
+    # leave `matched` below the rows returned; only MORE matches than rows is a truncation.
+    result = Q.envelope({"epoch": 1, "age_seconds": 0}, [{"x": 1}, {"x": 2}], 1, 5, {}, ["pages"])
+    assert result["truncated"] is False
+
+
+def _with_live_epoch(tmp_path, monkeypatch, epoch: str):
+    state = tmp_path / ".okengine/corpus"
+    state.mkdir(parents=True)
+    (state / "epoch").write_text(epoch)
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+
+
+def test_a_projection_without_a_recorded_epoch_lags_a_live_corpus_at_epoch_one(
+        tmp_path, monkeypatch):
+    _with_live_epoch(tmp_path, monkeypatch, "1")
+
+    async def scenario():
+        set_pool(Pool(Record(epoch=1, finished_at="now", age_seconds=0)))
+        assert (await Q.projection_status())["corpus_lag"] == 1
+        with pytest.raises(Q.ProjectionUnavailable, match="lags .* by 1 epoch"):
+            await Q.projection_status(checked=True)
+
+    asyncio.run(scenario())
+
+
+def test_a_projection_ahead_of_the_live_epoch_reports_no_lag(tmp_path, monkeypatch):
+    _with_live_epoch(tmp_path, monkeypatch, "3")
+
+    async def scenario():
+        set_pool(Pool(Record(epoch=1, corpus_epoch=5, finished_at="now", age_seconds=0)))
+        status = await Q.projection_status(checked=True)
+        assert status["corpus_lag"] == 0 and status["current_corpus_epoch"] == 3
+
+    asyncio.run(scenario())
+
+
+def test_an_unknown_age_is_zero_seconds_old(tmp_path, monkeypatch):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+
+    async def scenario():
+        Q.MAX_AGE_HOURS = 0
+        set_pool(Pool(Record(epoch=1, finished_at="now", age_seconds=None)))
+        assert (await Q.projection_status(checked=True))["stale"] is False
+        Q.MAX_AGE_HOURS = -1  # every age is stale; the refusal reports the age it measured
+        with pytest.raises(Q.ProjectionUnavailable, match=r"projection is 0\.0h old"):
+            await Q.projection_status(checked=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(("age_seconds", "limit_hours", "reported"),
+                         [(180, 0.01, "0.1h"), (25_019, 6, "6.9h")])
+def test_the_refusal_reports_the_age_in_hours_to_one_decimal(
+        tmp_path, monkeypatch, age_seconds, limit_hours, reported):
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+
+    async def scenario():
+        Q.MAX_AGE_HOURS = limit_hours
+        set_pool(Pool(Record(epoch=1, finished_at="now", age_seconds=age_seconds)))
+        with pytest.raises(Q.ProjectionUnavailable) as refused:
+            await Q.projection_status(checked=True)
+        assert f"projection is {reported} old" in str(refused.value)
+
+    asyncio.run(scenario())

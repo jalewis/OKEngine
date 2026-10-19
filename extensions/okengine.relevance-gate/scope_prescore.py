@@ -23,6 +23,12 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Engine cron libs, appended so this extension's own modules keep precedence: staged one level
+# up (/opt/data/scripts/ holds /opt/data/scripts/<id>/), or scripts/cron/ in a repo checkout.
+_ENGINE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(_ENGINE_ROOT))
+sys.path.append(str(_ENGINE_ROOT.parent / "scripts" / "cron"))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import scope_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
@@ -107,7 +113,7 @@ def main() -> int:
         if len(ambiguous) > 50:
             L.append(f"- … and {len(ambiguous) - 50} more")
         L.append("")
-    dash.write_text("\n".join(L) + "\n", encoding="utf-8")
+    generated_page.write(dash, "\n".join(L) + "\n")
 
     print(f"scope-prescore: {seen} scanned · {kept_in} in · {len(flagged)} flagged · "
           f"{len(ambiguous)} ambiguous -> dashboards/scope-audit.md")

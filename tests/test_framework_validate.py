@@ -936,6 +936,56 @@ def test_cross_tier_duplicate_extension_fails_validate(tmp_path):  # invariant-a
     assert any("demo.dup" in d and "multiple tiers" in d for d in fails), r.rows
 
 
+def _write_manifest(root, ext_id, text=None):
+    d = root / ext_id
+    d.mkdir(parents=True, exist_ok=True)
+    man = {"id": ext_id, "kind": "operation", "version": "0.1.0", "name": ext_id,
+           "requires": {"engine": ">=0.3.0"}, "trust": "in-gateway",
+           "capabilities": {"read": ["wiki/**"], "write": ["x/**"]}}
+    (d / "extension.yaml").write_text(text if text is not None else yaml.safe_dump(man),
+                                      encoding="utf-8")
+
+
+@pytest.mark.parametrize("fault, expected", [
+    ("reserved", "reserved id 'okengine.squat'"),
+    ("duplicate", "multiple tiers"),
+    ("unparseable", "extension.yaml"),
+])
+def test_discovery_faults_fail_validate_without_an_enabled_map(tmp_path, fault, expected):
+    """okengine#991: a pack with no .okengine/extensions.yaml used to skip discovery entirely at
+    `framework validate`, so a reserved-namespace squat, a cross-tier duplicate id, or a broken
+    manifest first failed at deploy step 5 — after step 4 had recreated every container.
+    resolve_for_pack (stage-plan) reports discover() errors regardless of the enabled map, so the
+    pre-deploy gate must too."""
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    if fault == "reserved":
+        _write_manifest(pack / "extensions", "okengine.squat")
+    elif fault == "duplicate":
+        _write_manifest(pack / "extensions", "demo.dup")
+        _write_manifest(pack / ".okengine" / "extensions", "demo.dup")
+    else:
+        _write_manifest(pack / "extensions", "demo.broken", text="id: [unterminated\n")
+    assert not (pack / ".okengine" / "extensions.yaml").exists()
+    v = _load("framework_validate", VAL)
+    r = v.Report()
+    v.check_enabled_extensions_resolve(pack, r)
+    fails = [d for s, _c, d in r.rows if s == "FAIL"]
+    assert any(expected in d for d in fails), r.rows
+    assert v.main([str(pack), "--quiet"]) == 1
+
+
+def test_clean_discovery_without_an_enabled_map_reports_nothing(tmp_path):
+    """The no-enabled-map path stays silent for a pack whose extensions all discover cleanly."""
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    _write_manifest(pack / "extensions", "demo.fine")
+    v = _load("framework_validate", VAL)
+    r = v.Report()
+    v.check_enabled_extensions_resolve(pack, r)
+    assert r.rows == []
+
+
 def test_owns_must_cover_non_core_schema_types_and_namespaces(tmp_path):  # invariant-audit #351
     """compose-preview builds a pack's schema fragment from pack.yaml owns ONLY, so a non-core type
     or partitioning namespace present in schema.yaml but absent from owns is invisible to the
@@ -1335,3 +1385,147 @@ def test_shadowing_reports_undetectable_when_the_engine_cron_dir_is_missing(tmp_
     assert any(s == "WARN" and "UNDETECTABLE" in d for s, d in shadow_rows), shadow_rows
     assert not any(s == "OK" and "no pack script shadows" in d for s, d in shadow_rows), (
         "must not claim a clean result it could not measure")
+
+
+# --- okengine#816: a composed host declares its guests' types and namespaces because
+# install-domain merged them in. Reporting those as unaccounted-for left only one way to silence
+# the warning — adding a guest's type to the HOST's owns.types, a false claim, and exactly the
+# double-declared ownership okengine#811 found live (the host claiming 6 of a guest's 8 types).
+
+
+def _composed_host(tmp_path, *, manifest=True, host_also_claims=False):
+    v = _load("framework_validate", VAL)
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    sch = yaml.safe_load((pack / "schema.yaml").read_text()) or {}
+    types = sch.get("types") if isinstance(sch.get("types"), dict) else {}
+    types["guest-thing"] = {"required": ["name"], "owner": "okpack-guest"}
+    sch["types"] = types
+    part = sch.get("partitioning") if isinstance(sch.get("partitioning"), dict) else {}
+    nss = part.get("namespaces") if isinstance(part.get("namespaces"), dict) else {}
+    nss["guest-things"] = {"strategy": "flat"}
+    part["namespaces"] = nss
+    sch["partitioning"] = part
+    (pack / "schema.yaml").write_text(yaml.safe_dump(sch), encoding="utf-8")
+    if host_also_claims:
+        pm = yaml.safe_load((pack / "pack.yaml").read_text()) or {}
+        owns = pm.get("owns") if isinstance(pm.get("owns"), dict) else {}
+        owns["types"] = (owns.get("types") or []) + ["guest-thing"]
+        pm["owns"] = owns
+        (pack / "pack.yaml").write_text(yaml.safe_dump(pm), encoding="utf-8")
+    if manifest:
+        d = pack / ".okengine" / "installed-domains"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "okpack-guest.json").write_text(json.dumps({
+            "manifest_version": 1, "pack": "okpack-guest", "pack_version": "0.1.0",
+            "owned_namespaces": {"guest-things": {"strategy": "flat"}}}))
+    return v, pack
+
+
+def _warn_text(v, pack):
+    r = v.Report()
+    v.check_owns_covers_schema(pack, r)
+    assert not [d for s, c, d in r.rows if s == "FAIL"], r.rows
+    return " | ".join(d for s, c, d in r.rows if s == "WARN")
+
+
+def test_a_guests_type_and_namespace_are_accounted_for_by_its_manifest(tmp_path):
+    v, pack = _composed_host(tmp_path)
+    warns = _warn_text(v, pack)
+    assert "guest-thing" not in warns, warns
+    assert "guest-things" not in warns, warns
+
+
+def test_without_the_manifest_they_are_unaccounted_for_again(tmp_path):
+    """The manifest is the evidence. Absent it, the pack really is declaring something it does not
+    own, and the original warning is right."""
+    v, pack = _composed_host(tmp_path, manifest=False)
+    warns = _warn_text(v, pack)
+    assert "guest-thing" in warns and "owns.types" in warns, warns
+    assert "guest-things" in warns and "owns.namespaces" in warns, warns
+
+
+def test_ownership_claimed_by_both_the_host_and_a_guest_is_reported(tmp_path):
+    """Composed packs must own disjointly. Nothing detected this before, which is how a live host
+    came to claim 6 of a guest's 8 types (okengine#811)."""
+    v, pack = _composed_host(tmp_path, host_also_claims=True)
+    warns = _warn_text(v, pack)
+    assert "BOTH claim" in warns and "guest-thing" in warns, warns
+
+
+def test_a_standalone_pack_is_unaffected(tmp_path):
+    """No installed-domains dir: behaviour identical to before this existed."""
+    v, pack = _composed_host(tmp_path, manifest=False)
+    assert not (pack / ".okengine" / "installed-domains").exists()
+    warns = _warn_text(v, pack)
+    assert "BOTH claim" not in warns, warns
+
+
+def test_a_manifest_without_owned_namespaces_still_grants_its_types(tmp_path):
+    """Manifests written before #270 recorded no owned_namespaces. The pack is still installed, so
+    its TYPES are accounted for by composed-schema `owner:`; only its namespaces are unknown."""
+    v, pack = _composed_host(tmp_path, manifest=False)
+    d = pack / ".okengine" / "installed-domains"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "okpack-guest.json").write_text(json.dumps(
+        {"manifest_version": 1, "pack": "okpack-guest", "pack_version": "0.1.0"}))
+    warns = _warn_text(v, pack)
+    assert "guest-thing" not in warns.replace("guest-things", ""), warns
+    assert "guest-things" in warns, "a namespace with no record must stay unaccounted-for"
+
+
+def test_a_malformed_manifest_does_not_grant_ownership(tmp_path):
+    v, pack = _composed_host(tmp_path, manifest=False)
+    d = pack / ".okengine" / "installed-domains"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "broken.json").write_text("{ not json")
+    (d / "list.json").write_text(json.dumps(["not", "a", "mapping"]))
+    warns = _warn_text(v, pack)
+    assert "guest-thing" in warns, warns
+
+
+@pytest.mark.parametrize("contracted", [True, False])
+def test_a_pack_lane_naming_an_over_length_writer_fails_validate(tmp_path, contracted):
+    """okengine#840. A derived writer name is bounded, so the live risk at the pack gate is a
+    writer a lane names EXPLICITLY -- and an uncontracted lane can do that too."""
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    _percheck_cron(pack, script_body="print('select')\n")
+    path = pack / "crons/domain-crons.json"
+    jobs = json.loads(path.read_text())
+    long_writer = "okengine-write-" + "x" * 60
+    jobs[0]["enabled_toolsets"] = list(jobs[0].get("enabled_toolsets") or []) + [long_writer]
+    if not contracted:
+        jobs[0].pop("output_contract", None)
+        jobs[0]["output_contract_exempt"] = "test: an uncontracted lane"
+    path.write_text(json.dumps(jobs))
+    rows = _load("framework_validate", VAL).validate(pack).rows
+    assert any(s == "FAIL" and c == "cron write-server name" and long_writer in d
+               for s, c, d in rows), rows
+
+
+def test_a_pack_lane_with_its_derived_writer_passes_the_name_gate(tmp_path):
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    _percheck_cron(pack, script_body="print('select')\n")
+    rows = _load("framework_validate", VAL).validate(pack).rows
+    assert not any(s == "FAIL" and c == "cron write-server name" for s, c, _d in rows), rows
+
+
+@pytest.mark.parametrize("value,ok", [
+    ("update_entity", False), ([], False), (["update_entiy"], False),
+    (["update_entity", "append_to_section"], True),
+])
+def test_a_pack_lane_write_tools_is_validated_at_the_pack_gate(tmp_path, value, ok):
+    """okengine#1044 [8]/[18]: the earliest gate refuses a malformed `write_tools` that the deploy
+    path used to read as the full tool surface (or as an allowlist matching nothing)."""
+    pack = tmp_path / "pack"
+    _scaffold(pack)
+    _percheck_cron(pack, script_body="print('select')\n")
+    path = pack / "crons/domain-crons.json"
+    jobs = json.loads(path.read_text())
+    jobs[0]["write_tools"] = value
+    path.write_text(json.dumps(jobs))
+    rows = _load("framework_validate", VAL).validate(pack).rows
+    failed = [d for s, c, d in rows if s == "FAIL" and c == "cron write_tools"]
+    assert (failed == []) is ok, rows

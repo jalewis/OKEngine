@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 
 import yaml
+from yaml import YAMLError
 
 _ENGINE = Path(__file__).resolve().parent.parent
 _REVIEW_SPEC = importlib.util.spec_from_file_location(
@@ -68,7 +69,7 @@ def predictions_enabled(pack_dir: Path) -> bool:
     path = pack_dir / ".okengine" / "extensions.yaml"
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError):
+    except (OSError, YAMLError):
         return False
     enabled = data.get("enabled") if isinstance(data, dict) else None
     return isinstance(enabled, dict) and "okengine.predictions" in enabled

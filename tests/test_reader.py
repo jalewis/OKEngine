@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import re
 import sys
 from pathlib import Path
@@ -570,3 +571,171 @@ def test_editing_flag_defaults_on_and_honors_falsey(tmp_path, monkeypatch):
     assert _load(tmp_path, monkeypatch)._EDITING is False
     monkeypatch.setenv("OKENGINE_EDITING", "1")
     assert _load(tmp_path, monkeypatch)._EDITING is True
+
+
+# ── okengine#1024: the embed and link-title memos revalidate instead of living forever ─────────
+class _Clock:
+    """A monotonic clock the test advances by hand."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def test_a_link_written_before_its_target_resolves_once_the_target_exists(tmp_path, monkeypatch):
+    """Red before #1024: a miss was memoized for the process lifetime, so a citation written
+    before its page existed rendered as the bare slug until the container was recreated."""
+    (tmp_path / "wiki" / "entities" / "a").mkdir(parents=True)
+    m = _load(tmp_path, monkeypatch)
+    clock = _Clock()
+    monkeypatch.setattr(m._LINK_TITLE_CACHE, "_clock", clock)
+    # The basename index runs on the same monotonic clock in production (okengine#1044 [24]).
+    monkeypatch.setattr(m.rendering._BASENAME_INDEX, "_clock", clock)
+    assert m._link_title("apt29") is None
+    (tmp_path / "wiki" / "entities" / "a" / "apt29.md").write_text(
+        "---\ntype: actor\ntitle: APT29\n---\nbody\n", encoding="utf-8")
+    assert m._link_title("apt29") is None, "a miss is remembered inside its TTL"
+    clock.now += m._LINK_TITLE_CACHE.miss_ttl
+    assert m._link_title("apt29") == "APT29", "an expired miss is resolved again"
+
+
+def test_a_retitled_page_shows_its_new_title(tmp_path, monkeypatch):
+    """Red before #1024: the first title read was served for the process lifetime."""
+    page = tmp_path / "wiki" / "entities" / "a" / "apt29.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("---\ntype: actor\ntitle: Old Name\n---\nbody\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    assert m._link_title("entities/a/apt29") == "Old Name"
+    page.write_text("---\ntype: actor\ntitle: The New Name\n---\nbody\n", encoding="utf-8")
+    assert m._link_title("entities/a/apt29") == "The New Name"
+
+
+def test_an_embed_of_a_reshelved_page_follows_it(tmp_path, monkeypatch):
+    """Red before #1024: the memo kept the page's old path, so after a reshelve the embed read a
+    file that no longer existed and rendered 'unreadable embed'."""
+    old = tmp_path / "wiki" / "entities" / "apt29.md"
+    old.parent.mkdir(parents=True)
+    old.write_text("---\ntype: actor\n---\nEMBEDDED-BODY\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    assert "EMBEDDED-BODY" in m._resolve_embeds("![[apt29]]")
+    new = tmp_path / "wiki" / "entities" / "a" / "apt29.md"
+    new.parent.mkdir()
+    old.rename(new)
+    out = m._resolve_embeds("![[apt29]]")
+    assert "EMBEDDED-BODY" in out and "unreadable" not in out
+
+
+def test_a_link_title_follows_an_entity_page_created_after_the_first_render(tmp_path, monkeypatch):
+    """okengine#1042 [30], the finder's replay: `apt29` first resolved to the only page with that
+    slug, an observation copy. An entity-backfill lane then wrote the entity page, which the
+    resolver prefers. The cached hit revalidated only the observation file, so the link kept the
+    observation's title until the reader restarted. A hit is re-resolved after its TTL."""
+    obs = tmp_path / "wiki" / "observations" / "src" / "apt29.md"
+    obs.parent.mkdir(parents=True)
+    obs.write_text("---\ntype: observation\ntitle: Observation copy\n---\nbody\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    clock = _Clock()
+    monkeypatch.setattr(m._LINK_TITLE_CACHE, "_clock", clock)
+    # The basename index runs on the same monotonic clock in production (okengine#1044 [24]).
+    monkeypatch.setattr(m.rendering._BASENAME_INDEX, "_clock", clock)
+    assert m._link_title("apt29") == "Observation copy"
+    ent = tmp_path / "wiki" / "entities" / "a" / "apt29.md"
+    ent.parent.mkdir(parents=True)
+    ent.write_text("---\ntype: actor\ntitle: APT29 entity\n---\nbody\n", encoding="utf-8")
+    clock.now += 3600.0   # well past the resolution TTL
+    assert m._link_title("apt29") == "APT29 entity"
+
+
+def test_an_embed_whose_slug_became_ambiguous_stops_resolving(tmp_path, monkeypatch):
+    """okengine#1042 [38]: a second non-entity page with the same slug makes a fresh process
+    render the embed missing (no unique canonical page). The long-running reader kept embedding
+    the first page; after the TTL it agrees with a fresh process."""
+    first = tmp_path / "wiki" / "concepts" / "x" / "dup.md"
+    first.parent.mkdir(parents=True)
+    first.write_text("---\ntype: concept\n---\nFIRST\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    clock = _Clock()
+    monkeypatch.setattr(m._EMBED_PATH_CACHE, "_clock", clock)
+    # The basename index runs on the same monotonic clock in production (okengine#1044 [24]).
+    monkeypatch.setattr(m.rendering._BASENAME_INDEX, "_clock", clock)
+    assert "FIRST" in m._resolve_embeds("![[dup]]")
+    second = tmp_path / "wiki" / "concepts" / "y" / "dup.md"
+    second.parent.mkdir(parents=True)
+    second.write_text("---\ntype: concept\n---\nSECOND\n", encoding="utf-8")
+    clock.now += 3600.0   # well past the resolution TTL
+    assert m._resolve_basename("dup.md") is None, "a fresh process resolves nothing"
+    out = m._resolve_embeds("![[dup]]")
+    assert "FIRST" not in out and "SECOND" not in out, out
+
+
+def test_an_embed_written_before_its_target_resolves_once_the_target_exists(tmp_path, monkeypatch):
+    (tmp_path / "wiki").mkdir()
+    m = _load(tmp_path, monkeypatch)
+    clock = _Clock()
+    monkeypatch.setattr(m._EMBED_PATH_CACHE, "_clock", clock)
+    # The basename index runs on the same monotonic clock in production (okengine#1044 [24]).
+    monkeypatch.setattr(m.rendering._BASENAME_INDEX, "_clock", clock)
+    assert "missing embed" in m._resolve_embeds("![[later]]")
+    (tmp_path / "wiki" / "x").mkdir()
+    (tmp_path / "wiki" / "x" / "later.md").write_text("---\ntype: x\n---\nLATER\n", encoding="utf-8")
+    clock.now += m._EMBED_PATH_CACHE.miss_ttl
+    assert "LATER" in m._resolve_embeds("![[later]]")
+
+
+def test_the_reader_lookup_memos_are_bounded(tmp_path, monkeypatch):
+    """Red before #1024: plain dicts that grew with every distinct link ever rendered."""
+    (tmp_path / "wiki").mkdir()
+    m = _load(tmp_path, monkeypatch)
+    for cache in (m._LINK_TITLE_CACHE, m._EMBED_PATH_CACHE):
+        monkeypatch.setattr(cache, "maxsize", 3)
+    for n in range(10):
+        m._link_title(f"nope-{n}")
+        m._embed_rglob(f"nope-{n}.md")
+    assert len(m._LINK_TITLE_CACHE) == 3 and len(m._EMBED_PATH_CACHE) == 3
+
+
+def test_a_link_title_lookup_that_cannot_read_yields_no_title(tmp_path, monkeypatch):
+    """An unreadable page or an unresolvable target falls back to the slug, never an error."""
+    page = tmp_path / "wiki" / "entities" / "apt29.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("---\ntitle: APT29\n---\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    assert m._link_title("bad\x00target") is None
+
+    def unreadable(path):
+        raise OSError(5, "EIO")
+
+    monkeypatch.setattr(m.rendering, "_READ_HEAD", unreadable)
+    monkeypatch.setattr(m, "_read_head", unreadable)
+    assert m._link_title("entities/apt29") is None
+
+
+def test_re_resolving_a_link_heavy_page_after_the_ttl_walks_the_vault_once(tmp_path, monkeypatch):
+    """okengine#1044 [24]: the hits one render creates expire together, and each basename
+    re-resolution was its own rglob. Measured on a live 91k-file vault: a 203-link page re-rendered
+    after RESOLVE_TTL took 32 s (cold 37 s), every five minutes. Counted here as directory listings:
+    the post-TTL render may list each directory once (one walk), not once per link."""
+    wiki = tmp_path / "wiki"
+    slugs = [f"actor-{n:03d}" for n in range(60)]
+    for s in slugs:
+        p = wiki / "entities" / s[0] / s[6] / f"{s}.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"---\ntype: actor\ntitle: T {s}\n---\nbody\n", encoding="utf-8")
+    dirs = sum(1 for d in wiki.rglob("*") if d.is_dir()) + 1
+    m = _load(tmp_path, monkeypatch)
+    clock = _Clock()
+    monkeypatch.setattr(m._LINK_TITLE_CACHE, "_clock", clock)
+    monkeypatch.setattr(m.rendering._BASENAME_INDEX, "_clock", clock)
+    assert [m._link_title(s) for s in slugs] == [f"T {s}" for s in slugs]
+    clock.now += m._LINK_TITLE_CACHE.resolve_ttl
+    listings = []
+    real = os.scandir
+
+    def counted(path=None):
+        listings.append(path)
+        return real(path) if path is not None else real()
+    monkeypatch.setattr(os, "scandir", counted)
+    assert [m._link_title(s) for s in slugs] == [f"T {s}" for s in slugs]
+    assert len(listings) <= dirs, f"{len(listings)} directory listings for {dirs} directories"

@@ -1,0 +1,124 @@
+diff --git a/jobs.py b/jobs.py
+index 5861efb..c20c574 100644
+--- a/jobs.py
++++ b/jobs.py
+@@ -12,6 +12,7 @@ Schedule kinds:
+ """
+ from __future__ import annotations
+ 
++import contextlib
+ import fcntl
+ import json
+ import logging
+@@ -36,6 +37,12 @@ CRON_PLUS_HOME = HERMES_HOME / "cron-plus"
+ # (deployment-validate / health_export) turn this into a RED signal instead of silence.
+ STALLED_SENTINEL = CRON_PLUS_HOME / ".scheduler-stalled"
+ JOBS_FILE = CRON_PLUS_HOME / "jobs.json"
++# okengine#850: every writer REPLACES jobs.json (tempfile + os.replace), so a flock taken on the
++# jobs.json inode is a lock on a file about to stop being jobs.json -- two writers each "held the
++# lock" on different inodes and excluded nothing. A deploy's write was lost to the scheduler's
++# read-modify-write that way. The lock lives on this sidecar instead, which is never replaced; the
++# deploy script takes the same one.
++JOBS_LOCK_FILE = CRON_PLUS_HOME / "jobs.json.lock"
+ 
+ # croniter is part of the Hermes venv (the built-in scheduler uses it).
+ try:
+@@ -113,6 +120,27 @@ def _prior_owner(path) -> "tuple[int, int] | None":
+         return None
+ 
+ 
++@contextlib.contextmanager
++def _jobs_lock(mode: int):
++    """Hold ``mode`` (LOCK_SH / LOCK_EX) on the stable sidecar lock for the job store.
++
++    Opened read-only: flock needs no write access, so a lock file a root `docker exec` created can
++    never lock the service uid out of its own scheduler (okengine#197's failure shape)."""
++    CRON_PLUS_HOME.mkdir(parents=True, exist_ok=True)
++    created = not JOBS_LOCK_FILE.exists()
++    fd = os.open(str(JOBS_LOCK_FILE), os.O_RDONLY | os.O_CREAT, 0o644)
++    try:
++        if created:
++            _preserve_owner(JOBS_LOCK_FILE)
++        fcntl.flock(fd, mode)
++        yield
++    finally:
++        try:
++            fcntl.flock(fd, fcntl.LOCK_UN)
++        finally:
++            os.close(fd)
++
++
+ def _ensure_jobs_file() -> None:
+     CRON_PLUS_HOME.mkdir(parents=True, exist_ok=True)
+     if not JOBS_FILE.exists():
+@@ -128,12 +156,8 @@ def _new_id() -> str:
+ def load_jobs() -> list[dict]:
+     _ensure_jobs_file()
+     try:
+-        with open(JOBS_FILE, "r") as fd:
+-            fcntl.flock(fd, fcntl.LOCK_SH)
+-            try:
+-                data = json.load(fd)
+-            finally:
+-                fcntl.flock(fd, fcntl.LOCK_UN)
++        with _jobs_lock(fcntl.LOCK_SH), open(JOBS_FILE, "r") as fd:
++            data = json.load(fd)
+     except (OSError, json.JSONDecodeError) as e:
+         # okengine#197: an unreadable store previously logged once and returned [] — the ticker
+         # then saw "no jobs due" forever and the outage was invisible. Scream, and drop a
+@@ -160,21 +184,14 @@ def save_jobs(jobs: list[dict]) -> None:
+     ``locked_modify()`` instead so the load+modify+save runs under a
+     single lock — otherwise two concurrent updaters can lose writes."""
+     _ensure_jobs_file()
+-    fd = os.open(str(JOBS_FILE), os.O_RDWR)
+-    try:
+-        fcntl.flock(fd, fcntl.LOCK_EX)
++    with _jobs_lock(fcntl.LOCK_EX):
+         _write_jobs_atomic(jobs)
+-    finally:
+-        try:
+-            fcntl.flock(fd, fcntl.LOCK_UN)
+-        finally:
+-            os.close(fd)
+ 
+ 
+ def _write_jobs_atomic(jobs: list[dict]) -> None:
+     """Write {jobs} to JOBS_FILE atomically (tempfile + rename).
+ 
+-    Caller is responsible for holding the exclusive lock on JOBS_FILE.
++    Caller is responsible for holding ``_jobs_lock(fcntl.LOCK_EX)``.
+     """
+     tmp = tempfile.NamedTemporaryFile(
+         mode="w", dir=str(CRON_PLUS_HOME),
+@@ -198,7 +215,7 @@ def _write_jobs_atomic(jobs: list[dict]) -> None:
+ 
+ 
+ def locked_modify(fn):
+-    """Run ``fn(jobs)`` under a single exclusive lock on JOBS_FILE.
++    """Run ``fn(jobs)`` under a single exclusive lock on the job store (``_jobs_lock``).
+ 
+     ``fn`` receives the current job list (mutable) and returns either:
+         - the (possibly mutated) list to persist, OR
+@@ -210,9 +227,7 @@ def locked_modify(fn):
+     save A, save B — A's changes lost).
+     """
+     _ensure_jobs_file()
+-    fd = os.open(str(JOBS_FILE), os.O_RDWR)
+-    try:
+-        fcntl.flock(fd, fcntl.LOCK_EX)
++    with _jobs_lock(fcntl.LOCK_EX):
+         # Re-read inside the lock so we see the latest state
+         try:
+             with open(JOBS_FILE, "r") as f:
+@@ -231,11 +246,6 @@ def locked_modify(fn):
+         if jobs_to_save is not None:
+             _write_jobs_atomic(jobs_to_save)
+         return return_value
+-    finally:
+-        try:
+-            fcntl.flock(fd, fcntl.LOCK_UN)
+-        finally:
+-            os.close(fd)
+ 
+ 
+ # ─── Schedule eval ────────────────────────────────────────────────────

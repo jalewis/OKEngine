@@ -62,6 +62,23 @@ def test_map_heuristic_and_field(tmp_path, monkeypatch):
     assert "0.87" in dash
 
 
+
+def test_a_field_below_a_long_frontmatter_list_is_read(tmp_path, monkeypatch):
+    """okengine#993: the map parsed a 4000-char window, so a concept whose `evolution` sat below a
+    long list lost its declared field and title and was placed by the heuristic."""
+    c = tmp_path / "wiki" / "concepts"
+    page = c / "l" / "long-concept.md"
+    page.parent.mkdir(parents=True)
+    aliases = "".join(f"- an alias long enough to fill the window {i:04d}\n" for i in range(120))
+    page.write_text(f"---\ntype: concept\naliases:\n{aliases}title: Long Concept\n"
+                    "evolution: commodity\n---\n# c\n")
+    assert page.read_text().index("evolution:") > 4000
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    viz = _load("build_wardley_map_long", EXT / "build_wardley_map.py")
+    assert viz.main() == 0
+    dash = (tmp_path / "wiki" / "dashboards" / "wardley.md").read_text()
+    assert "Long Concept" in dash and "0.87" in dash and "HEURISTIC" not in dash
+
 def test_anchor_scopes_to_neighborhood(tmp_path, monkeypatch):
     """VIZ_ANCHOR: the map keeps only concepts the anchor links directly + concepts linked from
     entities the anchor links (1 hop); global hub concepts outside that neighborhood drop out."""

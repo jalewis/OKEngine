@@ -25,9 +25,9 @@ def load():
 def jobs():
     return [
         {"id": "eng-id", "name": "engine", "schedule": {"expr": "0 * * * *"},
-         "max_iterations": 8},
+         "max_iterations": 8, "prompt": "Run the engine lane."},
         {"id": "dom-id", "name": "domain", "pack": "pack",
-         "schedule": {"expr": "5 * * * *"}, "max_iterations": 8},
+         "schedule": {"expr": "5 * * * *"}, "max_iterations": 8, "prompt": "Run the domain lane."},
     ]
 
 
@@ -36,6 +36,7 @@ def configure(module, tmp_path):
     module.JOBS.write_text(json.dumps({"jobs": jobs()}))
     module.TIERS = tmp_path / "cron-tiers.yaml"
     module.TIERS.write_text("engine: [engine]\nengine-template: []\ndomain: []\n")
+    module.PACK_DIR = tmp_path               # a real deployment dir (okengine#970)
     return module.JOBS
 
 
@@ -77,10 +78,13 @@ def test_cli_regen_and_compose_success_and_failure(tmp_path, monkeypatch, capsys
     assert module.main(["regen"]) == 0 and called == ["regen"]
 
     monkeypatch.setattr(module, "compose", lambda _path: (jobs(), []))
-    monkeypatch.setattr(module, "validate_ordering", lambda _jobs: (_jobs, []))
-    monkeypatch.setattr(module, "validate_unique_ids", lambda _jobs: [])
+    finalized = []
+    # The CLI runs the deploy path's own finalize step (okengine#968), not a shorter list.
+    monkeypatch.setattr(module, "finalize_fleet",
+                        lambda values, host: finalized.append(host) or values)
     assert module.main(["compose", "--packs", str(tmp_path)]) == 0
     assert "composed 2 jobs" in capsys.readouterr().out
+    assert finalized == [module.PACK_DIR]
 
     monkeypatch.setattr(module, "compose", lambda _path: (jobs(), ["collision"]))
     assert module.main(["compose", "--packs", str(tmp_path)]) == 1
@@ -92,7 +96,7 @@ def test_cli_check_ordering_and_mismatch_failures(tmp_path, monkeypatch, capsys)
     configure(module, tmp_path)
     monkeypatch.setattr(module, "validate_ordering", lambda values: (values, ["cycle"]))
     assert module.main(["check"]) == 1
-    assert "ORDERING" in capsys.readouterr().err
+    assert "  cron ordering errors: cycle" in capsys.readouterr().err
 
     monkeypatch.setattr(module, "validate_ordering", lambda values: (values, []))
     original_merge = module.merge
@@ -129,6 +133,7 @@ def test_split_prompt_and_merge_pack_error_paths():
 
 def test_discover_compose_and_regen_composed_gates(tmp_path, monkeypatch):
     module = load()
+    module.PACK_DIR = tmp_path               # a real deployment dir (okengine#970)
     packs = tmp_path / "packs"
     good = packs / "good"
     (good / "crons").mkdir(parents=True)
@@ -149,7 +154,7 @@ def test_discover_compose_and_regen_composed_gates(tmp_path, monkeypatch):
     else:
         raise AssertionError("composition errors must block writes")
 
-    monkeypatch.setattr(module, "compose", lambda _p: ([{"id": "x", "name": "x"}], []))
+    monkeypatch.setattr(module, "compose", lambda _p: ([{"id": "x", "name": "x", "prompt": "p"}], []))
     monkeypatch.setattr(module, "validate_ordering", lambda _j: (_j, ["cycle"]))
     try:
         module.regen_composed(packs)
@@ -181,6 +186,16 @@ def test_discover_compose_and_regen_composed_gates(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as raised:
         module.regen_composed(packs)
     assert str(raised.value) == "cron agent-bound errors (not deploying):\n  bad bound"
+
+    # okengine#840: the real validator, on a composed job naming an over-length writer explicitly
+    monkeypatch.setattr(module, "validate_agent_bounds", lambda _j: [])
+    long_writer = "okengine-write-" + "x" * 60
+    monkeypatch.setattr(module, "compose", lambda _p: (
+        [{"id": "x", "name": "x", "prompt": "p", "enabled_toolsets": [long_writer]}], []))
+    with pytest.raises(SystemExit) as raised:
+        module.regen_composed(packs)
+    assert str(raised.value).startswith("cron write-server name errors (not deploying):")
+    assert long_writer in str(raised.value)
 
 
 def test_regen_fail_loud_gates(tmp_path, monkeypatch):
@@ -268,10 +283,13 @@ def test_remaining_split_pack_discovery_regen_and_cli_edges(tmp_path, monkeypatc
     assert module.discover_packs(packs_dir) == []
 
     module.JOBS = tmp_path / "jobs.json"
+    module.PACK_DIR = tmp_path               # a real deployment dir (okengine#970)
     monkeypatch.setattr(module, "compose", lambda _p: ([{"name": "ok", "no_agent": True}], []))
     monkeypatch.setattr(module, "validate_ordering", lambda values: (values, []))
     monkeypatch.setattr(module, "validate_unique_ids", lambda _values: [])
     monkeypatch.setattr(module, "validate_output_contracts", lambda _values: [])
+    real_extension_pass = module._extension_pass
+    monkeypatch.setattr(module, "_extension_pass", lambda *_a: ([], []))
     assert module.regen_composed(packs_dir) == [{"name": "ok", "no_agent": True}]
     assert module.JOBS.is_file()
 
@@ -281,7 +299,8 @@ def test_remaining_split_pack_discovery_regen_and_cli_edges(tmp_path, monkeypatc
         Path, "is_file",
         lambda self: False if self == extension_script else original_is_file(self),
     )
-    assert module._extension_pass(pack, []) == ([], [])
+    # The REAL pass (not the stub above): without the composer module it folds in nothing.
+    assert real_extension_pass(pack, []) == ([], [])
     monkeypatch.setattr(Path, "is_file", original_is_file)
 
     # Successful regen marks every domain job with pack provenance.
@@ -343,6 +362,7 @@ def test_remaining_contract_prompt_and_dump_branches(tmp_path, monkeypatch, caps
     module.TIERS.write_text("engine: [engine]\nengine-template: []\ndomain: []\n")
     module.ENGINE_CRONS_FILE = tmp_path / "engine-crons.json"
     module.PACK_DIR = tmp_path / "pack"
+    module.PACK_DIR.mkdir()                  # dump writes into an existing deployment (okengine#970)
     live = tmp_path / "live.json"
     live.write_text(json.dumps({"jobs": [{"name": "engine", "runtime": True}]}))
     monkeypatch.setattr(module, "sanitize", lambda values: [
@@ -369,3 +389,216 @@ def test_restore_deploy_transforms_import_failure_returns_verbatim(monkeypatch):
         return original_import(name, *args, **kwargs)
     monkeypatch.setattr("builtins.__import__", importing)
     assert module._restore_source_reprs(values) is values
+
+
+def test_a_pack_without_pack_yaml_is_named_by_its_directory(tmp_path):
+    module = load()
+    pack = tmp_path / "okpack-bare"
+    pack.mkdir()
+    assert module._pack_name(pack) == "okpack-bare"
+
+
+def test_the_declared_name_wins_over_the_directory(tmp_path):
+    module = load()
+    pack = tmp_path / "okpack-house-test"
+    pack.mkdir()
+    (pack / "pack.yaml").write_text("name: okpack-house\n", encoding="utf-8")
+    assert module._pack_name(pack) == "okpack-house"
+
+
+def test_an_unloadable_pack_meta_is_an_error_not_the_directory_name(tmp_path, monkeypatch):
+    """okengine#857: pack_meta imports the okengine package; without it the old code stamped
+    every lane with the directory name and the deploy aborted on a bogus FOREIGN-PACK."""
+    module = load()
+    pack = tmp_path / "okpack-house-test"
+    pack.mkdir()
+    (pack / "pack.yaml").write_text("name: okpack-house\n", encoding="utf-8")
+
+    def unimportable():
+        raise ModuleNotFoundError("No module named 'okengine'")
+    monkeypatch.setattr(module, "_pack_meta", unimportable)
+    with pytest.raises(RuntimeError, match=r"pack\.yaml: ModuleNotFoundError: No module named 'okengine'"):
+        module._pack_name(pack)
+
+
+@pytest.mark.parametrize("body", ["name: [unclosed\n", "- just\n- a list\n"])
+def test_an_unreadable_pack_yaml_is_an_error_not_the_directory_name(tmp_path, body):
+    module = load()
+    pack = tmp_path / "okpack-house-test"
+    pack.mkdir()
+    (pack / "pack.yaml").write_text(body, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="unparseable or not a mapping"):
+        module._pack_name(pack)
+
+
+# --- okengine#970 -------------------------------------------------------------------------------
+# The generator refuses to run without a real deployment directory. With CRON_PACK_DIR unset,
+# PACK_DIR fell back to the literal placeholder `/path/to/pack`, and the extension pass for a
+# directory that does not exist returns only the core-default extensions: `compose` /
+# regen_composed exited 0 with the host's enabled extensions silently missing, and a single-pack
+# regen shipped an engine-only fleet. deploy-cron-plus-jobs.sh passes the placeholder itself when
+# its caller leaves CRON_PACK_DIR unset, so the directory must also exist. And the `check`
+# subcommand runs fleet_errors(), the one gate list regen and compose use.
+
+MOD = REPO / "scripts" / "cron_pack_split.py"
+
+
+def _load(name: str, monkeypatch, env: str | None = None):
+    if env is None:
+        monkeypatch.delenv("CRON_PACK_DIR", raising=False)
+    else:
+        monkeypatch.setenv("CRON_PACK_DIR", env)
+    spec = importlib.util.spec_from_file_location(name, MOD)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _packs_root(tmp_path: Path) -> Path:
+    pack = tmp_path / "packs" / "okpack-a"
+    (pack / "crons").mkdir(parents=True)
+    (pack / "pack.yaml").write_text(
+        "name: okpack-a\nversion: 0.1.0\ntrust: public\nowns: {types: [alpha]}\n")
+    (pack / "crons" / "engine-template-prompts.json").write_text(
+        json.dumps({"entity-backfill": "Run entity-backfill for okpack-a."}))
+    return tmp_path / "packs"
+
+
+# --- PACK_DIR resolution -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("env", [None, ""])
+def test_an_unset_or_empty_cron_pack_dir_leaves_the_placeholder(monkeypatch, env):
+    cps = _load("cps_970_unset", monkeypatch, env)
+    assert str(cps.PACK_DIR) == cps.PACK_DIR_PLACEHOLDER == "/path/to/pack"
+
+
+def test_a_set_cron_pack_dir_is_the_host_dir(monkeypatch, tmp_path):
+    cps = _load("cps_970_set", monkeypatch, str(tmp_path))
+    assert cps.host_dir() == tmp_path
+
+
+# --- the composed path -------------------------------------------------------------------------
+
+
+def test_regen_composed_refuses_an_unset_cron_pack_dir(monkeypatch, tmp_path):
+    cps = _load("cps_970_composed_unset", monkeypatch)
+    cps.JOBS = tmp_path / "jobs.json"
+    with pytest.raises(SystemExit, match=r"^CRON_PACK_DIR is not set: .*/path/to/pack"):
+        cps.regen_composed(_packs_root(tmp_path))
+    assert not cps.JOBS.exists(), "a refused compose must write nothing"
+
+
+def test_regen_composed_refuses_a_missing_cron_pack_dir(monkeypatch, tmp_path):
+    missing = tmp_path / "no-such-deployment"
+    cps = _load("cps_970_composed_missing", monkeypatch, str(missing))
+    cps.JOBS = tmp_path / "jobs.json"
+    with pytest.raises(SystemExit, match=rf"^CRON_PACK_DIR={missing} is not a directory"):
+        cps.regen_composed(_packs_root(tmp_path))
+    assert not cps.JOBS.exists()
+
+
+def test_regen_composed_refuses_a_file_named_as_the_deployment(monkeypatch, tmp_path):
+    a_file = tmp_path / "deployment.txt"
+    a_file.write_text("")
+    cps = _load("cps_970_composed_file", monkeypatch, str(a_file))
+    cps.JOBS = tmp_path / "jobs.json"
+    with pytest.raises(SystemExit, match="is not a directory"):
+        cps.regen_composed(_packs_root(tmp_path))
+
+
+def test_the_compose_cli_fails_loudly_without_cron_pack_dir(monkeypatch, tmp_path, capsys):
+    cps = _load("cps_970_cli", monkeypatch)
+    cps.JOBS = tmp_path / "jobs.json"
+    assert cps.main(["compose", "--packs", str(_packs_root(tmp_path))]) == 1
+    assert "CRON_PACK_DIR is not set" in capsys.readouterr().out
+    assert not cps.JOBS.exists()
+
+
+def test_regen_composed_resolves_extensions_for_the_named_deployment(monkeypatch, tmp_path):
+    """Negative fixture: a real deployment directory composes, with its extension pass."""
+    host = tmp_path / "host"
+    host.mkdir()
+    cps = _load("cps_970_composed_ok", monkeypatch, str(host))
+    cps.JOBS = tmp_path / "jobs.json"
+    seen = []
+    real = cps._extension_pass
+    monkeypatch.setattr(cps, "_extension_pass", lambda d, e: seen.append(d) or real(d, e))
+    names = {job["name"] for job in cps.regen_composed(_packs_root(tmp_path))}
+    assert "entity-backfill@okpack-a" in names and seen == [host]
+
+
+# --- single-pack regen and dump ----------------------------------------------------------------
+
+
+def test_regen_refuses_an_unset_cron_pack_dir(monkeypatch, tmp_path):
+    cps = _load("cps_970_regen_unset", monkeypatch)
+    cps.JOBS = tmp_path / "jobs.json"
+    with pytest.raises(SystemExit, match="^CRON_PACK_DIR is not set"):
+        cps.regen()
+    assert not cps.JOBS.exists(), "an engine-only fleet must not be written for no deployment"
+
+
+def test_regen_refuses_the_placeholder_deploy_cron_plus_jobs_passes(monkeypatch, tmp_path):
+    """deploy-cron-plus-jobs.sh exports CRON_PACK_DIR=/path/to/pack when its caller set nothing."""
+    cps = _load("cps_970_regen_literal", monkeypatch, "/path/to/pack")
+    cps.JOBS = tmp_path / "jobs.json"
+    with pytest.raises(SystemExit, match="^CRON_PACK_DIR is not set"):
+        cps.regen()
+    assert not cps.JOBS.exists()
+
+
+@pytest.mark.parametrize("where", ["tmp", "/a-missing-deployment"])
+def test_regen_refuses_a_missing_cron_pack_dir(monkeypatch, tmp_path, where):
+    """Any path other than the placeholder is a NAMED deployment, whatever it sorts against."""
+    missing = str(tmp_path / "gone") if where == "tmp" else where
+    cps = _load("cps_970_regen_missing", monkeypatch, missing)
+    cps.JOBS = tmp_path / "jobs.json"
+    with pytest.raises(SystemExit, match=rf"^CRON_PACK_DIR={missing} is not a directory"):
+        cps.regen()
+    assert not cps.JOBS.exists()
+
+
+def test_dump_refuses_before_writing_either_half(monkeypatch, tmp_path):
+    cps = _load("cps_970_dump", monkeypatch)
+    cps.ENGINE_CRONS_FILE = tmp_path / "engine-crons.json"
+    cps.ENGINE_CRONS_FILE.write_text("[]")
+    live = tmp_path / "live.json"
+    live.write_text(json.dumps({"jobs": [{"name": "x"}]}))
+    with pytest.raises(SystemExit, match="^CRON_PACK_DIR is not set"):
+        cps.dump_from_live(str(live))
+    assert cps.ENGINE_CRONS_FILE.read_text() == "[]", "the engine half must not be rewritten"
+
+
+# --- the check subcommand runs the one gate list -----------------------------------------------
+
+
+def _check_fixture(cps, tmp_path, jobs):
+    cps.JOBS = tmp_path / "cron-plus-jobs.json"
+    cps.JOBS.write_text(json.dumps({"jobs": jobs}))
+    cps.TIERS = tmp_path / "cron-tiers.yaml"
+    cps.TIERS.write_text("engine: [one, two]\nengine-template: []\ndomain: []\n")
+
+
+def test_check_fails_an_artifact_only_fleet_errors_catches(monkeypatch, tmp_path, capsys):
+    """A shared selection manifest was never in check's old list, so check passed an artifact
+    every deploy path rejects."""
+    cps = _load("cps_970_check_gate", monkeypatch)
+    shared = "/opt/data/cron-plus/selections/shared.json"
+    _check_fixture(cps, tmp_path, [
+        {"id": "1", "name": "one", "no_agent": True, "selection_manifest": shared},
+        {"id": "2", "name": "two", "no_agent": True, "selection_manifest": shared}])
+    assert cps.main(["check"]) == 1
+    err = capsys.readouterr().err
+    assert "✗ GATES" in err and "  cron selection-manifest collisions: jobs 'one' and 'two'" in err
+
+
+def test_check_runs_exactly_the_fleet_gates(monkeypatch, tmp_path, capsys):
+    cps = _load("cps_970_check_list", monkeypatch)
+    _check_fixture(cps, tmp_path, [{"id": "1", "name": "one", "no_agent": True}])
+    seen = []
+    monkeypatch.setattr(cps, "fleet_errors", lambda jobs: seen.append(jobs) or [("a gate", [])])
+    assert cps.main(["check"]) == 0
+    assert [[j["name"] for j in jobs] for jobs in seen] == [["one"]]
+    assert "lossless" in capsys.readouterr().out

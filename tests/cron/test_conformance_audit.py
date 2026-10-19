@@ -160,3 +160,26 @@ def test_audit_missing_wiki_frontmatter_edges_and_sample_cap(tmp_path, monkeypat
     assert capped.main() == 0
     dash = (wiki / "dashboards/conformance.md").read_text()
     assert "prose\\|value" in dash
+
+
+def test_a_page_whose_envelope_runs_past_8000_chars_is_still_audited(tmp_path, monkeypatch):
+    """okengine#993: the audit parsed an 8000-char window, so a long-envelope page parsed as {}
+    and silently escaped every type-scoped rule."""
+    vault = tmp_path
+    w = vault / "wiki" / "sources" / "2026" / "07"
+    w.mkdir(parents=True)
+    raw = "".join(f"- raw/market/2026-07-13-a-long-capture-name-{i:04d}.md\n" for i in range(200))
+    (w / "long-blank.md").write_text(f"---\ntype: source\nraw:\n{raw}published:\n---\n# long\n")
+    assert len((w / "long-blank.md").read_text()) > 8000
+    (vault / "schema.yaml").write_text(yaml.safe_dump({
+        "okf": {"required": ["type"]},
+        "conformance": {"rules": [
+            {"id": "source-metadata-complete", "kind": "nonempty_fields",
+             "type": "source", "fields": ["published"],
+             "severity": "fix", "remediation": "recover dates"}]}}))
+    monkeypatch.setenv("WIKI_PATH", str(vault))
+    audit = _load("conformance_audit_long", "scripts/cron/conformance_audit.py")
+    assert audit.main() == 0
+    dash = (vault / "wiki" / "dashboards" / "conformance.md").read_text()
+    assert "**1** page(s)" in dash
+    assert "sources/2026/07/long-blank" in dash.split("Non-conformant entries")[-1]

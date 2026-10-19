@@ -42,6 +42,7 @@ common_optional:
   - estimative_probability # likelihood of a proposition; distinct from confidence in the judgment
   - tags
   - aliases          # alternate/legacy ids — the id resolver consults these
+  - rejected_aliases # names a review removed from `aliases`; no writer may re-add them
   - actor_identity_validated # governed actor admission passed source-grounded entity-class proof
   - maintained_by    # provenance: packs that maintain the page (composition)
   - discovered_by    # provenance: where the knowledge was first attributed
@@ -121,7 +122,10 @@ value_aliases:
 # declared shape at the single write chokepoint, so an agent that authors the wrong shape can't land
 # a page that crashes a downstream lane (generalizes the ad-hoc list coercion of okengine#196). Today:
 #   list  — a scalar string is split (on commas) into a list, so a list-consuming lane never sees a
-#           bare `aliases: A, B`. An unlisted field is free-form (passed through unchanged).
+#           bare `aliases: A, B`. A comma inside brackets, a date or a number is not a delimiter
+#           (`okengine.list_scalars`, okengine#1005). An unlisted field is free-form (unchanged).
+#   prose-list — a list whose items are sentences (an assessment's `assumptions`): a scalar string
+#           becomes ONE item and is never split, because its commas belong to the sentence.
 #   int   — a machine-owned COUNT. A digit-string coerces to int; anything else REJECTS the write
 #           with the field named, so an agent that misreads the field name semantically (live
 #           incident: `recent_reports:` hand-set to a LIST of source paths, which then topped the
@@ -148,6 +152,7 @@ value_aliases:
 # Packs EXTEND this for their domain fields (a pack key wins on conflict), same as `field_enums`.
 field_shapes:
   aliases:       list   # alternate names/ids (id resolver + normalize-bare-name-links consume as list)
+  rejected_aliases: list # review-removed names; the write path + importers honor it (TAA#48)
   tags:          list
   maintained_by: list   # provenance: packs that maintain the page (composition)
   discovered_by: list   # provenance: where the knowledge was first attributed

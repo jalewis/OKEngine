@@ -27,12 +27,19 @@ def _load():
     return m
 
 
-def test_registry_covers_the_thirteen_validator_checks_plus_operations():
+def test_registry_covers_the_validator_checks_plus_operations():
     C = _load()
-    # every daily-validator check is registered, in order; operations is the doctor-only extra
+    # every daily-validator check is registered, in order; operations is the doctor-only extra.
+    # source-identity (okengine#886) runs beside partition-dups: same class, the other half.
+    # tool-search joined in okengine#886 (Hermes' tool bridge cost lanes their turns).
+    # reserved-basenames (okengine#997) sits beside partition-dups: both are vault-placement checks.
+    # write-principal (okengine#1027) follows provenance: both judge the writer's pack identity.
+    # scheduler-dst follows timezone: both judge when cron-plus fires a fixed-hour lane.
     assert C.VALIDATE_CHECKS == [
-        "pins", "schema", "subdomains", "crons", "timezone", "partition-dups", "rules",
-        "extensions", "ownership", "runtime-ownership", "auth", "write-path", "provenance"]
+        "pins", "schema", "subdomains", "crons", "timezone", "scheduler-dst", "partition-dups",
+        "reserved-basenames", "source-identity",
+        "rules", "extensions", "ownership", "runtime-ownership", "auth", "write-path",
+        "chat-capability", "provenance", "write-principal", "tool-search"]
     assert "operations" in C.CHECKS and "operations" not in C.VALIDATE_CHECKS
     assert set(C.VALIDATE_CHECKS) | {"operations"} == set(C.CHECKS)
 
@@ -86,6 +93,8 @@ def test_reset_clears_prior_findings(tmp_path):
 ])
 def test_host_provenance_check_reads_gateway_compose_environment(
         tmp_path, monkeypatch, environment):
+    """Host-side, the gateway's OKENGINE_PACK comes from its compose service. A value that agrees
+    with pack.yaml is clean; one that disagrees is reported as ignored (okengine#1032 [20])."""
     C = _load()
     monkeypatch.delenv("OKENGINE_PACK", raising=False)
     (tmp_path / "wiki").mkdir()
@@ -93,19 +102,25 @@ def test_host_provenance_check_reads_gateway_compose_environment(
         pytest.importorskip("yaml").safe_dump({
             "services": {"gateway": {"environment": environment}},
         }))
+    (tmp_path / "pack.yaml").write_text("name: okpack-test\n")
     C.configure(tmp_path)
     assert C.run(["provenance"]) == []
+    (tmp_path / "pack.yaml").write_text("name: okpack-renamed\n")
+    findings = C.run(["provenance"])
+    assert any(level == "WARN" and area == "provenance" and "OKENGINE_PACK=okpack-test" in message
+               for level, area, message in findings), findings
 
 
-def test_provenance_check_warns_when_env_and_compose_both_omit_pack(tmp_path, monkeypatch):
+def test_provenance_check_warns_when_pack_yaml_names_no_pack(tmp_path, monkeypatch):
     C = _load()
     monkeypatch.delenv("OKENGINE_PACK", raising=False)
     (tmp_path / "wiki").mkdir()
-    (tmp_path / "docker-compose.yml").write_text("services: {gateway: {environment: []}}\n")
+    (tmp_path / "docker-compose.yml").write_text(
+        "services: {gateway: {environment: [OKENGINE_PACK=okpack-test]}}\n")
     C.configure(tmp_path)
     findings = C.run(["provenance"])
-    assert any(level == "WARN" and area == "provenance"
-               for level, area, _message in findings)
+    assert any(level == "WARN" and area == "provenance" and "declares no `name`" in message
+               for level, area, message in findings), findings
 
 
 def test_configure_rebinds_the_paths_the_checks_read(tmp_path):

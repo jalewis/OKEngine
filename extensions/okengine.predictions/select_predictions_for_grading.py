@@ -11,8 +11,21 @@ import json
 import os
 import sys
 
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# selection_manifest lives one level UP in the staged layout (/opt/data/scripts/<ext-id>/ ->
+# /opt/data/scripts/) and in scripts/cron in the repo layout. Appended, so no shared lib can
+# shadow a sibling of this extension.
+sys.path.append(str(_HERE.parent))
+sys.path.append(str(_HERE.parents[1] / "scripts" / "cron"))
 import pred_lib as P   # noqa: E402
+from selection_manifest import (  # noqa: E402
+    page_selection_key, print_receipt_template, write_selection_manifest)
+
+SELECTION_MANIFEST = Path(os.environ.get(
+    "OKENGINE_SELECTION_MANIFEST", str(P.selection_manifest_path("grade"))))
 
 N = int(os.environ.get("PREDICTION_GRADE_BATCH_SIZE", "15"))
 
@@ -34,11 +47,14 @@ def main() -> int:
     print(f"  open predictions past resolves_by: {len(overdue)}")
 
     if not overdue:
+        write_selection_manifest([], SELECTION_MANIFEST)   # a no-work run refreshes it too
         print("  → SKIP: no overdue predictions")
         print(json.dumps({"wakeAgent": False}))
         return 0
 
     chosen = overdue[:N]
+    selected = [page_selection_key(p, v) for _, p, _ in chosen]
+    manifest = write_selection_manifest(selected, SELECTION_MANIFEST)
     print(f"  batch: {len(chosen)} of {len(overdue)}\n")
     print("=== batch ===")
     print("For each overdue prediction below: append a `## Postmortem` "
@@ -56,6 +72,7 @@ def main() -> int:
             print(f"  subject: {subj}")
         print()
 
+    print_receipt_template(manifest)
     print(json.dumps({"wakeAgent": True}))
     return 0
 

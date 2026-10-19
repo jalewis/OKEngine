@@ -22,9 +22,11 @@ import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from stat import S_ISREG
 
 # Sibling-script import — both live in /opt/data/scripts/ after deploy.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import tz_lib  # noqa: E402
 from select_raw_batch import (  # noqa: E402
     BULK_IMPORT_MTIMES,
@@ -67,8 +69,18 @@ def scan() -> dict:
     bogus = 0
     skipped_pdf = 0
     skipped_orphan_link = 0
-    for p in RAW.rglob("*"):
-        if not p.is_file() or p.suffix.lower() not in LEAF_EXTS:
+    # Sorted: the dashboard lists files in a stable order, and a skipped entry cannot hide what
+    # the walk reaches after it.
+    for p in sorted(RAW.rglob("*")):
+        if p.suffix.lower() not in LEAF_EXTS:
+            continue
+        # One stat serves both the regular-file test and the mtime: a dangling symlink (or an
+        # entry removed since the walk listed it) is skipped, as `is_file()` would skip it.
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if not S_ISREG(st.st_mode):
             continue
         if any(part.startswith(".") for part in p.parts):
             continue
@@ -82,10 +94,7 @@ def scan() -> dict:
             skipped_orphan_link += 1
             continue
         rel = str(p.relative_to(VAULT))
-        try:
-            mtime = p.stat().st_mtime
-        except OSError:
-            continue
+        mtime = st.st_mtime
         # Replicate derive_year's priority chain and capture WHICH SOURCE fired.
         years_in_path = [int(y) for y in YEAR_RE.findall(rel) if 2018 <= int(y) <= 2026]
         mtime_year = datetime.fromtimestamp(mtime).year
@@ -291,7 +300,7 @@ def main() -> int:
     if OUT.exists():
         bak = OUT.parent / (OUT.name + ".bak")   # single overwritten sidecar, not indexed (#165 sweep)
         shutil.copy2(OUT, bak)
-    OUT.write_text(body)
+    generated_page.write(OUT, body)
     print(f"wrote {OUT} ({len(body)} bytes)", file=sys.stderr)
     return 0
 

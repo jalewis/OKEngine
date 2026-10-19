@@ -23,22 +23,27 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from json import JSONDecodeError
 import os
 import re
 import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.error import URLError
 import xml.etree.ElementTree as ET
+from xml.etree.ElementTree import ParseError
 import ipaddress
 import socket
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from http.client import InvalidURL
 from pathlib import Path
 from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import web_capture  # noqa: E402
+from web_capture import CaptureError  # noqa: E402
 import collection_ledger  # noqa: E402
 
 USER_AGENT = os.environ.get("FEED_USER_AGENT", "okf-engine-feeds/1.0")
@@ -71,7 +76,7 @@ def load_opml_sources(path: Path) -> list[dict]:
     """Configured feeds plus optional provenance classification extensions."""
     try:
         root = _safe_xml_fromstring(path.read_bytes())
-    except (OSError, ET.ParseError) as e:
+    except (OSError, ParseError) as e:
         print(f"ERROR: cannot read OPML {path}: {e}", file=sys.stderr)
         return []
     feeds: list[dict] = []
@@ -99,6 +104,12 @@ def load_opml_sources(path: Path) -> list[dict]:
                 "url": url,
                 "origin_class": kind,
                 "independent_origin": independent,
+                # The organization that PUBLISHES this feed's items, declared by the operator
+                # (`publisher="arXiv"`). The feed label is not a publisher (`source_feed` keeps
+                # it), and without a declared value raw-backfill had to guess one from the URL —
+                # the largest rejection class on one live vault (okengine#862). Undeclared stays
+                # absent: never inferred.
+                "publisher": (o.get("publisher") or "").strip() or None,
             })
     return feeds
 
@@ -323,7 +334,7 @@ def load_state(p: Path) -> dict:
         return {"seen": {}}
     try:
         return json.loads(p.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, JSONDecodeError):
         return {"seen": {}}
 
 
@@ -343,12 +354,26 @@ def save_state(p: Path, state: dict) -> None:
     os.replace(tmp, p)
 
 
+_SURROGATE_PAIR = re.compile(r"\\ud[89ab][0-9a-f]{2}\\ud[c-f][0-9a-f]{2}")
+
+
+def _astral(frontmatter: str) -> str:
+    """Write each astral character in `json.dumps` frontmatter as itself (okengine#894).
+
+    JSON's ASCII escaping writes an emoji as a surrogate PAIR (`\\ud83d\\udd25`). YAML decodes
+    each half alone, and a lone surrogate has no UTF-8 encoding, so the page that inherited such
+    a title broke the projection. Every other JSON escape is valid YAML and stays as written; the
+    body is the capture's own text and is never touched."""
+    return _SURROGATE_PAIR.sub(lambda m: json.loads(f'"{m.group(0)}"'), frontmatter)
+
+
 def slugify(s: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", (s or "untitled").lower()).strip("-")
     return (s or "untitled")[:80]
 
 
-def write_item(out_dir: Path, feed: str, it: dict, tag: str) -> Path | None:
+def write_item(out_dir: Path, feed: str, it: dict, tag: str,
+               publisher: str | None = None) -> Path | None:
     pub = it.get("published") or ""
     m = re.match(r"(\d{4}-\d{2}-\d{2})", pub)
     date = m.group(1) if m else datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -367,6 +392,7 @@ def write_item(out_dir: Path, feed: str, it: dict, tag: str) -> Path | None:
         "type: source",
         "source_channel: feed",
         f"source_feed: {json.dumps(feed)}",
+        f"publisher: {json.dumps(publisher)}" if publisher else "",
         f"title: {json.dumps(it.get('title') or '(untitled)')}",
         f"url: {json.dumps(it.get('link') or '')}",
         f"canonical_url: {json.dumps(it.get('canonical_url'))}" if it.get("canonical_url") else "",
@@ -398,8 +424,30 @@ def write_item(out_dir: Path, feed: str, it: dict, tag: str) -> Path | None:
         "",
     ]
     out_dir.mkdir(parents=True, exist_ok=True)
-    dst.write_text("\n".join(l for l in fm if l is not None), encoding="utf-8")
+    front, fence, body = "\n".join(l for l in fm if l is not None).partition("\n---\n")
+    dst.write_text(_astral(front) + fence + body, encoding="utf-8")
     return dst
+
+
+def capture_link_index(captures: dict) -> dict[str, dict]:
+    """Recover article-level capture history from existing per-GUID state (#928).
+
+    A publisher may rotate GUIDs. Index the recorded requested URL within its feed,
+    preserving the latest observation and leaving the persisted state format unchanged.
+    Legacy observations without a requested URL retain the exact-GUID fallback.
+    """
+    index: dict[str, dict] = {}
+    for key, record in captures.items():
+        feed, separator, _native = key.partition("\0")
+        if not separator or not isinstance(record, dict):
+            continue
+        url = record.get("requested_url")
+        if not isinstance(url, str) or not url.strip():
+            continue
+        link = f"{feed}\0link:{_dedupe_link(url)}"
+        if str(record.get("retrieved_at") or "") >= str(index.get(link, {}).get("retrieved_at") or ""):
+            index[link] = record
+    return index
 
 
 def main(argv: list[str]) -> int:
@@ -450,6 +498,7 @@ def main(argv: list[str]) -> int:
     if args.capture_full_text and capture_dir is None:
         ap.error("--capture-full-text requires --out-dir or --capture-dir")
     captures = state.setdefault("captures", {})
+    captures_by_link = capture_link_index(captures)
 
     new_by_feed: dict[str, list[dict]] = {}
     written = 0
@@ -489,7 +538,7 @@ def main(argv: list[str]) -> int:
             unchanged += 1
             record("success")
             continue
-        except (ValueError, urllib.error.URLError, TimeoutError, OSError) as e:
+        except (ValueError, URLError, TimeoutError, OSError) as e:
             errors.append(f"{name}: fetch failed ({e})")
             record("failure", error_category=_error_category(e))
             continue
@@ -520,7 +569,7 @@ def main(argv: list[str]) -> int:
                               and not (link_key and link_key in seen))
             revision = False
             if args.capture_full_text and it.get("link"):
-                previous = captures.get(seen_key) or {}
+                previous = captures_by_link.get(link_key) or captures.get(seen_key) or {}
                 was_removed = bool(previous.get("upstream_removed"))
                 feed_fingerprint = hashlib.sha256(json.dumps(
                     {key: it.get(key) for key in ("title", "summary", "published", "authors",
@@ -533,6 +582,7 @@ def main(argv: list[str]) -> int:
                         previous=previous, observed_at=now)
                     captured.state["feed_fingerprint"] = feed_fingerprint
                     captures[seen_key] = captured.state
+                    captures_by_link[link_key] = captured.state
                     it.update({"canonical_url": captured.canonical_url,
                                "retrieved_url": captured.final_url,
                                "content_hash": captured.content_hash,
@@ -549,7 +599,10 @@ def main(argv: list[str]) -> int:
                         it["language"] = captured.language
                     if captured.license:
                         it["license"] = captured.license
-                    revision = bool(previous and (captured.changed or feed_changed or was_removed))
+                    # A seen excerpt with no earlier successful capture still needs its first
+                    # full-text landing. "Seen" is discovery identity, not capture completion.
+                    recovered = not first_seen and not previous and bool(captured.text.strip())
+                    revision = recovered or bool(previous and (captured.changed or feed_changed or was_removed))
                     if revision:
                         # Keyed on the EXTRACTED-TEXT hash, not the byte hash (okengine#748).
                         # The byte hash churns on every fetch for publishers whose markup
@@ -559,7 +612,14 @@ def main(argv: list[str]) -> int:
                         # whether a new raw item exists at all.
                         it["_revision_hash"] = hashlib.sha256(
                             f"{captured.text_hash}\0{feed_fingerprint}".encode()).hexdigest()
-                except web_capture.CaptureError as exc:
+                # Plain names in the tuple: cosmic-ray's ExceptionReplacer crashes on dotted ones.
+                except (CaptureError, ValueError, InvalidURL) as exc:
+                    # A bad item URL (UnicodeError is a ValueError; http.client.InvalidURL is not)
+                    # is a failure of THAT item: dead-letter it like any capture failure and keep
+                    # the run going. Uncaught, one IRI link aborted every feed (okengine#882).
+                    if not isinstance(exc, CaptureError):
+                        exc = CaptureError(
+                            "invalid-url", f"{type(exc).__name__}: {exc}")
                     capture_errors += 1
                     feed_capture_errors += 1
                     it["capture_dead_letter"] = web_capture.dead_letter(
@@ -587,7 +647,8 @@ def main(argv: list[str]) -> int:
             seen[it.get("_seen_key") or it["id"]] = now
             if it.get("_seen_link_key"):      # so a rotated guid cannot re-capture this article
                 seen[it["_seen_link_key"]] = now
-            if out_dir is not None and write_item(out_dir, name, it, args.source_tag):
+            if out_dir is not None and write_item(out_dir, name, it, args.source_tag,
+                                                   publisher=source.get("publisher")):
                 written += 1
         if novel:
             new_by_feed[name] = novel

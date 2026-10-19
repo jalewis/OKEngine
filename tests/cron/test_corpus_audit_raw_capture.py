@@ -211,11 +211,11 @@ def test_the_summary_line_reports_the_count_and_distinguishes_unmeasured(tmp_pat
     mod.DASH_DIR = tmp_path / "wiki" / "dashboards"
 
     _schema(mod, monkeypatch, SOURCES_SCHEMA)
-    assert mod.main() == 0
+    assert mod.main([]) == 0
     assert "1 undeclared ingest value(s)" in capsys.readouterr().out
 
     _schema(mod, monkeypatch, {"types": {"source": {}}})
-    assert mod.main() == 0
+    assert mod.main([]) == 0
     assert "ingest vocabulary UNDETECTABLE" in capsys.readouterr().out
 
 

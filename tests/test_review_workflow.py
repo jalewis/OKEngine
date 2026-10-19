@@ -146,8 +146,14 @@ def test_write_path_flag_creates_structured_request(tmp_path, monkeypatch):
     monkeypatch.setenv("WIKI_PATH", str(tmp_path))
     monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-07-17")
     m = _load()
+    # A created actor must be grounded in a cited source (okengine#1012).
+    source = tmp_path / "wiki" / "sources" / "2026" / "apt-y-report.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("---\ntype: source\ntitle: Report\n---\n\nAPT-Y is a threat group.\n",
+                      encoding="utf-8")
     result = m._create("entities/a/apt-y", {"type": "actor", "id": "apt-y", "title": "APT-Y",
-                                             "confidence": "confirmed"}, "Body.")
+                                             "confidence": "confirmed",
+                                             "sources": ["sources/2026/apt-y-report"]}, "Body.")
     assert "flagged for review" in result
     rec = yaml.safe_load(next((tmp_path / "wiki" / "operational" / "reviews").glob("*.yaml")).read_text())
     assert rec["reasons"][0]["code"] == "categorical-confidence"

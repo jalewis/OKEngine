@@ -171,6 +171,11 @@ def enforce(text: str, fields: dict) -> tuple[str | None, list[str]]:
         return None, []   # nothing to do
 
     stripped = _strip_keys(fm_body, set(real.keys()))
+    if comment:
+        # The block re-emits its own comment, so drop the copy a previous enforcement left: without
+        # this every restore added one more identical comment line to the page.
+        mine = f"# {comment}"
+        stripped = "\n".join(line for line in stripped.splitlines() if line.strip() != mine)
     block: list[str] = []
     if comment:
         block.append(f"# {comment}")

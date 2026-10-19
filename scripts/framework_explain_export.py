@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import io
 import json
+from json import JSONDecodeError
 import re
 import shutil
 import sys
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from yaml import YAMLError
 
 LINK = re.compile(r"\[\[([^\]|#]+)")
 SENSITIVE_KEY = re.compile(r"(?:token|secret|password|credential|api[_-]?key)", re.I)
@@ -51,7 +53,7 @@ def _page(path: Path, dep: Path) -> dict[str, Any]:
     if text.startswith("---\n"):
         try:
             front, body = text[4:].split("\n---", 1); fm = yaml.safe_load(front) or {}
-        except (ValueError, yaml.YAMLError): body = text
+        except (ValueError, YAMLError): body = text
     else: body = text
     refs = sorted(set(LINK.findall(text)))
     return {"path": path.relative_to(dep / "wiki").as_posix(), "frontmatter": fm,
@@ -73,7 +75,7 @@ def _production(dep: Path, rel: str) -> list[dict]:
     # glob-ok: operation run receipts are a deliberately flat run-id registry.
     for path in sorted(root.glob("*.json")) if root.is_dir() else []:
         try: receipt = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError): continue
+        except (OSError, JSONDecodeError): continue
         outputs = receipt.get("outputs") or receipt.get("declared_outputs") or []
         if any(rel == str(item) or rel in str(item) for item in outputs):
             found.append({"run_id": receipt.get("run_id"), "operation": receipt.get("operation"),

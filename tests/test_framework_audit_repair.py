@@ -164,3 +164,81 @@ def test_execute_skips_malformed_prior_receipt(tmp_path, monkeypatch):
         json.dumps({"kind": "other", "status": "failed"})
     )
     assert call(mod.repair, ["verify", str(root), "--plan", plan["plan_id"]])[0] == 0
+
+
+# --- receipts, statuses and argument contracts (mutation target registered for okengine#994) -----
+
+def _plan_fixture(root, repairs="body-integrity"):
+    mod._atomic_new(root / ".okengine/operations/runs/audit-fixture.json",
+                    {"api": 1, "kind": "audit", "run_id": "audit-fixture"})
+    _, out, _ = call(mod.repair, ["plan", str(root), "--from-audit", "audit-fixture",
+                                  "--repairs", repairs, "--json"])
+    return json.loads(out)
+
+
+def test_a_directory_without_a_wiki_is_not_a_deployment(tmp_path):
+    (tmp_path / "bare").mkdir()
+    with pytest.raises(mod.AuditRepairError, match="not an OKEngine deployment"):
+        mod._deployment(tmp_path / "bare")
+
+
+def test_artifacts_are_indented_sorted_json(tmp_path):
+    target = tmp_path / "a.json"
+    mod._atomic_new(target, {"b": 1, "a": 2})
+    assert target.read_text() == '{\n  "a": 2,\n  "b": 1\n}\n'
+
+
+def test_audit_requires_a_selection_and_passes_check_only_to_schema_drift(tmp_path, monkeypatch):
+    root = dep(tmp_path)
+    with pytest.raises(SystemExit):
+        mod.audit([str(root)])
+    seen = {}
+    monkeypatch.setattr(mod, "_run", lambda script, deployment, extra=None:
+                        seen.update({script: extra}) or {"exit_code": 0, "stdout": "", "stderr": ""})
+    code, out, _ = call(mod.audit, [str(root), "--checks", "schema-drift,policy", "--json"])
+    summary = json.loads(out)
+    assert code == 0 and summary["status"] == "succeeded" and summary["failed"] == []
+    assert seen == {"wiki_schema_audit.py": ["--check"], "policy_audit.py": None}
+    import re
+    assert re.fullmatch(r"audit-\d{4}-\d{2}-\d{2}T\d{6}Z-[0-9a-f]{8}", summary["run_id"])
+    receipt = json.loads((root / ".okengine/operations/runs" / f"{summary['run_id']}.json").read_text())
+    assert receipt["api"] == 1 and receipt["status"] == "succeeded"
+    assert list(json.loads(out)) == sorted(json.loads(out))
+
+
+def test_a_child_killed_by_a_signal_fails_the_audit_and_the_repair(tmp_path, monkeypatch):
+    root = dep(tmp_path)
+    monkeypatch.setattr(mod, "_run", lambda *_a, **_k: {"exit_code": -9, "stdout": "", "stderr": ""})
+    code, out, _ = call(mod.audit, [str(root), "--checks", "policy", "--json"])
+    assert code == 1 and json.loads(out)["status"] == "failed"
+    monkeypatch.undo()
+    plan = _plan_fixture(root)
+    assert plan["api"] == 1 and list(plan) == sorted(plan)
+    monkeypatch.setattr(mod, "_run", lambda *_a, **_k: {"exit_code": -9, "stdout": "", "stderr": ""})
+    code, out, _ = call(mod.repair, ["apply", str(root), "--plan", plan["plan_id"], "--json"])
+    receipt = json.loads(out)
+    assert code == 1 and receipt["status"] == "failed" and receipt["api"] == 1
+    assert list(receipt) == sorted(receipt)
+
+
+def test_only_a_successful_apply_of_this_plan_counts_as_applied(tmp_path, monkeypatch):
+    root = dep(tmp_path)
+    plan = _plan_fixture(root)
+    runs = root / ".okengine/operations/runs"
+    for name, receipt in {
+        "repair-failed": {"kind": "apply", "plan_id": plan["plan_id"], "status": "failed"},
+        "repair-other": {"kind": "apply", "plan_id": "repair-other", "status": "succeeded"},
+        "repair-verify": {"kind": "verify", "plan_id": plan["plan_id"], "status": "succeeded"},
+    }.items():
+        (runs / f"{name}.json").write_text(json.dumps(receipt))
+    code, _, err = call(mod.repair, ["verify", str(root), "--plan", plan["plan_id"]])
+    assert code == 1 and "no successful apply receipt" in err
+
+
+def test_repair_subcommands_require_their_arguments(tmp_path):
+    root = dep(tmp_path)
+    for argv in (["plan", str(root), "--repairs", "body-integrity"],
+                 ["plan", str(root), "--from-audit", "x"],
+                 ["apply", str(root)], ["verify", str(root)]):
+        with pytest.raises(SystemExit):
+            call(mod.repair, argv)

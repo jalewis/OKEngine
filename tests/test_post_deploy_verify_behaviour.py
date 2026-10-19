@@ -132,3 +132,70 @@ def test_the_healthy_branch_is_pinned_at_the_source_because_no_stub_reaches_it()
     tail = VERIFY.read_text(encoding="utf-8").splitlines()[-1]
     assert '[ "$fail" -eq 0 ]' in tail, "the verdict no longer keys off the fail tally"
     assert "exit 0" in tail and "exit 1" in tail, "the two exits are no longer both present"
+
+
+# ---- host-side checks must not inherit CONTAINER-scoped .env values ----------------------------
+
+def _stub_docker(bindir: Path, body: str) -> None:
+    bindir.mkdir(exist_ok=True)
+    stub = bindir / "docker"
+    stub.write_text("#!/bin/sh\n" + body + "\nexit 0\n", encoding="utf-8")
+    stub.chmod(0o755)
+
+
+def _policy_vault(tmp_path: Path, extensions_yaml: str) -> Path:
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    (tmp_path / ".okengine").mkdir()
+    (tmp_path / ".okengine" / "extensions.yaml").write_text(extensions_yaml, encoding="utf-8")
+    return tmp_path
+
+
+def _run(tmp_path: Path, extra_env: dict | None = None) -> str:
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", **(extra_env or {})}
+    result = subprocess.run(["bash", str(VERIFY)], cwd=tmp_path, capture_output=True, text=True,
+                            timeout=300, env=env)
+    return result.stdout + result.stderr
+
+
+def test_the_policy_digest_is_computed_without_the_containers_engine_root(tmp_path):
+    """.env carries OKENGINE_ENGINE_ROOT=/opt/data for the GATEWAY. Inherited by the host-side
+    composer it hid every tier-1 extension, the digest came back empty, and an identical policy
+    was reported as drift -- on every roll of the deployment that sets it."""
+    vault = _policy_vault(tmp_path, "enabled:\n  okengine.dedupe: {}\n")
+    digest = subprocess.run(
+        ["python3", str(REPO / "tools" / "policy_plane.py"), "digest", "--vault", str(vault)],
+        capture_output=True, text=True, timeout=120, check=True,
+        env={**os.environ, "OKENGINE_POLICY_CATALOG": str(REPO / "config/policy/catalog.yaml")},
+    ).stdout.strip()
+    assert digest, "fixture: the composer must produce a digest for this vault"
+    (vault / ".okengine" / "effective-policy.json").write_text(f'{{"digest": "{digest}"}}\n',
+                                                               encoding="utf-8")
+    (vault / ".env").write_text("OKENGINE_ENGINE_ROOT=/opt/data\n", encoding="utf-8")
+    _stub_docker(vault / "bin", "")
+    out = _run(vault)
+    assert f"runtime policy digest matches composed source ({digest})" in out, out[-3000:]
+    assert "digest drift" not in out
+
+
+def test_a_digest_that_cannot_be_computed_is_not_reported_as_drift(tmp_path):
+    vault = _policy_vault(tmp_path, "enabled:\n  - not-a-mapping\n")
+    (vault / ".okengine" / "effective-policy.json").write_text('{"digest": "abc"}\n', encoding="utf-8")
+    _stub_docker(vault / "bin", "")
+    out = _run(vault)
+    assert "cannot compute the composed policy digest to compare (runtime=abc)" in out, out[-3000:]
+    assert "must be a mapping" in out, "the composer's own reason is shown, not swallowed"
+    assert "digest drift" not in out
+
+
+def test_a_projection_health_check_that_times_out_says_so(tmp_path):
+    """The health scan walks the whole corpus (158s on a 72k-file vault). A fixed 120s budget
+    killed a healthy check and printed an empty reason under 'conformance failed'."""
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    _stub_docker(tmp_path / "bin", (
+        'case "$*" in\n'
+        '  *"config --services"*|*"--services"*) printf "okengine-projection\\npostgres\\n" ;;\n'
+        '  *"exec -T okengine-projection"*) sleep 5 ;;\n'
+        'esac'))
+    out = _run(tmp_path, {"OKENGINE_VERIFY_PROJECTION_TIMEOUT": "1"})
+    assert "projection health check timed out after 1s (no verdict)" in out, out[-3000:]
+    assert "projection health/conformance failed" not in out

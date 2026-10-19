@@ -20,9 +20,13 @@ A sidecar is the extension's own container: the *intended* isolation boundary (�
 `image` tied to `trust`); `extension_compose.sidecar_specs` /
 `render_sidecar_service` / `render_trigger_wrapper` / `sidecar_compose_override`; and
 `framework extensions sidecar-generate` writes `<pack>/.okengine/generated/
-sidecars.compose.yml` (a compose override with each sidecar service — host network,
+sidecars.compose.yml` (a compose override with each sidecar service — the per-pack bridge,
 digest-pinned image, the #132 scoped token + MCP endpoints + `extension_id` injected as
-env) plus the per-extension `trigger.sh`. The override holds tokens → written `0600`.
+env) plus the per-extension `trigger.sh`. The wrapper runs under the deployment's OWN compose
+project (`COMPOSE_PROJECT_NAME`, else the directory name, as `engine_images.py` derives it), and the
+read MCP URL is the `okengine-mcp:8730` service name (okengine#1044 [5]). Two sidecars whose
+derived service names coincide (`<id>--<op>` against an extension id containing `--`) fail
+generation (okengine#1044 [6]). The override holds tokens → written `0600`.
 **Operator-opt-in / not auto-wired:** actually launching the sidecar needs (a) a real
 sidecar image and (b) docker reachable from the host-net gateway (a socket mount — the
 §3.4 trust note), so the deploy does **not** auto-launch or schedule sidecars. It emits

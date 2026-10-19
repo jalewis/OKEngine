@@ -5,7 +5,13 @@ CHE core step 1 (okengine#234). Builds the inverted map the dependency-aware sel
 (#235) walks: for every OPEN proposition page, every evidence page it cites — from the
 schema-relevant frontmatter ref fields (`subject`, `sources`, `basis` by default — the
 write path normalizes these to plain paths, so `.backlinks.json`'s body-wikilink parse
-misses them), from `evidence[].source` records, and from body wikilinks.
+misses them), from `evidence[].source` and `adversarial_evidence[].source` records, and from
+body wikilinks.
+
+Assessments are propositions by default alongside predictions (okengine#854). Before, only
+`prediction` was indexed, so an assessment's cited evidence could change or vanish and nothing in
+the CHE loop would ever notice. The consumer for assessments is okengine.inquiry's
+inquiry-analyze selector; the predictions regrade lane still reads only its own rows.
 
 SCHEDULED SWEEP, NEVER EVENT-DRIVEN (the §3 guardrail): a full scan rebuilding a derived
 sidecar wholesale, exactly the backlinks_refresh pattern. The artifact is machine state
@@ -20,7 +26,7 @@ carry refs are env config — okcti's diagnostic class (#236) registers with zer
 here. Pure ``no_agent``; atomic tmp→replace write; ``wakeAgent=false`` always; tolerates
 pages vanishing mid-scan.
 
-Env: WIKI_PATH (default /opt/vault) · OKENGINE_REEVAL_TYPES ("prediction")
+Env: WIKI_PATH (default /opt/vault) · OKENGINE_REEVAL_TYPES ("prediction,assessment")
      · OKENGINE_REEVAL_OPEN_STATUSES ("open,active") · OKENGINE_REEVAL_REF_FIELDS
      ("subject,sources,basis")
 """
@@ -42,7 +48,7 @@ ARTIFACT = WIKI / ".reevaluation-edges.json"
 
 TYPES = {t.strip() for t in os.environ.get(
     "OKENGINE_REEVAL_TYPES",
-    os.environ.get("OKENGINE_REEVALUATION_PROPOSITION_TYPES", "prediction"),
+    os.environ.get("OKENGINE_REEVALUATION_PROPOSITION_TYPES", "prediction,assessment"),
 ).split(",") if t.strip()}
 OPEN = {s.strip() for s in os.environ.get(
     "OKENGINE_REEVAL_OPEN_STATUSES",
@@ -52,6 +58,11 @@ REF_FIELDS = [f.strip() for f in os.environ.get(
     "OKENGINE_REEVAL_REF_FIELDS",
     os.environ.get("OKENGINE_REEVALUATION_REF_FIELDS", "subject,sources,basis"),
 ).split(",") if f.strip()]
+
+# Structured evidence lists whose items carry a `source`: predictions use `evidence`,
+# assessments use `adversarial_evidence`. A free-text source that names no page yields an edge
+# to a key no page has, which a consumer's page lookup simply never matches.
+EVIDENCE_RECORD_FIELDS = ("evidence", "adversarial_evidence")
 
 _FM_RE = re.compile(r"\A---\s*\n(.*?\n)---\s*(?:\n|\Z)", re.DOTALL)
 _WIKILINK_RE = re.compile(r"\[\[([^\]]+?)\]\]", re.DOTALL)
@@ -85,13 +96,14 @@ def _refs(fm: dict, body: str) -> dict:
             n = _norm(item)
             if n:
                 out[n].add(field)
-    ev = fm.get("evidence")
-    if isinstance(ev, list):
-        for item in ev:
-            if isinstance(item, dict):
-                n = _norm(item.get("source"))
-                if n:
-                    out[n].add("evidence.source")
+    for record_field in EVIDENCE_RECORD_FIELDS:
+        ev = fm.get(record_field)
+        if isinstance(ev, list):
+            for item in ev:
+                if isinstance(item, dict):
+                    n = _norm(item.get("source"))
+                    if n:
+                        out[n].add(f"{record_field}.source")
     for m in _WIKILINK_RE.finditer(body or ""):
         n = _norm(m.group(0))
         if n:

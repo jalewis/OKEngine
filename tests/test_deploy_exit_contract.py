@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -75,7 +76,14 @@ exit 0
 
 # deploy.sh calls $PYTHON for framework validate/upgrade, the composed-schema recompose, the policy
 # plane, cron_pack_split and the projection config. All succeed; none is what this file tests.
-PYTHON_STUB = "#!/bin/sh\nexit 0\n"
+# engine_images.py (okengine#1033) is the exception: it derives the image pins deploy.sh persists,
+# which several tests below assert, so it runs for real from the scratch engine tree.
+PYTHON_STUB = f"""#!/bin/sh
+case "$1" in
+  */scripts/engine_images.py) exec "{sys.executable}" "$@" ;;
+esac
+exit 0
+"""
 
 
 def write_exec(path: Path, body: str) -> None:
@@ -93,6 +101,13 @@ def deployment(tmp_path):
         "engine_release: v9.8.7\n", encoding="utf-8")
     for name in STUBBED_SCRIPTS:
         write_exec(engine / "scripts" / name, "#!/bin/sh\nexit 0\n")
+    (engine / "scripts" / "cron").mkdir()
+    shutil.copy(REPO / "scripts" / "engine_images.py", engine / "scripts" / "engine_images.py")
+    shutil.copy(REPO / "scripts" / "cron" / "dotenv_lib.py",
+                engine / "scripts" / "cron" / "dotenv_lib.py")
+    (engine / "scripts" / "lib").mkdir()
+    shutil.copy(REPO / "scripts" / "lib" / "hermes_uid.sh",
+                engine / "scripts" / "lib" / "hermes_uid.sh")
 
     pack = tmp_path / "pack"
     pack.mkdir()
@@ -104,7 +119,7 @@ def deployment(tmp_path):
     write_exec(bindir / "git", GIT_STUB)
     write_exec(bindir / "python-stub", PYTHON_STUB)
 
-    def run(*args, verify_exit=0, **env):
+    def run(*args, verify_exit=0, cwd=None, **env):
         write_exec(engine / "scripts" / "post_deploy_verify.sh",
                    f"#!/bin/sh\necho 'stub verifier'\nexit {verify_exit}\n")
         environment = {
@@ -118,9 +133,11 @@ def deployment(tmp_path):
             "OKENGINE_VERIFY_DELAY": "0",
             **env,
         }
+        # A None value unsets the variable, so a test can exercise the .env pin alone.
+        environment = {key: value for key, value in environment.items() if value is not None}
         return subprocess.run(
             ["bash", str(engine / "scripts" / "deploy.sh"), *args],
-            cwd=pack, capture_output=True, text=True, timeout=180, env=environment,
+            cwd=cwd or pack, capture_output=True, text=True, timeout=180, env=environment,
         )
 
     run.pack = pack
@@ -236,6 +253,57 @@ def test_an_existing_uid_pin_is_never_overwritten(deployment):
     assert env_text.count("HERMES_UID=") == 1, "deploy appended a second, conflicting pin"
 
 
+# --- okengine#1044 [1]: deploy.sh reads the .env uid pin the way compose does -------------------
+# deploy.sh used a private first-wins `grep '^HERMES_UID=[0-9]+'` that disagreed with compose and
+# scripts/lib/hermes_uid.sh (dotenv_lib: last assignment wins, quotes and `export` handled). The
+# deploy exported its own reading, so the deploy itself looked consistent while every later bare
+# `docker compose up` ran the gateway as the uid compose reads.
+
+_UNPINNED = {"HERMES_UID": None, "HERMES_GID": None}
+
+
+def _resolved_uid(result) -> str:
+    line = next((l for l in result.stdout.splitlines() if "uid:gid " in l), "")
+    return line.rsplit("uid:gid ", 1)[-1].strip()
+
+
+@pytest.mark.parametrize("env_text", [
+    "HERMES_UID=10000\nHERMES_GID=10000\nHERMES_UID=4242\nHERMES_GID=4242\n",  # last one wins
+    'HERMES_UID="4242"\nHERMES_GID="4242"\n',                                  # quoted
+    "export HERMES_UID=4242\nexport HERMES_GID=4242\n",                          # export form
+    "HERMES_UID=4242 # pinned\nHERMES_GID=4242 # pinned\n",                      # inline comment
+], ids=["duplicate-key", "quoted", "export", "inline-comment"])
+def test_the_env_uid_pin_is_read_as_compose_reads_it(deployment, env_text):
+    (deployment.pack / ".env").write_text(env_text, encoding="utf-8")
+    result = deployment(verify_exit=0, **_UNPINNED)
+    assert _resolved_uid(result) == "4242:4242", result.stdout + result.stderr
+
+
+def test_an_export_form_pin_is_not_shadowed_by_an_appended_one(deployment):
+    """`grep -qE '^HERMES_UID='` missed `export HERMES_UID=...` and appended a second pin, which
+    compose then took as the last assignment: the operator's pin silently lost."""
+    (deployment.pack / ".env").write_text("export HERMES_UID=1003\nexport HERMES_GID=1003\n",
+                                          encoding="utf-8")
+    deployment(verify_exit=0, HERMES_UID="4242", HERMES_GID="4242")
+    env_text = (deployment.pack / ".env").read_text(encoding="utf-8")
+    assert env_text.count("HERMES_UID=") == 1, env_text
+
+
+def test_an_empty_env_pin_is_replaced_by_the_resolved_uid(deployment):
+    """An empty `HERMES_UID=` is no pin: compose's `${HERMES_UID:-10000}` gives 10000. deploy.sh
+    must append the uid it resolved, so a later bare `compose up` runs as the tree owner."""
+    (deployment.pack / ".env").write_text("HERMES_UID=\nHERMES_GID=\n", encoding="utf-8")
+    deployment(verify_exit=0, HERMES_UID="1003", HERMES_GID="1003")
+    lines = (deployment.pack / ".env").read_text(encoding="utf-8").splitlines()
+    assert [l for l in lines if l.startswith("HERMES_UID=")][-1] == "HERMES_UID=1003", lines
+
+
+def test_with_no_pin_and_no_export_the_invoking_uid_is_used(deployment):
+    """okengine#102: a clone-as-yourself pack defaults to your uid, not the tree-owner fallback."""
+    result = deployment(verify_exit=0, **_UNPINNED)
+    assert _resolved_uid(result) == f"{os.getuid()}:{os.getgid()}", result.stdout
+
+
 def test_deploy_persists_an_immutable_gateway_image_and_compose_override(deployment):
     result = deployment(verify_exit=0)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -265,6 +333,100 @@ def test_redeploy_updates_image_pin_once_without_duplicate_compose_entries(deplo
     compose_file = next(line for line in env_text.splitlines()
                         if line.startswith("COMPOSE_FILE="))
     assert compose_file.count("docker-compose.okengine-image.yml") == 1
+
+
+# --- okengine#1033: the compose-built engine images are pinned too ----------------------------
+
+LEGACY_COMPOSE = """services:
+  gateway:
+    image: hermes-agent
+  okengine-reader:
+    build: {context: "${ENGINE_DIR:-../engine}", dockerfile: okengine-reader/Dockerfile}
+    image: okengine-reader
+  okengine-cockpit:
+    build: {context: "${ENGINE_DIR:-../engine}", dockerfile: okengine-cockpit/Dockerfile}
+    image: ${OKENGINE_COCKPIT_IMAGE:-okengine-cockpit}
+"""
+
+
+def _override_images(deployment) -> dict:
+    override = yaml.safe_load(
+        (deployment.pack / "docker-compose.okengine-image.yml").read_text(encoding="utf-8"))
+    return {name: spec.get("image") for name, spec in override["services"].items()}
+
+
+def test_deploy_pins_a_legacy_packs_engine_images_to_its_scoped_tag(deployment):
+    """Migration: an existing pack keeps `image: okengine-reader` in its own docker-compose.yml.
+    Its next deploy.sh must move it onto the scoped tag without editing that file."""
+    (deployment.pack / "docker-compose.yml").write_text(LEGACY_COMPOSE, encoding="utf-8")
+    result = deployment(verify_exit=0)
+    assert result.returncode == 0, result.stdout + result.stderr
+    tag = f"okengine-v9.8.7-{SHA}.pack"
+    env_text = (deployment.pack / ".env").read_text(encoding="utf-8")
+    assert f"OKENGINE_ENGINE_IMAGE_TAG={tag}" in env_text.splitlines()
+    images = _override_images(deployment)
+    pin = "${OKENGINE_ENGINE_IMAGE_TAG:?deploy.sh must pin an immutable engine image tag}"
+    assert images["okengine-reader"] == f"okengine-reader:{pin}"
+    assert images["okengine-cockpit"] == f"okengine-cockpit:{pin}", \
+        "a pack-local cockpit pin must not keep the cockpit on a hand-maintained tag"
+    assert "okengine-mcp" not in images, \
+        "an override entry for a service the pack does not define would CREATE that service"
+    assert (deployment.pack / "docker-compose.yml").read_text() == LEGACY_COMPOSE
+
+
+def test_redeploy_keeps_one_engine_tag_pin_and_one_override_entry(deployment):
+    (deployment.pack / "docker-compose.yml").write_text(LEGACY_COMPOSE, encoding="utf-8")
+    assert deployment(verify_exit=0).returncode == 0
+    assert deployment(verify_exit=0).returncode == 0
+    env_text = (deployment.pack / ".env").read_text(encoding="utf-8")
+    assert env_text.count("OKENGINE_ENGINE_IMAGE_TAG=") == 1
+    text = (deployment.pack / "docker-compose.okengine-image.yml").read_text(encoding="utf-8")
+    assert text.count("  okengine-reader:") == 1
+
+
+def test_the_engine_tag_is_scoped_to_the_compose_project(deployment):
+    (deployment.pack / ".env").write_text("COMPOSE_PROJECT_NAME=Okcti_Test\n", encoding="utf-8")
+    assert deployment(verify_exit=0).returncode == 0
+    env_text = (deployment.pack / ".env").read_text(encoding="utf-8")
+    assert f"OKENGINE_ENGINE_IMAGE_TAG=okengine-v9.8.7-{SHA}.okcti_test" in env_text
+
+
+def test_an_unreadable_compose_file_stops_the_deploy_before_bring_up(deployment):
+    (deployment.pack / "docker-compose.yml").write_text("services: [unterminated\n",
+                                                         encoding="utf-8")
+    result = deployment(verify_exit=0)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "cannot read this deployment's compose files" in result.stderr
+    assert "[4/6]" not in result.stdout
+
+
+def test_an_unresolvable_engine_revision_stops_the_deploy(deployment):
+    """QA on !1317: `git rev-parse` failing used to yield `unknown`, so every unattributable engine
+    tree got the same `okengine-<rel>-unknown` gateway and engine tags. Fail closed instead."""
+    write_exec(deployment.pack.parent / "bin" / "git", GIT_STUB.replace(
+        'rev-parse) echo "abc1234" ; exit 0 ;;', "rev-parse) exit 128 ;;"))
+    result = deployment(verify_exit=0)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "cannot resolve the engine revision" in result.stderr
+    assert "[3/6]" not in result.stdout and "[4/6]" not in result.stdout
+    env = deployment.pack / ".env"
+    assert "unknown" not in (env.read_text() if env.exists() else "")
+
+
+def test_a_missing_compose_file_entry_stops_the_deploy(deployment):
+    (deployment.pack / ".env").write_text(
+        "COMPOSE_FILE=docker-compose.yml:.hermes-data/projection-compose.yml\n", encoding="utf-8")
+    result = deployment(verify_exit=0)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "projection-compose.yml" in result.stderr and "[4/6]" not in result.stdout
+
+
+def test_a_tag_that_cannot_be_derived_stops_the_deploy(deployment):
+    manifest = deployment.engine / "engine-manifest.yaml"
+    manifest.write_text("engine_release: v9.8.7/../x\n", encoding="utf-8")
+    result = deployment(verify_exit=0)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "cannot derive the immutable engine image tag" in result.stderr
 
 
 def test_deploy_never_attaches_generated_sidecar_to_default_compose_project(deployment):
@@ -298,3 +460,217 @@ def test_deploy_removes_absolute_legacy_sidecar_override(deployment):
         if line.startswith("COMPOSE_FILE=")
     )
     assert str(generated.resolve()) not in compose_line
+
+
+# --- the pre-verify projection reconcile (okengine#853) -------------------------------------------
+
+RACING_PROJECTION_DOCKER = DOCKER_STUB.replace(
+    'case "$1 $2" in',
+    '''case "$*" in
+  *"config --services"*) echo okengine-projection ; exit 0 ;;
+  *"exec -T okengine-projection python /app/service.py --reconcile"*)
+      echo "projection operation failed: RuntimeError: canonical corpus changed during projection reconciliation; retry" >&2
+      exit 1 ;;
+esac
+case "$1 $2" in''', 1)
+
+
+def test_a_reconcile_that_loses_the_race_with_live_writes_does_not_fail_the_bring_up(deployment):
+    """The live finding: every rollout step had completed and the gateway was healthy, but the
+    forced full scan lost the race with lanes writing to the vault and `set -e` turned that into
+    exit 1 -- "bring-up failed". The verdict belongs to post_deploy_verify."""
+    write_exec(deployment.pack.parent / "bin" / "docker", RACING_PROJECTION_DOCKER)
+    result = deployment(verify_exit=0)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "WARN: projection reconcile did not complete" in out
+    assert "deployment verified healthy" in out
+
+
+def test_a_reconcile_failure_with_a_failing_verify_is_reported_as_three(deployment):
+    """A genuinely broken projector is not hidden: verification still fails it, and the deploy
+    reports the stack-up-with-issues state rather than success."""
+    write_exec(deployment.pack.parent / "bin" / "docker", RACING_PROJECTION_DOCKER)
+    assert deployment(verify_exit=1).returncode == 3
+
+
+# --- step [0/6]: a failed engine-pin reconcile stops the deploy (okengine#991) -------------------
+
+def _upgrade_exits(deployment, rc: int) -> None:
+    """`framework upgrade` exits `rc`; every other $PYTHON call succeeds."""
+    (deployment.pack / "engine.version").write_text("version: v9.8.6\n", encoding="utf-8")
+    stub = deployment.pack.parent / "bin" / "python-stub"
+    write_exec(stub, PYTHON_STUB.replace(
+        "esac\nexit 0", f'esac\ncase " $* " in *" upgrade "*) exit {rc} ;; esac\nexit 0'))
+
+
+def test_a_rolled_back_engine_upgrade_stops_the_deploy(deployment):
+    """framework upgrade exits 1 when a migration failed and rolled back. validate passes a
+    same-series pin, so swallowing that status deployed an un-migrated pack and reported success."""
+    _upgrade_exits(deployment, 1)
+    result = deployment()
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "[1/6]" not in result.stdout, "the deploy continued past a failed migration"
+    assert "engine pin reconcile FAILED" in result.stderr
+
+
+def test_an_ahead_or_unknown_pin_still_falls_through_to_validate(deployment):
+    """okengine#359: exit 2 (nothing attempted -- ahead or unparseable pin) must not dead-end the
+    deploy; the validate gate reports the actionable mismatch."""
+    _upgrade_exits(deployment, 2)
+    result = deployment()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "[1/6] validate" in result.stdout
+    assert "pin not reconciled" in result.stderr
+
+
+# --- okengine#1042 [28]: a validate FAIL in step [0/6] is named as one, and --skip-validate reaches it
+
+def _record_upgrade_args(deployment, rc: int) -> Path:
+    (deployment.pack / "engine.version").write_text("version: v9.8.6\n", encoding="utf-8")
+    log = deployment.pack.parent / "upgrade-args.log"
+    stub = deployment.pack.parent / "bin" / "python-stub"
+    write_exec(stub, PYTHON_STUB.replace(
+        "esac\nexit 0",
+        f'esac\ncase " $* " in *" upgrade "*) echo "$*" >> "{log}"; exit {rc} ;; esac\nexit 0'))
+    return log
+
+
+def test_an_upgrade_validate_fail_is_not_reported_as_a_migration_failure(deployment):
+    _upgrade_exits(deployment, 3)
+    result = deployment()
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "[1/6]" not in result.stdout
+    assert "framework validate FAILED" in result.stderr
+    assert "a migration" not in result.stderr
+    assert "--skip-validate" in result.stderr
+
+
+def test_skip_validate_also_skips_the_upgrades_roll_forward_validate(deployment):
+    """The documented escape for 'other FAILs' did not reach step [0/6], so a pre-existing FAIL
+    rolled the pin back and aborted before --skip-validate was ever honored."""
+    log = _record_upgrade_args(deployment, 0)
+    result = deployment("--skip-validate")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "--no-validate" in log.read_text()
+
+
+def test_without_skip_validate_the_upgrade_keeps_its_validate_gate(deployment):
+    log = _record_upgrade_args(deployment, 0)
+    assert deployment().returncode == 0
+    assert "--no-validate" not in log.read_text()
+
+
+# --- okengine#1042 [8]/[14]: project ownership and build provenance, as deploy.sh runs them -----
+
+def _logging_docker(deployment, owners: str = "") -> Path:
+    """The default stub, plus: `ps -a` reports `owners` as the project's working dirs, and every
+    `compose up` records the build-tag variable it saw."""
+    log = deployment.pack.parent / "docker.log"
+    body = DOCKER_STUB.replace(
+        'case "$1 $2" in',
+        f'echo "$* BUILD_TAG=${{OKENGINE_ENGINE_BUILD_TAG:-}}" >> "{log}"\n'
+        f'case "$1 $2" in\n  "ps -a") printf "{owners}" ; exit 0 ;;', 1)
+    write_exec(deployment.pack.parent / "bin" / "docker", body)
+    return log
+
+
+def test_a_compose_project_another_directory_owns_stops_the_deploy(deployment):
+    """[8]: two deployments named `pack` in different parents derive one compose project and one
+    engine tag. The second deploy must not recreate the first one's containers."""
+    log = _logging_docker(deployment, owners="/srv/elsewhere/pack\\n")
+    result = deployment(verify_exit=0)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "already belongs to '/srv/elsewhere/pack'" in result.stderr
+    assert "[4/6]" not in result.stdout
+    assert "compose up" not in log.read_text(encoding="utf-8")
+
+
+def test_this_directorys_own_project_deploys_and_labels_its_build(deployment):
+    """[14]: deploy.sh exports the build tag for its own `compose up --build` only, so the image
+    it builds carries the tag it runs under; .env never persists it for a later bare rebuild."""
+    log = _logging_docker(deployment, owners=f"{deployment.pack}\\n")
+    (deployment.pack / "docker-compose.yml").write_text(LEGACY_COMPOSE, encoding="utf-8")
+    result = deployment(verify_exit=0)
+    assert result.returncode == 0, result.stdout + result.stderr
+    up = [line for line in log.read_text(encoding="utf-8").splitlines()
+          if line.startswith("compose up")]
+    assert up == [f"compose up -d --build BUILD_TAG=okengine-v9.8.7-{SHA}.pack"]
+    assert "OKENGINE_ENGINE_BUILD_TAG" not in (deployment.pack / ".env").read_text(encoding="utf-8")
+    override = yaml.safe_load((deployment.pack / "docker-compose.okengine-image.yml").read_text())
+    assert override["services"]["okengine-reader"]["build"]["labels"] == {
+        "org.okengine.engine_image_tag": "${OKENGINE_ENGINE_BUILD_TAG:-unattributed}"}
+
+
+def test_an_unanswerable_ownership_check_warns_and_continues(deployment):
+    write_exec(deployment.pack.parent / "bin" / "docker", DOCKER_STUB.replace(
+        'case "$1 $2" in', 'case "$1 $2" in\n  "ps -a") exit 1 ;;', 1))
+    result = deployment(verify_exit=0)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "undetectable, not a pass" in result.stderr
+
+
+# --- okengine#1044 [25]: a host port another deployment publishes stops the deploy pre-compose --
+
+def _port_docker(deployment, ps_line: str) -> Path:
+    """A docker stub whose compose model publishes reader 9200 and whose `ps` shows `ps_line`;
+    every invocation is logged so the test can tell whether `compose up` ran."""
+    log = deployment.pack.parent / "docker.log"
+    config = ('{"services": {"okengine-reader": {"ports": [{"host_ip": "127.0.0.1", "target": 9200, '
+              '"published": "9200", "protocol": "tcp"}]}}}')
+    write_exec(deployment.pack.parent / "bin" / "docker", f"""#!/bin/sh
+echo "$*" >> "{log}"
+case "$*" in
+  *"config --format json"*)
+    # Compose finds compose files in its cwd; --project-directory does not move that search.
+    [ -f docker-compose.yml ] || {{ echo "no configuration file provided: not found" >&2; exit 1; }}
+    echo '{config}' ; exit 0 ;;
+  "ps --format"*) printf '%s\\n' "{ps_line}" ; exit 0 ;;
+esac
+case "$1 $2" in
+  "image inspect") case "$*" in *org.okengine.git_sha*) echo "{SHA}" ;; esac; exit 0 ;;
+  "compose ps") echo "container-id" ; exit 0 ;;
+  "inspect --format") echo "2026-08-17T00:00:00.000000000Z" ; exit 0 ;;
+esac
+exit 0
+""")
+    return log
+
+
+def test_a_host_port_another_deployment_holds_stops_the_deploy_before_compose_up(deployment):
+    log = _port_docker(deployment, "other-stack\tother-reader\t0.0.0.0:9200->9200/tcp")
+    result = deployment(verify_exit=0)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "host port conflict: okengine-reader wants 127.0.0.1:9200/tcp, held by other-reader" \
+        in result.stderr
+    assert "compose up" not in log.read_text(encoding="utf-8"), "compose up ran into the conflict"
+    assert "[4/6]" not in result.stdout
+
+
+def test_a_host_port_held_by_this_deployment_itself_deploys(deployment):
+    _port_docker(deployment, "pack\tpack-reader\t127.0.0.1:9200->9200/tcp")
+    result = deployment(verify_exit=0)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "host port conflict" not in result.stderr
+
+
+def test_an_unanswerable_port_check_warns_and_continues(deployment):
+    """The default stub answers `compose config` with nothing: undetectable, never a pass."""
+    result = deployment(verify_exit=0)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "could not check this deployment's host ports" in result.stderr
+
+
+def test_a_deploy_run_from_another_cwd_still_checks_the_packs_ports(deployment, tmp_path):
+    """v0.15.14 audit: the documented `bash $ENGINE_DIR/scripts/deploy.sh /path/to/pack` runs from
+    the deployer's cwd. `ports` ran compose there, found no compose file, and deploy.sh warned
+    "undetectable" and brought the stack up into the conflict."""
+    log = _port_docker(deployment, "other-stack\tother-reader\t0.0.0.0:9200->9200/tcp")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    result = deployment(str(deployment.pack), verify_exit=0, cwd=elsewhere)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "host port conflict: okengine-reader wants 127.0.0.1:9200/tcp, held by other-reader" \
+        in result.stderr
+    assert "could not check this deployment's host ports" not in result.stderr
+    assert "compose up" not in log.read_text(encoding="utf-8"), "compose up ran into the conflict"

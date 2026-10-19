@@ -390,3 +390,216 @@ def test_state_without_a_text_hash_falls_back_to_the_byte_comparison(tmp_path, m
 
     quiet = m.capture(tmp_path, "https://news.example/stable", previous=result.state)
     assert quiet.changed is False, "the very next fetch must already be stable"
+
+
+# --- okengine#882: IRI feed links are requested as ASCII URIs ---------------------------------
+
+def _ascii_only_opener(seen):
+    """Mimics http.client: the request line is encoded as ASCII, so an IRI raises
+    UnicodeEncodeError exactly where the live feed run crashed."""
+    def opener(req, _timeout):
+        seen.append(req.full_url)
+        req.full_url.encode("ascii")
+        return Response(b"plain", url=req.full_url, content_type="text/plain")
+    return opener
+
+
+def test_iri_to_uri_percent_encodes_non_ascii_path_query_and_fragment(monkeypatch):
+    m = _load(monkeypatch)
+    assert (m.iri_to_uri("https://news.example/café-überblick?q=naïve&x=1#teil-ä")
+            == "https://news.example/caf%C3%A9-%C3%BCberblick?q=na%C3%AFve&x=1#teil-%C3%A4")
+
+
+def test_iri_to_uri_idna_encodes_non_ascii_host_and_keeps_port(monkeypatch):
+    m = _load(monkeypatch)
+    assert m.iri_to_uri("https://bücher.example/pfad") == "https://xn--bcher-kva.example/pfad"
+    assert (m.iri_to_uri("https://user@bücher.example:8443/a b")
+            == "https://user@xn--bcher-kva.example:8443/a%20b")
+
+
+def test_iri_to_uri_leaves_an_already_encoded_uri_unchanged(monkeypatch):
+    m = _load(monkeypatch)
+    for uri in ("https://news.example/a%C3%A9/b?x=1&y=%20&z=a+b#frag",
+                "https://news.example/",
+                "https://[2001:db8::1]:8443/p;params?q=(x)!*'~"):
+        assert m.iri_to_uri(uri) == uri
+
+
+def test_iri_to_uri_splits_the_port_before_idna_encoding_the_last_label(monkeypatch):
+    """A non-ASCII label next to the port must be punycoded alone, not as "bücher:8443"."""
+    m = _load(monkeypatch)
+    assert (m.iri_to_uri("https://example.bücher:8443/a")
+            == "https://example.xn--bcher-kva:8443/a")
+    # A bracketed IPv6 literal is never split at its own colons (userinfo makes netloc non-ASCII).
+    assert m.iri_to_uri("https://üser@[2001:db8::1]:8443/a") == "https://%C3%BCser@[2001:db8::1]:8443/a"
+    assert m.iri_to_uri("https://üser@[2001:db8::1]/a") == "https://%C3%BCser@[2001:db8::1]/a"
+
+
+def test_iri_to_uri_never_idna_encodes_an_ascii_host(monkeypatch):
+    """An ASCII netloc passes through untouched, even one the IDNA codec would refuse (a label over
+    63 characters): only a non-ASCII host needs conversion; the HTTP stack judges the rest."""
+    m = _load(monkeypatch)
+    uri = "https://" + "a" * 70 + ".example/p"
+    assert m.iri_to_uri(uri) == uri
+    assert m.iri_to_uri("https://" + "a" * 70 + ".example/ü") == "https://" + "a" * 70 + ".example/%C3%BC"
+
+
+def test_iri_to_uri_rejects_an_unencodable_host(monkeypatch):
+    m = _load(monkeypatch)
+    with pytest.raises(m.CaptureError) as exc:
+        m.iri_to_uri("https://" + "ü" * 80 + ".example/a")
+    assert exc.value.category == "invalid-url"
+
+
+def test_fetch_document_requests_an_iri_link_as_its_uri(monkeypatch):
+    m = _load(monkeypatch)
+    seen = []
+    body, meta = m.fetch_document("https://bücher.example/nachrichten/über-uns",
+                                  opener=_ascii_only_opener(seen))
+    assert body == b"plain"
+    assert seen == ["https://xn--bcher-kva.example/nachrichten/%C3%BCber-uns"]
+    assert meta["final_url"] == seen[0]
+
+
+def test_redirect_to_an_iri_is_converted_before_validation(monkeypatch):
+    m = _load(monkeypatch)
+    validated = []
+    monkeypatch.setattr(m, "_validate_url", lambda url: validated.append(url))
+    monkeypatch.setattr(urllib.request.HTTPRedirectHandler, "redirect_request",
+                        lambda _self, _req, _fp, _code, _msg, _headers, newurl: newurl)
+    out = m._SafeRedirect().redirect_request(None, None, 302, "", {}, "https://news.example/ü")
+    assert out == validated[0] == "https://news.example/%C3%BC"
+
+
+def test_fetch_document_turns_a_refused_url_into_a_capture_error(monkeypatch):
+    """Any ValueError the HTTP stack still raises (UnicodeError, http.client.InvalidURL) is a
+    per-document CaptureError, not an exception that escapes to the feed run."""
+    import http.client
+    m = _load(monkeypatch)
+    for error in (UnicodeEncodeError("ascii", "ü", 0, 1, "ordinal not in range(128)"),
+                  http.client.InvalidURL("URL can't contain control characters")):
+        with pytest.raises(m.CaptureError) as exc:
+            m.fetch_document("https://news.example/a",
+                             opener=lambda *_a, _e=error: (_ for _ in ()).throw(_e))
+        assert exc.value.category == "invalid-url"
+        assert type(error).__name__ in str(exc.value)
+
+
+# --- the document, not the page chrome (okengine#886) ------------------------
+PROSE = ("Sparse attention cuts long-context cost without hurting quality, and the effect "
+         "holds across four model sizes and three benchmark families in our measurements. "
+         "Ablations on block size and routing show the gain comes from skipping far tokens, "
+         "not from the routing heuristic itself. ")   # above MIN_MAIN_CHARS, like a real article
+CHROME = ("<a>Skip to main content</a><nav><a>Research</a><a>Products</a></nav>"
+          "<header><a>Sign in</a></header>")
+
+
+def _text(wc, html):
+    return wc.extract(html.encode(), "text/html", "https://news.example/a")["text"]
+
+
+def test_main_content_wins_over_page_chrome(monkeypatch):
+    """REGRESSION: captured pages began "Skip to main content | Search | Sign in ...". With a
+    <main>/<article> landmark only the document is kept; its own header (title, byline) stays."""
+    wc = _load(monkeypatch)
+    text = _text(wc, f"<html><body>{CHROME}<main><article><header><h1>Paper</h1>"
+                     f"<p>By A. Author</p></header><p>{PROSE}</p></article></main>"
+                     f"<footer>Terms Privacy</footer><aside>Related</aside></body></html>")
+    assert text.startswith("Paper") and "By A. Author" in text and PROSE.strip() in text
+    for junk in ("Skip to main content", "Research", "Sign in", "Terms", "Related"):
+        assert junk not in text
+
+
+def test_aria_landmarks_and_hidden_blocks_are_chrome(monkeypatch):
+    wc = _load(monkeypatch)
+    text = _text(wc, f"<body><div role='navigation'>Menu</div><div role='banner'>Banner</div>"
+                     f"<div aria-hidden='true'>Hidden</div><div role='main'><p>{PROSE}</p></div>"
+                     f"<div role='contentinfo'>Copyright</div></body>")
+    assert PROSE.strip() in text
+    assert not any(x in text for x in ("Menu", "Banner", "Hidden", "Copyright"))
+
+
+def test_a_page_without_landmarks_drops_only_chrome(monkeypatch):
+    wc = _load(monkeypatch)
+    text = _text(wc, f"<body>{CHROME}<div><p>{PROSE}</p></div><footer>Footer</footer></body>")
+    assert PROSE.strip() in text and "Research" not in text and "Footer" not in text
+
+
+def test_a_thin_main_falls_back_and_never_extracts_less_than_before(monkeypatch):
+    """NEGATIVE: a <main> holding a stub (or a page that is ALL chrome) must not shrink the
+    capture below the pre-landmark extraction."""
+    wc = _load(monkeypatch)
+    thin = _text(wc, f"<body><main>Loading…</main><div><p>{PROSE}</p></div></body>")
+    assert PROSE.strip() in thin, "a stub <main> falls back to the page minus chrome"
+    only_chrome = _text(wc, "<body><nav>Just a menu page with links only</nav></body>")
+    assert only_chrome == "Just a menu page with links only", "nothing else: keep everything"
+
+
+def test_unclosed_tags_never_swallow_the_rest_of_the_page(monkeypatch):
+    """Real-world HTML leaves tags unclosed; closing an ancestor unwinds its children, so an
+    unclosed <nav> inside a <div> ends with that <div>."""
+    wc = _load(monkeypatch)
+    text = _text(wc, f"<body><div><nav><a>Menu</div><p>{PROSE}</p><br><img src=x></body>")
+    assert PROSE.strip() in text and "Menu" not in text
+
+
+def test_a_stray_closing_tag_changes_nothing(monkeypatch):
+    wc = _load(monkeypatch)
+    text = _text(wc, f"<body></span></nav><main><p>{PROSE}</p></main><nav>Menu</nav></body>")
+    assert PROSE.strip() in text and "Menu" not in text
+
+
+def test_blocks_break_lines_and_inline_tags_do_not(monkeypatch):
+    wc = _load(monkeypatch)
+    text = _text(wc, f"<main><h1>Paper</h1><p>Hello <b>big</b> <a>world</a> today.</p>"
+                     f"<p>{PROSE}</p></main>")
+    lines = text.splitlines()
+    assert lines[0] == "Paper" and lines[1] == "Hello big world today."
+    assert lines[2] == PROSE.strip()
+
+
+def test_chrome_as_the_first_element_ends_where_it_closes(monkeypatch):
+    """No <html>/<body> wrapper: the chrome element sits at the bottom of the open-tag stack."""
+    wc = _load(monkeypatch)
+    text = _text(wc, f"<nav>Menu</nav><p>{PROSE}</p>")
+    assert text == PROSE.strip()
+
+
+def test_a_stray_closer_inside_chrome_does_not_end_it(monkeypatch):
+    wc = _load(monkeypatch)
+    text = _text(wc, f"<p>{PROSE}</p><nav>Menu</b>More menu</nav>")
+    assert "More menu" not in text and PROSE.strip() in text
+
+
+def test_nested_same_name_chrome_closes_one_level_at_a_time(monkeypatch):
+    wc = _load(monkeypatch)
+    text = _text(wc, f"<p>{PROSE}</p><nav><nav>Inner</nav>Still menu</nav>")
+    assert "Still menu" not in text and "Inner" not in text
+
+
+def test_hidden_and_landmark_chrome_without_a_main(monkeypatch):
+    wc = _load(monkeypatch)
+    text = _text(wc, f"<div aria-hidden='true'>Hidden</div><div aria-hidden='yes'>Shown</div>"
+                     f"<div role='region'>Region intro</div><p>{PROSE}</p>")
+    assert "Hidden" not in text, "aria-hidden=true is chrome"
+    assert "Shown" in text, "only aria-hidden=true hides"
+    assert "Region intro" in text, "role=region is content, not the main landmark"
+
+
+def test_role_main_is_the_main_content(monkeypatch):
+    wc = _load(monkeypatch)
+    text = _text(wc, f"<div role='main'><p>{PROSE}</p></div><p>Unrelated sibling text</p>")
+    assert PROSE.strip() in text and "Unrelated sibling" not in text
+
+
+def test_text_after_a_thin_main_still_counts_as_body(monkeypatch):
+    wc = _load(monkeypatch)
+    text = _text(wc, f"<nav>Menu</nav><main>Loading</main><p>{PROSE}</p>")
+    assert PROSE.strip() in text and "Menu" not in text
+
+
+def test_main_exactly_at_the_floor_is_used(monkeypatch):
+    wc = _load(monkeypatch)
+    monkeypatch.setattr(wc, "MIN_MAIN_CHARS", len("".join("Exactly enough.".split())))
+    text = _text(wc, "<main><p>Exactly enough.</p></main><p>Other page text here</p>")
+    assert text == "Exactly enough."

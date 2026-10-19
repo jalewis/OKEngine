@@ -26,55 +26,18 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "cron"))
-import id_lib       # noqa: E402
-import schema_lib   # noqa: E402
+import generated_page  # noqa: E402 — the shared derivation generated-page writers use (#933)
 
-import yaml         # noqa: E402
-
-_FM_RE = re.compile(r"\A(---\s*\n)(.*?\n)(---\s*(?:\n|\Z))", re.DOTALL)
-_ID_LINE = re.compile(r"^id:\s", re.MULTILINE)
-_RESERVED = {"index.md", "log.md", "agents.md", "readme.md", "hot.md", "bundle.md", "health.md"}
-
-
-def _skip(p: Path) -> bool:
-    n = p.name.lower()
-    return (n in _RESERVED or p.name.startswith(("_", "."))
-            or ".bak." in p.name or n == "schema.yaml")
-
-
-def _parse_fm(text: str):
-    m = _FM_RE.match(text)
-    if not m:
-        return None, None
-    try:
-        fm = yaml.safe_load(m.group(2))
-    except Exception:
-        return None, m
-    return (fm if isinstance(fm, dict) else {}), m
-
-
-def _insert_id(text: str, pid: str, m: "re.Match") -> str:
-    """Insert `id: "<pid>"` as the first frontmatter line — surgical, preserves
-    the rest of the file byte-for-byte."""
-    return m.group(1) + f'id: "{pid}"\n' + m.group(2) + m.group(3) + text[m.end():]
-
-
-def derive_for_page(vault: Path, rel: str, fm: dict) -> tuple[str, str]:
-    """(id, kind) for a page at wiki-relative `rel` with frontmatter `fm`."""
-    namespace = rel.split("/", 1)[0]
-    stem = Path(rel).stem
-    schema = schema_lib.merged_schema(vault, namespace)
-    ptype = str(fm.get("type") or "").strip()
-    authority, id_field = schema_lib.type_id_authority(schema, ptype)
-    local_id = fm.get(id_field) if authority else None
-    return id_lib.derive_id(authority=authority, local_id=local_id,
-                            minted_scope=namespace,
-                            slug_source=id_lib.natural_key(fm, fallback=stem))
+# The skip rule, frontmatter parse, id insertion and derivation live in generated_page so a
+# regenerated dashboard/report writes the very id this pass would stamp (okengine#933).
+_skip = generated_page.is_exempt
+_parse_fm = generated_page.parse_frontmatter
+_insert_id = generated_page.insert_id
+derive_for_page = generated_page.derive_for_page
 
 
 def run(vault: Path, apply: bool) -> dict:
@@ -109,8 +72,7 @@ def run(vault: Path, apply: bool) -> dict:
         pid, kind = derive_for_page(vault, rel, fm)
         if pid in claimed and claimed[pid] != rel:
             if kind == "slug":
-                ns = id_lib.parse_id(pid)[0]
-                pid = id_lib.make_id(ns, f"{Path(rel).stem}-{id_lib._short_hash(rel, 6)}")
+                pid = generated_page.disambiguate(pid, rel)
                 slug_collisions.append((pid, rel, claimed.get(pid, "")))
             else:
                 authority_collisions.append((pid, rel, claimed[pid]))

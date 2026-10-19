@@ -32,6 +32,12 @@ engine:
                                  # the move that strands them is backwards (okengine#563)
   - build-index-tree
   - backlinks-refresh            # no_agent precompute of wiki/.backlinks.json for the UIs (okengine#168)
+  - dedup-same-url               # no_agent, weekly DRY-RUN report; --apply by an operator merges live sources holding one URL
+                                 # through the write path; dry-run by default (okengine#886)
+  - raw-compile                  # no_agent: compiles STRUCTURED raw captures to sources through the
+                                 # write path; raw-backfill's model keeps the rest (okengine#862)
+  - entity-link                  # no_agent: appends sources naming an EXISTING entity to its
+                                 # `sources:` through the write path; never creates (okengine#888)
   - id-index-refresh             # no_agent precompute of the id->path index so the MCP write path loads it (not a 64k-page live scan)
   - index-rebuild-daily
   - build-hot-set

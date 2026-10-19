@@ -18,9 +18,13 @@ KEYS = {
     "api", "allowed_namespaces", "allowed_types", "operations",
     "required_fields", "required_relationships", "optional_relationships", "body", "unknown_fields",
     "unresolved_links", "placeholder_links", "completion",
-    "required_write_path",
+    "required_write_path", "identity_edit",
 }
 BODY_KEYS = {"required", "min_non_whitespace", "max_non_whitespace"}
+# okengine#1028: the identity fields a lane may change directly on an existing page. The write path
+# reads the same set (okengine.identity_guard.FIELDS); a test pins the two together.
+IDENTITY_FIELDS = {"type", "title", "name", "aliases", "citations", "remove"}
+IDENTITY_KEYS = {"fields", "retype_from"}
 
 
 def digest(contract: dict) -> str:
@@ -100,6 +104,7 @@ def validate(contract: object, where: str = "output_contract") -> list[str]:
             errors.append(f"{where}.{key} must be one of {sorted(POLICIES)}")
     if contract.get("completion") not in COMPLETION:
         errors.append(f"{where}.completion must be one of {sorted(COMPLETION)}")
+    errors.extend(_identity_edit_errors(contract, where))
     required_path = contract.get("required_write_path")
     if required_path is not None:
         if not isinstance(required_path, str) or not required_path.strip():
@@ -109,6 +114,62 @@ def validate(contract: object, where: str = "output_contract") -> list[str]:
         elif contract.get("completion") != "run":
             errors.append(f"{where}.required_write_path requires completion=run")
     return errors
+
+
+def _identity_edit_errors(contract: dict, where: str) -> list[str]:
+    """okengine#1028: `identity_edit` lets a curation lane retype, rename or strip existing pages
+    without review. A lane that CREATES pages is an ingest or backfill lane, and never holds it."""
+    grant = contract.get("identity_edit")
+    if grant is None:
+        return []
+    where = f"{where}.identity_edit"
+    if not isinstance(grant, dict):
+        return [f"{where} must be an object"]
+    errors = []
+    unknown = sorted(set(grant) - IDENTITY_KEYS)
+    if unknown:
+        errors.append(f"{where} has unknown key(s): {unknown}")
+    try:
+        bad = sorted(set(_strings(grant.get("fields"), f"{where}.fields", nonempty=True))
+                     - IDENTITY_FIELDS)
+        if bad:
+            errors.append(f"{where}.fields has unsupported value(s): {bad}")
+    except ValueError as exc:
+        errors.append(str(exc))
+    if "retype_from" in grant:
+        try:
+            _strings(grant["retype_from"], f"{where}.retype_from", nonempty=True)
+        except ValueError as exc:
+            errors.append(str(exc))
+        if "type" not in (grant.get("fields") or []):
+            errors.append(f"{where}.retype_from requires `type` in fields")
+    operations = contract.get("operations")
+    if isinstance(operations, list) and "create" in operations:
+        errors.append(f"{where} is not allowed on a lane that creates pages: ingest and backfill "
+                      "lanes route identity changes to review")
+    return errors
+
+
+def _compose_identity_edit(floor: dict | None, policy: dict | None, where: str) -> dict | None:
+    """A pack may narrow an engine lane's identity grant, never add or widen one."""
+    if policy is None:
+        return deepcopy(floor)
+    if floor is None:
+        raise ValueError(f"{where}.identity_edit policy may not widen the engine floor")
+    fields = [f for f in floor["fields"] if f in policy["fields"]]
+    if "retype_from" in floor and "retype_from" in policy:
+        retype_from = [t for t in floor["retype_from"] if t in policy["retype_from"]]
+    else:
+        retype_from = floor.get("retype_from", policy.get("retype_from"))
+    if retype_from == []:
+        fields = [f for f in fields if f not in ("type",)]
+        retype_from = None
+    if not fields:
+        return None
+    out = {"fields": fields}
+    if retype_from is not None and "type" in fields:
+        out["retype_from"] = list(retype_from)
+    return out
 
 
 def compose(floor: dict | None, policy: dict | None, where: str = "output_contract") -> dict | None:
@@ -191,5 +252,10 @@ def compose(floor: dict | None, policy: dict | None, where: str = "output_contra
     out["required_write_path"] = policy_path or floor_path
     if out["required_write_path"] is None:
         out.pop("required_write_path")
+    identity = _compose_identity_edit(floor.get("identity_edit"), policy.get("identity_edit"),
+                                      where)
+    out.pop("identity_edit", None)
+    if identity is not None:
+        out["identity_edit"] = identity
     out["api"] = API_VERSION
     return out

@@ -80,7 +80,10 @@ def test_no_event_types_is_a_clean_noop(tmp_path):
 
 def test_ledger_self_contained():
     imports = re.findall(r"^\s*(?:from|import)\s+([a-zA-Z_][\w.]*)", LEDGER.read_text(), re.M)
-    allowed = {"__future__", "json", "os", "re", "datetime", "pathlib", "yaml", "typing", "collections"}
+    # generated_page is the one engine lib allowed: deploy-cron-scripts.sh stages it one level up
+    # (/opt/data/scripts/) from the extension dir, and it keeps the ledger's id (okengine#933).
+    allowed = {"__future__", "json", "os", "re", "sys", "datetime", "pathlib", "yaml", "typing",
+               "collections", "generated_page"}
     assert not [i for i in imports if i.split(".")[0] not in allowed]
 
 

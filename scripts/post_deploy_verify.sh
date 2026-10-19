@@ -53,6 +53,11 @@ if [ ! -f docker-compose.yml ] && [ ! -f compose.yml ]; then
 fi
 # token/password are read from .env if present (values, not just names)
 [ -f .env ] && set -a && . ./.env 2>/dev/null && set +a
+# okengine#1043: every host-side python below imports THIS checkout's engine (okengine, tools) ahead
+# of whatever the deployer's interpreter carries in site-packages or a PYTHONPATH from .env. Set
+# after .env, so a container-scoped value there cannot redirect it. Step [9] also pins and checks
+# its own imports, which this cannot do for a module a .pth file imports at interpreter start.
+export PYTHONPATH="$VERIFY_ENGINE_DIR/src:$VERIFY_ENGINE_DIR${PYTHONPATH:+:$PYTHONPATH}"
 MCP_TOKEN=${OKENGINE_MCP_TOKEN:-}
 READER_PW=${OKENGINE_READER_PASSWORD:-}
 
@@ -121,10 +126,20 @@ elif [ "$_projection" -eq 0 ]; then
     # sits between them, and one inserted line silently inverts the verdict. This repo has been
     # bitten by the same shape twice — `deploy-cron-scripts.sh … | tail -3` returning tail's
     # status, and a `$?` read after a pipe reporting the wrong exit code (okengine#602).
-    if projection_health=$(timeout 120 docker compose exec -T "$PROJECTION" \
+    # The health scan walks the whole corpus: 158s on a 72k-file vault, so a fixed 120s budget
+    # killed a HEALTHY check and reported a failure with an empty reason. Budget is overridable,
+    # and a timeout says so instead of looking like a failed conformance check.
+    proj_budget="${OKENGINE_VERIFY_PROJECTION_TIMEOUT:-300}"
+    if projection_health=$(timeout "$proj_budget" docker compose exec -T "$PROJECTION" \
             python /app/service.py --health 2>&1); then
         ok "projection health and file-count conformance passed: $projection_health"
-    else bad "projection health/conformance failed" "$projection_health"; fi
+    else
+        proj_rc=$?
+        if [ "$proj_rc" -eq 124 ]; then
+            bad "projection health check timed out after ${proj_budget}s (no verdict)" \
+                "large vault? raise OKENGINE_VERIFY_PROJECTION_TIMEOUT and re-verify"
+        else bad "projection health/conformance failed" "$projection_health"; fi
+    fi
     if typed_count=$(timeout 30 docker compose exec -T "$MCP" python -c \
             'import asyncio,json; from okengine.mcp import projection; print(json.dumps(asyncio.run(projection.count_pages())))' 2>&1); then
         ok "typed MCP count_pages query passed: $typed_count"
@@ -250,6 +265,15 @@ fi
 # everything else runs new (the exact trap deployment_validate.check_write_path_libs and CLAUDE.md's
 # deploy-surfaces note describe). Compare the two copies INSIDE $GW, over the same libs as
 # _WRITE_PATH_LIBS. Present on only one side is UNDETECTABLE, never a pass (the M22 one-sided rule).
+#
+# Both sides empty is UNDETECTABLE too (okengine#1042 [16]): `dcx` drops stderr, so an exec that
+# failed (restart window, exec denied, an image without sha256sum) reads exactly like two missing
+# files, and this step is what POST_DEPLOY_HOST_EXCLUDED['write-path'] leans on. Probe the exec once
+# so a gateway that cannot be asked gets one WARN that says so, instead of no verdict at all.
+if [ "$(dcx "$GW" sh -c 'command -v sha256sum >/dev/null 2>&1 && echo digest-ok')" != "digest-ok" ]; then
+  wn "write-path baked-lib drift UNDETECTABLE — cannot run sha256sum in $GW (not exec-able, exec denied, or no sha256sum in the image)" \
+     "undetectable, not a pass: step [9] skips the write-path check because this step runs it; re-run once 'docker compose exec $GW sha256sum --version' works"
+else
 for lib in schema_lib.py id_lib.py id_index.py okf_migrate.py; do
   bh=$(dcx "$GW" sh -c "sha256sum /opt/hermes/scripts/cron/$lib 2>/dev/null | cut -d' ' -f1")
   sh_=$(dcx "$GW" sh -c "sha256sum /opt/data/scripts/$lib 2>/dev/null | cut -d' ' -f1")
@@ -259,6 +283,9 @@ for lib in schema_lib.py id_lib.py id_index.py okf_migrate.py; do
   elif [ -n "$bh" ] || [ -n "$sh_" ]; then
     wn "cannot compare write-path lib $lib — present on only one of {baked /opt/hermes/scripts/cron, staged /opt/data/scripts}" \
        "undetectable, not a pass: ensure both the gateway image and /opt/data/scripts carry $lib"
+  else
+    wn "cannot compare write-path lib $lib — absent from BOTH {baked /opt/hermes/scripts/cron, staged /opt/data/scripts}" \
+       "undetectable, not a pass: the gateway image and /opt/data/scripts must both carry $lib (rebuild the image; re-run deploy-cron-scripts.sh)"
   fi
 done
 
@@ -276,8 +303,28 @@ for spec in "config/base-schema.yaml:config/base-schema.yaml" \
   elif [ -n "$bh" ] || [ -n "$sh_" ]; then
     wn "cannot compare write-path contract $name — present on only one of {baked, staged}" \
        "undetectable, not a pass: ensure both the gateway image and /opt/data/config carry $name"
+  else
+    wn "cannot compare write-path contract $name — absent from BOTH {baked /opt/hermes, staged /opt/data}" \
+       "undetectable, not a pass: the gateway image and /opt/data/config must both carry $name"
   fi
 done
+fi
+
+# 3b2. the gateway carries the Hermes patch series (okengine#1044 [29]) ------
+# Patch 01 is the file-tool vault write guard; without it Hermes' native file tools are a second,
+# weaker write path around okengine-write. The gateway was verified only by build markers a
+# non-engine image lacks (an upstream tag, a hand-built image, an old tag in a pack's compose), so a
+# gateway with none of the carried guards verified green. Check the code itself: every runtime line
+# the series adds must be in /opt/hermes (one read-only tar stream out of the gateway).
+patch_out=$(python3 "$VERIFY_ENGINE_DIR/scripts/hermes_patch_probe.py" --engine-dir "$VERIFY_ENGINE_DIR" \
+    --service "$GW" 2>&1); patch_rc=$?
+case "$patch_rc" in
+    0) ok "$(printf '%s' "$patch_out" | head -1)" ;;
+    1) bad "gateway is missing carried Hermes patches: $(printf '%s' "$patch_out" | grep -E '^  MISSING ' | sed 's/^  MISSING //' | cut -d: -f1 | tr '\n' ' ')" \
+           "the running gateway image was not built by build-engine-image.sh from this engine (or predates a patch): re-run deploy.sh --rebuild; never point the gateway at an upstream hermes-agent image" ;;
+    *) wn "Hermes patch presence undetectable: $(printf '%s' "$patch_out" | tail -1)" \
+          "undetectable, not a pass: check that $GW is running and exec-able ('docker compose exec $GW tar --version')" ;;
+esac
 
 # 3c. gateway api_server exposure (okengine#120) ----------------------------
 # The host-net gateway's OpenAI-compatible api_server (the reader Chat relay target)
@@ -334,13 +381,24 @@ else
 fi
 
 # 4a. composed policy digest + non-mutating least-privilege probe ----------------
-expected_policy=$(OKENGINE_POLICY_CATALOG="$VERIFY_ENGINE_DIR/config/policy/catalog.yaml" \
-    python3 "$VERIFY_ENGINE_DIR/tools/policy_plane.py" digest --vault "$PWD" 2>/dev/null)
+# Computed HOST-side, but this script sourced the deployment's .env above -- and .env also carries
+# CONTAINER-scoped values for the gateway. OKENGINE_ENGINE_ROOT=/opt/data there made the host-side
+# composer look for tier-1 extensions under a path that exists only inside the container, fail,
+# and print nothing -- which read as "drift" on a deployment whose digest was in fact identical.
+policy_err=$(mktemp)
+expected_policy=$(env -u OKENGINE_ENGINE_ROOT \
+    OKENGINE_POLICY_CATALOG="$VERIFY_ENGINE_DIR/config/policy/catalog.yaml" \
+    python3 "$VERIFY_ENGINE_DIR/tools/policy_plane.py" digest --vault "$PWD" 2>"$policy_err")
+policy_why=$(tail -c 300 "$policy_err" | tr '\n' ' '); rm -f "$policy_err"
 runtime_policy=$(python3 -c 'import json; print(json.load(open(".okengine/effective-policy.json")).get("digest", ""))' 2>/dev/null)
-if [ -n "$expected_policy" ] && [ "$expected_policy" = "$runtime_policy" ]; then
+if [ -z "$expected_policy" ]; then
+    # undetectable is not a pass -- but it is not drift either; say which, and why
+    bad "cannot compute the composed policy digest to compare (runtime=${runtime_policy:-missing})" \
+        "${policy_why:-policy_plane.py printed nothing}"
+elif [ "$expected_policy" = "$runtime_policy" ]; then
     ok "runtime policy digest matches composed source ($runtime_policy)"
 else
-    bad "runtime policy digest drift (runtime=${runtime_policy:-missing}, expected=${expected_policy:-unavailable})" \
+    bad "runtime policy digest drift (runtime=${runtime_policy:-missing}, expected=$expected_policy)" \
         "rerun deploy.sh so policy is recomposed from merged engine/pack/extension sources"
 fi
 probe=$(dcx "$GW" sh -c \
@@ -350,6 +408,56 @@ if [ "$probe" = "source-quality-fields-only" ]; then
 else
     bad "source-quality capability probe returned ${probe:-nothing}" \
         "rebuild the gateway image and verify the effective policy artifact"
+fi
+
+# okengine#991: the chat writer ensure-runtime binds (config, stage + recreate) needs its capability
+# in the catalog BAKED into the running image; a stage-only roll onto an older image rejects every
+# chat write-back while the probe above still passes. Only the gateway can read its baked catalog,
+# so the shared check runs there (host-side it is undetectable by construction).
+# okengine#994 [15]: a staged deployment_checks.py older than the check would return no findings
+# (read as a pass), so a copy that does not register it reports STALE instead.
+chatcap=$(dcx "$GW" sh -c "cd /opt/data/scripts && /opt/hermes/.venv/bin/python -c 'import deployment_checks as C
+found = C.run([\"chat-capability\"]) if \"chat-capability\" in C.CHECKS else [(\"STALE\", \"\", \"the staged deployment_checks.py predates the chat-capability check, so it never ran\")]
+for level, area, msg in found: print(level + chr(9) + \" \".join(msg.split()))
+print(\"END\")'")
+if [ "$(printf '%s\n' "$chatcap" | tail -1)" != "END" ]; then
+    wn "cannot run the chat-capability check inside $GW (undetectable, not a pass)" \
+       "check that $GW is running and /opt/data/scripts carries deployment_checks.py"
+elif [ "$chatcap" = "END" ]; then
+    ok "no bound chat writer needs a baked capability"
+else
+    while IFS=$'\t' read -r level msg; do
+        case "$level" in
+            ""|END) continue ;;
+            FAIL) bad "[chat-capability] $msg" "rebuild the gateway image (build-engine-image.sh) and recreate $GW" ;;
+            STALE) bad "[chat-capability] $msg" "restage the cron scripts (deploy-cron-scripts.sh), then rerun this verify" ;;
+            WARN) wn  "[chat-capability] $msg" "run the check inside the gateway" ;;
+            *)    ok  "[chat-capability] $msg" ;;
+        esac
+    done <<< "$chatcap"
+fi
+
+# cron-plus computes every next_run_at with the GATEWAY venv's croniter; Hermes's frozen lock ships
+# 6.0.0, which shifts a next fire that crosses DST by an hour, while CI and the host lock 6.2.4. The
+# shared check runs the behavioral DST self-test under the baked interpreter, so only the gateway
+# can run it. A staged copy that predates the check reports STALE (okengine#994 [15]).
+dstcheck=$(dcx "$GW" sh -c "cd /opt/data/scripts && /opt/hermes/.venv/bin/python -c 'import deployment_checks as C
+found = C.run([\"scheduler-dst\"]) if \"scheduler-dst\" in C.CHECKS else [(\"STALE\", \"\", \"the staged deployment_checks.py predates the scheduler-dst check, so it never ran\")]
+for level, area, msg in found: print(level + chr(9) + \" \".join(msg.split()))
+print(\"END\")'")
+if [ "$(printf '%s\n' "$dstcheck" | tail -1)" != "END" ]; then
+    wn "cannot run the scheduler-dst check inside $GW (undetectable, not a pass)" \
+       "check that $GW is running and /opt/data/scripts carries deployment_checks.py"
+else
+    while IFS=$'\t' read -r level msg; do
+        case "$level" in
+            ""|END) continue ;;
+            FAIL) bad "[scheduler-dst] $msg" "a croniter case: rebuild the gateway image (build-engine-image.sh) and recreate $GW; a cron-plus case: rerun deploy.sh so install-cron-plus.sh reapplies the carried patches" ;;
+            STALE) bad "[scheduler-dst] $msg" "restage the cron scripts (deploy-cron-scripts.sh), then rerun this verify" ;;
+            WARN) wn  "[scheduler-dst] $msg" "run the check inside the gateway" ;;
+            *)    ok  "[scheduler-dst] $msg" ;;
+        esac
+    done <<< "$dstcheck"
 fi
 
 # 4b. governed operation runner (optional review profile) --------------------
@@ -378,6 +486,21 @@ else bad "cron-plus not enabled in config.yaml" "without it NO cron schedules; s
 njobs=$(dcx "$GW" sh -c 'python3 -c "import json;print(len(json.load(open(\"/opt/data/cron-plus/jobs.json\")).get(\"jobs\",[])))"' 2>/dev/null)
 if [ -n "$njobs" ] && [ "$njobs" -gt 0 ] 2>/dev/null; then ok "cron-plus has $njobs jobs registered"
 else bad "cron-plus jobs.json empty/absent" "CRON_PACK_DIR=<pack> bash ../okengine/scripts/deploy-cron-plus-jobs.sh"; fi
+# DEPLOYED == LIVE (okengine#850). Presence and a job count said "fine" on a deployment whose
+# scheduler had written the PRE-deploy definitions back over the new ones. The deploy records what
+# it wrote (jobs.deployed.json); prove the live store still carries every one of those definitions.
+if dcx "$GW" test -f /opt/data/cron-plus/jobs.deployed.json; then
+    if store_drift=$(docker compose exec -T "$GW" python3 - drift /opt/data/cron-plus/jobs.deployed.json \
+            /opt/data/cron-plus/jobs.json < "$VERIFY_ENGINE_DIR/scripts/cron_plus_store.py" 2>&1); then
+        ok "live jobs.json holds exactly the job definitions last deployed"
+    else
+        bad "live jobs.json no longer holds the deployed job definitions (an older copy was written back)" \
+            "$(printf '%s' "$store_drift" | head -5 | tr '\n' ';') — re-run deploy-cron-plus-jobs.sh (okengine#850)"
+    fi
+else
+    wn "no record of what was last deployed (jobs.deployed.json) — deployed-vs-live drift undetectable" \
+       "re-run deploy.sh; deploys before okengine#850 did not record it"
+fi
 # FRESHNESS, not presence: the pinned plugin re-opens .tick.lock with open("w") EVERY tick (verified
 # scheduler.py _try_acquire_lock @ 6b230dc; run_ticker tick()s once at startup before the first
 # sleep), so a HEALTHY ticker's lock mtime is >= this gateway's start AND advances ~every 60s. But
@@ -483,18 +606,33 @@ fi
 # well-owned dir") but only closes it for jobs.json. Sweep the tree instead of spot-checking it:
 # ~80k files costs <0.5s, which is nothing at a deploy gate.
 if [ -n "$want_uid" ]; then
-    nstray="$(dcx "$GW" sh -c "find /opt/data ! -uid $want_uid 2>/dev/null | wc -l" | tr -d '[:space:]')"
+    # ONE probe yields both the count and the examples (okengine#858). Two separate finds let a
+    # short-lived file be counted by the first and gone by the second, so the gate FAILed with
+    # "N file(s) ... (e.g. ?)" -- a red with no evidence. Each example is listed with its owner uid
+    # and mtime; one that vanished between the find and the listing says so, which is itself the
+    # evidence of a transient writer.
+    # Every candidate is re-stat'ed before it counts: an atomic writer's temp file (mkstemp ->
+    # rename) can be read by find and gone before find stats it, and find then reports a path it
+    # never saw an owner for. Twice that FAILed a healthy deploy ("gone before it could be
+    # listed" .spawn-ledger_*.tmp). A path that no longer exists is reported as transient, never
+    # counted as a mis-owned file.
+    SWEEP_SH='s=$(find /opt/data ! -uid "$1" 2>/dev/null); k=$(printf "%s\n" "$s" | while IFS= read -r p; do [ -n "$p" ] || continue; u=$(stat -c %u "$p" 2>/dev/null) || continue; [ "$u" = "$1" ] || printf "%s\n" "$p"; done); n=$(printf "%s" "$k" | grep -c .); printf "__COUNT=%s\n__TRANSIENT=%s\n" "$n" "$(( $(printf "%s" "$s" | grep -c .) - n ))"; printf "%s\n" "$k" | head -3 | while IFS= read -r p; do [ -n "$p" ] || continue; ls -lnd "$p" 2>/dev/null || echo "(gone before it could be listed) $p"; done'
+    sweep="$(dcx "$GW" sh -c "$SWEEP_SH" pdv-sweep "$want_uid")"
+    nstray="$(printf '%s\n' "$sweep" | sed -n 's/^__COUNT=//p' | tr -d '[:space:]')"
     # Empty => the probe never ran (gateway not exec-able). Reporting PASS there is the vacuous green
     # the repo's "missing key = WARN undetectable, never a vacuous pass" rule (M22) exists to forbid.
     if [ -z "$nstray" ]; then
         wn "cannot sweep runtime-tree ownership — the find probe returned nothing (gateway not exec-able?); UNDETECTABLE here, not a pass" \
            "docker compose ps $GW; docker compose logs $GW, then re-run once the gateway is up"
     elif [ "$nstray" -gt 0 ] 2>/dev/null; then
-        eg="$(dcx "$GW" sh -c "find /opt/data ! -uid $want_uid 2>/dev/null | head -3" | tr '\n' ' ')"
-        bad "$nstray file(s) under /opt/data are NOT owned by the gateway uid $want_uid (e.g. ${eg:-?})" \
+        eg="$(printf '%s\n' "$sweep" | grep -v '^__\(COUNT\|TRANSIENT\)=' | sed '/^$/d' | tr '\n' ';' | sed 's/;$//; s/;/; /g')"
+        bad "$nstray file(s) under /opt/data are NOT owned by the gateway uid $want_uid (e.g. ${eg:-none listed})" \
             "every write to them fails SILENTLY — dropped cron receipts, an unwritable agent.log (okengine#557); fix with 'sudo chown -R $want_uid:$want_uid <pack>/.hermes-data'. Do NOT use ensure-runtime.sh --fix-perms: it makes the tree world-writable, trading an ownership bug for a permissions downgrade"
     else
-        ok "runtime tree fully owned by the gateway uid ($want_uid) — $(dcx "$GW" sh -c 'find /opt/data 2>/dev/null | wc -l' | tr -d '[:space:]') paths swept"
+        ntransient="$(printf '%s\n' "$sweep" | sed -n 's/^__TRANSIENT=//p' | tr -d '[:space:]')"
+        note=""
+        [ "${ntransient:-0}" -gt 0 ] 2>/dev/null && note=" ($ntransient path(s) vanished or were re-owned mid-sweep, not counted)"
+        ok "runtime tree fully owned by the gateway uid ($want_uid) — $(dcx "$GW" sh -c 'find /opt/data 2>/dev/null | wc -l' | tr -d '[:space:]') paths swept$note"
     fi
 fi
 
@@ -605,41 +743,43 @@ fi
 # 9. deployment self-checks (shared library, okengine#405) -------------------
 # The filesystem checks below run through the SAME shared library the daily in-gateway validator and
 # `framework doctor` use (scripts/cron/deployment_checks.py) — one source of truth instead of a shell
-# re-implementation. Only the host-readable, uid-neutral checks run here (auth/toolset lockdown,
-# composed schema, sub-domains, timezone, partition dups, rules, extensions, provenance, pins,
-# operation runs). The BAKED-vs-staged
-# write-path drift (3b), runtime-uid ownership (5c), and vault ownership (5f) stay above: they require in-container
-# access (the baked /opt/hermes libs, the container's HERMES_UID) that a host-side read cannot reach.
+# re-implementation. Every registered check runs here except deployment_checks
+# .POST_DEPLOY_HOST_EXCLUDED: the BAKED-vs-staged write-path drift (3b), runtime-uid ownership (5c),
+# vault ownership (5f) and chat capability stay above, because they require in-container access (the
+# baked /opt/hermes libs and catalog, the container's HERMES_UID) that a host-side read cannot reach.
+# scripts/post_deploy_selfchecks.py pins its imports to THIS checkout (okengine#1043: an ambient
+# site-packages okengine judged the v0.15.12 roll with stale code) and ends with an END row, so a
+# crashed or killed run is a FAIL, never "no findings" (okengine#1042 [15]). Each row names the check
+# that produced it, which is what `framework doctor --checks` takes; the finding's area often is not
+# a check name (okengine#1042 [21]).
 echo "[9] deployment self-checks (shared library)"
-selfchecks=$(python3 - "$VERIFY_ENGINE_DIR" "$PWD" <<'PY' 2>/dev/null
-import os, sys
-sys.path.insert(0, os.path.join(sys.argv[1], "scripts", "cron"))
-try:
-    import deployment_checks as C
-except Exception as exc:
-    print("ERR\t\t%s" % exc); raise SystemExit(0)
-dep = sys.argv[2]
-C.configure(dep, data=os.path.join(dep, ".hermes-data"),
-            hermes=os.path.join(dep, ".no-baked-image-on-host"))
-subset = ["pins", "schema", "subdomains", "crons", "timezone", "partition-dups",
-          "rules", "extensions", "provenance", "operations", "auth"]
-for level, area, msg in C.run(subset):
-    print("%s\t%s\t%s" % (level, area, " ".join(msg.split())))
-PY
-)
-if [ -z "$selfchecks" ]; then
-    ok "shared checks produced no findings (or the engine checkout is unavailable)"
-else
-    while IFS=$'\t' read -r level area msg; do
-        [ -z "$level" ] && continue
-        case "$level" in
-            FAIL) bad "[$area] $msg" "framework doctor $PWD --checks $area  (fix, then re-run deploy)" ;;
-            WARN) wn  "[$area] $msg" "framework doctor $PWD --checks $area" ;;
-            INFO) ok  "[$area] $msg" ;;
-            ERR)  wn  "shared checks unavailable ($msg)" "run from the deployment dir with the engine checkout intact" ;;
-        esac
-    done <<< "$selfchecks"
+selfchecks_err=$(mktemp)
+selfchecks=$(PYTHONIOENCODING=utf-8 python3 "$VERIFY_ENGINE_DIR/scripts/post_deploy_selfchecks.py" \
+    "$PWD" 2>"$selfchecks_err")
+selfchecks_rc=$?
+selfchecks_done=0
+while IFS=$'\t' read -r level check area msg; do
+    [ -z "$level" ] && continue
+    if [ "$check" = "-" ]; then
+        hint="the deployer's python3 imports another okengine; deploy with an interpreter whose site-packages holds none (or deactivate the venv)"
+    else
+        hint="framework doctor $PWD --checks $check"
+    fi
+    case "$level" in
+        FAIL) bad "[$area] $msg" "$hint  (fix, then re-run deploy)" ;;
+        WARN) wn  "[$area] $msg" "$hint" ;;
+        INFO|PASS) ok  "[$area] $msg" ;;
+        # The driver failed outside any check (the checks' own import): none of them ran, so this
+        # is a FAIL even though the driver still reached END (v0.15.13 audit).
+        ERR)  bad "shared checks did not run ($msg)" "run from the deployment dir with the engine checkout intact" ;;
+        END)  selfchecks_done=1 ;;
+    esac
+done <<< "$selfchecks"
+if [ "$selfchecks_rc" -ne 0 ] || [ "$selfchecks_done" -ne 1 ]; then
+    bad "shared checks did not finish (rc=$selfchecks_rc): $(tail -n 1 "$selfchecks_err" 2>/dev/null) — every finding after the last one printed is LOST, not a pass" \
+        "re-run them directly: ( cd $PWD && python3 $VERIFY_ENGINE_DIR/scripts/post_deploy_selfchecks.py $PWD )"
 fi
+rm -f "$selfchecks_err"
 
 # unmaintained running services -----------------------------------------------
 # A container that is RUNNING but absent from the resolved Compose configuration is one no deploy
@@ -678,7 +818,11 @@ fi
 # enforced at one boundary and not the other is not enforced, and here both boundaries were the
 # same file at two ages. The gateway image is covered by its org.okengine.git_sha label; these
 # are compose-built from a docker-compose.yml the PACK owns, so they are verified by content.
-img_project="${COMPOSE_PROJECT_NAME:-$(basename "$PWD")}"
+# The project as Compose derives it (COMPOSE_PROJECT_NAME from the shell or .env, the compose
+# files' `name:`, then the directory as spelled), from the one derivation deploy.sh's tag and claim
+# use. A third spelling here ignored `name:` and a .env COMPOSE_PROJECT_NAME (okengine#1044 [26]).
+img_project="$(python3 "$VERIFY_ENGINE_DIR/scripts/engine_images.py" project "$PWD" 2>/dev/null)" \
+    || img_project="${COMPOSE_PROJECT_NAME:-$(basename "$PWD")}"
 if img_out=$(python3 "$VERIFY_ENGINE_DIR/scripts/image_drift.py" \
         --project "$img_project" --engine-dir "$VERIFY_ENGINE_DIR" 2>&1); then
     ok "engine images built from this source ($(printf '%s' "$img_out" | grep -c 'in sync') in sync)"
@@ -686,6 +830,41 @@ else
     bad "engine image(s) not built from this source: $(printf '%s' "$img_out" | grep -E 'DRIFTED|UNDETECTABLE' | tr '\n' ' ')" \
         "rebuild and roll them: docker compose build <svc> && docker compose up -d --force-recreate <svc>"
 fi
+
+# image tag drift (okengine#1033) ---------------------------------------------
+# A running container whose image ID is not what its compose image reference resolves to NOW: the
+# tag moved under it (another pack's build, a local smoke build, a manual retag). It keeps running
+# the old image until its next recreate, then silently runs whatever the tag names. Three docker
+# calls plus one `image inspect` per distinct reference. WARN, not FAIL: the running stack is
+# unchanged; the hazard is the next `compose up`.
+tag_out=$(python3 "$VERIFY_ENGINE_DIR/scripts/engine_images.py" drift 2>&1); tag_rc=$?
+case "$tag_rc" in
+    0) ok "running containers match their compose image references" ;;
+    # okengine#1042: SHARED (an engine image on a tag other deployments can move), UNATTRIBUTED
+    # (an image deploy.sh did not build, e.g. a bare `compose up` rebuilt a pruned one) and
+    # UNPINNED (nothing names the image) are the same hazard as a moved tag: re-run deploy.sh.
+    # Quote every `  <KIND> <item>` finding line drift printed, never a hand-typed list of kinds: a
+    # kind added to engine_images.FAILING_KINDS is then named here too (okengine#1044 [17]).
+    1) wn "engine image tag(s) not pinned to what is running: $(printf '%s' "$tag_out" | grep -E '^  [A-Z_]+ ' | sed 's/^  //' | tr '\n' ' ')" \
+          "re-run deploy.sh to pin and build this deployment's scoped engine image tags, or retag the reference back to the running image ID; a bare 'docker compose up' recreates onto whatever the tag names now" ;;
+    *) wn "image tag drift undetectable: $(printf '%s' "$tag_out" | tail -1)" \
+          "undetectable, not a pass: check the docker daemon and re-run from the deployment dir" ;;
+esac
+
+# tested image digests (okengine#1048) ----------------------------------------
+# The images above are proven to be built from THIS source; this proves they are the images CI
+# TESTED. A host-side rebuild of the same source is a different artifact (base layer, network
+# fetches, compose labels), and the v0.15.13 gateway never ran in CI at all. The list is the release
+# pipeline's artifacts/release-images/tested-digests.json, named by OKENGINE_TESTED_DIGESTS (the
+# environment or .env). No list is UNDETECTABLE (WARN), never a pass; an untested image is a FAIL.
+digest_out=$(python3 "$VERIFY_ENGINE_DIR/scripts/tested_digests.py" 2>&1); digest_rc=$?
+case "$digest_rc" in
+    0) ok "every running engine image is one CI tested: $(printf '%s' "$digest_out" | grep 'tested digests:' | tail -1)" ;;
+    1) bad "running engine image(s) CI never tested: $(printf '%s' "$digest_out" | grep -E 'UNTESTED|FAIL' | tr '\n' ' ')" \
+           "deploy the digests the release pipeline tested (artifacts/release-images/tested-digests.json), or point OKENGINE_TESTED_DIGESTS at the right release's list" ;;
+    *) wn "tested-digest check UNDETECTABLE: $(printf '%s' "$digest_out" | grep -E 'UNDETECTABLE|UNREADABLE' | tr '\n' ' ')" \
+          "undetectable, not a pass: set OKENGINE_TESTED_DIGESTS to the release pipeline's tested-digests.json and re-run from the deployment dir" ;;
+esac
 
 # summary --------------------------------------------------------------------
 echo "================================="

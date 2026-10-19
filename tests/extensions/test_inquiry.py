@@ -244,7 +244,7 @@ def test_declared_floor_is_passed_through_untouched(tmp_path):
     assert params["min_security_relevance"] == "0.5"
 
 
-def _fixture_vault(tmp_path, page=VALID, manifest_id="test.search"):
+def _fixture_vault(tmp_path, page=VALID, manifest_id="test.search", archive=False):
     vault = tmp_path / "vault"
     (vault / "wiki" / lib.NS).mkdir(parents=True)
     (vault / "wiki" / lib.NS / "does-it-happen.md").write_text(page, encoding="utf-8")
@@ -268,6 +268,18 @@ def _fixture_vault(tmp_path, page=VALID, manifest_id="test.search"):
         "archive: {enabled: false, raw_responses: false, path: '', retention_days: 0}\n"
         "license: {name: Test, redistribution: prohibited, max_retention_days: 0}\n"
         "health: {path: test.json}\n", encoding="utf-8")
+    if archive:
+        # A per-record archive is what makes evidence attributable; the runtime's own contract
+        # then also demands write_raw, a retention the license allows, and non-clear data.
+        text = (conn / "search.yaml").read_text(encoding="utf-8")
+        for a, b in (("write_raw: false", "write_raw: true"),
+                     ("data_sensitivity: clear", "data_sensitivity: internal"),
+                     ("archive: {enabled: false, raw_responses: false, path: '', retention_days: 0}",
+                      "archive: {enabled: true, raw_responses: false, path: test-search, "
+                      "retention_days: 30}"),
+                     ("max_retention_days: 0", "max_retention_days: 30")):
+            text = text.replace(a, b)
+        (conn / "search.yaml").write_text(text, encoding="utf-8")
     return vault, conn
 
 
@@ -317,7 +329,7 @@ def test_collect_runs_each_term_and_records_yield(tmp_path, monkeypatch, capsys)
     assert [p["q"] for p in seen] == ["alpha", "beta"]
     state = __import__("json").loads(
         (vault / ".okengine/inquiry/collect-state.json").read_text())
-    assert state["terms"]["does-it-happen::alpha"]["total_records"] == 3
+    assert state["terms"]["does-it-happen::alpha"]["records"] == 3
     assert "6 record(s)" in capsys.readouterr().out
 
 
@@ -384,8 +396,8 @@ def test_dossier_reports_a_healthy_term_as_ok(tmp_path, monkeypatch):
     today = _utc_today().isoformat()
     out = _render(monkeypatch, vault, conn, {
         "does-it-happen::alpha": {"last_run": today, "last_yield": today,
-                                  "total_records": 9, "ok": True, "error": ""}})
-    assert "| ok |" in out and "| 9 |" in out
+                                  "records": 9, "new_records": 4, "ok": True, "error": ""}})
+    assert "| ok |" in out and "| 4 |" in out
 
 
 def test_a_term_that_never_yielded_is_flagged_dry(tmp_path, monkeypatch):
@@ -484,7 +496,8 @@ def test_dossier_is_idempotent(tmp_path, monkeypatch):
 
 # ── framework validate wiring ───────────────────────────────────────────────
 
-def _validate_pack(tmp_path, *, page=VALID, manifest_id="test.search", enable=True):
+def _validate_pack(tmp_path, *, page=VALID, manifest_id="test.search", enable=True,
+                   extra_enabled="", monkeypatch=None):
     """Build a minimal pack and run the real check through framework_validate_extensions."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts import framework_validate as fv
@@ -493,13 +506,31 @@ def _validate_pack(tmp_path, *, page=VALID, manifest_id="test.search", enable=Tr
     (pack / "wiki" / lib.NS).mkdir(parents=True)
     (pack / "wiki" / lib.NS / "does-it-happen.md").write_text(page, encoding="utf-8")
     (pack / ".okengine").mkdir(parents=True, exist_ok=True)
-    if enable:
+    # enable: True = listed explicitly; "core" = not listed (core default-on); False = disabled
+    if enable is True:
         (pack / ".okengine" / "extensions.yaml").write_text(
-            "enabled:\n  okengine.inquiry: {}\n", encoding="utf-8")
+            "enabled:\n  okengine.inquiry: {}\n" + extra_enabled, encoding="utf-8")
+    elif enable == "core":
+        (pack / ".okengine" / "extensions.yaml").write_text(
+            "enabled:\n" + (extra_enabled or "  {}\n"), encoding="utf-8")
+    else:
+        (pack / ".okengine" / "extensions.yaml").write_text(
+            "enabled: {}\ndisabled: [okengine.inquiry]\n", encoding="utf-8")
     conn = pack / "connectors"
     conn.mkdir()
     (conn / "search.yaml").write_text(f"id: {manifest_id}\nname: Test\n", encoding="utf-8")
 
+    if enable == "core":
+        # Make okengine.inquiry resolve as a CORE (default-on) extension, exactly as a manifest
+        # `core: true` would: the gate must then judge a pack that never listed it.
+        real = fv._discovery_mod
+
+        def as_core():
+            module = real()
+            original = module.is_core
+            module.is_core = lambda rec: rec.get("id") == "okengine.inquiry" or original(rec)
+            return module
+        monkeypatch.setattr(fv, "_discovery_mod", as_core)
     report = fv.Report()
     fv.check_inquiries(pack, report)
     return report
@@ -525,10 +556,46 @@ def test_framework_validate_fails_an_inquiry_with_no_terms(tmp_path):
     assert fails and "collects nothing" in " ".join(str(f) for f in fails)
 
 
-def test_framework_validate_is_a_no_op_when_the_extension_is_not_enabled(tmp_path):
-    """A pack that never enabled the extension must not be judged by its contract."""
+def test_framework_validate_is_a_no_op_when_the_extension_is_disabled(tmp_path):
+    """A pack that turned the (core) extension OFF must not be judged by its contract."""
     report = _validate_pack(tmp_path, manifest_id="something.else", enable=False)
     assert not [x for x in report.rows if x[0] == "FAIL"], report.rows
+
+
+def test_framework_validate_judges_a_core_default_on_pack_that_never_listed_it(tmp_path,
+                                                                                monkeypatch):
+    """NEGATIVE (okengine#854): the gate consulted only the EXPLICIT enabled list, so an extension
+    resolved as core (default-on, never listed) was never judged — a misspelled connector there
+    would have passed validation and collected nothing. It must use the effective set the deploy
+    runs."""
+    report = _validate_pack(tmp_path, manifest_id="something.else", enable="core",
+                            monkeypatch=monkeypatch)
+    assert [x for x in report.rows if x[0] == "FAIL" and x[1] == "inquiry"], report.rows
+
+
+def test_inquiry_stays_opt_in():
+    """Decided (okengine#854 step 4): a core inquiry would force its schema fragment — an
+    `inquiry` type/namespace and a permanent composed artifact — into every pack."""
+    import yaml as _yaml
+    manifest = _yaml.safe_load((EXT / "extension.yaml").read_text())
+    assert manifest["core"] is False
+
+
+def test_open_inquiries_without_assessments_warn_that_they_cannot_be_answered(tmp_path):
+    report = _validate_pack(tmp_path)
+    warns = [x for x in report.rows if x[0] == "WARN" and x[1] == "inquiry"]
+    assert warns and "okengine.assessments is not enabled" in warns[0][2]
+
+
+def test_open_inquiries_with_assessments_do_not_warn(tmp_path):
+    report = _validate_pack(tmp_path, extra_enabled="  okengine.assessments: {}\n")
+    assert not [x for x in report.rows if x[0] == "WARN" and x[1] == "inquiry"], report.rows
+
+
+def test_closed_inquiries_without_assessments_do_not_warn(tmp_path):
+    """Nothing will be asked of a closed inquiry, so a missing answerer is not a gap."""
+    report = _validate_pack(tmp_path, page=VALID.replace("status: open", "status: closed"))
+    assert not [x for x in report.rows if x[0] == "WARN" and x[1] == "inquiry"], report.rows
 
 
 # ── connector discovery: every reject path ──────────────────────────────────
@@ -622,7 +689,7 @@ def test_run_connector_reads_the_record_count_from_the_runtime_json(tmp_path, mo
     monkeypatch.setattr(collect.subprocess, "run",
                         lambda *a, **k: _Proc(stdout='{"ok": true, "records": 7}\n'))
     assert collect.run_connector(tmp_path / "m.yaml", {"q": "x"}) == {
-        "ok": True, "records": 7, "error": ""}
+        "ok": True, "records": 7, "error": "", "native_ids": []}
 
 
 def test_run_connector_ignores_non_json_chatter_before_the_result(tmp_path, monkeypatch):
@@ -642,7 +709,7 @@ def test_run_connector_surfaces_a_nonzero_exit_as_a_failure(tmp_path, monkeypatc
     monkeypatch.setattr(collect.subprocess, "run",
                         lambda *a, **k: _Proc(returncode=2, stderr="boom"))
     outcome = collect.run_connector(tmp_path / "m.yaml", {"q": "x"})
-    assert outcome == {"ok": False, "records": 0, "error": "boom"}
+    assert outcome == {"ok": False, "records": 0, "error": "boom", "native_ids": []}
 
 
 def test_run_connector_falls_back_to_stdout_when_stderr_is_empty(tmp_path, monkeypatch):
@@ -698,16 +765,20 @@ def test_absent_collect_state_is_empty(tmp_path, monkeypatch):
     assert collect._load_state() == {}
 
 
-def test_total_records_accumulate_across_runs(tmp_path, monkeypatch, capsys):
-    vault, conn = _fixture_vault(tmp_path)
+def test_a_record_returned_again_is_not_counted_as_new(tmp_path, monkeypatch, capsys):
+    """NEGATIVE for the old `total_records`: a recency-capped query returns the same page every
+    day, and summing it reported 650 collected for a term holding 50 distinct records."""
+    vault, conn = _fixture_vault(tmp_path, archive=True)
     _patch_env(monkeypatch, vault, conn, collect)
-    monkeypatch.setattr(collect, "run_connector",
-                        lambda *a, **k: {"ok": True, "records": 4, "error": ""})
+    monkeypatch.setattr(collect, "run_connector", lambda *a, **k: {
+        "ok": True, "records": 2, "error": "", "native_ids": ["r1", "r2"]})
     collect.main([])
     collect.main([])
     import json as _json
-    state = _json.loads((vault / ".okengine/inquiry/collect-state.json").read_text())
-    assert state["terms"]["does-it-happen::alpha"]["total_records"] == 8
+    rec = _json.loads((vault / ".okengine/inquiry/collect-state.json").read_text())[
+        "terms"]["does-it-happen::alpha"]
+    assert rec["records"] == 2 and rec["new_records"] == 0
+    assert "total_records" not in rec
 
 
 def test_last_yield_is_retained_when_a_later_run_returns_nothing(tmp_path, monkeypatch):
@@ -723,7 +794,7 @@ def test_last_yield_is_retained_when_a_later_run_returns_nothing(tmp_path, monke
     import json as _json
     rec = _json.loads((vault / ".okengine/inquiry/collect-state.json").read_text())[
         "terms"]["does-it-happen::alpha"]
-    assert rec["last_yield"] and rec["records"] == 0 and rec["total_records"] == 5
+    assert rec["last_yield"] and rec["records"] == 0
 
 
 # ── dossier helpers: the branches the render tests walk past ────────────────
@@ -865,7 +936,7 @@ def test_collect_payload_reports_every_counter(tmp_path, monkeypatch, capsys):
                         lambda *a, **k: {"ok": True, "records": 6, "error": ""})
     collect.main([])
     assert _payload(capsys) == {"wakeAgent": False, "inquiries": 1, "terms": 2,
-                                "records": 12, "failures": 0}
+                                "records": 12, "new_records": 0, "failures": 0}
 
 
 def test_collect_payload_counts_failures_separately_from_records(tmp_path, monkeypatch, capsys):
@@ -986,7 +1057,7 @@ def test_index_counts_evidence_per_inquiry(tmp_path, monkeypatch):
     _render(monkeypatch, vault, conn, {})
     index = (vault / "wiki/dashboards/inquiry/INDEX.md").read_text()
     row = next(l for l in index.splitlines() if "does-it-happen" in l)
-    assert "| 1 | 2 | 0 | 0 |" in row       # terms, assessments, predictions, solutions
+    assert "| 1 | 0 | 2 | 0 | 0 |" in row   # terms, sources, assessments, predictions, solutions
 
 
 def test_dossier_payload_counts_what_it_rendered(tmp_path, monkeypatch, capsys):
@@ -1232,7 +1303,7 @@ def test_run_connector_skips_a_line_that_looks_like_json_but_is_not(tmp_path, mo
     out = '{"ok": true, "records":\n{"ok": true, "records": 5}\n'
     monkeypatch.setattr(collect.subprocess, "run", lambda *a, **k: _Proc(stdout=out))
     outcome = collect.run_connector(tmp_path / "m.yaml", {"q": "x"})
-    assert outcome == {"ok": True, "records": 5, "error": ""}, (
+    assert outcome == {"ok": True, "records": 5, "error": "", "native_ids": []}, (
         "a truncated JSON line must be skipped and the real result still read")
 
 
@@ -1323,7 +1394,9 @@ def test_a_discovery_fault_makes_the_inquiry_check_abstain(tmp_path):
     """Discovery faults are already reported by the extension-resolution check. Reporting them
     again here as an inquiry failure would double-count one defect under two names."""
     disc = _autospec_discovery()
-    disc.discover.side_effect = RuntimeError("unreadable extension.yaml")
+    # The gate resolves the EFFECTIVE set (resolve_for_pack); the fault must be raised THERE, or
+    # this passes without ever reaching the fault branch.
+    disc.resolve_for_pack.side_effect = RuntimeError("unreadable extension.yaml")
     checks, report = _checks(lambda: disc)
     checks.check_inquiries(tmp_path / "pack", report)
     assert report.rows == [], "a discovery fault must not produce an inquiry verdict"
@@ -1336,12 +1409,11 @@ def test_an_extension_record_without_its_library_makes_the_check_abstain(tmp_pat
     empty = tmp_path / "ext-without-lib"
     empty.mkdir()
     disc = _autospec_discovery()
-    disc.discover.return_value = ({}, [])
-    disc.load_enabled_state.return_value = (["okengine.inquiry"], [])
-    disc.resolve_enabled.return_value = ({"okengine.inquiry": {"dir": str(empty)}}, [])
+    disc.resolve_for_pack.return_value = ({"okengine.inquiry": {"dir": str(empty)}}, [])
     checks, report = _checks(lambda: disc)
     checks.check_inquiries(tmp_path / "pack", report)
     assert report.rows == [], "a record with no inquiry_lib.py must not be judged"
+    disc.resolve_for_pack.assert_called_with(tmp_path / "pack")
 
 
 def test_an_enabled_pack_with_no_inquiry_namespace_is_not_judged(tmp_path):
@@ -1406,3 +1478,445 @@ def test_a_manifest_without_an_id_is_skipped_and_the_scan_continues(tmp_path):
     fv.check_inquiries(pack, report)
     assert not [r for r in report.rows if r[0] == "FAIL"], report.rows
     assert [r for r in report.rows if r[0] == "OK"], "the reachable inquiry must still pass"
+
+
+# ── evidence provenance: term -> record -> compiled source ──────────────────
+#
+# Collection alone produced a dossier reading "650 records" and "Assessments 0": nothing could say
+# WHICH collected evidence answered WHICH inquiry, so no downstream lane could reason over it. The
+# ledger + raw-path join close that. The contract test comes first because the join is only as
+# good as the agreement between the path this lane derives and the path the runtime writes.
+
+def _run_real_runtime_offline(monkeypatch, tmp_path, records):
+    """Run the REAL connector runtime (real argv, real archive write, real stdout) against a
+    fixture instead of the network, by appending --fixture to the argv run_connector builds."""
+    import json as _json
+    fixture = tmp_path / "fixture.json"
+    fixture.write_text(_json.dumps({"fixture_version": 1,
+                                    "pages": [{"body": {"results": records}}]}))
+    real_run = collect.subprocess.run
+
+    def with_fixture(argv, **kwargs):
+        return real_run([*argv, "--fixture", str(fixture), "--state-root",
+                         str(tmp_path / "state"), "--health-root", str(tmp_path / "health"),
+                         "--collection-ledger", str(tmp_path / "ledger")], **kwargs)
+    monkeypatch.setattr(collect.subprocess, "run", with_fixture)
+
+
+def test_the_derived_record_dir_is_where_the_runtime_actually_archives(tmp_path, monkeypatch):
+    """CONTRACT: the join key must name a directory that exists. The native id is deliberately
+    one the runtime's sanitizer rewrites, so a re-implemented sanitizer would drift here."""
+    vault, conn = _fixture_vault(tmp_path, archive=True)
+    _patch_env(monkeypatch, vault, conn, collect)
+    _run_real_runtime_offline(monkeypatch, tmp_path, [{"id": "a/b c:1", "title": "t"}])
+    outcome = collect.run_connector(conn / "search.yaml", {"q": "alpha"})
+    assert outcome["ok"], outcome
+    assert outcome["native_ids"] == ["a/b c:1"]
+    _, manifests, _ = collect.discover_connectors(conn)
+    where = collect.record_dir(manifests["test.search"], "a/b c:1",
+                               collect._runtime_module()[0]._safe_component)
+    written = list((vault / where).glob("*.json"))
+    assert len(written) == 1, f"runtime archived nowhere near {where}"
+
+
+def test_collect_attributes_every_returned_record_to_its_term(tmp_path, monkeypatch):
+    vault, conn = _fixture_vault(tmp_path, archive=True)
+    _patch_env(monkeypatch, vault, conn, collect)
+    _run_real_runtime_offline(monkeypatch, tmp_path, [{"id": "r1"}, {"id": "r2"}])
+    assert collect.main([]) == 0
+    ledger = lib.load_ledger()
+    by_term = lib.records_by_term(ledger)
+    assert by_term["does-it-happen::alpha"] == {
+        "raw/connectors/test-search/records/r1", "raw/connectors/test-search/records/r2"}
+
+
+def test_a_record_returned_by_two_terms_carries_both(tmp_path, monkeypatch):
+    """Why provenance is a ledger and not a scalar field on the record or the source page."""
+    vault, conn = _fixture_vault(tmp_path, archive=True)
+    _patch_env(monkeypatch, vault, conn, collect)
+    monkeypatch.setattr(collect, "run_connector", lambda *a, **k: {
+        "ok": True, "records": 1, "error": "", "native_ids": ["shared"]})
+    collect.main([])
+    entry = lib.load_ledger()["records"]["raw/connectors/test-search/records/shared"]
+    assert set(entry["terms"]) == {"does-it-happen::alpha", "does-it-happen::beta"}
+
+
+def test_new_counts_only_records_the_term_had_not_returned_before(tmp_path, monkeypatch, capsys):
+    vault, conn = _fixture_vault(tmp_path, archive=True)
+    _patch_env(monkeypatch, vault, conn, collect)
+    ids = iter([["r1", "r2"], ["r1", "r2"], ["r2", "r3"], ["r2", "r3"]])
+    monkeypatch.setattr(collect, "run_connector", lambda *a, **k: {
+        "ok": True, "records": 2, "error": "", "native_ids": next(ids)})
+    collect.main([])
+    capsys.readouterr()
+    collect.main([])
+    assert _payload(capsys)["new_records"] == 2          # r3, once per term
+
+
+def test_no_attribution_without_a_per_record_archive(tmp_path, monkeypatch):
+    """NEGATIVE: a connector that archives nothing has no record path a source can cite, so
+    attributing one would point the join at a directory that never exists."""
+    vault, conn = _fixture_vault(tmp_path)                # archive disabled
+    _patch_env(monkeypatch, vault, conn, collect)
+    monkeypatch.setattr(collect, "run_connector", lambda *a, **k: {
+        "ok": True, "records": 1, "error": "", "native_ids": ["r1"]})
+    collect.main([])
+    assert lib.load_ledger()["records"] == {}
+
+
+def test_run_connector_reads_native_ids_from_the_runtime_items(tmp_path, monkeypatch):
+    out = ('{"ok": true, "records": 3, "items": [{"source_native_id": "a"}, '
+           '{"source_native_id": 7}, {"no_id": true}, "junk"]}\n')
+    monkeypatch.setattr(collect.subprocess, "run", lambda *a, **k: _Proc(stdout=out))
+    assert collect.run_connector(tmp_path / "m.yaml", {"q": "x"})["native_ids"] == ["a", "7"]
+
+
+def test_run_connector_names_the_archive_root_explicitly(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(collect.lib, "VAULT", tmp_path)
+
+    def capture(argv, **kwargs):
+        seen["argv"] = argv
+        return _Proc(stdout='{"records": 0}')
+    monkeypatch.setattr(collect.subprocess, "run", capture)
+    collect.run_connector(tmp_path / "m.yaml", {"q": "x"})
+    argv = seen["argv"]
+    assert argv[argv.index("--archive-root") + 1] == str(tmp_path / "raw/connectors")
+
+
+# ── ledger + join ───────────────────────────────────────────────────────────
+
+def test_ledger_round_trips_and_leaves_no_temp_file(tmp_path):
+    path = tmp_path / "deep" / "ledger.json"
+    ledger = {"records": {}}
+    assert lib.attribute(ledger, "raw/connectors/x/records/r", connector="c", native_id="r",
+                         term="s::t", today="2026-09-23") is True
+    lib.save_ledger(ledger, path)
+    assert lib.load_ledger(path) == ledger
+    assert [p.name for p in path.parent.iterdir()] == ["ledger.json"]
+
+
+@pytest.mark.parametrize("body", ["{ not json", "[]", '{"records": []}'])
+def test_a_corrupt_ledger_reads_as_empty_not_fatal(tmp_path, body):
+    path = tmp_path / "ledger.json"
+    path.write_text(body, encoding="utf-8")
+    assert lib.load_ledger(path) == {"records": {}}
+
+
+def test_reattributing_a_record_moves_last_seen_but_keeps_first_seen():
+    ledger = {"records": {}}
+    kw = {"connector": "c", "native_id": "r", "term": "s::t"}
+    lib.attribute(ledger, "d", today="2026-09-01", **kw)
+    assert lib.attribute(ledger, "d", today="2026-09-05", **kw) is False
+    assert ledger["records"]["d"]["terms"]["s::t"] == {"first_seen": "2026-09-01",
+                                                        "last_seen": "2026-09-05"}
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("raw/connectors/a/records/r1/2026-x.json", "raw/connectors/a/records/r1"),
+    ("/raw/connectors/a/records/r1/2026-x.json", "raw/connectors/a/records/r1"),
+    (["raw/feeds/x.md", "raw/connectors/a/records/r1/f.json"], "raw/connectors/a/records/r1"),
+    ("raw/connectors/a/raw/abc123.json", None),           # a whole response page: no one record
+    ("raw/feeds/x.md", None),
+    (None, None),
+    (42, None),
+])
+def test_record_dir_of_reads_only_per_record_paths(raw, expected):
+    assert lib.record_dir_of(raw) == expected
+
+
+def _source(wiki, rel, raw):
+    page = wiki / f"{rel}.md"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    page.write_text(f"---\ntype: source\nraw: {raw}\n---\nbody\n", encoding="utf-8")
+
+
+def _ledger_for(*pairs):
+    ledger = {"records": {}}
+    for record_dir, term in pairs:
+        lib.attribute(ledger, record_dir, connector="c", native_id="n", term=term,
+                      today="2026-09-23")
+    return ledger
+
+
+def test_compiled_sources_joins_through_the_raw_path(tmp_path):
+    wiki = tmp_path / "wiki"
+    _source(wiki, "sources/2026/09/01/known", "raw/connectors/a/records/r1/f.json")
+    _source(wiki, "sources/2026/09/01/unknown", "raw/connectors/a/records/zz/f.json")
+    _source(wiki, "sources/2026/09/01/from-response", "raw/connectors/a/raw/abc.json")
+    _source(wiki, "sources/_about", "raw/connectors/a/records/r1/f.json")
+    ledger = _ledger_for(("raw/connectors/a/records/r1", "s::t"))
+    assert lib.compiled_sources(wiki, ledger) == {
+        "raw/connectors/a/records/r1": ["sources/2026/09/01/known"]}
+
+
+def test_compiled_sources_skips_the_walk_when_the_ledger_is_empty(tmp_path):
+    wiki = tmp_path / "wiki"
+    _source(wiki, "sources/x", "raw/connectors/a/records/r1/f.json")
+    assert lib.compiled_sources(wiki, {"records": {}}) == {}
+    assert lib.compiled_sources(tmp_path / "nowhere", _ledger_for(("d", "s::t"))) == {}
+
+
+def test_evidence_by_term_counts_only_this_inquirys_terms(tmp_path):
+    wiki = tmp_path / "wiki"
+    _source(wiki, "sources/one", "raw/connectors/a/records/r1/f.json")
+    _source(wiki, "sources/two", "raw/connectors/a/records/r2/f.json")
+    ledger = _ledger_for(("raw/connectors/a/records/r1", "does-it-happen::alpha"),
+                         ("raw/connectors/a/records/r3", "does-it-happen::alpha"),
+                         ("raw/connectors/a/records/r2", "other-inquiry::alpha"))
+    _write(wiki, "does-it-happen", VALID)
+    inquiry = next(i for i in lib.load_inquiries(wiki)[0] if i.slug == "does-it-happen")
+    assert lib.evidence_by_term(wiki, inquiry, ledger) == {
+        "alpha": {"records": 2, "sources": ["sources/one"]},
+        "beta": {"records": 0, "sources": []}}
+
+
+# ── dossier: collected evidence is visible ──────────────────────────────────
+
+def test_dossier_shows_collected_and_compiled_evidence(tmp_path, monkeypatch):
+    vault, conn = _fixture_vault(tmp_path)
+    _source(vault / "wiki", "sources/2026/09/14/found-it", "raw/connectors/a/records/r1/f.json")
+    monkeypatch.setattr(lib, "VAULT", vault)
+    lib.save_ledger(_ledger_for(("raw/connectors/a/records/r1", "does-it-happen::alpha"),
+                                ("raw/connectors/a/records/r2", "does-it-happen::alpha")),
+                    vault / ".okengine/inquiry/evidence-ledger.json")
+    out = _render(monkeypatch, vault, conn, {})
+    assert "**2** record(s) collected" in out and "**1** compiled" in out
+    assert "[[sources/2026/09/14/found-it]]" in out
+    alpha = next(l for l in out.splitlines() if l.startswith("| `alpha`"))
+    assert "| — | 2 | 1 |" in alpha                        # new (never run), collected, compiled
+    index = (vault / "wiki/dashboards/inquiry/INDEX.md").read_text()
+    assert "| 2 | 1 | 0 |" in next(l for l in index.splitlines() if "does-it-happen" in l)
+
+
+def test_dossier_says_plainly_when_nothing_is_attributed(tmp_path, monkeypatch):
+    vault, conn = _fixture_vault(tmp_path)
+    out = _render(monkeypatch, vault, conn, {})
+    assert "No records attributed to this inquiry yet" in out
+
+
+def test_dossier_caps_the_listed_sources_but_not_the_count(tmp_path, monkeypatch):
+    vault, conn = _fixture_vault(tmp_path)
+    monkeypatch.setattr(dossier, "MAX_LISTED_SOURCES", 2)
+    pairs = []
+    for i in range(3):
+        _source(vault / "wiki", f"sources/s{i}", f"raw/connectors/a/records/r{i}/f.json")
+        pairs.append((f"raw/connectors/a/records/r{i}", "does-it-happen::alpha"))
+    monkeypatch.setattr(lib, "VAULT", vault)
+    lib.save_ledger(_ledger_for(*pairs), vault / ".okengine/inquiry/evidence-ledger.json")
+    out = _render(monkeypatch, vault, conn, {})
+    assert "**3** compiled" in out and "… and 1 more" in out
+    assert "[[sources/s2]]" in out and "[[sources/s0]]" not in out   # newest path first
+
+
+def test_collected_but_uncompiled_evidence_reads_as_a_queue_not_silence(tmp_path, monkeypatch):
+    """The state right after deploy: terms have collected, the compile lane has not caught up.
+    The dossier must show the backlog rather than an empty section."""
+    vault, conn = _fixture_vault(tmp_path)
+    monkeypatch.setattr(lib, "VAULT", vault)
+    lib.save_ledger(_ledger_for(("raw/connectors/a/records/r1", "does-it-happen::alpha")),
+                    vault / ".okengine/inquiry/evidence-ledger.json")
+    out = _render(monkeypatch, vault, conn, {})
+    section = out.split("## Collected evidence", 1)[1].split("## Evidence", 1)[0]
+    assert "**1** record(s) collected" in section and "**0** compiled" in section
+    assert "wait on the raw→source compile lane" in section
+    assert "[[" not in section
+
+
+# ── declared lacuna fields (okengine#854 step 3) ────────────────────────────
+
+@pytest.mark.parametrize("raw,expected", [
+    (["safety-alignment"], ["safety-alignment"]),
+    (["concepts/s/a/safety-alignment"], ["safety-alignment"]),
+    (["[[concepts/s/safety-alignment|Safety]]"], ["safety-alignment"]),
+    ("safety-alignment", ["safety-alignment"]),
+    (["a-field", "a-field"], ["a-field"]),
+    (None, []),
+])
+def test_fields_normalize_to_concept_slugs(raw, expected):
+    fields, errors = lib.normalize_fields(raw)
+    assert (fields, errors) == (expected, [])
+
+
+@pytest.mark.parametrize("raw", [[42], ["Not A Slug"], ["entities/x"]])
+def test_a_malformed_field_is_an_error_not_a_skip(raw):
+    fields, errors = lib.normalize_fields(raw)
+    assert fields == [] and errors and "not a concept reference" in errors[0]
+
+
+def _concept(wiki, rel):
+    page = wiki / f"concepts/{rel}.md"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    page.write_text("---\ntype: concept\n---\nx\n", encoding="utf-8")
+
+
+def test_a_declared_field_without_a_concept_page_is_unreachable(tmp_path):
+    wiki = tmp_path / "wiki"
+    _concept(wiki, "s/a/real-field")
+    _write(wiki, "does-it-happen", VALID.replace("terms: [alpha, beta]",
+                                                 "terms: [alpha, beta]\nfields: [real-field, ghost]"))
+    inquiries, errors = lib.load_inquiries(wiki)
+    assert not errors
+    assert lib.field_errors(inquiries, wiki) == [
+        "inquiry/does-it-happen: field 'ghost' has no concept page — create "
+        "concepts/**/ghost.md or remove it from `fields`"]
+    assert lib.concept_page(wiki, "real-field") == wiki / "concepts/s/a/real-field.md"
+    assert lib.concept_page(tmp_path / "nowhere", "real-field") is None
+
+
+def test_a_closed_inquiry_is_exempt_from_field_reachability(tmp_path):
+    wiki = tmp_path / "wiki"
+    _write(wiki, "does-it-happen", VALID.replace("status: open", "status: closed").replace(
+        "terms: [alpha, beta]", "terms: [alpha, beta]\nfields: [ghost]"))
+    inquiries, _ = lib.load_inquiries(wiki)
+    assert lib.field_errors(inquiries, wiki) == []
+
+
+def test_validate_fails_an_unreachable_field(tmp_path):
+    report = _validate_pack(tmp_path, page=VALID.replace(
+        "terms: [alpha, beta]", "terms: [alpha, beta]\nfields: [ghost]"))
+    assert any(x[0] == "FAIL" and "field 'ghost'" in x[2] for x in report.rows), report.rows
+
+
+def test_validate_warns_when_fields_have_no_lacuna_to_read_them(tmp_path):
+    page = VALID.replace("terms: [alpha, beta]", "terms: [alpha, beta]\nfields: [real]")
+    (tmp_path / "pack/wiki/concepts").mkdir(parents=True)
+    (tmp_path / "pack/wiki/concepts/real.md").write_text("---\ntype: concept\n---\n")
+    report = _validate_pack(tmp_path, page=page)
+    assert any(x[0] == "WARN" and "okengine.lacuna is not enabled" in x[2] for x in report.rows)
+    report2 = _validate_pack(tmp_path / "b", page=page, extra_enabled="  okengine.lacuna: {}\n")
+    assert not any("okengine.lacuna is not enabled" in x[2] for x in report2.rows)
+
+
+def test_the_dossier_nominates_only_real_fields_of_open_inquiries(tmp_path, monkeypatch):
+    import json as _json
+    vault, conn = _fixture_vault(tmp_path, page=VALID.replace(
+        "terms: [alpha, beta]", "terms: [alpha, beta]\nfields: [real-field, ghost]"))
+    _concept(vault / "wiki", "r/real-field")
+    (vault / "wiki" / lib.NS / "closed-one.md").write_text(
+        VALID.replace("status: open", "status: closed").replace(
+            "terms: [alpha, beta]", "terms: [alpha, beta]\nfields: [real-field]"), encoding="utf-8")
+    out = _render(monkeypatch, vault, conn, {})
+    rows = _json.loads((vault / ".okengine/inquiry/lacuna-nominations.json").read_text())
+    assert [(r["field"], r["source"]) for r in rows["nominations"]] == [
+        ("real-field", "inquiry/does-it-happen")]
+    assert rows["nominations"][0]["nominated_at"] == _utc_today().isoformat()
+    assert "## Fields (nominated to lacuna)" in out
+    assert "[[concepts/r/real-field]]" in out and "`ghost` — **no concept page**" in out
+
+
+def test_removing_every_field_empties_the_nomination_file(tmp_path, monkeypatch):
+    """Rewritten whole each run: a withdrawn field must stop steering discovery."""
+    import json as _json
+    vault, conn = _fixture_vault(tmp_path)
+    stale = vault / ".okengine/inquiry/lacuna-nominations.json"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text('{"nominations": [{"field": "old"}]}')
+    out = _render(monkeypatch, vault, conn, {})
+    assert _json.loads(stale.read_text()) == {"nominations": []}
+    assert "## Fields" not in out
+
+
+def test_a_bad_field_does_not_hide_the_ones_after_it():
+    fields, errors = lib.normalize_fields([42, "entities/x", "good-field"])
+    assert fields == ["good-field"] and len(errors) == 2
+
+
+def test_a_field_named_twice_in_different_spellings_is_kept_once():
+    assert lib.normalize_fields(["a-field", "concepts/a/a-field"]) == (["a-field"], [])
+
+
+def test_a_closed_inquiry_does_not_hide_an_open_ones_unreachable_field(tmp_path):
+    wiki = tmp_path / "wiki"
+    _write(wiki, "a-closed-one", VALID.replace("status: open", "status: closed").replace(
+        "terms: [alpha, beta]", "terms: [alpha, beta]\nfields: [ghost]"))
+    _write(wiki, "does-it-happen", VALID.replace(
+        "terms: [alpha, beta]", "terms: [alpha, beta]\nfields: [ghost]"))
+    inquiries, _ = lib.load_inquiries(wiki)
+    assert [e.split(":")[0] for e in lib.field_errors(inquiries, wiki)] == ["inquiry/does-it-happen"]
+
+
+def test_only_a_closed_status_is_exempt_from_field_reachability(tmp_path):
+    """An invalid status (reported elsewhere) must not quietly exempt a page as if closed."""
+    wiki = tmp_path / "wiki"
+    _write(wiki, "does-it-happen", VALID.replace("status: open", "status: archived").replace(
+        "terms: [alpha, beta]", "terms: [alpha, beta]\nfields: [ghost]"))
+    inquiries, _ = lib.load_inquiries(wiki)
+    assert len(lib.field_errors(inquiries, wiki)) == 1
+
+
+def _sources_section(n):
+    return dossier._collected_section({"t": {"records": n, "sources": [
+        f"sources/s{i:03d}" for i in range(n)]}})
+
+
+def test_the_dossier_lists_twenty_five_sources_and_counts_the_rest():
+    lines = _sources_section(60)
+    assert sum(1 for ln in lines if ln.startswith("- [[")) == 25
+    assert "- … and 35 more" in lines
+
+
+@pytest.mark.parametrize("n, listed, more", [(3, 3, None), (25, 25, None),
+                                             (26, 25, "- … and 1 more")])
+def test_the_listing_cap_is_exactly_twenty_five(n, listed, more):
+    lines = _sources_section(n)
+    assert sum(1 for ln in lines if ln.startswith("- [[")) == listed
+    assert [ln for ln in lines if ln.startswith("- …")] == ([more] if more else [])
+
+
+def test_a_term_with_no_attributed_evidence_shows_zero_held(tmp_path, monkeypatch):
+    vault, conn = _fixture_vault(tmp_path)
+    out = _render(monkeypatch, vault, conn, {})
+    row = next(ln for ln in out.splitlines() if ln.startswith("| `beta`"))
+    assert row.endswith("| — | 0 | 0 | not yet run |")
+
+
+def test_a_timeout_reports_no_records(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise collect.subprocess.TimeoutExpired(cmd="x", timeout=5)
+    monkeypatch.setattr(collect.subprocess, "run", boom)
+    outcome = collect.run_connector(tmp_path / "m.yaml", {"q": "x"}, timeout=5)
+    assert outcome["records"] == 0 and outcome["native_ids"] == []
+
+
+def test_a_run_that_brings_new_records_stamps_last_new(tmp_path, monkeypatch, capsys):
+    import json as _json
+    vault, conn = _fixture_vault(tmp_path, archive=True)
+    _patch_env(monkeypatch, vault, conn, collect)
+    monkeypatch.setattr(collect, "run_connector", lambda *a, **k: {
+        "ok": True, "records": 1, "error": "", "native_ids": ["r1"]})
+    collect.main([])
+    capsys.readouterr()
+    state = _json.loads((vault / ".okengine/inquiry/collect-state.json").read_text())
+    assert state["terms"]["does-it-happen::alpha"]["last_new"] == _utc_today().isoformat()
+
+
+def test_the_ledger_file_is_written_sorted_with_a_one_space_indent(tmp_path):
+    """The ledger is a diffed artifact: key order and indent must not depend on insertion order."""
+    import json as _json
+    path = tmp_path / "ledger.json"
+    ledger = {"records": {"b": {"n": 1}, "a": {"n": 2}}, "version": 1}
+    lib.save_ledger(ledger, path)
+    assert path.read_text(encoding="utf-8") == _json.dumps(ledger, indent=1, sort_keys=True) + "\n"
+    assert path.read_text(encoding="utf-8").startswith('{\n "records": {\n  "a"')
+
+
+def test_compiled_sources_walks_past_index_and_private_pages(tmp_path):
+    wiki = tmp_path / "wiki"
+    _source(wiki, "sources/INDEX", "raw/connectors/a/records/r1/f.json")
+    _source(wiki, "sources/_about", "raw/connectors/a/records/r1/f.json")
+    _source(wiki, "sources/zz/known", "raw/connectors/a/records/r1/f.json")
+    ledger = _ledger_for(("raw/connectors/a/records/r1", "s::t"))
+    assert lib.compiled_sources(wiki, ledger) == {"raw/connectors/a/records/r1": ["sources/zz/known"]}
+
+
+def test_render_without_term_evidence_reports_every_term_as_holding_nothing(tmp_path):
+    """render() is callable without per-term evidence (its default): every term then holds zero,
+    never an invented count."""
+    import datetime as _dt
+    wiki = tmp_path / "wiki"
+    _write(wiki, "does-it-happen", VALID)
+    inquiries, _ = lib.load_inquiries(wiki)
+    out = dossier.render(inquiries[0], {}, {}, _dt.date(2026, 9, 25))
+    rows = [ln for ln in out.splitlines() if ln.startswith("| `")]
+    assert rows and all(ln.endswith("| — | 0 | 0 | not yet run |") for ln in rows)

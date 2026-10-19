@@ -123,6 +123,25 @@ OKENGINE_WHEEL="$(find "$WORK/.okengine-build" -maxdepth 1 -name 'okengine-*.whl
 printf '\nRUN uv pip install --no-cache-dir --no-deps /opt/hermes/.okengine-build/%s\n' \
   "$(basename "$OKENGINE_WHEEL")" >> "$WORK/Dockerfile"
 
+# --- BEGIN scheduler croniter override --- extracted verbatim by tests/test_gateway_croniter_pin.py;
+# keep the sentinels. cron-plus computes every next_run_at with THIS venv's croniter. Hermes's frozen
+# uv.lock installs croniter 6.0.0, which shifts a next fire that crosses DST by an hour (fall-back
+# fires an hour late; spring-forward fires an hour early, then again on time). CI and the host lock
+# 6.2.4 (ci/tooling/*.requirements.lock), which is correct. Install the same version over Hermes's,
+# from a vendored, checksum-verified wheel (no PyPI at build time; --no-deps: 6.2.4 needs only
+# python-dateutil, which Hermes's lock already installs), then run the behavioral DST self-test in
+# the same layer, so an image whose scheduler computes DST wrong does not build. Hermes and its lock
+# stay unmodified; the deviation is recorded in engine-manifest.yaml runtime.dependency_overrides.
+CRONITER_WHEEL="$ENGINE_DIR/vendor/python-build/croniter-6.2.4-py3-none-any.whl"
+CRONITER_SHA256="8ef3d544107a5c05a150a2d78f8bf5a8eb9c5c4d93405a736b824109574e3f4d"
+printf '%s  %s\n' "$CRONITER_SHA256" "$CRONITER_WHEEL" | sha256sum -c - >/dev/null 2>&1 \
+  || { echo "ERROR: vendored croniter wheel checksum mismatch ($CRONITER_WHEEL)" >&2; exit 1; }
+mkdir -p "$WORK/.okengine-build"
+install -m 0644 "$CRONITER_WHEEL" "$WORK/.okengine-build/"
+printf '\nRUN uv pip install --offline --no-cache-dir --no-deps --python /opt/hermes/.venv/bin/python /opt/hermes/.okengine-build/%s && /opt/hermes/.venv/bin/python -I /opt/hermes/scripts/cron/croniter_dst_selftest.py\n' \
+  "$(basename "$CRONITER_WHEEL")" >> "$WORK/Dockerfile"
+# --- END scheduler croniter override ---
+
 # Governed MCP writes run from the vault and therefore import policy_plane from
 # the installed wheel, not from the source overlay. Give both locations the
 # same explicit catalog path so the wheel cannot derive a nonexistent

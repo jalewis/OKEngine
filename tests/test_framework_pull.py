@@ -272,7 +272,8 @@ def _write_pack_files(root: Path):
     h = packs / "okpack-host"
     (h / "wiki").mkdir(parents=True); (h / "crons").mkdir(); (h / "feeds").mkdir()
     (h / "schema.yaml").write_text(yaml.safe_dump(
-        {"name": "okpack-host", "types": {"actor": {"required": ["type", "id"]}}}))
+        {"name": "okpack-host",
+         "types": {"actor": {"required": ["type", "id"], "owner": "okpack-host"}}}))
     (h / "pack.yaml").write_text("name: okpack-host\ntrust: public\nowns: {types: [actor]}\n")
     (h / "CLAUDE.md").write_text("# host persona\n")
     (h / "crons" / "domain-crons.json").write_text(json.dumps(
@@ -289,7 +290,7 @@ def _write_pack_files(root: Path):
     (g / "pack.yaml").write_text(
         "name: okpack-guest\ntrust: public\nowns: {types: [cve], namespaces: [cves]}\n")
     (g / "subdomain" / "host-schema-additions.yaml").write_text(yaml.safe_dump(
-        {"types": {"cve": {"required": ["type", "id"]}}}))
+        {"types": {"cve": {"required": ["type", "id"], "owner": "okpack-guest"}}}))
     (g / "subdomain" / "PERSONA.md").write_text("curation rules for guest\n")
     (g / "crons" / "domain-crons.json").write_text(json.dumps(
         [{"id": "bb", "name": "okpack-guest-feed-fetch"}]))
@@ -334,11 +335,28 @@ def test_pull_bundle_composes_host_and_guests(tmp_path):
         assert "cves" in ns, ns
         # okengine#183: the composed vault carries the BUNDLE's display identity, not the host's —
         # the host fetch used to clobber pack.yaml, so the About panel described the vault as the
-        # host pack. owns stays the host's (the composed contract); name/description are the bundle's.
+        # host pack. owns stays the host's (the composed contract); the description is the bundle's.
+        # The name stays the HOST's: it is the write principal, and the host's types declare
+        # `owner: okpack-host` (okengine#1032 [11]).
         pk = yaml.safe_load((dest / "pack.yaml").read_text())
-        assert pk["name"] == "okpack-testbundle", pk["name"]
+        assert pk["name"] == "okpack-host", pk["name"]
         assert pk["description"] == "test bundle", pk.get("description")
         assert pk.get("owns", {}).get("types"), "host owns must survive the identity re-stamp"
+        # okengine#1032 [11]: every declared type owner is a principal some lane writes as. The
+        # host's own lanes and the engine's act for the host; a guest's lanes for the guest.
+        from okengine import pack_principal
+        from scripts.cron import schema_lib
+        from scripts.framework_validate_pack import check_type_owners
+        from scripts.framework_validate_report import Report
+        deployment = pack_principal.deployment_pack(dest, {})
+        sch = yaml.safe_load((dest / "schema.yaml").read_text())
+        for actor, typ in (("cron:okpack-host-feed-fetch", "actor"), ("cron:entity-backfill", "actor"),
+                           ("cron:okpack-guest-feed-fetch", "cve")):
+            assert pack_principal.lane_pack(dest, actor, deployment) == schema_lib.type_owner(
+                sch, typ), (actor, typ)
+        r = Report()
+        check_type_owners(dest, sch["types"], r)
+        assert not [row for row in r.rows if row[0] == "FAIL"], r.rows
     finally:
         os.environ.pop("OKENGINE_LIBRARY", None)
 
@@ -500,6 +518,8 @@ def test_pull_main_default_destination_and_composed_update_warning(tmp_path, mon
         _w(clone / "new-definition", "new\n")
 
     class Upgrade:
+        MigrationStateError = RuntimeError
+        read_state = staticmethod(lambda _dest: {})
         installed_pack_version = staticmethod(lambda *_a, **_k: "1.0.0")
         run_pack_migrations = staticmethod(lambda *_a, **_k: 0)
 

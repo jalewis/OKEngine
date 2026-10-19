@@ -4,6 +4,7 @@ Covers the union / consensus / latest merge policies, Admiralty-weighted conflic
 resolution (highest reliability wins, recency tiebreak), conflict surfacing, and
 shape-based defaulting. Pure-function tests — no vault I/O.
 """
+import os
 import importlib.util
 import runpy
 import sys
@@ -369,7 +370,11 @@ def test_helper_empty_schema_and_frontmatter_edges(tmp_path, monkeypatch):
     schema = m.load_schema(tmp_path)
     assert m.merge_policy(schema)["union"] == {"aliases"}
     assert m.source_reliability(schema) == {"feed": "B"}
+    # okengine#1017: the rewrite lands in the same timestamp tick (mtime pinned), as it does on a
+    # fast disk; the schema cache must still re-read it.
+    before = (tmp_path / "schema.yaml").stat()
     (tmp_path / "schema.yaml").write_text("[")
+    os.utime(tmp_path / "schema.yaml", ns=(before.st_atime_ns, before.st_mtime_ns))
     assert m.load_schema(tmp_path) == {}
 
     page = tmp_path / "page.md"
@@ -525,3 +530,34 @@ def test_main_reports_all_routes_and_entrypoint(tmp_path, monkeypatch, capsys):
     with pytest.raises(SystemExit) as exc:
         runpy.run_path(str(CRON / "canonical_assemble.py"), run_name="__main__")
     assert exc.value.code == 0
+
+
+def test_write_canonical_replaces_aliases_when_they_are_not_a_union_field(tmp_path):
+    """Keeping the page's existing aliases is the UNION policy's job; under any other policy the
+    fused list is the whole answer (okengine#845)."""
+    m = _load("canonical_assemble")
+    p = _canon(tmp_path, "apt29", "type: intrusion-set\nname: APT29\naliases: [Cozy Bear]\n", "")
+    policy = {"union": {"refs"}, "consensus": set(), "latest": set()}
+    m.write_canonical(tmp_path, "apt29", "intrusion-set", {"aliases": ["Midnight Blizzard"]}, [],
+                      ["mitre-attack"], policy, "2026-06-20")
+    fm, _ = m.read_fm(p)
+    assert fm["aliases"] == ["Midnight Blizzard"]
+
+
+def test_write_canonical_does_not_keep_a_legacy_scalar_alias_string(tmp_path):
+    m = _load("canonical_assemble")
+    p = _canon(tmp_path, "apt29", "type: intrusion-set\nname: APT29\naliases: Cozy Bear\n", "")
+    m.write_canonical(tmp_path, "apt29", "intrusion-set", {"aliases": ["Midnight Blizzard"]}, [],
+                      ["mitre-attack"], POLICY, "2026-06-20")
+    fm, _ = m.read_fm(p)
+    assert fm["aliases"] == ["Midnight Blizzard"]
+
+
+def test_write_canonical_keeps_a_review_rejected_alias_out(tmp_path):
+    m = _load("canonical_assemble")
+    p = _canon(tmp_path, "apt29", "type: intrusion-set\nname: APT29\naliases: [Cozy Bear]\n"
+               "rejected_aliases: [Midnight Blizzard]\n", "")
+    m.write_canonical(tmp_path, "apt29", "intrusion-set", {"aliases": ["Midnight Blizzard"]}, [],
+                      ["mitre-attack"], POLICY, "2026-06-20")
+    fm, _ = m.read_fm(p)
+    assert fm["aliases"] == ["Cozy Bear"]

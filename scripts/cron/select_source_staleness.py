@@ -33,6 +33,7 @@ if str(_HERE) not in sys.path:
 from source_decay import (  # type: ignore[import]
     STALE_THRESHOLD, compute_for, HALF_LIVES, DEFAULT_HALF_LIFE, scale_from_enum,
 )
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import schema_lib  # noqa: E402
 import tz_lib  # noqa: E402
 
@@ -492,11 +493,11 @@ def main() -> int:
     print(f"  pages with ALL primary citations stale: {stale_n}")
 
     DASH_PATH.parent.mkdir(parents=True, exist_ok=True)
-    rendered = render_dashboard(scores, anchors, today)
+    rendered = generated_page.with_id(DASH_PATH, render_dashboard(scores, anchors, today))
     if DASH_PATH.exists() and DASH_PATH.read_text() == rendered:
         print(f"  dashboard: unchanged ({DASH_PATH.relative_to(VAULT)})")
     else:
-        DASH_PATH.write_text(rendered)
+        DASH_PATH.write_text(rendered, encoding="utf-8")
         print(f"  dashboard: updated ({DASH_PATH.relative_to(VAULT)})")
 
     print()

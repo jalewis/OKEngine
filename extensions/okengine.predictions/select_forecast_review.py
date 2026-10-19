@@ -73,7 +73,9 @@ def main() -> int:
     print("=== forecast-review wake-gate ===")
     print(f"  window: {since} .. {week_ending}  |  {len(resolved_this_week)} resolved, "
           f"{len(reevaluated_this_week)} re-evaluated")
-    print(f"  write via mcp__okengine_write__create_entity to: {out_path}")
+    # the lane's own write server, published by cron_pack_split.bind_contract_writers (okengine#852)
+    print(f"  write via {os.environ.get('OKENGINE_WRITE_TOOL_PREFIX', 'mcp__okengine_write__')}"
+          f"create_entity to: {out_path}")
     print(f"  frontmatter: type: dashboard, title: \"Forecast review — {week_ending}\", "
           f"updated: {week_ending}")
     print()

@@ -42,6 +42,8 @@ def test_metrics_and_alert(tmp_path, monkeypatch):
     assert "okengine_health_overall 3" in prom            # red (1 errored + grounding 41%)
     alerts = (tmp_path / "wiki" / "dashboards" / "alerts.md").read_text()
     assert "overall health is RED" in alerts              # transition green->red on first run
+    # created once with a header that carries a stable id (okengine#933)
+    assert alerts.startswith('---\nid: "dashboards:alerts"\ntype: dashboard\n')
     # second run, unchanged -> NO new alert appended
     before = alerts
     _run(tmp_path, monkeypatch)
@@ -298,3 +300,97 @@ def test_lane_sidecar_rejects_invalid_schedule_shape(tmp_path, monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     assert module._fleet_lane_sets() is None
+
+
+# --- okengine#817: transition-only alerting is silence at one end.
+# A lane that goes red alerts once and is never mentioned again. On a live vault that left
+# wiki-health-audit red since 2026-08-31 with 1,941 consecutive failing checks — detected and
+# escalated correctly the whole time — and one alert line three weeks old.
+
+
+def _escalation(dd, lanes):
+    (dd / ".fleet-escalation.json").write_text(json.dumps({
+        "updated": "2026-07-16T12:00:00Z", "lanes": lanes}))
+
+
+def _redish(dd):
+    _dash(dd, "fleet-health", "- 🟢 ok: **51**  ·  🔴 stale: **0**  ·  🔴 errored: **1**  ·  🔴 off-model: **0**")
+    _dash(dd, "source-grounding", "- in scope: **106**  ·  🟢 grounded: **43** (41%)  ·  🔴 ungrounded: **58**")
+    _dash(dd, "review-queue", "**0 item(s) awaiting a human** · GROUNDING: **0**")
+    _dash(dd, "conformance", "- pages checked: **8823**  ·  source-refs-are-pages: **0**")
+
+
+def _alerts(tmp):
+    p = tmp / "wiki" / "dashboards" / "alerts.md"
+    return p.read_text() if p.is_file() else ""
+
+
+def test_a_lane_red_for_weeks_is_mentioned_again(tmp_path, monkeypatch):
+    dd = tmp_path / "wiki" / "dashboards"; dd.mkdir(parents=True)
+    _redish(dd)
+    _escalation(dd, {"wiki-health-audit": {"status": "errored", "consecutive": 1941,
+                                           "red_since": "2026-08-31T01:15:30Z"}})
+    _run(tmp_path, monkeypatch)
+    first = _alerts(tmp_path)
+    assert "STILL failing" in first and "wiki-health-audit" in first, first
+    assert "consecutive checks" in first, first
+    # and it does NOT repeat on the very next run — bounded cadence, not a firehose
+    _run(tmp_path, monkeypatch)
+    assert _alerts(tmp_path) == first
+
+
+def test_a_freshly_red_lane_is_left_to_the_transition_alert(tmp_path, monkeypatch):
+    """Under the reminder threshold it is the transition alert's business, not a reminder's."""
+    from datetime import datetime, timezone, timedelta
+    recent = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    dd = tmp_path / "wiki" / "dashboards"; dd.mkdir(parents=True)
+    _redish(dd)
+    _escalation(dd, {"just-broke": {"status": "errored", "consecutive": 8, "red_since": recent}})
+    _run(tmp_path, monkeypatch)
+    assert "STILL failing" not in _alerts(tmp_path), _alerts(tmp_path)
+
+
+def test_a_recovered_lane_leaves_the_reminder_book(tmp_path, monkeypatch):
+    """So a later relapse reads as new rather than as a continuing outage."""
+    dd = tmp_path / "wiki" / "dashboards"; dd.mkdir(parents=True)
+    _redish(dd)
+    _escalation(dd, {"flaky": {"status": "errored", "consecutive": 900,
+                               "red_since": "2026-08-31T01:15:30Z"}})
+    _run(tmp_path, monkeypatch)
+    assert "flaky" in _alerts(tmp_path)
+    _escalation(dd, {})                      # recovered
+    _run(tmp_path, monkeypatch)
+    state = json.loads((tmp_path / "wiki" / "dashboards" / ".health-export-state.json").read_text()) \
+        if (tmp_path / "wiki" / "dashboards" / ".health-export-state.json").is_file() else None
+    if state is not None:
+        assert "flaky" not in (state.get("reminded_at") or {}), state
+
+
+def test_an_absent_escalation_sidecar_is_unknown_not_healthy(tmp_path, monkeypatch):
+    dd = tmp_path / "wiki" / "dashboards"; dd.mkdir(parents=True)
+    _redish(dd)
+    _run(tmp_path, monkeypatch)               # no .fleet-escalation.json at all
+    assert "STILL failing" not in _alerts(tmp_path)
+
+
+def test_a_malformed_escalation_sidecar_reminds_nothing(tmp_path, monkeypatch):
+    """Malformed is the same as absent: unknown, never 'nothing is wrong'."""
+    dd = tmp_path / "wiki" / "dashboards"; dd.mkdir(parents=True)
+    _redish(dd)
+    for payload in ('{"lanes": "not-a-mapping"}', "{ this is not json"):
+        (dd / ".fleet-escalation.json").write_text(payload)
+        _run(tmp_path, monkeypatch)
+        assert "STILL failing" not in _alerts(tmp_path)
+
+
+def test_a_lane_entry_the_sidecar_cannot_date_is_skipped(tmp_path, monkeypatch):
+    """A non-mapping entry, a missing red_since, or an undateable one carries no age to judge."""
+    dd = tmp_path / "wiki" / "dashboards"; dd.mkdir(parents=True)
+    _redish(dd)
+    _escalation(dd, {
+        "not-a-mapping": "errored",
+        "no-red-since": {"status": "errored", "consecutive": 999},
+        "unparseable-date": {"status": "errored", "consecutive": 999, "red_since": "last tuesday"},
+    })
+    _run(tmp_path, monkeypatch)
+    assert "STILL failing" not in _alerts(tmp_path), _alerts(tmp_path)

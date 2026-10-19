@@ -58,13 +58,10 @@ def _create(
         return f"refused: {_rel(p)} already exists — use update_entity"
     fm = _coerce_fm(frontmatter_yaml, p)
     if fm is None:
-        return "rejected: frontmatter_yaml is not a valid YAML mapping"
+        return _fm_reject(frontmatter_yaml)
     receipt_reject = _source_receipt_refuse(fm, p)
     if receipt_reject:
         return receipt_reject
-    admission_reject = _actor_admission_reject(fm, body, p)
-    if admission_reject:
-        return admission_reject
     # Route every partitioned namespace through the shared canonical writer
     # contract before the existence, authorization, and schema gates.  A caller
     # may supply a logical flat key; the physical write must never create a
@@ -84,11 +81,19 @@ def _create(
         p,
         "create",
         page_type=str(fm.get("type") or ""),
-        changed_fields=fm.keys(),
+        changed_fields=_frontmatter_changes(p, {}, fm),
         body_change="replace" if body else "none",
+        values=fm,
     )
     if cap:
+        if _contract_operation == "converge":  # okengine#993: a new-id converge needs `create`
+            cap = cap.replace("operation 'create' is not allowed",
+                              "operation 'create' is not allowed (converging a new id is a create)")
         return f"rejected: {cap}"
+    # Curated-authority attestation is operator-owned: no MCP caller may introduce it (okengine#980).
+    attestation = _attestation_reject(p, {}, fm, bool(body))
+    if attestation:
+        return attestation
     # Underscore type spellings are the observed taxonomy-bypass class
     # (`threat_actor` beside canonical `threat-actor`/`actor`). Permit one only
     # when the governing schema explicitly declares it as a type or type_alias.
@@ -119,6 +124,9 @@ def _create(
     msr = _missing_source_reject(p, fm)
     if msr:
         return msr
+    alr = _alias_shape_reject(p, fm)  # an alias is a name, not a URL/prose/list (#845)
+    if alr:
+        return alr
     fdr = _future_date_reject(fm)
     if fdr:
         return f"rejected: {fdr}"
@@ -129,6 +137,9 @@ def _create(
     if bir:
         return f"rejected: {bir}"
     fm, drift = _normalize_drift(fm, p)  # converge on schema vocab (okengine#46)
+    admission_reject = _actor_admission_reject(fm, body, p)
+    if admission_reject:
+        return admission_reject
     # Server stamps version/last_updated if absent, and an IMMUTABLE `created` on first write
     # (the OKF-envelope creation date = when the page was ingested; unlike last_updated it never
     # shifts on later edits, so "recent ingest" / age reporting is accurate).
@@ -171,6 +182,7 @@ def _create(
         + _identity_contradiction_flags(p, fm)
         + _unresolvable_link_flags(p, body)
         + _degeneration_flags(body)
+        + _chat_review_flags()
     )
     contract_reject = _contract_reject(p, _contract_operation, fm, body, drift)
     if contract_reject:
@@ -193,13 +205,18 @@ def _create(
     # Dedup runs only AFTER the complete candidate passes schema validation. The
     # old order let an invalid type alias-match and converge before the validator
     # saw it. This stamps fm["id"], so recompose/revalidate the final new page.
-    dedup = _dedup_on_create(path, p, fm, body)
+    dedup = _dedup_on_create(path, p, fm, body, creating=_contract_operation == "create")
     if dedup is not None:
         return dedup
     content = _compose(fm, body)
     reason = schema_reject_reason(str(p), content)
     if reason:
         return f"rejected: {reason}"
+    # Judged only once dedup has decided this IS a new page: a create that resolves onto an
+    # existing page is a merge, and the converge path judges a retype there (okengine#1012).
+    grounding = _actor_grounding_reject(p, fm)
+    if grounding:
+        return grounding
     p.parent.mkdir(parents=True, exist_ok=True)
     _corpus_touch(p)
     _atomic_write_text(p, content)
@@ -230,17 +247,37 @@ def _create(
     return f"created {_rel(p)} v{ver}{note}"
 
 
-def _preserve_immutable(new_fm: dict, cur_fm: dict) -> list:
+def _canonical_view(p: Path, fm: dict) -> dict:
+    """`fm` in the write path's canonical shape (`_coerce_fm`), for the checks that compare a write
+    with the stored page (okengine#994 [19]). Both sides are read this way: a field the write did
+    not touch still holds its legacy shape, and a field it did touch now holds the canonical one,
+    so comparing a raw side with a canonical side reads a reshape as a change (a removed alias, a
+    new source). Raw on the one case `_coerce_fm` refuses (an unpaired surrogate)."""
+    canonical = _coerce_fm(dict(fm), p)
+    return fm if canonical is None else canonical
+
+
+def _record_alias_removals_canonically(new_fm: dict, new_view: dict, prev_view: dict) -> None:
+    """`_record_alias_removals` judged on the canonical views, its one output field written back."""
+    if _record_alias_removals(new_view, prev_view):
+        new_fm[schema_lib.REJECTED_ALIASES_FIELD] = new_view[schema_lib.REJECTED_ALIASES_FIELD]
+
+
+def _preserve_immutable(new_fm: dict, cur_fm: dict, p: Path) -> list:
     """Force any immutable identity/provenance field that ALREADY EXISTS back to its stored value,
     overriding a caller change — so a read-modify-write that echoes the whole frontmatter is fine,
     but a forged CHANGE is silently reverted. A field the page LACKS may still be set (backfilling an
     id/created onto a legacy or non-compliant page is legitimate — and, since base-schema makes `id`
-    required, necessary). The invariant is 'never CHANGES', not 'never appears'. Returns the fields
-    whose change was reverted, so the caller can flag the attempt for review."""
+    required, necessary). The invariant is 'never CHANGES', not 'never appears'. The canonical shape
+    of the stored value (`discovered_by: pack` as `[pack]`) is the same value, not a change: it is
+    kept, unflagged, so a legacy shape is repairable (okengine#994 [19]). Returns the fields whose
+    change was reverted, so the caller can flag the attempt for review."""
     reverted = []
     for key in _IMMUTABLE_KEYS:
         if key in cur_fm:  # exists -> immutable: restore (no-op if unchanged)
-            if new_fm.get(key) != cur_fm[key]:
+            if key not in new_fm or not _same_value(new_fm[key], cur_fm[key]):
+                if key in new_fm and _echo_kind(p, key, cur_fm[key], new_fm[key]) == "reshape":
+                    continue  # the canonical shape of the stored value: kept
                 reverted.append(key)
             new_fm[key] = cur_fm[key]
     return reverted
@@ -290,11 +327,15 @@ def _update(
         return tr
     new_fm = dict(cur_fm)
     patch: dict = {}
+    judged: dict = {}
     if frontmatter_yaml is not None:
         coerced_patch = _coerce_fm(frontmatter_yaml, p)
         if coerced_patch is None:
-            return "rejected: frontmatter_yaml is not a valid YAML mapping"
-        patch = coerced_patch
+            return _fm_reject(frontmatter_yaml)
+        # A JSON or coerced echo of a stored value is judged no change (okengine#991); a reshaped
+        # echo still STORES the canonical shape, so a legacy shape is repairable (okengine#994).
+        judged = _stored_echoes(p, cur_fm, coerced_patch)
+        patch = _stored_repairs(p, cur_fm, coerced_patch)
         # Future-date guard on ONLY the fields this patch supplies: a legacy page that already
         # carries a bad future date must stay fixable by an update that doesn't touch dates.
         fdr = _future_date_reject(patch, fields=tuple(k for k in _RECORD_DATE_FIELDS if k in patch))
@@ -308,11 +349,23 @@ def _update(
         p,
         "update",
         page_type=str(new_fm.get("type") or cur_fm.get("type") or ""),
-        changed_fields=patch.keys(),
+        # A read-modify-write echoes the whole frontmatter: a key whose value is unchanged is no
+        # mutation, so it is not a protected-field change either. Compared alias-renamed and
+        # type-strictly, so `0` over `false` is a change (okengine#983).
+        changed_fields=_frontmatter_changes(p, cur_fm, {**cur_fm, **judged}),
         body_change="replace" if body is not None else "none",
+        values={**cur_fm, **patch}, stored=cur_fm,
     )
     if cap:
         return f"rejected: {cap}"
+    attestation = _attestation_reject(  # okengine#980: operator-owned attestation
+        p, cur_fm, new_fm, body is not None and body != cur_body
+    )
+    if attestation:
+        return attestation
+    ttr = _tombstone_transition_refuse(cur_fm, new_fm, p)  # okengine#863: retire only via tombstone_entity
+    if ttr:
+        return ttr
     # extension_id is server-derived: strip any client forge, keep the create-time stamp (M14).
     _apply_extension_provenance(
         new_fm,
@@ -321,10 +374,22 @@ def _update(
         existing_producer_lane=cur_fm.get("producer_lane"),
     )
     # id + created/created_by/discovered_by are immutable — revert any caller change (audit HIGH #3).
-    reverted_immutable = _preserve_immutable(new_fm, cur_fm)
-    review_invalidation = _apply_review_governance(new_fm, cur_fm)
+    # The checks below compare the write with the stored page on canonical views of both, so an
+    # echo or a repair of a legacy shape is not a removed alias, a new source or a review-worthy
+    # change (okengine#994 [19]).
+    prev_view = _canonical_view(p, cur_fm)
+    reverted_immutable = _preserve_immutable(new_fm, cur_fm, p)
+    identity_flags, hold_body, _held = _identity_hold(p, cur_fm, new_fm)  # okengine#1028
+    if hold_body and body is not None and body.strip() != cur_body.strip():
+        identity_flags.append(_IDENTITY_BODY_HELD)
+        body = None
+    review_invalidation = _apply_review_governance(new_fm, prev_view)
     new_fm, drift = _normalize_drift(new_fm, p)  # converge on schema vocab (okengine#46)
     new_body = cur_body if body is None else body
+    admission_reject = (_actor_admission_reject(new_fm, new_body, p, cur_fm)
+                        or _actor_grounding_reject(p, new_fm, cur_fm))  # okengine#1012
+    if admission_reject:
+        return admission_reject
     if body is not None:  # only when this update REWRITES the body
         blr = _briefing_link_reject(p, new_body)
         if blr:
@@ -346,26 +411,32 @@ def _update(
     itr = _item_shape_reject(p, new_fm)
     if itr:
         return f"rejected: {itr}"  # existing file left untouched
-    pol = _policy_reject(p, new_fm, "update", prev=cur_fm)
+    new_view = _canonical_view(p, new_fm)
+    pol = _policy_reject(p, new_view, "update", prev=prev_view)
     if pol:
         return f"rejected: {pol}"  # existing file left untouched
     tnr = _type_ns_reject_on_change(
-        p, new_fm, cur_fm
+        p, new_view, prev_view
     )  # type can't drift out of its home ns (audit)
     if tnr:
         return f"rejected: {tnr}"  # existing file left untouched
     fsr = _fabricated_source_reject(
-        p, new_fm, prev_fm=cur_fm
+        p, new_view, prev_fm=prev_view
     )  # block NEW fabricated source refs (#348)
     if fsr:
         return fsr  # existing file left untouched
-    msr = _missing_source_reject(p, new_fm, prev_fm=cur_fm)
+    msr = _missing_source_reject(p, new_view, prev_fm=prev_view)
     if msr:
         return msr
+    alr = _alias_shape_reject(p, new_view, prev_fm=prev_view)  # #845
+    if alr:
+        return alr
+    _record_alias_removals_canonically(new_fm, new_view, prev_view)  # a review-removed alias stays out (TAA#48)
     flags = (
         review_invalidation
+        + identity_flags
         + drift
-        + _review_flags(p, new_fm, prev=cur_fm)
+        + _review_flags(p, new_view, prev=prev_view)
         + _identity_contradiction_flags(p, new_fm)
         + (
             _unresolvable_link_flags(p, new_body) + _degeneration_flags(new_body)
@@ -377,6 +448,7 @@ def _update(
             if reverted_immutable
             else []
         )
+        + _chat_review_flags()
     )
     contract_reject = _contract_reject(
         p, "update", new_fm, new_body, drift, body_links_changed=body is not None
@@ -394,6 +466,8 @@ def _update(
         return precondition
     _corpus_touch(p)
     _atomic_write_text(p, content)
+    if _namespace(p) == "entities":  # #962: aliases a write adds feed the next merge's hijack check
+        converge.record_identity(_registry(), _rel(p), new_fm)
     ver = new_fm["version"]
     _append_log(f"- {_today()} mcp-write update {_rel(p)} v{ver}")
     note = _queue_review(p, flags)
@@ -419,6 +493,9 @@ def _tombstone(path: str, reason: str, superseded_by: Optional[str] = None) -> s
     if ferr:
         return f"refused: {ferr} — fix the page's frontmatter before tombstoning (would silently wipe it)"
     cur_fm, cur_body = _read_page(p)
+    succ_reject = _tombstone_successor_reject(p, cur_fm, reason, superseded_by)  # #101
+    if succ_reject:
+        return succ_reject  # file left untouched
     if superseded_by:
         successor = _safe(superseded_by)
         if successor and successor.is_file():
@@ -432,8 +509,14 @@ def _tombstone(path: str, reason: str, superseded_by: Optional[str] = None) -> s
     changed = {"status", "tombstone_reason", "last_updated", "version"}
     if superseded_by:
         changed.add("superseded_by")
+    new_fm = dict(cur_fm)
+    new_fm["status"] = "tombstoned"
+    new_fm["tombstone_reason"] = reason
+    if superseded_by:
+        new_fm["superseded_by"] = superseded_by
     cap = _capability_reject(
-        p, "tombstone", page_type=str(cur_fm.get("type") or ""), changed_fields=changed
+        p, "tombstone", page_type=str(cur_fm.get("type") or ""), changed_fields=changed,
+        values=new_fm, stored=cur_fm,  # judged against forbidden_values (okengine#993)
     )
     if cap:
         return f"rejected: {cap}"
@@ -443,11 +526,6 @@ def _tombstone(path: str, reason: str, superseded_by: Optional[str] = None) -> s
     pol = _policy_reject(p, cur_fm, "update", prev=cur_fm)
     if pol:
         return f"rejected: {pol}"  # file left untouched
-    new_fm = dict(cur_fm)
-    new_fm["status"] = "tombstoned"
-    new_fm["tombstone_reason"] = reason
-    if superseded_by:
-        new_fm["superseded_by"] = superseded_by
     _apply_extension_provenance(
         new_fm,
         creating=False,
@@ -514,11 +592,25 @@ def _non_reviewable_flag(p: Path, note: str) -> bool:
     return not p.is_file() and bool(infrastructure or receipt)
 
 
+def _existing_page_type(p: Path) -> str:
+    """The stored `type` of an existing page, for capability checks that do not change it
+    (okengine#885). Flag and review checks passed no type at all, so any lane with a concrete type
+    list was refused with "page type '' is not allowed" even when the operation was granted. A
+    missing or unreadable page has no type; the tool's own existence/frontmatter checks answer."""
+    try:
+        if p.is_file():
+            fm, _body = _read_page(p)
+            return str(fm.get("type") or "")
+    except Exception:  # noqa: BLE001 -- the caller's own frontmatter guard reports the defect
+        return ""
+    return ""
+
+
 def _flag(path: str, note: str) -> str:
     p = _safe(path)
     if p is None:
         return "refused: path outside the vault wiki/"
-    cap = _capability_reject(p, "flag")
+    cap = _capability_reject(p, "flag", page_type=_existing_page_type(p))
     if cap:
         return f"rejected: {cap}"
     _wa = _wauth_refusal(path)

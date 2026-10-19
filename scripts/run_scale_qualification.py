@@ -11,6 +11,7 @@ import platform
 import re
 import shutil
 import subprocess
+from subprocess import TimeoutExpired
 import tempfile
 import time
 import urllib.parse
@@ -300,7 +301,7 @@ def main(argv: list[str] | None = None) -> int:
         target.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
         print(json.dumps(report, sort_keys=True))
         return 0
-    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+    except (OSError, ValueError, RuntimeError, TimeoutExpired) as exc:
         print(f"QUALIFICATION FAILED: {exc}", file=os.sys.stderr)
         return 1
 

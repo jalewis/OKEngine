@@ -79,9 +79,25 @@ def _discovery_mod():
     return m
 
 
+def _manifest_mod():
+    p = _HERE / "extension_manifest.py"
+    spec = importlib.util.spec_from_file_location("extension_manifest", p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
 def _output_contract_mod():
     p = _HERE / "cron" / "output_contract.py"
     spec = importlib.util.spec_from_file_location("extension_output_contract", p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def _lane_expect_mod():
+    p = _HERE / "cron" / "lane_expect.py"
+    spec = importlib.util.spec_from_file_location("extension_lane_expect", p)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     return m
@@ -170,30 +186,9 @@ def _iter_ops(m: dict) -> tuple[list[tuple[str | None, dict]], str | None]:
 
 
 def _ops_from_dropins(ext_dir) -> tuple[list[tuple[str, dict]], str | None]:
-    """`crons/*.cron.json` drop-in op files -> [(op_name, block)] (#63 P1, the drop-in model).
-
-    Each file is ONE operation block (same shape as an `operations:` entry — schedule /
-    entrypoint / prompt_file / toolsets); the op name is the filename stem minus `.cron.json`
-    (so `crons/grade.cron.json` -> op `grade` -> job `<id>:grade`). Collected forward-only;
-    an extension drops a file in rather than editing a central manifest block."""
-    if not ext_dir:
-        return [], None
-    d = Path(ext_dir) / "crons"
-    if not d.is_dir():
-        return [], None
-    out: list[tuple[str, dict]] = []
-    for f in sorted(d.glob("*.cron.json")):  # glob-ok: crons/ is a flat per-extension dir, not a sharded namespace
-        op_name = f.name[: -len(".cron.json")]
-        if not op_name:
-            return [], f"invalid cron drop-in filename: crons/{f.name}"
-        try:
-            block = json.loads(f.read_text(encoding="utf-8"))
-        except Exception as e:                                  # noqa: BLE001
-            return [], f"crons/{f.name}: invalid JSON ({e})"
-        if not isinstance(block, dict):
-            return [], f"crons/{f.name}: must be a JSON object (an operation block)"
-        out.append((op_name, block))
-    return out, None
+    """`crons/*.cron.json` drop-in op files -> [(op_name, block)] (#63 P1). One reader, shared
+    with discovery's trust check (extension_manifest.load_dropin_ops)."""
+    return _manifest_mod().load_dropin_ops(ext_dir)
 
 
 def _collect_ops(m: dict, ext_dir) -> tuple[list[tuple[str | None, dict]], str | None]:
@@ -209,6 +204,14 @@ def _collect_ops(m: dict, ext_dir) -> tuple[list[tuple[str | None, dict]], str |
     drop_ops, err = _ops_from_dropins(ext_dir)
     if err:
         return [], err
+    em = _manifest_mod()                # okengine#1004: declarative runs no operation, from any source
+    labelled = ([("operation" if name is None else f"operations.{name}", blk)
+                 for name, blk in manifest_ops]
+                + [(f"crons/{name}.cron.json", blk) for name, blk in drop_ops])
+    for ctx, blk in labelled:
+        declarative = em.declarative_operation_error(blk, m.get("trust"), ctx)
+        if declarative:
+            return [], declarative
     if not manifest_ops and not drop_ops:
         return [], ("kind=operation requires an 'operation'/'operations' block "
                     "or crons/*.cron.json drop-in files")
@@ -372,6 +375,14 @@ def _synthesize_one(ext_id: str, m: dict, trust, op_name: str | None, op: dict,
             errors.append(f"{label}: agent operation requires non-empty adversarial_fixtures")
             return None, errors, warnings
         job["adversarial_fixtures"] = fixtures
+    expect = op.get("expect")           # okengine#890: what "working" means, carried to the job
+    if expect is not None:              # so fleet-health (#892) can evaluate it at runtime
+        expect_errors = _lane_expect_mod().validate(expect, f"{label}.expect",
+                                                    op.get("output_contract"))
+        if expect_errors:
+            errors.extend(expect_errors)
+            return None, errors, warnings
+        job["expect"] = expect
     if has_script:
         # Absolute, namespaced path the staging step (#128) lands the script at.
         # no_agent: the work script; agent: the wake-gate selector.
@@ -407,6 +418,55 @@ def _synthesize_one(ext_id: str, m: dict, trust, op_name: str | None, op: dict,
     return job, errors, warnings
 
 
+# Discovery tiers whose operations are engine code (okengine#969). Only the engine root.
+_TRUSTED_TIERS = frozenset({"engine"})
+
+
+def _cron_pack_split_mod():
+    """Load the sibling cron_pack_split for its writer-name derivation, the one ensure-runtime
+    and regen use (okengine#840), rather than restating it."""
+    path = _HERE / "cron_pack_split.py"
+    spec = importlib.util.spec_from_file_location("extension_cron_pack_split", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def foreign_writer_errors(record: dict) -> list[str]:
+    """A pack- or operator-tier operation may list no write server but its own (okengine#969).
+
+    A write server carries ONE OKENGINE_WRITE_ACTOR; naming another lane's server in
+    `operation.toolsets` (the baseline okengine-write-source-quality, an engine lane's, a
+    disabled extension's) makes the operation write as that lane, with its fence and capability.
+    A first-party (tier-1) extension is engine code and keeps its toolsets as written. The tier
+    is the discovery tier, never something the manifest claims: only a record discovered in the
+    engine root is trusted, so a record with no tier is not. Its own server is the one derived
+    from its job name, `<id>` or `<id>:<op>`; the generic `okengine-write` names no lane and is
+    judged at regen (a model lane is rebound off it or refused)."""
+    if record.get("tier") in _TRUSTED_TIERS:
+        return []
+    ext_id = record["id"]
+    ops, err = _collect_ops(record.get("manifest") or {}, record.get("dir"))
+    if err:
+        return []                               # the composer reports a malformed operation set
+    cps = None
+    errors: list[str] = []
+    for op_name, op in ops:
+        listed = op.get("toolsets") if isinstance(op.get("toolsets"), list) else []
+        explicit = {str(t) for t in listed if str(t).startswith("okengine-write-")}
+        if not explicit:
+            continue
+        cps = cps or _cron_pack_split_mod()
+        name = ext_id if op_name is None else f"{ext_id}:{op_name}"
+        foreign = sorted(explicit - {cps.contract_writer_name(name), cps.unbounded_writer_name(name)})
+        if foreign:
+            errors.append(f"{ext_id}: {record.get('tier')}-tier operation {name!r} lists write "
+                          f"server(s) {foreign} that are not its own; one server carries one "
+                          "OKENGINE_WRITE_ACTOR, so the operation would write as that lane -- "
+                          "drop them (a contracted operation is bound to its own server)")
+    return errors
+
+
 def synthesize_ops(record: dict) -> tuple[list[dict], list[str], list[str]]:
     """One enabled extension -> (jobs, errors, warnings) — one job per declared
     operation. Supports both the singular ``operation:`` and plural ``operations:``
@@ -429,9 +489,16 @@ def synthesize_ops(record: dict) -> tuple[list[dict], list[str], list[str]]:
         if config_errors:
             return [], errors, warnings
     ext_dir = record.get("dir")
+    if (trust == "declarative" and m.get("operation") is None and m.get("operations") is None
+            and _ops_from_dropins(ext_dir) == ([], None)):
+        return [], errors, warnings             # okengine#1004: declarative = no operation, no job
     ops, err = _collect_ops(m, ext_dir)         # manifest operation(s) + crons/*.cron.json (#63 P1)
     if err:
         errors.append(f"{ext_id}: {err}")
+        return [], errors, warnings
+    foreign = foreign_writer_errors(record)     # okengine#969: untrusted tiers bind only their own
+    if foreign:
+        errors.extend(foreign)
         return [], errors, warnings
 
     jobs: list[dict] = []
@@ -530,8 +597,10 @@ def staging_targets(pack_dir) -> tuple[list[dict], list[str]]:
     disc = _discovery_mod()
     pack_dir = Path(pack_dir)
     resolved, errors = disc.resolve_for_pack(pack_dir)   # explicit ∪ core-not-disabled
+    blocked = disc.unaccepted_trust(pack_dir, resolved)   # okengine#994 [14]
+    errors.extend(blocked.values())
     targets: list[dict] = []
-    for ext_id in sorted(resolved):
+    for ext_id in (i for i in sorted(resolved) if i not in blocked):
         rec = resolved[ext_id]
         if _is_sidecar(rec):
             continue                          # sidecars get a wrapper + compose service, not *.py staging
@@ -568,6 +637,32 @@ def image_ref(image: dict) -> str:
     return ref
 
 
+_SIDECAR_OP_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+
+# A sidecar joins its deployment's compose bridge (okengine#138), so it reaches the read MCP by
+# SERVICE NAME on the port that service listens on; `localhost` inside a bridge container is the
+# sidecar itself (okengine#1044 [5]). Pinned to the skeleton's okengine-mcp service by a test.
+SIDECAR_READ_MCP_URL = "http://okengine-mcp:8730/mcp"
+# The networked write surface for sidecars is not deployed by the skeleton yet (write_server's
+# http transport runs only as the review-only service); see docs/design/sidecar-contract.md §4.
+SIDECAR_WRITE_MCP_URL = "http://localhost:8731/mcp"
+
+
+def _name_collisions(specs: list[dict]) -> tuple[list[dict], list[str]]:
+    """Drop every spec whose derived ``name`` another spec also derives (okengine#1044 [6]).
+
+    ``<ext>--<op>`` is not injective: an extension id may itself contain ``--``, so extension
+    ``acme`` operation ``sync`` and an extension ``acme--sync`` name the same Compose service and
+    wrapper, and the later spec silently replaced the earlier one's image and token."""
+    owners: dict[str, list[str]] = {}
+    for spec in specs:
+        owners.setdefault(spec["name"], []).append(spec["id"])
+    errors = [f"sidecar name {name!r} is derived by both {' and '.join(ids)}; one would silently "
+              "replace the other's Compose service and trigger wrapper (rename one extension or "
+              "operation)" for name, ids in owners.items() if len(ids) > 1]
+    return [spec for spec in specs if len(owners[spec["name"]]) == 1], errors
+
+
 def sidecar_specs(pack_dir) -> tuple[list[dict], list[str]]:
     """Enabled sidecar extensions -> (specs, errors). Each spec carries what the deploy
     needs to materialize a compose service + trigger wrapper + token injection."""
@@ -587,6 +682,10 @@ def sidecar_specs(pack_dir) -> tuple[list[dict], list[str]]:
         cfg = m.get("config") or {}
         for op_name, op in ops:
             spec_id = ext_id if op_name is None else f"{ext_id}:{op_name}"
+            if op_name is not None and not _SIDECAR_OP_RE.fullmatch(op_name):
+                errors.append(f"{spec_id}: a sidecar operation name must match "
+                              "[A-Za-z0-9][A-Za-z0-9_.-]* (it names a Compose service)")
+                continue
             ep = op.get("entrypoint") if isinstance(op.get("entrypoint"), dict) else {}
             image = ep.get("image")
             if not isinstance(image, dict) or not image.get("digest"):
@@ -594,13 +693,20 @@ def sidecar_specs(pack_dir) -> tuple[list[dict], list[str]]:
                 continue
             specs.append({
                 "id": spec_id,
+                # okengine#1042 [33]: the token and identity belong to the EXTENSION (one token per
+                # extension); `name` is what Compose and the wrapper directory are keyed by, which
+                # may not contain the `:` of the job-name form.
+                "ext_id": ext_id,
+                "operation": op_name,
+                "name": ext_id if op_name is None else f"{ext_id}--{op_name}",
                 "image": image_ref(image),
                 "command": image.get("command"),
                 "timeout": op.get("timeout"),
                 "config": {k: (v.get("default") if isinstance(v, dict) else v)
                            for k, v in cfg.items()},
             })
-    return specs, errors
+    specs, collisions = _name_collisions(specs)
+    return specs, errors + collisions
 
 
 def render_trigger_wrapper(ext_id: str, compose_file: str, project: str) -> str:
@@ -630,17 +736,19 @@ def render_sidecar_service(spec: dict, mcp_url: str, write_url: str,
     code can neither escalate, touch the host, nor exhaust it. Its only write surface is the
     scoped write MCP (#132); env injects the endpoints + scoped tokens + the extension id."""
     env = {
-        "OKENGINE_EXTENSION_ID": spec["id"],
+        "OKENGINE_EXTENSION_ID": spec.get("ext_id", spec["id"]),
         "OKENGINE_MCP_URL": mcp_url,
         "OKENGINE_WRITE_MCP_URL": write_url,
         "OKENGINE_READ_TOKEN": read_token,
         "OKENGINE_WRITE_TOKEN": write_token,
     }
+    if spec.get("operation"):
+        env["OKENGINE_OPERATION"] = spec["operation"]
     for k, v in (spec.get("config") or {}).items():
         env[f"OKENGINE_CONFIG_{str(k).upper()}"] = str(v)
     svc = {
         "image": spec["image"],
-        "container_name": f"{spec['id']}-sidecar",
+        "container_name": f"{spec.get('name', spec['id'])}-sidecar",
         "environment": [f"{k}={v}" for k, v in env.items()],
         "restart": "no",                 # one-shot; the wrapper runs it with --rm
         # --- OS sandbox (okengine#124): confine untrusted third-party code ---
@@ -823,27 +931,33 @@ def _read_secrets(pack_dir) -> dict:
         return {}
 
 
-def sidecar_compose_override(pack_dir, mcp_url: str = "http://localhost:8830/mcp",
-                             write_url: str = "http://localhost:8731/mcp",
-                             project: str = "okengine"
+def sidecar_compose_override(pack_dir, *, project: str,
+                             mcp_url: str = SIDECAR_READ_MCP_URL,
+                             write_url: str = SIDECAR_WRITE_MCP_URL
                              ) -> tuple[dict, dict, list[str]]:
     """Assemble the deploy artifacts for enabled sidecars: a compose-override dict
-    ({services: {<id>-sidecar: ...}}) and {id: trigger-wrapper-text}, with the scoped
+    ({services: {<name>-sidecar: ...}}) and {name: trigger-wrapper-text}, with the scoped
     token (#132) injected from the vault secrets file. Returns (override, wrappers,
-    errors). A sidecar with no minted token yet -> error (enable mints it)."""
+    errors). <name> is the extension id, or `<id>--<operation>` for each operation of a
+    multi-operation sidecar, which shares its extension's token. A sidecar with no minted token
+    yet -> error (enable mints it). ``project`` is the deployment's own compose project, which
+    the caller derives; it has no default because a shared one put every pack's sidecars in one
+    project (okengine#1044 [5])."""
     specs, errors = sidecar_specs(pack_dir)
     secrets = _read_secrets(pack_dir)
     services: dict = {}
     wrappers: dict = {}
     for s in specs:
-        token = secrets.get(s["id"], "")
+        token = secrets.get(s["ext_id"], "")
         if not token:
-            errors.append(f"{s['id']}: no minted token (re-run `extensions enable`)")
+            missing = f" for {s['ext_id']}" if s["operation"] else ""
+            errors.append(f"{s['id']}: no minted token{missing} (re-run `extensions enable`)")
             continue
-        # one token per extension; the read/write surfaces scope it differently (#132).
-        services[f"{s['id']}-sidecar"] = render_sidecar_service(
+        # one token per extension, shared by its operations; the read/write surfaces scope it
+        # differently (#132).
+        services[f"{s['name']}-sidecar"] = render_sidecar_service(
             s, mcp_url, write_url, token, token)
-        wrappers[s["id"]] = render_trigger_wrapper(s["id"], "docker-compose.yml", project)
+        wrappers[s["name"]] = render_trigger_wrapper(s["name"], "docker-compose.yml", project)
     return {"services": services}, wrappers, errors
 
 
@@ -856,6 +970,10 @@ def extension_jobs(pack_dir, existing_names=None) -> tuple[list[dict], list[str]
     resolved, errors = disc.resolve_for_pack(pack_dir)   # explicit ∪ core-not-disabled
     if not resolved and not errors:
         return [], []                        # nothing active -> nothing to compose
+    # Unaccepted operator-tier in-gateway code never gets a job (okengine#994 [14]).
+    blocked = disc.unaccepted_trust(pack_dir, resolved)
+    errors.extend(blocked.values())
+    resolved = {ext_id: rec for ext_id, rec in resolved.items() if ext_id not in blocked}
     jobs, comp_err, _ = compose(resolved, existing_names)
     errors.extend(comp_err)
     errors.extend(_apply_prompt_overrides(jobs, pack_dir))

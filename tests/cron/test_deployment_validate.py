@@ -1034,7 +1034,7 @@ def test_check_auth_passes_locked_api_server_toolset(tmp_path, monkeypatch):
     vault = tmp_path / "v"; (vault / "wiki").mkdir(parents=True)
     data = tmp_path / "d"; data.mkdir()
     (data / "config.yaml").write_text(
-        "platform_toolsets: {api_server: [okengine, okengine-write, web]}\n")   # web is allowlisted
+        "platform_toolsets: {api_server: [okengine, okengine-write-chat, web]}\n")   # web is allowlisted
     m = _load_dv(monkeypatch, vault, data, tmp_path / "h")
     _auth_env(monkeypatch); monkeypatch.setenv("API_SERVER_ENABLED", "true")
     monkeypatch.delenv("API_SERVER_KEY", raising=False)
@@ -1097,7 +1097,8 @@ import json as _json197  # noqa: E402  (this file predates the json need; local 
 
 # --- okengine#197: cron store ownership + stall sentinel -------------------------------------
 
-def _run_cron_check(tmp_path, monkeypatch, *, owner_uid=None, sentinel=None):
+def _run_cron_check(tmp_path, monkeypatch, *, owner_uid=None, sentinel=None, env=None,
+                    pidfile=False):
     vault = tmp_path / "vault"
     data = tmp_path / "data"
     (vault / "wiki").mkdir(parents=True)
@@ -1106,6 +1107,9 @@ def _run_cron_check(tmp_path, monkeypatch, *, owner_uid=None, sentinel=None):
     (cp / "jobs.json").write_text(_json197.dumps({"jobs": [{"id": "a1", "name": "j1"}]}))
     if sentinel is not None:
         (cp / ".scheduler-stalled").write_text(_json197.dumps(sentinel))
+    if pidfile:
+        (cp / "pids").mkdir()
+        (cp / "pids" / "j1.pid").write_text("1\n")
     monkeypatch.setenv("WIKI_PATH", str(vault))
     spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
@@ -1113,6 +1117,9 @@ def _run_cron_check(tmp_path, monkeypatch, *, owner_uid=None, sentinel=None):
     spec.loader.exec_module(m)
     m.F.clear()
     m.VAULT, m.DATA = vault, data
+    # The gateway environment the check judges (okengine#1044 [9]); none by default, so a
+    # HERMES_UID in the runner's own environment cannot change these tests' verdicts.
+    m.ENV = {} if env is None else env
     if owner_uid is not None:                 # simulate a foreign-owned store without needing root
         real_stat = type(cp / "jobs.json").stat
 
@@ -1153,30 +1160,72 @@ def test_scheduler_stalled_sentinel_fails(tmp_path, monkeypatch):
     assert any(l == "FAIL" and "STALLED" in msg and "Permission denied" in msg for l, c, msg in f), f
 
 
-def _run_provenance_check(monkeypatch, pack):
+def _run_provenance_check(monkeypatch, tmp_path, *, gateway=None, name=None):
     spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
     m = importlib.util.module_from_spec(spec)
     sys.modules["deployment_checks"] = m
     spec.loader.exec_module(m)
     m.F.clear()
-    if pack is None:
+    if gateway is None:
         monkeypatch.delenv("OKENGINE_PACK", raising=False)
     else:
-        monkeypatch.setenv("OKENGINE_PACK", pack)
+        monkeypatch.setenv("OKENGINE_PACK", gateway)
+    if name is not None:
+        (tmp_path / "pack.yaml").write_text(f"name: {name}\n", encoding="utf-8")
+    m.configure(tmp_path)
     m.check_provenance_env()
     return list(m.F)
 
 
-def test_provenance_env_unset_warns(monkeypatch):
-    """invariant-audit M14/#750: no OKENGINE_PACK in the gateway env -> the write path stamps no
-    composition provenance. Undetectable at runtime, so the in-gateway validator must WARN."""
-    f = _run_provenance_check(monkeypatch, None)
-    assert any(l == "WARN" and c == "provenance" and "OKENGINE_PACK" in msg for l, c, msg in f), f
+def test_provenance_without_a_pack_yaml_name_warns(monkeypatch, tmp_path):
+    """invariant-audit M14/#750 + okengine#1032 [20]: with no pack.yaml `name` the write path has no
+    deployment pack to stamp as provenance, so the validator must WARN."""
+    f = _run_provenance_check(monkeypatch, tmp_path)
+    assert any(l == "WARN" and c == "provenance" and "declares no `name`" in msg
+               for l, c, msg in f), f
 
 
-def test_provenance_env_set_is_clean(monkeypatch):
-    f = _run_provenance_check(monkeypatch, "okpack-example")
+def test_provenance_gateway_env_alone_does_not_satisfy_the_check(monkeypatch, tmp_path):
+    """okengine#1032 [20]: the gateway's OKENGINE_PACK never reaches a served write server, so it
+    must not read as proof that provenance is stamped (the old check passed on it)."""
+    f = _run_provenance_check(monkeypatch, tmp_path, gateway="okpack-example")
+    assert any(l == "WARN" and c == "provenance" and "declares no `name`" in msg
+               for l, c, msg in f), f
+
+
+def test_provenance_pack_yaml_name_is_clean_without_gateway_env(monkeypatch, tmp_path):
+    """okengine#1032 [20]: a compose that predates the gateway OKENGINE_PACK no longer earns a WARN
+    (and an unnecessary recreate) when pack.yaml names the pack the write path stamps."""
+    f = _run_provenance_check(monkeypatch, tmp_path, name="okpack-example")
     assert not any(c == "provenance" for l, c, msg in f), f
+
+
+def test_provenance_matching_gateway_env_is_clean(monkeypatch, tmp_path):
+    f = _run_provenance_check(monkeypatch, tmp_path, gateway="okpack-example", name="okpack-example")
+    assert not any(c == "provenance" for l, c, msg in f), f
+
+
+@pytest.mark.parametrize("stale", ["okpack-old", "okpack-aaa"])   # sorts after and before the name
+def test_provenance_stale_gateway_env_that_disagrees_with_pack_yaml_warns(monkeypatch, tmp_path, stale):
+    f = _run_provenance_check(monkeypatch, tmp_path, gateway=stale, name="okpack-example")
+    assert any(l == "WARN" and c == "provenance" and stale in msg and "'okpack-example'" in msg
+               for l, c, msg in f), f
+
+
+def test_provenance_without_pack_principal_module_is_undetectable_not_clean(monkeypatch, tmp_path):
+    spec = importlib.util.spec_from_file_location("deployment_checks", MOD)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["deployment_checks"] = m
+    spec.loader.exec_module(m)
+    m.F.clear()
+    (tmp_path / "pack.yaml").write_text("name: okpack-example\n", encoding="utf-8")
+    m.configure(tmp_path)
+
+    def _missing():
+        raise ImportError("no okengine.pack_principal")
+    monkeypatch.setattr(m, "_pack_principal", _missing)
+    m.check_provenance_env()
+    assert any(l == "WARN" and c == "provenance" and "undetectable" in msg for l, c, msg in m.F), m.F
 
 
 # --- invariant-audit v0.11.5 batch-5 (cron scripts) --------------------------------------------
@@ -1536,3 +1585,112 @@ def test_disabled_and_no_agent_lanes_are_excluded_from_routing(tmp_path, monkeyp
     ]
     f = _crons_with_config(tmp_path, monkeypatch, jobs, _RCFG)
     assert not [x for x in f if "inherit the default `base_url`" in x[2] or "claimed by" in x[2]], f
+
+
+# --- okengine#1044 [9]: the store must be owned by the SCHEDULER's uid, not the verifier's -------
+# post_deploy_verify step [9] runs this check on the HOST, where the euid is the deployer's (or 0
+# under sudo), not the gateway's HERMES_UID. A second operator was told to `chown` the store to
+# their own uid, which is the okengine#193 fleet stall; a store owned by the deployer instead of
+# the scheduler passed.
+
+def _foreign_uid() -> int:
+    return 4242 if os.geteuid() != 4242 else 4343
+
+
+def test_a_store_owned_by_the_gateway_uid_passes_a_host_side_run(tmp_path, monkeypatch):
+    scheduler = _foreign_uid()
+    f = _run_cron_check(tmp_path, monkeypatch, owner_uid=scheduler,
+                        env={"HERMES_UID": str(scheduler)})
+    assert not any(l == "FAIL" and "owned by uid" in msg for l, c, msg in f), f
+
+
+def test_a_store_owned_by_the_verifier_not_the_gateway_fails_with_the_gateway_uid(
+        tmp_path, monkeypatch):
+    scheduler = _foreign_uid()
+    f = _run_cron_check(tmp_path, monkeypatch, env={"HERMES_UID": str(scheduler)})
+    fails = [msg for l, c, msg in f if l == "FAIL" and "owned by uid" in msg]
+    assert fails and f"scheduler runs as uid {scheduler}" in fails[0], f
+    assert f"chown {scheduler} " in fails[0], "the remedy must name the scheduler's uid"
+
+
+@pytest.mark.parametrize("value", ["", "abc", "0", "-5"])
+def test_an_unusable_gateway_uid_falls_back_to_the_running_uid(tmp_path, monkeypatch, value):
+    """In the gateway the validator runs as the service uid; an absent, malformed or root value
+    must not turn a correct store into a FAIL."""
+    f = _run_cron_check(tmp_path, monkeypatch, env={"HERMES_UID": value})
+    assert not any(l == "FAIL" and "owned by uid" in msg for l, c, msg in f), f
+
+
+def test_pidfiles_are_judged_against_the_gateway_uid(tmp_path, monkeypatch):
+    scheduler = _foreign_uid()
+    pids = tmp_path / "data" / "cron-plus" / "pids"
+    f = _run_cron_check(tmp_path, monkeypatch, owner_uid=scheduler,
+                        env={"HERMES_UID": str(scheduler)}, pidfile=True)
+    assert pids.is_dir()
+    assert not any(c == "crons" and "pidfile" in msg for l, c, msg in f), f
+
+
+def test_host_env_carries_the_gateway_uid_as_compose_interpolates_it(tmp_path):
+    """The gateway's `environment:` sets HERMES_UID=${HERMES_UID:-10000}: the invoking
+    environment first, then the pack .env. The 10000 default is not carried (see host_env)."""
+    m = _load_checks()
+    (tmp_path / ".env").write_text("HERMES_UID=1003\n", encoding="utf-8")
+    assert m.host_env(tmp_path, {})["HERMES_UID"] == "1003"
+    assert m.host_env(tmp_path, {"HERMES_UID": "4242"})["HERMES_UID"] == "4242"
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    assert "HERMES_UID" not in m.host_env(tmp_path, {}), \
+        "an unpinned uid is not asserted: the check falls back to the running uid"
+
+
+def _load_checks():
+    spec = importlib.util.spec_from_file_location("deployment_checks_1044", MOD)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+# --- okengine#1044 [29]: a visible Hermes tree without the engine's build markers is not silent --
+
+def _run_pins_with_hermes(tmp_path, monkeypatch, hermes, markers):
+    if hermes is not None and markers:
+        (hermes / ".okengine_release").write_text("v0.9.0\n", encoding="utf-8")
+        (hermes / ".hermes_pin").write_text("v2026.7.1\n", encoding="utf-8")
+    vault, data = tmp_path / "vault", tmp_path / "data"
+    (vault / "wiki").mkdir(parents=True)
+    data.mkdir()
+    (vault / "engine.version").write_text(yaml.safe_dump({"version": "v0.9.0"}))
+    (data / "engine-runtime.yaml").write_text(_stamp())
+    monkeypatch.setenv("WIKI_PATH", str(vault))
+    m = _load_checks()
+    m.F.clear()
+    m.VAULT, m.DATA = vault, data
+    m.HERMES = hermes if hermes is not None else tmp_path / "no-image-on-host"
+    m.check_pins()
+    return [(level, msg) for level, area, msg in m.F if area == "pins"]
+
+
+def test_a_hermes_tree_without_engine_markers_warns(tmp_path, monkeypatch):
+    hermes = tmp_path / "hermes"
+    hermes.mkdir()
+    found = _run_pins_with_hermes(tmp_path, monkeypatch, hermes, markers=False)
+    assert any(level == "WARN" and "not built by build-engine-image.sh" in msg
+               for level, msg in found), found
+
+
+def test_an_engine_built_hermes_tree_does_not_warn_about_markers(tmp_path, monkeypatch):
+    hermes = tmp_path / "hermes"
+    hermes.mkdir()
+    found = _run_pins_with_hermes(tmp_path, monkeypatch, hermes, markers=True)
+    assert not any("not built by build-engine-image.sh" in msg for _level, msg in found), found
+
+
+def test_a_host_side_run_with_no_image_to_see_stays_quiet(tmp_path, monkeypatch):
+    found = _run_pins_with_hermes(tmp_path, monkeypatch, None, markers=False)
+    assert not any("not built by build-engine-image.sh" in msg for _level, msg in found), found
+
+
+def test_uid_one_is_a_usable_gateway_uid(tmp_path, monkeypatch):
+    """Only 0 (root) is rejected; every positive uid, 1 included, names the scheduler."""
+    m = _load_checks()
+    m.ENV = {"HERMES_UID": "1"}
+    assert m.scheduler_uid() == 1

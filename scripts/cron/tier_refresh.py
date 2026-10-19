@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import tier_lib  # noqa: E402
 import tz_lib  # noqa: E402
 
@@ -63,7 +64,6 @@ def _count_namespace(ns: str, nscfg: dict, cfg: dict, today) -> dict:
             active_nscfg = (active_cfg.get("namespaces") or {}).get(ns)
             if not active_nscfg:
                 continue
-        from_path = active_nscfg.get("from_path") and not active_nscfg.get("status_field")
         for p in base.rglob("*.md"):
             n = p.name
             if n == "INDEX.md" or n.startswith("INDEX-p") or n.startswith("_"):
@@ -73,8 +73,7 @@ def _count_namespace(ns: str, nscfg: dict, cfg: dict, today) -> dict:
             # '<subdomain>/<ns>/…', so tier_of got the sub-domain name instead of the namespace and
             # the namespace's date/status tiering config never applied (multipack under-count).
             rel = f"{ns}/{p.relative_to(base).as_posix()}"
-            fm = {} if from_path else tier_lib.fm_of(p)
-            t = tier_lib.tier_of(rel, fm, active_cfg, today)
+            t = tier_lib.tier_of(rel, tier_lib.tier_fm(p, active_nscfg), active_cfg, today)
             if t in counts:
                 counts[t] += 1
             else:
@@ -135,7 +134,7 @@ def main() -> int:
     L.append(f"| **all** | **{tot['hot']}** | **{tot['warm']}** | **{tot['cold']}** | **{grand}** |")
     L.append("")
     OPDIR.mkdir(parents=True, exist_ok=True)
-    DASH.write_text("\n".join(L), encoding="utf-8")
+    generated_page.write(DASH, "\n".join(L))
     SIDECAR.write_text(json.dumps({"as_of": now, "dist": dist}, indent=2), encoding="utf-8")
 
     summary = " · ".join(f"{ns}: {dist[ns].get('hot',0)}h/{dist[ns].get('warm',0)}w/{dist[ns].get('cold',0)}c"

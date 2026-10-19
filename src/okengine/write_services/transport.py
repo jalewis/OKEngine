@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import hmac
 from typing import Mapping
+
+from okengine.http_auth import authorization_header
 from starlette.requests import Request as StarletteRequest
 
 
@@ -26,11 +28,37 @@ def _fence_tool_registrations(mcp_tool, caller_context, wiki_path):
                 ):
                     return function(*args, **kwargs)
 
-            return register(fenced)
+            registered = register(fenced)
+            _close_tool_arguments(mcp_tool, decorator_kwargs.get("name") or function.__name__)
+            return registered
 
         return decorate
 
     return transactional_tool
+
+
+def _close_tool_arguments(mcp_tool, name: str) -> None:
+    """Refuse unknown arguments to a governed write tool, by name (okengine#879).
+
+    Both MCP SDKs (1.x FastMCP, 2.x MCPServer) publish an open input schema and build a pydantic
+    argument model that silently DROPS extra keys. A model that sent the brief as `content` instead
+    of `body` had the text discarded, the page refused as an empty body four times over, and never
+    learned why. Closing the published schema lets the gateway's own argument validation reject
+    the call naming the unexpected key; forbidding extras on the model refuses a direct call too.
+    If the SDK's internal layout ever changes this raises at startup -- a write server with
+    silently-open tools is the failure this exists to prevent, so it must not degrade quietly."""
+    server = getattr(mcp_tool, "__self__", None)
+    tools = getattr(getattr(server, "_tool_manager", None), "_tools", None)
+    tool = tools.get(name) if isinstance(tools, dict) else None
+    params = getattr(tool, "parameters", None)
+    arg_model = getattr(getattr(tool, "fn_metadata", None), "arg_model", None)
+    if not isinstance(params, dict) or arg_model is None:
+        raise RuntimeError(
+            f"cannot close the argument schema of write tool {name!r}: the MCP SDK's tool layout "
+            "changed (expected _tool_manager._tools[name].parameters and fn_metadata.arg_model)")
+    params["additionalProperties"] = False
+    arg_model.model_config["extra"] = "forbid"
+    arg_model.model_rebuild(force=True)
 
 
 class _ScopedWriteAuth:
@@ -45,8 +73,7 @@ class _ScopedWriteAuth:
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") == "http" and scope.get("path") != "/healthz":
-            headers = dict(scope.get("headers") or [])
-            provided = headers.get(b"authorization", b"").decode()
+            provided = authorization_header(scope)
             token = provided[7:] if provided.startswith("Bearer ") else ""
             caller = None
             if self.admin_token and hmac.compare_digest(token, self.admin_token):

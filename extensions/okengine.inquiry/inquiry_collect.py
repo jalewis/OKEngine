@@ -52,6 +52,7 @@ STAGED_RUNTIME = Path("/opt/data/scripts/source_connector.py")
 STATE = lib.VAULT / ".okengine/inquiry/collect-state.json"
 MAX_INQUIRIES = int(os.environ.get("OKENGINE_INQUIRY_MAX_INQUIRIES", "20"))
 MAX_TERMS = int(os.environ.get("OKENGINE_INQUIRY_MAX_TERMS_PER_INQUIRY", "12"))
+ARCHIVE_ROOT = "raw/connectors"   # vault-relative; the runtime's own default, made explicit
 
 
 def connector_dir() -> Path:
@@ -130,18 +131,24 @@ def run_connector(manifest_path: Path, params: dict[str, str], timeout: int = 18
     network I/O and holds secrets, and one term's failure must not abort the run. Replaced
     wholesale in tests."""
     runtime = CONNECTOR_RUNTIME if CONNECTOR_RUNTIME.is_file() else STAGED_RUNTIME
-    argv = [sys.executable, str(runtime), "--manifest", str(manifest_path)]
+    # The archive root is passed EXPLICITLY, not left to the runtime's WIKI_PATH default: the
+    # evidence ledger derives each record's directory from it (record_dir), and a derivation
+    # that only agrees with the runtime by coincidence of defaults is one env change from
+    # attributing evidence to paths that do not exist.
+    argv = [sys.executable, str(runtime), "--manifest", str(manifest_path),
+            "--archive-root", str(lib.VAULT / ARCHIVE_ROOT)]
     for name, value in sorted(params.items()):
         argv += ["--param", f"{name}={value}"]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired:
-        return {"ok": False, "records": 0, "error": f"timeout after {timeout}s"}
+        return {"ok": False, "records": 0, "error": f"timeout after {timeout}s", "native_ids": []}
     if proc.returncode != 0:
         return {"ok": False, "records": 0,
                 "error": (proc.stderr or proc.stdout or "").strip()[:300] or
-                         f"exit {proc.returncode}"}
+                         f"exit {proc.returncode}", "native_ids": []}
     records = 0
+    native_ids: list[str] = []
     for line in (proc.stdout or "").splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -152,7 +159,22 @@ def run_connector(manifest_path: Path, params: dict[str, str], timeout: int = 18
             continue
         if isinstance(payload, dict) and "records" in payload:
             records = int(payload.get("records") or 0)
-    return {"ok": True, "records": records, "error": ""}
+            native_ids = [str(item["source_native_id"]) for item in payload.get("items") or []
+                          if isinstance(item, dict) and item.get("source_native_id") is not None]
+    return {"ok": True, "records": records, "error": "", "native_ids": native_ids}
+
+
+def record_dir(manifest: dict, native_id: str, safe_component) -> str | None:
+    """Vault-relative directory the runtime archives `native_id` under, or None when the
+    connector keeps no per-record archive (then no source page can cite one, and there is
+    nothing to join). `safe_component` is the RUNTIME's own sanitizer, passed in rather than
+    re-implemented, so the two spellings of a record's path cannot drift."""
+    archive = manifest.get("archive") or {}
+    if not archive.get("enabled"):
+        return None
+    parts = [ARCHIVE_ROOT, str(archive.get("path") or "").strip("/"), "records",
+             safe_component(native_id)]
+    return "/".join(p for p in parts if p)
 
 
 def _load_state() -> dict:
@@ -200,10 +222,12 @@ def main(argv: list[str] | None = None) -> int:
     today = now.strftime("%Y-%m-%d")
     state = _load_state()
     runs = state.setdefault("terms", {})
+    ledger = lib.load_ledger()
+    safe_component = _runtime_module()[0]._safe_component
 
     active = sorted((i for i in inquiries if i.is_open), key=lambda i: (i.opened or "9999", i.slug))
     deferred = max(0, len(active) - MAX_INQUIRIES)
-    total_records = total_terms = failures = 0
+    total_records = total_new = total_terms = failures = 0
 
     for inquiry in active[:MAX_INQUIRIES]:
         manifest = manifests[inquiry.connector]
@@ -216,17 +240,29 @@ def main(argv: list[str] | None = None) -> int:
             params = build_params(inquiry, term, input_name)
             outcome = run_connector(paths[inquiry.connector], params)
             total_terms += 1
-            key = f"{inquiry.slug}::{term.key}"
+            key = lib.term_id(inquiry.slug, term.key)
             prior = runs.get(key) or {}
+            # `records` is what the connector RETURNED this run. A recency-sorted, capped query
+            # returns mostly the same page every day, so summing it (the old `total_records`)
+            # reported 650 for a term that had collected 50 distinct records. NEW is what the
+            # ledger had never seen this term return — the number that means "more evidence".
+            new = 0
+            for native_id in outcome.get("native_ids") or []:
+                where = record_dir(manifest, native_id, safe_component)
+                if where and lib.attribute(ledger, where, connector=inquiry.connector,
+                                           native_id=native_id, term=key, today=today):
+                    new += 1
             record = {"last_run": today, "connector": inquiry.connector, "query": term.query,
-                      "records": outcome["records"], "ok": outcome["ok"],
+                      "records": outcome["records"], "new_records": new, "ok": outcome["ok"],
                       "error": outcome["error"],
                       "last_yield": today if outcome["records"] else prior.get("last_yield", ""),
-                      "total_records": int(prior.get("total_records") or 0) + outcome["records"]}
+                      "last_new": today if new else prior.get("last_new", "")}
             runs[key] = record
             if outcome["ok"]:
                 total_records += outcome["records"]
-                print(f"  {inquiry.slug} :: {term.key} -> {outcome['records']} record(s)")
+                total_new += new
+                print(f"  {inquiry.slug} :: {term.key} -> {outcome['records']} record(s), "
+                      f"{new} new")
             else:
                 failures += 1
                 print(f"  {inquiry.slug} :: {term.key} -> FAILED: {outcome['error']}")
@@ -236,13 +272,15 @@ def main(argv: list[str] | None = None) -> int:
 
     state["last_run"] = now.isoformat()
     _save_state(state)
+    lib.save_ledger(ledger)
     if deferred:
         print(f"# {deferred} open inquiry(s) deferred to the next run "
               f"(OKENGINE_INQUIRY_MAX_INQUIRIES={MAX_INQUIRIES})")
     print(f"# {len(active)} open inquiry(s), {total_terms} term(s) run, "
-          f"{total_records} record(s), {failures} failure(s)")
+          f"{total_records} record(s), {total_new} new, {failures} failure(s)")
     print(json.dumps({"wakeAgent": False, "inquiries": len(active), "terms": total_terms,
-                      "records": total_records, "failures": failures}))
+                      "records": total_records, "new_records": total_new,
+                      "failures": failures}))
     return 0
 
 

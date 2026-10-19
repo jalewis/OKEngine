@@ -7,6 +7,7 @@ import json
 import os
 import re
 import subprocess
+from subprocess import SubprocessError
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,7 +17,7 @@ def _git(repo: Path, *args: str) -> str | None:
     try:
         result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
                                 text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, SubprocessError):
         return None
     return result.stdout.strip() if result.returncode == 0 else None
 

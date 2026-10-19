@@ -54,6 +54,12 @@ async def projection_status(*, checked: bool = False) -> dict:
         raise ProjectionUnavailable(
             "the projection has never completed; run framework rebuild --projection")
     result = dict(row)
+    stats = result.get("stats") or {}
+    if isinstance(stats, str):
+        import json
+        stats = json.loads(stats)
+    if checked and stats.get("unreadable"):
+        raise ProjectionUnavailable("projection epoch contains unreadable paths; results withheld")
     state = Path(os.environ.get("WIKI_PATH") or "/opt/vault") / ".okengine/corpus"
     if (state / "active.json").exists():
         raise ProjectionUnavailable("corpus mutation is in progress or awaiting recovery")

@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import collection_ledger  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
@@ -133,7 +134,7 @@ def render(*, vault: Path = VAULT, ledger: Path = LEDGER, now=None) -> Path:
     out = Path(vault) / "wiki" / "operational" / "collection-health.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".md.tmp")
-    tmp.write_text("\n".join(lines), encoding="utf-8")
+    tmp.write_text(generated_page.with_id(out, "\n".join(lines)), encoding="utf-8")
     os.replace(tmp, out)
     return out
 

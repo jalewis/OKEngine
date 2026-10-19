@@ -35,6 +35,15 @@ except ImportError:                             # standalone import (cron/tests)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import id_lib
 
+# A legacy scalar `aliases` is split exactly as the write path coerces it (okengine#1042 [19]). The
+# package is installed wherever this file is baked or staged (gateway image, wheel); a source
+# checkout loaded by path finds it in ../../src, appended so an installed copy always wins (the
+# schema_lib / engine_package convention).
+_SRC = Path(__file__).resolve().parents[2] / "src"
+if (_SRC / "okengine").is_dir() and str(_SRC) not in sys.path:
+    sys.path.append(str(_SRC))
+from okengine.list_scalars import split_list_scalar  # noqa: E402
+
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 INDEX_PATH = Path(os.environ.get("HERMES_DATA", "/opt/data")) / "state" / "id-index.json"
 
@@ -121,7 +130,7 @@ class IdIndex:
         # coerce to a list before iterating, then str() each member.
         aliases = fm.get("aliases") or []
         if isinstance(aliases, str):
-            aliases = [a.strip() for a in aliases.split(",") if a.strip()]
+            aliases = split_list_scalar(aliases)
         elif not isinstance(aliases, list):
             aliases = []
         for a in aliases:
@@ -142,7 +151,7 @@ class IdIndex:
                 bucket.append(rel)
         aliases = fm.get("aliases") or []
         if isinstance(aliases, str):
-            aliases = [a.strip() for a in aliases.split(",") if a.strip()]
+            aliases = split_list_scalar(aliases)
         elif not isinstance(aliases, list):
             aliases = []
         for a in aliases:

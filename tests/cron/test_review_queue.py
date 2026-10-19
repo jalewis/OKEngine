@@ -38,11 +38,13 @@ def test_queue(tmp_path, monkeypatch):
     assert "briefings/stale-vet" in d                 # edited after sign-off -> re-review
     assert "entities/a/clean" not in d                # clean -> not queued
     assert "briefings/vetted" not in d                # signed off at current version -> cleared
-    assert "entities/a/needs-vetted" not in d         # needs_review but signed off -> cleared
+    # a LIVE flag is pending work whatever was signed (okengine#867): review_policy, the Cockpit and
+    # the #842 reconciler all require it, and this queue used to hide it
+    assert "NEEDS-REVIEW | [[entities/a/needs-vetted]]" in d
     assert "GROUNDING: **1**" in d
-    assert "NEEDS-REVIEW: **1**" in d
+    assert "NEEDS-REVIEW: **2**" in d
     assert "UNVETTED: **2**" in d
-    assert "**4 item(s) awaiting a human**" in d
+    assert "**5 item(s) awaiting a human**" in d
 
 def test_queue_rows_are_wikilinks_not_relative_md_links(tmp_path, monkeypatch):
     """The reader renders [[wikilinks]] as in-app navigation; a file-relative
@@ -121,3 +123,34 @@ def test_split_and_main_edge_paths_and_overflow(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(m, "SAMPLES", 1)
     assert m.main() == 0
     assert "…and 2 more" in m.DASH.read_text()
+
+
+def test_the_queue_lists_exactly_what_review_policy_requires(tmp_path, monkeypatch):
+    """okengine#867: one membership rule. Same-day re-flag after sign-off and a grounding failure
+    added after sign-off were the cases the old reviewed_on >= last_updated shortcut hid."""
+    sys.path.insert(0, str(REPO / "src"))
+    from okengine.review_policy import requires_review
+    wiki = tmp_path / "wiki" / "entities" / "a"
+    wiki.mkdir(parents=True)
+    grounding = "\n## Grounding check\n- **unsupported** - claim not in source\n"
+    pages = {
+        "same-day-reflag": ("type: entity\nneeds_review: true\nreviewed_on: 2026-09-25\n"
+                            "last_updated: '2026-09-25T15:00:00Z'\n", ""),
+        "grounding-after-signoff": ("type: entity\nreviewed_on: 2026-09-25\nlast_updated: 2026-09-25\n",
+                                    grounding),
+        "signed-off-briefing": ("type: briefing\nreviewed_on: 2026-09-25\nlast_updated: 2026-09-25\n", ""),
+        "edited-briefing": ("type: briefing\nreviewed_on: 2026-09-20\nlast_updated: 2026-09-25\n", ""),
+        "approved-briefing": ("type: briefing\nreview_state: approved\nlast_updated: 2026-09-25\n", ""),
+        "plain": ("type: entity\nlast_updated: 2026-09-25\n", ""),
+    }
+    for name, (fm, body) in pages.items():
+        (wiki / f"{name}.md").write_text(f"---\n{fm}---\n# {name}\n{body}")
+    (tmp_path / "schema.yaml").write_text(yaml.safe_dump({"okf": {"required": ["type"]},
+                                                          "review_required_types": ["briefing"]}))
+    queue = _run(tmp_path, monkeypatch)
+    for name, (fm, body) in pages.items():
+        required = requires_review(yaml.safe_load(fm), f"# {name}\n{body}", frozenset({"briefing"}))
+        assert (f"entities/a/{name}]]" in queue) == required, (
+            f"{name}: review_policy says required={required}, but the queue "
+            f"{'omits' if required else 'lists'} it")
+    assert "entities/a/same-day-reflag]]" in queue and "entities/a/grounding-after-signoff]]" in queue

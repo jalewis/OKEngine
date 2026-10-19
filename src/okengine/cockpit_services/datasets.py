@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from yaml import YAMLError  # bare name: cosmic-ray cannot mutate a dotted except-tuple member
 import markdown as md
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, FileResponse, Response, StreamingResponse
@@ -33,6 +34,58 @@ from okengine.actor_identity import actor_identity_error
 _FM_SCAN_BYTES = 262_144
 
 
+def _actor_schema(_cache: dict = {}) -> dict:  # noqa: B006 - the default IS the cache
+    """The schema that says which types are actors (okengine#1020), parsed once per file version.
+
+    Keyed on the file's identity, never a TTL, so a fresh process reads it on first use instead
+    of serving an empty default. The cache lives in the default argument because these functions
+    are rebound into the app facade, which carries no module globals."""
+    from okengine.file_fingerprint import fingerprint
+
+    path = _governing_schema_path()
+    key = fingerprint(path)
+    if key is None:
+        return {}
+    stamp = (str(path), key)
+    if _cache.get("stamp") != stamp:
+        try:
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, YAMLError):
+            loaded = {}
+        _cache.clear()
+        _cache.update(stamp=stamp, schema=loaded if isinstance(loaded, dict) else {})
+    return _cache["schema"]
+
+
+def _governing_actor_schema(page_dir: Path, cache: dict) -> dict:
+    """The schema governing pages in ``page_dir``, cached per directory (v0.15.11 audit [10]/[19]):
+    a walk-up sub-domain's own, as the write path and corpus_audit resolve it, so its `role: actor`
+    types are actors here too. Root-governed pages keep the root authority, ``_actor_schema()``."""
+    if page_dir not in cache:
+        import schema_lib
+        try:
+            ns = page_dir.relative_to(WIKI).as_posix()
+        except ValueError:
+            ns = ""
+        gov = schema_lib._governing_dir(VAULT, ns)
+        sub_domain = gov not in (VAULT, VAULT / "wiki")
+        cache[page_dir] = schema_lib.merged_schema(VAULT, ns) if sub_domain else _actor_schema()
+    return cache[page_dir]
+
+
+def _row_dir(row: dict) -> Path:
+    """The directory holding a dataset row's page (rows carry `_sub` and their `_rel` under it)."""
+    sub, rel = WIKI / str(row.get("_sub") or ""), str(row.get("_rel") or "")
+    return (sub / rel).parent if rel else sub
+
+
+def _is_actor_row(fm: dict, schema: dict) -> bool:
+    """True for a page of any actor type the governing schema declares, not just `actor`."""
+    from okengine import actor_types
+
+    return actor_types.is_actor_type(schema, fm.get("type"))
+
+
 def _scan_dir_meta(sub: str) -> list[dict]:
     """Parse frontmatter of every page under wiki/<sub> (recursive, like Dataview FROM). The raw
     scan: on a 3k–6k-file namespace this is seconds of syscalls + YAML parses, so it must never run
@@ -40,6 +93,7 @@ def _scan_dir_meta(sub: str) -> list[dict]:
     (Distinct from the browse-layer _scan_dir below, which returns a lighter list-row shape.)"""
     out: list[dict] = []
     base = WIKI / sub
+    schemas: dict = {}   # page directory -> its governing schema
     if base.is_dir():
         for p in base.rglob("*.md"):
             name = p.name
@@ -57,7 +111,7 @@ def _scan_dir_meta(sub: str) -> list[dict]:
             # Scoped review launchers reuse this namespace cache instead of walking the whole
             # corpus. Preserve the one body-derived review signal while the file is already open.
             fm["_body_review_flag"] = bool(_GROUNDING_REVIEW.search(body or ""))
-            if str(fm.get("type") or "").casefold() == "actor":
+            if _is_actor_row(fm, _governing_actor_schema(p.parent, schemas)):
                 title = str(fm.get("title") or fm.get("name") or p.stem)
                 fm["_actor_identity_error"] = actor_identity_error(title, body)
             out.append(fm)
@@ -655,12 +709,13 @@ def _ds_rows(spec: dict) -> list[dict]:
     # Tombstones retain their original type so references can resolve, but analyst-facing
     # datasets must never render them as live entities.
     rows = [r for r in rows if str(r.get("status") or "").casefold() != "tombstoned"]
+    schemas: dict = {}   # page directory -> its governing schema
     # Contradictory actor pages remain addressable for repair, but never appear as live actors in
     # analyst datasets.  Evidence/news volume does not override an ontological contradiction.
     rows = [
         r for r in rows
         if not (
-            str(r.get("type") or "").casefold() == "actor"
+            _is_actor_row(r, _governing_actor_schema(_row_dir(r), schemas))
             and (r.get("_actor_identity_error") or r.get("actor_identity_validated") is False)
         )
     ]

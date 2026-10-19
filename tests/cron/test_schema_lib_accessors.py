@@ -70,7 +70,16 @@ def test_core_convention_applies_without_a_declaration():
     assert sl.type_home_namespace({}, "source") == "sources"
 
 
-def test_every_engine_core_type_has_a_home_namespace_guard():
+@pytest.fixture
+def parsed_base_schema():
+    """Parse config/base-schema.yaml in SETUP. This file loads its OWN copy of schema_lib
+    (`schema_lib_accessors`), whose `_BASE_CACHE` the conftest session warm-up never reaches, so
+    the first test here to call `base_schema()` always paid the cold YAML parse (~0.3s CPU on the
+    runner) inside its 0.1s unit budget (okengine#994)."""
+    sl.base_schema()
+
+
+def test_every_engine_core_type_has_a_home_namespace_guard(parsed_base_schema):
     """A new base type must not silently disable both write-time and audit anti-fork checks."""
     core_types = set((sl.base_schema().get("types") or {}).keys())
     assert core_types == set(sl._CORE_TYPE_HOME), (
@@ -137,3 +146,17 @@ def test_excluded_dirs_default_empty():
 def test_excluded_dirs_derives_namespace_names_from_exclude_paths():
     got = sl.excluded_dirs({"exclude": ["wiki/operational/", "dashboards/"]})
     assert "operational" in got and "dashboards" in got
+
+
+# -- okengine#1005: prose-list is a list shape whose scalar is never split -------------------
+
+def test_a_prose_list_field_is_a_list_field_and_a_prose_list_field():
+    schema = {"field_shapes": {"tags": "list", "assumptions": "prose-list", "n": "int",
+                               "confidence": {"by_type": {"prediction": "number"}}}}
+    assert sl.list_fields(schema) == {"tags", "assumptions"}
+    assert sl.prose_list_fields(schema) == {"assumptions"}
+
+
+@pytest.mark.parametrize("schema", [None, {}, {"field_shapes": None}])
+def test_prose_list_fields_default_to_none(schema):
+    assert sl.prose_list_fields(schema) == set()

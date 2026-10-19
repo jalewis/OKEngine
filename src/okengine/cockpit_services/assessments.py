@@ -5,6 +5,7 @@ import functools
 import os
 import re
 import json
+from json import JSONDecodeError
 import glob
 import hashlib
 import hmac
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from yaml import YAMLError  # bare name: cosmic-ray cannot mutate a dotted exception in an except tuple
 import markdown as md
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, FileResponse, Response, StreamingResponse
@@ -92,7 +94,7 @@ def _assessment_terminal_for_row(row: dict, spec: dict) -> dict | None:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             cached = payload.get("subjects") if isinstance(payload.get("subjects"), dict) else {}
-        except (OSError, json.JSONDecodeError, AttributeError):
+        except (OSError, JSONDecodeError, AttributeError):
             cached = {}
         by_key = _terminal_by_subject_key(cached)
         _assessment_terminal_cache = (time.monotonic(), cached, by_key)
@@ -134,6 +136,28 @@ def _current_assessment_subject(row: dict) -> bool:
     )
 
 
+def _assessment_terminal_reason(terminal: dict | None) -> str:
+    """Explain coverage diagnostics without changing terminal or assessment semantics."""
+    terminal = terminal or {}
+    reason = str(terminal.get("reason") or
+                 "No covering actor review result is available for this actor.")
+    details = terminal.get("reason_details")
+    if not isinstance(details, list):
+        return reason
+    entries = []
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        category = str(detail.get("category") or "evidence diagnostic").replace("-", " ")
+        parts = [category]
+        for key in ("reference", "origin", "reason", "resolution_reason", "disposition"):
+            if detail.get(key):
+                parts.append(str(detail[key]))
+        entries.append(": ".join(parts))
+    scope = str(terminal.get("question_kind") or "actor-country-linkage")
+    return "; ".join([reason, f"Bounded question: {scope}", *entries]) if entries else reason
+
+
 def _assessed_value_cell(row: dict, spec: dict) -> str:
     """Render a ledger judgment without laundering it into an unqualified fact."""
     record = _assessment_for_row(row, spec)
@@ -141,10 +165,7 @@ def _assessed_value_cell(row: dict, spec: dict) -> str:
         terminal = _assessment_terminal_for_row(row, spec)
         state = str((terminal or {}).get("state") or "review-not-run")
         label = _assessment_terminal_label(state)
-        reason = str(
-            (terminal or {}).get("reason")
-            or "No covering actor review result is available for this actor."
-        )
+        reason = _assessment_terminal_reason(terminal)
         return (
             f'<a class="wl assessment-empty assessment-terminal assessment-{_esc(state)}" '
             f'data-page="dashboards/actor-review-status" '
@@ -204,6 +225,70 @@ def _assessed_value_cell(row: dict, spec: dict) -> str:
         f'title="{_esc(aria)}"><strong>{_esc(value)}</strong> '
         f'<span class="assessment-marker" aria-hidden="true">{marker}</span>{conf}{warn}</a>'
     )
+
+
+def _ref_path(rel: str) -> Path | None:
+    """The page `rel` names, or None when it is absent or resolves outside the wiki. `rel` comes
+    from page frontmatter, so `../` and absolute values are untrusted (okengine#1024)."""
+    try:
+        path = (WIKI / f"{rel}.md").resolve()
+    except (OSError, ValueError):
+        return None
+    return path if path.is_file() and _within(WIKI, path) else None
+
+
+def _frontmatter_title(path: Path) -> str:
+    """The frontmatter `title` of the page at `path`, or "" when it cannot be read."""
+    # Read to the END OF FRONTMATTER, not a fixed byte window. A first attempt capped at 2048 bytes
+    # and silently missed `scattered-spider`, whose `title:` sits at line 67 behind a 60-alias
+    # list — the board then fell back to the slug and displayed "scattered spider" beside properly
+    # titled peers. Frontmatter length is bounded by the frontmatter; file length is not.
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            if fh.readline().rstrip("\n").strip() != "---":
+                return ""
+            lines: list[str] = []
+            for _ in range(400):  # a sane ceiling on frontmatter lines
+                line = fh.readline()
+                if not line:
+                    return ""
+                if line.rstrip("\n").strip() == "---":
+                    return _title_from_frontmatter(lines, closed=True)
+                lines.append(line)
+            # The ceiling ended the read: the fence may be the very next line. Past it, the
+            # frontmatter cannot be parsed whole, so a title inside the window is still read
+            # from its line (a 450-source actor kept its title before #1042 [26]).
+            closing = fh.readline().rstrip("\n").strip() == "---"
+            return _title_from_frontmatter(lines, closed=closing)
+    except OSError:
+        return ""
+
+
+def _title_from_frontmatter(lines: list[str], closed: bool) -> str:
+    """`title` from the frontmatter `lines`, parsed as YAML. The write path dumps frontmatter with
+    yaml.safe_dump, which wraps a long title onto continuation lines; reading only the `title:` line
+    cut it mid-sentence (okengine#1042 [26]). Hand-written frontmatter that is not valid YAML (an
+    unquoted `title: APT29: Cozy Bear`), or frontmatter longer than the read window (`closed` is
+    False), falls back to that line's text. So does YAML that parses but cannot be constructed: an
+    impossible date such as `first_seen: 2026-02-30` raises ValueError, not YAMLError, and it took
+    the whole board down (v0.15.13 audit)."""
+    try:
+        fm = yaml.safe_load("".join(lines)) if closed else None
+    except (YAMLError, ValueError, RecursionError):
+        fm = None
+    if isinstance(fm, dict):
+        title = fm.get("title")
+        return "" if title is None else str(title).strip()
+    for line in lines:
+        if line.startswith("title:"):
+            return line.split(":", 1)[1].strip().strip("\"'")
+    return ""
+
+
+def _ref_title(rel: str) -> str:
+    """The `title` of the page at `rel`, or "" when it cannot be read. Memoized in
+    `_REF_TITLE_CACHE`, which re-reads a changed page and forgets a miss after its TTL."""
+    return _REF_TITLE_CACHE.lookup(rel, lambda: _ref_path(rel), _frontmatter_title, missing="")
 
 
 def _ref_link_cell(value, col: dict) -> str:

@@ -12,7 +12,7 @@
 # (schema.yaml + persona + feeds + crons + content). See INSTALL.md and
 # docs/deploy-a-new-domain.md.
 version: 1
-engine_release: v0.14.5  # PATCH: stabilize prerequisite checks and DeepSeek Flash cron writers
+engine_release: v0.15.18  # PATCH: scheduler-dst check writes no bytecode into the cron-plus plugin tree (#1064); completes the v0.15.17 DST fold roll
 
 runtime:
   # Hermes is a PINNED DEPENDENCY, not vendored into this repo. You clone Hermes
@@ -22,7 +22,21 @@ runtime:
   pinned_version: v0.21.3          # upstream git tag v2026.9.14
   pinned_tag: v2026.9.14
   pinned_sha: 345cd2b057a452236de401d3534b8502a7465e8d   # commit the tag resolves to; build-engine-image.sh verifies the clone matches
-  carried_patches: patches/target-v2026.9.14/  # 23 carried patch artifacts selected by apply.sh (23 original IDs plus target-native 24; 09+22 share one artifact; 05 is test-only retirement evidence)
+  carried_patches: patches/target-v2026.9.14/  # 24 carried patch artifacts selected by apply.sh (23 original IDs plus target-native 24 and 25; 09+22 share one artifact; 05 is test-only retirement evidence)
+  # Engine-side Python dependency overrides layered over Hermes's frozen uv.lock AFTER Hermes is
+  # installed (scripts/build-engine-image.sh). Hermes and its lock stay unmodified; drop an entry
+  # once the pinned Hermes lock carries a version at least as good.
+  dependency_overrides:
+    croniter:
+      version: 6.2.4
+      hermes_lock: 6.0.0
+      wheel: vendor/python-build/croniter-6.2.4-py3-none-any.whl
+      reason: >-
+        cron-plus computes next_run_at with the gateway venv's croniter; 6.0.0 keeps the base's UTC
+        offset when the next fire crosses DST, so fixed-hour lanes fire an hour late on fall-back
+        and an hour early, then again on time, on spring-forward. 6.2.4 matches the CI and host
+        locks (ci/tooling/*.requirements.lock). The image build and the scheduler-dst deployment
+        check run scripts/cron/croniter_dst_selftest.py against the gateway interpreter.
 
 dependencies:
   # External plugins the engine REQUIRES at runtime — cloned separately by the
@@ -45,6 +59,7 @@ engine_layer:
     - config/cron-tiers.yaml             # engine/engine-template/domain classification
     - config/engine-crons.json           # the engine half of the cron fleet (source)
     - scripts/cron_pack_split.py         # split/merge/regen/dump generator
+    - scripts/lane_writers.py            # per-deployment lane writer render + stale-writer prune/gate (okengine#1029)
     - scripts/cron/                      # engine + engine-template scripts + shared libs (schema_lib, okf_migrate, kb_*, tier_*)
     - config/source-connector.schema.yaml # declarative Bundle/Query/Enrichment/Stream/Poll contract
   ops_tooling:

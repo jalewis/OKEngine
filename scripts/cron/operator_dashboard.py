@@ -21,6 +21,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.append(str(Path(__file__).resolve().parent))  # staged sibling libs
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
+
 WIKI = Path(os.environ.get("WIKI_PATH", "/opt/vault")) / "wiki"
 DDIR = WIKI / "dashboards"
 OUT = DDIR / "operator.md"
@@ -137,7 +140,7 @@ def main() -> int:
         fresh = "" if d["age"] is None else f" ({int(d['age'])}h ago)"
         L.append(f"| [{d['title']}]({n}.md) | {d['updated']}{fresh} |")
     L.append("")
-    OUT.write_text("\n".join(L), encoding="utf-8")
+    generated_page.write(OUT, "\n".join(L))
     print(f"operator-dashboard: overall {worst}, {len(rollup)} areas, {len(stale)} stale -> "
           "wiki/dashboards/operator.md")
     print(json.dumps({"wakeAgent": False}))

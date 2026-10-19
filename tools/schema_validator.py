@@ -27,6 +27,7 @@ TWO PROFILES (see the conformance spec, docs/okf/okengine-conformance-spec.md):
 from __future__ import annotations
 
 import fnmatch
+from okengine.file_fingerprint import fingerprint
 from okengine.schema_exclusions import exclusion_globs_from_schema, excluded_namespaces_from_schema
 import os
 import re
@@ -50,33 +51,58 @@ _SCHEMA_NAMES = ("schema.yaml", ".okf-schema.yaml")
 # via `reserved_files`. The engine ALSO generates root dashboards each cron run
 # (HOT/HEALTH/BUNDLE.md) that are `type: dashboard` with no `id` — non-page
 # artifacts that must be conformance-exempt on every surface. This set + the
-# structural predicate below are the shared contract with
-# okengine-mcp/write_server.py `_RESERVED_NAMES`/reserve-predicate and
-# scripts/cron/conformance_audit._is_structural; tests/test_reserved_files_contract.py
-# binds them so they cannot silently drift again (the okengine#193-class bug where
+# structural predicate below compose `is_reserved_basename`, the ONE predicate the write path's
+# refusal, the okf_migrate minting guard and the reserved-basenames detector call (okengine#997),
+# so they cannot silently drift again (the okengine#193-class bug where
 # the validator's narrow default left engine-generated HOT.md permanently non-conformant).
 _OKF_RESERVED_DEFAULT = ("index.md", "log.md", "agents.md", "readme.md",
                          "hot.md", "health.md", "bundle.md")
 
 
+#: A paginated page of a generated INDEX.md (`INDEX-p02.md`), in any case. Only the NUMBERED form:
+#: `index-pricing.md` is an ordinary page, not pagination (okengine#997).
+_PAGINATED_INDEX_RE = re.compile(r"index-p\d+\.md", re.IGNORECASE)
+
+
+def is_engine_generated(basename: str) -> bool:
+    """True for a file an engine lane GENERATES inside the tree: the hierarchical index tree
+    (INDEX.md, INDEX-<x>.md, paginated index-pNN.md) and `_`-prefixed scaffolding
+    (_review-queue.md, …). A lookup for an authored page must never resolve to one of these."""
+    return (basename.startswith("_") or basename == "INDEX.md" or basename.startswith("INDEX-")
+            or _PAGINATED_INDEX_RE.fullmatch(basename) is not None)
+
+
 def _is_generated_structural(basename: str) -> bool:
-    """True for an engine-GENERATED structural file (not an authored page): the hierarchical
-    index tree (INDEX.md and paginated INDEX-pNN.md), and any `_`/`.`-prefixed scaffold
-    (_review-queue.md, .backlinks.json-adjacent md, …). Mirrors write_server's `startswith("index-p")`
-    / `startswith("_")` reserve rule and conformance_audit._is_structural, so a page the write path
-    treats as generated is never flagged non-conformant by the drift lint."""
-    n = basename
-    return (n.startswith("_") or n.startswith(".")
-            or n == "INDEX.md" or n.startswith("INDEX-")
-            or n.lower().startswith("index-p"))
+    """True for an engine-generated structural file (`is_engine_generated`) or a `.`-prefixed
+    hidden file — neither is an authored page, so neither is conformance-checked."""
+    return basename.startswith(".") or is_engine_generated(basename)
+
+
+def is_reserved_basename(basename: str, pack_reserved=()) -> bool:
+    """THE reserved-basename predicate (okengine#997): a name no content page may carry.
+
+    The OKF reserved files (engine defaults plus the pack's `reserved_files`, case-insensitive)
+    and every generated-structural shape. One predicate for every boundary: the validator's
+    conformance exemption, the write path's refusal (`write_services.policy._reserved_refuse`),
+    okf_migrate's minting guard and the `reserved-basenames` deployment check all call it, so a
+    name exempt at one boundary can never be writable at another — or mintable at a third.
+
+    Every `index-*` name, in any case, is reserved: the reader, backlinks, lint, the critic and
+    several cron libraries skip `index-*`/`INDEX-*` as the generated index tree, so a page under
+    one would be writable yet invisible (okengine#997 QA). tests/test_reserved_name_consumers.py
+    binds those read-side skips to this predicate."""
+    low = basename.lower()
+    return (low in _OKF_RESERVED_DEFAULT or low in {str(r).lower() for r in pack_reserved}
+            or low.startswith("index-") or _is_generated_structural(basename))
 
 # dir -> (cached_at_monotonic, schema path|None). Entries EXPIRE (okengine#49): a negative
 # result cached forever would leave a long-running validator/write-server fail-open for a tree
 # whose schema.yaml is added/moved later (until restart); a positive is also re-resolved if its
-# file later vanished. TTL bounds staleness; the parsed content is cached separately by mtime.
+# file later vanished. TTL bounds staleness; the parsed content is cached separately by file
+# fingerprint (okengine.file_fingerprint: an mtime-only key missed same-tick rewrites, okengine#1017).
 _dir_to_schema: dict[str, tuple[float, Optional[str]]] = {}
 _FIND_TTL = float(os.environ.get("OKENGINE_SCHEMA_FIND_TTL", "10") or 0)
-_schema_cache: dict[str, tuple[float, dict]] = {}  # schema path -> (mtime, parsed)
+_schema_cache: dict[str, tuple[tuple, dict]] = {}  # schema path -> (fingerprint, parsed)
 
 # The engine-owned base schema (config/base-schema.yaml) is merged UNDER every
 # pack schema: it supplies the universal `okf.required` floor (`type`) and the
@@ -176,9 +202,8 @@ def _find_schema(start: str) -> Optional[Path]:
 def _load_schema(sp: Path) -> Optional[dict]:
     if yaml is None:
         return None
-    try:
-        mtime = sp.stat().st_mtime
-    except OSError:
+    mtime = fingerprint(sp)
+    if mtime is None:
         return None
     hit = _schema_cache.get(str(sp))
     if hit and hit[0] == mtime:
@@ -457,11 +482,7 @@ def _evaluate(abs_path: str, content: str, *, follow_final_symlink: bool = True)
         # `type:` contract (index.md/log.md/AGENTS.md/README.md, the regenerated root dashboards
         # HOT/HEALTH/BUNDLE.md, the INDEX tree, and any `_`/`.`-prefixed scaffold).
         bn = rel_posix.rsplit("/", 1)[-1]
-        reserved = schema.get("reserved_files")
-        reserved = set(_OKF_RESERVED_DEFAULT) | {
-            str(r).lower() for r in (reserved or [])
-        }
-        if bn.lower() in reserved or _is_generated_structural(bn):
+        if is_reserved_basename(bn, schema.get("reserved_files") or ()):
             return ("skip", None)
 
         m = _FM_RE.match(content)

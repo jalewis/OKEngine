@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import schema_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
@@ -90,24 +91,17 @@ def _load_autoverify(vault: Path):
     return module
 
 
-def _held_reason(av, schema, pol, text: str, fm: dict) -> str | None:
+def _held_reason(av, page_schema, pol, text: str, fm: dict, page: Path, sources: dict):
     """The refusal `review_autoverify` would record, or None if the page fails only on evidence.
 
-    Mirrors the ladder in review_autoverify.main() in the same order, using its own predicates.
+    The lane's own ladder (`review_autoverify.refusal`), not a copy: a hand-kept mirror lost the
+    actor holds (contradiction, `actor_identity_validated: false`, the okengine#1014 grounding
+    hold) and `hold_when_fields`, so the census ranked publishers for pages no grade could clear
+    (okengine#1032 [21]).
     """
-    if str(fm.get("type") or "") in pol["exempt_types"]:
-        return f"judgment type '{fm.get('type') or ''}'"
     if str(fm.get("status") or "").lower() == "tombstoned":
-        return "tombstoned"
-    if isinstance(fm.get("conflicts"), list) and fm["conflicts"]:
-        return "conflicts present"
-    if av._GROUNDING_FAIL.search(text):
-        return "grounding-check failure"
-    missing = [f for f in av._required_fields(schema, str(fm.get("type") or ""))
-               if fm.get(f) in (None, "", [], {})]
-    if missing:
-        return f"missing required: {', '.join(missing)}"
-    return None
+        return "tombstoned"   # the lane drops these before its ladder; never a grading question
+    return av.refusal(fm, text, page, page_schema, pol, sources)
 
 
 def _cited_labels(av, fm: dict) -> list[str]:
@@ -132,6 +126,26 @@ def _cited_labels(av, fm: dict) -> list[str]:
     return out
 
 
+def _census_self_graded(av, fm: dict, registry: dict, pol: dict, rel: str, buckets: Counter,
+                        blocked_by: dict, clears_at_a: dict, clears_at_b: dict) -> None:
+    """Bucket a held source page the lane grades by its OWN publisher (okengine#1042 [17]).
+
+    An ungraded publisher is the page's whole blocker: grading it at or above the self-grade bar
+    releases the page, so it is ranked like any other ungraded publisher. A page with no publisher,
+    or one graded under the bar, is held for something a new grade does not fix."""
+    own, pub = av._self_grade(fm, registry)
+    if not pub:
+        buckets["source page has no publisher"] += 1
+    elif own:
+        buckets["source publisher graded below the self-grade bar"] += 1
+    else:
+        buckets["blocked by an ungraded publisher"] += 1
+        blocked_by[pub].add(rel)
+        clears_at_a[pub].add(rel)                  # A is the top grade: it meets any bar
+        if "B" <= pol["source_self_grade"]:
+            clears_at_b[pub].add(rel)
+
+
 def census(vault: Path) -> dict:
     av = _load_autoverify(vault)
     wiki = vault / "wiki"
@@ -146,6 +160,8 @@ def census(vault: Path) -> dict:
     artifact_refs: dict[str, set] = defaultdict(set)
     wikilink_refs: dict[str, set] = defaultdict(set)
     held_total = 0
+    schemas: dict = {}   # governing directory -> schema, as the lane resolves it
+    sources: dict = {}   # the lane's grounding-reader cache, built on the first actor that needs it
 
     for p in sorted(wiki.rglob("*.md")):
         if p.name.startswith(("_", ".")) or p.name.upper().startswith("INDEX") or ".bak" in p.name:
@@ -165,21 +181,34 @@ def census(vault: Path) -> dict:
         # publishers by pages the lane publishes regardless measures a bar nobody applies to them
         # (okengine#554). Skipping here keeps the census and the lane in agreement, which is the
         # census's entire purpose.
-        if str(fm.get("type") or "") in pol.get("always_publish_types", set()):
+        # The refusal ladder runs FIRST, as in the lane: an always-publish actor that a refusal
+        # holds (okengine#1014's grounding hold) is still a page the lane holds.
+        page_schema = av._page_schema(p, schemas)
+        reason = _held_reason(av, page_schema, pol, text, fm, p, sources)
+        # The lane's own evidence step (`review_autoverify.evidence_verdict`), self-grade branch
+        # included. Its hold (an ungraded or under-bar source publisher) comes before the
+        # always-publish release, exactly as in the lane.
+        ok, why, graded, _basis = (av.evidence_verdict(fm, registry, pol) if reason is None
+                                   else (False, None, {}, None))
+        if (reason is None and why is None
+                and av.always_publishes(pol, page_schema, str(fm.get("type") or ""))):
             continue
         held_total += 1
         rel = p.relative_to(wiki).as_posix()
 
-        reason = _held_reason(av, schema, pol, text, fm)
         if reason is not None:
-            buckets[reason.split(":")[0]] += 1
+            # The bucket is the reason's stable head, without the per-page detail.
+            buckets[reason.split(":")[0].split(" — ")[0].split(" (")[0]] += 1
             continue
-
-        graded = av._grade_evidence(fm, registry)
-        n_a, n_b = len(graded.get("A", [])), len(graded.get("B", []))
-        if n_a >= pol["a_sources"] or n_b >= pol["b_sources"]:
+        if ok:
             buckets["clearable now (lane has not run)"] += 1
             continue
+        if av.self_grades(fm, pol):
+            _census_self_graded(av, fm, registry, pol, rel, buckets, blocked_by, clears_at_a,
+                                clears_at_b)
+            continue
+
+        n_a, n_b = len(graded.get("A", [])), len(graded.get("B", []))
 
         labels = _cited_labels(av, fm)
         if not labels:
@@ -225,7 +254,41 @@ def census(vault: Path) -> dict:
         "wikilink_pages": len({r for v in wikilink_refs.values() for r in v}),
         "wikilink_refs": sum(len(v) for v in wikilink_refs.values()),
         "policy": {"a_sources": pol["a_sources"], "b_sources": pol["b_sources"]},
+        # The grades ALREADY set in this vault, and the types the lane exempts. Both are rendered
+        # for the human who has to answer this page (okengine#823): a reviewer asked for a grade
+        # with no scale, no worked examples and no statement of what a grade cannot fix has been
+        # handed a question they cannot calibrate. The pack's own existing grades are the only
+        # calibration that exists, so the page shows them rather than describing them.
+        "registry": dict(sorted(registry.items(), key=lambda kv: (kv[1], kv[0].lower()))),
+        "exempt_types": sorted(pol["exempt_types"]),
     }
+
+
+# Admiralty reliability, as the engine states it (templates/pack/skeleton/prompts/
+# source-quality-backfill.md ships this same baseline to the scoring lane). Rendered on the page
+# because "bar: 1xA or 2xB" is unreadable to anyone who does not already know the code.
+_RELIABILITY_SCALE = (
+    ("A", "completely reliable"),
+    ("B", "usually reliable"),
+    ("C", "fairly reliable"),
+    ("D", "not usually reliable"),
+    ("E", "unreliable"),
+    ("F", "reliability cannot be judged"),
+)
+
+
+def _held_split(result: dict) -> tuple[int, int, int]:
+    """Held pages as (grading fixes it, grading can NEVER fix it, some other defect).
+
+    The single "N page(s) held" headline reads as one backlog and is not one. On a live CTI vault
+    it was 1,540 held of which 467 were grade-blocked, 675 were judgment types the lane exempts BY
+    DESIGN, and 334 cited nothing at all -- so the page asked its reader for 1,540 pages' worth of
+    grading when 3 grading decisions were the whole addressable job.
+    """
+    buckets = result["buckets"]
+    addressable = buckets.get("blocked by an ungraded publisher", 0)
+    exempt = sum(v for k, v in buckets.items() if k.startswith("judgment type"))
+    return addressable, exempt, max(0, result["held_total"] - addressable - exempt)
 
 
 def render(result: dict) -> str:
@@ -241,10 +304,55 @@ def render(result: dict) -> str:
         L += ["> **No `source_registry` in the governing schema.** `review-autoverify` is a no-op "
               "here — nothing can be graded, so nothing can ever clear. This is UNDETECTABLE, not "
               "a pass: add `source_registry` to the pack's schema.yaml to enable the lane.", ""]
-    L += ["## Why pages are held", "", "| Reason | Pages |", "|---|---|"]
-    L += [f"| {k} | {v} |" for k, v in sorted(buckets.items(), key=lambda kv: -kv[1])]
+    addressable, exempt, other = _held_split(result)
+    L += ["## What this page is asking you for", "",
+          f"> Grade the publishers below, and the **{addressable}** page(s) waiting only on a grade "
+          "are released automatically. No other page on this list is affected.", "",
+          "| Of the held pages | Count | Grading releases them? |",
+          "|---|---:|---|",
+          f"| waiting only on an ungraded publisher | **{addressable}** | **yes — this is the job** |",
+          f"| analytic judgments ({', '.join(result.get('exempt_types') or []) or 'exempt types'}) "
+          f"| {exempt} | **never** — see below |",
+          f"| held for some other defect | {other} | no — citation, schema or evidence defects |", ""]
+    if exempt:
+        L += [f"_The {exempt} judgment page(s) are exempt **by design**: an A-grade source can "
+              "support a judgment a human still has to review. Grading every publisher in existence "
+              "would not release one of them. They need an analyst, in the cockpit's Ops → Human "
+              "review worklist._", ""]
+    L += ["## Why pages are held", "", "| Reason | Pages | Grading fixes it |", "|---|---:|---|"]
+    for k, v in sorted(buckets.items(), key=lambda kv: -kv[1]):
+        fixes = ("**yes**" if k == "blocked by an ungraded publisher"
+                 else "never — needs a human judgment" if k.startswith("judgment type")
+                 else "no")
+        L.append(f"| {k} | {v} | {fixes} |")
     L.append("")
     if ranked:
+        L += ["## What a grade is, and what it does", "",
+              "`reliability` is a **NATO Admiralty letter** grading the *publishing channel* — not "
+              "any single article, and not the page citing it.", "",
+              "| Grade | Meaning |", "|---|---|"]
+        L += [f"| **{letter}** | {meaning} |" for letter, meaning in _RELIABILITY_SCALE]
+        a_n, b_n = pol["a_sources"], pol["b_sources"]
+        L += ["", f"The clearing bar is **{a_n}×A or {b_n}×B**:", "",
+              f"- **{a_n} A-grade source** clears a page on its own;",
+              f"- **{b_n} distinct B-grade sources** clear a page together;",
+              "- **C, D, E and F never clear a page**, alone or in combination.", "",
+              "Grading an aggregator `C` is still worth doing: it moves the page out of "
+              "*\"blocked by an ungraded publisher\"* (an unanswered question) into "
+              "*\"cited, graded, still under the bar\"* (an answered one). The vault then knows "
+              "the page is weakly sourced rather than unassessed.", ""]
+        if result.get("registry"):
+            by_grade: dict[str, list[str]] = {}
+            for name, grade in result["registry"].items():
+                by_grade.setdefault(grade, []).append(name)
+            L += ["### Already graded in this vault — calibrate against these", "",
+                  "| Grade | Publishers |", "|---|---|"]
+            L += [f"| **{g}** | {', '.join('`%s`' % n for n in sorted(by_grade[g]))} |"
+                  for g in sorted(by_grade)]
+            L += ["", "_The question is not \"is this a good website?\" — it is: does this "
+                  "publisher do primary research and publish it as the originator (**A**), report "
+                  "on other people's research with editorial standards (**B**), aggregate other "
+                  "people's reporting (**C**), or host whatever a user typed (**D**)?_", ""]
         L += [f"## Ungraded publishers, ranked by pages released", "",
               "_Per-publisher and **not additive** — two publishers can each be the sole blocker of "
               "the same page, so grading one changes the other's number._", "",
@@ -253,15 +361,28 @@ def render(result: dict) -> str:
               f"{r['clears_if_graded_b']} |" for r in ranked[:TOP]]
         if len(ranked) > TOP:
             L.append(f"\n_…and {len(ranked) - TOP} more ungraded publisher(s)._")
-        L += ["", "## Proposed `schema.yaml` addition", "",
-              "_Grades are deliberately left blank — assigning them is the human's call, and the "
-              "audit property of #313 depends on it staying that way._", "",
+        L += ["", "## How to answer", "",
+              "Edit the `source_registry:` block in the pack's **`schema.yaml`** and fill in one "
+              "letter per publisher. The key must match the publisher string below **exactly**, "
+              "including case and spacing — `Wiz` and `wiz` are different publishers to the "
+              "matcher. Only `reliability` is accepted. Leave a comment saying why: every existing "
+              "grade has one, and the next reviewer will use yours the way you used theirs.", "",
+              "Do **not** grade an entry you are unsure of. An absent grade is an honest "
+              "\"unassessed\"; a wrong `A` silently verifies pages nobody checked.", "",
+              "_Grades are deliberately left blank below — assigning them is the human's call, and "
+              "the audit property of #313 depends on it staying that way._", "",
               "```yaml", "source_registry:"]
         L += [f"  {r['publisher']}: {{reliability: }}   # would release {r['clears_if_graded_a']} "
               f"page(s) at A" for r in ranked[:TOP]]
         L += ["```", ""]
         L.append(f"Grading the top {min(TOP, len(ranked))} would release up to **{reach}** page(s) "
                  f"at A-grade (upper bound — see the non-additive note above).\n")
+        L += ["**After you answer:** the composed schema regenerates, `review-autoverify` re-runs "
+              "and clears every page whose sources now meet the bar, and each cleared page is "
+              "stamped with the arithmetic that cleared it (`auto_verified_basis`), so any clear "
+              "traces back to your decision. This page regenerates on its own schedule — if a "
+              "publisher you graded still appears here afterwards, the edit did not reach the "
+              "composed schema.", ""]
     if result["artifact_refs"]:
         L += ["## Vault artifacts cited as sources — a defect, not a grading gap", "",
               f"Files that are not sources at all, sitting in a `sources:` list on "
@@ -296,7 +417,7 @@ def main(argv=None) -> int:
     result = census(VAULT)
     out = WIKI / "operational" / "registry-coverage.md"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(render(result), encoding="utf-8")
+    generated_page.write(out, render(result))
 
     if args.json:
         Path(args.json).write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")

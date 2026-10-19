@@ -44,7 +44,8 @@ def test_valid_manifest_passes():
     assert warnings == []
 
 
-@pytest.mark.parametrize("bad_id", ["Demo.Alpha", "demo_alpha", "a", "-demo", "demo-"])
+@pytest.mark.parametrize("bad_id", ["Demo.Alpha", "demo_alpha", "a", "-demo", "demo-",
+                                    "demo.alpha\n"])  # okengine#991: `$` let a trailing newline pass
 def test_invalid_id_fails(bad_id):
     m = _mod()
     errors, _ = m.validate_manifest(_valid(id=bad_id))
@@ -147,3 +148,20 @@ def test_agent_operation_requires_explicit_iteration_bound():
         "schedule": "0 * * * *", "prompt": "bounded work", "max_iterations": 8,
     }))
     assert errors == []
+
+
+def test_an_extension_identity_grant_follows_the_cron_lane_rule():
+    """okengine#1028 (QA r2 N1): a manifest's `write_policy.identity_edit` is validated exactly as a
+    lane contract's: known fields only, and never on an extension that can create pages."""
+    m = _mod()
+    policy = {"rule_id": "rule", "operations": ["update", "converge"], "paths": ["wiki/**"],
+              "body": "allow", "identity_edit": {"fields": ["citations"]}}
+    errors, _ = m.validate_manifest(_valid(capabilities={"write_policy": policy}))
+    assert errors == []
+    creating = {**policy, "operations": ["create", "update"]}
+    errors, _ = m.validate_manifest(_valid(capabilities={"write_policy": creating}))
+    assert any("not allowed on a lane that creates pages" in e for e in errors), errors
+    bogus = {**policy, "identity_edit": {"fields": ["everything"]}}
+    errors, _ = m.validate_manifest(_valid(capabilities={"write_policy": bogus}))
+    assert any("capabilities.write_policy.identity_edit.fields has unsupported" in e
+               for e in errors), errors

@@ -30,6 +30,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import schema_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
@@ -410,7 +411,7 @@ def append_snapshot(today, queues):
             "| Date | Queue depths |\n"
             "|---|---|\n"
         )
-        SNAPSHOTS.write_text(header)
+        generated_page.write(SNAPSHOTS, header)
     row = "| " + today + " | " + ", ".join(f"{k}={v}" for k, v in sorted(queues.items())) + " |\n"
     with open(SNAPSHOTS, "a") as f:
         f.write(row)
@@ -493,7 +494,7 @@ def write_today_report(today, queues, prior, alerts, details: dict | None = None
             )
             out.append(f"| `{typ}` | {count} | {classification} | {sample} |")
         out.append("")
-    report.write_text("\n".join(out))
+    generated_page.write(report, "\n".join(out))
     return report
 
 

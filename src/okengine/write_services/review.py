@@ -104,6 +104,21 @@ def _structured_review_reasons(fm: dict, body: str, flags=None) -> list[dict]:
     return out
 
 
+def _subject_refusal(subject: str) -> str | None:
+    """Refuse a record key that is not vault-relative (okengine#832).
+
+    The ledger's `subject` IS the join key the Cockpit worklist uses to attach a decision to its
+    page. An absolute path silently produces a record nothing can ever find, while the page's own
+    projection still reads as reviewed -- so the operator sees a decided page over a ledger that
+    cannot corroborate it. `_rel` no longer produces one, and this makes any future regression fail
+    loudly at the write instead of quietly at the join.
+    """
+    if not subject or subject.startswith("/") or subject.startswith("../"):
+        return (f"refusing to record a review under a non-vault-relative subject {subject!r}; "
+                "the decision would not be joinable to its page (okengine#832)")
+    return None
+
+
 def _ensure_review_request(p: Path, flags=None) -> dict:
     fm, body, subject, version, digest = _review_page_state(p)
     reasons = _structured_review_reasons(fm, body, flags)
@@ -163,7 +178,7 @@ def _assign_review(
         scope_refusal = _wauth_refusal(candidate)
         if scope_refusal:
             return {"ok": False, "status": 403, "error": scope_refusal}
-        cap = _capability_reject(candidate, "review")
+        cap = _capability_reject(candidate, "review", page_type=_existing_page_type(candidate))
         if cap:
             return {"ok": False, "status": 403, "error": cap}
     reviewer = str(reviewer or "").strip()
@@ -250,7 +265,7 @@ def _resolve_review(
         scope_refusal = _wauth_refusal(candidate)
         if scope_refusal:
             return {"ok": False, "status": 403, "error": scope_refusal}
-        cap = _capability_reject(candidate, "review")
+        cap = _capability_reject(candidate, "review", page_type=_existing_page_type(candidate))
         if cap:
             return {"ok": False, "status": 403, "error": cap}
     decision = str(decision or "").strip().lower()
@@ -279,6 +294,8 @@ def _resolve_review(
     with lock.open("a+", encoding="utf-8") as lock_f:
         fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
         fm, body, subject, version, digest = _review_page_state(p)
+        if refusal := _subject_refusal(subject):
+            return {"ok": False, "status": 500, "error": refusal}
         if version != expected_version or not hmac.compare_digest(digest, str(expected_hash)):
             return {
                 "ok": False,
@@ -409,7 +426,7 @@ def _record_machine_review(path: str, evaluator: str, outcome: str, note: str = 
         scope_refusal = _wauth_refusal(p)
         if scope_refusal:
             return {"ok": False, "status": 403, "error": scope_refusal}
-        cap = _capability_reject(p, "review")
+        cap = _capability_reject(p, "review", page_type=_existing_page_type(p))
         if cap:
             return {"ok": False, "status": 403, "error": cap}
     if p is None or not p.is_file():
@@ -451,3 +468,112 @@ def _record_machine_review(path: str, evaluator: str, outcome: str, note: str = 
             "state": rec["state"],
             "machine_check": check,
         }
+
+
+def _identity_edit_grant() -> "Any":
+    """The caller's identity-edit permission (okengine#1028). The operator principal (the
+    actor-less admin caller, which no model-facing surface binds) holds every grant. A cron lane's
+    grant is `identity_edit` in its server-bound output contract; a networked extension's is the
+    same key in its scoped write capability. Anything else, chat included, holds none."""
+    from okengine import identity_guard
+
+    caller = _caller()
+    kind = caller.get("kind")
+    if kind in ("admin",):
+        return identity_guard.ALL
+    if kind in ("extension",):
+        capability = caller.get("write_capability")
+        if not isinstance(capability, dict) or "create" in (capability.get("operations") or []):
+            # A page-creating extension never holds a grant, as for a cron lane (enforced here
+            # whatever the manifest says; extension_manifest refuses the declaration too).
+            return identity_guard.NONE
+        return identity_guard.permission(capability.get("identity_edit"))
+    contract, _lane = _output_contract.resolve(caller)
+    return identity_guard.permission(
+        contract.get("identity_edit") if isinstance(contract, dict) else None)
+
+
+def _identity_view(p: Path, fm: dict) -> dict:
+    """`fm` in the canonical shape (`aliases: A, B` is two aliases), with the pack's key renames
+    and the canonical type, as the write will store them. Not a full drift normalization, which
+    trips over legacy unhashable values on the stored page."""
+    view = _alias_renamed(_canonical_view(p, dict(fm)), _field_aliases(p))
+    if "type" in view:
+        try:
+            view["type"] = schema_lib.canonical_type(_governing(p), view.get("type"))
+        except Exception:  # an unreadable schema leaves the stored spelling, judged as is
+            pass
+    return view
+
+
+def _dangling_reference_removal(change: "Any", p: Path) -> bool:
+    """Removing a reference that names no page at all is repair, not an identity change
+    (okengine#1028): a lane clearing the dangling `prediction_candidate` its own contract refuses
+    must not be held. It fails closed, so a link to a page that EXISTS is never removed this way:
+    - only a plain field removal (never `type`, `title`, `name`, `aliases` or a citation list,
+      which are judged apart), of a field the caller's server-bound contract declares as a
+      relationship;
+    - every stored value must be a wiki PATH (`namespace/.../stem`, wikilink brackets allowed). A
+      bare stem (`[[p1]]`), an id (`predictions:p1`) or free text is never judged dangling;
+    - no other page anywhere in the vault may carry that stem, compared case-insensitively. That
+      covers an exact, sharded, moved, case-variant, duplicated or tombstoned target."""
+    if change.kind not in ("removal",):
+        return False
+    contract, _lane = _output_contract.resolve(_caller())
+    if not isinstance(contract, dict):
+        return False
+    declared = {*contract.get("required_relationships", []),
+                *contract.get("optional_relationships", [])}
+    if change.field not in declared:
+        return False
+    values = change.before if isinstance(change.before, list) else [change.before]
+    return all(_names_no_page(value, p) for value in values)
+
+
+def _names_no_page(value: "Any", p: Path) -> bool:
+    """True only for a well-formed wiki path whose stem no OTHER page in the vault carries (the
+    page under write may share the stem: a lacuna names the prediction it would become)."""
+    from okengine import identity_guard
+
+    target = identity_guard._citation_key(value)
+    parts = target.split("/")
+    if ":" in target or len(parts) < 2 or not all(parts):
+        return False
+    stem = parts[-1].casefold()
+    own = p.resolve()
+    return not any(page.stem.casefold() == stem and page.resolve() != own
+                   for page in _wiki().rglob("*.md"))  # glob-ok: an existence probe, every shard
+
+
+def _identity_hold(p: Path, before: dict, after: dict) -> tuple[list[str], bool, set]:
+    """Hold every identity change `after` makes to the stored page `before` that the caller may
+    not apply directly (okengine#1028): restore the stored value in `after` (in place) and return
+    the review reasons, whether a body replacement in the same write must be held too, and the
+    held fields. Both
+    sides are judged on the pack's canonical vocabulary, so a key or value the write path itself
+    renames is never read as the caller's change."""
+    from okengine import identity_guard
+
+    before_view = _identity_view(p, before)
+    after_view = _identity_view(p, after)
+    # A key alias needs no exemption: the views above have already renamed it away.
+    exempt = set().union(converge._SERVER_KEYS, _STAMP_KEYS, _REVIEW_MANAGED_FIELDS)
+    changes = identity_guard.identity_changes(before_view, after_view, exempt, stem=p.stem,
+                                              name_key=id_lib.normalize_key)
+    if not changes:
+        return [], False, set()
+    grant = _identity_edit_grant()
+    catchall = _governing(p).get("classify_catchall") or []
+    held = [change for change in changes
+            if not identity_guard.permits(grant, change, before_type=before_view.get("type"),
+                                          catchall=catchall if isinstance(catchall, list) else [])
+            and not _dangling_reference_removal(change, p)]
+    identity_guard.hold(after, before_view, held)
+    # A held field must not come back under a key alias the write path renames onto it later
+    # (`display_name: name`): the alias spelling of a held change is held with it (!1305 QA N1).
+    held_fields = {change.field for change in held}
+    for alias, canonical in _field_aliases(p).items():
+        if canonical in held_fields:
+            after.pop(alias, None)
+    return ([identity_guard.flag(change) for change in held], identity_guard.holds_body(held),
+            {change.field for change in held})

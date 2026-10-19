@@ -87,9 +87,12 @@ def test_content_pegs_wakes_on_watchlist_relevant_source(tmp_path):
     out = _run("select_content_pegs.py", {
         "WIKI_PATH": str(tmp_path), "PRODUCT_ANCHOR_PATH": str(anchor), "WATCHLIST_PATH": str(wl),
         "CONTENT_PEGS_NOW": "2026-06-28",   # pin now to the source date so the lookback window is deterministic
+        "OKENGINE_WRITE_TOOL_PREFIX": "mcp__okengine_write_lane_pegs__",
     })
     assert json.loads(out.strip().splitlines()[-1]) == {"wakeAgent": True}
     assert "acme-rival" in out.lower() or "sources/2026/06/s1" in out
+    # the lane's own writer, published by the binding (okengine#852), not the generic one
+    assert "write via mcp__okengine_write_lane_pegs__create_entity" in out
 
 
 def test_value_prop_refresh_wakes_on_min_new_signals(tmp_path):
@@ -108,8 +111,10 @@ def test_value_prop_refresh_wakes_on_min_new_signals(tmp_path):
     out = _run("select_value_prop_refresh.py", {
         "WIKI_PATH": str(tmp_path), "PRODUCT_ANCHOR_PATH": str(anchor), "WATCHLIST_PATH": str(wl),
         "VALUE_PROP_MIN_NEW_SIGNALS": "3",
+        "OKENGINE_WRITE_TOOL_PREFIX": "mcp__okengine_write_lane_vp__",
     })
     assert json.loads(out.strip().splitlines()[-1]) == {"wakeAgent": True}
+    assert "write via mcp__okengine_write_lane_vp__create_entity" in out
 
 
 def test_positioning_battle_cards_caps_batch_size(tmp_path):
@@ -181,6 +186,8 @@ def test_messaging_synthesis_wakes_on_new_content_peg(tmp_path):
         "WIKI_PATH": str(tmp_path), "PRODUCT_ANCHOR_PATH": str(anchor),
     })
     assert json.loads(out.strip().splitlines()[-1]) == {"wakeAgent": True}
+    # outside cron-plus (no job env) the selector falls back to the generic writer's name
+    assert "write via mcp__okengine_write__create_entity" in out
 
 
 def _anchor(tmp_path):
@@ -258,3 +265,39 @@ def test_messaging_synthesis_detects_same_day_upstream_delta(tmp_path):  # invar
     out = _run("select_messaging_synthesis.py", {
         "WIKI_PATH": str(tmp_path), "PRODUCT_ANCHOR_PATH": str(a)})
     assert json.loads(out.strip().splitlines()[-1]) == {"wakeAgent": True}, out
+
+
+def test_every_contract_admits_the_canonical_briefing_type():
+    """okengine#877: packs alias these types to `briefing` (README) and the write path stores the
+    canonical type, so a contract naming only the aliases refused every create after normalization
+    and every update of a stored card."""
+    m = yaml.safe_load((EXT / "extension.yaml").read_text())
+    for name, op in m["operations"].items():
+        types = op["output_contract"]["allowed_types"]
+        assert "briefing" in types, f"{name}: contract cannot write the canonical type it stores"
+
+
+def test_positioning_battle_cards_marks_which_cards_exist(tmp_path):
+    """A card path is stable per (segment, competitor): refreshing an existing card with
+    create_entity is refused, so the digest must say which tool applies (okengine#877)."""
+    anchor = tmp_path / "anchor.yaml"
+    anchor.write_text(yaml.safe_dump({
+        "product_name": "Acme Shield", "capability_pages": [], "watchlist_segments": ["direct"],
+    }))
+    wl = tmp_path / "wl.yaml"
+    # namespaced watchlist slugs, as packs write them: the card is keyed by the LAST segment
+    wl.write_text(yaml.safe_dump({"segments": {"direct": {
+        "competitors": ["entities/old-rival", "entities/new-rival"]}}}))
+    for c in ("old-rival", "new-rival"):
+        _write(tmp_path / f"wiki/entities/{c}.md",
+               f"---\ntype: vendor\ntitle: {c}\nupdated: '2026-09-20'\n---\n- shipped something\n")
+    card = tmp_path / "wiki/briefings/positioning-direct-old-rival.md"
+    _write(card, "---\ntype: briefing\ntitle: old card\nupdated: '2026-09-01'\n---\n# old\n")
+    os.utime(card, (1_756_700_000, 1_756_700_000))   # older than the competitor's activity
+    out = _run("select_positioning_battle_cards.py", {
+        "WIKI_PATH": str(tmp_path), "PRODUCT_ANCHOR_PATH": str(anchor), "WATCHLIST_PATH": str(wl),
+    })
+    assert "positioning-direct-old-rival (exists: yes)" in out, out
+    assert "positioning-direct-new-rival (exists: no)" in out, out
+    prompt = (EXT / "prompts" / "battle-cards.md").read_text()
+    assert "update_entity" in prompt and "exists: yes" in prompt

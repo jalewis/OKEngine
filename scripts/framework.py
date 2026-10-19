@@ -47,7 +47,7 @@ Commands:
       Inspect/control the spend-cap guard. --resume is the manual recovery path
       after a budget trip (re-enables paused crons + clears state); see okengine#35.
   framework extensions (list | inspect | validate | enable | disable
-                        | stage-plan | sidecar-generate | purge) <pack> [...]
+                        | stage-plan | sidecar-generate | reconcile-tokens | forget | purge) <pack> [...]
       Discover/inspect/validate a pack's extensions across the engine/pack/operator
       tiers, enable/disable them, and emit deploy artifacts (delegates to
       framework_extensions; okengine#134, #113, #128, #135). enable/disable manage

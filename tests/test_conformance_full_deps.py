@@ -31,13 +31,18 @@ TESTS = Path(__file__).resolve().parent
 # guard until 2026-07-19, so the private_ci merge gate skipped them silently while GitHub CI (which
 # installs mcp) only runs post-publish (invariant-audit HIGH #10). croniter gates fleet_health;
 # the remaining entries cover document extraction, DOM smoke, and Starlette's TestClient.
-REQUIRED_FULL_DEPS = ("fastapi", "markdown", "nh3", "httpx", "mcp", "croniter", "docx", "pptx", "openpyxl", "striprtf", "playwright", "starlette")
+REQUIRED_FULL_DEPS = ("fastapi", "markdown", "nh3", "httpx", "mcp", "croniter", "docx", "pptx", "openpyxl", "striprtf", "playwright", "starlette", "uvicorn")
 
 # The known gated modules (okengine#75 + #10). Adding a cockpit/reader/MCP test means adding it
 # here — that edit IS the acknowledgement that it needs the full-deps env to run.
 EXPECTED_GATED = {
+    "test_mcp_server_read_boundary.py",       # read-MCP security surface (mutation floor, !1220)
+    "test_ui_auth_boundary.py",               # reader+cockpit BasicAuth boundary (mutation floor, !1220)
+    "test_write_server_facade_mutation.py",   # write-server facade + uvicorn entry point (!1220)
+    "test_alias_scalar_agreement_1042.py",    # alias readers vs the write path (okengine#1042 [19])
     "cron/test_fleet_health.py",
     "cron/test_observability_contract.py",
+    "cron/test_probe_lane_toolcalls.py",   # real-SDK Tool contract test (okengine#874)
     "e2e/smoke/test_smoke_render.py",
     "extensions/test_direction_single_source.py",
     "test_backlinks_artifact_ui.py",
@@ -75,10 +80,14 @@ EXPECTED_GATED = {
     "test_reader_edge_paths.py",
     "test_reader_grounding_registry.py",
     "test_reader_inputshape.py",
+    "test_reader_tombstones.py",
     "test_review_queue_newest_first.py",
     "test_write_server_review_tools_surface.py",
+    "test_write_server_tool_arguments.py",   # real write server over the mcp SDK (okengine#879)
     "test_write_server_actor_tools_env.py",
+    "test_composed_write_actor_lane.py",      # composed @<pack> actor fence over the mcp SDK (#961)
     "test_corpus_transaction_touched.py",
+    "test_auth_header_decoding.py",          # all five HTTP auth middlewares (okengine#966)
 }
 
 

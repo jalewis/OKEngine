@@ -36,6 +36,9 @@ from pathlib import Path
 
 import yaml
 
+sys.path.append(str(Path(__file__).resolve().parent))  # staged sibling libs
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
+
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
 SOURCES_DIR = VAULT / "wiki" / "sources"
@@ -232,7 +235,7 @@ def render(sources: list[dict], today: date) -> str:
 def main() -> int:
     sources = _collect()
     DASH_DIR.mkdir(parents=True, exist_ok=True)
-    (DASH_DIR / "source-portfolio.md").write_text(render(sources, date.today()), encoding="utf-8")
+    generated_page.write(DASH_DIR / "source-portfolio.md", render(sources, date.today()))
     print(f"source-portfolio: {len(sources)} source(s) -> dashboards/source-portfolio.md")
     print(json.dumps({"wakeAgent": False}))
     return 0

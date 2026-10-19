@@ -10,6 +10,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+from json import JSONDecodeError
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -76,7 +77,7 @@ def register_sources(root: Path, sources: list[dict], *, connector_id: str | Non
         path = root / "sources.json"
         try:
             current = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, JSONDecodeError):
             current = {"schema_version": SCHEMA_VERSION, "sources": {}}
         rows = current.get("sources") if isinstance(current, dict) else {}
         rows = rows if isinstance(rows, dict) else {}
@@ -163,7 +164,7 @@ def append_attempt(root: Path, record: dict) -> dict:
 def load_sources(root: Path) -> list[dict]:
     try:
         doc = json.loads((Path(root) / "sources.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, JSONDecodeError):
         return []
     rows = doc.get("sources") if isinstance(doc, dict) else {}
     return list(rows.values()) if isinstance(rows, dict) else []
@@ -183,7 +184,7 @@ def load_attempts(root: Path, *, now=None, retention_days: int = 90) -> list[dic
                 row = json.loads(line)
                 if _utc(row.get("finished_at")) >= cutoff:
                     out.append(row)
-            except (json.JSONDecodeError, TypeError, ValueError):
+            except (JSONDecodeError, TypeError, ValueError):
                 continue
     return sorted(out, key=lambda row: (str(row.get("finished_at")), str(row.get("attempt_id"))))
 

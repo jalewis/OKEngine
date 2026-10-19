@@ -316,3 +316,25 @@ def test_vault_mtime_nonincreasing_loop_arcs(tmp_path, monkeypatch):
               os.path.join(first, "newer.md"): 15.0, second: 12.0}
     monkeypatch.setattr(m.os, "stat", lambda path: SimpleNamespace(st_mtime=mtimes[path]))
     assert m._vault_max_mtime() == 15.0
+
+
+def test_backlink_artifact_same_size_rewrite_within_one_tick_is_reloaded(tmp_path, monkeypatch):
+    """okengine#1017: the artifact cache was keyed on mtime alone, so a rebuild landing in the
+    same timestamp tick as the previous read kept serving the old backlink map."""
+    m = _load(tmp_path, monkeypatch, "mcp_artifact_same_tick")
+    artifact = tmp_path / "wiki/.backlinks.json"
+    artifact.write_text('{"backlinks":{"concepts/aaa":[]}}')
+    assert set(m._artifact_backlinks()) == {"concepts/aaa"}
+    before = artifact.stat()
+    artifact.write_text('{"backlinks":{"concepts/bbb":[]}}')
+    os.utime(artifact, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert set(m._artifact_backlinks()) == {"concepts/bbb"}
+
+
+def test_an_unchanged_backlink_artifact_is_served_from_the_cache(tmp_path, monkeypatch):
+    """The fingerprint comparison must be equality: a fresh key tuple is never identical, so an
+    identity check would re-parse the artifact on every call."""
+    m = _load(tmp_path, monkeypatch, "mcp_artifact_cache_hit")
+    (tmp_path / "wiki/.backlinks.json").write_text('{"backlinks":{"concepts/aaa":[]}}')
+    first = m._artifact_backlinks()
+    assert m._artifact_backlinks() is first

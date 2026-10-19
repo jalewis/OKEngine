@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import importlib.util
+import re
 from importlib.resources import files as package_files
 import sys
 from glob import glob
@@ -57,18 +58,21 @@ def _add_source_checkout_package() -> None:
 
 _add_source_checkout_package()
 import yaml
+from okengine.file_fingerprint import fingerprint
 from okengine.schema_exclusions import (
     RESERVED_DERIVED_NAMESPACES,
     excluded_namespaces_from_schema,
 )
 
-# All three are (mtime, data) caches — invalidated when the file changes on disk, so the enforced
-# write path (a long-running process) picks up a hand-edited schema without a restart. Before the
-# audit fix _SCHEMA_CACHE/_BASE_CACHE were plain path->data and cached FOREVER, so write_server
+# All three are (fingerprint, data) caches — invalidated when the file changes on disk, so the
+# enforced write path (a long-running process) picks up a hand-edited schema without a restart. Before
+# the audit fix _SCHEMA_CACHE/_BASE_CACHE were plain path->data and cached FOREVER, so write_server
 # validated every write against the pre-edit schema for the life of the gateway (invariant-audit HIGH).
-_SCHEMA_CACHE: dict[str, tuple[float, dict]] = {}
-_BASE_CACHE: dict[str, tuple[float, dict]] = {}
-_COMPOSED_CACHE: dict[str, tuple[float, dict]] = {}
+# The key is okengine.file_fingerprint, not mtime: an mtime-only key missed a rewrite landing in the
+# same timestamp tick, so the write path validated against the previous schema (okengine#1017).
+_SCHEMA_CACHE: dict[str, tuple[tuple, dict]] = {}
+_BASE_CACHE: dict[str, tuple[tuple, dict]] = {}
+_COMPOSED_CACHE: dict[str, tuple[tuple, dict]] = {}
 
 # config/base-schema.yaml ships with the engine. It is resolved from one of two
 # layouts: the REPO (scripts/cron/schema_lib.py -> ../../config) or the DEPLOYED cron
@@ -109,13 +113,13 @@ def _default_base() -> Path:
 
 
 def _yaml_mtime_cached(p: Path, cache: dict) -> dict:
-    """Parse the YAML mapping at `p`, cached by path but INVALIDATED on mtime change — so a
+    """Parse the YAML mapping at `p`, cached by path but INVALIDATED when the file changes — so a
     long-running process re-reads a hand-edited file without a restart (the _COMPOSED_CACHE contract,
-    extended to base/governing schema; invariant-audit HIGH). Missing/unparseable -> {}."""
+    extended to base/governing schema; invariant-audit HIGH). Missing/unparseable -> {}. The
+    function keeps its name for its callers; the key is file_fingerprint (okengine#1017)."""
     k = str(p)
-    try:
-        mt = p.stat().st_mtime
-    except OSError:
+    mt = fingerprint(p)
+    if mt is None:
         return {}
     hit = cache.get(k)
     if hit and hit[0] == mt:
@@ -134,20 +138,19 @@ def base_schema() -> dict:
     (types/namespaces/tiering) + cross-cutting optional fields + the global toggles
     (okf.required/should, strict_types). Returns {} if absent. Resolution: the
     OKENGINE_BASE_SCHEMA override, else the first existing repo/staged candidate.
-    mtime-cached (re-reads a hand-edited base-schema without a restart)."""
+    fingerprint-cached (re-reads a hand-edited base-schema without a restart)."""
     p = Path(os.environ.get("OKENGINE_BASE_SCHEMA") or _default_base())
     return _yaml_mtime_cached(p, _BASE_CACHE)
 
 
 def _composed_artifact_at(dir_: Path) -> dict | None:
     """The generated composed schema (engine ⊕ pack ⊕ enabled extensions, okengine#133) at
-    ``<dir_>/.okengine/composed-schema.yaml``, mtime-cached. None when absent. ``dir_`` is the
+    ``<dir_>/.okengine/composed-schema.yaml``, fingerprint-cached. None when absent. ``dir_`` is the
     GOVERNING schema's directory — the vault root OR a walk-up sub-domain (okengine#177) — so a
     sub-domain's own composed artifact governs its pages instead of always the root's."""
     p = Path(dir_) / ".okengine" / "composed-schema.yaml"
-    try:
-        mt = p.stat().st_mtime
-    except OSError:
+    mt = fingerprint(p)
+    if mt is None:
         return None
     k = str(p)
     hit = _COMPOSED_CACHE.get(k)
@@ -327,11 +330,19 @@ def _merge_base_pack(root: Path, namespace: str = "") -> dict:
 
 
 def list_fields(schema: dict) -> set:
-    """Field names a schema declares with `list` shape (`field_shapes`). The enforced write path
+    """Field names a schema declares with `list` or `prose-list` shape (`field_shapes`). The enforced write path
     coerces a scalar string written for one of these into a list (okengine#196 generalized), so a
     list-consuming lane can't crash on a page authored as `aliases: A, B`."""
     shapes = (schema or {}).get("field_shapes") or {}
-    return {k for k, v in shapes.items() if v == "list"}
+    return {k for k, v in shapes.items() if v in ("list", "prose-list")}
+
+
+def prose_list_fields(schema: dict) -> set:
+    """Field names a schema declares with `prose-list` shape: a list whose items are sentences
+    (okengine#1005). They are list fields, but a scalar written for one is ONE item -- the write
+    path never splits it on commas, which belong to the sentence (`okengine.list_scalars`)."""
+    shapes = (schema or {}).get("field_shapes") or {}
+    return {k for k, v in shapes.items() if v == "prose-list"}
 
 
 def int_fields(schema: dict) -> set:
@@ -698,12 +709,12 @@ def _is_extensible_enum(schema: dict, enum_name: str, owners: dict | None = None
 def governing_schema(root: Path, namespace: str = "") -> dict:
     """The schema.yaml governing wiki/<namespace>/ — walk UP from the namespace dir
     (a sub-domain's own schema.yaml, else the vault root's). `namespace=""` resolves
-    the vault-root schema. Returns {} if none found. mtime-cached (re-reads on edit)."""
+    the vault-root schema. Returns {} if none found. fingerprint-cached (re-reads on edit)."""
     cur = (root / "wiki" / namespace) if namespace else (root / "wiki")
     while True:
         sp = cur / "schema.yaml"
         if sp.is_file():
-            return _yaml_mtime_cached(sp, _SCHEMA_CACHE)   # mtime-invalidated (audit HIGH)
+            return _yaml_mtime_cached(sp, _SCHEMA_CACHE)   # change-invalidated (audit HIGH)
         if cur == root or cur.parent == cur:
             return {}
         cur = cur.parent
@@ -715,6 +726,155 @@ def canonical_types(schema: dict) -> set[str]:
     never as 'fall back to a built-in domain taxonomy'."""
     types = schema.get("types")
     return set(types.keys()) if isinstance(types, dict) else set()
+
+
+# An `aliases` entry is a NAME -- a match term other lanes join identities on (okengine#845). A URL,
+# prose, or several names jammed into one string is never a name: on one live vault 44 actor
+# aliases were URLs and ~50 were comma-joined lists or sentences, imported from reference/notes
+# columns of a spreadsheet. One such tool-name alias ("Stuxnet" on a military unit) later drove a
+# dedupe lane to merge an actor into a malware page. Deliberately narrow -- no word-count or
+# sentence rule: "Furuno Electric Co., Ltd." and "Cyber Army of Russia Reborn" are real names.
+_ALIAS_URL = re.compile(r"(?i)^(?:[a-z][a-z0-9+.-]*://|www\.)")
+ALIAS_MAX_LEN = 80
+
+
+def alias_value_problem(value: object) -> str | None:
+    """Why an `aliases` entry is not a single name, or None when it is one."""
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return "empty"
+    if _ALIAS_URL.match(text):
+        return "a URL"
+    if "\n" in text:
+        return "multi-line text"
+    if text.count(",") >= 2:
+        return "several names in one entry (send each alias separately)"
+    if len(text) > ALIAS_MAX_LEN:
+        return f"longer than {ALIAS_MAX_LEN} characters"
+    return None
+
+
+# `rejected_aliases` records names a REVIEW removed from a page's `aliases` (a live identity
+# review). Aliases are additive for every importer, so without a record a removed name comes
+# straight back on the next run: an identity review removed tool and victim names from actor pages
+# and a six-hourly sheet import put them back the same morning. The write path appends to it when an
+# `update_entity`/`patch_entity` drops a well-formed alias and refuses to re-add a listed name;
+# direct writers go through `admissible_aliases`. Deleting an entry re-admits the name.
+REJECTED_ALIASES_FIELD = "rejected_aliases"
+_ALIAS_KEY = re.compile(r"[^0-9a-z]+")
+
+
+def alias_key(value: object) -> str:
+    """Spelling-blind identity of an alias: `Brown Fox`, `BrownFox` and `brown-fox` are one name."""
+    return _ALIAS_KEY.sub("", str(value if value is not None else "").casefold())
+
+
+def _as_alias_list(raw: object) -> list:
+    if isinstance(raw, list):
+        return raw
+    return [] if raw in (None, "") else [raw]
+
+
+def rejected_alias_keys(fm: dict) -> set[str]:
+    """Keys of the names this page's review rejected as aliases."""
+    return {k for k in (alias_key(v) for v in _as_alias_list((fm or {}).get(REJECTED_ALIASES_FIELD)))
+            if k}
+
+
+def admissible_aliases(existing: object, additions: object,
+                       rejected: object = ()) -> tuple[list, list[tuple[object, str]]]:
+    """The `aliases` list a writer may store, and what it refused with why.
+
+    `existing` is kept exactly as it is (removing an alias is a review decision, never a writer's
+    side effect). Each addition is appended only when it is a single name (`alias_value_problem`),
+    is not already present under any spelling, and is not in `rejected` (a page's
+    `rejected_aliases`). One definition for every writer that merges aliases below the write path
+    -- importers, converge, canonical assembly -- so the rule cannot drift between them."""
+    kept = list(_as_alias_list(existing))
+    seen = {alias_key(v) for v in kept}
+    banned = {k for k in (alias_key(v) for v in _as_alias_list(rejected)) if k}
+    refused: list[tuple[object, str]] = []
+    for value in _as_alias_list(additions):
+        key = alias_key(value)
+        why = alias_value_problem(value)
+        if why:
+            refused.append((value, why))
+        elif key in banned:
+            refused.append((value, "rejected by review for this page (`rejected_aliases`)"))
+        elif key and key not in seen:
+            seen.add(key)
+            kept.append(value)
+    return kept, refused
+
+
+def removed_aliases(before: object, after: object) -> list:
+    """Well-formed names present in `before` whose spelling-blind key is absent from `after` -- the
+    aliases an edit deliberately dropped. Malformed entries are not recorded: the shape rule already
+    keeps them out, and a rejection list of URLs and prose would only be noise."""
+    kept = {alias_key(v) for v in _as_alias_list(after)}
+    out, seen = [], set()
+    for v in _as_alias_list(before):
+        k = alias_key(v)
+        if k and k not in kept and k not in seen and not alias_value_problem(v):
+            seen.add(k)
+            out.append(str(v).strip())
+    return out
+
+
+# A knowledge page's own Admiralty `reliability` that is WORSE than the best grade its
+# `auto_verified_basis` cites (okengine#563). Admiralty grades a SOURCE; stamped onto a knowledge page
+# it is a snapshot of whatever wrote the page, so it goes stale as evidence accumulates. The write
+# path REJECTS every write to such a page -- which made review_autoverify, a direct writer that stamps
+# the basis, the thing that manufactured unwritable pages: a model lane copies a source's "B" onto an
+# entity, autoverify later stamps "1 A-grade source", and no write reaches the page again. One
+# definition here for autoverify and the corpus audit; tests pin it to tools/schema_validator.py.
+_BASIS_GRADE_RE = re.compile(r"(\d+)\s+([A-F])-grade")
+
+
+def contradicting_reliability(fm: dict, basis: object = None) -> tuple[str, str] | None:
+    """(page grade, best cited grade) when the page's `reliability` is worse than the best grade
+    its basis cites -- `basis` if given (a stamp about to be written), else the page's own."""
+    grade = str((fm or {}).get("reliability") or "").strip().upper()[:1]
+    if not grade or grade not in "ABCDEF":
+        return None
+    text = (fm or {}).get("auto_verified_basis") if basis is None else basis
+    best = min((g for _, g in _BASIS_GRADE_RE.findall(str(text or ""))), default=None)
+    if not best or grade <= best:
+        return None
+    return grade, best
+
+
+# A tombstone RETIRES a page that is the SAME identity as another (okengine#101). On one live vault
+# 15 actors -- Lazarus Group, Andariel, Ke3chang, White Bear among them -- were tombstoned with the
+# reason "Different entity from X": a distinctness verdict applied as a retirement, so the vault
+# lost the actor it had just decided was distinct. One definition for the write path's refusal and
+# the corpus audit's count.
+_DISTINCT_REASON = re.compile(
+    r"(?i)\b(?:different|distinct|separate|not\s+the\s+same)\s+(?:entity|entities|actor|actors|"
+    r"group|groups|identity|identities)\b")
+_DUPLICATE_REASON = re.compile(
+    r"(?i)\b(?:duplicate|merged\s+into|same\s+(?:entity|actor|identity)\s+as|alias\s+of)\b")
+
+
+# A NEGATED distinctness phrase is a same-identity verdict (okengine#887): "...aligns with OilRig's
+# operations, not a separate entity" retired hellonet-campaign onto oilrig correctly, yet read as
+# 'distinct' -- which also made the #101 guard refuse such a retirement. "not the same X" is NOT
+# negated distinctness; it IS distinctness, and stays in _DISTINCT_REASON.
+_NEGATED_DISTINCT = re.compile(
+    r"(?i)\b(?:not|no\s+longer)\s+(?:an?\s+)?(?:separate|distinct|different)\s+"
+    r"(?:entity|entities|actor|actors|group|groups|identity|identities)\b")
+
+
+def tombstone_reason_kind(reason: object) -> str | None:
+    """'distinct' when a tombstone reason says the subjects DIFFER (never a reason to retire),
+    'duplicate' when it says the page is the same identity as another (needs a successor), else None."""
+    text = str(reason or "")
+    negated = bool(_NEGATED_DISTINCT.search(text))
+    if _DISTINCT_REASON.search(_NEGATED_DISTINCT.sub(" ", text)):
+        return "distinct"
+    if negated or _DUPLICATE_REASON.search(text):
+        return "duplicate"
+    return None
 
 
 def type_aliases(schema: dict) -> dict[str, str]:
@@ -797,19 +957,34 @@ def type_id_authority(schema: dict, type_name: str) -> tuple[str | None, str]:
     return (str(auth) if auth else None, str(field))
 
 
+# `compose_schema` writes `pack` into `owners` as composition BOOKKEEPING (the pack layer declared
+# that id, for collision detection), not as a principal: no caller writes as "pack" (okengine#1026).
+# `engine` is the same kind of token; it is deliberately left as is here (see the MR for #1026).
+_COMPOSE_PACK_PLACEHOLDER = "pack"
+
+
 def type_owner(schema: dict, type_name: str) -> str | None:
     """The principal that owns a type and its pages.
 
-    Composed schemas record the authoritative map at ``owners.types``. The
-    nested ``types.<t>.owner`` form remains a compatibility fallback for older
-    hand-authored schemas. None means ownership is undeclared (legacy
-    single-pack behavior).
+    Composed schemas record the owner map at ``owners.types``; it is authoritative for an
+    extension (``ext:<id>``) and the engine. The nested ``types.<t>.owner`` form is the fallback
+    for hand-authored schemas with no map. None means ownership is undeclared (legacy single-pack
+    behavior: no enforcement).
+
+    okengine#1026: compose records the placeholder ``pack`` for every pack-declared type. Read as
+    a principal it made a pack a non-owner of its own types (no caller is ``"pack"``), so converge
+    refused the owner's ``remove=`` and field changes from v0.14.0 on. The placeholder is resolved
+    ONLY to a real owner the schema declares (``types.<t>.owner``). With none, it stays ``pack``:
+    nobody may change or remove an existing field, exactly as on main. It never resolves to None,
+    which would switch enforcement off for every caller, including one with no pack at all.
     """
-    owners = (schema.get("owners") or {}).get("types")
-    if isinstance(owners, dict) and owners.get(type_name):
-        return str(owners[type_name])
     t = (schema.get("types") or {}).get(type_name)
-    return str(t["owner"]) if isinstance(t, dict) and t.get("owner") else None
+    declared = str(t["owner"]) if isinstance(t, dict) and t.get("owner") else None
+    owners = (schema.get("owners") or {}).get("types")
+    mapped = owners.get(type_name) if isinstance(owners, dict) else None
+    if mapped:
+        return declared if str(mapped) == _COMPOSE_PACK_PLACEHOLDER and declared else str(mapped)
+    return declared
 
 
 def field_owners(schema: dict, type_name: str) -> dict[str, str]:

@@ -24,7 +24,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import schema_lib  # noqa: E402
+import engine_package  # noqa: E402  — makes `okengine` importable when loaded by path
+engine_package.ensure()
+from okengine.review_policy import requires_review  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
@@ -75,21 +79,21 @@ def main() -> int:
         # generated dashboard truthful before that cleanup has run.
         if str(fm.get("status") or "").strip().lower() == "tombstoned":
             continue
+        # Membership is review_policy's call, the same rule the Cockpit worklist and the #842
+        # reconciler use (okengine#867). This file used to clear ANY reason once reviewed_on >=
+        # last_updated at day precision, so a page re-flagged (needs_review, or a failed grounding
+        # check) later on the day it was signed off was required by the Cockpit and hidden here
+        # until some later-day edit. A sign-off clears only an UNVETTED type; a live flag or a
+        # failed grounding section is pending work whatever was signed.
+        if not requires_review(fm, body, frozenset(review_types)):
+            continue
         reviewed = _d(fm.get("reviewed_on"))
-        updated = _d(fm.get("last_updated") or fm.get("created"))
-        vetted = bool(reviewed) and reviewed >= updated      # signed off at the current version
-        reason = detail = None
         if _UNSUPPORTED.search(body):
             reason, detail = "GROUNDING", "grounding check flagged an unsupported claim"
         elif fm.get("needs_review") is True:
             reason, detail = "NEEDS-REVIEW", "needs_review flag set"
-        elif str(fm.get("type") or "") in review_types and not vetted:
+        else:
             reason, detail = "UNVETTED", f"{fm.get('type')} not signed off at current version"
-        if not reason:
-            continue
-        if vetted:
-            continue   # signed off AT the current version — cleared for any reason; an edit later
-            #            advances last_updated past reviewed_on, returning it to the queue.
         rel = p.relative_to(WIKI).as_posix()[:-3]
         items.append((_PRIO[reason], reason, rel, detail + (f" · last vetted {reviewed}" if reviewed else "")))
     items.sort()
@@ -114,7 +118,7 @@ def main() -> int:
             L.append(f"\n_…and {len(items) - SAMPLES} more._")
     L.append("")
     DASH.parent.mkdir(parents=True, exist_ok=True)
-    DASH.write_text("\n".join(L), encoding="utf-8")
+    generated_page.write(DASH, "\n".join(L))
     print(f"review-queue: {len(items)} awaiting review ({head.replace('**', '')}) -> "
           "wiki/dashboards/review-queue.md")
     print(json.dumps({"wakeAgent": False}))

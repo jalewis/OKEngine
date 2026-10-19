@@ -8,7 +8,11 @@ from pathlib import Path
 
 import yaml
 
+from okengine.file_fingerprint import fingerprint
 from okengine.schema_exclusions import excluded_namespace
+
+# file_fingerprint's key is the stat identity (five fields), then the content digest while unsettled.
+_DIGEST = 5
 
 
 def _namespace(value) -> str:
@@ -20,7 +24,8 @@ def _namespace(value) -> str:
 
 
 @lru_cache(maxsize=32)
-def _declared_namespaces(schema_path: str, mtime_ns: int) -> frozenset[str]:
+def _declared_namespaces(schema_path: str, key) -> frozenset[str]:
+    """Declared namespaces of one schema; ``key`` (the file fingerprint) only keys the cache."""
     try:
         schema = yaml.safe_load(Path(schema_path).read_text(encoding="utf-8")) or {}
     except (OSError, ValueError):
@@ -46,7 +51,9 @@ def _root_namespaces(wiki: Path) -> frozenset[str]:
     ):
         try:
             if candidate.is_file():
-                return _declared_namespaces(str(candidate), candidate.stat().st_mtime_ns)
+                # Fingerprint, not mtime_ns: a schema edited within the same timestamp tick must not
+                # keep the previous namespace set (okengine#1017).
+                return _declared_namespaces(str(candidate), fingerprint(candidate))
         except OSError:
             continue
     return frozenset()
@@ -94,12 +101,82 @@ def display_timestamp(value) -> str:
     return text[:10] if re.match(r"\d{4}-\d{2}-\d{2}", text) else text
 
 
+# A frontmatter envelope whose closing delimiter is in hand: the opener line, then the earliest
+# `\n---` after it (the reader's split, rendering._FM_RE, closes on the same delimiter).
+_ENVELOPE_CLOSED = re.compile(rb"[^\n]*\n.*?\n---", re.S)
+
+
 def read_head(path: Path, limit: int) -> str:
+    """The page's first `limit` bytes, extended through its whole frontmatter envelope.
+
+    A plain head cut a long envelope off: a tombstone with ~58 kB of frontmatter (a merged actor's
+    sources list) parsed as {}, so the reader listed and served it while every generator hid it
+    (okengine#993). Only a page whose envelope outruns `limit` reads further, so the listing scan
+    stays a head read for ordinary pages."""
     try:
         with path.open("rb") as handle:
-            return handle.read(limit).decode("utf-8", errors="replace")
+            head = handle.read(limit)
+            if head.startswith(b"---"):
+                head = _through_envelope(handle, head)
+            return head.decode("utf-8", errors="replace")
     except OSError:
         return ""
+
+
+def _through_envelope(handle, head: bytes) -> bytes:
+    """Extend `head` until it holds the envelope's closing delimiter (or the file ends).
+
+    The opener is `---` plus the rest of its first line, so the closing delimiter is looked for
+    only after the first newline, as the reader's frontmatter split does. Each read doubles the
+    head, so an envelope of any length costs reads linear in its size."""
+    while not _ENVELOPE_CLOSED.match(head):
+        more = handle.read(len(head))
+        if not more:
+            return head
+        head += more
+    return head
+
+
+TOMBSTONED = "tombstoned"
+
+
+def is_tombstoned(path: Path, *, split_frontmatter, read, limit: int = 16384) -> bool:
+    """True when the page's frontmatter says `status: tombstoned`.
+
+    A tombstone is a retired page the write path keeps on disk as history: the reader hides it
+    everywhere a reader would find it (listings, counts, search, backlinks, direct links). The
+    head read extends through the whole envelope, so a `status` below a long `sources:` list is
+    seen however long the list is.
+    """
+    frontmatter, _ = split_frontmatter(read(path, limit))
+    return str(frontmatter.get("status") or "").strip().lower() == TOMBSTONED
+
+
+def tombstone_check(split_frontmatter):
+    """`is_tombstoned` bound to a frontmatter parser: the one predicate every reader surface uses."""
+    return lambda path: is_tombstoned(path, split_frontmatter=split_frontmatter, read=read_head)
+
+
+def _revision(path: Path, stat, now_ns: int | None = None) -> str:
+    """A page's edit identity for clients that skip unchanged pages (render-lint), which store it
+    and compare it for equality. "" when the page vanished mid-read.
+
+    A SETTLED page (its timestamps older than the file_fingerprint settle window) gets exactly
+    ``mtime_ns:size``. Any later write must stamp a newer mtime, so that is exact, and it is the
+    format render-lint stored before v0.15.10: a different format would invalidate every stored
+    check (okengine#1023). It deliberately leaves out the inode, device and ctime, so a restore, a
+    vault move or a ``chmod -R`` that changes no content does not re-check the whole vault.
+
+    An UNSETTLED page also carries its content digest: a same-size rewrite in the same timestamp
+    tick leaves ``mtime_ns:size`` unchanged, and only the content tells the versions apart
+    (okengine#1017). Whether a page has settled is file_fingerprint's decision: its key carries the
+    digest exactly while the file is unsettled. A page therefore changes token at most once as it
+    settles."""
+    key = fingerprint(path, stat, now_ns)
+    if key is None:
+        return ""
+    # key[_DIGEST:] is () for a settled page and (digest,) for an unsettled one.
+    return ":".join([str(stat.st_mtime_ns), str(stat.st_size), *key[_DIGEST:]])
 
 
 def page_meta(
@@ -114,9 +191,9 @@ def page_meta(
         title = heading.group(0).lstrip("# ").strip() if heading else Path(relative).name
     try:
         stat = path.stat()
-        revision = f"{stat.st_mtime_ns}:{stat.st_size}"
     except OSError:
-        revision = ""
+        stat = None
+    revision = _revision(path, stat) if stat is not None else ""
     return {
         "path": relative,
         "title": title,
@@ -158,7 +235,9 @@ def scan_directory(
         for path in base.rglob("*.md"):
             if skip(path.name) or reserved(path) or (namespaces(path) & excluded):
                 continue
-            output.append(metadata(path.resolve()))
+            row = metadata(path.resolve())
+            if row["status"].lower() != TOMBSTONED:
+                output.append(row)
     output.sort(key=lambda row: (row["title"].lower(), row["path"]))
     cache[subdirectory] = (now, output)
     return output
@@ -182,7 +261,10 @@ def revision_inventory(
             relative = str(resolved.relative_to(root))[:-3]
         except (OSError, ValueError):
             continue
-        output.append({"path": relative, "revision": f"{stat.st_mtime_ns}:{stat.st_size}"})
+        revision = _revision(resolved, stat)
+        if not revision:
+            continue
+        output.append({"path": relative, "revision": revision})
     output.sort(key=lambda row: row["path"])
     updated = (now, output)
     return {"pages": output}, updated

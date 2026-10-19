@@ -26,18 +26,36 @@ def ext(ext_id="demo", *, tier="pack", kind="declarative"):
             "manifest": {"id": ext_id, "kind": kind, "version": "1", "name": "Demo"}}
 
 
+def _real_discovery():
+    spec = importlib.util.spec_from_file_location(
+        "extension_discovery_trust_helpers", REPO / "scripts/extension_discovery.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+REAL_DISCOVERY = _real_discovery()
+
+
 def discovery(*, extensions=None, errors=None, enabled=None, effective=None):
     extensions = [ext()] if extensions is None else extensions
     enabled = {} if enabled is None else enabled
     effective = set(enabled) if effective is None else effective
     return SimpleNamespace(
-        discover=lambda _pack: (extensions, errors or []),
+        # the trust-acceptance rules are the real ones, judged against this stub's enabled map
+        requires_trust_acceptance=REAL_DISCOVERY.requires_trust_acceptance,
+        is_trust_accepted=REAL_DISCOVERY.is_trust_accepted,
+        unaccepted_trust=lambda pack, resolved: REAL_DISCOVERY.unaccepted_trust(
+            pack, resolved if isinstance(resolved, dict) else {e["id"]: e for e in resolved},
+            enabled=enabled),
+        discover=lambda _pack, **_kw: (extensions, errors or []),
         load_enabled_state=lambda _pack: (enabled, []),
         effective_enabled=lambda _pack, _exts: (effective, []),
         resolve_enabled=lambda ids, _exts: (
             [e for e in extensions if e["id"] in set(ids)], []),
         is_core=lambda e: e["tier"] == "engine",
-        set_enabled=lambda *_args: [],
+        set_enabled=lambda *_args, **_kw: [],
+        stale_disabled_errors=lambda _pack, _exts: [],
     )
 
 
@@ -119,7 +137,7 @@ def test_stage_plan_sidecar_and_disable_paths(tmp_path, monkeypatch, capsys):
     composer = SimpleNamespace(
         staging_targets=lambda _pack: ([{"id": "demo", "dir": "/ext"}], []),
         effective_records=lambda _pack: ([{"id": "demo"}], []),
-        sidecar_compose_override=lambda _pack: ({"services": {}}, {}, []),
+        sidecar_compose_override=lambda _pack, project: ({"services": {}}, {}, []),
         write_composed_schema=lambda _pack: [],
     )
     monkeypatch.setattr(cli, "_composer", lambda: composer)
@@ -252,6 +270,8 @@ def test_enable_missing_validation_failure_and_already_enabled(tmp_path, monkeyp
     token = SimpleNamespace(
         scopes_from_manifest=lambda _m: (["read"], ["write"]),
         write_capability_from_manifest=lambda _m: {},
+        identity_edit_needs_acceptance=lambda _record: False,
+        effective_write_capability=lambda _record, _settings, _pack=None: ({}, []),
         reconcile=lambda *_: {"rotated": False, "changed": True},
     )
     monkeypatch.setattr(cli, "_tokens", lambda: token)
@@ -279,7 +299,7 @@ def test_stage_and_sidecar_errors_then_generation(tmp_path, monkeypatch, capsys)
     assert "FAIL: broken" in capsys.readouterr().err
 
     monkeypatch.setattr(cli, "_composer", lambda: SimpleNamespace(
-        sidecar_compose_override=lambda _pack: ({}, {}, ["sidecar bad"])))
+        sidecar_compose_override=lambda _pack, project: ({}, {}, ["sidecar bad"])))
     assert cli.main(["sidecar-generate", str(tmp_path)]) == 1
     assert "sidecar bad" in capsys.readouterr().err
 
@@ -290,7 +310,7 @@ def test_stage_and_sidecar_errors_then_generation(tmp_path, monkeypatch, capsys)
     stale.write_text("old")
     monkeypatch.setattr(cli, "_composer", lambda: SimpleNamespace(
         TRIGGER_NAME="trigger.sh",
-        sidecar_compose_override=lambda _pack: (override, wrappers, []),
+        sidecar_compose_override=lambda _pack, project: (override, wrappers, []),
     ))
     assert cli.main(["sidecar-generate", str(tmp_path)]) == 0
     compose = tmp_path / ".okengine/generated/sidecars.compose.yml"
@@ -368,6 +388,8 @@ def test_enable_dependency_state_write_and_regen_paths(tmp_path, monkeypatch, ca
     monkeypatch.setattr(cli, "_tokens", lambda: SimpleNamespace(
         scopes_from_manifest=lambda _m: ([], []),
         write_capability_from_manifest=lambda _m: {},
+        identity_edit_needs_acceptance=lambda _record: False,
+        effective_write_capability=lambda _record, _settings, _pack=None: ({}, []),
         reconcile=lambda *_: {"rotated": False, "changed": False},
     ))
     assert cli.main(["enable", str(tmp_path), "demo"]) == 0
@@ -413,6 +435,8 @@ def test_extension_toggle_fails_loud_when_policy_regeneration_fails(
     monkeypatch.setattr(cli, "_tokens", lambda: SimpleNamespace(
         scopes_from_manifest=lambda _m: ([], []),
         write_capability_from_manifest=lambda _m: {},
+        identity_edit_needs_acceptance=lambda _record: False,
+        effective_write_capability=lambda _record, _settings, _pack=None: ({}, []),
         reconcile=lambda *_: {"rotated": False, "changed": False},
     ))
     monkeypatch.setattr(cli, "_materialize_policy", lambda _pack: ["bad policy"])
@@ -496,7 +520,7 @@ def test_discovery_config_override_rejections(monkeypatch):
         ({"x": 1}, "unknown config override"),
     ]
     for overrides, expected in cases:
-        monkeypatch.setattr(disc, "discover", lambda _p: ([record], []))
+        monkeypatch.setattr(disc, "discover", lambda _p, **_kw: ([record], []))
         monkeypatch.setattr(disc, "load_enabled_state",
                             lambda _p, value=overrides: ({"demo": {"config": value}}, []))
         monkeypatch.setattr(disc, "effective_enabled", lambda *_: ({"demo"}, []))
@@ -506,7 +530,7 @@ def test_discovery_config_override_rejections(monkeypatch):
 
     record_bad_decl = ext()
     record_bad_decl["manifest"]["config"] = [1]
-    monkeypatch.setattr(disc, "discover", lambda _p: ([record_bad_decl], []))
+    monkeypatch.setattr(disc, "discover", lambda _p, **_kw: ([record_bad_decl], []))
     monkeypatch.setattr(disc, "load_enabled_state",
                         lambda _p: ({"demo": {"config": {"x": 1}}}, []))
     monkeypatch.setattr(disc, "effective_enabled", lambda *_: ({"demo"}, []))
@@ -608,7 +632,8 @@ def test_compose_resolution_sidecar_schema_and_secret_edges(tmp_path, monkeypatc
     record["manifest"].update({"kind": "operation", "trust": "in-gateway",
                                "description": " multi\n line ", "operation": {
         "entrypoint": "job.py", "schedule": {"kind": "cron", "expr": "@jitter:daily"}}})
-    disc = SimpleNamespace(resolve_for_pack=lambda _p: ({"demo": record}, []))
+    disc = SimpleNamespace(resolve_for_pack=lambda _p: ({"demo": record}, []),
+                           unaccepted_trust=lambda *_: {})
     monkeypatch.setattr(comp, "_discovery_mod", lambda: disc)
     assert comp.effective_ids(tmp_path)[0] == ["demo"]
     assert comp.effective_records(tmp_path)[0][0]["description"] == "multi line"
@@ -686,7 +711,8 @@ def test_extension_compose_remaining_contract_edges(tmp_path, monkeypatch):
     assert job is not None and "after" not in job and not errors
 
     nonop = ext()
-    disc = SimpleNamespace(resolve_for_pack=lambda _p: ({"demo": nonop}, []))
+    disc = SimpleNamespace(resolve_for_pack=lambda _p: ({"demo": nonop}, []),
+                           unaccepted_trust=lambda *_: {})
     monkeypatch.setattr(comp, "_discovery_mod", lambda: disc)
     assert comp.staging_targets(tmp_path)[0] == []
 
@@ -728,3 +754,43 @@ def test_extension_compose_remaining_contract_edges(tmp_path, monkeypatch):
     overrides.write_text(json.dumps({"deterministic": "use model"}))
     errors = comp._apply_prompt_overrides(jobs, tmp_path)
     assert "uncontracted deterministic operation" in errors[0]
+
+
+def test_recording_trust_acceptance_fails_loud_when_state_cannot_be_written(
+        tmp_path, monkeypatch, capsys):
+    """okengine#994 [14]: an already-enabled operator in-gateway extension whose acceptance cannot
+    be recorded must not report success (the load gate would still block it)."""
+    cli = load()
+    target = ext("demo", tier="operator", kind="operation")
+    target["manifest"]["trust"] = "in-gateway"
+    disc = discovery(extensions=[target], enabled={"demo": {}})
+    disc.set_enabled = lambda *_a, **_k: ["cannot write state"]
+    monkeypatch.setattr(cli, "_discovery", lambda: disc)
+    monkeypatch.setattr(cli, "_manifest", lambda: SimpleNamespace(
+        validate_manifest=lambda _m: ([], [])))
+    monkeypatch.setattr(cli, "_composer", lambda: SimpleNamespace(
+        compose=lambda _resolved: ({}, [], []), compose_check=lambda *_: []))
+    monkeypatch.setattr(cli, "_tokens", lambda: SimpleNamespace(
+        scopes_from_manifest=lambda _m: ([], []), write_capability_from_manifest=lambda _m: {},
+        identity_edit_needs_acceptance=lambda _record: False,
+        effective_write_capability=lambda _record, _settings, _pack=None: ({}, [])))
+    assert cli.main(["enable", str(tmp_path), "demo", "--allow-untrusted"]) == 1
+    captured = capsys.readouterr()
+    assert "FAIL: cannot write state" in captured.err
+    assert "trust acceptance recorded" not in captured.out
+
+
+def test_sidecar_generate_refuses_a_pack_with_no_derivable_compose_project(
+        monkeypatch, tmp_path, capsys):
+    """okengine#1044 [5]: no project means no generation, never a fallback another pack shares."""
+    cli = load()
+    called = []
+    composer = SimpleNamespace(
+        sidecar_compose_override=lambda _pack, project: called.append(project))
+    monkeypatch.setattr(cli, "_composer", lambda: composer)
+    monkeypatch.delenv("COMPOSE_PROJECT_NAME", raising=False)
+    pack = tmp_path / "___"
+    pack.mkdir()
+    assert cli.main(["sidecar-generate", str(pack)]) == 1
+    assert "FAIL: cannot derive a compose project name" in capsys.readouterr().err
+    assert called == []

@@ -63,8 +63,110 @@ mutation; a shared baseline is never repeated once per module or shard.
 target's pathological-execution kill deadline. Shards use longest-processing-time balancing over
 those costs. Each shard's estimated wall time at its configured worker count must fit inside 80%
 of the campaign budget. A manifest that cannot fit is rejected before mutation execution and must
-be reduced, re-measured, or split into CPU-bounded shards. The four daily shards use one worker
-each, so their aggregate worker count does not exceed the verified four-CPU allocation.
+be reduced, re-measured, or split into CPU-bounded shards. A changed-mode target that a fresh
+coverage map selects is charged its selection cost instead: covering-test time per in-scope
+mutant, the selection baseline, and a bounded full-command confirmation of assumed survivors
+(`selected_cost_seconds` in `ci/mutation_gate.py`, okengine#941). A missing or stale map keeps
+the whole-file cost, and a refusal names which estimate its targets used. Whole-file (full-mode)
+campaigns instead read `runtime_costs.selected_worker_seconds`, a measured selected cost per
+critical target (okengine#940, basis in `selected_basis`): a target runs selected only when that
+measurement is below its full-command cost, and is charged it; otherwise it runs its full
+`test_command`. The formula over-charged whole files several times over and would have refused
+every nightly critical shard. The four daily shards
+use one worker each, so their aggregate worker count does not exceed the verified four-CPU allocation.
+
+## Coverage-guided test selection
+
+A target's `test_command` is a hand-written list, and it drifts both ways: too narrow produces a
+false survivor (the `transport.py` target never ran the test that kills its `or`->`and` mutant,
+!1145), too broad produces a baseline timeout (!1171, okengine#895). Every campaign therefore
+selects tests from coverage: changed mode since okengine#900, the nightly critical and the full
+campaigns since okengine#940:
+
+- **The map.** The sharded `full-suite` job records per-test coverage contexts
+  (`--cov-context=test`, subprocesses included), and `full-suite-combine` publishes
+  `artifacts/mutation-coverage-map.json.gz` (`ci/coverage_map.py build`). No second test run.
+- **Selection.** `mutation-changed`, `mutation-critical-preflight` and `mutation-full` download
+  that map from their own pipeline's `full-suite-combine` (`MUTATION_COVERAGE_MAP`); the critical
+  shards read the copy the preflight relays. Critical and full mode mutate whole files, so every
+  mapped line of a target is selected. Each mutant runs
+  only the tests whose context covers its line, fewest-files-touched first, under `-x`
+  (`ci/mutation_selection.py`, with `ci/pytest_plugins/okengine_mutation_select.py`). A line's
+  selection is capped at half the per-mutant timeout of measured test time.
+- **Confirmation.** Every mutant that survives selection is re-run against the target's full
+  `test_command`, after that command's own baseline passes in a fresh checkout. Selection only
+  makes kills cheaper; it never reports a survivor the full command would kill.
+- **Fail closed.** A missing, unreadable or stale map (target or test files changed since the
+  map's commit) runs the full `test_command` and says so in `summary.json` (`selection`,
+  `warnings`) and the job log. So does a selection baseline that cannot pass.
+- **The nightly baseline proof.** With a usable map, `mutation-critical-preflight` proves the
+  full-command baseline only for targets that will run on their full `test_command`, lists the
+  selected ones under `baseline_deferred` in `baseline-proof.json`, and copies the map it planned
+  from into its artifacts (`coverage_map_sha256`). A deferred target proves its selected-test
+  baseline in its own campaign, and the full command's before any survivor confirmation, exactly
+  as in changed mode. A shard fails if it would run a deferred target on its full command, or if
+  its map is not the one the proof was planned from. The preflight and `mutation-full` run even
+  when the full suite is red (okengine#783); without a map every baseline is proved up front.
+- **Inputs.** Each target in `summary.json` records `inputs`: the git blob ids at HEAD of the
+  target, of the test files that could decide its mutants, and of every `tests/**/conftest.py`,
+  plus its `test_command` and map commit, and the evidence-reuse `key` below.
+- **Drift.** `test_command_gaps` names test files that execute a target but its `test_command`
+  omits; `kills_outside_test_command` names the tests outside the list that killed mutants.
+  Correct the list from them.
+
+## Evidence reuse (nightly critical lane)
+
+The nightly critical campaign does not re-mutate a target whose inputs are unchanged since its
+last passing measurement (okengine#943, `ci/mutation_reuse.py`):
+
+- **Key.** A SHA-256 over the target's blob; the blobs of every test file its campaign can run
+  (its `test_command`'s files and, when it runs selected, the map's covering test files); the
+  `conftest.py` files pytest loads for them; the map's per-line covering test sets (selected
+  mode); its raw manifest entry; its survivor-disposition entries and matching patterns; and the
+  tooling: Cosmic Ray version and operator set, Python version, pytest's configuration
+  (`pyproject.toml`'s `[tool.pytest]` table, `pytest.ini`, `setup.cfg`, `tox.ini`) and the gate's
+  own files. Each fresh result records `inputs.key` and per-component digests, so a re-measure
+  names what changed. Anything that cannot be hashed re-measures. Production modules the target
+  imports are not in the key; the re-baseline window bounds that gap.
+- **Evidence.** `mutation-critical-preflight` (`--reuse-evidence`) reads, through the private CI API
+  with `CI_JOB_TOKEN` (or a `read_api` token in `MUTATION_EVIDENCE_TOKEN`), the shard summaries
+  of scheduled `main` pipelines inside the window. A source counts only when its job finished
+  (`success` or `failed`), its summary records the pipeline's commit, and that commit is an
+  ancestor of HEAD. Per target, the most recent fresh measurement decides: it is reused only when
+  it is complete, passed its own checks when measured (`verdict`), is inside the window, and has
+  the same key. Any listing or artifact that cannot be read (expired, missing, refused,
+  unparseable) re-measures every target, and the plan and log say why.
+- **Plan.** The decision is `reuse-plan.json` in the preflight's artifacts. Every shard shards
+  only the targets it re-measures (a shard with none passes at once), the budget pre-check prices
+  only those, and `mutation-critical-aggregate` carries the reused results, marked `reused` with
+  source pipeline, job and date in `summary.json`, the JUnit report and stderr, and re-scores them
+  under the current floors, waivers and disposition checks exactly as fresh ones.
+- **Re-baseline.** Evidence older than 7 days (`--rebaseline-days`, `MUTATION_REBASELINE_DAYS`)
+  is refused. Each night also re-measures the oldest reusable evidence up to 1/7 of the critical
+  set's measured cost, so re-baselining is staggered. The dropout watcher (`ci/mutation_history.py`)
+  counts a carried score as measured only within its own 7-day bound.
+- **Narrow commands (okengine#955).** A target that runs its full `test_command` is keyed on that
+  command's files, so a shared list re-keys every target that shares it. Coverage does not narrow
+  the write-service lists, because every `test_write_server*.py` file executes every service.
+  Kills do. A narrowed command is the union of the test files that killed the target's mutants
+  in a full-command campaign (the first failure under `-x`, so a sufficient set), plus any
+  killers outside the list that selection found while the target ran selected. Prove it with the
+  same local campaign on the old and the new command: the score must be equal or higher, with no
+  survivor the old command killed. A target that runs selected is also keyed on the map's
+  covering files. Narrowing its command changes its key only if the narrower command is measured
+  cheaper than selection, so that it switches to full-command mode.
+
+Locally, build a map from any `--cov-context=test` run with `ci/coverage_map.py build` and pass
+`--coverage-map` (or `MUTATION_COVERAGE_MAP`) to `ci/mutation_gate.py`.
+
+## Timeouts
+
+Every target's `timeout_seconds` must be at least twice its measured full-command baseline: the
+sum of its test files' CI wall times in `ci/test-durations.json`. `tests/ci/test_mutation_gate.py`
+enforces it on every change, not only when a target's own file changes (the two #895 baselines
+were broken for five days). Re-derive timeouts from re-recorded durations; never raise one by
+hand. A baseline killed by its watchdog prints `OKENGINE_MUTATION_TIMEOUT after <n>s` on stdout,
+the stream Cosmic Ray reports for a failed baseline.
 
 ## Live progress and shard diagnosis
 
@@ -111,6 +213,18 @@ Pattern dispositions are reserved for mechanically identical classes, such as
 operators acting only on postponed annotations. Broad patterns for reachable
 code use `assertion-gap-counted`, remain in the score, and are candidates for
 the next ratchet.
+
+A disposition key is a position (`module:line:column:operator:occurrence`), so
+an edit above a recorded survivor moves the mutant off its key. The diff-scoped
+merge-request lane never re-scores those untouched lines; the nightly critical
+campaign then fails on a reviewed survivor (okengine#1047). Every merge request
+therefore runs `python ci/mutation_dispositions.py check`
+(the `mutation-dispositions` CI job), which fails on any key or pattern
+that names no current mutation site. Repair the drift in the same change with
+`python ci/mutation_dispositions.py rekey --base <merge base>`: it carries each
+stale entry through the module's unchanged lines and reports, rather than
+guesses, an entry whose own line changed. Re-review such an entry, or delete it
+if the reviewed code is gone.
 
 ## Evidence
 

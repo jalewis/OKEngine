@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import okf_migrate  # noqa: E402  — shared shard-aware page locator (find_page / canonical_key)
 import entity_resolve  # noqa: E402 — conservative cross-source identity resolver
 import schema_lib  # noqa: E402
+from okengine.list_scalars import split_list_scalar  # noqa: E402 — schema_lib makes okengine importable
 
 _FM = re.compile(r"\A---[ \t]*\n(.*?\n)---[ \t]*\n?(.*)\Z", re.S)
 # A>...>F, higher rank = more reliable; unknown reliability sorts below F.
@@ -227,7 +228,7 @@ def _canonical_index(vault: Path) -> entity_resolve.CanonicalIndex:
             continue
         aliases = fm.get("aliases") or []
         if isinstance(aliases, str):
-            aliases = [a.strip() for a in aliases.split(",") if a.strip()]
+            aliases = split_list_scalar(aliases)   # as the write path coerces it (#1042 [19])
         elif not isinstance(aliases, list):
             aliases = []
         records.append((p.stem, str(fm.get("name") or fm.get("title") or p.stem), aliases))
@@ -346,6 +347,12 @@ def write_canonical(vault: Path, slug: str, type_: str, fused: dict, conflicts: 
                     seen.add(kk)
                     merged.append(item)
             fields[k] = merged
+    if "aliases" in fields:                      # the write path's alias rule, below it (#845)
+        existing_aliases = existing_fm.get("aliases")
+        kept = (existing_aliases if isinstance(existing_aliases, list) else []) \
+            if "aliases" in union_f else []
+        fields["aliases"], _refused = schema_lib.admissible_aliases(
+            kept, _as_list(fields["aliases"]), existing_fm.get(schema_lib.REJECTED_ALIASES_FIELD))
 
     # A consensus CONFLICT must not regress a value the canonical already holds: keep the
     # existing value and let review (needs_review) arbitrate, rather than overwrite with a

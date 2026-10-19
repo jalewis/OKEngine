@@ -11,12 +11,25 @@
 # land with correct ownership and the cron subprocess (also `hermes`) can read
 # them. The repo (scripts/cron/) is the backup — no per-file .bak snapshots.
 #
-# Usage:  bash scripts/deploy-cron-scripts.sh
+# Usage:  bash scripts/deploy-cron-scripts.sh [--prune-stale-extensions]
 #         (run after editing scripts/cron/*.py and committing)
+#
+#   --prune-stale-extensions  remove staged extension dirs (/opt/data/scripts/<id>/) that the
+#                             current stage plan no longer stages (disabled, removed or no longer
+#                             discovered). Without it they are only REPORTED (okengine#994 [27]).
 #
 # Idempotent.
 
 set -euo pipefail
+
+PRUNE_STALE_EXTENSIONS=0
+for arg in "$@"; do
+    case "$arg" in
+        --prune-stale-extensions) PRUNE_STALE_EXTENSIONS=1 ;;
+        *) echo "ERROR: unknown argument '$arg' (usage: deploy-cron-scripts.sh [--prune-stale-extensions])" >&2
+           exit 2 ;;
+    esac
+done
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC_DIR="$REPO_ROOT/scripts/cron"
@@ -33,6 +46,8 @@ PACK_DIR="${CRON_PACK_DIR:-/path/to/pack}"
 . "$REPO_ROOT/scripts/lib/hermes_uid.sh"
 # shellcheck source=lib/pack_data.sh
 . "$REPO_ROOT/scripts/lib/pack_data.sh"
+# shellcheck source=lib/baked_validator_preflight.sh
+. "$REPO_ROOT/scripts/lib/baked_validator_preflight.sh"
 HERMES_UID="$(resolve_hermes_uid "$PACK_DIR")"
 PACK_SCRIPTS="$PACK_DIR/crons/scripts"
 PACK_DATA="$PACK_DIR/data"
@@ -52,6 +67,26 @@ if [ -z "$CONTAINER" ]; then
     exit 1
 fi
 echo "  gateway container: $CONTAINER"
+
+# Refuse to stage onto a gateway whose BAKED engine is older than these scripts: a staged script
+# importing a name the image lacks would make every cron that imports it raise ImportError
+# (okengine#997, #1017). The probe is derived from exactly what is about to be staged, the pack's
+# scripts and connectors included (#1016). Before ANY write, so a refused stage leaves the running
+# scripts untouched.
+# The enabled extensions' staging plan comes from the composer: a broken enabled set (dup id,
+# missing dep) fails the deploy here, before staging. Its dirs (engine, pack and operator tier)
+# are probed with everything else (!1305 QA N2).
+if ! EXT_PLAN="$(python3 "$REPO_ROOT/scripts/framework.py" extensions stage-plan "$PACK_DIR")"; then
+    echo "ERROR: extension staging plan failed (see errors above)." >&2
+    exit 1
+fi
+EXT_DIRS=()
+while IFS=$'\t' read -r _ext_id ext_dir; do
+    [ -n "$ext_dir" ] && EXT_DIRS+=("$ext_dir")
+done <<< "$EXT_PLAN"
+require_baked_validator "$CONTAINER" "$HERMES_UID" "$SRC_DIR" \
+    "${RUNTIME_COMPOSE_HELPERS[@]/#/$REPO_ROOT/scripts/}" "$REPO_ROOT/extensions" \
+    "$PACK_SCRIPTS" "$PACK_CONNECTORS" "${EXT_DIRS[@]}" || exit 1
 
 # A freshly-seeded pack runtime has no /opt/data/{scripts,config,metrics} yet — create them AS THE
 # CRON UID before any write. Else the first deploy fails "Cannot open" (#17), and — if the metrics
@@ -227,10 +262,7 @@ fi
 # subdir; the synthesized cron job's `script:` is /opt/data/scripts/<id>/<file>
 # (extension_compose.SCRIPTS_ROOT). The plan comes from the composer, so a broken
 # enabled set (dup id, missing dep) fails the deploy BEFORE staging — fail-loud.
-if ! EXT_PLAN="$(python3 "$REPO_ROOT/scripts/framework.py" extensions stage-plan "$PACK_DIR")"; then
-    echo "ERROR: extension staging plan failed (see errors above)." >&2
-    exit 1
-fi
+# (EXT_PLAN was computed before the baked-engine preflight, which probes these dirs too.)
 if [ -n "$EXT_PLAN" ]; then
     estaged=0
     while IFS=$'\t' read -r ext_id ext_dir; do
@@ -249,6 +281,31 @@ if [ -n "$EXT_PLAN" ]; then
     echo "  $estaged enabled extension(s) staged"
 else
     echo "  (no enabled extensions to stage)"
+fi
+
+# --- stale extension dirs (okengine#994 [27]) ---
+# tar extraction only ADDS, so a dir staged for an extension that is since disabled, removed or no
+# longer discovered stays importable forever, and the validator's "staged scripts but has NO lane"
+# WARN turns into permanent noise. Report each one; remove them only on the explicit flag (an
+# operator choice, like `framework extensions purge`). The comparison is scripts/staged_extensions.py.
+STAGED_EXT_DIRS="$(docker exec -u "$HERMES_UID" "$CONTAINER" \
+    find /opt/data/scripts -mindepth 1 -maxdepth 1 -type d -printf '%f\n')"
+STALE_EXT="$(printf '%s\n' "$STAGED_EXT_DIRS" \
+    | python3 "$REPO_ROOT/scripts/staged_extensions.py" --staged-listing - \
+        --plan <(printf '%s\n' "$EXT_PLAN"))"
+if [ -n "$STALE_EXT" ]; then
+    if [ "$PRUNE_STALE_EXTENSIONS" = 1 ]; then
+        while IFS= read -r stale; do
+            docker exec -u "$HERMES_UID" "$CONTAINER" rm -rf -- "/opt/data/scripts/$stale"
+            echo "  reconciled: removed staged extension dir no longer in the stage plan: $stale"
+        done <<< "$STALE_EXT"
+    else
+        echo "  ⚠ staged extension dir(s) no longer in the stage plan (disabled, removed or not" \
+             "discovered); their code stays importable:" >&2
+        printf '%s\n' "$STALE_EXT" | sed 's/^/    - /' >&2
+        echo "    remove them: CRON_PACK_DIR='$PACK_DIR' bash '$REPO_ROOT/scripts/deploy-cron-scripts.sh'" \
+             "--prune-stale-extensions" >&2
+    fi
 fi
 
 # --- reader extension panels (okengine#160) -> <pack>/.okengine/reader-panels.json ---
@@ -327,6 +384,14 @@ fi
 # libraries into its own image while this script updates the gateway-mounted source. Refuse to
 # report success when those two runtimes now disagree; otherwise search/graph silently serves old
 # behavior until somebody happens to rebuild the MCP image later.
+# The rebuild goes through deploy.sh: it builds onto this deployment's scoped engine image tag and
+# stamps the provenance label. A compose build given only `-f` and the pack's own file drops the
+# engine image override that .env's COMPOSE_FILE carries, so it rebuilt onto the shared `okengine-mcp:latest`
+# that other packs resolve (okengine#1042 [13]/[31]).
+mcp_rebuild_hint() {
+    echo "       rebuild it with this deployment's pinned engine image: cd '$PACK_DIR' && bash '$REPO_ROOT/scripts/deploy.sh'" >&2
+    echo "       (not a compose build with -f and the pack's compose file alone: that drops the engine image override)" >&2
+}
 for lib in kb_search.py tier_lib.py schema_lib.py; do
     STAGED_HASH="$(docker exec "$CONTAINER" sh -c "sha256sum /opt/data/scripts/$lib 2>/dev/null | cut -d' ' -f1")"
     MCP_HASH="$(docker compose -f "$PACK_DIR/docker-compose.yml" exec -T okengine-mcp \
@@ -338,8 +403,7 @@ for lib in kb_search.py tier_lib.py schema_lib.py; do
     fi
     if [ "$STAGED_HASH" != "$MCP_HASH" ]; then
         echo "ERROR: read-MCP $lib is stale after staging; refusing a split-version deploy." >&2
-        echo "       docker compose -f '$PACK_DIR/docker-compose.yml' build okengine-mcp &&" >&2
-        echo "       docker compose -f '$PACK_DIR/docker-compose.yml' up -d okengine-mcp" >&2
+        mcp_rebuild_hint
         exit 1
     fi
 done
@@ -353,8 +417,7 @@ if [ -z "$STAGED_HASH" ] || [ -z "$MCP_HASH" ]; then
 fi
 if [ "$STAGED_HASH" != "$MCP_HASH" ]; then
     echo "ERROR: read-MCP base-schema.yaml is stale after staging; refusing a split-version deploy." >&2
-    echo "       docker compose -f '$PACK_DIR/docker-compose.yml' build okengine-mcp &&" >&2
-    echo "       docker compose -f '$PACK_DIR/docker-compose.yml' up -d okengine-mcp" >&2
+    mcp_rebuild_hint
     exit 1
 fi
 echo "  read-MCP baked search libraries match staged source"

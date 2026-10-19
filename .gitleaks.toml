@@ -9,3 +9,19 @@ description = "Wiki page-path fixtures that trip generic-api-key. A `key`/`path`
 regexes = [
   '''^(?:briefings|sources|entities|concepts|predictions|findings|trends|dashboards|techniques|indicators|detections|security-incidents|cves)/[a-z0-9/_.-]+$''',
 ]
+
+# These provenance keys are computed SHA-256 fingerprints, validated against the
+# source inputs by the tooling verifier and committed-lock contract tests.
+# Require BOTH the exact metadata path and the complete hash-only JSON line.
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Validated tooling provenance fingerprints"
+condition = "AND"
+regexTarget = "line"
+paths = [
+  '''^(?:\./)?ci/tooling/lock\.json$''',
+  '''^(?:\./)?artifacts/ci-tooling-runtime\.json$''',
+]
+regexes = ['''^\s*"key": "[0-9a-f]{64}"[,]?\s*$''']

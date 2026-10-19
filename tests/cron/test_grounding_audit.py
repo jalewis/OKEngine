@@ -65,3 +65,22 @@ def test_grounding_sample_cap_and_partial_band(tmp_path,monkeypatch):
     assert m.main()==0
     dash=(tmp_path/"wiki/dashboards/source-grounding.md").read_text()
     assert "🟡 partial" in dash and "## Ungrounded" not in dash and "## Dangling" not in dash
+
+
+def test_a_long_sources_list_still_grounds_the_page(tmp_path, monkeypatch):
+    """okengine#993: the audit parsed an 8000-char window, so an entity with a long `sources`
+    list parsed as {} and was counted ungrounded although every source exists."""
+    srcdir = tmp_path / "wiki/sources/2026/06"
+    srcdir.mkdir(parents=True)
+    refs = []
+    for i in range(150):
+        (srcdir / f"report-with-a-fairly-long-slug-{i:04d}.md").write_text("---\ntype: source\n---\n")
+        refs.append(f"- sources/2026/06/report-with-a-fairly-long-slug-{i:04d}\n")
+    entities = tmp_path / "wiki/entities"
+    entities.mkdir()
+    (entities / "merged.md").write_text("---\ntype: entity\nsources:\n" + "".join(refs) + "---\n# m\n")
+    assert len((entities / "merged.md").read_text()) > 8000
+    m = _load(tmp_path, monkeypatch)
+    assert m.main() == 0
+    dash = (tmp_path / "wiki/dashboards/source-grounding.md").read_text()
+    assert "grounded: **1**" in dash and "ungrounded: **0**" in dash

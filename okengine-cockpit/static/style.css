@@ -137,6 +137,20 @@ td.num,th.num{text-align:right;font-family:var(--mono);white-space:nowrap}
 #ov-content .review-scope{margin:8px 0;color:var(--muted)}#ov-content .review-decision-context dl{display:grid;grid-template-columns:max-content 1fr;gap:5px 10px;margin:10px 0 0}
 #ov-content .review-decision-context dt{font-weight:650}#ov-content .review-decision-context dd{margin:0;color:var(--muted)}
 #ov-content .review-reasons{margin:0;padding-left:20px}#ov-content .review-reasons li span{display:block;color:var(--muted)}
+/* okengine#823 — the reason codes and the effect of each decision, on the screen where the
+   decision is made. The quarantine column is the load-bearing one: approve/dismiss release the
+   content, the other three hold it, and nothing said so before. */
+#ov-content .review-glossary{margin:10px 0;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:var(--panel)}
+#ov-content .review-glossary summary{cursor:pointer;font:600 .786rem var(--mono);text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
+#ov-content .review-glossary dl{margin:8px 0 0}#ov-content .review-glossary dt{font-weight:650;margin-top:7px}
+#ov-content .review-glossary dt code{font:inherit;font-family:var(--mono)}
+#ov-content .review-glossary dd{margin:2px 0 0;color:var(--muted)}#ov-content .review-glossary em{color:var(--live);font-style:normal}
+#ov-content .review-effects{width:100%;border-collapse:collapse;margin:6px 0 10px;font-size:.929rem}
+#ov-content .review-effects th{text-align:left;font:600 .786rem var(--mono);text-transform:uppercase;letter-spacing:.5px;color:var(--muted);padding:4px 8px;border-bottom:1px solid var(--border)}
+#ov-content .review-effects td{padding:5px 8px;border-bottom:1px solid var(--border);vertical-align:top}
+#ov-content .review-effects .rq-cleared{color:var(--ok,#3a9d5d);font-weight:650}
+#ov-content .review-effects .rq-kept{color:var(--warn,#b8860b);font-weight:650}
+#ov-content .review-lock{margin:8px 0 12px;padding:8px 10px;border-left:3px solid var(--warn,#b8860b);background:var(--panel);color:var(--muted)}
 #ov-content .review-evidence{display:flex;flex-direction:column;gap:5px}
 #ov-content .review-ev{display:flex;justify-content:space-between;gap:12px;padding:5px 8px;border:1px solid var(--border);border-radius:4px;font:.786rem var(--mono)}
 #ov-content .review-ev>span:last-child{color:var(--muted)}#ov-content .review-ev.unresolved{border-color:var(--warn);color:var(--warn)}

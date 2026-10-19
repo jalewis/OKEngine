@@ -6,12 +6,17 @@ module coupling.
 """
 from __future__ import annotations
 
+import re
+
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from statistics import median
 from typing import Any, Callable
+
+# Which types are actors (okengine#1020). The caller has made the engine package importable.
+from okengine import actor_types
 
 
 @dataclass(frozen=True)
@@ -53,6 +58,112 @@ class AuditContext:
     provenance_lib: Any
     raw_capture_health: Callable[..., Any]
     schema_lib: Any
+    attestation: Any
+    actor_grounding: Any = None
+
+
+_LEADING_THE = re.compile(r"^(?i:the)(?=[\s_\-A-Z])")
+
+
+def _compact_identity(value: object, min_len: int) -> str:
+    """The identity with ALL separators removed (okengine#99). The spaced key cannot join names that
+    differ only in spacing -- "TheVikingsofDW" and "The Vikings of DW", "Cyber Army of Russia Reborn"
+    and "CyberArmy of Russia Reborn" -- so those pairs stayed split on one live vault while this
+    detector reported nothing. A leading "The" is dropped only as a word or a CamelCase prefix, so
+    "Theft" keeps its letters. Digit-only results are skipped: two different IP addresses
+    (110.37.3.251, 110.37.32.51) collapse to the same digits."""
+    raw = _LEADING_THE.sub("", str(value or "").strip())
+    compact = re.sub(r"[^0-9a-z]+", "", raw.casefold())
+    return compact if len(compact) >= min_len and not compact.isdigit() else ""
+
+
+# Signals beside the grounding verdict itself (okengine#1012). The verdict's own codes come from
+# `actor_grounding`; these two are shapes of the name, not of the evidence.
+HEADLINE_TITLE = "headline_title"
+NEXUS_LABEL = "geopolitical_or_nexus_label"
+
+
+def actor_grounding_findings(wiki: Path, rows: list, source_ids: dict, grounding: Any,
+                             max_examples: int, non_actor_keys: frozenset = frozenset()) -> dict:
+    """ACTOR IDENTITY NOT GROUNDED IN ITS SOURCES (okengine#1012), a WARN for human review.
+
+    The write path now refuses a model write that creates or retypes an actor no cited source
+    names and affirms. This measures the stored corpus with the SAME predicate, so the pages that
+    predate the guard, and any writer that goes around it, stay visible. A provenance label
+    vouches here, as it does for the deterministic importer that wrote it. A page with no
+    resolvable source at all is counted apart: it is unverifiable, not contradicted.
+
+    ``non_actor_keys`` are the folded names of the corpus's live non-actor entity pages: a name
+    one of them carries is grounded only by what a source says the subject IS, never by what it
+    does (okengine#1014: "RedLine steals ...").
+    """
+    read = grounding.WikiSources(wiki, source_ids)
+    unverifiable = {grounding.UNSOURCED, grounding.NO_RESOLVABLE_SOURCE}
+    reasons: dict[str, int] = {}
+    pages, examples = 0, []
+    unsourced, unsourced_examples = 0, []
+    for rel, fm, stem, schema in rows:
+        names = grounding.actor_names(fm, stem)
+        title = str(fm.get("title") or fm.get("name") or stem)
+        held = grounding.reserved_titles(schema) + [
+            name for name in names if grounding.name_key(name) in non_actor_keys]
+        verdict = grounding.ground_page(fm, read, fallback_name=stem, labels_vouch=True,
+                                        non_actor_names=held)
+        found = []
+        if verdict is not None and verdict.code in unverifiable:
+            unsourced += 1
+            if len(unsourced_examples) < max_examples:
+                unsourced_examples.append(rel)
+        elif verdict is not None:
+            found.append(verdict.code)
+        if grounding.bylined(names, fm.get("publisher")) and (
+                grounding.NAME_EQUALS_PUBLISHER not in found):
+            found.append(grounding.NAME_EQUALS_PUBLISHER)
+        if grounding.headline_title(title, stem):
+            found.append(HEADLINE_TITLE)
+        if grounding.nexus_label(title, grounding.reserved_titles(schema)):
+            found.append(NEXUS_LABEL)
+        if not found:
+            continue
+        pages += 1
+        for reason in found:
+            reasons[reason] = reasons.get(reason, 0) + 1
+        if len(examples) < max_examples:
+            examples.append(f"{rel} → {', '.join(found)}")
+    return {
+        "actor_identity_ungrounded_pages": pages,
+        "actor_identity_ungrounded_reasons": dict(sorted(reasons.items())),
+        "actor_identity_ungrounded_examples": examples,
+        "actor_identity_unsourced_pages": unsourced,
+        "actor_identity_unsourced_examples": unsourced_examples,
+    }
+
+
+def undeclared_actor_type_findings(refs: list, page_type_of: dict, keys_by_stem: dict,
+                                   schema: dict, actor_types: Any) -> dict[str, int]:
+    """Types the corpus uses for actors without the schema declaring them (okengine#1020).
+
+    Every actor check keys on the declared actor types. A pack that keeps its adversaries under
+    its own type name and never declares the role gets no grounding, and every actor metric reads
+    0: a vacuous pass. The corpus says where its actors live, in its own `actor` references
+    (`campaign.actor: entities/t/a/ta505`), so a type that receives a real share of them is
+    reported. Names come from the data; the engine names none.
+    """
+    counts: dict[str, int] = {}
+    declared: set[str] = set()   # resolved as actors under the target page's OWN governing schema
+    for ref in refs:
+        found = page_type_of.get(ref)
+        if found is None:
+            # A partition-unaware reference (`entities/ta505`) still names one page by its slug.
+            keys = keys_by_stem.get(ref.rsplit("/", 1)[-1]) or []
+            found = page_type_of.get(keys[0]) if len(keys) == 1 else None
+        if found is None:
+            continue
+        counts[found[0]] = counts.get(found[0], 0) + 1
+        if found[1]:
+            declared.add(found[0])
+    return {typ: count for typ, count in actor_types.undeclared_actor_types(schema, counts).items()
+            if typ not in declared}
 
 
 def audit(vault: Path, context: AuditContext) -> dict:
@@ -69,7 +180,6 @@ def audit(vault: Path, context: AuditContext) -> dict:
     OVERMATCH_RATIO = context.overmatch_ratio
     PREDICTION_TERMINAL = context.prediction_terminal
     PREDICTION_UNGRADED = context.prediction_ungraded
-    _BASIS_GRADE_RE = context.basis_grade_re
     _CARRIER_PROSE_RE = context.carrier_prose_re
     _FIELD_KEY_RE = context.field_key_re
     _FM_RE = context.frontmatter_re
@@ -93,6 +203,9 @@ def audit(vault: Path, context: AuditContext) -> dict:
     provenance_lib = context.provenance_lib
     raw_capture_health = context.raw_capture_health
     schema_lib = context.schema_lib
+    attestation = context.attestation.AttestationAudit(MAX_EXAMPLES)  # okengine#980
+    _actor_names = (context.actor_grounding.actor_names if context.actor_grounding is not None
+                    else lambda fm: [str(fm.get("title") or fm.get("name") or "")])
 
     """Walk the corpus once; return the measured state (pure, testable)."""
     wiki = vault / "wiki"
@@ -116,6 +229,9 @@ def audit(vault: Path, context: AuditContext) -> dict:
     # per-entity metadata for the cluster report.
     identity_index: dict[str, set] = defaultdict(set)
     entity_meta: dict[str, dict] = {}
+    entity_state: dict[str, tuple[str, bool]] = {}   # entities/<...> -> (canonical type, tombstoned)
+    entity_by_slug: dict[str, list[str]] = {}
+    tomb_rows: list[tuple[str, str, object, object]] = []
     enums_declared = False
     pages = parse_errors = 0
     prediction_loop = {
@@ -162,10 +278,25 @@ def audit(vault: Path, context: AuditContext) -> dict:
         "actor_is_a_publisher_examples": [],
         "actor_class_contradiction_pages": 0,
         "actor_class_contradiction_examples": [],
+        "actor_identity_ungrounded_pages": None,
+        "actor_identity_ungrounded_reasons": {},
+        "actor_identity_ungrounded_examples": [],
+        "actor_identity_unsourced_pages": None,
+        "actor_identity_unsourced_examples": [],
         "overbroad_alias_pages": 0,
         "overbroad_alias_terms": [],
         "overbroad_alias_examples": [],
         "scalar_alias_pages": 0,
+        "non_name_alias_pages": 0,
+        "non_name_alias_examples": [],
+        "readded_rejected_alias_pages": 0,
+        "readded_rejected_alias_examples": [],
+        "broken_tombstone_pages": 0,
+        "broken_tombstone_kinds": {},
+        "broken_tombstone_examples": [],
+        "unnamed_actor_pages": 0,
+        "unnamed_actor_examples": [],
+        "actor_types_undeclared": {},
     }
     # An aggregator/repository is a CARRIER, not an originator: data it holds is owned by whoever
     # produced it, and the source record already models that (`publisher` = originator,
@@ -194,6 +325,16 @@ def audit(vault: Path, context: AuditContext) -> dict:
     publisher_identities: set[str] = set()         # identities the corpus PUBLISHES under
     actor_identities: list[tuple[str, str]] = []   # (normalized identity, page rel)
 
+    # okengine#1012: live actors, judged after the walk against the sources they cite.
+    actor_rows: list[tuple[str, dict, str, dict]] = []
+    # names of live non-actor, non-source pages, by type (okengine#1014)
+    non_actor_keys: dict[str, set[str]] = defaultdict(set)
+    # okengine#1020: which types hold actors, measured from the corpus's own actor references, so
+    # a pack that never declared its actor types is reported undetectable instead of clean.
+    actor_refs: list[str] = []                      # targets of `actor`/`actors` page references
+    page_type_of: dict[str, tuple[str, bool]] = {}  # page key -> (canonical type, is actor type)
+    page_keys_by_stem: dict[str, list[str]] = defaultdict(list)
+    source_ids: dict[str, str] = {}    # a source page's `id` -> its path, for id-shaped refs
     existing_paths: set[str] = set()   # every real page (no .md), for dangling-ref resolution
     path_refs: list[tuple[str, str, str]] = []   # (field, target, source_rel) — bare path refs
     slug_variants: dict[tuple[str, str], set[str]] = defaultdict(set)   # (ns, norm slug) -> rels
@@ -229,19 +370,18 @@ def audit(vault: Path, context: AuditContext) -> dict:
                     f"{rel} → `{_badkeys[0][:60]}`")
         if fm.get("retrieved_via"):
             carriers.add(str(fm["retrieved_via"]).strip())
+        attestation.observe(rel.as_posix()[:-3], fm)
         # A page-level Admiralty `reliability` that is WORSE than the grade its own
         # `auto_verified_basis` cites. Admiralty reliability grades a SOURCE; when it is stamped
         # onto a knowledge page it is a snapshot of whatever produced that page, and it does not
         # move as evidence accumulates. The trust strip then shows the stale, lower grade beside a
         # basis naming A-grade authorities — the page argues with itself, and the weaker claim is
         # the one the reader sees.
-        _rel = str(fm.get("reliability") or "").strip().upper()
-        _best = min((g for _, g in _BASIS_GRADE_RE.findall(str(fm.get("auto_verified_basis") or ""))),
-                    default=None)
-        if _rel and _best and _rel > _best:          # 'C' > 'A': a worse grade than the evidence
+        _stale = schema_lib.contradicting_reliability(fm)   # one rule with autoverify (#563)
+        if _stale:
             body_integrity["stale_reliability_pages"] += 1
             if len(body_integrity["stale_reliability_examples"]) < MAX_EXAMPLES:
-                body_integrity["stale_reliability_examples"].append(f"{rel} → {_rel} vs {_best}")
+                body_integrity["stale_reliability_examples"].append(f"{rel} → {_stale[0]} vs {_stale[1]}")
         for _cm in _CARRIER_PROSE_RE.finditer(body):
             carrier_prose.append((_cm.group(1).strip(), str(rel)))
         if _LEAKED_FRONTMATTER_RE.match(body):
@@ -323,7 +463,38 @@ def audit(vault: Path, context: AuditContext) -> dict:
         # `threat-actor_group`, `threat_actor_family`) slip in and fragment an entity across
         # near-duplicate types. Base ∪ pack types (+ type_aliases) are the sanctioned set.
         ptype = str(fm.get("type") or "").strip()
-        if ptype == "actor" and not tombstoned:
+        # collect both sides of the tombstone-successor join (okengine#101), resolved after the loop
+        if rel.parts and rel.parts[0] == "entities":
+            _ekey = rel.as_posix()[:-3]
+            _etype = schema_lib.canonical_type(schema_cache[govdir], ptype) if ptype else ""
+            entity_state[_ekey] = (_etype, tombstoned)
+            entity_by_slug.setdefault(p.stem, []).append(_ekey)
+            if tombstoned:
+                tomb_rows.append((_ekey, _etype, fm.get("tombstone_reason"),
+                                  fm.get("superseded_by") or fm.get("redirect_to")))
+        is_actor = bool(ptype) and actor_types.is_actor_type(schema_cache[govdir], ptype)
+        if ptype:
+            _page_key = rel.as_posix()[:-3]
+            page_type_of[_page_key] = (schema_lib.canonical_type(schema_cache[govdir], ptype),
+                                       is_actor)
+            page_keys_by_stem[p.stem].append(_page_key)
+        if not tombstoned:
+            actor_refs.extend(actor_types.reference_targets(fm))
+        if is_actor and not tombstoned and not "".join(
+                re.sub(r"[^a-z0-9]+", "", name.lower()) for name in _actor_names(fm)):
+            # okengine#846: the write path refuses to create a nameless actor; these predate that.
+            # Aliases name a page too (okengine#1020), the same names the write path reads.
+            body_integrity["unnamed_actor_pages"] += 1
+            if len(body_integrity["unnamed_actor_examples"]) < MAX_EXAMPLES:
+                body_integrity["unnamed_actor_examples"].append(str(rel))
+        if rel.parts and rel.parts[0] == "sources" and isinstance(fm.get("id"), str):
+            source_ids.setdefault(fm["id"], rel.as_posix()[:-3])
+        if (ptype and not is_actor and not tombstoned and context.actor_grounding is not None
+                and schema_lib.canonical_type(schema_cache[govdir], ptype) != "source"):
+            non_actor_keys[schema_lib.canonical_type(schema_cache[govdir], ptype)].update(
+                context.actor_grounding.name_key(fm.get(field)) for field in ("title", "name"))
+        if is_actor and not tombstoned:
+            actor_rows.append((rel.as_posix()[:-3], fm, p.stem, schema_cache[govdir]))
             title = str(fm.get("title") or fm.get("name") or p.stem).strip()
             contradiction = _actor_identity_error(title, body)
             if contradiction:
@@ -367,6 +538,27 @@ def audit(vault: Path, context: AuditContext) -> dict:
         if not tombstoned:
             if fm.get("aliases") is not None and not isinstance(fm.get("aliases"), list):
                 body_integrity["scalar_alias_pages"] += 1
+            # 0e'. an alias that is not a NAME at all -- a URL, prose, or a comma-joined list
+            # (okengine#845). Same rule the write path enforces (schema_lib), so a nonzero count
+            # here is legacy data or a lane that writes around the write path.
+            _non_names = [a for a in _alias_list(fm.get("aliases"))
+                          if schema_lib.alias_value_problem(a)]
+            if _non_names:
+                body_integrity["non_name_alias_pages"] += 1
+                if len(body_integrity["non_name_alias_examples"]) < MAX_EXAMPLES:
+                    body_integrity["non_name_alias_examples"].append(
+                        f"{rel} → {str(_non_names[0])[:50]}")
+            # 0e''. a name back in `aliases` that the page's own review rejected (TAA#48). The write
+            # path refuses it and direct writers go through schema_lib.admissible_aliases, so a
+            # nonzero count means some writer merged aliases around that rule.
+            _banned = schema_lib.rejected_alias_keys(fm)
+            _back = [a for a in _alias_list(fm.get("aliases"))
+                     if _banned and schema_lib.alias_key(a) in _banned]
+            if _back:
+                body_integrity["readded_rejected_alias_pages"] += 1
+                if len(body_integrity["readded_rejected_alias_examples"]) < MAX_EXAMPLES:
+                    body_integrity["readded_rejected_alias_examples"].append(
+                        f"{rel} → {str(_back[0])[:50]}")
             _broad = _overbroad_aliases(fm.get("aliases"))
             if _broad:
                 body_integrity["overbroad_alias_pages"] += 1
@@ -387,7 +579,7 @@ def audit(vault: Path, context: AuditContext) -> dict:
                     _k = _norm_identity(_src)
                     if len(_k) >= MIN_IDENTITY_LEN:
                         publisher_identities.add(_k)
-            elif ptype == "actor":
+            elif is_actor:
                 # BOTH title and name, like the fragmentation index and the publisher side above.
                 # `title or name` ignores `name` whenever a title exists, so a page titled
                 # "Intruder Group" whose name is "Intruder" would never join the publisher called
@@ -454,6 +646,9 @@ def audit(vault: Path, context: AuditContext) -> dict:
                 k = _norm_identity(src)
                 if len(k) >= MIN_IDENTITY_LEN:
                     keys.add(k)
+                c = _compact_identity(src, MIN_IDENTITY_LEN)
+                if c:
+                    keys.add(c)
             # _alias_list, not `isinstance(..., list)`: that skip meant a page whose `aliases` is a
             # scalar never entered the index at all, so the pages with a malformed field were the
             # ones exempt from fragmentation detection.
@@ -461,6 +656,9 @@ def audit(vault: Path, context: AuditContext) -> dict:
                 k = _norm_identity(a)
                 if len(k) >= MIN_IDENTITY_LEN:
                     keys.add(k)
+                c = _compact_identity(a, MIN_IDENTITY_LEN)
+                if c:
+                    keys.add(c)
             if keys:
                 entity_meta[str(rel)] = {"type": ptype, "keys": keys}
                 for k in keys:
@@ -555,6 +753,24 @@ def audit(vault: Path, context: AuditContext) -> dict:
         parts = pp.split("/")
         for i in range(1, len(parts)):
             existing_dirs.add("/".join(parts[:i]))
+    body_integrity.update(attestation.result(existing_paths))
+    undeclared = undeclared_actor_type_findings(
+        actor_refs, page_type_of, page_keys_by_stem, schema_lib.merged_schema(vault), actor_types)
+    body_integrity["actor_identity_library"] = context.actor_grounding is not None
+    if context.actor_grounding is not None:
+        body_integrity.update(actor_grounding_findings(
+            wiki, actor_rows, source_ids, context.actor_grounding, MAX_EXAMPLES,
+            # a type the corpus uses for actors without declaring it holds actors, not namesakes
+            # (an empty key never matches: an actor's names are never empty)
+            frozenset(set().union(*(keys for typ, keys in non_actor_keys.items()
+                                    if typ not in undeclared)))))
+    body_integrity["actor_types_undeclared"] = undeclared
+    if not actor_rows:
+        # Nothing was measured, so a count would be a vacuous pass (QA of !1296): either the actors
+        # live in a type the schema never declared, or no page carries a declared actor type at
+        # all and nothing the audit can read says where actors would be. Undetectable, never 0.
+        body_integrity["actor_identity_ungrounded_pages"] = None
+        body_integrity["actor_identity_unsourced_pages"] = None
     # Report carrier-credited prose only where the captured name is one the corpus itself declares
     # as a `retrieved_via` carrier — so an ordinary sentence about a real dataset is not flagged,
     # and the engine never has to name a repository.
@@ -592,6 +808,45 @@ def audit(vault: Path, context: AuditContext) -> dict:
     # The DISTINCT terms are what an operator acts on -- one bad alias on nine pages is one decision,
     # not nine -- so the page count and the term count are reported as separate numbers.
     body_integrity["overbroad_alias_terms"] = sorted(set(body_integrity["overbroad_alias_terms"]))
+
+    # TOMBSTONE SUCCESSORS (okengine#101). A tombstone retires a page ONTO the same identity. The
+    # write path now refuses the cases below (schema_lib.tombstone_reason_kind is shared with it);
+    # this counts what is already in the corpus. On one live vault 42 of 82 tombstoned actors were
+    # here, including Lazarus Group retired on a "Different entity from Sapphire Sleet" reason.
+    for _key, _etype, _reason, _succ in tomb_rows:
+        _kind = schema_lib.tombstone_reason_kind(_reason)
+        _target = (str(_succ or "").strip().strip("[]").strip()
+                   .removeprefix("wiki/").removesuffix(".md").strip("/"))
+        _problem = None
+        if _kind == "distinct":
+            _problem = "reason says the subjects differ"
+        elif not _target:
+            _problem = "duplicate with no successor" if _kind == "duplicate" else None
+        else:
+            if _target in entity_state or _target in existing_paths:
+                _hit = _target
+            elif _target.startswith("entities/"):
+                _cands = entity_by_slug.get(_target.rsplit("/", 1)[-1]) or []
+                _hit = next((c for c in _cands if not entity_state[c][1]), _cands[0] if _cands else None)
+            else:
+                _hit = None
+            if _hit is None:
+                _problem = "successor does not exist"
+            elif _hit == _key:
+                _problem = "supersedes itself"
+            elif _hit not in entity_state:
+                _problem = "successor is not an entity"
+            elif entity_state[_hit][1]:
+                _problem = "successor is tombstoned"
+            elif _etype and entity_state[_hit][0] and entity_state[_hit][0] != _etype:
+                _problem = f"successor is another type ({entity_state[_hit][0]}, not {_etype})"
+        if _problem:
+            body_integrity["broken_tombstone_pages"] += 1
+            _bucket = _problem.split(" (")[0]
+            body_integrity["broken_tombstone_kinds"][_bucket] = (
+                body_integrity["broken_tombstone_kinds"].get(_bucket, 0) + 1)
+            if len(body_integrity["broken_tombstone_examples"]) < MAX_EXAMPLES:
+                body_integrity["broken_tombstone_examples"].append(f"{_key} → {_problem}")
 
     # RETRACTED-WITHOUT-SUCCESSOR (okengine#563). A judgment is retired only BY another judgment:
     # attribution changes when EVIDENCE changes, and the superseded_by chain IS that history. A

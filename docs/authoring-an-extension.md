@@ -95,6 +95,26 @@ operations:
 Scripts run from `/opt/data/scripts/<id>/` in the gateway and may `import` a sibling lib in
 the same dir (it's staged too).
 
+**Every operation declares `expect:`: what "working" means for that lane.** The
+`output_contract` says what an agent operation *may* write; `expect:` says what it *should*
+produce, so the fleet-health dashboard can show a lane that runs but has stopped producing:
+
+```yaml
+operations:
+  grade:
+    schedule: {kind: cron, expr: "23 6 * * *"}
+    entrypoint: grade.py
+    prompt_file: prompts/grade.md
+    output_contract: {...}                  # allowed_namespaces: [predictions, dashboards]
+    expect:
+      produces: {namespace: predictions, at_least: 1, per: 4x}   # 4x = four schedule cadences
+      may_idle: {max_idle_runs: 8}          # the gate may skip — not indefinitely
+```
+
+A `produces` namespace must be one the operation's contract allows. First-party (`okengine.*`)
+operations without `expect:` fail CI unless listed in `config/expect-allowlist.yaml`, which only
+shrinks; pack and operator extensions WARN. See [`lane-expectations.md`](lane-expectations.md).
+
 **Drop-in form (#63 P1, preferred for new extensions).** Instead of an `operations:` map in
 the manifest, drop one file per op into `crons/<op>.cron.json` — each file is the same operation
 block (`schedule` / `entrypoint` / `prompt_file` / `toolsets` / `max_iterations`), and the op name is the filename
@@ -123,11 +143,16 @@ dependency contract.
 
 ## 4. Trust & capabilities (two axes)
 
-- **`trust`** = how the code runs: `declarative` (no code), `in-gateway` (a gateway script —
+- **`trust`** = how the code runs: `declarative` (no code and no operations: any `operation`,
+  `operations` entry or `crons/*.cron.json` drop-in under it is a validation error, okengine#1004), `in-gateway` (a gateway script —
   **first-party only**; operator-tier in-gateway is refused without `--allow-untrusted`,
-  okengine#124), `sidecar` (its own container — the isolation boundary).
+  okengine#124, and the recorded acceptance is re-checked at regen, staging and
+  `framework validate`, okengine#994), `sidecar` (its own container — the isolation boundary).
 - **`capabilities`** = what it may touch: `read` scopes, `write` namespaces, `network`,
-  `secrets`, `delivery` — granted by the operator at enable, independent of trust.
+  `secrets`, `delivery` — granted by the operator at enable, independent of trust. A
+  `write_policy.identity_edit` grant from a pack- or operator-tier extension also needs
+  `--accept-identity-edit`, bound to the policy's digest (okengine#1032; see
+  [`model-write-contracts.md`](model-write-contracts.md)).
 
 Path scope can be narrowed with an optional field/body policy for every new writer whose
 responsibility is smaller than a namespace:
@@ -204,7 +229,9 @@ ENGINE_DIR=… CRON_PACK_DIR=<pack> bash scripts/deploy-cron-plus-jobs.sh    # f
 # trigger a lane on demand by its stable composed name:
 bin/framework jobs run <deployment> <job-name>
 framework extensions disable <pack> <id>                  # opt-out (also turns OFF a core extension)
-framework extensions purge   <pack> <id>                  # remove staged scripts + token
+framework extensions forget  <pack> <id>                  # clear a disabled: id no tier discovers (renamed/removed)
+framework extensions purge   <pack> <id>                  # delete the pages it produced (dry-run unless --yes)
+ENGINE_DIR=… CRON_PACK_DIR=<pack> bash scripts/deploy-cron-scripts.sh --prune-stale-extensions   # drop its staged scripts
 ```
 
 Enabling folds the synthesized jobs into `cron-plus-jobs.json` (each carries an `extension:`

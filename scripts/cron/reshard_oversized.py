@@ -22,11 +22,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 from pathlib import Path
-
-import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import okf_migrate  # noqa: E402
@@ -47,17 +44,11 @@ _RESHARD_BY = {
 
 
 def _fm(p: Path) -> dict:
-    try:
-        m = okf_migrate._FM_RE.match(p.read_text(encoding="utf-8", errors="replace")[:4000])
-    except OSError:
-        return {}
-    if not m:
-        return {}
-    try:
-        d = yaml.safe_load(m.group(1))
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
+    """The page's frontmatter exactly as the reshelve drain reads it (okf_migrate._fm_at: the
+    whole envelope). A 4000-char window here parsed a long-envelope source as {}, split it to the
+    `00` day bucket, and the drain, reading the real `published`, moved it back every cycle
+    (okengine#993, the okengine#54 class)."""
+    return okf_migrate._fm_at(VAULT, p.relative_to(WIKI).with_suffix("").as_posix())
 
 
 def _reshardable_namespaces() -> list[tuple[str, str, int]]:

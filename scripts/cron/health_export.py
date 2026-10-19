@@ -23,6 +23,7 @@ Env: WIKI_PATH (/opt/vault) · METRICS_DIR (/opt/data/metrics) · ALERT_WEBHOOK 
 from __future__ import annotations
 
 import json
+from json import JSONDecodeError
 import os
 import re
 import sys
@@ -30,11 +31,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
+sys.path.append(str(Path(__file__).resolve().parent))  # staged sibling libs
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
+
 WIKI = Path(os.environ.get("WIKI_PATH", "/opt/vault")) / "wiki"
 DDIR = WIKI / "dashboards"
 MDIR = Path(os.environ.get("METRICS_DIR", "/opt/data/metrics"))
 WEBHOOK = os.environ.get("ALERT_WEBHOOK", "").strip()
 FLEET_LANES = DDIR / ".fleet-lanes.json"
+ESCALATION = DDIR / ".fleet-escalation.json"
 
 
 def _http_url(value: str, label: str) -> str:
@@ -99,7 +104,7 @@ def _fleet_lane_sets() -> "dict[str, set[str]] | None":
         if FLEET_LANES.stat().st_mtime < dashboard_mtime:
             return None
         data = json.loads(FLEET_LANES.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, JSONDecodeError):
         return None
     out = {}
     for key in ("stale", "critical-stale", "errored", "off-model"):
@@ -113,6 +118,59 @@ def _fleet_lane_sets() -> "dict[str, set[str]] | None":
         return None
     out["invalid-schedule"] = {item for item in (invalid or []) if item}
     return out
+
+
+REMIND_AFTER_H = float(os.environ.get("ALERT_REMIND_AFTER_HOURS") or 24)
+REMIND_EVERY_H = float(os.environ.get("ALERT_REMIND_EVERY_HOURS") or 24)
+
+
+def _sustained_red(now_dt, reminded: dict) -> "tuple[list[str], dict]":
+    """Lanes red for longer than REMIND_AFTER_H that are due another mention.
+
+    Transition-only alerting is "no fatigue" at one end and total silence at the other: a lane that
+    went red once alerts once and is never spoken of again. On a live vault that produced
+    `wiki-health-audit` red since 2026-08-31 with 1,941 consecutive failing checks, correctly
+    detected and escalated the whole time, and one alert line three weeks old (okengine#817).
+
+    fleet_health already records `red_since` and `consecutive` per lane; this turns a sustained
+    failure back into a signal on a bounded cadence — loud enough to notice, rare enough not to be
+    filtered. Recovered lanes drop out of the reminder book so a later relapse reads as new.
+    """
+    try:
+        data = json.loads(ESCALATION.read_text(encoding="utf-8"))
+        lanes = data.get("lanes") if isinstance(data, dict) else None
+        if not isinstance(lanes, dict):
+            return [], reminded
+    except (OSError, JSONDecodeError):
+        return [], reminded          # absent sidecar is "unknown", never "nothing is wrong"
+    due, book = [], {}
+    for lane, st in sorted(lanes.items()):
+        if not isinstance(st, dict):
+            continue
+        red_since = _parse_iso(st.get("red_since"))
+        if red_since is None:
+            continue
+        age_h = (now_dt - red_since).total_seconds() / 3600.0
+        book[lane] = reminded.get(lane)          # carry the last mention for still-red lanes only
+        if age_h < REMIND_AFTER_H:
+            continue
+        last_ping = _parse_iso(reminded.get(lane))
+        if last_ping is not None and (now_dt - last_ping).total_seconds() / 3600.0 < REMIND_EVERY_H:
+            continue
+        streak = st.get("consecutive")
+        due.append(f"{lane} (red {age_h / 24:.1f}d"
+                   + (f", {streak} consecutive checks" if isinstance(streak, int) else "") + ")")
+        book[lane] = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return due, book
+
+
+def _parse_iso(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def main() -> int:
@@ -223,10 +281,15 @@ def main() -> int:
             newly.append(f"a cron lane escalated to CRITICAL-STALE (now {critical_stale})")
         if (invalid_schedule or 0) > last.get("invalid_schedule", 0):
             newly.append(f"a cron lane has an INVALID-SCHEDULE (now {invalid_schedule})")
+    now_dt = datetime.now(timezone.utc)
+    still_red, remind_book = _sustained_red(now_dt, dict(last.get("reminded_at") or {}))
+    if still_red:
+        newly.append(f"cron lane(s) STILL failing: {'; '.join(still_red)}")
     webhook_failed = False
     if newly:
         alerts = DDIR / "alerts.md"
-        head = "" if alerts.is_file() else ("---\ntype: dashboard\ntitle: \"Alerts\"\n---\n\n# Alerts\n\n")
+        head = "" if alerts.is_file() else generated_page.with_id(
+            alerts, "---\ntype: dashboard\ntitle: \"Alerts\"\n---\n\n# Alerts\n\n")
         with alerts.open("a", encoding="utf-8") as f:
             if head:
                 f.write(head)
@@ -253,7 +316,8 @@ def main() -> int:
                  "critical_stale": critical_stale or 0,
                  "errored": errored or 0, "invalid_schedule": invalid_schedule or 0,
                  "offmodel": offmodel or 0,
-                 "at": now}
+                 "at": now,
+                 "reminded_at": {k: v for k, v in remind_book.items() if v}}
         if lane_sets is not None:
             state["errored_lanes"] = sorted(lane_sets["errored"])
             state["offmodel_lanes"] = sorted(lane_sets["off-model"])

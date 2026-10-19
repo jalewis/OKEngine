@@ -2,6 +2,7 @@ from __future__ import annotations
 # ruff: noqa: F821
 
 from okengine.corpus_transaction import touch as _corpus_touch
+from okengine.write_services.convergence import _actor_admission_reject
 
 import contextvars
 import datetime
@@ -76,9 +77,7 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
         return f"rejected: edit produced invalid frontmatter YAML: {str(e)[:120]}"
     if not isinstance(new_fm, dict):
         return "rejected: edit produced non-mapping frontmatter"
-    changed_fields = {
-        key for key in set(cur_fm) | set(new_fm) if cur_fm.get(key) != new_fm.get(key)
-    }
+    changed_fields = _frontmatter_changes(p, cur_fm, new_fm)  # type-strict, alias-aware (#983)
     old_match = _FM.match(text)
     old_body = old_match.group(2).lstrip("\n") if old_match else ""
     candidate_body = m.group(2).lstrip("\n")
@@ -88,15 +87,27 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
         page_type=str(new_fm.get("type") or cur_fm.get("type") or ""),
         changed_fields=changed_fields,
         body_change="replace" if candidate_body != old_body else "none",
+        values=new_fm, stored=cur_fm,
     )
     if cap:
         return f"rejected: {cap}"
+    attestation = _attestation_reject(  # okengine#980: operator-owned attestation
+        p, cur_fm, new_fm, candidate_body != old_body
+    )
+    if attestation:
+        return attestation
+    ttr = _tombstone_transition_refuse(cur_fm, new_fm, p)  # okengine#863: retire only via tombstone_entity
+    if ttr:
+        return ttr
     # patch_entity is a full write chokepoint: apply the SAME shape coercion _create/_update/_converge
     # do (#196 — a schema-declared list field authored as a scalar becomes a list; bare [[wikilink]]
     # values are stripped), so an edit can't land a malformed shape that poisons a downstream lane.
-    # new_fm was parsed and type-checked as a mapping immediately above, so this call cannot
-    # take _coerce_fm's invalid-YAML/shape None branch.
-    new_fm = cast(dict, _coerce_fm(new_fm, p))
+    # new_fm was parsed and type-checked as a mapping immediately above; the one None left is a
+    # value holding an unpaired surrogate (okengine#894), refused like any other write.
+    coerced = _coerce_fm(new_fm, p)
+    if coerced is None:
+        return _fm_reject(new_fm)
+    new_fm = coerced
     fl = _field_loss(
         cur_fm, new_fm
     )  # compare in the pre-normalized space (cur_fm is un-normalized)
@@ -114,8 +125,13 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
         existing_producer_lane=cur_fm.get("producer_lane"),
     )
     # id + created/created_by/discovered_by are immutable — revert any patched-in change (audit HIGH #3).
-    reverted_immutable = _preserve_immutable(new_fm, cur_fm)
-    review_invalidation = _apply_review_governance(new_fm, cur_fm)
+    # The checks below compare the write with the stored page on canonical views of both, so an
+    # echo or a repair of a legacy shape is not a removed alias, a new source or a review-worthy
+    # change (okengine#994 [19]).
+    prev_view = _canonical_view(p, cur_fm)
+    reverted_immutable = _preserve_immutable(new_fm, cur_fm, p)
+    identity_flags, hold_body, _held = _identity_hold(p, cur_fm, new_fm)  # okengine#1028
+    review_invalidation = _apply_review_governance(new_fm, prev_view)
     _enum_case_coerce(p, new_fm)
     isr = _int_shape_reject(p, new_fm)
     if isr:
@@ -123,26 +139,38 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
     itr = _item_shape_reject(p, new_fm)
     if itr:
         return f"rejected: {itr}"
-    pol = _policy_reject(p, new_fm, "update", prev=cur_fm)
+    new_view = _canonical_view(p, new_fm)
+    pol = _policy_reject(p, new_view, "update", prev=prev_view)
     if pol:
         return f"rejected: {pol}"
     tnr = _type_ns_reject_on_change(
-        p, new_fm, cur_fm
+        p, new_view, prev_view
     )  # type can't drift out of its home ns (audit)
     if tnr:
         return f"rejected: {tnr}"
     receipt_reject = _source_receipt_refuse(new_fm, p)
     if receipt_reject:
         return receipt_reject
-    fsr = _fabricated_source_reject(p, new_fm, prev_fm=cur_fm)
+    fsr = _fabricated_source_reject(p, new_view, prev_fm=prev_view)
     if fsr:
         return fsr
-    msr = _missing_source_reject(p, new_fm, prev_fm=cur_fm)
+    msr = _missing_source_reject(p, new_view, prev_fm=prev_view)
     if msr:
         return msr
+    alr = _alias_shape_reject(p, new_view, prev_fm=prev_view)  # #845
+    if alr:
+        return alr
+    _record_alias_removals_canonically(new_fm, new_view, prev_view)  # a review-removed alias stays out (TAA#48)
     body = m.group(2)
     if body.startswith("\n"):
         body = body[1:]
+    if hold_body and body != _cur_body:
+        identity_flags.append(_IDENTITY_BODY_HELD)
+        body = _cur_body
+    admission_reject = (_actor_admission_reject(new_fm, body, p, cur_fm)
+                        or _actor_grounding_reject(p, new_fm, cur_fm))  # okengine#1012
+    if admission_reject:
+        return admission_reject
     bir = _body_integrity_reject(_cur_body, body)
     if bir:
         return f"rejected: {bir}"
@@ -158,8 +186,9 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
     # carries no write attribution (invariant-audit — patch bypassed all three).
     flags = (
         review_invalidation
+        + identity_flags
         + drift
-        + _review_flags(p, new_fm, prev=cur_fm)
+        + _review_flags(p, new_view, prev=prev_view)
         + _identity_contradiction_flags(p, new_fm)
         + _unresolvable_link_flags(p, body)
         + _degeneration_flags(body)
@@ -180,6 +209,8 @@ def _patch(path: str, old_string: str, new_string: str) -> str:
         return f"rejected: {rej}"  # file left untouched
     _corpus_touch(p)
     _atomic_write_text(p, content)
+    if _namespace(p) == "entities":  # #962: aliases a write adds feed the next merge's hijack check
+        converge.record_identity(_registry(), _rel(p), new_fm)
     ver = new_fm["version"]
     _append_log(f"- {_today()} mcp-write patch {_rel(p)} v{ver}")
     note = _queue_review(p, flags)
@@ -292,10 +323,18 @@ def _append_section(path: str, heading: str, text: str) -> str:
     )
     if cap:
         return f"rejected: {cap}"
+    # An append never touches frontmatter, but it does grow an attested record's body (okengine#980).
+    attestation = _attestation_reject(p, cur_fm, cur_fm, True)
+    if attestation:
+        return attestation
     tr = _tombstone_refuse(cur_fm, p)  # tombstone-guard (a separate concern)
     if tr:
         return tr
     new_body, where = _insert_into_section(cur_body, heading, text)
+    admission_fm, _ = _normalize_drift(dict(cur_fm), p)
+    admission_reject = _actor_admission_reject(admission_fm, new_body, p, cur_fm)
+    if admission_reject:
+        return admission_reject
     bir = _body_integrity_reject(cur_body, new_body)
     if bir:
         return f"rejected: {bir}"
@@ -323,6 +362,7 @@ def _append_section(path: str, heading: str, text: str) -> str:
         _review_flags(p, new_fm, prev=cur_fm)
         + _unresolvable_link_flags(p, text)
         + _degeneration_flags(text)
+        + _chat_review_flags()
     )
     contract_reject = _contract_reject(p, "append", new_fm, new_body, [])
     if contract_reject:

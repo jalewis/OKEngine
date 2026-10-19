@@ -25,6 +25,12 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Engine cron libs, appended so this extension's own modules keep precedence: staged one level
+# up (/opt/data/scripts/ holds /opt/data/scripts/<id>/), or scripts/cron/ in a repo checkout.
+_ENGINE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(_ENGINE_ROOT))
+sys.path.append(str(_ENGINE_ROOT.parent / "scripts" / "cron"))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 from event_schemas import SUPPORTED_EXTRACTORS, extract_typed_fields  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
@@ -428,7 +434,7 @@ def main() -> int:
             _write_jsonl(state / "typed-events" / f"{name}.jsonl", typed.get(event_type, []))
     dashboard = WIKI / "dashboards" / "event-scoring.md"
     dashboard.parent.mkdir(parents=True, exist_ok=True)
-    dashboard.write_text(render(scored, today, cfg, typed, source_scored), encoding="utf-8")
+    generated_page.write(dashboard, render(scored, today, cfg, typed, source_scored))
     print(f"event-scoring: scored {len(scored)} event(s) + {len(source_scored)} source(s) "
           f"-> {dashboard.name}")
     print(json.dumps({"wakeAgent": False}))

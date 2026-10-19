@@ -5,6 +5,7 @@ import functools
 import os
 import re
 import json
+from json import JSONDecodeError
 import glob
 import hashlib
 import hmac
@@ -29,6 +30,8 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from okengine.file_fingerprint import fingerprint
+
 _FM_SCAN_BYTES = 262_144
 
 
@@ -36,8 +39,8 @@ def _artifact_backlinks() -> dict | None:
     """The cron-precomputed backlink map (wiki/.backlinks.json), or None when
     absent/stale/corrupt — callers then fall back to the bounded in-process scanner.
     Freshness is judged by file mtime (the cron's atomic rename stamps it at
-    build time); the parsed map is cached and only re-read when the mtime
-    changes, so the steady-state cost per request is one stat()."""
+    build time); the parsed map is cached and only re-read when the file
+    fingerprint changes, so the steady-state cost per request is one stat()."""
     p = WIKI / ".backlinks.json"
     try:
         st = p.stat()
@@ -45,17 +48,20 @@ def _artifact_backlinks() -> dict | None:
         return None
     if time.time() - st.st_mtime > _BL_ARTIFACT_MAX_AGE:
         return None
-    if _BL_ARTIFACT["mtime"] == st.st_mtime and _BL_ARTIFACT["map"] is not None:
+    # The "mtime" slot holds the file fingerprint: an mtime-only key kept serving the previous map
+    # after a rebuild landing in the same timestamp tick (okengine#1017).
+    key = fingerprint(p, st)
+    if _BL_ARTIFACT["mtime"] == key and _BL_ARTIFACT["map"] is not None:
         return _BL_ARTIFACT["map"]
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, JSONDecodeError):
         return None
     m = data.get("backlinks") if isinstance(data, dict) else None
     if not isinstance(m, dict):
         return None
     _BL_ARTIFACT["map"] = m
-    _BL_ARTIFACT["mtime"] = st.st_mtime
+    _BL_ARTIFACT["mtime"] = key
     return m
 
 

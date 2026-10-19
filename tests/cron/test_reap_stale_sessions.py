@@ -22,12 +22,26 @@ import json
 import sqlite3
 import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "cron" / "reap_stale_sessions.py"
+
+
+def _patch_module_sqlite_connect(monkeypatch, module, connect):
+    """Swap the module-under-test's ``sqlite3`` reference, never the global ``sqlite3.connect``.
+
+    coverage.py writes its per-test context data through ``sqlite3`` at every test-phase boundary
+    (``--cov-context=test``, okengine#900). Patching the shared module attribute broke that write
+    and errored every later test in the process.
+    """
+    isolated = types.ModuleType("sqlite3")
+    isolated.__dict__.update(vars(sqlite3))
+    isolated.connect = connect
+    monkeypatch.setattr(module, "sqlite3", isolated)
 
 
 def _load():
@@ -277,7 +291,7 @@ def test_invalid_age_connect_error_and_large_dry_run(tmp_path, monkeypatch, caps
     assert m.main(["--db", str(tmp_path / "x"), "--age-hours", "0"]) == 2
     db = tmp_path / "exists.db"
     db.touch()
-    monkeypatch.setattr(m.sqlite3, "connect", lambda _p: (_ for _ in ()).throw(
+    _patch_module_sqlite_connect(monkeypatch, m, lambda _p: (_ for _ in ()).throw(
         m.sqlite3.Error("denied")))
     assert m.main(["--db", str(db)]) == 1
 
@@ -292,7 +306,7 @@ def test_invalid_age_connect_error_and_large_dry_run(tmp_path, monkeypatch, caps
         def close(self):
             pass
 
-    monkeypatch.setattr(m.sqlite3, "connect", lambda _p: Conn())
+    _patch_module_sqlite_connect(monkeypatch, m, lambda _p: Conn())
     monkeypatch.setattr(m, "find_stale", lambda *_a: [(str(i), 1.0) for i in range(21)])
     assert m.main(["--db", str(db), "--dry-run"]) == 0
     assert "and 1 more" in capsys.readouterr().out

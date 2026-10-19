@@ -9,6 +9,8 @@ import threading
 from collections import defaultdict
 from pathlib import Path
 
+from okengine.vault_lookup_cache import VaultLookupCache
+
 _FM_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?(.*)\Z", re.DOTALL)
 
 _WIKILINK = re.compile(r"\[\[\s*([^\]|#\n\\]*)(?:#([^\]|\n]+))?(?:\\?\|\s*([^\]\n]+?))?\s*\]\]")
@@ -83,7 +85,11 @@ _EMBED_DIRS = (
     "reports",
 )
 
-_EMBED_PATH_CACHE: dict = {}
+# okengine#1024: revalidated on every hit, misses expire, bounded (see okengine.vault_lookup_cache).
+_EMBED_PATH_CACHE = VaultLookupCache()
+
+# The `title` behind a dataset relationship cell, keyed by its vault-relative page path.
+_REF_TITLE_CACHE = VaultLookupCache()
 
 _SRC_LINK = re.compile(r'<a class="wl" data-page="(sources/[^"]+)">([^<]*)</a>')
 
@@ -95,7 +101,7 @@ _DECK_CACHE = Path(
     os.environ.get("OKENGINE_DECK_CACHE", str(Path(tempfile.gettempdir()) / "okengine-deck-cache"))
 )
 
-_EV_PREFIX_RE = re.compile(r"^\s*\[(\d{4}-\d{2}-\d{2})(?:\s+([^\]]+?))?\]\s*(.*)$", re.S)
+_EV_PREFIX_RE = re.compile(r"^\s*\[(\d{4}-\d{2}-\d{2})(?:\s+([^\]]+?))?\]\s*(.*)\Z", re.S)
 
 _EV_DIR_LEGACY = {
     "reinforce": "reinforces",
@@ -249,7 +255,7 @@ _DRILL_FALLBACK_FIELDS = (
     ("sector", "Sector", False),
 )
 
-_DATED_SERIES_RE = re.compile(r"^(.*)-(\d{4}-\d{2}-\d{2})$")
+_DATED_SERIES_RE = re.compile(r"^(.*)-(\d{4}-\d{2}-\d{2})\Z")
 
 _OPS_GROUPS = [
     (
@@ -551,6 +557,7 @@ __all__ = (
     "_EMBED",
     "_EMBED_DIRS",
     "_EMBED_PATH_CACHE",
+    "_REF_TITLE_CACHE",
     "_SRC_LINK",
     "_UNCODE_WIKILINK",
     "_MARP",

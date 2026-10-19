@@ -23,20 +23,16 @@ def directory_is_derived(paths: list[Path], *, split_frontmatter, derived_types)
     return seen > 0 and derived == seen
 
 
-def tree(*, wiki, excluded_dirs, skip, reserved, namespaces, is_derived, rail_top) -> dict:
+def tree(*, wiki, excluded_dirs, skip, is_derived, rail_top, scan) -> dict:
+    """Namespace rail. Counts come from the same cached scan the page list uses, so a count is
+    exactly the pages listed (tombstones excluded) and the rail never re-reads the vault."""
     directories = []
     if wiki.is_dir():
         excluded = excluded_dirs()
         for directory in sorted(wiki.iterdir()):
             if not directory.is_dir() or skip(directory.name) or directory.name in excluded:
                 continue
-            pages = [
-                path
-                for path in directory.rglob("*.md")
-                if not skip(path.name)
-                and not reserved(path)
-                and not (namespaces(path) & excluded)
-            ]
+            pages = [wiki / f"{row['path']}.md" for row in scan(directory.name)]
             if pages:
                 directories.append(
                     {
@@ -91,17 +87,12 @@ def namespace_about(directory: str, *, wiki: Path, within, split_frontmatter, re
 
 
 def resolve_page(path: str, *, wiki: Path, skip, excluded_dirs, namespaces, within,
-                 split_frontmatter) -> Path:
+                 tombstoned) -> Path:
+    """Resolve a link to a LIVE page. A tombstoned page is never served: a link to it follows a
+    live same-name copy when one exists, and is otherwise not found."""
     if ".." in path or path.startswith("/"):
         raise HTTPException(400, "bad path")
     candidate = wiki / (path + ".md")
-
-    def tombstoned(item: Path) -> bool:
-        try:
-            fm, _ = split_frontmatter(item.read_text(encoding="utf-8", errors="replace")[:4000])
-        except OSError:
-            return False
-        return str(fm.get("status") or "").strip().lower() == "tombstoned"
 
     # A full wiki-relative path names one exact page. Basename fallback below
     # must not redirect it to a deeper same-name shard (or claim ambiguity)
@@ -117,9 +108,8 @@ def resolve_page(path: str, *, wiki: Path, skip, excluded_dirs, namespaces, with
     hits = [item for item in search_root.rglob(name) if not skip(item.name)] \
         if search_root.is_dir() else []
 
+    hits = [item for item in hits if not tombstoned(item)]
     if hits:
-        live = [item for item in hits if not tombstoned(item)]
-        hits = live or hits
         if search_root == wiki and len(hits) > 1:
             excluded = excluded_dirs()
             preferred = [item for item in hits if not (namespaces(item) & excluded)] or hits
@@ -130,7 +120,7 @@ def resolve_page(path: str, *, wiki: Path, skip, excluded_dirs, namespaces, with
         if len(hits) > 1:
             raise HTTPException(409, "ambiguous page basename; use the full wiki-relative path")
         candidate = hits[0]
-    elif not candidate.is_file():
+    else:
         candidate = None
     if not candidate:
         raise HTTPException(404, "page not found")

@@ -28,6 +28,12 @@ from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Engine cron libs, appended so this extension's own modules keep precedence: staged one level
+# up (/opt/data/scripts/ holds /opt/data/scripts/<id>/), or scripts/cron/ in a repo checkout.
+_ENGINE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(_ENGINE_ROOT))
+sys.path.append(str(_ENGINE_ROOT.parent / "scripts" / "cron"))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import scope_lib  # noqa: E402
 import llm_lib    # noqa: E402  (vendored — reasoning-off default, truncation raises)
 
@@ -119,7 +125,7 @@ def main() -> int:
     for title, rows in (("Flagged off-scope", flagged), ("Uncertain — kept, operator review", uncertain)):
         if rows:
             L += [f"## {title}", ""] + [f"- [[{r}]]" for r in rows] + [""]
-    dash.write_text("\n".join(L) + "\n", encoding="utf-8")
+    generated_page.write(dash, "\n".join(L) + "\n")
 
     print(f"scope-classify: {int(time.monotonic()-start)}s used of {budget}s budget · {examined} examined · {len(flagged)} flagged · {len(kept)} in · "
           f"{len(uncertain)} uncertain-kept · {errors} model error(s) -> dashboards/scope-classify.md")

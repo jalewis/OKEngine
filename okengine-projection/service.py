@@ -20,10 +20,22 @@ APP_ROOT = Path(__file__).resolve().parent
 WRITER_DSN = os.environ.get("OKENGINE_PROJECTION_WRITER_DSN", "")
 READER_PASSWORD = os.environ.get("OKENGINE_PROJECTION_READER_PASSWORD", "")
 INTERVAL_SECONDS = max(60, int(os.environ.get("OKENGINE_PROJECTION_INTERVAL_SECONDS", "3600")))
+# Refresh on change (okengine#851). Typed MCP queries are withheld while the projection lags the live
+# corpus by ANY epoch, and an hourly-only rebuild left them withheld for most of every hour on a vault
+# being written to. Between rebuilds the service now polls the corpus epoch and re-projects (journal-
+# fed, incremental) as soon as it moves; INTERVAL_SECONDS remains the ceiling for a quiet vault so the
+# projection never ages past its staleness limit.
+POLL_SECONDS = max(1, int(os.environ.get("OKENGINE_PROJECTION_POLL_SECONDS", "15")))
+RETRY_SECONDS = 60      # after a failed rebuild; the old loop waited a whole interval
 SCHEMA = Path(os.environ.get("OKENGINE_PROJECTION_SCHEMA", "/app/db/projection-schema.sql"))
 
 
 async def bootstrap(conn) -> None:
+    async with projector.mutation_lock(conn):
+        await _bootstrap(conn)
+
+
+async def _bootstrap(conn) -> None:
     validate_secrets(WRITER_DSN, READER_PASSWORD)
     if not SCHEMA.is_file():
         raise RuntimeError(f"projection schema missing at {SCHEMA}")
@@ -71,6 +83,9 @@ async def rebuild(*, force_reconcile: bool = False) -> dict:
         raise RuntimeError("OKENGINE_PROJECTION_WRITER_DSN is not set")
     conn = await asyncpg.connect(WRITER_DSN)
     try:
+        # Bootstrap commits its short DDL transaction before the potentially long
+        # scan. Holding DROP VIEW's exclusive lock during that scan would block
+        # ordinary health/typed readers despite their otherwise lock-free contract.
         await bootstrap(conn)
         return await projector.project(
             conn, projector.VAULT, force_reconcile=force_reconcile)
@@ -90,6 +105,7 @@ async def health_check() -> dict:
         latest = await conn.fetchrow(
             "SELECT epoch,ok,error,finished_at FROM projection_runs ORDER BY epoch DESC LIMIT 1")
         scan = projector.scan_vault(projector.VAULT)
+        projector.require_readable_scan(scan)
         rows = int(await conn.fetchval("SELECT count(*) FROM pages"))
         files = len(scan.pages)
         churn = churn_since(scan.pages, health["finished_at"] if health else None)
@@ -218,10 +234,19 @@ def require_digest_health(mismatches: list[str], comparable: int) -> None:
 
 
 async def verify_reproducible() -> dict:
-    """Rebuild in a scratch schema and compare digest-anchored semantic rows and links."""
+    """Serialize scratch-schema lifecycle and live comparison with projection writers."""
     import asyncpg
-    scratch = "okengine_verify_projection"
     conn = await asyncpg.connect(WRITER_DSN)
+    try:
+        async with projector.mutation_lock(conn):
+            return await _verify_reproducible(conn)
+    finally:
+        await conn.close()
+
+
+async def _verify_reproducible(conn) -> dict:
+    """Rebuild in a scratch schema and compare digest-anchored semantic rows and links."""
+    scratch = "okengine_verify_projection"
     try:
         await conn.execute(f"DROP SCHEMA IF EXISTS {scratch} CASCADE")
         await conn.execute(f"CREATE SCHEMA {scratch}")
@@ -258,7 +283,6 @@ async def verify_reproducible() -> dict:
                 "scratch_epoch": stats["epoch"]}
     finally:
         await conn.execute(f"DROP SCHEMA IF EXISTS {scratch} CASCADE")
-        await conn.close()
 
 
 def require_reproducible(comparable: int, row_diff, link_diff) -> None:
@@ -269,20 +293,43 @@ def require_reproducible(comparable: int, row_diff, link_diff) -> None:
                            f"{len(link_diff)} link mismatches")
 
 
+def corpus_state(vault: Path | None = None) -> tuple[int, bool]:
+    """(live corpus epoch -- 0 when unreadable, per read_epoch; whether a mutation is in flight)."""
+    vault = projector.VAULT if vault is None else vault
+    return projector.corpus_epoch(vault), (vault / ".okengine/corpus/active.json").exists()
+
+
+async def wait_for_change(projected: int | None, budget: float) -> None:
+    """Sleep in POLL_SECONDS steps until the corpus has moved past ``projected`` with no mutation in
+    flight, or until ``budget`` seconds have passed."""
+    waited = 0.0
+    while waited < budget:
+        step = min(POLL_SECONDS, budget - waited)
+        await asyncio.sleep(step)
+        waited += step
+        epoch, active = corpus_state()
+        if epoch != projected and not active:
+            return
+
+
 async def run_service(once: bool, *, force_reconcile: bool = False) -> int:
+    projected: int | None = None
     while True:
         try:
             stats = (await rebuild(force_reconcile=True)
                      if force_reconcile else await rebuild())
             print(json.dumps(stats, sort_keys=True), flush=True)
+            projected = stats.get("corpus_epoch", projected)
         except Exception as exc:
             print(f"projection rebuild failed: {type(exc).__name__}: {exc}",
                   file=sys.stderr, flush=True)
             if once:
                 return 1
+            await asyncio.sleep(RETRY_SECONDS)
+            continue
         if once:
             return 0
-        await asyncio.sleep(INTERVAL_SECONDS)
+        await wait_for_change(projected, INTERVAL_SECONDS)
 
 
 def main(argv=None) -> int:

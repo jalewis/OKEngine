@@ -27,7 +27,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 _SENTINEL_RE = re.compile(
-    r"^@jitter:(hourly|2h|4h|6h|12h|daily|weekly)(?:@(\d{1,2})(?:,([0-6]))?)?$"
+    r"^@jitter:(hourly|2h|4h|6h|12h|daily|weekly)(?:@(\d{1,2})(?:,([0-6]))?)?\Z"
 )
 
 # Default hour (UTC) for once-a-day / weekly jobs. ~09:00 US-Eastern in summer;
@@ -92,7 +92,7 @@ def expand_one(expr: str, minute: int, *, hour: int = _DEFAULT_HOUR,
     }[base]
 
 
-_MORNING_RE = re.compile(r"^@morning(?::(\d{1,2}))?$")
+_MORNING_RE = re.compile(r"^@morning(?::(\d{1,2}))?\Z")
 # The deployment-wide morning hour for reader-facing daily briefs (gateway-local TZ).
 # One knob (OKENGINE_BRIEF_HOUR in .env) so ALL brief lanes cluster in the operator's
 # morning instead of each lane hardcoding an hour — the recurring "briefs run at the

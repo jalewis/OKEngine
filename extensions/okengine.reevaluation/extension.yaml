@@ -31,9 +31,11 @@ capabilities:
 config:
   # Composer/runtime contract: OKENGINE_REEVALUATION_<KEY>.
   # Which `type:` values are propositions (comma-separated). okcti's diagnostic class adds here.
-  proposition_types: {type: string, default: "prediction"}
+  # `assessment` is indexed by default (okengine#854): its consumer is okengine.inquiry's
+  # inquiry-analyze reassessment; predictions regrade reads only prediction rows.
+  proposition_types: {type: string, default: "prediction,assessment"}
   # Which `status:` values count as open/reevaluable.
   open_statuses: {type: string, default: "open,active"}
-  # Frontmatter fields whose refs are evidence/dependency edges (evidence[].source and body
-  # wikilinks are always scanned in addition).
+  # Frontmatter fields whose refs are evidence/dependency edges (evidence[].source,
+  # adversarial_evidence[].source and body wikilinks are always scanned in addition).
   ref_fields: {type: string, default: "subject,sources,basis"}

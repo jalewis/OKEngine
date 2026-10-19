@@ -19,6 +19,10 @@ path applies to agent writes —
   - int-shape coercion/reporting (digit-string -> int; junk reported, #196)
   - item-contract enforcement for list-of-dict fields (evidence[].direction etc., #211/#217):
     strict object/required-key contracts, enum case coercion, scalar and container shapes
+  - on a CREATE (``creating=True``), actor identity grounding (okengine#1012): the same predicate
+    the write path applies, ``okengine.actor_grounding``. An importer's curated provenance label
+    (``sources: [<curated list>]``) vouches here, because the importer IS that list's mirror; a
+    record with no label and no cited source that names and affirms the actor is reported.
 
 Enum/shape sources are the page's GOVERNING composed schema (base ⊕ pack ⊕ extensions), the
 same resolution the write path uses. Fail-open like the runtime gate: a broken/missing schema
@@ -44,12 +48,15 @@ Env: none (pure library). Staged with the cron fleet; imports the baked schema_v
 from __future__ import annotations
 
 import datetime as _dt
+import importlib
 import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import schema_lib  # noqa: E402
+# schema_lib has put the engine package on sys.path (it imports from it itself).
+from okengine import actor_types  # noqa: E402
 
 # tools.schema_validator ships in the Hermes image at /opt/hermes/tools/ (repo: tools/).
 for _p in ("/opt/hermes", str(Path(__file__).resolve().parents[2])):
@@ -161,7 +168,28 @@ def _guard_items(fm: dict, schema: dict) -> list[str]:
     return problems
 
 
-def guard(fm: dict, *, vault: Path, namespace: str = "") -> list[str]:
+def actor_identity_problems(fm: dict, *, vault: Path, schema: dict | None = None) -> list[str]:
+    """The write path's actor grounding, for a direct writer creating an actor (okengine#1012).
+
+    ``schema`` decides which types are actors (okengine#1020); without one, only the engine's
+    ``actor`` type is. Never fail-open: a guard that cannot load its predicate says so, so the
+    record lands review-flagged instead of silently unchecked."""
+    if not actor_types.is_actor_type(schema or {}, fm.get("type")):
+        return []
+    try:
+        import engine_package
+        engine_package.ensure()
+        actor_grounding = importlib.import_module("okengine.actor_grounding")
+    except ImportError as exc:
+        return [f"actor identity grounding unavailable ({exc}); the record was not checked"]
+    failure = actor_grounding.ground_page(
+        fm, actor_grounding.WikiSources(Path(vault) / "wiki"), labels_vouch=True)
+    if failure is None:
+        return []
+    return [f"actor identity is not grounded in its cited sources ({failure})"]
+
+
+def guard(fm: dict, *, vault: Path, namespace: str = "", creating: bool = False) -> list[str]:
     """Apply the write-path guards to a direct-writer's frontmatter IN PLACE.
 
     Coerces everything unambiguous (enum casing, list/int shapes, item numbers/casing) and
@@ -196,5 +224,7 @@ def guard(fm: dict, *, vault: Path, namespace: str = "") -> list[str]:
             problems.append(enum_reason)
     except Exception:
         pass
+    if creating:
+        problems += actor_identity_problems(fm, vault=vault, schema=schema)
     _revoke_invalid_authority_approval(fm, problems)
     return problems

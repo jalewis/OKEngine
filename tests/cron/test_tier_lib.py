@@ -178,3 +178,108 @@ def test_tier_file_outside_vault_and_status_from_frontmatter(tmp_path):
     prediction.parent.mkdir()
     prediction.write_text("---\nstatus: open\nresolves_by: 2020-01-01\n---\n", encoding="utf-8")
     assert TL.tier_of_file(prediction, wiki, CFG, TODAY) == "hot"
+
+
+# okengine#991 audit 2 [10]: tombstoning stamps `last_updated`, and an entity carrying only the
+# envelope dates fell back to it, so a just-retired page tiered HOT. Retired is never recent.
+@pytest.mark.parametrize("page_type", ["actor", "malware", "concept", None])
+def test_a_just_tombstoned_page_tiers_cold_whatever_its_type(page_type):
+    fm = {"status": "tombstoned", "last_updated": "2026-06-15T09:00:00Z", "created": "2026-06-01"}
+    if page_type:
+        fm["type"] = page_type
+    assert t("entities/a/x", fm) == "cold"
+
+
+@pytest.mark.parametrize("status", ["Tombstoned", " TOMBSTONED ", "tombstoned"])
+def test_tombstone_spelling_matches_okf_migrate(status):
+    sys.path.insert(0, str(REPO / "scripts" / "cron"))
+    import okf_migrate
+    fm = {"status": status, "updated": "2026-06-14"}
+    assert okf_migrate.is_tombstoned(fm) and TL.is_tombstoned(fm)
+    assert t("entities/a/x", fm) == "cold"
+    assert t("predictions/x", {**fm, "resolves_by": "2026-06-20"}) == "cold"
+    assert t("sources/2026/06/x", fm) == "cold"   # beats a from_path date too
+
+
+@pytest.mark.parametrize("fm", [None, {}, {"status": "active"}, {"status": "tombstone"},
+                                {"status": ""}, {"status": None}])
+def test_live_pages_are_not_tombstoned(fm):
+    assert not TL.is_tombstoned(fm)
+
+
+def test_live_pages_keep_their_recency_tier():
+    assert t("entities/a/x", {"status": "active", "last_updated": "2026-06-15"}) == "hot"
+    assert t("entities/a/x", {"last_updated": "2026-01-15"}) == "warm"
+    assert t("sources/2026/06/x", {"status": "active"}) == "hot"
+
+
+def test_untiered_namespace_stays_untiered_even_when_tombstoned():
+    assert t("lookup/x", {"status": "tombstoned"}) is None
+
+
+def _long_fm(status: str) -> str:
+    rows = "\n".join(f"  - https://example.org/report/{i:05d}-a-fairly-long-report-slug"
+                     for i in range(150))
+    return f"---\ntype: actor\nlast_updated: 2026-06-15\nsources:\n{rows}\nstatus: {status}\n---\n# x\n"
+
+
+def test_fm_of_reads_the_whole_envelope_past_4000_chars(tmp_path):
+    page = tmp_path / "x.md"
+    page.write_text(_long_fm("tombstoned"))
+    assert page.read_text().index("\n---\n# x") > 4000
+    assert TL.fm_of(page).get("status") == "tombstoned"
+
+
+def test_tier_of_file_sees_a_tombstone_in_a_from_path_namespace(tmp_path):
+    wiki = tmp_path / "wiki"
+    live = wiki / "sources/2026/06/live.md"
+    gone = wiki / "sources/2026/06/gone.md"
+    live.parent.mkdir(parents=True)
+    live.write_text("---\ntype: source\n---\n# live\n")
+    gone.write_text("---\ntype: source\nstatus: tombstoned\n---\n# gone\n")
+    assert TL.tier_of_file(live, wiki, CFG, TODAY) == "hot"
+    assert TL.tier_of_file(gone, wiki, CFG, TODAY) == "cold"
+    long_gone = wiki / "entities/a/long.md"
+    long_gone.parent.mkdir(parents=True)
+    long_gone.write_text(_long_fm("tombstoned"))
+    assert TL.tier_of_file(long_gone, wiki, CFG, TODAY) == "cold"
+
+
+def _counting_fm_of(monkeypatch):
+    calls = []
+    real = TL.fm_of
+
+    def counted(path):
+        calls.append(path)
+        return real(path)
+
+    monkeypatch.setattr(TL, "fm_of", counted)
+    return calls
+
+
+def test_tier_fm_pre_filter_matches_tombstoned_in_any_case(tmp_path):
+    """The from_path pre-filter must agree with is_tombstoned, which ignores case."""
+    page = tmp_path / "gone.md"
+    page.write_text("---\ntype: source\nstatus: TOMBSTONED\n---\n")
+    nscfg = {"from_path": True}
+    assert TL.tier_fm(page, nscfg) == {"type": "source", "status": "TOMBSTONED"}
+
+
+def test_tier_fm_does_not_parse_a_live_from_path_page(tmp_path, monkeypatch):
+    """A bulk sources walk stays cheap: a from_path namespace without a status_field parses only
+    pages whose envelope spells `tombstoned`."""
+    page = tmp_path / "live.md"
+    page.write_text("---\ntype: source\ntitle: live\n---\n")
+    calls = _counting_fm_of(monkeypatch)
+    assert TL.tier_fm(page, {"from_path": True}) == {}
+    assert calls == []
+
+
+def test_tier_fm_parses_when_the_namespace_needs_more_than_status(tmp_path, monkeypatch):
+    page = tmp_path / "open.md"
+    page.write_text("---\ntype: prediction\nstate: open\n---\n")
+    calls = _counting_fm_of(monkeypatch)
+    assert TL.tier_fm(page, {"from_path": True, "status_field": "state"}) == {
+        "type": "prediction", "state": "open"}
+    assert TL.tier_fm(page, {}) == {"type": "prediction", "state": "open"}
+    assert calls == [page, page]

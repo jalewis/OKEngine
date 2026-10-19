@@ -101,7 +101,20 @@ apply_carried_patch "$ENGINE_DIR/patches/cron-plus/run-deadline-env.patch" \
     "OKEngine run deadline published to the lane"
 apply_carried_patch "$ENGINE_DIR/patches/cron-plus/slug-identity-guard.patch" \
     "OKEngine deterministic direct-writer identity guard"
+# The job store's lock moves to a sidecar that os.replace never swaps out (okengine#850);
+# deploy-cron-plus-jobs.sh takes the same lock when it writes jobs.json.
+apply_carried_patch "$ENGINE_DIR/patches/cron-plus/jobs-store-lock.patch" \
+    "OKEngine stable job-store lock"
+# Every tick closes any lane's orphaned `running` record, not only the next start of that lane
+# (okengine#1010). Imports the run_records overlay copied below.
+apply_carried_patch "$ENGINE_DIR/patches/cron-plus/reconcile-orphans-on-tick.patch" \
+    "OKEngine per-tick orphaned-run reconciliation"
+# The fall-back fold policy: an explicit-hour slot fires once in the repeated hour, a star-hour
+# slot in both passes (okengine#1055, #1061 [4]). Replaces the pin's claim-time guard in jobs.py.
+apply_carried_patch "$ENGINE_DIR/patches/cron-plus/dst-fold.patch" \
+    "OKEngine DST fall-back fold policy"
 cp "$ENGINE_DIR/patches/cron-plus/after_ordering.py" "$DEST/after_ordering.py"
+cp "$ENGINE_DIR/patches/cron-plus/dst_fold.py" "$DEST/dst_fold.py"
 cp "$ENGINE_DIR/patches/cron-plus/run_receipts.py" "$DEST/run_receipts.py"
 cp "$ENGINE_DIR/patches/cron-plus/model_slots.py" "$DEST/model_slots.py"
 cp "$ENGINE_DIR/patches/cron-plus/run_timeout.py" "$DEST/run_timeout.py"

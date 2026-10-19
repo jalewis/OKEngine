@@ -116,9 +116,10 @@ CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-scripts.sh
 CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-plus-jobs.sh
 ```
 
-Prefer `deploy.sh`: it pins `OKENGINE_GATEWAY_IMAGE` and the generated
-`docker-compose.okengine-image.yml` override in `.env`, so a later bare Compose run keeps this
-deployment on the reviewed engine revision. The manual path must export the exact immutable image
+Prefer `deploy.sh`: it pins `OKENGINE_GATEWAY_IMAGE`, `OKENGINE_ENGINE_IMAGE_TAG` (the
+deployment-scoped tag of the reader/mcp/cockpit/review-write/operation-runner/projection images)
+and the generated `docker-compose.okengine-image.yml` override in `.env`, so a later bare Compose
+run keeps this deployment on the reviewed engine revision. The manual path must export the exact immutable image
 reference before Compose; it never consumes `hermes-agent:latest`.
 Full procedure: `docs/deploy-a-new-domain.md` §2 in the engine repo; the domain-pack
 spec is §1.

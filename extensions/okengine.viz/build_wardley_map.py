@@ -36,6 +36,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Engine cron libs, appended so this extension's own modules keep precedence: staged one level
+# up (/opt/data/scripts/ holds /opt/data/scripts/<id>/), or scripts/cron/ in a repo checkout.
+_ENGINE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(_ENGINE_ROOT))
+sys.path.append(str(_ENGINE_ROOT.parent / "scripts" / "cron"))
+import frontmatter_lib  # noqa: E402
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import panel_svg    # noqa: E402  (sibling: server-side SVG — the chart lives IN the body)
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
@@ -46,7 +53,6 @@ EVO_FIELD = os.environ.get(
 VAL_FIELD = os.environ.get(
     "VIZ_VALUE_FIELD", os.environ.get("OKENGINE_VIZ_VALUE_FIELD", "value_chain")
 )
-_FM = re.compile(r"\A---[ \t]*\n(.*?\n)---", re.S)
 # final path segment — concepts may be letter-sharded ([[concepts/t/slug]]) or flat ([[concepts/slug]])
 _CLINK = re.compile(r"\[\[\s*concepts/(?:[a-z0-9._-]+/)*([a-z0-9][a-z0-9-]*)\s*(?:[|#\]])")
 # any wikilink's final path segment (handles [[entities/vendor/d/diligent]], [[../x/y]], [[bare-slug]])
@@ -57,12 +63,9 @@ _EVO = {"genesis": 0.12, "custom": 0.37, "custom-built": 0.37, "product": 0.62,
 
 
 def _fm(p: Path) -> dict:
-    try:
-        import yaml
-        m = _FM.match(p.read_text(encoding="utf-8", errors="replace")[:4000])
-        return (yaml.safe_load(m.group(1)) or {}) if m else {}
-    except Exception:
-        return {}
+    """The concept's whole frontmatter envelope (frontmatter_lib). A 4000-char window lost a
+    field declared below a long list, so the map placed the concept by heuristic (okengine#993)."""
+    return frontmatter_lib.read_frontmatter(p)
 
 
 def _num(v):
@@ -211,7 +214,7 @@ def main() -> int:
     L.append("")
     out = WIKI / "dashboards" / "wardley.md"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("\n".join(L), encoding="utf-8")
+    generated_page.write(out, "\n".join(L))
     print(f"build-wardley-map: {len(nodes)} concept(s), {heuristic_x} heuristic-positioned -> "
           "wiki/dashboards/wardley.md")
     print(json.dumps({"wakeAgent": False}))

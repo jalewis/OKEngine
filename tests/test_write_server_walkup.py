@@ -254,3 +254,37 @@ def test_governing_resolves_subdomain_schema(tmp_path, monkeypatch):
     root = m._governing(Path(str(tmp_path) + "/wiki/entities/x.md"))
     assert "advisory" in (sub.get("types") or {}), "sub-domain page did not resolve the sub-domain schema"
     assert "advisory" not in (root.get("types") or {}), "root page leaked the sub-domain type"
+
+
+def test_a_wiki_root_page_resolves_the_same_schema_for_dot_and_empty_namespace(tmp_path, monkeypatch):
+    """Pins the equivalence the line-64 dispositions in mutation/survivors.json rest on
+    (okengine#1047). For a page directly under wiki/, `_governing` computes nsdir "." and
+    normalizes it to "". pathlib collapses a "." segment, so `wiki/.` IS `wiki/`, and
+    `merged_schema(vault, ".")` resolves exactly what `merged_schema(vault, "")` does. A mutant that
+    skips the normalization therefore cannot change a result. If schema_lib ever treats "."
+    differently, this fails and those dispositions must be revisited."""
+    (tmp_path / "wiki" / "acme").mkdir(parents=True)
+    (tmp_path / "wiki" / "schema.yaml").write_text(
+        "types: {entity: {required: [type]}}\n", encoding="utf-8")
+    (tmp_path / "wiki" / "acme" / "schema.yaml").write_text(
+        "types: {advisory: {required: [type]}}\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    schema_lib = m._governing.__globals__["schema_lib"]
+    dotted, empty = schema_lib.merged_schema(tmp_path, "."), schema_lib.merged_schema(tmp_path, "")
+    assert dotted == empty
+    assert "entity" in (empty.get("types") or {}) and "advisory" not in (empty.get("types") or {})
+    assert m._governing(tmp_path / "wiki" / "x.md") == empty
+
+
+def test_a_subdomain_named_below_dot_still_resolves_its_own_schema(tmp_path, monkeypatch):
+    """Only the exact "." is the wiki root. A sub-domain whose name sorts before "." ("-acme":
+    '-' is 0x2d, '.' is 0x2e) must still resolve its own schema, so `_governing` cannot widen the
+    root normalization to an ordering test (okengine#1047: kills the line-64 `<` and `<=` mutants,
+    which rewrote "-acme/entities" to the root namespace)."""
+    (tmp_path / "wiki" / "-acme" / "entities").mkdir(parents=True)
+    (tmp_path / "schema.yaml").write_text("types: {entity: {required: [type]}}\n", encoding="utf-8")
+    (tmp_path / "wiki" / "-acme" / "schema.yaml").write_text(
+        "types: {advisory: {required: [type]}}\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    sub = m._governing(tmp_path / "wiki" / "-acme" / "entities" / "x.md")
+    assert "advisory" in (sub.get("types") or {}), "a '-acme' sub-domain page resolved the root schema"

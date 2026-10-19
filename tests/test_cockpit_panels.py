@@ -1333,3 +1333,325 @@ def test_prediction_confidence_accepts_the_full_sanctioned_scale(tmp_path, monke
     assert app._conf({"confidence": "HIGH"}) == 0.81
     monkeypatch.setenv("PREDICTION_CONFIDENCE_SCALE", "not-json")
     assert app._conf({"confidence": "high"}) == expected["high"]
+
+
+# --- okengine#817: "how many lanes are red" and "how long" are different facts. The Ops panel
+# showed only the count, so 33 lanes red for up to a month read exactly like 33 red since
+# breakfast — and did, on a live deployment, for four weeks.
+
+
+def _fleet(w, body="- ok: 94 · stale: 0 · errored: 2 · off-model: 0 · never-run: 0\n"):
+    (w / "dashboards").mkdir(parents=True, exist_ok=True)
+    (w / "dashboards" / "fleet-health.md").write_text(
+        "---\ntitle: Fleet health\n---\n**attention needed**\n" + body, encoding="utf-8")
+
+
+def _escalation(w, lanes):
+    (w / "dashboards" / ".fleet-escalation.json").write_text(
+        json.dumps({"updated": "2026-09-21T00:00:00Z", "lanes": lanes}), encoding="utf-8")
+
+
+def _ops_metrics(tmp_path, monkeypatch):
+    m = _load(tmp_path, monkeypatch)
+    return {x["label"]: x for x in m.api_ops()["summary"]["metrics"]}
+
+
+def test_ops_summary_reports_how_long_the_oldest_lane_has_been_red(tmp_path, monkeypatch):
+    import datetime as _dt
+    w = tmp_path / "wiki"
+    _fleet(w)
+    old = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=21)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    recent = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _escalation(w, {"wiki-health-audit": {"status": "errored", "consecutive": 1941, "red_since": old},
+                    "just-broke": {"status": "errored", "consecutive": 3, "red_since": recent}})
+    by = _ops_metrics(tmp_path, monkeypatch)
+    assert "oldest red lane" in by, by
+    value = by["oldest red lane"]["value"]
+    assert "wiki-health-audit" in value and "21d" in value, value
+    assert "1941" in value, "the streak is what distinguishes a standing outage from a blip"
+    assert by["oldest red lane"]["tone"] == "crit"
+
+
+def test_a_green_fleet_reports_no_oldest_red_lane(tmp_path, monkeypatch):
+    w = tmp_path / "wiki"
+    _fleet(w, "- ok: 94 · stale: 0 · errored: 0 · off-model: 0 · never-run: 0\n")
+    _escalation(w, {})
+    assert "oldest red lane" not in _ops_metrics(tmp_path, monkeypatch)
+
+
+def test_a_missing_or_unreadable_escalation_sidecar_is_not_an_error(tmp_path, monkeypatch):
+    w = tmp_path / "wiki"
+    _fleet(w)
+    assert "oldest red lane" not in _ops_metrics(tmp_path, monkeypatch)   # absent
+    (w / "dashboards" / ".fleet-escalation.json").write_text("{ not json", encoding="utf-8")
+    assert "oldest red lane" not in _ops_metrics(tmp_path, monkeypatch)   # malformed
+    _escalation(w, {"odd": "not-a-mapping", "undated": {"status": "errored"},
+                    "bad-date": {"status": "errored", "red_since": "last tuesday"}})
+    assert "oldest red lane" not in _ops_metrics(tmp_path, monkeypatch)   # nothing dateable
+    # a sidecar whose `lanes` is not a mapping at all — shape from a future/foreign writer
+    (w / "dashboards" / ".fleet-escalation.json").write_text(
+        json.dumps({"updated": "x", "lanes": ["wiki-health-audit"]}), encoding="utf-8")
+    assert "oldest red lane" not in _ops_metrics(tmp_path, monkeypatch)
+
+
+_NOW = __import__("datetime").datetime(2026, 9, 21, 12, 0, tzinfo=__import__("datetime").timezone.utc)
+
+
+def _frozen(m, monkeypatch):
+    """Pin the clock the ops summary measures red age against."""
+    import datetime as real
+
+    class Frozen(real.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _NOW
+
+    monkeypatch.setattr(m, "datetime", __import__("types").SimpleNamespace(
+        datetime=Frozen, timezone=real.timezone))
+
+
+def _oldest(tmp_path, monkeypatch, lanes):
+    w = tmp_path / "wiki"
+    (w / "dashboards").mkdir(parents=True, exist_ok=True)
+    _escalation(w, lanes)
+    m = _load(tmp_path, monkeypatch)
+    _frozen(m, monkeypatch)
+    return m._oldest_red()
+
+
+def test_oldest_red_measures_age_in_exact_days(tmp_path, monkeypatch):
+    assert _oldest(tmp_path, monkeypatch, {"a": {"red_since": "2026-09-20T00:00:00Z"}}) == \
+        ("a", 1.5, None)
+
+
+def test_oldest_red_keeps_the_first_of_two_equally_old_lanes(tmp_path, monkeypatch):
+    lanes = {"young": {"red_since": "2026-09-18T12:00:00Z", "consecutive": 1},
+             "old": {"red_since": "2026-09-16T12:00:00Z", "consecutive": 2},
+             "tie": {"red_since": "2026-09-16T12:00:00Z", "consecutive": 7}}
+    assert _oldest(tmp_path, monkeypatch, lanes) == ("old", 5.0, 2)
+
+
+@pytest.mark.parametrize("bad", ["not-a-dict", {"red_since": 5}, {"consecutive": 3},
+                                 {"red_since": ""}, {"red_since": "yesterday"}])
+def test_oldest_red_skips_an_unreadable_lane_and_reads_the_rest(tmp_path, monkeypatch, bad):
+    lanes = {"broken": bad, "good": {"red_since": "2026-09-20T12:00:00Z"}}
+    assert _oldest(tmp_path, monkeypatch, lanes) == ("good", 1.0, None)
+
+
+@pytest.mark.parametrize("days, tone", [(0.5, "warn"), (1.0, "crit"), (1.5, "crit")])
+def test_a_lane_red_for_a_day_or_more_is_critical(tmp_path, monkeypatch, days, tone):
+    w = tmp_path / "wiki"
+    _fleet(w)
+    m = _load(tmp_path, monkeypatch)
+    monkeypatch.setattr(m, "_oldest_red", lambda: ("lane", days, None))
+    metrics = {x["label"]: x for x in m.api_ops()["summary"]["metrics"]}
+    assert metrics["oldest red lane"]["tone"] == tone
+
+
+def test_a_declared_actor_type_is_quarantined_like_an_actor(tmp_path, monkeypatch):
+    """okengine#1020: the actor panels read the schema's declared actor types. Red before: an
+    `intrusion-set` whose evidence defines a ClickFix variant was listed as a live actor."""
+    (tmp_path / "schema.yaml").write_text(
+        "types:\n  intrusion-set: {required: [type], role: actor}\n  malware: {required: [type]}\n",
+        encoding="utf-8")
+    ent = tmp_path / "wiki" / "entities" / "t"
+    ent.mkdir(parents=True)
+    body = "A new ClickFix variant, dubbed TerminalFix, tricks users into running commands.\n"
+    (ent / "terminalfix.md").write_text(
+        f"---\ntype: intrusion-set\ntitle: TerminalFix\n---\n{body}", encoding="utf-8")
+    (ent / "terminalfix-malware.md").write_text(
+        f"---\ntype: malware\ntitle: TerminalFix\n---\n{body}", encoding="utf-8")
+    (ent / "unvalidated.md").write_text(
+        "---\ntype: intrusion-set\ntitle: Unvalidated\nactor_identity_validated: false\n---\nx\n",
+        encoding="utf-8")
+    (ent / "shinyhunters.md").write_text(
+        "---\ntype: intrusion-set\ntitle: ShinyHunters\n---\nShinyHunters is a cybercriminal group.\n",
+        encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    assert [r["title"] for r in m._ds_rows({"dir": "entities", "type": "intrusion-set"})] == [
+        "ShinyHunters"]
+    assert [r["title"] for r in m._ds_rows({"dir": "entities", "type": "malware"})] == [
+        "TerminalFix"], "a non-actor type is never quarantined as an actor"
+
+
+def test_the_actor_schema_is_reread_when_it_changes_and_absent_is_empty(tmp_path, monkeypatch):
+    m = _load(tmp_path, monkeypatch)
+    assert m._actor_schema() == {}
+    schema = tmp_path / "schema.yaml"
+    schema.write_text("types:\n  a: {role: actor}\n", encoding="utf-8")
+    assert m._actor_schema()["types"]["a"]["role"] == "actor"
+    assert m._actor_schema() is m._actor_schema(), "parsed once per file version"
+    schema.write_text("types:\n  bb: {role: actor}\n", encoding="utf-8")
+    assert "bb" in m._actor_schema()["types"]
+    schema.write_text("- not a mapping\n", encoding="utf-8")
+    assert m._actor_schema() == {}
+    schema.write_text("types: [unclosed\n", encoding="utf-8")
+    assert m._actor_schema() == {}
+
+
+# ── okengine#1024: the cockpit's embed and ref-title memos revalidate instead of living forever ──
+class _Clock:
+    """A monotonic clock the test advances by hand."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def test_a_cockpit_embed_of_a_reshelved_page_follows_it(tmp_path, monkeypatch):
+    """Red before #1024: the memo kept the old path and the embed rendered 'unreadable embed'."""
+    old = tmp_path / "wiki" / "dashboards" / "board.md"
+    old.parent.mkdir(parents=True)
+    old.write_text("---\ntype: dashboard\n---\nBOARD-BODY\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    assert "BOARD-BODY" in m._resolve_embeds("![[board]]")
+    new = tmp_path / "wiki" / "dashboards" / "b" / "board.md"
+    new.parent.mkdir()
+    old.rename(new)
+    out = m._resolve_embeds("![[board]]")
+    assert "BOARD-BODY" in out and "unreadable" not in out
+
+
+def test_a_cockpit_embed_written_before_its_target_resolves_later(tmp_path, monkeypatch):
+    (tmp_path / "wiki" / "dashboards").mkdir(parents=True)
+    m = _load(tmp_path, monkeypatch)
+    clock = _Clock()
+    monkeypatch.setattr(m._EMBED_PATH_CACHE, "_clock", clock)
+    assert "missing embed" in m._resolve_embeds("![[later]]")
+    (tmp_path / "wiki" / "dashboards" / "later.md").write_text(
+        "---\ntype: dashboard\n---\nLATER\n", encoding="utf-8")
+    assert "missing embed" in m._resolve_embeds("![[later]]"), "a miss is kept inside its TTL"
+    clock.now += m._EMBED_PATH_CACHE.miss_ttl
+    assert "LATER" in m._resolve_embeds("![[later]]")
+
+
+def test_a_ref_title_sees_a_target_created_after_the_first_lookup(tmp_path, monkeypatch):
+    """Red before #1024: `lru_cache` kept the '' of a not-yet-written page for the process life."""
+    (tmp_path / "wiki" / "entities").mkdir(parents=True)
+    m = _load(tmp_path, monkeypatch)
+    clock = _Clock()
+    monkeypatch.setattr(m._REF_TITLE_CACHE, "_clock", clock)
+    assert m._ref_title("entities/apt29") == ""
+    (tmp_path / "wiki" / "entities" / "apt29.md").write_text(
+        "---\ntype: actor\ntitle: APT29\n---\n", encoding="utf-8")
+    clock.now += m._REF_TITLE_CACHE.miss_ttl
+    assert m._ref_title("entities/apt29") == "APT29"
+
+
+def test_a_ref_title_follows_a_retitle(tmp_path, monkeypatch):
+    page = tmp_path / "wiki" / "entities" / "apt29.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("---\ntype: actor\ntitle: Old Name\n---\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    assert m._ref_title("entities/apt29") == "Old Name"
+    page.write_text("---\ntype: actor\ntitle: The New Name\n---\n", encoding="utf-8")
+    assert m._ref_title("entities/apt29") == "The New Name"
+
+
+@pytest.mark.parametrize("rel", ["../secret", "entities/../../secret", "/etc/hostname"])
+def test_a_ref_title_never_reads_outside_the_vault(tmp_path, monkeypatch, rel):
+    """Red before #1024: `rel` comes from page frontmatter and `WIKI / f"{rel}.md"` followed `../`
+    out of the wiki."""
+    (tmp_path / "wiki" / "entities").mkdir(parents=True)
+    (tmp_path / "secret.md").write_text("---\ntitle: Outside The Vault\n---\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    assert m._ref_title(rel) == ""
+
+
+def test_the_cockpit_lookup_memos_are_bounded(tmp_path, monkeypatch):
+    (tmp_path / "wiki" / "dashboards").mkdir(parents=True)
+    m = _load(tmp_path, monkeypatch)
+    for cache in (m._REF_TITLE_CACHE, m._EMBED_PATH_CACHE):
+        monkeypatch.setattr(cache, "maxsize", 3)
+    for n in range(10):
+        m._ref_title(f"nope-{n}")
+        m._embed_rglob(f"nope-{n}.md")
+    assert len(m._REF_TITLE_CACHE) == 3 and len(m._EMBED_PATH_CACHE) == 3
+
+
+# ── v0.15.11 audit [10]/[19]: actor types come from each page's GOVERNING schema ───────────────
+def _subdomain_actor_vault(tmp_path):
+    """Root schema knows no `intrusion-set`; the walk-up sub-domain `cti` declares it an actor."""
+    (tmp_path / "schema.yaml").write_text("types:\n  report: {required: [type]}\n",
+                                          encoding="utf-8")
+    sub = tmp_path / "wiki" / "cti"
+    (sub / "entities").mkdir(parents=True)
+    (sub / "schema.yaml").write_text(
+        "types:\n  intrusion-set: {required: [type], role: actor}\n  malware: {required: [type]}\n",
+        encoding="utf-8")
+    return sub / "entities"
+
+
+def test_a_subdomain_actor_type_is_quarantined_like_an_actor(tmp_path, monkeypatch):
+    """Red before the fix: the cockpit read only the root schema, so an `intrusion-set` the
+    sub-domain declares `role: actor` was never judged as an actor, and a page the write path had
+    stamped `actor_identity_validated: false` stayed in the analyst dataset."""
+    ent = _subdomain_actor_vault(tmp_path)
+    body = "A new ClickFix variant, dubbed TerminalFix, tricks users into running commands.\n"
+    (ent / "terminalfix.md").write_text(
+        f"---\ntype: intrusion-set\ntitle: TerminalFix\n---\n{body}", encoding="utf-8")
+    (ent / "unvalidated.md").write_text(
+        "---\ntype: intrusion-set\ntitle: Unvalidated\nactor_identity_validated: false\n---\nx\n",
+        encoding="utf-8")
+    (ent / "shinyhunters.md").write_text(
+        "---\ntype: intrusion-set\ntitle: ShinyHunters\n---\nShinyHunters is a cybercriminal group.\n",
+        encoding="utf-8")
+    (ent / "tool.md").write_text(
+        "---\ntype: malware\ntitle: Unvalidated Tool\nactor_identity_validated: false\n---\nx\n",
+        encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    assert [r["title"] for r in m._ds_rows({"dir": "cti/entities", "type": "intrusion-set"})] == [
+        "ShinyHunters"]
+    assert [r["title"] for r in m._ds_rows({"dir": "cti/entities", "type": "malware"})] == [
+        "Unvalidated Tool"], "a type the sub-domain does not call an actor is never quarantined"
+
+
+def test_a_subdomain_actor_declaration_does_not_leak_to_root_pages(tmp_path, monkeypatch):
+    """The same type at the vault root is governed by the root schema, which does not declare it."""
+    _subdomain_actor_vault(tmp_path)
+    root_ent = tmp_path / "wiki" / "entities"
+    root_ent.mkdir()
+    (root_ent / "rootset.md").write_text(
+        "---\ntype: intrusion-set\ntitle: Root Set\nactor_identity_validated: false\n---\nx\n",
+        encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    assert [r["title"] for r in m._ds_rows({"dir": "entities"})] == ["Root Set"]
+
+
+def test_a_ref_title_with_an_unresolvable_path_is_empty(tmp_path, monkeypatch):
+    (tmp_path / "wiki").mkdir()
+    m = _load(tmp_path, monkeypatch)
+    assert m._ref_title("bad\x00rel") == ""
+
+
+def test_rows_without_a_page_path_and_dirs_outside_the_wiki_use_the_root_schema(tmp_path,
+                                                                               monkeypatch):
+    """A row with no `_rel` sits in its dataset directory; a directory outside the wiki has no
+    sub-domain, so the root schema governs both."""
+    _subdomain_actor_vault(tmp_path)
+    m = _load(tmp_path, monkeypatch)
+    assert m._row_dir({"_sub": "cti/entities"}) == m.WIKI / "cti" / "entities"
+    assert m._row_dir({"_sub": "cti/entities", "_rel": "a/x"}) == m.WIKI / "cti" / "entities" / "a"
+    root = m._actor_schema()
+    assert "intrusion-set" not in root.get("types", {})
+    assert m._governing_actor_schema(tmp_path / "elsewhere", {}) is root
+    sub = m._governing_actor_schema(m.WIKI / "cti" / "entities", {})
+    assert sub["types"]["intrusion-set"]["role"] == "actor"
+
+
+def test_an_ambiguous_cockpit_embed_resolves_to_the_first_page_in_path_order(tmp_path, monkeypatch):
+    """The walk order is the filesystem's; the pick must not depend on it."""
+    for shard in ("b", "a", "c"):
+        page = tmp_path / "wiki" / "dashboards" / shard / "board.md"
+        page.parent.mkdir(parents=True)
+        page.write_text(f"---\ntype: dashboard\n---\nBODY-{shard}\n", encoding="utf-8")
+    m = _load(tmp_path, monkeypatch)
+    assert m._embed_rglob("board.md") == tmp_path / "wiki" / "dashboards" / "a" / "board.md"
+
+
+def test_the_wiki_root_itself_is_governed_by_the_root_schema(tmp_path, monkeypatch):
+    _subdomain_actor_vault(tmp_path)
+    m = _load(tmp_path, monkeypatch)
+    assert m._governing_actor_schema(m.WIKI, {}) is m._actor_schema()

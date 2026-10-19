@@ -60,7 +60,8 @@ def _generation_clause(probe: str) -> str:
 _CLK_TCK = None
 
 
-def _run_clause(tmp_path, *, container_age_h, records, pid1_mtime_now=False, pid1_stat=True):
+def _run_clause(tmp_path, *, container_age_h, records, pid1_mtime_now=False, pid1_stat=True,
+                raw_files=None):
     """Execute the REAL clause against fixtures standing in for /proc and the runs directory.
 
     PID 1's command name contains spaces and parentheses on purpose: /proc/<pid>/stat field 2 is
@@ -93,6 +94,13 @@ def _run_clause(tmp_path, *, container_age_h, records, pid1_mtime_now=False, pid
     for name, (status, anchor, offset) in records.items():
         written = anchors[anchor] + offset
         f = runs / f"{name}.json"
+        f.write_text('{"status": "%s"}' % status, encoding="utf-8")
+        os.utime(f, (written, written))
+    # Files under runs/ that are NOT receipts -- a backup left beside one, an editor swapfile.
+    # The key is the FULL filename, so a test can put a non-.json suffix in the scanned tree.
+    for name, (status, anchor, offset) in (raw_files or {}).items():
+        written = anchors[anchor] + offset
+        f = runs / name
         f.write_text('{"status": "%s"}' % status, encoding="utf-8")
         os.utime(f, (written, written))
 
@@ -172,3 +180,40 @@ def test_the_template_and_the_deploy_override_cannot_drift():
             "skeleton and deploy.sh gateway healthchecks differ; they must be changed together. "
             "This compares the WHOLE probe: comparing only the find expression would not notice the "
             "generation start being computed differently in one copy")
+
+
+def test_a_backup_beside_a_receipt_does_not_fail_the_probe(tmp_path):
+    """okengine#835. The clause scanned every regular file under runs/, so a backup of a receipt
+    counted as a live run.
+
+    Observed on okcti-test: an orphaned `policy-audit` receipt was reconciled to a terminal status
+    and the original was preserved beside it as `<ts>.json.orphaned.bak`. The receipt was fixed and
+    the gateway stayed unhealthy, because the BACKUP still said "running" -- and since the copy kept
+    the original mtime, `-mmin +60` matched immediately and would have matched forever. A
+    reconciliation could not clear the condition it was performed to clear, with nothing on screen
+    explaining the gap."""
+    result = _run_clause(tmp_path, container_age_h=48,
+                         records={"reconciled": ("failed", "start", 3600)},
+                         raw_files={"reconciled.json.orphaned.bak": ("running", "start", 3600)})
+    assert result.returncode == 0, (
+        "a receipt backup was counted as a live run; the probe must scan receipts, not every file")
+
+
+def test_a_real_receipt_beside_a_backup_is_still_detected(tmp_path):
+    """The negative guard: scoping the scan must not blind it. A genuinely stuck receipt still
+    fails even when a backup sits next to it."""
+    result = _run_clause(tmp_path, container_age_h=48,
+                         records={"stuck": ("running", "start", 3600)},
+                         raw_files={"stuck.json.orphaned.bak": ("running", "start", 3600)})
+    assert result.returncode == 1, "a genuinely stuck receipt was missed"
+
+
+def test_non_receipt_files_in_the_runs_tree_are_ignored(tmp_path):
+    """Any non-receipt file may land in runs/ -- an editor swapfile, a partial copy, a log tail.
+    None of them is a run, whatever text they contain."""
+    result = _run_clause(tmp_path, container_age_h=48, records={}, raw_files={
+        "notes.txt": ("running", "start", 3600),
+        ".receipt.json.swp": ("running", "start", 3600),
+        "receipt.json.tmp": ("running", "start", 3600),
+    })
+    assert result.returncode == 0, result.stderr

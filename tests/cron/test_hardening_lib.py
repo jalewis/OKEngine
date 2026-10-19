@@ -239,22 +239,22 @@ def _auth_fails(m):
 
 
 def test_gate_flags_editing_off_but_write_still_in_toolset(tmp_path, monkeypatch):
-    """okengine#257: editing off but okengine-write STILL in the api_server toolset = the switch
+    """okengine#257: editing off but okengine-write-chat STILL in the api_server toolset = the switch
     didn't take (config not reconciled / gateway not recreated) -> FAIL."""
     m = _dv()
     m.F.clear(); m.DATA = tmp_path
-    _write_ts_config(tmp_path, "okengine", "okengine-write")
+    _write_ts_config(tmp_path, "okengine", "okengine-write-chat")
     monkeypatch.delenv("OKENGINE_HARDENED", raising=False)
     monkeypatch.setenv("API_SERVER_KEY", "k")       # chat enabled
     monkeypatch.setenv("OKENGINE_EDITING", "0")     # editing OFF
     m.check_auth()
-    assert any("OKENGINE_EDITING is off but okengine-write" in x for x in _auth_fails(m)), m.F
+    assert any("OKENGINE_EDITING is off but okengine-write-chat" in x for x in _auth_fails(m)), m.F
 
 
 def test_gate_editing_on_with_write_present_is_fine(tmp_path, monkeypatch):
     m = _dv()
     m.F.clear(); m.DATA = tmp_path
-    _write_ts_config(tmp_path, "okengine", "okengine-write")
+    _write_ts_config(tmp_path, "okengine", "okengine-write-chat")
     monkeypatch.delenv("OKENGINE_HARDENED", raising=False)
     monkeypatch.setenv("API_SERVER_KEY", "k")
     monkeypatch.setenv("OKENGINE_EDITING", "1")     # editing ON -> write present is correct
@@ -263,7 +263,7 @@ def test_gate_editing_on_with_write_present_is_fine(tmp_path, monkeypatch):
 
 
 def test_gate_editing_off_and_write_dropped_is_clean(tmp_path, monkeypatch):
-    """The post-ensure-runtime steady state: editing off, okengine-write already dropped -> no FAIL."""
+    """The post-ensure-runtime steady state: editing off, okengine-write-chat already dropped -> no FAIL."""
     m = _dv()
     m.F.clear(); m.DATA = tmp_path
     _write_ts_config(tmp_path, "okengine")          # read-only toolset

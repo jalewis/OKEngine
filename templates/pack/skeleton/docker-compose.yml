@@ -60,7 +60,8 @@ services:
     build:
       context: ${ENGINE_DIR:-../engine}
       dockerfile: okengine-projection/Dockerfile
-    image: okengine-projection
+    image: okengine-projection:${OKENGINE_ENGINE_IMAGE_TAG:-unpinned}
+    user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
     restart: unless-stopped
     depends_on:
       postgres: {condition: service_healthy}
@@ -69,6 +70,7 @@ services:
       OKENGINE_PROJECTION_WRITER_DSN: postgresql://okengine:${OKENGINE_PROJECTION_WRITER_PASSWORD:?Set a distinct projection writer credential}@postgres:5432/okengine
       OKENGINE_PROJECTION_READER_PASSWORD: ${OKENGINE_PROJECTION_READER_PASSWORD:?Set a distinct projection reader credential}
       OKENGINE_PROJECTION_INTERVAL_SECONDS: ${OKENGINE_PROJECTION_INTERVAL_SECONDS:-3600}
+      OKENGINE_PROJECTION_POLL_SECONDS: ${OKENGINE_PROJECTION_POLL_SECONDS:-15}
       OKENGINE_PROJECTION_MAX_DELETE_PCT: ${OKENGINE_PROJECTION_MAX_DELETE_PCT:-2}
       OKENGINE_PROJECTION_MAX_DELETE_ABS: ${OKENGINE_PROJECTION_MAX_DELETE_ABS:-50}
       TZ: ${TZ:-UTC}
@@ -182,7 +184,7 @@ services:
     # This is the containment half. Reconciling orphans to a terminal state at scheduler start
     # belongs to cron-plus, an external pinned dependency (okengine#747).
     healthcheck:
-      test: ["CMD-SHELL", "now=$$(date +%s); tick=$$(stat -c %Y /opt/data/cron-plus/.tick.lock 2>/dev/null) || exit 1; [ $$((now-tick)) -le 180 ] || exit 1; [ ! -s /opt/data/cron-plus/.scheduler-stalled ] || exit 1; owner=/opt/vault/.okengine/corpus/lock-owner.json; [ ! -e $$owner ] || { mtime=$$(stat -c %Y $$owner) || exit 1; [ $$((now-mtime)) -le 300 ] || exit 1; }; gen=$$(( $$(awk '/^btime/{print $$2}' /proc/stat) + $$(sed 's/.*) //' /proc/1/stat | awk '{print $$20}') / $$(getconf CLK_TCK) )); ! find /opt/data/cron-plus/runs -type f -mmin +60 -newermt @$$gen -exec grep -lE '\"status\"[[:space:]]*:[[:space:]]*\"running\"' {} + 2>/dev/null | grep -q . || exit 1; for stat in /proc/[0-9]*/stat; do grep -q ') D ' $$stat 2>/dev/null && exit 1; done; exit 0"]
+      test: ["CMD-SHELL", "now=$$(date +%s); tick=$$(stat -c %Y /opt/data/cron-plus/.tick.lock 2>/dev/null) || exit 1; [ $$((now-tick)) -le 180 ] || exit 1; [ ! -s /opt/data/cron-plus/.scheduler-stalled ] || exit 1; owner=/opt/vault/.okengine/corpus/lock-owner.json; [ ! -e $$owner ] || { mtime=$$(stat -c %Y $$owner) || exit 1; [ $$((now-mtime)) -le 300 ] || exit 1; }; gen=$$(( $$(awk '/^btime/{print $$2}' /proc/stat) + $$(sed 's/.*) //' /proc/1/stat | awk '{print $$20}') / $$(getconf CLK_TCK) )); ! find /opt/data/cron-plus/runs -type f -name '*.json' -mmin +60 -newermt @$$gen -exec grep -lE '\"status\"[[:space:]]*:[[:space:]]*\"running\"' {} + 2>/dev/null | grep -q . || exit 1; for stat in /proc/[0-9]*/stat; do grep -q ') D ' $$stat 2>/dev/null && exit 1; done; exit 0"]
       interval: 60s
       timeout: 10s
       retries: 3
@@ -198,7 +200,7 @@ services:
     build:
       context: ${ENGINE_DIR:-../engine}
       dockerfile: okengine-reader/Dockerfile
-    image: okengine-reader
+    image: okengine-reader:${OKENGINE_ENGINE_IMAGE_TAG:-unpinned}
     container_name: {{PACK}}-reader
     user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
     restart: unless-stopped
@@ -212,6 +214,14 @@ services:
       # ensure-runtime.sh derives it from pack.yaml; default `private` is fail-safe.
       - OKENGINE_TRUST=${OKENGINE_TRUST:-private}
       - OKENGINE_BIND=${OKENGINE_BIND:-127.0.0.1}
+      # UI-editing switch (okengine#257/#991): the reader has no env_file, so pass it explicitly or
+      # its read-only indicator never sees OKENGINE_EDITING=0 in .env (ensure-runtime reads the same
+      # .env to drop the chat writer). This is compose INTERPOLATION, so a value exported in the
+      # invoking shell beats .env here while the gateway's env_file follows .env; deploy.sh pins the
+      # shell to the .env value before `compose up` (okengine#993). Hand-maintained composes need
+      # this same line; a bare `docker compose up` run by hand should not export OKENGINE_EDITING.
+      # No env_file here on purpose: it would hand every .env secret to the network-facing reader.
+      - OKENGINE_EDITING=${OKENGINE_EDITING:-}
       - OKENGINE_PROJECT_URL=${OKENGINE_PROJECT_URL:-}   # About-panel repo link (optional)
       - OKENGINE_UI_DISPLAY_NAME=${OKENGINE_UI_DISPLAY_NAME:-} # optional deployment identity in header/title
       - TZ=${TZ:-UTC}                                    # match the gateway clock (page timestamps)
@@ -239,7 +249,7 @@ services:
     build:
       context: ${ENGINE_DIR:-../engine}
       dockerfile: okengine-mcp/Dockerfile
-    image: okengine-mcp
+    image: okengine-mcp:${OKENGINE_ENGINE_IMAGE_TAG:-unpinned}
     container_name: {{PACK}}-mcp
     user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
     restart: unless-stopped
@@ -295,7 +305,7 @@ services:
     build:
       context: ${ENGINE_DIR:-../engine}
       dockerfile: okengine-mcp/Dockerfile.review
-    image: okengine-review-write
+    image: okengine-review-write:${OKENGINE_ENGINE_IMAGE_TAG:-unpinned}
     container_name: {{PACK}}-review-write
     user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
     restart: unless-stopped
@@ -330,7 +340,7 @@ services:
     build:
       context: ${ENGINE_DIR:-../engine}
       dockerfile: okengine-operations/Dockerfile
-    image: okengine-operation-runner
+    image: okengine-operation-runner:${OKENGINE_ENGINE_IMAGE_TAG:-unpinned}
     container_name: {{PACK}}-operation-runner
     user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
     restart: unless-stopped
@@ -359,7 +369,7 @@ services:
     build:
       context: ${ENGINE_DIR:-../engine}
       dockerfile: okengine-cockpit/Dockerfile
-    image: okengine-cockpit
+    image: okengine-cockpit:${OKENGINE_ENGINE_IMAGE_TAG:-unpinned}
     container_name: {{PACK}}-cockpit
     user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
     restart: unless-stopped

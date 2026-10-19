@@ -7,17 +7,22 @@ import asyncio
 import hashlib
 import json
 import os
+import posixpath
 import re
+import stat
 import sys
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
 import yaml
+from yaml import YAMLError
 
 from okengine.corpus_transaction import read_epoch as corpus_epoch
+from okengine.list_scalars import split_list_scalar
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 DSN = os.environ.get("OKENGINE_PROJECTION_WRITER_DSN", "")
@@ -29,10 +34,54 @@ _FM = re.compile(r"\A---[ \t]*\n(.*?\n)---[ \t]*(?:\n|\Z)", re.S)
 _WIKILINK = re.compile(r"\[\[([^\]|#\n]+?)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]")
 _HEADING = re.compile(r"^#{1,6}\s+(.*?)\s*$")
 _RESERVED = {"index.md", "log.md", "agents.md", "hot.md", "bundle.md", "health.md"}
+# Paginated directory indexes (build_index_tree writes INDEX-pNN.md beside INDEX.md). The reserved
+# set above only named INDEX.md, so every page-2+ index was projected as CONTENT. Its writer does
+# not journal, so the journal-fed incremental projector never re-read it: the row kept its
+# morning content while every pass re-stamped indexed_at, and the conformance sample reported
+# "digest drift" on a generated file (84 rows on one live vault).
+_PAGED_INDEX = re.compile(r"^index-p\d+\.md\Z")
+
+
+def _structural(name: str) -> bool:
+    """A generated per-directory or vault-root artifact, never projected as a page. ONE definition
+    for the full scan, the incremental scan and the carried-forward rows, so the three cannot
+    disagree about what is content."""
+    lowered = name.lower()
+    return lowered in _RESERVED or bool(_PAGED_INDEX.match(lowered))
+
+
+def _projectable(rel: str, namespaces) -> bool:
+    """Whether a wiki-relative page is projected as content. The full scan and the incremental scan
+    both ask HERE; two copies of this condition is how the paged-index gap landed in both."""
+    name = posixpath.basename(rel)
+    return (rel.partition("/")[0] in namespaces and not _structural(name)
+            and not name.startswith((".", "_")) and ".bak." not in name)
 
 
 def _monotonic():
     return time.monotonic()
+
+
+@asynccontextmanager
+async def mutation_lock(conn):
+    """Serialize projection writers, including bootstrap, before reading their checkpoint.
+
+    Transaction-scoped advisory locks are released on rollback/cancellation. Readers do
+    not acquire this lock. Nested callers on the same connection share the transaction
+    lock, so bootstrap and an epoch can be one atomic operation.
+    """
+    async with conn.transaction():
+        await conn.execute("SET LOCAL lock_timeout = '5min'")
+        await conn.execute("SELECT pg_advisory_xact_lock(1869307493, 951)")
+        yield
+
+
+def require_readable_scan(scan: Scan) -> None:
+    """An unreadable page is unknown canonical state, never evidence of deletion."""
+    if scan.unreadable:
+        raise RuntimeError(
+            f"projection scan has {len(scan.unreadable)} unreadable path(s); "
+            f"population is incomplete: {', '.join(scan.unreadable[:3])}")
 
 
 @dataclass(frozen=True)
@@ -63,7 +112,7 @@ def _norm(value):
 def _aliases(fm: dict) -> list[str]:
     values = fm.get("aliases") or []
     if isinstance(values, str):
-        values = [part.strip() for part in values.split(",")]
+        values = split_list_scalar(values)   # the write path's coercion (okengine#1042 [19])
     if not isinstance(values, list):
         return []
     return [str(value).strip() for value in values if str(value).strip()]
@@ -79,6 +128,32 @@ def _to_date(value):
         return date.fromisoformat(text) if text else None
     except ValueError:
         return None
+
+
+def _encodable(value):
+    """`value` as text PostgreSQL can store, and whether it held an unpaired surrogate (okengine#894).
+
+    A feed writer once put an emoji into YAML as a JSON surrogate-pair escape; YAML decodes each
+    half alone. One such title made asyncpg refuse the row and aborted the whole rebuild, leaving
+    4,483 of 8,382 pages unprojected. A pair is rejoined into its character; an unpaired half
+    becomes U+FFFD and the page is reported through fm_error, never dropped from the projection."""
+    if isinstance(value, str):
+        raw = value.encode("utf-16-le", "surrogatepass")
+        try:
+            return raw.decode("utf-16-le"), False
+        except UnicodeDecodeError:
+            return raw.decode("utf-16-le", "replace"), True
+    if isinstance(value, list):
+        items = [_encodable(v) for v in value]
+        return [v for v, _ in items], any(bad for _, bad in items)
+    if isinstance(value, dict):
+        out, bad = {}, False
+        for key, item in value.items():
+            (key, bad_key), (item, bad_item) = _encodable(key), _encodable(item)
+            out[key] = item
+            bad = bad or bad_key or bad_item
+        return out, bad
+    return value, False
 
 
 def parse_page(rel: str, raw: bytes) -> tuple[dict, list[Link]]:
@@ -102,6 +177,10 @@ def parse_page(rel: str, raw: bytes) -> tuple[dict, list[Link]]:
             fm_error = str(exc)[:500]
     else:
         fm_error = "no frontmatter block"
+    fm, unencodable = _encodable(fm)
+    if unencodable:  # fm is {} whenever fm_error is already set, so nothing is overwritten
+        fm_error = ("frontmatter holds an unpaired UTF-16 surrogate, which has no UTF-8 encoding; "
+                    "projected with U+FFFD in its place (okengine#894)")
 
     status = _norm(fm.get("status"))
     row = {
@@ -141,7 +220,7 @@ def selected_namespaces(vault: Path) -> set[str]:
         try:
             schema = yaml.safe_load(schema_path.read_text(encoding="utf-8")) or {}
             break
-        except (OSError, yaml.YAMLError):
+        except (OSError, YAMLError):
             continue
     excluded = {"operational", "dashboards"}
     for value in schema.get("exclude") or []:
@@ -165,13 +244,25 @@ def scan_vault(vault: Path = VAULT, *, known=None, prior_links=None) -> Scan:
         raise ValueError(f"vault not found at {wiki}; refusing to project an empty corpus")
     namespaces = selected_namespaces(vault)
     scan = Scan([], {}, [], [], scanned_at=datetime.now(timezone.utc))
-    for path in sorted(wiki.rglob("*.md")):
+    paths = []
+    def walk_error(exc):
+        relative = Path(exc.filename).relative_to(wiki).as_posix()
+        if relative == "." or relative.partition("/")[0] in namespaces:
+            scan.unreadable.append(f"{relative}: {type(exc).__name__}")
+    for root, dirs, files in os.walk(wiki, onerror=walk_error):
+        paths.extend(Path(root) / name for name in files if name.endswith(".md"))
+        paths.extend(Path(root) / name for name in dirs if name.endswith(".md"))
+    for path in sorted(paths):
         rel = path.relative_to(wiki).as_posix()
-        if not path.is_file():
+        try:
+            regular = stat.S_ISREG(path.stat().st_mode)
+        except OSError as exc:
+            scan.unreadable.append(f"{rel}: {type(exc).__name__}")
+            continue
+        if not regular:
             scan.skipped_dirs.append(rel)
             continue
-        if rel.split("/", 1)[0] not in namespaces or path.name.lower() in _RESERVED \
-                or path.name.startswith((".", "_")) or ".bak." in path.name:
+        if not _projectable(rel, namespaces):
             scan.excluded += 1
             continue
         try:
@@ -293,6 +384,16 @@ def classify_removals(known_rows, stale_paths: set, scanned: list) -> tuple[list
 
 async def run_epoch(conn, scan: Scan, *, dry_run: bool = False,
                     source_epoch: int | None = None, mode: str = "reconcile") -> dict:
+    require_readable_scan(scan)
+    if dry_run:
+        return await _run_epoch(conn, scan, dry_run=True, source_epoch=source_epoch, mode=mode)
+    async with mutation_lock(conn):
+        return await _run_epoch(conn, scan, source_epoch=source_epoch, mode=mode)
+
+
+async def _run_epoch(conn, scan: Scan, *, dry_run: bool = False,
+                     source_epoch: int | None = None, mode: str = "reconcile") -> dict:
+    require_readable_scan(scan)
     started = _monotonic()
     known_rows = await conn.fetch("SELECT path, content_digest, canonical_id FROM pages")
     known = {row["path"]: row["content_digest"] for row in known_rows}
@@ -382,6 +483,12 @@ def journal_delta(vault: Path, after_epoch: int) -> tuple[int, set[str]] | None:
     current = corpus_epoch(vault)
     if current == after_epoch:
         return current, set()
+    if current < after_epoch:
+        # The corpus epoch went BACKWARDS: the vault was restored from an older backup (the
+        # projection volume lives outside it). No journal record can describe that change, and
+        # the contiguity test below is vacuously true for a negative range — it used to return an
+        # empty delta and keep every pre-restore row (okengine#1032).
+        return None
     journal = vault / ".okengine/corpus/journal.jsonl"
     try:
         records = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()
@@ -405,24 +512,38 @@ def scan_changed(vault: Path, paths: set[str]) -> Scan:
     namespaces = selected_namespaces(vault)
     for relative in sorted(paths):
         path = vault / relative
-        if not path.is_file():
+        # is_file() suppresses OSError on newer interpreters. Only a known
+        # missing path is deletion evidence; inaccessible state must survive.
+        try:
+            file_stat = path.stat()
+            if not stat.S_ISREG(file_stat.st_mode):
+                continue
+            raw = path.read_bytes()
+        except FileNotFoundError:
             continue
-        raw = path.read_bytes()
+        except OSError as exc:
+            scan.unreadable.append(f"{relative}: {type(exc).__name__}")
+            continue
         scan.bytes_parsed += len(raw)
         rel = path.relative_to(vault / "wiki").as_posix()
-        if rel.split("/", 1)[0] not in namespaces or path.name.lower() in _RESERVED \
-                or path.name.startswith((".", "_")) or ".bak." in path.name:
+        if not _projectable(rel, namespaces):
             scan.excluded += 1
             continue
         row, links = parse_page(rel, raw)
         row.update(content_digest=hashlib.sha256(raw).hexdigest(), _unchanged=False,
-                   file_mtime=datetime.fromtimestamp(path.stat().st_mtime, timezone.utc))
+                   file_mtime=datetime.fromtimestamp(file_stat.st_mtime, timezone.utc))
         scan.pages.append(row)
         scan.links[rel] = links
     return scan
 
 
 async def project(conn, vault: Path = VAULT, *, force_reconcile: bool = False) -> dict:
+    """Acquire the writer lock before checkpoint reads or canonical scans."""
+    async with mutation_lock(conn):
+        return await _project(conn, vault, force_reconcile=force_reconcile)
+
+
+async def _project(conn, vault: Path, *, force_reconcile: bool) -> dict:
     """Apply a journal-fed epoch when possible, retaining full reconciliation as the backstop."""
     async def reconcile() -> dict:
         known, links = await load_projection_state(conn)
@@ -458,6 +579,8 @@ async def project(conn, vault: Path = VAULT, *, force_reconcile: bool = False) -
     for path, previous in known.items():
         if path in relative:
             continue
+        if _structural(posixpath.basename(path)):
+            continue  # projected before it was recognized as structural: let this epoch drop it
         fm = previous.get("fm") or {}
         if isinstance(fm, str):
             fm = json.loads(fm)

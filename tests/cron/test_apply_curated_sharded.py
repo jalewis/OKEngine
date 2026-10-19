@@ -216,3 +216,21 @@ def test_apply_curated_entrypoint_missing_overlay(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         runpy.run_path(str(MOD), run_name="__main__")
     assert exc.value.code == 0
+
+
+def test_repeated_restores_keep_exactly_one_curated_comment(tmp_path):
+    """Live finding (2026-09-23): each restore after a regen dropped a curated
+    field re-emitted the overlay's `_comment` without removing the previous copy, so the page grew
+    one duplicate comment line per restore. An unrelated operator comment must survive."""
+    m = _load(tmp_path)
+    fields = {"_comment": "Operator-curated: see [[sources/x]]", "traction_status": "live",
+              "buyer_target": ["ciso"]}
+    page = "---\ntype: product\n# an operator note\ntitle: Acme\n---\n# Acme\n"
+    first, _ = m.enforce(page, fields)
+    assert first.count("# Operator-curated: see [[sources/x]]") == 1
+    dropped = first.replace("traction_status: live\n", "")           # a regen drops one field
+    second, changed = m.enforce(dropped, fields)
+    assert "traction_status" in changed
+    assert second.count("# Operator-curated: see [[sources/x]]") == 1, second
+    assert "# an operator note" in second
+    assert second == first, "a restore after a dropped field reproduces the enforced page exactly"

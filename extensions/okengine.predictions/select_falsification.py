@@ -7,8 +7,18 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
+_HERE = Path(__file__).resolve().parent
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# selection_manifest: one level up when staged, scripts/cron in the repo (appended — no shadowing).
+sys.path.append(str(_HERE.parent))
+sys.path.append(str(_HERE.parents[1] / "scripts" / "cron"))
 import pred_lib as P  # noqa: E402
+from selection_manifest import (  # noqa: E402
+    page_selection_key, print_receipt_template, write_selection_manifest)
+
+SELECTION_MANIFEST = Path(os.environ.get(
+    "OKENGINE_SELECTION_MANIFEST", str(P.selection_manifest_path("prediction-falsification-search"))))
 
 MAX_PRED = int(os.environ.get("FALSIFY_MAX_PRED", "10"))
 MAX_SRC = int(os.environ.get("FALSIFY_MAX_SRC", "25"))
@@ -45,9 +55,13 @@ def main() -> int:
     print("=== falsification-search wake-gate ===")
     print(f"  vault: {v}\n  high-confidence open: {len(high_open)}  ·  sources since {cutoff}: {len(recent)}")
     if not high_open or not recent:
+        write_selection_manifest([], SELECTION_MANIFEST)   # a no-work run refreshes it too
         print("  → SKIP: need confident open predictions AND recent sources")
         print(json.dumps({"wakeAgent": False}))
         return 0
+    # The selected items are the predictions under test; the recent sources are shared evidence.
+    selected = [page_selection_key(p, v) for p, _ in high_open[:MAX_PRED]]
+    manifest = write_selection_manifest(selected, SELECTION_MANIFEST)
     print(f"  batch: {min(len(high_open),MAX_PRED)} prediction(s) vs {min(len(recent),MAX_SRC)} source(s)\n")
     print("For each confident open prediction below, ACTIVELY SEEK DISCONFIRMING evidence in the "
           "recent sources (steelman the opposite). Where evidence weakens it, append to its "
@@ -59,6 +73,8 @@ def main() -> int:
     print("=== recent sources ===")
     for d, p, t in recent[:MAX_SRC]:
         print(f"  {d} [[{p.relative_to(v / 'wiki').as_posix()[:-3]}]] {t[:80]}")
+    print()
+    print_receipt_template(manifest)
     print(json.dumps({"wakeAgent": True}))
     return 0
 

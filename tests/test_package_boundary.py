@@ -3,6 +3,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ from okengine import cli, compat
 
 
 def test_package_version_matches_project():
-    assert __version__ == "0.14.5"
+    assert __version__ == tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
     assert 'okengine-framework = "okengine.cli:framework"' in (
         ROOT / "pyproject.toml").read_text()
 
@@ -131,8 +132,9 @@ def test_ci_installs_the_revision_wheel_before_every_gate():
     if not pipeline_path.is_file():
         pytest.skip("private private_ci pipeline is not part of the public snapshot")
     pipeline = pipeline_path.read_text()
-    assert "python scripts/build_engine_wheel.py --out artifacts/wheel" in pipeline
-    assert "pip install -q --no-deps artifacts/wheel/*.whl" in pipeline
+    assert pipeline.count("python ci/candidate_wheel.py build") == 1
+    assert "python ci/candidate_wheel.py verify" in pipeline
+    assert 'pip install -q --no-deps "$wheel"' in pipeline
 
 
 def test_coverage_runs_against_canonical_sources_after_wheel_correctness_gate():

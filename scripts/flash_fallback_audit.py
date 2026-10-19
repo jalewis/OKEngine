@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 _STAMP = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+")
-_LOG = re.compile(r"^(.+)-\d{8}-\d{6}\.log$")
+_LOG = re.compile(r"^(.+)-\d{8}-\d{6}\.log\Z")
 _FLASH_CALL = re.compile(
     r"\bAPI call #\d+:\s+model=(?:deepseek-flash|deepseek-v4-flash)\s+provider=(deepseek|custom)\b",
     re.I,

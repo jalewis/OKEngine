@@ -15,6 +15,7 @@ severity split in framework_validate.
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -26,13 +27,26 @@ except Exception:  # pragma: no cover - yaml is a deploy dep; absence is a clear
 MANIFEST_NAME = "extension.yaml"
 
 # §6: lower-case, no underscores, 3-128 chars, dotted/hyphenated; okengine.* reserved.
-ID_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,126}[a-z0-9]$")
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,126}[a-z0-9]\Z")
 OKENGINE_PREFIX = "okengine."
-_SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+_SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+\Z")
 
 # §8 kinds. MVP ships only `operation`; the rest are reserved (a kind binds to a
 # stable contract that must already exist, so a non-MVP kind is not yet shippable).
 KNOWN_KINDS = ("operation", "importer", "reader-extension", "validator")
+
+
+def _identity_edit_errors(write_policy: dict) -> list[str]:
+    """okengine#1028: an extension's `identity_edit` grant follows the cron-lane rule exactly
+    (scripts/cron/output_contract.py): the same fields, and never on an extension that can create
+    pages. The write path enforces the creating-lane rule too; this is the earliest gate."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "cron" / "output_contract.py"
+    spec = importlib.util.spec_from_file_location("okengine_output_contract_identity", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module._identity_edit_errors(write_policy, "capabilities.write_policy")
 MVP_KINDS = ("operation",)
 # §7 execution models.
 KNOWN_TRUST = ("declarative", "in-gateway", "sidecar")
@@ -92,6 +106,9 @@ def _validate_operation(op: dict, trust, errors: list[str], ctx: str) -> None:
     `operations:` entry). The entrypoint is a discriminated union tied to `trust`
     (okengine#135): in-gateway -> a script (string or {script: ...}); sidecar ->
     a digest-pinned {image: ...}. ``ctx`` labels the block in error messages."""
+    declarative = declarative_operation_error(op, trust, ctx)   # okengine#1004, before any return
+    if declarative:
+        errors.append(declarative)
     for k in set(op) - _OPERATION_KEYS:
         errors.append(f"unknown key under {ctx}: {k}")
     # agent vs no_agent: a `prompt` (inline) or `prompt_file` (bundled) makes it an
@@ -159,6 +176,86 @@ def _validate_operation(op: dict, trust, errors: list[str], ctx: str) -> None:
     elif trust in ("in-gateway", "declarative") and is_image:
         errors.append(f"trust: {trust} uses a script entrypoint, not an image "
                       "(image is for trust: sidecar)")
+
+
+def script_entrypoint(op) -> str | None:
+    """The gateway script an operation block names, or None (no entrypoint, an image, a malformed
+    value). A string entrypoint or ``{script: ...}`` is a script the deploy stages and cron runs."""
+    ep = op.get("entrypoint") if isinstance(op, dict) else None
+    if isinstance(ep, dict):
+        if "image" in ep:
+            return None
+        ep = ep.get("script")
+    return ep if isinstance(ep, str) and ep.strip() else None
+
+
+def declarative_operation_error(op, trust, ctx: str) -> str | None:
+    """okengine#1004: `trust: declarative` runs no extension-owned code — "schema + reader nav +
+    config only" (extension-system.md §7) — so ANY operation under it is a label that lies about
+    what runs: a script is staged and executed, and an agent lane runs a model in the gateway with
+    whatever toolsets it lists (terminal, file, ...). One rule for the manifest `operation` /
+    `operations` blocks and the `crons/*.cron.json` drop-ins; operation-bearing extensions are
+    `in-gateway` (operator tier requires acceptance) or `sidecar`."""
+    if trust != "declarative" or not isinstance(op, dict):
+        return None
+    script = script_entrypoint(op)
+    what = (f"{ctx}.entrypoint names the script {script!r}" if script
+            else f"{ctx} declares an operation (an agent or script lane that runs in the gateway)")
+    return (f"trust: declarative runs no code, but {what}; declare trust: in-gateway (operator "
+            "tier requires --allow-untrusted) or trust: sidecar")
+
+
+# First-cut name (okengine#1004 round 1), kept so an older caller still resolves it.
+declarative_script_error = declarative_operation_error
+
+
+def load_dropin_ops(ext_dir) -> tuple[list[tuple[str, dict]], str | None]:
+    """`crons/*.cron.json` drop-in op files -> ([(op_name, block)], error) (#63 P1, the drop-in model).
+
+    Each file is ONE operation block (same shape as an `operations:` entry — schedule /
+    entrypoint / prompt_file / toolsets); the op name is the filename stem minus `.cron.json`
+    (so `crons/grade.cron.json` -> op `grade` -> job `<id>:grade`). Collected forward-only;
+    an extension drops a file in rather than editing a central manifest block."""
+    if not ext_dir:
+        return [], None
+    d = Path(ext_dir) / "crons"
+    if not d.is_dir():
+        return [], None
+    out: list[tuple[str, dict]] = []
+    for f in sorted(d.glob("*.cron.json")):  # glob-ok: crons/ is a flat per-extension dir, not a sharded namespace
+        op_name = f.name[: -len(".cron.json")]
+        if not op_name:
+            return [], f"invalid cron drop-in filename: crons/{f.name}"
+        try:
+            block = json.loads(f.read_text(encoding="utf-8"))
+        except Exception as e:                                  # noqa: BLE001
+            return [], f"crons/{f.name}: invalid JSON ({e})"
+        if not isinstance(block, dict):
+            return [], f"crons/{f.name}: must be a JSON object (an operation block)"
+        out.append((op_name, block))
+    return out, None
+
+
+def validate_dropins(manifest: dict, ext_dir) -> list[str]:
+    """Errors for the `crons/*.cron.json` drop-ins of an extension (okengine#1004).
+
+    Deliberately narrow: only the trust contract. The drop-ins' other fields are checked where the
+    job is synthesized, and the full manifest-block validation would newly reject keys (`expect`)
+    the drop-in form carries. An unreadable drop-in is reported by the composer, except under
+    `trust: declarative`, where shipping a drop-in at all is the violation."""
+    ops, err = load_dropin_ops(ext_dir)
+    trust = manifest.get("trust") if isinstance(manifest, dict) else None
+    if err and trust == "declarative":
+        # an unreadable drop-in can hide a readable one (the reader stops at the first fault); under
+        # declarative, ANY drop-in is an operation, so do not let the fault mask the rest
+        return [f"trust: declarative runs no code, but it ships crons/ drop-in(s) ({err}); declare "
+                "trust: in-gateway (operator tier requires --allow-untrusted) or trust: sidecar"]
+    errors = []
+    for name, op in ops:
+        error = declarative_operation_error(op, trust, f"crons/{name}.cron.json")
+        if error:
+            errors.append(error)
+    return errors
 
 
 def validate_manifest(manifest: dict) -> tuple[list[str], list[str]]:
@@ -235,7 +332,7 @@ def validate_manifest(manifest: dict) -> tuple[list[str], list[str]]:
                     errors.append("capabilities.write_policy must be a mapping")
                 else:
                     allowed = {"rule_id", "operations", "paths", "types", "update_fields",
-                               "protected_fields", "body"}
+                               "protected_fields", "body", "identity_edit"}
                     unknown = sorted(set(wp) - allowed)
                     if unknown:
                         errors.append(f"capabilities.write_policy has unknown keys: {unknown}")
@@ -253,6 +350,7 @@ def validate_manifest(manifest: dict) -> tuple[list[str], list[str]]:
                                       f"{unknown_operations}")
                     if wp.get("body", "deny") not in {"allow", "append-only", "deny"}:
                         errors.append("capabilities.write_policy.body must be allow, append-only, or deny")
+                    errors.extend(_identity_edit_errors(wp))
 
     # core: default-ON marker (okengine#142). Only honored for the engine tier (a
     # pack/operator extension can't force itself on) — enforced at resolve time.

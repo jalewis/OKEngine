@@ -401,7 +401,7 @@ def test_auth_unverifiable_editing_mismatch_and_hardened_success(tmp_path, monke
     data = tmp_path / "data"
     data.mkdir()
     (data / "config.yaml").write_text(
-        "platform_toolsets: {api_server: [okengine, okengine-write]}\n")
+        "platform_toolsets: {api_server: [okengine, okengine-write-chat]}\n")
     c.configure(tmp_path, data, tmp_path / "hermes")
     monkeypatch.setattr(c, "is_editing", lambda _env: False)
     c.reset(); c.check_auth()
@@ -597,18 +597,26 @@ def test_provenance_list_scan_and_success_only_operations(tmp_path, monkeypatch)
     (tmp_path / "docker-compose.yml").write_text(
         "services:\n  gateway:\n    environment:\n      - OTHER=x\n      - BADENTRY\n      - OKENGINE_PACK=pack\n")
     c.configure(tmp_path)
-    c.check_provenance_env()
-    assert c.F == []
+    assert c._gateway_pack() == "pack"
 
     (tmp_path / "docker-compose.yml").write_text(
         "services:\n  gateway:\n    environment: [OTHER=x, BADENTRY]\n")
-    c.check_provenance_env()
-    assert "OKENGINE_PACK is not set" in _messages(c)
-    c.reset()
+    assert c._gateway_pack() == ""
     (tmp_path / "docker-compose.yml").write_text(
         "services: {gateway: {environment: scalar}}\n")
+    assert c._gateway_pack() == ""
+    (tmp_path / "docker-compose.yml").write_text(
+        "services: {gateway: {environment: [ALPHA=wrong, OKENGINE_PACK=pack]}}\n")
+    assert c._gateway_pack() == "pack", "only the OKENGINE_PACK entry names the pack"
+    (tmp_path / "docker-compose.yml").unlink()
+    assert c._gateway_pack() == ""
+    monkeypatch.setenv("OKENGINE_PACK", " from-env ")
+    c.configure(tmp_path)
+    assert c._gateway_pack() == "from-env"
+    monkeypatch.delenv("OKENGINE_PACK")
+    c.configure(tmp_path)
     c.check_provenance_env()
-    assert "OKENGINE_PACK is not set" in _messages(c)
+    assert "declares no `name`" in _messages(c)
     c.reset()
 
     base = tmp_path / ".okengine/operations/runs/op"
@@ -617,3 +625,181 @@ def test_provenance_list_scan_and_success_only_operations(tmp_path, monkeypatch)
         {"operation": "op", "run_id": "ok", "status": "succeeded"}))
     c.check_operation_runs()
     assert c.F == []
+
+
+# --- okengine#881: a symlink is judged by its OWN owner, never its target's -----------------------
+# Hermetic: CI runs as root (and check_runtime_ownership exempts euid 0), and a test cannot chown,
+# so ownership is SIMULATED — a fixed non-root lane uid, every path under the tree owned by it, and
+# any symlink's TARGET (what a following stat sees) owned by a foreign uid.
+
+_LANE_UID = 4242
+_FOREIGN_UID = 4243
+
+
+def _fresh(uid):
+    """An int EQUAL to uid but a distinct object, as st_uid and geteuid() are in production, so
+    an identity comparison (`is not`) cannot pass for an equality one."""
+    return int(str(uid))
+
+
+def _simulate_owners(monkeypatch, c, root, *, foreign=(), foreign_uid=_FOREIGN_UID):
+    """Path.stat under `root`: lstat (follow_symlinks=False) sees the lane uid, except paths in
+    `foreign` (owned by foreign_uid); a FOLLOWING stat of a symlink sees a foreign-owned target."""
+    original = Path.stat
+    foreign = set(foreign)
+
+    def fake(path, *args, **kwargs):
+        info = original(path, *args, **kwargs)
+        if path != root and root not in path.parents:
+            return info
+        if kwargs.get("follow_symlinks", True) and os.path.islink(path):
+            uid = _FOREIGN_UID
+        else:
+            uid = foreign_uid if path in foreign else _LANE_UID
+        return type(info)(tuple(info)[:4] + (_fresh(uid),) + tuple(info)[5:])
+
+    monkeypatch.setattr(Path, "stat", fake)
+    monkeypatch.setattr(c.os, "geteuid", lambda: _fresh(_LANE_UID))
+
+
+def _link_targets(tmp_path):
+    outside = tmp_path / "outside"
+    (outside / "tree").mkdir(parents=True)
+    (outside / "python3").write_text("#!")
+    (outside / "tree" / "f").write_text("x")
+    return outside / "python3", outside / "tree"
+
+
+def test_runtime_ownership_passes_lane_owned_symlink_to_foreign_target(tmp_path, monkeypatch):
+    """A venv's bin/python3 -> /usr/bin/python3: the LINK is lane-owned, the target root-owned.
+    Following the link reported a false FAIL [runtime-ownership] on a live deployment."""
+    c = _mod("deployment_checks_runtime_symlink_ok")
+    data = tmp_path / "data"
+    venv_bin = data / "scripts" / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    target_file, target_dir = _link_targets(tmp_path)
+    (venv_bin / "python3").symlink_to(target_file)
+    (data / "scripts" / "sysdir").symlink_to(target_dir)  # a symlinked dir must not be walked
+    c.configure(tmp_path, data, tmp_path / "hermes")
+    _simulate_owners(monkeypatch, c, data)
+    c.check_runtime_ownership()
+    assert "runtime-ownership" not in _messages(c), _messages(c)
+
+
+def test_runtime_ownership_still_fails_foreign_regular_file(tmp_path, monkeypatch):
+    c = _mod("deployment_checks_runtime_symlink_foreign_file")
+    data = tmp_path / "data"
+    scripts = data / "scripts"
+    scripts.mkdir(parents=True)
+    foreign = scripts / "lane.py"
+    foreign.write_text("x")
+    c.configure(tmp_path, data, tmp_path / "hermes")
+    _simulate_owners(monkeypatch, c, data, foreign={foreign})
+    c.check_runtime_ownership()
+    assert f"scripts/lane.py (file, uid {_FOREIGN_UID})" in _messages(c), _messages(c)
+
+
+def test_runtime_ownership_flags_foreign_owned_symlink_itself(tmp_path, monkeypatch):
+    """The link's own owner is what counts: a link that is ITSELF foreign-owned is still a stray."""
+    c = _mod("deployment_checks_runtime_symlink_foreign_link")
+    data = tmp_path / "data"
+    scripts = data / "scripts"
+    scripts.mkdir(parents=True)
+    link = scripts / "python3"
+    link.symlink_to(_link_targets(tmp_path)[0])
+    c.configure(tmp_path, data, tmp_path / "hermes")
+    _simulate_owners(monkeypatch, c, data, foreign={link})
+    c.check_runtime_ownership()
+    assert f"scripts/python3 (symlink, uid {_FOREIGN_UID})" in _messages(c), _messages(c)
+
+
+def test_runtime_ownership_fails_a_root_owned_file_below_the_lane_uid(tmp_path, monkeypatch):
+    """The live failure mode is ROOT-owned (uid 0, numerically BELOW the lane uid): any uid that
+    differs is foreign, not only a larger one."""
+    c = _mod("deployment_checks_runtime_root_owned_file")
+    data = tmp_path / "data"
+    scripts = data / "scripts"
+    scripts.mkdir(parents=True)
+    foreign = scripts / "lane.py"
+    foreign.write_text("x")
+    c.configure(tmp_path, data, tmp_path / "hermes")
+    _simulate_owners(monkeypatch, c, data, foreign={foreign}, foreign_uid=0)
+    c.check_runtime_ownership()
+    assert "scripts/lane.py (file, uid 0)" in _messages(c), _messages(c)
+
+
+def test_vault_ownership_passes_lane_owned_symlink_to_foreign_target(tmp_path, monkeypatch):
+    c = _mod("deployment_checks_vault_symlink_ok")
+    vault = tmp_path / "vault"
+    wiki = vault / "wiki"
+    wiki.mkdir(parents=True)
+    (wiki / "page.md").write_text("x")
+    target_file, target_dir = _link_targets(tmp_path)
+    (wiki / "link.md").symlink_to(target_file)
+    (wiki / "sysdir").symlink_to(target_dir)
+    c.configure(vault, tmp_path / "data", tmp_path / "hermes")
+    _simulate_owners(monkeypatch, c, vault)
+    c.check_ownership()
+    assert "FAIL ownership" not in _messages(c), _messages(c)
+
+
+def test_vault_ownership_still_fails_foreign_file_and_symlink(tmp_path, monkeypatch):
+    c = _mod("deployment_checks_vault_symlink_foreign")
+    vault = tmp_path / "vault"
+    wiki = vault / "wiki"
+    wiki.mkdir(parents=True)
+    page = wiki / "page.md"
+    page.write_text("x")
+    link = wiki / "link.md"
+    link.symlink_to(_link_targets(tmp_path)[0])
+    c.configure(vault, tmp_path / "data", tmp_path / "hermes")
+    _simulate_owners(monkeypatch, c, vault, foreign={page, link})
+    c.check_ownership()
+    messages = _messages(c)
+    assert f"wiki/page.md (file, uid {_FOREIGN_UID})" in messages, messages
+    assert f"wiki/link.md (symlink, uid {_FOREIGN_UID})" in messages, messages
+
+
+def test_owned_kind_ignores_special_files():
+    import stat as st
+    c = _mod("deployment_checks_owned_kind")
+    assert c._owned_kind(st.S_IFLNK | 0o777) == "symlink"
+    assert c._owned_kind(st.S_IFDIR | 0o755) == "dir"
+    assert c._owned_kind(st.S_IFREG | 0o644) == "file"
+    assert c._owned_kind(st.S_IFIFO | 0o644) is None
+    assert c._owned_kind(st.S_IFSOCK | 0o644) is None
+
+
+@pytest.mark.parametrize("config, level", [
+    ("tools:\n  tool_search:\n    enabled: 'off'\n", "PASS"),
+    ("tools:\n  tool_search:\n    enabled: false\n", "PASS"),
+    ("tools:\n  tool_search: false\n", "PASS"),
+    ("tools:\n  tool_search:\n    enabled: auto\n", "WARN"),
+    ("model: {default: x}\n", "WARN"),          # absent: Hermes' own default is "auto"
+    ("- not a mapping\n", "WARN"),
+    ("tools: [\n", "WARN"),                     # unreadable: UNDETECTABLE, never a pass
+])
+def test_tool_search_should_be_off_on_an_okengine_deployment(tmp_path, config, level):
+    """REGRESSION (okengine#886): Hermes' default hides every MCP write tool behind
+    tool_search/describe bridges; 285 of 357 live raw-backfill runs spent 2 of 4 turns on them."""
+    c = _mod("deployment_checks_tool_search")
+    data = tmp_path / "d"
+    data.mkdir()
+    (data / "config.yaml").write_text(config)
+    c.configure(tmp_path, data, tmp_path)
+    c.check_tool_search()
+    (got,) = [lvl for lvl, area, _msg in c.F if area == "tool search"]
+    assert got == level, _messages(c)
+
+
+def test_tool_search_check_is_quiet_without_a_config(tmp_path):
+    c = _mod("deployment_checks_tool_search_none")
+    c.configure(tmp_path, tmp_path / "missing", tmp_path)
+    c.check_tool_search()
+    assert not [f for f in c.F if f[1] == "tool search"]
+
+
+def test_the_engine_template_ships_tool_search_off():
+    import yaml
+    template = yaml.safe_load((REPO / "config" / "config.yaml.template").read_text())
+    assert template["tools"]["tool_search"]["enabled"] == "off"

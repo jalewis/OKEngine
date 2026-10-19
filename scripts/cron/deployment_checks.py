@@ -17,11 +17,14 @@ import json
 import os
 import re
 import stat
+import subprocess  # nosec B404 - runs the baked gateway interpreter on a fixed engine script
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Mapping
 
 import yaml
+from yaml import YAMLError
 
 # Sibling cron lib (staged into DATA/scripts alongside this script; scripts/cron/ in the repo).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -30,7 +33,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # same full-composition check deterministic in host tests and direct source execution instead of
 # depending on some earlier test having imported extension_compose into sys.modules.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from hardening_lib import hardened_posture_violations, is_hardened, is_editing  # noqa: E402
+from hardening_lib import (  # noqa: E402
+    ACTORLESS_WRITER,
+    CHAT_WRITER,
+    OPERATOR_SURFACES,
+    actorless_writer_bindings,
+    actorless_writers,
+    STORED_CREDENTIAL_PLATFORMS,
+    hardened_posture_violations,
+    is_editing,
+    is_hardened,
+    platform_config_state,
+    platform_toolset_bindings,
+    read_auth_json,
+)
+from dotenv_lib import compose_default, read_compose_env, read_dotenv  # noqa: E402
 from deepseek_policy import (  # noqa: E402
     MODEL_ENV_KEY, env_model_values, model_values,
     legacy_deepseek_model as _legacy_deepseek_model,
@@ -41,6 +58,12 @@ DATA = Path(os.environ.get("OKENGINE_DATA", "/opt/data"))
 # The Hermes INSTALL dir (baked code + the okengine#192 version marker), NOT HERMES_HOME — which
 # Hermes sets to the DATA dir (/opt/data). Fixed /opt/hermes; overridable for tests.
 HERMES = Path(os.environ.get("OKENGINE_HERMES_DIR", "/opt/hermes"))
+#: The gateway container's environment, which the auth, timezone and provenance checks judge. In the
+#: gateway it IS this process's environment (compose env_file + environment:). A host run
+#: (`framework status/doctor`, post-deploy [9]) is not: there `configure(env=host_env(dep))` points
+#: the checks at what compose hands the gateway from the pack .env, not at the operator's shell
+#: (okengine#994 [16]: a pack-.env-only API_SERVER_ENABLED was invisible to the host check).
+ENV: Mapping[str, str] = os.environ
 F: list[tuple[str, str, str]] = []
 
 def add(level, area, msg):
@@ -86,6 +109,16 @@ def check_pins():
     # -> skip silently.
     baked_hp = HERMES / ".hermes_pin"
     running_hp = baked_hp.read_text(encoding="utf-8").strip() if baked_hp.is_file() else ""
+    # okengine#1044 [29]: "pre-marker image" is not a silent pass when the image IS visible. Every
+    # gateway build-engine-image.sh has produced since #192 carries both markers; a Hermes tree
+    # without them is an image this engine did not build (an upstream tag, a hand-built image),
+    # which may not carry the patch-01 write guard. Host-side runs point HERMES at a path that does
+    # not exist (no image to see), and stay quiet.
+    if HERMES.is_dir() and not (running or running_hp):
+        add("WARN", "pins", f"{HERMES} carries no .okengine_release/.hermes_pin marker: this gateway "
+                            "image was not built by build-engine-image.sh, so the carried Hermes "
+                            "patches (incl. the patch-01 write guard) are unverified. Re-run deploy.sh "
+                            "--rebuild; post_deploy_verify step [3b2] checks the patches themselves.")
     if running_hp and rt is not None:
         stamped_hp = str(rt.get("hermes_pin", ""))
         if stamped_hp and stamped_hp != running_hp:
@@ -286,7 +319,7 @@ def _check_slot_concurrency_coherence(jobs):
         raw = yaml.safe_load((DATA / "config.yaml").read_text(encoding="utf-8", errors="replace"))
         model = (raw or {}).get("model") if isinstance(raw, dict) else None
         cfg = model if isinstance(model, dict) else {}
-    except (OSError, yaml.YAMLError, AttributeError):
+    except (OSError, YAMLError, AttributeError):
         cfg = {}
     limits = {}
     for j in jobs:
@@ -343,7 +376,7 @@ def _check_model_routing(jobs):
         raw = yaml.safe_load((DATA / "config.yaml").read_text(encoding="utf-8", errors="replace"))
         model = (raw or {}).get("model") if isinstance(raw, dict) else None
         cfg = model if isinstance(model, dict) else {}
-    except (OSError, yaml.YAMLError, AttributeError):
+    except (OSError, YAMLError, AttributeError):
         cfg = {}
     default_provider = str(cfg.get("provider") or "")
     default_base = str(cfg.get("base_url") or "")
@@ -391,8 +424,21 @@ def _check_model_routing(jobs):
             f"runtime — give the odd lane an explicit provider.")
 
 
+def scheduler_uid() -> int:
+    """The uid cron-plus runs as: the gateway's HERMES_UID from the judged environment, else this
+    process's euid. In the gateway the two agree (deployment-validate runs as the service uid). A
+    host-side run (post_deploy_verify step [9], `framework doctor`) runs as the deployer, or as 0
+    under sudo, so its euid says nothing about the scheduler; comparing the store's owner to it
+    told a second operator to chown jobs.json to themselves (okengine#1044 [9]). An absent,
+    malformed or root value falls back to the euid: the gateway never runs as root (#185)."""
+    raw = str(ENV.get("HERMES_UID") or "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return os.geteuid()
+
+
 def check_crons():
-    environments = [("process environment", os.environ.items())]
+    environments = [("gateway environment", ENV.items())]
     for dotenv in sorted({VAULT / ".env", DATA / ".env"}):
         if dotenv.is_file():
             try:
@@ -412,10 +458,9 @@ def check_crons():
     # okengine#197: a root `docker exec` that rewrites the store re-owns it root:root — the
     # uid-service scheduler then silently stops firing EVERYTHING (44-min live all-lane outage).
     # Two red signals, at the earliest gate: (a) the store/pidfiles owned by someone other than
-    # the uid running this validator (the service uid — deployment-validate runs as the gateway
-    # service), (b) the scheduler's own .scheduler-stalled sentinel (cron-plus drops it when it
-    # cannot load the store; a successful load clears it).
-    me = os.geteuid()
+    # the scheduler's uid, (b) the scheduler's own .scheduler-stalled sentinel (cron-plus drops it
+    # when it cannot load the store; a successful load clears it).
+    me = scheduler_uid()
     try:
         st = jf.stat()
         if st.st_uid != me:
@@ -502,7 +547,7 @@ def check_crons():
     # but that lives in the MCP container, not this gateway cron surface.
 
 
-_FIXED_HOUR_RE = re.compile(r"^\s*(\S+)\s+(\d+)\s+\S+\s+\S+\s+\S+\s*$")
+_FIXED_HOUR_RE = re.compile(r"^\s*(\S+)\s+(\d+)\s+\S+\s+\S+\s+\S+\s*\Z")
 
 
 def _cron_plus_tz_aware():
@@ -530,7 +575,7 @@ def check_timezone():
       TZ-aware cron-plus): a fresh deploy clones the old scheduler and TZ does nothing.
     - TZ SET to an invalid IANA zone -> FAIL before inspecting jobs. Falling back to UTC would make
       every schedule and human-facing date silently disagree with the operator's declaration."""
-    tz = (os.environ.get("TZ") or "").strip()
+    tz = (ENV.get("TZ") or "").strip()
     tz_set = bool(tz) and tz.upper() != "UTC"
     zone = None
     if tz_set:
@@ -542,6 +587,7 @@ def check_timezone():
                 f"TZ={tz!r} is not a valid IANA timezone ({exc}) — refusing the silent UTC "
                 "fallback; correct TZ in .env and recreate every service")
             return
+    _check_writer_timezones(tz)
     jf = DATA / "cron-plus" / "jobs.json"
     if not jf.is_file():
         return
@@ -609,6 +655,66 @@ def check_timezone():
             ".hermes-data/cron-plus/jobs.json to adopt the current TZ.")
 
 
+#: The behavioral DST self-test (staged beside this file) and how long the gateway interpreter gets.
+_DST_SELFTEST = Path(__file__).resolve().parent / "croniter_dst_selftest.py"
+_DST_SELFTEST_TIMEOUT = 60
+#: The self-test's exit status -> finding level. Anything else (a crash, a missing PASS line, no tz
+#: database, a timeout) means the scheduler's croniter was not judged: WARN, never a pass.
+_DST_VERDICTS = {("PASS", 0): "INFO", ("FAIL", 10): "FAIL", ("MISSING", 11): "FAIL"}
+_DST_REMEDY = {
+    "INFO": "",
+    "FAIL": ". Lanes fire an hour off (or twice) on the next DST transition. Rebuild the gateway "
+            "image (build-engine-image.sh installs the pinned croniter) and recreate the gateway, "
+            "then null any next_run_at computed across a transition in "
+            ".hermes-data/cron-plus/jobs.json.",
+}
+
+
+def check_scheduler_dst():
+    """cron-plus computes next_run_at with the GATEWAY venv's croniter. Hermes's frozen uv.lock
+    installs croniter 6.0.0, which shifts a next fire that crosses DST by an hour (fall-back fires
+    an hour late; spring-forward fires an hour early and again on time), while CI and the host lock
+    6.2.4, so no test saw it. The image build pins 6.2.4 (build-engine-image.sh); this re-checks the
+    running gateway by BEHAVIOR, running croniter_dst_selftest.py under the interpreter cron-plus
+    runs in (HERMES/.venv/bin/python, isolated), never under this process's interpreter: a host run
+    would judge the host's croniter. Host side there is no baked venv, so it is undetectable."""
+    interp = HERMES / ".venv" / "bin" / "python"
+    if not interp.is_file():
+        add("WARN", "scheduler-dst", f"no gateway interpreter at {interp}, so the croniter cron-plus "
+            "schedules with is not checked here (undetectable, not a pass). Run inside the gateway.")
+        return
+    if not _DST_SELFTEST.is_file():
+        add("WARN", "scheduler-dst", f"{_DST_SELFTEST} is absent, so the gateway's croniter DST "
+            "behavior is unchecked (undetectable, not a pass). Restage the cron scripts.")
+        return
+    # -B: verify runs this as root in the gateway; bytecode must not land in the plugin tree (#1064).
+    argv = [str(interp), "-I", "-B", str(_DST_SELFTEST)]
+    plugin = DATA / "plugins" / "cron-plus"
+    if (plugin / "jobs.py").is_file():
+        # Also judge the deployed plugin's fall-back policy (okengine#1055, #1061 [4]); a missing
+        # plugin is reported by the cron-plus checks, so croniter alone is still judged here.
+        argv += ["--cron-plus", str(plugin)]
+    try:
+        proc = subprocess.run(argv,  # nosec B603 - fixed argv
+                              capture_output=True, text=True, timeout=_DST_SELFTEST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        add("WARN", "scheduler-dst", f"the croniter DST self-test timed out after "
+            f"{_DST_SELFTEST_TIMEOUT}s under {interp} (undetectable, not a pass)")
+        return
+    except OSError as exc:
+        add("WARN", "scheduler-dst", f"cannot run {interp} ({exc}) (undetectable, not a pass)")
+        return
+    line = (proc.stdout.strip().splitlines() or [""])[-1]
+    verdict, _, detail = line.partition("\t")
+    level = _DST_VERDICTS.get((verdict, proc.returncode))
+    if level is None:
+        why = detail or (proc.stderr.strip().splitlines() or ["no output"])[-1]
+        add("WARN", "scheduler-dst", f"the croniter DST self-test under {interp} did not reach a "
+            f"verdict (exit {proc.returncode}: {why}) (undetectable, not a pass)")
+    else:
+        add(level, "scheduler-dst", detail + _DST_REMEDY[level])
+
+
 def check_partition_dups():
     """A partitioned namespace must hold each slug ONCE. The KEV/NVD importers wrote CVEs to the
     flat `cves/CVE-X.md` root while the reshelve drain files them at `cves/YYYY/MM/CVE-X.md`, so a
@@ -665,6 +771,38 @@ def check_partition_dups():
                 + (" …" if len(dups) > 3 else ""))
 
 
+
+def check_reserved_basenames():
+    """No content page may sit under a reserved basename (okengine#997).
+
+    The write path refuses those names and the validator, id-index and INDEX builders skip them,
+    so such a page can be neither maintained through the enforced write path nor listed — it
+    silently drops out of its INDEX.md. The detector is `okf_migrate.reserved_name_pages`, whose
+    predicate is `schema_validator.is_reserved_basename` — the one the minting guard and the write
+    path's refusal also use. A LIVE page under an OKF-reserved or dot-leading name is a FAIL
+    (unmaintainable content). A WARN when the only offenders are tombstones (a dead redirect) or
+    scaffold-shaped pages (`_template.md`, `INDEX-x.md`): a pack may read those by name, so they
+    are a review item, not an automatic rename."""
+    if not (VAULT / "wiki").is_dir():
+        return
+    import okf_migrate
+    hits = okf_migrate.reserved_name_pages(VAULT)
+    if not hits:
+        return
+    scaffold = okf_migrate._reserved_contract().is_engine_generated
+    live = [rel for rel, tombstoned in hits if not tombstoned]
+    content = [rel for rel in live if not scaffold(Path(rel).name)]
+    # the FAIL-class pages first, so tombstones and templates never crowd a real offender out
+    ordered = content + [rel for rel, _ in hits if rel not in content]
+    sample = ", ".join(ordered[:3]) + (" …" if len(ordered) > 3 else "")
+    add("FAIL" if content else "WARN", "reserved-basenames",
+        f"{len(hits)} content page(s) ({len(live)} live, {len(live) - len(content)} "
+        f"scaffold-shaped) sit under a reserved basename — the write path refuses them and "
+        f"INDEX.md omits them (okengine#997): {sample}. Rename them and rewrite their links with "
+        "the malformed-slugs repair: dry-run `repair_malformed_slugs.py --vault <deployment>`, "
+        "then `framework repair plan|apply` with `--repairs malformed-slugs`.")
+
+
 def check_rules():
     cdir = VAULT / "config"
     for f in cdir.glob("*rules*.yaml") if cdir.is_dir() else []:  # glob-ok: vault config/ is a flat dir, not a sharded content namespace
@@ -710,7 +848,23 @@ def check_extensions():
     for ext in staged:
         if ext not in referenced and any((sroot / ext).glob("*.py")):  # glob-ok: a staged extension scripts dir is FLAT, never a sharded namespace
             add("WARN", "extensions", f"extension '{ext}' staged scripts but has NO lane in "
-                "jobs.json — its cron lanes may not have been folded (run deploy-cron-plus-jobs)")
+                "jobs.json — its cron lanes may not have been folded (run deploy-cron-plus-jobs), "
+                "or it is no longer enabled and its dir is stale (deploy-cron-scripts.sh "
+                "--prune-stale-extensions removes it)")
+
+
+def _owned_kind(mode):
+    """The ownership-relevant kind of an LSTAT mode, or None for kinds the checks ignore (sockets,
+    fifos, devices). Symlinks count, judged by the link's own owner — never the target's (#881).
+    Path.rglob does not descend through symlinked directories, so a link to a foreign tree
+    (e.g. /usr) is judged once, as a link, and its target tree is never walked."""
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISDIR(mode):
+        return "dir"
+    if stat.S_ISREG(mode):
+        return "file"
+    return None
 
 
 def check_ownership():
@@ -737,9 +891,11 @@ def check_ownership():
                 # (from a bare root `docker exec`) is unwritable by the lane uid, so the atomic-write
                 # pattern (write tmp + os.replace) can't create new pages in it — yet the file-only
                 # detection/repair pair converged 'green' with the dir still root-owned.
-                info = p.stat()
-                if (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)) and info.st_uid != me:
-                    kind = "dir" if stat.S_ISDIR(info.st_mode) else "file"
+                # stat(follow_symlinks=False): judge a symlink by ITS OWN owner, never its target's
+                # (okengine#881) — a lane-owned link to a root-owned system file is not a stray.
+                info = p.stat(follow_symlinks=False)
+                kind = _owned_kind(info.st_mode)
+                if kind and info.st_uid != me:
                     strays.append(f"{p.relative_to(VAULT)} ({kind}, uid {info.st_uid})")
             except OSError:
                 strays.append(f"{p.relative_to(VAULT)} (unstattable)")
@@ -784,10 +940,11 @@ def check_runtime_ownership():
             if child == DATA / "cron-plus" / "jobs.json":
                 continue  # retained below with its scheduler-specific failure guidance
             try:
-                info = child.stat()
-                if ((stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode))
-                        and info.st_uid != me):
-                    kind = "dir" if stat.S_ISDIR(info.st_mode) else "file"
+                # A venv's bin/python3 -> /usr/bin/python3 is a lane-owned LINK to a root-owned
+                # target; following it reported a false FAIL on a live deployment (okengine#881).
+                info = child.stat(follow_symlinks=False)
+                kind = _owned_kind(info.st_mode)
+                if kind and info.st_uid != me:
                     strays.append(
                         f"{child.relative_to(DATA)} ({kind}, uid {info.st_uid})"
                     )
@@ -824,30 +981,43 @@ def check_runtime_ownership():
 # blocklist missed the ways broad tools get in — a composite alias (`hermes-api-server`) that Hermes
 # expands to terminal/code_execution, or a non-list value that Hermes treats as unset -> broad
 # default (re-verify). Anything outside this set (or a non-list, or unset while enabled) FAILs.
-_API_SERVER_SAFE_TS = {"okengine", "okengine-write", "web", "no_mcp"}
+# okengine#983: the chat writes ONLY through its actor-bound `okengine-write-chat`; the actor-less
+# `okengine-write` (admin to the write path) is no longer allowlisted.
+_API_SERVER_SAFE_TS = {"okengine", CHAT_WRITER, "web", "no_mcp"}
+
+
+def _gateway_env_and_chat(cfg) -> tuple[dict, bool]:
+    """(the env Hermes enables platforms from, whether the Agent Chat (api_server) is on).
+
+    Chat enables on ANY of: API_SERVER_ENABLED, an API_SERVER_KEY (Hermes enables on the key
+    alone), or an api_server block enabled in config.yaml in any spelling Hermes reads
+    (platform_config_state, okengine#993). okengine#991: Hermes loads $HERMES_HOME/.env
+    (= DATA/.env) over the container environment (override=True), and `hermes setup` writes
+    credentials there, so a key set only in that file still enables its platform. A `docker exec`
+    run of this check does not inherit that load."""
+    env = {**ENV, **read_dotenv(DATA / ".env")}
+    enabled = (str(env.get("API_SERVER_ENABLED", "")).strip().lower() in ("1", "true", "yes", "on")
+               or bool(str(env.get("API_SERVER_KEY", "")).strip()))
+    if isinstance(cfg, dict) and platform_config_state(cfg, "api_server")[0]:
+        enabled = True
+    return env, enabled
 
 
 def check_auth():
-    trust = os.environ.get("OKENGINE_TRUST", "private")
-    bind = os.environ.get("OKENGINE_BIND", "127.0.0.1")
-    pw = os.environ.get("OKENGINE_READER_PASSWORD", "")
+    trust = ENV.get("OKENGINE_TRUST", "private")
+    bind = ENV.get("OKENGINE_BIND", "127.0.0.1")
+    pw = ENV.get("OKENGINE_READER_PASSWORD", "")
     if trust == "private" and bind not in ("", "127.0.0.1", "localhost") and not pw:
         add("FAIL", "auth", "private vault exposed beyond loopback with NO password")
 
     # config.yaml is seeded ONCE from the template and never reconciled (ensure-runtime leaves an
-    # existing one untouched). The secure `platform_toolsets.api_server: [okengine, okengine-write]`
+    # existing one untouched). The secure `platform_toolsets.api_server: [okengine, okengine-write-chat]`
     # lockdown was added to the template later (v0.10.7) — so a deployment seeded before it that then
     # enables Agent Chat inherits the BROAD default toolset (terminal / code_execution / file /
     # computer_use) on a network-exposed endpoint, and nothing validated it (invariant-audit HIGH).
-    # Chat enables on ANY of: API_SERVER_ENABLED, an API_SERVER_KEY (Hermes enables on the key alone),
-    # or platforms.api_server.enabled (re-verify: the first two were unchecked).
-    enabled = (str(os.environ.get("API_SERVER_ENABLED", "")).strip().lower() in ("1", "true", "yes", "on")
-               or bool(str(os.environ.get("API_SERVER_KEY", "")).strip()))
+    # Chat enablement and the gateway env: _gateway_env_and_chat.
     cfg = _yaml(DATA / "config.yaml") if (DATA / "config.yaml").is_file() else None
-    if cfg:
-        plats = cfg.get("platforms") or {}
-        if isinstance(plats.get("api_server"), dict) and plats["api_server"].get("enabled"):
-            enabled = True
+    env, enabled = _gateway_env_and_chat(cfg)
     if enabled:
         if cfg is None:
             add("WARN", "auth", "Agent Chat (api_server) appears enabled but config.yaml is unreadable "
@@ -858,31 +1028,106 @@ def check_auth():
                 add("FAIL", "auth", "Agent Chat (api_server) is enabled but platform_toolsets.api_server "
                     f"is not a list ({type(ts).__name__}) — Hermes then uses the broad default toolset "
                     "(terminal/code_execution/file/computer_use) on a network endpoint. Set it to "
-                    "[okengine, okengine-write] (see config/config.yaml.template).")
+                    f"[okengine, {CHAT_WRITER}] (see config/config.yaml.template).")
             elif (bad := {str(x).strip() for x in ts} - _API_SERVER_SAFE_TS):
                 add("FAIL", "auth", f"Agent Chat (api_server) toolset has non-allowlisted member(s) "
                     f"{sorted(bad)} — a composite/alias can expand to terminal/code_execution/file. "
                     f"Restrict platform_toolsets.api_server to {sorted(_API_SERVER_SAFE_TS)}.")
             # okengine#257: the OKENGINE_EDITING switch must AGREE with the live toolset. Editing off is
-            # enforced by DROPPING okengine-write here (ensure-runtime). If the flag says off but the
+            # enforced by DROPPING the chat writer here (ensure-runtime). If the flag says off but the
             # write MCP is still present, the switch never took (config not reconciled / gateway not
             # recreated) — UI editing (reader Chat write-back) is still exposed.
-            if isinstance(ts, list) and not is_editing(os.environ) and \
-                    "okengine-write" in {str(x).strip() for x in ts}:
-                add("FAIL", "auth", "OKENGINE_EDITING is off but okengine-write is STILL in the "
+            if isinstance(ts, list) and not is_editing(ENV) and \
+                    CHAT_WRITER in {str(x).strip() for x in ts}:
+                add("FAIL", "auth", f"OKENGINE_EDITING is off but {CHAT_WRITER} is STILL in the "
                     "api_server toolset — UI editing (reader Chat write-back) is still exposed. Re-run "
                     "ensure-runtime and recreate the gateway so the switch applies (okengine#257).")
+    # okengine#983: no model-facing platform may reach the actor-less writer, which the write path
+    # treats as admin. Checked whether or not chat is enabled (any configured platform counts);
+    # the CLI is exempt by NAME (OPERATOR_SURFACES), never by omission.
+    if isinstance(cfg, dict):
+        # okengine#991: the gateway env is what Hermes enables messaging platforms from;
+        # okengine#993: photon also enables from credentials stored in $HERMES_HOME/auth.json.
+        auth, auth_error = read_auth_json(DATA / "auth.json")
+        for msg in actorless_writer_bindings(cfg, chat_enabled=enabled, env=env, auth=auth):
+            add("FAIL", "auth", msg)
+        servers = cfg.get("mcp_servers")
+        if auth_error and isinstance(servers, dict) and actorless_writers(servers):
+            add("WARN", "auth", f"{auth_error}: whether {sorted(STORED_CREDENTIAL_PLATFORMS)} "
+                "enable from stored credentials, and so reach the actor-less writer, is "
+                "undetectable here (not a pass). Run the check as the gateway user.")
+        if isinstance(servers, dict) and actorless_writers(servers):
+            for platform, why in sorted(OPERATOR_SURFACES.items()):
+                add("INFO", "auth", f"platform {platform!r} is an operator surface, exempt from "
+                    "the actor-less writer check: " + why)
 
     # OKENGINE_HARDENED (okengine#78): a single opt-in profile. When set, the deployment ASSERTS it
     # must be safe to expose, so every unsafe setting is a FAIL (fail-closed — the profile never mints
     # secrets or flips values silently). hardened_posture_violations is the shared source of truth.
-    if is_hardened(os.environ):
-        viols = hardened_posture_violations(os.environ)
+    if is_hardened(ENV):
+        viols = hardened_posture_violations(ENV)
         for msg in viols:
             add("FAIL", "hardening", msg)
         if not viols:
             add("INFO", "hardening", "OKENGINE_HARDENED posture satisfied "
                 "(real MCP token, reader auth-or-public, rate limits on, exports safe).")
+
+
+def check_chat_capability():
+    """okengine#991: a chat writer ensure-runtime has bound must have its capability in the BAKED
+    policy catalog. The binding is config (stage + recreate); the capability is baked into the
+    gateway image. A stage-only roll onto an image that predates it rejects every chat write-back
+    ('caller has no declared write capability') while every other gate stays green. Only the engine
+    catalog can introduce a chat capability (a pack may only replace one: policy_plane
+    .compose_documents), so the baked catalog is the complete answer. Bound means some platform
+    Hermes runs (or that has a platform_toolsets entry) is handed the writer: named in its list,
+    or BY DEFAULT, when the platform has no list or a list naming no registered server
+    (okengine#993 N2: with no actor-less writer registered, nothing else catches a default
+    binding)."""
+    path = DATA / "config.yaml"
+    cfg = _yaml(path) if path.is_file() else None
+    if not isinstance(cfg, dict):
+        return
+    servers = cfg.get("mcp_servers") if isinstance(cfg.get("mcp_servers"), dict) else {}
+    chat = {}
+    for name, spec in servers.items():
+        env = (spec or {}).get("env") if isinstance(spec, dict) else None
+        actor = str((env or {}).get("OKENGINE_WRITE_ACTOR") or "").strip() \
+            if isinstance(env, dict) else ""
+        if actor.startswith("chat:"):
+            chat[str(name)] = actor
+    env, enabled = _gateway_env_and_chat(cfg)
+    auth, _error = read_auth_json(DATA / "auth.json")   # an unreadable file is check_auth's WARN
+    bindings = platform_toolset_bindings(cfg, chat_enabled=enabled, env=env, auth=auth)
+    reached = set().union(*(names for names, _toolset in bindings.values()))
+    bound = {name: actor for name, actor in chat.items() if name in reached}
+    if not bound:
+        return
+    catalog_path = HERMES / "config" / "policy" / "catalog.yaml"
+    if not catalog_path.is_file():
+        add("WARN", "chat-capability", f"chat writer(s) {sorted(bound)} are bound but the baked "
+            f"policy catalog {catalog_path} is absent here, so their capability is unverifiable "
+            "(undetectable, not a pass). Run inside the gateway.")
+        return
+    recorded = len(F)
+    catalog = _yaml(catalog_path)
+    if len(F) > recorded:           # unparseable: _yaml already recorded the FAIL
+        return
+    # An empty (or comment-only) catalog parses to None: it declares nothing, so it falls through
+    # to the no-capabilities FAIL below rather than reading as nothing to check.
+    capabilities = catalog.get("capabilities") if isinstance(catalog, dict) else None
+    if not isinstance(capabilities, dict):
+        add("FAIL", "chat-capability", f"the baked policy catalog {catalog_path} has no "
+            "capabilities mapping, so no bound chat writer can write. Rebuild the gateway image.")
+        return
+    for name, actor in sorted(bound.items()):
+        if actor in capabilities:
+            add("INFO", "chat-capability", f"{name} is bound and the baked catalog declares {actor}")
+        else:
+            add("FAIL", "chat-capability", f"{name} is bound (actor {actor}) but the gateway's baked "
+                f"policy catalog declares no {actor} capability, so every chat write-back is "
+                "rejected. The image predates the config ensure-runtime staged: rebuild the gateway "
+                "image (build-engine-image.sh) and recreate the gateway; a stage-only roll misses it.")
 
 
 # The libs the enforced okengine-write MCP (write_server.py) imports from the BAKED scripts/cron tree
@@ -922,7 +1167,7 @@ def check_write_path_libs():
             if baked.read_bytes() != staged.read_bytes():
                 add("FAIL", "write-path", f"{name} DIFFERS between the baked write path ({baked}) and "
                     f"the staged copy ({staged}) — the enforced MCP write server is running a STALE "
-                    f"lib. Rebuild the gateway image (build-engine-image.sh, or the id-index overlay); "
+                    f"lib. Rebuild the gateway image (build-engine-image.sh, as a patch release); "
                     f"staging alone does not reach write_server. See docs/id-index-runbook.md.")
         except OSError as e:
             add("WARN", "write-path", f"{name}: cannot compare ({e})")
@@ -971,63 +1216,346 @@ def check_write_path_libs():
             f"(undetectable, not a pass).")
 
 
+def _gateway_pack() -> str:
+    """OKENGINE_PACK as the gateway carries it: the process env in the gateway, else (host-side
+    doctor/post-deploy) the gateway service declaration in docker-compose.yml."""
+    pack = ENV.get("OKENGINE_PACK", "").strip()
+    if pack:
+        return pack
+    compose = _yaml(VAULT / "docker-compose.yml") \
+        if (VAULT / "docker-compose.yml").is_file() else {}
+    gateway = (((compose or {}).get("services") or {}).get("gateway") or {})
+    environment = gateway.get("environment") or {}
+    if isinstance(environment, dict):
+        return str(environment.get("OKENGINE_PACK") or "").strip()
+    if isinstance(environment, list):
+        for entry in environment:
+            key, separator, value = str(entry).partition("=")
+            if key == "OKENGINE_PACK" and separator:
+                return value.strip()
+    return ""
+
+
 def check_provenance_env():
-    """invariant-audit M14/#750: composition provenance (maintained_by / discovered_by) is stamped
-    by the enforced write path ONLY when the gateway carries OKENGINE_PACK (deployment-pinned, never
-    client-supplied). A pack whose compose predates the OKENGINE_PACK env (pre-2026-06-26 skeleton)
-    silently stops stamping it on every write — undetectable until you ask 'which pack wrote this'.
-    The daily validator runs in the gateway, while framework doctor/post-deploy
-    run on the host. Host-side checks therefore fall back to the gateway service
-    declaration in docker-compose.yml instead of inspecting the unrelated host
-    process environment."""
-    pack = os.environ.get("OKENGINE_PACK", "").strip()
-    if not pack:
-        compose = _yaml(VAULT / "docker-compose.yml") \
-            if (VAULT / "docker-compose.yml").is_file() else {}
-        gateway = (((compose or {}).get("services") or {}).get("gateway") or {})
-        environment = gateway.get("environment") or {}
-        if isinstance(environment, dict):
-            pack = str(environment.get("OKENGINE_PACK") or "").strip()
-        elif isinstance(environment, list):
-            for entry in environment:
-                key, separator, value = str(entry).partition("=")
-                if key == "OKENGINE_PACK" and separator:
-                    pack = value.strip()
-                    break
-    if not pack:
-        add("WARN", "provenance", "OKENGINE_PACK is not set in the gateway env — the write path "
-            "stamps no composition provenance (maintained_by/discovered_by). Add "
-            "`OKENGINE_PACK=<pack>` to the gateway service in docker-compose.yml and recreate it "
-            "(regenerate from the current skeleton, or copy the line).")
+    """invariant-audit M14/#750, re-pointed by okengine#1032 [20]: composition provenance
+    (maintained_by / discovered_by) is stamped with the write path's pack principal. Since
+    okengine#1027 that is the ``name`` in <vault>/pack.yaml (okengine.pack_principal), with
+    OKENGINE_PACK only as a fallback read from the WRITER's own environment. Hermes never passes the
+    gateway's OKENGINE_PACK to a served write server, so the gateway value proves nothing about
+    what is stamped. This check therefore judges the real source:
+
+      - pack.yaml declares no ``name``: WARN. Provenance then depends on an OKENGINE_PACK in each
+        writer's own ``env:`` map, which write-principal judges per server;
+      - the gateway's OKENGINE_PACK disagrees with pack.yaml: WARN. The write path stamps the
+        pack.yaml name and ignores the gateway value, which only misleads whoever reads it.
+    """
+    try:
+        declared = _pack_principal().declared_pack(VAULT)
+    except (ImportError, AttributeError):
+        add("WARN", "provenance", "okengine.pack_principal is not importable from this engine, so "
+            "the pack the write path stamps as provenance cannot be determined (undetectable, not a "
+            "pass). Rebuild the gateway image, or run from a current engine checkout.")
+        return
+    gateway = _gateway_pack()
+    if not declared:
+        add("WARN", "provenance", f"{VAULT / 'pack.yaml'} declares no `name`, so the write path "
+            "has no deployment pack to stamp as composition provenance (maintained_by/"
+            "discovered_by). The gateway's OKENGINE_PACK does not reach the write servers; only an "
+            "OKENGINE_PACK in a writer's own env: map stands in (see write-principal). Give "
+            "pack.yaml its `name`.")
+    elif gateway and gateway != declared:
+        add("WARN", "provenance", f"the gateway's OKENGINE_PACK={gateway} disagrees with the name "
+            f"{declared!r} in pack.yaml. The write path stamps {declared!r} and ignores the gateway "
+            "value; correct or drop OKENGINE_PACK in docker-compose.yml so it stops misleading.")
+
+
+def _pack_principal():
+    """The write server's own startup rule, from THIS engine. On the host (framework doctor,
+    deploy.sh's pre-recreate gate, post_deploy_verify) this file sits in an engine checkout whose
+    own src/ must win: an installed or editable `okengine` from another worktree may predate
+    okengine#1027. In the gateway the staged copy has no checkout beside it, and the baked wheel
+    is the write server's own."""
+    checkout = Path(__file__).resolve().parents[2] / "src" / "okengine" / "pack_principal.py"
+    if checkout.is_file():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("okengine_pack_principal_checkout", checkout)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    import engine_package  # noqa: F401 — `okengine` importable when this tree is loaded by path
+    from okengine import pack_principal
+    return pack_principal
+
+
+def _writer_envs(cfg: dict) -> dict[str, dict[str, str]]:
+    """`{server: env map}` for every write server registered in the gateway `cfg`: an
+    `okengine-write*` name or any server that runs write_server.py."""
+    servers = cfg.get("mcp_servers") if isinstance(cfg.get("mcp_servers"), dict) else {}
+    writers = {}
+    for name, spec in servers.items():
+        spec = spec if isinstance(spec, dict) else {}
+        if str(name).startswith(ACTORLESS_WRITER) or any(
+                "write_server.py" in str(arg) for arg in (spec.get("args") or [])):
+            env = spec.get("env")
+            writers[str(name)] = {str(k): str(v) for k, v in env.items()} \
+                if isinstance(env, dict) else {}
+    return writers
+
+
+# The writers ensure-runtime reconciles (its `^  okengine-write(-…)?:` selector).
+_BOUND_WRITER = re.compile(r"okengine-write(?:-[A-Za-z0-9_.-]+)?$")
+
+
+def _check_writer_timezones(tz: str) -> None:
+    """okengine#1042 [36]: a write server dates its wiki/log.md ledger lines with the zone in its
+    OWN `env:` map, because Hermes never passes the gateway's TZ to a stdio server. A writer whose
+    map lacks the gateway's zone (or carries another) writes a different calendar day from the
+    in-process writers and the review/rotation lanes for part of every day. ensure-runtime binds
+    it; this catches a config.yaml that ensure-runtime has not reconciled since."""
+    path = DATA / "config.yaml"
+    cfg = _yaml(path) if path.is_file() else None
+    if not isinstance(cfg, dict):
+        return
+    want = "UTC" if not tz or tz.upper() == "UTC" else tz
+    off = []
+    for name, env in sorted(_writer_envs(cfg).items()):
+        if not _BOUND_WRITER.match(name):
+            continue        # ensure-runtime binds only okengine-write*; its advice could not clear it
+        have = (env.get("TZ") or "").strip()
+        have = "UTC" if not have or have.upper() == "UTC" else have
+        if have != want:
+            off.append(f"{name} ({have})")
+    if off:
+        add("WARN", "timezone",
+            f"the gateway runs TZ={want} but {len(off)} write server(s) date the ledger in another "
+            f"zone: {', '.join(off[:4])}{' …' if len(off) > 4 else ''}. Hermes does not pass the "
+            "gateway's TZ to a stdio writer, so its wiki/log.md lines name a different day around "
+            "midnight. Re-run ensure-runtime (it binds TZ into every writer's env:), then recreate "
+            "the gateway.")
+
+
+def check_write_principal():
+    """okengine#1027: every registered write server must start with a pack principal. Hermes hands
+    a stdio MCP server only a safe baseline plus its own `env:` map, so the gateway's OKENGINE_PACK
+    never reaches it; the server derives the pack from the vault's pack.yaml (OKENGINE_PACK from its
+    `env:` map only where pack.yaml declares none) and refuses to start without one or on a
+    disagreement. This applies the server's own startup rule (okengine.pack_principal) to each
+    server's env map, so a writer that would refuse to start, and leave its lane with no write
+    tools, FAILs here before the gateway is recreated."""
+    path = DATA / "config.yaml"
+    cfg = _yaml(path) if path.is_file() else None
+    if not isinstance(cfg, dict):
+        return
+    try:
+        startup_refusal = _pack_principal().startup_refusal
+    except (ImportError, AttributeError):
+        add("WARN", "write-principal", "okengine.pack_principal is not importable from this engine "
+            "(an engine checkout or a gateway image that predates okengine#1027), so this check "
+            "cannot judge the write servers (undetectable, not a pass). Rebuild the gateway image, "
+            "or run from a current engine checkout.")
+        return
+
+    writers = _writer_envs(cfg)
+    refused = {name: why for name, env in sorted(writers.items())
+               if (why := startup_refusal(VAULT, env))}
+    for name, why in refused.items():
+        add("FAIL", "write-principal", f"{name} would refuse to start: {why}. Its lane gets no "
+            "write tools. Give the pack.yaml a `name` (and drop or correct a stale OKENGINE_PACK in "
+            "that server's env:), re-run ensure-runtime, then recreate the gateway.")
+    if writers and not refused:
+        add("INFO", "write-principal", f"{len(writers)} write server(s) start with a pack principal")
+
+
+def _source_url_key(url: str) -> str:
+    """The grouping key for a source URL: the write path's own identity rule
+    (`state._source_identity_url`, which `deduplication._norm_url` also calls), so this check can
+    never group what the write path keeps apart. "" for a non-address or a bare service endpoint."""
+    import engine_package  # noqa: F401 — `okengine` importable when this tree is loaded by path
+    from okengine.write_services.state import _source_identity_url
+    return _source_identity_url(url)
+
+
+def check_source_identity():
+    """Identity drift the write path cannot see after the fact (okengine#886), counted — never
+    repaired — so the class stays visible between reviews:
+
+      - live SOURCE urls held by more than one page (the same document at several seats; merge
+        with scripts/cron/dedup_same_url.py, dry-run by default);
+      - PLACEHOLDER source urls (`abs/[pending]`, `{id}`, `/tbd`, example.com — the write path's
+        own `_PLACEHOLDER_URL`); one live vault filed 20 different papers under one;
+      - live pages with NO `id`, per namespace. The write path can neither update nor find such a
+        page by identity: ~600 importer-written sources were invisible to converge and duplicated.
+      - bare SERVICE-ENDPOINT source urls (an ArcGIS `/query`, `/MapServer/<n>`, a Socrata
+        `/resource/<id>.json`, with no query string — `state._is_service_endpoint_url`). Every
+        record read from the endpoint shares the URL; before okengine#901 the write path converged
+        on it and fused unrelated records into whichever page claimed it first (one live vault lost
+        a 38-parcel body that way). They carry no identity now, so they are never grouped as
+        "shared" URLs; the count finds the pages to inspect for earlier fusions.
+
+    WARN with counts and a few examples. Tombstoned pages, generated INDEX/_ files and history are
+    excluded. URL normalization mirrors write_services.deduplication._norm_url (pinned by a test)."""
+    import engine_package  # noqa: F401 — `okengine` importable when this tree is loaded by path
+    from okengine.write_services.state import _PLACEHOLDER_URL, _is_service_endpoint_url
+    wiki = VAULT / "wiki"
+    if not wiki.is_dir():
+        return
+    by_url: dict[str, list[str]] = {}
+    placeholders: list[str] = []
+    endpoints: list[str] = []
+    idless: dict[str, list[str]] = {}
+    for p in sorted(wiki.rglob("*.md")):
+        rel = p.relative_to(wiki).as_posix()
+        parts = rel.split("/")
+        if len(parts) < 2 or parts[0].startswith(("_", ".")) or p.name.startswith(("INDEX", "_")):
+            continue
+        try:
+            head = p.read_text(encoding="utf-8", errors="replace")[:8192]
+        except OSError:
+            continue
+        m = re.match(r"---\s*\n(.*?)\n---", head, re.S)
+        fm = m.group(1) if m else ""
+        if re.search(r"(?im)^status:\s*[\"']?tombstoned\b", fm):
+            continue
+        if not re.search(r"(?m)^id:\s*\S", fm):
+            idless.setdefault(parts[0], []).append(rel)
+        if parts[0] != "sources":
+            continue
+        um = re.search(r"(?m)^url:\s*[\"']?([^\"'\n]*?)[\"']?\s*$", fm)
+        url = um.group(1).strip() if um else ""
+        if url and _PLACEHOLDER_URL.search(url):
+            placeholders.append(rel)
+        elif _is_service_endpoint_url(url):
+            endpoints.append(rel)
+        elif _source_url_key(url):
+            by_url.setdefault(_source_url_key(url), []).append(rel)
+    shared = {u: ps for u, ps in by_url.items() if len(ps) > 1}
+    if shared:
+        sample = "; ".join(f"{u} ×{len(ps)}" for u, ps in list(shared.items())[:3])
+        add("WARN", "source-identity",
+            f"{len(shared)} source URL(s) are held by more than one live page "
+            f"({sum(map(len, shared.values()))} pages) — the same document at several seats "
+            f"splits citations and doubles counts. Review/merge with "
+            f"scripts/cron/dedup_same_url.py (dry-run by default). e.g. {sample}")
+    if placeholders:
+        add("WARN", "source-identity",
+            f"{len(placeholders)} source page(s) carry a placeholder URL — URL identity fuses "
+            f"unrelated documents under it. Repair from their raw captures with "
+            f"dedup_same_url.py --placeholders. e.g. {', '.join(placeholders[:3])}")
+    if endpoints:
+        add("WARN", "source-identity",
+            f"{len(endpoints)} source page(s) carry a bare service-endpoint URL (an API query "
+            f"endpoint with no query string, shared by every record read from it) — it is not a "
+            f"document identity, and before okengine#901 the write path converged unrelated "
+            f"records into such pages. Check each for a fused body (its .okengine/snapshots "
+            f"history) and give it a record-specific URL. e.g. {', '.join(endpoints[:3])}")
+    for ns, rels in sorted(idless.items()):
+        add("WARN", "source-identity",
+            f"namespace '{ns}' has {len(rels)} live page(s) with no `id` — the write path can "
+            f"neither update them nor find them by identity, so writers duplicate them. "
+            f"e.g. {', '.join(rels[:3])}")
 
 
 # ── shared driver (okengine#405) ──────────────────────────────────────────────
+def check_tool_search():
+    """Hermes' progressive tool disclosure should be OFF on an OKEngine deployment (okengine#886).
+
+    Hermes defaults `tools.tool_search.enabled` to "auto": every MCP tool — every OKEngine write
+    tool — is hidden behind tool_search/tool_describe/tool_call bridges. OKEngine lanes already
+    scope their tools with enabled_toolsets, so the bridge saves nothing and costs turns: on one
+    live deployment 285 of 357 raw-backfill runs spent 2 of their 4 iterations finding their
+    write tool. WARN (not FAIL): a deployment may opt in deliberately.
+    """
+    cfg = DATA / "config.yaml"
+    if not cfg.is_file():
+        return
+    try:
+        doc = yaml.safe_load(cfg.read_text(encoding="utf-8")) or {}
+    except (OSError, YAMLError):  # bare name: Cosmic Ray cannot mutate a dotted exception
+        add("WARN", "tool search", f"{cfg}: unreadable — tool disclosure setting UNDETECTABLE")
+        return
+    setting = ((doc.get("tools") or {}).get("tool_search") if isinstance(doc, dict) else None)
+    enabled = setting.get("enabled") if isinstance(setting, dict) else setting
+    if str(enabled).strip().lower() in ("off", "false"):
+        add("PASS", "tool search", "progressive tool disclosure off (lanes call their tools directly)")
+        return
+    add("WARN", "tool search", "tools.tool_search.enabled is not \"off\" (Hermes default \"auto\") — "
+        "every lane spends turns on tool_search/describe before it can write; set it off in "
+        "config.yaml (see config/config.yaml.template)")
+
+
 CHECKS = {
     "pins": check_pins,
     "schema": check_schema,
     "subdomains": check_subdomains,
     "crons": check_crons,
     "timezone": check_timezone,
+    "scheduler-dst": check_scheduler_dst,
     "partition-dups": check_partition_dups,
+    "reserved-basenames": check_reserved_basenames,
+    "source-identity": check_source_identity,
     "rules": check_rules,
     "extensions": check_extensions,
     "ownership": check_ownership,
     "runtime-ownership": check_runtime_ownership,
     "auth": check_auth,
     "write-path": check_write_path_libs,
+    "chat-capability": check_chat_capability,
     "provenance": check_provenance_env,
+    "write-principal": check_write_principal,
     "operations": lambda: check_operation_runs(),
+    "tool-search": check_tool_search,
 }
-# The daily validator runs exactly the original 13 (operations is doctor-only) so the extraction
-# leaves its behavior unchanged.
+# The daily validator runs every registered check except operations (doctor-only). The list is
+# pinned by test_registry_covers_the_validator_checks_plus_operations, so adding one is deliberate.
 VALIDATE_CHECKS = [k for k in CHECKS if k != "operations"]
+# post_deploy_verify.sh step [9] runs every registered check host-side EXCEPT these, each of which
+# needs the running gateway and runs in its own in-container step there (okengine#1032 [22]). The
+# step derives its list from CHECKS minus this map, so a new check runs at deploy time by default;
+# tests/cron/test_post_deploy_verify_checks.py pins that each exclusion's in-container step exists.
+POST_DEPLOY_HOST_EXCLUDED = {
+    "write-path": "compares the BAKED /opt/hermes libs with the staged copies; step [3b] does it in "
+                  "the gateway",
+    "runtime-ownership": "needs the container's HERMES_UID; step [5c] stats the runtime dir in the "
+                         "gateway",
+    "ownership": "must run as the lane uid inside the gateway; step [5f] runs it there",
+    "chat-capability": "reads the policy catalog baked into the gateway image; its own in-container "
+                       "step runs it there",
+    "scheduler-dst": "runs the DST self-test under the gateway's baked venv interpreter; its own "
+                     "in-container step runs it there",
+}
 
 
-def configure(vault, data=None, hermes=None) -> None:
+def host_env(deployment, environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The environment compose hands the gateway of the HOST deployment dir `deployment`: its pack
+    .env read as both compose's project .env and the gateway's env_file, with `environ` (default:
+    this process's) as compose's invoking environment. `.hermes-data/.env`, which Hermes loads over
+    it, is applied where the checks need it (_gateway_env_and_chat), exactly as in the gateway.
+
+    TZ and HERMES_UID are the exceptions to the env_file view: the gateway service sets
+    `TZ=${TZ:-UTC}` and `HERMES_UID=${HERMES_UID:-10000}` in its `environment:`, which overrides
+    env_file and resolves from the invoking environment first, so they are taken as compose
+    interpolates them (okengine#1042 [36] review, okengine#1044 [9]); HERMES_UID only when set."""
+    environ = os.environ if environ is None else environ
+    env = read_compose_env(Path(deployment) / ".env", environ)
+    env["TZ"] = compose_default("TZ", environ, Path(deployment) / ".env", "UTC")
+    # Same for the gateway's `HERMES_UID=${HERMES_UID:-10000}`: the uid the scheduler runs as,
+    # which check_crons judges the store's owner against (okengine#1044 [9]). Only an explicit
+    # value is carried: with none, check_crons keeps judging by the running uid rather than by the
+    # bare-compose default, which deploy.sh and ensure-runtime never leave in effect.
+    uid = compose_default("HERMES_UID", environ, Path(deployment) / ".env", "")
+    if uid:
+        env["HERMES_UID"] = uid
+    return env
+
+
+def configure(vault, data=None, hermes=None, env: Mapping[str, str] | None = None) -> None:
     """Point the checks at a specific deployment (host `framework status/doctor`). Rebinds the module
-    globals the checks read; unspecified DATA/HERMES keep their env defaults."""
-    global VAULT, DATA, HERMES
+    globals the checks read; unspecified DATA/HERMES keep their env defaults. `env` is the gateway
+    environment the checks judge (a host run passes host_env(deployment)); omitted, it is this
+    process's environment, as in the gateway, so a later in-process configure never inherits it."""
+    global VAULT, DATA, HERMES, ENV
     VAULT = Path(vault)
+    ENV = os.environ if env is None else dict(env)
     if data is not None:
         DATA = Path(data)
     if hermes is not None:
@@ -1047,6 +1575,12 @@ def run(names=None):
     else:
         want = set(names)
         selected = [n for n in CHECKS if n in want]
+        # okengine#994 [15]: a name this copy does not register never ran, which is not a pass.
+        # post_deploy_verify asks the STAGED copy for a check by name; one staged before the
+        # check existed used to return no findings, read as "nothing to report".
+        for name in sorted(want - set(CHECKS)):
+            add("FAIL", "validator", f"unknown check {name!r}: this deployment_checks.py does not "
+                "register it (stale staged copy?), so it never ran")
     for name in selected:
         try:
             CHECKS[name]()

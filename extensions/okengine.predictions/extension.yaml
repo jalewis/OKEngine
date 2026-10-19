@@ -24,7 +24,8 @@ requires:
   engine: ">=0.4.0"
 capabilities:
   read: ["wiki/**"]
-  write: ["predictions/**", "dashboards/**"]   # predictions + derived dashboards (base-rates, outcome-eval)
+  write: ["predictions/**", "dashboards/**", "briefings/**"]   # predictions + derived dashboards
+                                            # (base-rates, outcome-eval) + the forecast-review narrative
 schema:
   - schema/predictions.schema.yaml   # evidence-record ITEM contract (#217) — single source of the
                                      #   direction vocabulary; wires into the composer (without this
@@ -45,7 +46,12 @@ operations:
     entrypoint: select_prediction_candidates.py      # wake-gate selector
     prompt_file: prompts/candidate-watch.md
     max_iterations: 12
-    output_contract: &prediction_contract
+    # Batch-triage lanes (candidate-watch, grade, regrade, prediction-schema-drain,
+    # prediction-falsification-search) are judged PER SELECTED ITEM (okengine#878): a batch whose
+    # every item is correctly deferred wrote nothing and still succeeded. Under `completion: run`
+    # such a run fails ("requires at least one verified write"). Each selector writes the
+    # selection manifest and prints the okengine-receipt the runner verifies.
+    output_contract: &prediction_item_contract
       api: 1
       allowed_namespaces: [predictions, dashboards]
       allowed_types: [prediction, dashboard]
@@ -56,7 +62,7 @@ operations:
       unknown_fields: reject
       unresolved_links: review
       placeholder_links: reject
-      completion: run
+      completion: per-selected-item
     adversarial_fixtures: &model_fixtures [tests/extensions/test_model_output_contracts.py]
     toolsets: [file_read, okengine-write, okengine]
   grade:
@@ -64,7 +70,7 @@ operations:
     entrypoint: select_predictions_for_grading.py
     prompt_file: prompts/grade.md
     max_iterations: 12
-    output_contract: *prediction_contract
+    output_contract: *prediction_item_contract
     adversarial_fixtures: *model_fixtures
     toolsets: [todo, okengine-write, okengine]
   regrade:
@@ -72,7 +78,7 @@ operations:
     entrypoint: select_regrade_batch.py
     prompt_file: prompts/regrade.md
     max_iterations: 12
-    output_contract: *prediction_contract
+    output_contract: *prediction_item_contract
     adversarial_fixtures: *model_fixtures
     toolsets: [todo, okengine-write, okengine]
   confidence-recommender:
@@ -108,7 +114,7 @@ operations:
     entrypoint: select_prediction_schema_drain.py
     prompt_file: prompts/schema-drain.md
     max_iterations: 12
-    output_contract: *prediction_contract
+    output_contract: *prediction_item_contract
     adversarial_fixtures: *model_fixtures
     toolsets: [todo, okengine-write, okengine]
   prediction-structural-backfill:
@@ -139,7 +145,24 @@ operations:
     entrypoint: select_forecast_review.py
     prompt_file: prompts/forecast-review.md
     max_iterations: 12
-    output_contract: *prediction_contract
+    # Publishing lanes (forecast-review, base-rates, output-outcome-eval) owe a dashboard every
+    # run they wake, so they keep whole-run completion: zero writes after waking IS a failure.
+    # forecast-review writes its NARRATIVE to briefings/ (select_forecast_review.py's target), so
+    # its contract adds that namespace. It shared the predictions-only contract below until
+    # 2026-09: the selector asked for briefings/, the contract refused it, and a live vault's
+    # reviews scattered across predictions/, dashboards/ and briefings/ (okengine#886 follow-up).
+    output_contract:
+      api: 1
+      allowed_namespaces: [briefings, predictions, dashboards]
+      allowed_types: [prediction, dashboard]
+      operations: [create, update, patch, append, converge]
+      required_fields: [type]
+      required_relationships: []
+      body: {required: true, min_non_whitespace: 40}
+      unknown_fields: reject
+      unresolved_links: review
+      placeholder_links: reject
+      completion: run
     adversarial_fixtures: *model_fixtures
     toolsets: [todo, okengine-write, okengine]
   base-rates:
@@ -147,7 +170,18 @@ operations:
     entrypoint: select_base_rates.py
     prompt_file: prompts/base-rates.md
     max_iterations: 12
-    output_contract: *prediction_contract
+    output_contract: &prediction_contract
+      api: 1
+      allowed_namespaces: [predictions, dashboards]
+      allowed_types: [prediction, dashboard]
+      operations: [create, update, patch, append, converge]
+      required_fields: [type]
+      required_relationships: []
+      body: {required: true, min_non_whitespace: 40}
+      unknown_fields: reject
+      unresolved_links: review
+      placeholder_links: reject
+      completion: run
     adversarial_fixtures: *model_fixtures
     toolsets: [todo, okengine-write, okengine]
     # Selector first writes deterministic A–E rate families to base-rate-metrics + JSONL (#223),
@@ -157,7 +191,7 @@ operations:
     entrypoint: select_falsification.py
     prompt_file: prompts/falsification-search.md
     max_iterations: 12
-    output_contract: *prediction_contract
+    output_contract: *prediction_item_contract
     adversarial_fixtures: *model_fixtures
     toolsets: [web, todo, okengine-write, okengine]
   output-outcome-eval:

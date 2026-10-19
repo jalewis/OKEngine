@@ -1,4 +1,5 @@
-FROM python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f AS wheel
+ARG PYTHON_BASE_IMAGE=python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f
+FROM ${PYTHON_BASE_IMAGE} AS wheel
 WORKDIR /build
 COPY src/ ./src/
 COPY tools/schema_validator.py tools/policy_plane.py ./tools/
@@ -8,7 +9,7 @@ COPY scripts/build_engine_wheel.py ./scripts/build_engine_wheel.py
 COPY config/base-schema.yaml ./config/base-schema.yaml
 RUN python scripts/build_engine_wheel.py --out /wheel
 
-FROM python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f
+FROM ${PYTHON_BASE_IMAGE}
 
 WORKDIR /app
 COPY okengine-projection/requirements.txt .

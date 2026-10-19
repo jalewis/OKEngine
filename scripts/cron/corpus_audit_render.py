@@ -194,10 +194,32 @@ def render(
     descriptor_pages = int(integrity.get("source_descriptor_pages") or 0)
     actor_publisher = int(integrity.get("actor_is_a_publisher_pages") or 0)
     actor_class = int(integrity.get("actor_class_contradiction_pages") or 0)
+    ungrounded = integrity.get("actor_identity_ungrounded_pages")
+    ungrounded_reasons = integrity.get("actor_identity_ungrounded_reasons") or {}
+    unsourced_actors = integrity.get("actor_identity_unsourced_pages")
+    undeclared_actor_types = integrity.get("actor_types_undeclared") or {}
+    # Why a grounding count is missing: no library, or actors stored under undeclared types.
+    ungrounded_unknown = (
+        "**undetectable** — actors are stored under type(s) the schema does not declare "
+        "`role: actor`: " + ", ".join(f"`{t}`" for t in undeclared_actor_types) + " |"
+        if undeclared_actor_types else
+        "**undetectable** — no page carries a declared actor type (`actor`, or a type with "
+        "`role: actor`), so nothing was measured |"
+        if integrity.get("actor_identity_library") is not False else
+        "**undetectable** — the actor-grounding library is not available to this audit |")
     overmatch = int(integrity.get("overmatching_identity_pages") or 0)
     alias_pages = int(integrity.get("overbroad_alias_pages") or 0)
     alias_terms = list(integrity.get("overbroad_alias_terms") or [])
     scalar_alias = int(integrity.get("scalar_alias_pages") or 0)
+    non_name_alias = int(integrity.get("non_name_alias_pages") or 0)
+    readded_alias = int(integrity.get("readded_rejected_alias_pages") or 0)
+    broken_tombs = int(integrity.get("broken_tombstone_pages") or 0)
+    tomb_kinds = integrity.get("broken_tombstone_kinds") or {}
+    unnamed_actors = int(integrity.get("unnamed_actor_pages") or 0)
+    misplaced_attest = int(integrity.get("misplaced_attestation_pages") or 0)
+    lane_attest = int(integrity.get("lane_created_attestation_pages") or 0)
+    unattested_refs = int(integrity.get("unattested_operator_ref_pages") or 0)
+    dangling_refs = int(integrity.get("dangling_operator_ref_pages") or 0)
     out += [
         "",
         "## Body integrity",
@@ -240,6 +262,28 @@ def render(
         + ", ".join(
             f"`{p}`" for p in integrity.get("actor_class_contradiction_examples", [])
         ) + " |",
+        # okengine#1012: no cited source names the actor and affirms it as an adversary -- the
+        # write path now refuses this on create and retype; a count is legacy or a bypass. WARN
+        # and a review list, not a failure: a real actor with a headline title shows here too.
+        (f"| Actor identity not grounded in its sources (WARN: review) | {ungrounded} | "
+         + (", ".join(f"{k}: {v}" for k, v in ungrounded_reasons.items()) or "—") + " | "
+         + ", ".join(f"`{p}`" for p in integrity.get("actor_identity_ungrounded_examples", []))
+         + " |")
+        if ungrounded is not None else
+        "| Actor identity not grounded in its sources | — | — | " + ungrounded_unknown,
+        (f"| Actor page with no resolvable source (WARN: unverifiable) | {unsourced_actors} | "
+         f"{unsourced_actors} | "
+         + ", ".join(f"`{p}`" for p in integrity.get("actor_identity_unsourced_examples", []))
+         + " |")
+        if unsourced_actors is not None else
+        "| Actor page with no resolvable source | — | — | " + ungrounded_unknown,
+        # okengine#1020: the corpus's own `actor` references land on a type the schema never
+        # declared an actor type, so no actor guard or metric covers those pages.
+        "| Actor type not declared (WARN: declare `role: actor` on the type) | "
+        f"{len(undeclared_actor_types)} type(s) | {sum(undeclared_actor_types.values())} "
+        "actor reference(s) | "
+        + (", ".join(f"`{t}` ({n} actor references)" for t, n in undeclared_actor_types.items())
+           or "—") + " |",
         # an alias is a MATCH TERM: a short common token tags every page that contains it. Distinct
         # terms are counted separately from pages because a term is one decision however it spreads.
         f"| Over-broad alias (< {min_alias_len} chars) | {alias_pages} | {len(alias_terms)} distinct "
@@ -248,6 +292,38 @@ def render(
         # `aliases` is declared `list`; a scalar means the page was written around the write path
         f"| `aliases` is a scalar (declared `list`) | {scalar_alias} | {scalar_alias} | "
         "written outside the enforced write path |",
+        # an alias is a NAME; a URL, prose or a comma-joined list is not one (okengine#845) --
+        # the write path refuses new ones, so a count here is legacy data or a bypassing lane
+        f"| Alias that is not a name (URL / prose / list) | {non_name_alias} | {non_name_alias} | "
+        + ", ".join(f"`{p}`" for p in integrity.get("non_name_alias_examples", [])) + " |",
+        # a review removed it and recorded the removal (TAA#48); only a bypassing writer re-adds it
+        f"| Alias re-added after review rejected it | {readded_alias} | {readded_alias} | "
+        + ", ".join(f"`{p}`" for p in integrity.get("readded_rejected_alias_examples", [])) + " |",
+        # a tombstone retires a page ONTO the same identity; these point nowhere usable (okengine#101)
+        f"| Tombstoned entity with an unusable successor | {broken_tombs} | "
+        + (", ".join(f"{k}: {v}" for k, v in sorted(tomb_kinds.items(), key=lambda kv: -kv[1]))
+           or "—")
+        + " | " + ", ".join(f"`{p}`" for p in integrity.get("broken_tombstone_examples", [])) + " |",
+        # an actor with no name defeats every name-based identity check (okengine#846)
+        f"| Actor page with no name | {unnamed_actors} | {unnamed_actors} | "
+        + ", ".join(f"`{p}`" for p in integrity.get("unnamed_actor_examples", [])) + " |",
+        # curated-authority attestation is operator-owned (okengine#980): the write path refuses it
+        # from every MCP caller, so these are a bypassing writer or a merge that misfiled a record
+        f"| Curated-authority attestation on a non-source page | {misplaced_attest} | "
+        f"{misplaced_attest} | "
+        + ", ".join(f"`{p}`" for p in integrity.get("misplaced_attestation_examples", [])) + " |",
+        f"| Curated-authority attestation on a page a model lane created | {lane_attest} | "
+        f"{lane_attest} | "
+        + ", ".join(f"`{p}`" for p in integrity.get("lane_created_attestation_examples", []))
+        + " |",
+        f"| `operator_evidence_refs` naming a page with no attestation | {unattested_refs} | "
+        f"{unattested_refs} | "
+        + ", ".join(f"`{p}`" for p in integrity.get("unattested_operator_ref_examples", []))
+        + " |",
+        f"| `operator_evidence_refs` naming no page by exact path | {dangling_refs} | "
+        f"{dangling_refs} | "
+        + ", ".join(f"`{p}`" for p in integrity.get("dangling_operator_ref_examples", []))
+        + " |",
         # no declared rule = UNDETECTABLE, never a vacuous zero (the missing-key rule)
         (f"| Field shape wrong for its type | {shape_bad} | {shape_bad} | "
          + ", ".join(f"`{p}`" for p in integrity.get("typed_shape_examples", [])) + " |")

@@ -31,15 +31,19 @@ description: >-
   Research topics as declared objects: an inquiry page states a standing question and the terms
   that collect evidence for it, drives bounded collection through a pack-declared source
   connector, and renders a per-inquiry dossier that groups the assessments, predictions and
-  solutions answering it. Adding a topic is dropping a page.
+  solutions answering it, and answers its standing questions as assessments (competing
+  hypotheses, adversarial evidence, stated confidence) from the evidence it collected, reassessing
+  as new evidence compiles. Adding a topic is dropping a page.
 trust: in-gateway
 core: false                  # opt-in: collection volume and topic choice are operator decisions
 requires:
   engine: ">=0.6.0"          # schema-owning extension grammar (#133) + the #63 cron drop-in model
 capabilities:
   read: [wiki/**]
-  write: [dashboards/**]     # the dossier is a derived L1 `dashboard`; the inquiry PAGES are
+  write: [dashboards/**,     # the dossier is a derived L1 `dashboard`; the inquiry PAGES are
                              # human/agent-authored through the normal write path, never by a lane
+          assessments/**]    # SOFT edge: inquiry-analyze answers standing questions as
+                             # okengine.assessments pages (no hard `requires`)
   network: false             # collection is delegated to source_connector.py, which holds its own
                              # allowed_hosts / private-network contract. This extension opens no
                              # socket of its own.
@@ -58,7 +62,75 @@ operations:
     schedule: {kind: cron, expr: "45 5 * * *"}    # after collection + the nightly index rebuild
     entrypoint: inquiry_dossier.py
     tier: analyze
+  inquiry-analyze:
+    # AGENT lane (okengine#854): answers each open inquiry's standing questions as ASSESSMENTS —
+    # competing hypotheses, adversarial evidence, confidence with the observations that would
+    # move it — from the evidence the inquiry's own terms collected (inquiry_lib.evidence_by_term).
+    # Also the REASSESS half of the CHE loop: an assessment is selected again when evidence it
+    # CITES changed or was removed (okengine.reevaluation's dependency sidecar — this lane is its
+    # consumer for assessments), or when MIN_NEW sources compiled since it was written. Without this lane an inquiry steered collection and nothing
+    # else; the dossier read "Assessments 0" indefinitely.
+    #
+    # The selector names the page (one per question) so reruns update instead of duplicating;
+    # `sources` and `subject_ref` must resolve, so a fabricated citation is rejected at the write
+    # path. Receipt-enforced per question: `insufficient-evidence` is a correct outcome.
+    schedule: {kind: cron, expr: "50 6 * * *"}   # after collect/dossier; before the 07:12
+                                                  # adversarial-evidence-review reads the result
+    entrypoint: select_inquiry_questions.py
+    prompt_file: prompts/analyze.md
+    # Budget covers the WORK, not a guess: reading up to analyze_max_evidence listed sources plus
+    # the inquiry, the current page on UPDATE, and the write/verify calls. 20 was too few: the first
+    # live run (2026-09-24) read ~35 pages, reasoned out the claim and three hypotheses, and ran out
+    # of steps before create_entity — receipt `failed`, no page. Pinned by
+    # test_the_step_budget_covers_the_evidence_the_digest_can_list.
+    max_iterations: 40
+    output_contract:
+      api: 1
+      allowed_namespaces: [assessments]
+      allowed_types: [assessment]
+      operations: [create, update, converge]
+      # would_* are the refutation criteria the CHE profile requires of every proposition
+      # (require_refutation_or_resolution_criteria): stated before the evidence arrives.
+      required_fields: [type, question, claim, confidence, alternatives, adversarial_evidence,
+                        would_increase_confidence, would_decrease_confidence,
+                        inquiry, needs_review]
+      required_relationships: [sources, subject_ref]
+      optional_relationships: []
+      body: {required: true, min_non_whitespace: 400}
+      unknown_fields: reject
+      unresolved_links: review
+      placeholder_links: reject
+      completion: per-selected-item
+    adversarial_fixtures: [tests/extensions/test_model_output_contracts.py]
+    toolsets: [todo, okengine-write, okengine]
+    tier: analyze
 config:
+  analyze_batch:
+    type: string
+    default: "1"
+    description: >-
+      Standing questions assessed per inquiry-analyze run. Starts at one on purpose: grade the
+      lane on one question's disposition before widening it. Env: OKENGINE_INQUIRY_ANALYZE_BATCH.
+  analyze_min_sources:
+    type: string
+    default: "5"
+    description: >-
+      Attributed compiled sources an inquiry needs before a question gets its FIRST assessment.
+      Below this a judgment is extrapolation from a handful of articles.
+      Env: OKENGINE_INQUIRY_ANALYZE_MIN_SOURCES.
+  analyze_min_new:
+    type: string
+    default: "3"
+    description: >-
+      Sources compiled since an assessment was last written before it is reassessed.
+      Env: OKENGINE_INQUIRY_ANALYZE_MIN_NEW.
+  analyze_max_evidence:
+    type: string
+    default: "25"
+    description: >-
+      Sources listed in the digest per question (new-since-last-assessment first). The model can
+      open any vault page; this bounds the prompt, not the evidence.
+      Env: OKENGINE_INQUIRY_ANALYZE_MAX_EVIDENCE.
   max_inquiries:
     type: string
     default: "20"

@@ -8,7 +8,7 @@ from fastapi import HTTPException
 
 
 def search(request, query: str, limit: int, *, wiki, guard, semaphore, excluded_dirs,
-           namespaces, subprocess_module):
+           namespaces, subprocess_module, tombstoned):
     query = query.strip()
     if len(query) < 2:
         return {"q": query, "results": []}
@@ -48,6 +48,8 @@ def search(request, query: str, limit: int, *, wiki, guard, semaphore, excluded_
         if relative in seen:
             continue
         seen.add(relative)
+        if tombstoned(Path(file_path)):
+            continue
         directory = relative.split("/", 1)[0]
         rows.append(
             {

@@ -88,7 +88,9 @@ def main() -> int:
     print(f"  product: {product}  |  window: published since {since.isoformat()}")
     print(f"  {len(hits)} candidate source(s) — turn the strongest 3-7 into outbound content "
           "angles (blog/LinkedIn/podcast/newsletter); skip the rest")
-    print(f"  write via mcp__okengine_write__create_entity to: {out_path}")
+    # the lane's own write server, published by cron_pack_split.bind_contract_writers (okengine#852)
+    print(f"  write via {os.environ.get('OKENGINE_WRITE_TOOL_PREFIX', 'mcp__okengine_write__')}"
+          f"create_entity to: {out_path}")
     print(f"  frontmatter: type: marketing-pulse, title: \"Content pegs — week of "
           f"{week_ending}\", published: {week_ending}, updated: {week_ending}")
     print()

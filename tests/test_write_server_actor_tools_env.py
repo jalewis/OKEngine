@@ -65,8 +65,9 @@ def test_env_allowlist_overrides_the_engine_table_for_engine_lanes(tmp_path, mon
 
 
 def test_engine_table_carries_no_pack_or_deployment_names(tmp_path, monkeypatch):
-    """The detector for okengine#664: an engine literal may only name engine lanes."""
+    """The detector for okengine#664: an engine literal may only name engine lanes, or the
+    engine's own Agent Chat identity (okengine#983)."""
     m = _load("ws_tools_env_e", tmp_path, monkeypatch, "cron:entity-backfill", None)
     for actor in m._ACTOR_TOOLS:
-        assert actor.startswith("cron:"), actor
+        assert actor.startswith("cron:") or actor == "chat:api_server", actor
         assert "okpack-" not in actor, actor

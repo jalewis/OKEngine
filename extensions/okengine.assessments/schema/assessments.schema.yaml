@@ -28,11 +28,14 @@ owns:
                  inquiry]
 
 field_shapes:
-  alternatives: list
+  # `prose-list`: each item is a sentence, so a scalar written for the field is ONE item and is
+  # never split on its commas (okengine#1005). `adversarial_evidence` stays `list`: its string
+  # items are read as source references (local_evidence.py), so a scalar must split like `sources`.
+  alternatives: prose-list
   remedy_prerequisites: list   # what must already be true for the remedy to be available
-  assumptions: list
-  would_increase_confidence: list
-  would_decrease_confidence: list
+  assumptions: prose-list
+  would_increase_confidence: prose-list
+  would_decrease_confidence: prose-list
   adversarial_evidence: list
 
 enums:

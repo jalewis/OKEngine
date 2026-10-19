@@ -28,11 +28,12 @@ import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-
-import yaml
+from itertools import islice
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import schema_lib  # noqa: E402
+from active_view_lib import is_retired_actor  # noqa: E402
+from frontmatter_lib import FRONTMATTER_RE, load_frontmatter  # noqa: E402
 import tz_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
@@ -62,7 +63,6 @@ def knowledge_namespaces() -> list[str]:
                 out.append(d.name)
     return out
 
-FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?\n)---\s*(?:\n|\Z)", re.DOTALL)
 H1_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
 WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
 
@@ -77,15 +77,14 @@ def parse_page(path: Path) -> tuple[dict | None, str | None]:
     body_start = 0
     m = FRONTMATTER_RE.match(txt)
     if m:
-        try:
-            fm = yaml.safe_load(m.group(1))
-        except yaml.YAMLError:
-            fm = None
+        # load_frontmatter treats every parse failure as unparseable, including the ValueError
+        # an impossible date like 2026-02-30 raises (okengine#993); {} reads as no frontmatter.
+        fm = load_frontmatter(m.group(1)) or None
         body_start = m.end()
     body = txt[body_start:]
     h1m = H1_RE.search(body)
     title = h1m.group(1).strip() if h1m else None
-    return (fm if isinstance(fm, dict) else None), title
+    return fm, title
 
 
 def is_operational(fm: dict | None) -> bool:
@@ -117,11 +116,12 @@ def list_dir(subdir: str, limit: int | None = None, sort_recent: bool = False) -
         files.sort(key=lambda p: p.name, reverse=True)
     else:
         files.sort(key=lambda p: p.name)
+    parsed = ((p, *parse_page(p)) for p in files)
+    parsed = (row for row in parsed if not is_retired_actor(row[1], VAULT, row[0]))
     if limit:
-        files = files[:limit]
+        parsed = islice(parsed, limit) if limit > 0 else list(parsed)[:limit]
     out: list[str] = []
-    for p in files:
-        fm, title = parse_page(p)
+    for p, fm, title in parsed:
         if is_operational(fm):
             continue
         # Vault-relative path so the wikilink resolves under sharding; for a flat
@@ -148,7 +148,7 @@ def group_by_type(subdir: str) -> dict[str, list[str]]:
         if not p.is_file() or p.name.startswith("_"):
             continue
         fm, title = parse_page(p)
-        if is_operational(fm):
+        if is_operational(fm) or is_retired_actor(fm, VAULT, p):
             continue
         t = str(fm.get("type", "untyped")) if fm else "untyped"
         rel = p.relative_to(VAULT / "wiki").with_suffix("").as_posix()
@@ -203,7 +203,7 @@ def render_index() -> str:
     out: list[str] = []
     out.append("# Wiki Index")
     out.append("")
-    out.append("> Content catalog. Every page listed; a `sources` namespace shows the most recent.")
+    out.append("> Active content catalog; retired actors are omitted. A `sources` namespace shows the most recent.")
     now = tz_lib.deployment_now().strftime("%Y-%m-%d %H:%M %Z")  # okengine#301: deployment zone, not "UTC"
     summary = " | ".join(f"{ns.capitalize()}: {counts[ns]}" for ns in namespaces)
     out.append(f"> Generated: {now}" + (f" | {summary}" if summary else ""))

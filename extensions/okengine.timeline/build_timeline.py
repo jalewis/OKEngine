@@ -4,9 +4,17 @@
 entities/pages (`updated:`/`created:`), groups by month, renders a timeline of [[wikilinks]].
 No agent, no network — the established engine dashboard-generator pattern (cf. contradictions)."""
 import os
+import sys
 import re
 from datetime import date, datetime, timezone
 from pathlib import Path
+
+# Engine cron libs, appended so this extension's own modules keep precedence: staged one level
+# up (/opt/data/scripts/ holds /opt/data/scripts/<id>/), or scripts/cron/ in a repo checkout.
+_ENGINE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(_ENGINE_ROOT))
+sys.path.append(str(_ENGINE_ROOT.parent / "scripts" / "cron"))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 
 try:
     import yaml
@@ -99,7 +107,7 @@ def render(items: list) -> str:
 def main() -> int:
     items = collect(WIKI)
     DASH_PATH.parent.mkdir(parents=True, exist_ok=True)
-    DASH_PATH.write_text(render(items), encoding="utf-8")
+    generated_page.write(DASH_PATH, render(items))
     print(f"timeline: {len(items)} dated page(s) -> {DASH_PATH}")
     return 0
 

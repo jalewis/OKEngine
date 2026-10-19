@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from yaml import YAMLError
 
 _FM = re.compile(r"\A---[ \t]*\n(.*?)\n---(.*)\Z", re.S)
 _LINK = re.compile(r"\[\[([^\]|#\n]+)")
@@ -44,7 +45,7 @@ def _page(path: Path) -> tuple[dict, str] | None:
         match = _FM.match(text)
         fm = yaml.safe_load(match.group(1)) if match else None
         return (fm, match.group(2)) if isinstance(fm, dict) else None
-    except (OSError, yaml.YAMLError):
+    except (OSError, YAMLError):
         return None
 
 

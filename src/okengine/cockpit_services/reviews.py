@@ -18,6 +18,7 @@ import shutil
 import tempfile
 import urllib.request
 import urllib.error
+from urllib.error import URLError
 from contextlib import asynccontextmanager
 from urllib.parse import quote, urlparse
 from pathlib import Path
@@ -100,11 +101,32 @@ def _review_queue_snapshot() -> tuple[list[dict], list[dict]]:
 def _build_review_snapshot() -> tuple[list[dict], list[dict]]:
     """The uncached full-vault worklist build (see _review_queue_snapshot for the caching contract)."""
     records = {}
+    # Reshard-proof secondary index (okengine#822). A record stores `subject:` as the path AT WRITE
+    # TIME, and a partitioned namespace re-files pages as it grows -- `entities/q/qakbot` becomes
+    # `entities/q/a/qakbot`. Joining on the raw string therefore strands the record the moment the
+    # page moves: it stays `open` forever, never appears in a worklist, and cannot be closed, while
+    # the page itself reads as unreviewed. Measured on a live vault: 821 stranded open records, and
+    # 741 of them (90%) had their page still present, merely re-shelved.
+    #
+    # `_subject_key` is the same (namespace, slug) identity the assessment index already uses for
+    # this exact reason -- same namespace + same slug IS the same page, that being the partition
+    # invariant, with duplicates owned by `deployment_checks.check_partition_dups()`. The exact path
+    # still wins when it matches, so an unmoved page is unaffected.
+    by_key = {}
+    subjects_by_key: dict[str, set[str]] = {}
     all_records = sorted(_review_records(), key=lambda r: str(r.get("requested_at") or ""))
     for rec in all_records:
         if rec.get("subject"):
             records[str(rec["subject"])] = rec
-    rows = []
+            # No emptiness guard: a malformed `subject:` (a bare `wiki/`, a bare `.md`) normalises
+            # to "" and is stored inertly, because no PAGE path can normalise to "" -- a root-level
+            # page yields its own stem, and dot/underscore names never reach here. A guard would be
+            # an unreachable branch, and the only test that could reach it would be asserting the
+            # guard's own existence rather than any behaviour.
+            key = _subject_key(rec["subject"])
+            by_key[key] = rec
+            subjects_by_key.setdefault(key, set()).add(str(rec["subject"]))
+    pages = []
     for p in WIKI.rglob("*.md"):
         try:
             rel = p.relative_to(WIKI)
@@ -112,6 +134,16 @@ def _build_review_snapshot() -> tuple[list[dict], list[dict]]:
             continue
         if any(part.startswith(("_", ".")) for part in rel.parts) or "operational" in rel.parts:
             continue
+        pages.append((p, rel))
+    # The (namespace, slug) key is only an identity when it names ONE page (okengine#868). In a
+    # walk-up sub-domain the first segment is the sub-domain, so `sec/concepts/r/ransomware` and
+    # `sec/entities/r/ransomware` share `sec/ransomware`; a flat namespace with sub-folders collides
+    # the same way. Borrowing a record across such a collision showed another page's state, reasons
+    # and assignee -- and a state filter could hide a page that genuinely needed review. The reshard
+    # case this fallback exists for has exactly one live page and one recorded subject per key.
+    page_keys = Counter(_subject_key(rel.as_posix()[:-3]) for _p, rel in pages)
+    rows = []
+    for p, rel in pages:
         try:
             fm, body = split_fm(_read_head(p, 65536))
         except OSError:
@@ -119,7 +151,11 @@ def _build_review_snapshot() -> tuple[list[dict], list[dict]]:
         if not isinstance(fm, dict) or not _requires_review(fm, body):
             continue
         subject = rel.as_posix()[:-3]
-        rec = records.get(subject) or {}
+        key = _subject_key(subject)
+        rec = records.get(subject)
+        if rec is None and page_keys[key] == 1 and len(subjects_by_key.get(key, ())) == 1:
+            rec = by_key[key]
+        rec = rec or {}
         reasons = rec.get("reasons") or _review_reasons(fm, body)
         evidence = _evidence_sources(fm)
         resolved, total = sum(1 for e in evidence if e.get("page")), len(evidence)
@@ -235,6 +271,10 @@ def api_reviews(
         "offset": offset,
         "limit": limit,
         "items": rows[offset : offset + limit],
+        # The queue filters BY reason code, so the codes are the first thing a reviewer meets --
+        # and they were rendered as bare identifiers (okengine#823). Explained for exactly the
+        # codes present, so an unregistered code shows as unexplained rather than as jargon.
+        "glossary": [explain_reasons([{"code": c}])[0] for c in sorted(reasons_count)],
         "facets": {
             "states": dict(states),
             "reasons": dict(reasons_count),
@@ -289,7 +329,7 @@ def _operation_request(path: str, *, data: dict | None = None, method: str = "GE
         except Exception:
             detail = {"detail": "operation service rejected the request"}
         raise HTTPException(exc.code, str(detail.get("detail") or detail.get("error") or detail))
-    except (urllib.error.URLError, TimeoutError) as exc:
+    except (URLError, TimeoutError) as exc:
         raise HTTPException(503, f"operation service unavailable: {exc}")
 
 
@@ -359,7 +399,7 @@ async def api_review_decision(request: Request):
         except Exception:
             detail = {"error": "review service rejected the decision"}
         raise HTTPException(exc.code, str(detail.get("error") or detail))
-    except (urllib.error.URLError, TimeoutError) as exc:
+    except (URLError, TimeoutError) as exc:
         raise HTTPException(503, f"review service unavailable: {exc}")
 
 
@@ -397,7 +437,7 @@ async def api_review_assign(request: Request):
         except Exception:
             detail = {"error": "review service rejected assignment"}
         raise HTTPException(exc.code, str(detail.get("error") or detail))
-    except (urllib.error.URLError, TimeoutError) as exc:
+    except (URLError, TimeoutError) as exc:
         raise HTTPException(503, f"review service unavailable: {exc}")
 
 

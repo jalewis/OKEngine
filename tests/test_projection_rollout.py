@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import yaml
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,7 +38,7 @@ def test_existing_deployment_gets_secure_idempotent_projection_overlay(tmp_path)
     assert env["OKENGINE_PROJECTION_READER_PASSWORD"] not in CFG.PLACEHOLDERS
     assert env["OKENGINE_PROJECTION_WRITER_PASSWORD"] != env["OKENGINE_PROJECTION_READER_PASSWORD"]
     assert env["OKENGINE_PROJECTION_READER_PASSWORD"] in env["OKENGINE_PROJECTION_READER_DSN"]
-    assert env["COMPOSE_FILE"] == "docker-compose.yml:.hermes-data/projection-compose.yml"
+    assert env["COMPOSE_FILE"] == "docker-compose.yml:.hermes-data/projection-compose.yml:.hermes-data/projection-owner-compose.yml"
     assert (pack / ".hermes-data/projection-compose.yml").read_text() == (
         ROOT / "templates/pack/projection-compose-overlay.yml").read_text()
     assert os.stat(pack / ".env").st_mode & 0o777 == 0o600
@@ -97,6 +98,52 @@ def test_stale_overlay_is_replaced_for_any_lexicographic_content(tmp_path):
         assert generated.read_text() == expected
 
 
+@pytest.mark.parametrize("native", [False, True])
+def test_stale_owner_overlay_is_repaired_for_any_content(tmp_path, native):
+    service = "okengine-projection" if native else "okengine-mcp"
+    (tmp_path / "docker-compose.yml").write_text(f"services:\n  {service}: {{}}\n")
+    CFG.ensure(tmp_path, ROOT)
+    generated = tmp_path / ".hermes-data/projection-owner-compose.yml"
+    expected = (ROOT / "templates/pack/projection-owner-compose.yml").read_text()
+    for stale in ("", "zzz\n"):
+        generated.write_text(stale)
+        assert "materialized projection owner overlay" in CFG.ensure(tmp_path, ROOT)
+        assert generated.read_text() == expected
+        assert CFG.ensure(tmp_path, ROOT) == []
+
+
+def test_equal_exported_owner_pins_remain_idempotent(tmp_path, monkeypatch):
+    (tmp_path / "docker-compose.yml").write_text("services:\n  okengine-projection: {}\n")
+    monkeypatch.setenv("HERMES_UID", "1003")
+    monkeypatch.setenv("HERMES_GID", "1003")
+    CFG.ensure(tmp_path, ROOT)
+    before = (tmp_path / ".env").read_bytes()
+    assert CFG.ensure(tmp_path, ROOT) == []
+    assert (tmp_path / ".env").read_bytes() == before
+
+
+def test_lowest_non_root_owner_id_is_accepted_and_persisted(tmp_path, monkeypatch):
+    (tmp_path / "docker-compose.yml").write_text("services:\n  okengine-projection: {}\n")
+    monkeypatch.setenv("HERMES_UID", "1")
+    monkeypatch.setenv("HERMES_GID", "1")
+    CFG.ensure(tmp_path, ROOT)
+    env = dict(line.split("=", 1) for line in (tmp_path / ".env").read_text().splitlines())
+    assert env["HERMES_UID"] == env["HERMES_GID"] == "1"
+    assert CFG.ensure(tmp_path, ROOT) == []
+
+
+def test_owner_migration_preserves_operator_overlay_names_containing_equals(tmp_path):
+    (tmp_path / "docker-compose.yml").write_text("services:\n  okengine-projection: {}\n")
+    operator = tmp_path / "operator=custom.yml"
+    operator.write_text("services: {}\n")
+    (tmp_path / ".env").write_text("COMPOSE_FILE=docker-compose.yml:operator=custom.yml\n")
+    CFG.ensure(tmp_path, ROOT)
+    text = (tmp_path / ".env").read_text()
+    assert "COMPOSE_FILE=docker-compose.yml:operator=custom.yml:.hermes-data/projection-owner-compose.yml" in text
+    assert operator.read_text() == "services: {}\n"
+    assert CFG.ensure(tmp_path, ROOT) == []
+
+
 def test_native_projection_needs_no_overlay(tmp_path):
     pack = tmp_path / "pack"
     pack.mkdir()
@@ -105,7 +152,7 @@ def test_native_projection_needs_no_overlay(tmp_path):
     changes = CFG.ensure(pack, ROOT)
     assert "projection compose overlay" not in " ".join(changes)
     assert not (pack / ".hermes-data/projection-compose.yml").exists()
-    assert "COMPOSE_FILE=" not in (pack / ".env").read_text()
+    assert "COMPOSE_FILE=docker-compose.yml:.hermes-data/projection-owner-compose.yml" in (pack / ".env").read_text()
 
 
 def test_standard_deploy_and_verifier_require_projection():
@@ -234,3 +281,55 @@ def test_the_legacy_directory_survives_if_it_still_holds_anything_else(tmp_path)
     assert not (legacy_dir / "projection-compose.yml").exists()
     assert neighbour.read_text() == "enabled: []\n", "a neighbour's config must survive"
     assert legacy_dir.is_dir()
+
+
+def test_projector_owner_contract_matches_readers_and_preserves_read_only_vault():
+    for filename in ("templates/pack/skeleton/docker-compose.yml",
+                     "templates/pack/projection-compose-overlay.yml"):
+        text = (ROOT / filename).read_text()
+        model = yaml.safe_load(re.sub(r"\{\{[^}]*\}\}", "fixture", text))
+        projector = model["services"]["okengine-projection"]
+        assert projector["user"] == "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
+        assert "./:/opt/vault:ro" in projector["volumes"]
+
+
+def test_native_owner_migration_preserves_operator_overlays_and_secrets(tmp_path):
+    (tmp_path / "docker-compose.yml").write_text("services:\n  okengine-projection: {}\n")
+    (tmp_path / ".env").write_text(
+        "COMPOSE_FILE=docker-compose.yml:operator.yml\nKEEP=private-value\nHERMES_UID=1003\nHERMES_GID=1003\n")
+    CFG.ensure(tmp_path, ROOT)
+    text = (tmp_path / ".env").read_text()
+    assert "COMPOSE_FILE=docker-compose.yml:operator.yml:.hermes-data/projection-owner-compose.yml" in text
+    assert "KEEP=private-value" in text and "HERMES_UID=1003" in text
+    assert CFG.ensure(tmp_path, ROOT) == []
+
+
+def test_config_cli_reports_changes_then_remains_idempotent(tmp_path, capsys):
+    (tmp_path / "docker-compose.yml").write_text("services:\n  okengine-projection: {}\n")
+    assert CFG.main([str(tmp_path), "--engine", str(ROOT)]) == 0
+    assert "materialized projection owner overlay" in capsys.readouterr().out
+    assert CFG.main([str(tmp_path), "--engine", str(ROOT)]) == 0
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("owner", ["0", "-1", "root", "1.5", "\u0661"])
+@pytest.mark.parametrize("key", ["HERMES_UID", "HERMES_GID"])
+def test_projection_owner_refuses_root_or_malformed_ids_before_writing(tmp_path, monkeypatch, key, owner):
+    (tmp_path / "docker-compose.yml").write_text("services:\n  okengine-projection: {}\n")
+    (tmp_path / ".env").write_text(f"KEEP=original\n{key}={owner}\n")
+    monkeypatch.delenv("HERMES_UID", raising=False)
+    monkeypatch.delenv("HERMES_GID", raising=False)
+    with pytest.raises(ValueError, match="non-root numeric"):
+        CFG.ensure(tmp_path, ROOT)
+    assert (tmp_path / ".env").read_text() == f"KEEP=original\n{key}={owner}\n"
+    assert not (tmp_path / ".hermes-data").exists()
+
+
+def test_projection_owner_uses_explicit_exports_before_persisted_values(tmp_path, monkeypatch):
+    (tmp_path / "docker-compose.yml").write_text("services:\n  okengine-projection: {}\n")
+    (tmp_path / ".env").write_text("HERMES_UID=0\nHERMES_GID=0\n")
+    monkeypatch.setenv("HERMES_UID", "1003")
+    monkeypatch.setenv("HERMES_GID", "1003")
+    CFG.ensure(tmp_path, ROOT)
+    text = (tmp_path / ".env").read_text()
+    assert "HERMES_UID=1003" in text and "HERMES_GID=1003" in text

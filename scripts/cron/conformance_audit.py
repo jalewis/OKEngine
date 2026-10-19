@@ -19,34 +19,25 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import frontmatter_lib  # noqa: E402
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import schema_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
 DASH = WIKI / "dashboards" / "conformance.md"
 SAMPLES = int(os.environ.get("CONFORMANCE_SAMPLES", "25"))
-_FM_RE = re.compile(r"\A---[ \t]*\n(.*?\n)---", re.S)
 
 
 def _fm(p: Path) -> dict:
-    try:
-        m = _FM_RE.match(p.read_text(encoding="utf-8", errors="replace")[:8000])
-    except OSError:
-        return {}
-    if not m:
-        return {}
-    try:
-        import yaml
-        d = schema_lib.fast_load(m.group(1))
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
+    """The page's whole frontmatter envelope (frontmatter_lib). An 8000-char window parsed a
+    long-envelope page as {}, so it escaped the audit or read as unsourced (okengine#993)."""
+    return frontmatter_lib.read_frontmatter(p, loader=schema_lib.fast_load)
 
 
 def _skip(p: Path) -> bool:
@@ -148,7 +139,7 @@ def main() -> int:
                 L.append(f"| [{rel}]({rel}.md) | {fld} | {vals} |")
     L.append("")
     DASH.parent.mkdir(parents=True, exist_ok=True)
-    DASH.write_text("\n".join(L), encoding="utf-8")
+    generated_page.write(DASH, "\n".join(L))
 
     tally = ", ".join(f"{a['pages']} {rid}" for rid, a in findings.items()) or "no rules defined"
     print(f"conformance-audit: {checked} pages checked; {tally} -> wiki/dashboards/conformance.md")

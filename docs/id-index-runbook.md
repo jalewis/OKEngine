@@ -101,29 +101,24 @@ find "$D"/wiki -name 'zzz-probe*.md' -delete
 sed -i '/zzz-probe/d' "$D"/wiki/log.md
 ```
 
-**Deploy a change to `scripts/cron/*.py` that write_server imports** — two paths:
+**Deploy a change to `scripts/cron/*.py` that write_server imports**: cut a patch release and
+roll it. The gateway installs these libs from the engine wheel it bakes
+(`site-packages/id_index.py`, not `/opt/hermes/scripts/cron/`), so only an image build reaches
+them: `bash scripts/build-engine-image.sh` with the release's `OKENGINE_TAG`, then
+`deploy.sh --skip-build` per deployment with `OKENGINE_GATEWAY_IMAGE` set to that tag.
 
-- *Canonical:* `bash scripts/build-engine-image.sh` (re-clones Hermes, ~10–20 min), then
-  `(cd $D && docker compose up -d --force-recreate --no-deps gateway)`.
-- *Fast hotfix* (no Hermes re-clone): the committed overlay
-  [`scripts/gateway-idindex-overlay.Dockerfile`](../scripts/gateway-idindex-overlay.Dockerfile):
-
-  ```bash
-  docker tag hermes-agent:latest hermes-agent:pre-idindex-hotfix                       # backup, reversible
-  docker build -f scripts/gateway-idindex-overlay.Dockerfile -t hermes-agent:latest .
-  (cd "$D" && docker compose up -d --force-recreate --no-deps gateway)                 # per deployment
-  ```
-
-  Confirm the baked copy took: `docker exec "$GW" grep -c 'force: bool' /opt/hermes/scripts/cron/id_index.py` → `1`.
-  The next `build-engine-image.sh` release bakes it canonically, so there's no drift to track.
+The old "fast hotfix" overlay Dockerfiles (`gateway-idindex-overlay.Dockerfile`,
+`gateway-write-server-overlay.Dockerfile`) are removed (okengine#1033). They copied files to
+paths the wheel shadows and built `hermes-agent:latest`, which no deployment runs since deploy.sh
+pins an immutable gateway image, so the recipe changed nothing while reporting success.
 
 ## Troubleshooting
 
 | Check | If… | Do |
 |---|---|---|
 | `stat /opt/data/state/id-index.json` in the gateway | missing | run the `id-index-refresh` cron |
-| `write-path build()` timing (above) | tens of seconds despite the artifact | the gateway image predates the fix → rebuild/overlay + recreate |
-| `docker exec "$GW" grep -c 'force: bool' /opt/hermes/scripts/cron/id_index.py` | `0` | the baked id_index is old → rebuild/overlay + recreate |
+| `write-path build()` timing (above) | tens of seconds despite the artifact | the gateway image predates the fix → patch release, rebuild + roll |
+| `docker exec "$GW" grep -c 'force: bool' /opt/hermes/.venv/lib/python3.13/site-packages/id_index.py` | `0` | the baked id_index is old → patch release, rebuild + roll |
 | fleet-health lane still ERRORED after a fix | timeout was on a *different* MCP tool (`search`, `find_references`) | those are separate live-vault-scan paths — see the backlinks artifact fix + engine issues #198/#199 |
 
 ## Related

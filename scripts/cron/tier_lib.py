@@ -115,26 +115,52 @@ def _date_from_path(parts: list[str]) -> Optional[date]:
     return None
 
 
+def _envelope(abs_path: Path) -> str:
+    """The raw text of the page's WHOLE frontmatter envelope ('' when absent or unreadable). No
+    leading-window cap: a `status` below a long sources/aliases list must still be seen
+    (okengine#991 audit 2 [2]/[10]; a 4000-char window parsed such a page as {})."""
+    try:
+        m = _FM_RE.match(Path(abs_path).read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return ""
+    return m.group(1) if m else ""
+
+
 def fm_of(abs_path: Path) -> dict:
     """Parse a page's frontmatter (best-effort; {} on any failure)."""
     if yaml is None:
         return {}
-    try:
-        m = _FM_RE.match(Path(abs_path).read_text(encoding="utf-8", errors="replace")[:4000])
-    except OSError:
-        return {}
-    if not m:
+    block = _envelope(abs_path)
+    if not block:
         return {}
     try:
-        d = yaml.safe_load(m.group(1))
+        d = yaml.safe_load(block)
         return d if isinstance(d, dict) else {}
     except Exception:
         return {}
 
 
+def is_tombstoned(fm: Optional[dict]) -> bool:
+    """The engine-wide spelling of "retired", identical to okf_migrate.is_tombstoned (pinned by
+    test). A pinned copy, not an import, only to keep tier_lib self-contained: okf_migrate IS
+    importable in the read-MCP image (scripts/build_engine_wheel.py ships it in the engine
+    wheel), but it is the partition/migration module and tiering needs none of it."""
+    return str((fm or {}).get("status") or "").strip().lower() == "tombstoned"
+
+
+def tier_fm(abs_path: Path, nscfg: dict) -> dict:
+    """The frontmatter tier_of needs for a page in a namespace configured by `nscfg`. A from_path
+    namespace without a status_field reads only `status` (for a tombstone), so its pages are
+    parsed only when the envelope spells `tombstoned`: a bulk sources walk stays cheap."""
+    if nscfg.get("from_path") and not nscfg.get("status_field"):
+        return fm_of(abs_path) if "tombstoned" in _envelope(abs_path).lower() else {}
+    return fm_of(abs_path)
+
+
 def tier_of(rel_path: str, fm: Optional[dict], cfg: dict, today: date) -> Optional[str]:
     """Return 'hot'|'warm'|'cold' for a wiki-relative page path, or None if the
-    page's namespace is not tiered. `fm` may be None for from_path namespaces."""
+    page's namespace is not tiered. `fm` may be None for from_path namespaces. A tombstoned
+    page in a tiered namespace is always 'cold'."""
     parts = rel_path.split("/")
     if len(parts) < 2:
         return None
@@ -142,6 +168,11 @@ def tier_of(rel_path: str, fm: Optional[dict], cfg: dict, today: date) -> Option
     if not nscfg:
         return None
     fm = fm or {}
+    # A retired page is never recent, whatever its type. The tombstone write stamps
+    # `last_updated`, which a page carrying only envelope dates would otherwise tier HOT, so a
+    # just-retired page resurfaced in `kb_search --tier hot` and the tier counts (#991 [10]).
+    if is_tombstoned(fm):
+        return "cold"
     sf = nscfg.get("status_field")
     if sf:
         ov = {str(v).lower() for v in (nscfg.get("open_values") or [])}
@@ -179,5 +210,4 @@ def tier_of_file(abs_path: Path, wiki: Path, cfg: dict, today: date) -> Optional
     nscfg = (cfg.get("namespaces") or {}).get(parts[0] if parts else "")
     if not nscfg:
         return None
-    fm = {} if nscfg.get("from_path") and not nscfg.get("status_field") else fm_of(abs_path)
-    return tier_of(rel, fm, cfg, today)
+    return tier_of(rel, tier_fm(abs_path, nscfg), cfg, today)

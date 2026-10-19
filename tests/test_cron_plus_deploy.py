@@ -159,7 +159,10 @@ def test_deploy_persists_hermes_uid_to_env():  # uid-muddle prevention
     and the cron-plus ticker dies on a .tick.lock PermissionError. Guard both the append and the
     idempotence (only when not already pinned)."""
     t = (S / "deploy.sh").read_text()
-    assert 'grep -qE \'^HERMES_UID=\' "$PACK/.env"' in t, "deploy.sh no longer guards on an existing pin"
+    # okengine#1044 [1]: the guard reads the pin through the dotenv parser compose agrees with; its
+    # behavior (export, quoted, duplicate and empty pins) is pinned by tests/test_deploy_exit_contract.py.
+    assert 'if ! _okengine_env_file_val "$PACK" HERMES_UID >/dev/null; then' in t, \
+        "deploy.sh no longer guards on an existing pin"
     assert "HERMES_UID=%s" in t and '>> "$PACK/.env"' in t, "deploy.sh no longer persists HERMES_UID to .env"
     # #7 regression: the persist ran only when .env ALREADY existed, but ensure-runtime creates
     # .env afterward (via >>) without the pin — so a clean deploy left .env with no HERMES_UID.
@@ -327,6 +330,31 @@ def test_install_cron_plus_force_recovers_a_dirty_managed_clone(tmp_path):  # in
     (eng / "patches" / "cron-plus" / "slug_identity_guard.py").write_text(
         "# slug identity overlay\n"
     )
+    (eng / "patches" / "cron-plus" / "jobs-store-lock.patch").write_text(
+        "diff --git a/jobs-lock-hook b/jobs-lock-hook\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/jobs-lock-hook\n"
+        "@@ -0,0 +1 @@\n"
+        "+JOBS-STORE-LOCK-PATCHED\n"
+    )
+    (eng / "patches" / "cron-plus" / "reconcile-orphans-on-tick.patch").write_text(
+        "diff --git a/tick-reconcile-hook b/tick-reconcile-hook\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tick-reconcile-hook\n"
+        "@@ -0,0 +1 @@\n"
+        "+TICK-RECONCILE-PATCHED\n"
+    )
+    (eng / "patches" / "cron-plus" / "dst-fold.patch").write_text(
+        "diff --git a/dst-fold-hook b/dst-fold-hook\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/dst-fold-hook\n"
+        "@@ -0,0 +1 @@\n"
+        "+DST-FOLD-PATCHED\n"
+    )
+    (eng / "patches" / "cron-plus" / "dst_fold.py").write_text("# fall-back fold overlay\n")
 
     pack = tmp_path / "pack"; dest = pack / ".hermes-data" / "plugins" / "cron-plus"
     dest.parent.mkdir(parents=True)
@@ -343,6 +371,8 @@ def test_install_cron_plus_force_recovers_a_dirty_managed_clone(tmp_path):  # in
         "# cli\nAFTER-ORDERING-PATCHED\nNULL-NEXT-RUN-PATCHED\n"
     assert (dest / "receipt-hook").read_text() == "RUN-RECEIPTS-PATCHED\n"
     assert (dest / "pid-hook").read_text() == "PID-OWNERSHIP-PATCHED\n"
+    assert (dest / "jobs-lock-hook").read_text() == "JOBS-STORE-LOCK-PATCHED\n"
+    assert (dest / "tick-reconcile-hook").read_text() == "TICK-RECONCILE-PATCHED\n"
     assert (dest / "run-record-hook").read_text() == "RUN-RECORDS-PATCHED\n"
     assert (dest / "after_ordering.py").read_text() == "# policy overlay\n"
     assert (dest / "pid_ownership.py").read_text() == "# pid ownership overlay\n"
@@ -506,3 +536,14 @@ def test_deploy_force_recreates_gateway_on_config_change():  # invariant-audit #
     dp = (S / "deploy.sh").read_text()
     assert "force-recreate" in dp and "config.yaml" in dp and "StartedAt" in dp, \
         "deploy.sh must force-recreate the gateway on a config.yaml change newer than the container"
+
+
+def test_jobs_deploy_refuses_writers_the_runtime_config_does_not_register():  # okengine#840
+    """A stage-only jobs deploy after a writer rename must fail before the live store changes,
+    not ship lanes naming servers the gateway never starts."""
+    t = (S / "deploy-cron-plus-jobs.sh").read_text()
+    check = t.index("cron_pack_split.unregistered_writers(jobs, runtime_config)")
+    assert t.index("runtime_config = yaml.safe_load") < check < t.index("cat >"), (
+        "the writer-registration check must run after config.yaml is read and before the "
+        "live jobs store is written")
+    assert "sys.exit(1)" in t[check:check + 400], "an unregistered writer must fail the deploy"

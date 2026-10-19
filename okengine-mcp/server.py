@@ -50,6 +50,8 @@ import yaml
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
+from okengine.http_auth import authorization_header as _authorization_header
+from okengine.file_fingerprint import fingerprint
 from okengine.mcp import projection as _projection
 
 _BACKLINK_READ_ERRORS = (OSError, json.JSONDecodeError, ValueError)
@@ -416,7 +418,7 @@ _WL_RE = re.compile(r"\[\[([^\]|#\n]+?)(?:[#|][^\]]*)?\]\]")
 
 def _artifact_backlinks() -> dict | None:
     """The precomputed {target -> [{key,title}]} backlink map (wiki/.backlinks.json), or None when
-    absent / stale / corrupt. Callers return an explicit degraded result. mtime-cached (steady-state cost
+    absent / stale / corrupt. Callers return an explicit degraded result. fingerprint-cached (steady-state cost
     per call is one stat)."""
     p = WIKI / ".backlinks.json"
     try:
@@ -425,7 +427,10 @@ def _artifact_backlinks() -> dict | None:
         return None
     if time.time() - st.st_mtime > _BL_ARTIFACT_MAX_AGE:
         return None
-    if _BL_CACHE["mtime"] == st.st_mtime and _BL_CACHE["map"] is not None:
+    # The "mtime" slot holds the file fingerprint: an mtime-only key kept serving the previous map
+    # after a rebuild landing in the same timestamp tick (okengine#1017).
+    key = fingerprint(p, st)
+    if _BL_CACHE["mtime"] == key and _BL_CACHE["map"] is not None:
         return _BL_CACHE["map"]
     try:
         doc = json.loads(p.read_text(encoding="utf-8"))
@@ -434,7 +439,7 @@ def _artifact_backlinks() -> dict | None:
     m = doc.get("backlinks") if isinstance(doc, dict) else None
     if not isinstance(m, dict):
         return None
-    _BL_CACHE["map"], _BL_CACHE["doc"], _BL_CACHE["mtime"] = m, doc, st.st_mtime
+    _BL_CACHE["map"], _BL_CACHE["doc"], _BL_CACHE["mtime"] = m, doc, key
     return m
 
 
@@ -705,8 +710,7 @@ class _ScopedAuth:
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") == "http":
-            headers = dict(scope.get("headers") or [])
-            provided = headers.get(b"authorization", b"").decode()
+            provided = _authorization_header(scope)
             token = provided[7:] if provided.startswith("Bearer ") else ""
             caller = None
             if self.admin_token and hmac.compare_digest(token, self.admin_token):

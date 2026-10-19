@@ -138,7 +138,38 @@ The scaffold ships a sane generic contract; edit it to your domain. The blocks:
   ```
   `owner` (and per-field `field_owners`) are how the converge-on-write path keeps
   one pack from clobbering another's fields. All four keys are optional — omit them
-  and you get minted slugs, which is fine for a single pack.
+  and you get minted slugs, which is fine for a single pack. A declared `owner` must be a
+  write principal on the deployment: this pack's `pack.yaml` `name`, a pack co-installed with
+  `framework install-domain`, `engine` or `ext:<id>`. Converge compares the two by equality,
+  so any other value (a renamed pack, a typo, a pack folded into this one) leaves every lane
+  a non-owner of those pages, and `framework validate` FAILs it (okengine#1032).
+  A converge whose frontmatter merge **conflicts** on an identity-defining field keeps
+  the page's existing body instead of replacing it, and flags the page for review: the
+  write disagrees about *which* record the page is. The engine's set is `title`, `name`,
+  `subject` and `url`; a pack adds its own domain fields per type with
+  `identity_fields`, e.g. `source: {required: [type], identity_fields: [property]}`
+  (okengine#901).
+- **Actor types (`role: actor`)** — the engine grounds actor identity (okengine#1012) on
+  every type the composed schema marks as an actor. `actor` is one by default; a pack that
+  keeps adversaries under its own type names declares the role on each (okengine#1020):
+  ```yaml
+  types:
+    threat-actor:  {required: [type], role: actor}
+    intrusion-set: {required: [type], role: actor}
+  ```
+  A `type_aliases` key that maps onto an actor type is one too. Without the declaration no
+  actor guard, detector or cockpit panel sees those pages, and `corpus_audit` reports the
+  type under "Actor type not declared" and the grounding metrics as undetectable. A newly
+  declared type is judged when a page is created as one, retyped to one or renamed, never
+  retroactively on an ordinary update to a stored page. `framework validate` FAILs any
+  other `role` value, on a pack type or on a type an extension fragment owns (okengine#1032).
+- **Source URL identity** — a `source` page's `url` is its identity (okengine#515), so
+  it must name ONE record. A bare service endpoint with no query string (an ArcGIS
+  `…/MapServer/0/query` or `…/FeatureServer/<n>`, a Socrata `…/resource/<id>.json`) is
+  shared by every record read from it and carries **no** identity: the write path
+  never converges on it, and the raw-capture compile path rejects it. Store the
+  record-specific URL (the query that returns this record) instead.
+  `deployment_checks` WARNs on source pages that still carry a bare endpoint URL.
 - **`partitioning:`** — how each namespace buckets on disk (read by
   `okf_migrate`/`reshelve`/`reshard`): `by-letter`, `by-date`, or `flat`, with
   `reshard_over` (split a directory once it exceeds N entries).
@@ -266,9 +297,20 @@ fields straight.
 > `framework compose-preview` verifies that and flags any pack that re-declares (owns) or
 > tightens a core type. See [`core-types-and-extensions.md`](core-types-and-extensions.md).
 
-Check a composition with `python $ENGINE_DIR/scripts/cron_pack_split.py compose
---packs <dir>` (it discovers every pack with a `pack.yaml` and fails loudly on an
-ownership/trust conflict).
+Check a composition with `CRON_PACK_DIR=<deployment> python $ENGINE_DIR/scripts/cron_pack_split.py
+compose --packs <dir>`. `CRON_PACK_DIR` is required: compose, `regen` and `dump` refuse to run
+when it is unset or not a directory, rather than silently resolving extensions for no deployment.
+It discovers every pack with a `pack.yaml`, fails loudly on an ownership or trust
+conflict, and otherwise writes the same deployable job store `regen` does: enabled extensions
+(resolved for `CRON_PACK_DIR`, the host deployment) are folded in, every contracted model lane
+is bound to its own actor-bound writer, and the full deploy gate list runs.
+
+**One driver per engine-template lane.** A pack drives an engine-template lane by supplying its
+prompt, which ships the lane as the single instance `<lane>@<pack>`. That instance keeps the
+engine job's id (so run history, receipts and `next_run_at` carry over) and owns the lane's
+selector state and selection manifest. Two packs supplying a prompt for the same lane is a
+composition error naming both; remove the prompt from one of them. `framework install-domain`
+applies the same rule when co-installing ("engine-template prompt collision ... HOST WINS").
 
 > **Accepting a trust exposure on the record (okengine#813).** The reader and cockpit serve ONE
 > global trust — the *host's* — so co-installing a `private` guest onto a `public` host serves that
@@ -323,10 +365,18 @@ doesn't fail).
 <opml version="2.0">
   <head><title>My Brain feeds</title></head>
   <body>
-    <outline text="Example Source" type="rss" xmlUrl="https://example.com/feed.xml"/>
+    <outline text="Example Source" type="rss" xmlUrl="https://example.com/feed.xml"
+             publisher="Example Org"/>
   </body>
 </opml>
 ```
+
+Declare `publisher` on every outline: the organization that publishes the feed's items
+(`publisher="arXiv"` for an arXiv category feed). `feed_fetch.py` writes it into each raw
+item, and raw-backfill copies it onto the source page. `text` is the feed's label; it lands
+in `source_feed` and never counts as the publisher. Without the attribute the model has to
+infer a publisher from the URL, and a miss rejects the whole page (`publisher` is required
+on sources).
 
 **Non-feed sources (PDF / HTML).** Feeds land as markdown stubs; for binary or noisy
 sources you drop into `raw/`, the engine ships **Stage-1 extractors** that write a
@@ -367,14 +417,17 @@ At deploy, `scripts/cron_pack_split.py` **merges** the engine's
 
 - **`crons/engine-template-prompts.json`** — a JSON object mapping an
   engine-template job name → the domain prompt the engine grafts onto its script.
-  The engine-template jobs you can supply prompts for include `raw-backfill`,
-  `entity-backfill`, `concept-backfill`, `classify-new-sources`,
-  `prediction-grade`, `prediction-candidate-watch`, `event-ledger`,
-  `page-quality-enrich`, … (full list: `config/cron-tiers.yaml`).
+  The engine-template jobs that take a pack prompt are `raw-backfill`,
+  `entity-backfill`, `concept-backfill`, `source-quality-backfill`,
+  `page-quality-enrich`, `schema-classify-drain`, `daily-brief` and
+  `trends-refresh` (the skeleton's `crons/engine-template-prompts.json` lists them;
+  `scripts/prompt_lint.py` reports any key that matches no engine agent lane).
+  Prediction lanes (grading, candidate watch, regrade) belong to the
+  `okengine.predictions` extension and take their prompts from it, not from here.
   ```json
   {
     "entity-backfill": "You maintain entity pages for <domain>. For each entity missing required fields, research and fill …",
-    "prediction-grade": "Grade open predictions against new evidence. A prediction resolves only when …"
+    "daily-brief": "Write today's <domain> brief from the load-first set: what changed, why it matters, what to watch …"
   }
   ```
 - **`crons/domain-crons.json`** — a JSON **array** of full domain-tier defs. Each
@@ -391,6 +444,23 @@ At deploy, `scripts/cron_pack_split.py` **merges** the engine's
   ]
   ```
 - **`crons/scripts/*.py`** — any domain-specific scripts your domain crons call.
+
+**Every domain cron declares `expect:`: what "working" means for it.** A lane that runs
+on schedule but produces nothing is otherwise indistinguishable from one that works, and
+new lanes tend to get attention while old ones quietly stop. State what the lane owes:
+
+```json
+[
+  {"name": "my-weekly-digest", "schedule": {"kind": "cron", "expr": "0 13 * * SUN"},
+   "prompt": "Compile the week into a digest grouped by …",
+   "expect": {"produces": {"namespace": "briefings", "at_least": 1, "per": "1w"}}}
+]
+```
+
+Shapes are `produces`, `drains`, `maintains` and `may_idle`, combinable. See
+[`lane-expectations.md`](lane-expectations.md) for the shapes and how the fleet-health
+dashboard evaluates them. `framework validate` FAILs a malformed `expect:` and WARNs on a
+missing one (a missing one will FAIL in a future release).
 
 Leave both files at their scaffold defaults (`[]` and `{}`) for a minimal pack —
 the engine-tier maintenance fleet still runs.

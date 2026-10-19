@@ -5,6 +5,7 @@ import functools
 import os
 import re
 import json
+from json import JSONDecodeError
 import glob
 import hashlib
 import hmac
@@ -498,6 +499,39 @@ def _ops_available() -> bool:
     return bool(_ops_groups())
 
 
+def _oldest_red() -> "tuple[str, float, int | None] | None":
+    """(lane, days red, consecutive) for the longest-standing red lane, or None.
+
+    Read fresh on each call — no TTL cache. A monotonic()-TTL cache initialised to a finite value
+    serves its EMPTY snapshot as fresh for the whole window on a just-booted container, which is
+    how the reader/cockpit once served a blank queue for 15 minutes after every start.
+    """
+    path = WIKI / "dashboards" / ".fleet-escalation.json"
+    try:
+        lanes = (json.loads(path.read_text(encoding="utf-8")) or {}).get("lanes")
+    except (OSError, ValueError):
+        return None
+    if not isinstance(lanes, dict):
+        return None
+    now = datetime.datetime.now(datetime.timezone.utc)
+    best = None
+    for lane, state in lanes.items():
+        if not isinstance(state, dict):
+            continue
+        raw = state.get("red_since")
+        if not isinstance(raw, str) or not raw:
+            continue
+        try:
+            since = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        days = (now - since).total_seconds() / 86400.0
+        streak = state.get("consecutive")
+        if best is None or days > best[1]:
+            best = (str(lane), days, streak if isinstance(streak, int) else None)
+    return best
+
+
 def _ops_summary() -> dict:
     """Small, evidence-linked exception summary derived from existing engine artifacts."""
     metrics = []
@@ -529,6 +563,20 @@ def _ops_summary() -> dict:
                         "path": "dashboards/fleet-health",
                     }
                 )
+        # HOW LONG, not just how many. A lane red for three weeks and one red for an hour are the
+        # same number here, and that is how 33 red lanes went unremarked for a month on a live
+        # deployment while this very panel displayed the count (okengine#817). fleet_health already
+        # records red_since/consecutive per lane; the oldest one is the number that makes a
+        # standing outage impossible to read as a blip.
+        oldest = _oldest_red()
+        if oldest is not None:
+            lane, days, streak = oldest
+            metrics.append({
+                "label": "oldest red lane",
+                "value": f"{days:.0f}d — {lane}" + (f" ({streak}×)" if streak else ""),
+                "tone": "crit" if days >= 1 else "warn",
+                "path": "dashboards/fleet-health",
+            })
         if any(counts.get(k, 0) for k in ("errored", "off-model")):
             overall = "critical"
         elif any(counts.get(k, 0) for k in ("critical-stale", "stale", "never-run")):
@@ -665,7 +713,7 @@ def api_policy():
         try:
             value = json.loads((VAULT / ".okengine" / name).read_text(encoding="utf-8"))
             return value if isinstance(value, type(default)) else default
-        except (OSError, json.JSONDecodeError):
+        except (OSError, JSONDecodeError):
             return default
 
     effective = load("effective-policy.json", {})

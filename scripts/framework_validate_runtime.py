@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -40,6 +41,22 @@ def check_composition_state(pack: Path, report: Any) -> None:
     trust-exposure acceptance. They answer one question and belong on the report together."""
     check_installed_domain_drift(pack, report)
     check_trust_exposure_overrides(pack, report)
+    check_guest_chat_capabilities(pack, report)
+
+
+def check_guest_chat_capabilities(pack: Path, report: Any) -> None:
+    """WARN for each installed guest whose own `chat:*` capability this host never composes
+    (okengine#991). Validating a pack directory itself never warns: there its policy IS composed."""
+    if not (pack / ".okengine" / "installed-domains").is_dir():
+        return
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "composed_pack_state.py"
+    spec = importlib.util.spec_from_file_location("composed_pack_state_chat", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for warning in module.guest_chat_warnings(pack):
+        report.warn("guest chat capability", warning)
 
 
 def check_trust_exposure_overrides(pack: Path, report: Any) -> None:
@@ -103,18 +120,30 @@ def check_env(pack: Path, r: Any, *, required: bool = True) -> None:
             r.info(".env", "present and untracked (ok)")
 
 
+def _dotenv_lib() -> Any:
+    """The ONE .env reader (scripts/cron/dotenv_lib.py), shared with ensure-runtime and the
+    in-gateway checks: it parses the file as compose env_file does (okengine#991)."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "cron" / "dotenv_lib.py"
+    spec = importlib.util.spec_from_file_location("okengine_dotenv_lib", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _read_dotenv(pack: Path) -> dict[str, str]:
-    env = pack / ".env"
-    if not env.is_file():
-        return {}
-    out: dict[str, str] = {}
-    for raw in env.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        out[k.strip()] = v.strip().strip('"').strip("'")
-    return out
+    """The pack .env, as compose gives it to the containers through env_file: `${X}` resolves from
+    this process's environment (deploy.sh runs compose in it), then the whole file (okengine#993)."""
+    return _dotenv_lib().read_compose_env(pack / ".env", os.environ)
+
+
+def _gateway_env(pack: Path) -> dict[str, str]:
+    """What the gateway's Hermes process sees from the deployment's dotenv files: the pack .env
+    (compose env_file) overlaid by `.hermes-data/.env`, which Hermes loads as $HERMES_HOME/.env
+    with override=True (hermes_cli/env_loader.load_hermes_dotenv) and where `hermes setup` writes
+    credentials. Not statically visible: external secret sources (.op.env/1Password, Bitwarden)."""
+    return {**_read_dotenv(pack), **_dotenv_lib().read_dotenv(pack / ".hermes-data" / ".env")}
 
 
 def _is_exposed(text: str, env: dict, loopback: set[str]) -> bool:
@@ -296,6 +325,103 @@ def _runtime_gitignored(pack: Path) -> bool:
     return False
 
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _hardening_lib() -> Any:
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "cron" / "hardening_lib.py"
+    spec = importlib.util.spec_from_file_location("okengine_hardening_lib", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _chat_enabled(pack: Path, cfg: dict) -> bool:
+    """Whether this deployment turns the Agent Chat (api_server) on: Hermes enables it on
+    API_SERVER_ENABLED or on an API_SERVER_KEY alone, from .env, .hermes-data/.env (_gateway_env)
+    or the compose environment, or on an api_server block enabled in config.yaml in any spelling
+    the pinned Hermes reads (hardening_lib.platform_config_state, okengine#993)."""
+    env = _gateway_env(pack)
+    if str(env.get("API_SERVER_ENABLED") or "").strip().lower() in _TRUTHY \
+            or str(env.get("API_SERVER_KEY") or "").strip():
+        return True
+    compose = pack / "docker-compose.yml"
+    if compose.is_file():
+        text = compose.read_text(encoding="utf-8", errors="replace")
+        # Inline flags: a combined `re.I | re.M` only yields equivalent mutants (+, ^ on
+        # disjoint bits), so the gate could never tell them apart.
+        if re.search(r"(?im)^\s*-?\s*API_SERVER_ENABLED\s*[=:]\s*['\"]?(1|true|yes|on)\b",
+                     text):
+            return True
+    return _hardening_lib().platform_config_state(cfg, "api_server")[0]
+
+
+def _api_server_after_migration(cfg: dict) -> dict | None:
+    """The config as ensure-runtime's okengine#983 reconcile leaves it, or None when it would not
+    touch it. Only the case that reconcile guarantees is modeled: a `platform_toolsets.api_server`
+    LIST naming the actor-less writer, which it rewrites to the chat writer or removes (and
+    otherwise fails the deploy). Editing on or off, the actor-less entry is gone afterward, so
+    the chat writer stands in for it either way here."""
+    toolsets = cfg.get("platform_toolsets")
+    listed = toolsets.get("api_server") if isinstance(toolsets, dict) else None
+    if not isinstance(listed, list) or "okengine-write" not in [str(x).strip() for x in listed]:
+        return None
+    new: list = []
+    for item in listed:
+        name = "okengine-write-chat" if str(item).strip() == "okengine-write" else item
+        if name not in new:
+            new.append(name)
+    servers = cfg.get("mcp_servers") if isinstance(cfg.get("mcp_servers"), dict) else {}
+    # ensure-runtime also registers the chat writer, actor-bound; a list naming an unregistered
+    # server would otherwise read as binding every server.
+    servers = {"okengine-write-chat": {"env": {"OKENGINE_WRITE_ACTOR": "chat:api_server"}},
+               **servers}
+    return {**cfg, "mcp_servers": servers,
+            "platform_toolsets": {**toolsets, "api_server": new}}
+
+
+def check_chat_writer_binding(pack: Path, r: Any, cfg: dict) -> None:
+    """okengine#983, the earliest gate: no model-facing platform may reach the actor-less
+    `okengine-write`, which the write path treats as admin. The in-gateway deployment check runs
+    the same pure rule (hardening_lib.actorless_writer_bindings) after the roll."""
+    lib = _hardening_lib()
+    chat = _chat_enabled(pack, cfg)
+    # okengine#991: Hermes also enables messaging platforms from dotenv credentials alone.
+    env = _gateway_env(pack)
+    # okengine#993: and photon from credentials stored in $HERMES_HOME/auth.json.
+    auth, auth_error = lib.read_auth_json(pack / ".hermes-data" / "auth.json")
+    if auth_error and lib.actorless_writers(cfg.get("mcp_servers") if isinstance(
+            cfg.get("mcp_servers"), dict) else {}):
+        r.warn("model-facing actor-less writer",
+               f"{auth_error}: whether {sorted(lib.STORED_CREDENTIAL_PLATFORMS)} enable from "
+               "stored credentials, and so reach the actor-less writer, is undetectable here "
+               "(not a pass). Make it readable and re-run validate.")
+    errors = lib.actorless_writer_bindings(cfg, chat_enabled=chat, env=env, auth=auth)
+    # deploy.sh runs this gate (step 1) BEFORE ensure-runtime (step 2), and ensure-runtime is
+    # what migrates a pre-#983 api_server list off the actor-less writer (or fails the deploy
+    # when it cannot). Failing here on exactly that list dead-ended every existing deployment's
+    # upgrade, so a binding the migration removes is reported as pending; every other binding,
+    # and the in-gateway check after the roll, still FAILs.
+    # Compared by PLATFORM, never by message: the migrated list changes the message text, so a
+    # string compare excused a list still bound to a second actor-less writer (release audit).
+    migrated = _api_server_after_migration(cfg)
+    before = lib.actorless_writer_platforms(cfg, chat_enabled=chat, env=env, auth=auth)
+    after = (lib.actorless_writer_platforms(migrated, chat_enabled=chat, env=env, auth=auth)
+             if migrated is not None else before)
+    for platform, error in zip(before, errors, strict=True):
+        if platform not in after:
+            r.warn("model-facing actor-less writer",
+                   f"{error} [pending: deploy.sh step 2 (ensure-runtime) migrates this list]")
+        else:
+            r.fail("model-facing actor-less writer", error)
+    if not errors:
+        r.ok("model-facing actor-less writer",
+             "no model-facing platform binds the actor-less okengine-write "
+             f"(exempt operator surfaces: {', '.join(sorted(lib.OPERATOR_SURFACES))})")
+
+
 def check_runtime_config(
     pack: Path,
     r: Any,
@@ -363,6 +489,7 @@ def check_runtime_config(
         )
     else:
         r.ok("mcp_servers.okengine-write-source-quality", "server-bound job identity declared")
+    check_chat_writer_binding(pack, r, data)
     # The seeded read-MCP Authorization header must be a real token, not the
     # template placeholder — an unsubstituted `<...>` 401s the gateway agent on
     # every read-MCP call (okengine#32).

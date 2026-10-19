@@ -1,0 +1,26 @@
+# Build-only release images (okengine#1048). ci/release_images.py builds these together with the
+# smoke stack's images (`-f docker-compose.smoke.yml -f docker-compose.release-build.yml`) so the
+# release records a CI-tested digest for every product image a deployment runs. The smoke stack
+# itself never starts them: they need PostgreSQL or a governed vault the frozen seed does not model,
+# so each is booted once by release_images.smoke_image() instead.
+#
+# Image names are SCOPED to the smoke stack and must never equal a name a deployment references
+# (okengine#1033; pinned by tests/test_smoke_image_scope.py). CI overrides them with registry tags.
+name: okengine-smoke
+
+services:
+  projection:
+    build:
+      context: ../../../
+      dockerfile: okengine-projection/Dockerfile
+      args:
+        PYTHON_BASE_IMAGE: ${OKENGINE_PYTHON_BASE_IMAGE:-python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f}
+    image: okengine-smoke-projection:${SMOKE_RUN_ID:-local}
+
+  operation-runner:
+    build:
+      context: ../../../
+      dockerfile: okengine-operations/Dockerfile
+      args:
+        PYTHON_BASE_IMAGE: ${OKENGINE_PYTHON_BASE_IMAGE:-python:3.13-slim-trixie@sha256:c33f0bc4364a6881bed1ec0cc2665e6c53c87a43e774aaeab88e6f17af105e4f}
+    image: okengine-smoke-operation-runner:${SMOKE_RUN_ID:-local}

@@ -7,10 +7,13 @@ keys), dry-run writes nothing, and full idempotency (second --apply = no steps).
 """
 import importlib.util
 import json
+import shutil
 import sys
 from pathlib import Path
 
 import pytest
+import shutil
+
 import yaml
 
 pytest.importorskip("yaml")
@@ -1014,3 +1017,127 @@ def test_reason_without_the_accept_flag_is_refused(tmp_path):
     """--reason alone reads like consent but grants none; refuse rather than silently ignore it."""
     h, p = _exposing_pair(tmp_path)
     assert mod.main([str(h), str(p), "--apply", "--reason", "looks accepted but is not"]) == 2
+
+
+def test_a_consumed_snapshot_reports_instead_of_quarantining_the_deployment(tmp_path, capsys,
+                                                                            monkeypatch):
+    """okengine#819: install-domain's rollback must survive its snapshot being gone.
+
+    On a live vault the pack-migration runner adopted install-domain's transaction snapshot (same
+    pack/to keys, unconfirmed), rolled back from it and deleted it. install-domain then restored
+    from the missing tree, and because `added` is 'live files absent from the snapshot', that was
+    the entire deployment: 110,263 files quarantined, wiki/ emptied, and the run still printed
+    '110263 files restored'. The guard in framework_upgrade.restore now refuses; this pins that
+    install-domain reports it rather than dying, and moves nothing.
+    """
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    manifest = p / "pack.yaml"
+    manifest.write_text(manifest.read_text() + "version: 0.1.0\n")
+    assert mod.main([str(h), str(p), "--apply"]) == 0
+    pages_before = sorted(x.name for x in (h / "wiki").rglob("*.md"))
+    schema_before = (h / "schema.yaml").read_bytes()
+
+    manifest.write_text(manifest.read_text().replace("0.1.0", "0.2.0"))
+    # the refresh must PLAN something, or install-domain takes no transaction snapshot of its own
+    # and its rollback site is never reached
+    additions_path = p / "subdomain" / "host-schema-additions.yaml"
+    additions = yaml.safe_load(additions_path.read_text())
+    additions["cockpit"] = {"tab_contributions": {"okpack-tax.c819": {
+        "target": "overview",
+        "boxes": [{"id": "okpack-tax.c819-box", "title": "C819", "view": "table"}],
+    }}}
+    additions_path.write_text(yaml.safe_dump(additions, sort_keys=False))
+    (p / "migrations").mkdir(exist_ok=True)
+    (p / "migrations" / "m_0_1_0_0_2_0_fail.py").write_text(
+        'ID="fail-update"\nFROM="0.1.0"\nTO="0.2.0"\nDESCRIPTION="fail"\n'
+        'def apply(pack, dry_run):\n    raise RuntimeError("expected failure")\n')
+
+    real_load = mod._load_mod
+
+    def _consumed(name):
+        loaded = real_load(name)
+        if name == "framework_upgrade.py":
+            def _gone(_vault, snapshot, *_a, **_kw):
+                # consumed means GONE: the runner deleted the tree, so cleanup must tolerate that
+                shutil.rmtree(snapshot, ignore_errors=True)
+                raise FileNotFoundError("snapshot consumed by another transaction (okengine#819)")
+            monkeypatch.setattr(loaded, "restore", _gone, raising=True)
+        return loaded
+
+    monkeypatch.setattr(mod, "_load_mod", _consumed)
+    rc = mod.main([str(h), str(p), "--refresh", "--apply"])
+    out = capsys.readouterr()
+    assert rc == 1
+    assert out.err.count("NOT rolled back") >= 2, out.err   # inner runner AND install-domain
+    # The contract of a refused rollback is "nothing was MOVED", not "everything was reverted":
+    # the transaction's own edits stand and the operator is told to resolve it. That is the trade —
+    # the alternative, rolling back against a snapshot that can restore nothing, emptied a vault.
+    assert sorted(x.name for x in (h / "wiki").rglob("*.md")) == pages_before
+    assert yaml.safe_load((h / "schema.yaml").read_text()), "schema must still be readable"
+    assert schema_before is not None
+    quarantine = h / ".okengine" / "rolled-back"
+    assert not list(quarantine.rglob("*.md")) if quarantine.is_dir() else True
+
+
+def _spy_preflight(monkeypatch):
+    """Capture the argv install-domain hands the co-install preflight."""
+    seen = []
+    real_load = mod._load_mod
+
+    def _load(name):
+        loaded = real_load(name)
+        if name == "coinstall_preflight.py":
+            real_main = loaded.main
+
+            def main(argv):
+                seen.append(list(argv))
+                return real_main(argv)
+            monkeypatch.setattr(loaded, "main", main)
+        return loaded
+
+    monkeypatch.setattr(mod, "_load_mod", _load)
+    return seen
+
+
+def test_a_dry_run_hands_a_pending_acceptance_to_the_gate(tmp_path, monkeypatch, capsys):
+    h, p = _exposing_pair(tmp_path)
+    seen = _spy_preflight(monkeypatch)
+    assert mod.main([str(h), str(p), "--accept-trust-exposure", "--reason", "trusted LAN"]) == 0
+    assert seen and seen[0][-2:] == ["--assume-trust-accepted", "trusted LAN"]
+
+
+@pytest.mark.parametrize("extra", [[], ["--apply", "--accept-trust-exposure", "--reason", "LAN"]])
+def test_no_acceptance_is_assumed_without_a_pending_dry_run_one(tmp_path, monkeypatch, capsys, extra):
+    """Without an acceptance there is nothing to assume; on --apply the acceptance is RECORDED
+    before the gate, so the gate must read the record rather than be told to assume it."""
+    h, p = _exposing_pair(tmp_path)
+    seen = _spy_preflight(monkeypatch)
+    mod.main([str(h), str(p), *extra])
+    assert seen and all("--assume-trust-accepted" not in argv for argv in seen)
+
+
+def test_the_recorded_acceptance_names_the_guests_declared_trust(tmp_path, capsys):
+    h, p = _exposing_pair(tmp_path)
+    (p / "pack.yaml").write_text((p / "pack.yaml").read_text().replace(
+        "trust: private", "trust: ' Internal '"))
+    assert mod.main([str(h), str(p), "--apply", "--accept-trust-exposure", "--reason", "LAN"]) == 0
+    recorded = yaml.safe_load((h / ".okengine" / "coinstall-overrides.yaml").read_text())
+    assert recorded["trust_exposure"]["okpack-tax"]["guest_trust"] == "internal"
+
+
+def test_a_new_member_install_refuses_a_torn_migration_state_before_writing(tmp_path, capsys):
+    """okengine#991: a new member used to merge the schema, regenerate the composed schema and
+    only then raise in record_pack_version, leaving the install unbaselined and its transaction
+    snapshot leaked. An unreadable host state must refuse before anything is written."""
+    h, p = _host(tmp_path), _taxonomy_pack(tmp_path)
+    (p / "pack.yaml").write_text((p / "pack.yaml").read_text() + "version: 0.1.0\n")
+    state = h / ".okengine" / "migrations-state.json"
+    state.parent.mkdir(parents=True)
+    state.write_text('{"pack_versions": {"okpack-tax": "0.1')
+    before = {str(f.relative_to(h)): f.read_bytes() for f in sorted(h.rglob("*")) if f.is_file()}
+
+    assert mod.main([str(h), str(p), "--apply"]) == 1
+
+    after = {str(f.relative_to(h)): f.read_bytes() for f in sorted(h.rglob("*")) if f.is_file()}
+    assert after == before, "install-domain wrote to the host before refusing"
+    assert "migrations-state.json" in capsys.readouterr().err

@@ -17,27 +17,59 @@ summaries, so it can be run from a workstation, a cron, or CI, and answers the s
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
+import re
 import sys
 from pathlib import Path
 
 DEFAULT_THRESHOLD = 3
+# The gate's re-baseline window (okengine#943): a score carried forward from an older measurement
+# is fresh for at most this long. The watcher applies its OWN bound rather than trusting the one a
+# summary declares, so a misconfigured gate cannot widen what counts as measured.
+DEFAULT_REBASELINE_DAYS = 7
 
 
-def measured_paths(run: dict) -> set[str]:
+def _moment(value) -> dt.datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else None
+
+
+def fresh_carry(run: dict, target: dict, days: int) -> bool:
+    """Whether a carried-forward score was measured within ``days`` of this run.
+
+    Missing or unreadable dates are not fresh: an undatable carry is no evidence of measurement.
+    """
+    reused = target.get("reused")
+    run_at, measured_at = _moment(run.get("generated_at")), _moment(
+        reused.get("measured_at") if isinstance(reused, dict) else None)
+    if run_at is None or measured_at is None:
+        return False
+    return dt.timedelta(0) <= run_at - measured_at <= dt.timedelta(days=days)
+
+
+def measured_paths(run: dict, days: int = DEFAULT_REBASELINE_DAYS) -> set[str]:
     """Targets that produced a real score in this run.
 
     A `score` of None means the campaign crashed, timed out, or found nothing mutable -- in none
-    of those cases is there a measurement, so none of them counts.
+    of those cases is there a measurement, so none of them counts. A score carried forward from an
+    earlier run (okengine#943) counts only while that measurement is inside the re-baseline window.
     """
     return {
         target["path"]
         for target in run.get("targets") or []
         if isinstance(target, dict) and target.get("path") and target.get("score") is not None
+        and (not target.get("reused") or fresh_carry(run, target, days))
     }
 
 
-def dropout_streaks(runs: list[dict], expected: list[str]) -> dict[str, int]:
+def dropout_streaks(runs: list[dict], expected: list[str],
+                    days: int = DEFAULT_REBASELINE_DAYS) -> dict[str, int]:
     """path -> number of consecutive most-recent runs in which it produced no score.
 
     `runs` is NEWEST FIRST. A target absent from a run entirely counts as unmeasured: dropping out
@@ -51,7 +83,7 @@ def dropout_streaks(runs: list[dict], expected: list[str]) -> dict[str, int]:
     for path in expected:
         streak = 0
         for run in runs:
-            if path in measured_paths(run):
+            if path in measured_paths(run, days):
                 break
             streak += 1
         if streak:
@@ -59,14 +91,27 @@ def dropout_streaks(runs: list[dict], expected: list[str]) -> dict[str, int]:
     return streaks
 
 
-def load_summaries(directory: Path) -> list[dict]:
-    """Published `summary.json` files, newest first by filename.
+def chronological_key(path: Path) -> tuple:
+    """Sort key that orders `summary-<pipeline id>.json` by the id's VALUE, not its spelling.
 
-    Names are expected to sort chronologically (the CI helper writes `summary-<pipeline id>.json`,
-    and pipeline ids increase). Sorting by name rather than mtime keeps a re-downloaded artifact
-    from reordering history.
+    A plain string sort puts `summary-9947` after `summary-13159`, so every four-digit pipeline
+    read as newer than every five-digit one; the watcher then reported six critical targets as
+    unmeasured for 16 runs that predated them, while the real newest run had scored all six
+    (okengine#1047). Splitting on digit runs keeps strings and integers at fixed positions, so
+    names without an id still compare deterministically.
     """
-    files = sorted(directory.glob("*.json"), reverse=True)
+    return tuple(int(part) if index % 2 else part
+                 for index, part in enumerate(re.split(r"(\d+)", path.name)))
+
+
+def load_summaries(directory: Path) -> list[dict]:
+    """Published `summary.json` files, newest first by pipeline id.
+
+    The CI helper writes `summary-<pipeline id>.json`, and pipeline ids increase, so the id's
+    numeric value is chronological. Sorting by name rather than mtime keeps a re-downloaded
+    artifact from reordering history.
+    """
+    files = sorted(directory.glob("*.json"), key=chronological_key, reverse=True)
     runs = []
     for path in files:
         try:
@@ -116,10 +161,15 @@ def main(argv=None) -> int:
     parser.add_argument("--manifest", type=Path, default=Path("mutation/targets.json"))
     parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD)
     parser.add_argument("--critical-only", action="store_true")
+    parser.add_argument("--rebaseline-days", type=int, default=DEFAULT_REBASELINE_DAYS,
+                        help="a carried-forward score counts as measured only this long after "
+                             "its measurement (okengine#943)")
     args = parser.parse_args(argv)
 
     if args.threshold < 1:
         raise SystemExit("mutation-history: --threshold must be at least 1")
+    if args.rebaseline_days < 1:
+        raise SystemExit("mutation-history: --rebaseline-days must be at least 1")
     if not args.summaries.is_dir():
         raise SystemExit(f"mutation-history: {args.summaries} is not a directory — with no run "
                          f"history the streak is UNDETECTABLE, and reporting 'no dropouts' here "
@@ -135,7 +185,8 @@ def main(argv=None) -> int:
         raise SystemExit("mutation-history: the manifest declares no matching targets, so this "
                          "measured nothing; refusing to report a clean sweep over an empty set")
 
-    lines, code = report(dropout_streaks(runs, expected), len(runs), args.threshold, len(expected))
+    lines, code = report(dropout_streaks(runs, expected, args.rebaseline_days), len(runs),
+                         args.threshold, len(expected))
     print("\n".join(lines))
     return code
 

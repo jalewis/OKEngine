@@ -16,7 +16,7 @@ OKEngine is pre-1.0. Security fixes target the latest `0.x` release and `main`.
 
 | Version | Supported |
 |---|---|
-| `0.14.x` / `main` | ✅ |
+| `0.15.x` / `main` | ✅ |
 | older | ❌ |
 
 ## Security model (what to keep in mind)
@@ -37,11 +37,31 @@ deployment is configured:
   file-tool write-guard is the backstop.
 - **A public reader deployment** must mount only public content and should disable
   or rate-limit expensive endpoints (export/graph rebuild).
-- **UI editing.** The reader's Chat can *write back* to the vault (via the `okengine-write`
-  MCP in the api_server toolset). On an externally-exposed deployment set **`OKENGINE_EDITING=0`**
-  to make it read-only — `ensure-runtime` drops `okengine-write` from the api_server toolset on the
-  next gateway recreate, so chat still answers from the vault but cannot edit it. Default is on for
+- **UI editing.** The reader's Chat can *write back* to the vault, through its own actor-bound
+  `okengine-write-chat` MCP (actor `chat:api_server`) in the api_server toolset, never the generic
+  `okengine-write` (which has no actor, so the write path treats it as admin). The `chat:api_server`
+  capability in `config/policy/catalog.yaml` limits it to creating pages and updating frontmatter or
+  appending to sections in `entities/` and `concepts/`: no body replacement, no tombstone, converge,
+  patch, flag or review, and no provenance, handling, review or attestation fields. Every chat write
+  is queued for human review. A pack may replace that capability only inside the engine ceiling
+  (`framework validate` FAILs anything wider), and `framework validate` plus the in-gateway
+  deployment check FAIL any model-facing platform that can reach the actor-less writer
+  (okengine#983), including a messaging platform Hermes enables from `.env` credentials alone
+  (such as `TELEGRAM_BOT_TOKEN` in `.env` or `.hermes-data/.env`) with no `platform_toolsets` entry
+  (okengine#991). On an
+  externally-exposed deployment set **`OKENGINE_EDITING=0`** in the pack `.env` to make chat
+  read-only — `ensure-runtime` reads it from there, parsing the file the way compose does, and
+  drops `okengine-write-chat` from the api_server toolset on the next gateway recreate, so chat
+  still answers from the vault but cannot edit it. The gateway gets the flag from `.env` through compose
+  `env_file`; the reader has no `env_file` and gets it only from an explicit
+  `OKENGINE_EDITING=${OKENGINE_EDITING:-}` entry (in the skeleton compose since okengine#991; a
+  hand-maintained pack compose needs it added, or the reader's read-only indicator stays off). Default is on for
   back-compat; the reader shows a read-only indicator when off.
+- **The Hermes CLI is an operator surface.** An interactive `hermes` session inside the gateway
+  has no `platform_toolsets` entry, so Hermes gives it every MCP server, including the actor-less
+  admin writer. It is reachable only via `docker exec` into the gateway, by someone who already
+  holds the container, so it is admin-equivalent by construction. The binding check exempts it by
+  an explicit, named rule (`hardening_lib.OPERATOR_SURFACES`).
 - **Hardened profile (one switch).** Rather than discover and set each flag above,
   set `OKENGINE_HARDENED=1` to assert "this deployment must be safe to expose." It
   is **fail-closed**: the daily in-gateway `deployment_validate` lane FAILs (marking

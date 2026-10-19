@@ -7,6 +7,7 @@ accidentally present an instrument failure as good product quality.
 from __future__ import annotations
 
 import json
+from json import JSONDecodeError
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -54,7 +55,7 @@ def _receipts(root: Path) -> list[dict]:
     for path in root.glob("*/*.json"):  # glob-ok: flat receipt registry per lane
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, JSONDecodeError):
             continue
         if isinstance(value, dict):
             records.append(value)
@@ -89,7 +90,7 @@ def rollup(receipt_root: Path, adjudication_path: Path | None = None) -> dict:
     if adjudication_path and adjudication_path.is_file():
         try:
             snapshot = json.loads(adjudication_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, JSONDecodeError):
             snapshot = None
         supplied = snapshot.get("metrics") if isinstance(snapshot, dict) else None
         if isinstance(supplied, dict):

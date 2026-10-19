@@ -495,10 +495,14 @@ def test_pull_bundle_identity_and_member_resolution(tmp_path):
         pull._resolve_member("host", {**spec, "subdir": ""}, None)
 
     (tmp_path / "pack.yaml").write_text("name: host\ndescription: old\nowns: {}\n")
-    pull._apply_bundle_identity(tmp_path, {"name": "bundle", "mission": "combined"})
+    pull._apply_bundle_identity(tmp_path, {"name": "bundle", "description": "composed",
+                                           "mission": "combined"})
     text = (tmp_path / "pack.yaml").read_text()
-    assert "name: bundle" in text and "mission: combined" in text and "owns: {}" in text
-    assert pull._bundle_identity(tmp_path)["name"] == "bundle"
+    # okengine#1032 [11]: the name stays the host's (the write principal); only display keys move
+    assert "name: host" in text and "mission: combined" in text and "owns: {}" in text
+    assert "name: bundle" not in text
+    assert "description: composed" in text and "description: old" not in text
+    assert pull._bundle_identity(tmp_path)["name"] == "host"
     assert pull._bundle_identity(tmp_path / "missing") == {}
 
 
@@ -547,6 +551,7 @@ def test_pull_update_main_runs_migration_workflow(tmp_path, monkeypatch):
     monkeypatch.setattr(pull, "_load_meta_safe", lambda path: {
         "name": "demo", "version": "1.1.0" if "clone" in str(path) else "1.0.0"})
     upgrade = SimpleNamespace(
+        read_state=lambda _dest: {}, MigrationStateError=RuntimeError,
         installed_pack_version=lambda *a, **k: "1.0.0",
         run_pack_migrations=lambda *a, **k: 0)
     monkeypatch.setattr(pull, "_framework_upgrade_mod", lambda: upgrade)

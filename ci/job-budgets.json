@@ -1,51 +1,306 @@
 {
   "_why": [
-    "Recorded runtimes for every CI job that claims a timeout under the shared-preamble floor.",
+    "Recorded runtimes for EVERY CI job (okengine#898).",
     "",
-    "A short timeout is a CLAIM that a job is cheap. Nothing checked the claim against the job's",
-    "actual runtime, so the claim could be false indefinitely: diff-check and mutation-targets both",
-    "carried 5m while needing 208-311s, and both died at the wall repeatedly (!1018, !1020, !1013).",
-    "The rule that was supposed to catch this keyed on which PREAMBLE a job used, not on how long",
-    "the job took, so trimming a preamble made a job compliant without making it fast.",
+    "A timeout is a CLAIM about what a job costs. Until okengine#898 this file only had to evidence",
+    "jobs claiming a timeout below the shared-preamble floor, so a job ABOVE the floor never had to",
+    "prove its budget: full-suite held 30m while measuring 1,619-1,800s (a headroom factor of ~1.0)",
+    "and timed out green changes four times on 2026-09-26. Before that, diff-check and",
+    "mutation-targets carried 5m while needing 208-311s (!1018, !1020, !1013).",
     "",
-    "This file is the evidence half. tests/test_ci_config.py asserts two things against it:",
-    "  1. every job with a timeout below the floor HAS an entry here -- a new job cannot escape",
-    "     the rule by simply not being listed, which is exactly how these two escaped;",
-    "  2. its timeout is at least HEADROOM_FACTOR x its recorded runtime.",
+    "tests/test_ci_config.py asserts, for every job in the CI pipeline definition:",
+    "  1. it has a timeout, own or inherited through `extends` (the project default lives outside",
+    "     this repo, so a job without one has a budget no test can see);",
+    "  2. it HAS an entry here with a real CI job id -- a job cannot escape by not being listed;",
+    "  3. its timeout is at least headroom_factor x measured_s.",
+    "A job that has never run in CI cannot be measured; it may sit in `unmeasured` with a reason,",
+    "which the same test requires and reports, instead of a fabricated number.",
     "",
-    "measured_s is wall-clock from a real CI job, not a local run and not an estimate. Record the",
-    "job id so the number can be audited. Re-measure when a job's work changes; a stale number",
-    "that is too LOW is the dangerous direction, because it makes a tight budget look safe."
+    "measured_s is wall-clock (the CI job `duration`, queue time excluded) from real CI jobs, not a",
+    "local run and not an estimate. Unless a note says otherwise it is the SLOWEST successful run of",
+    "the job over the stated window, and job_id is that run. For parallel jobs it is the slowest",
+    "shard. Re-measure when a job's work changes; a stale number that is too LOW is the dangerous",
+    "direction, because it makes a tight budget look safe."
   ],
   "headroom_factor": 2.0,
   "jobs": {
-    "publication-policy": {
-      "measured_s": 19.51,
-      "timeout": "5m",
-      "job_id": 122299,
-      "measured_on": "2026-09-20",
-      "note": "Initial complete 106-test execution took 19.505943s including shared wheel setup; 104 passed and two configuration-contract assertions failed. This is timing evidence, not a passing qualification claim. The repair removes unused wheel setup and retains the same test population."
+    "quality-summary-failed": {
+      "measured_s": 4.545009,
+      "job_id": 159022,
+      "measured_on": "2026-10-12",
+      "note": "First run, MR pipeline 13052 (okengine#1045): the fan-in twin reporting python314-forward's failure. Resource guard + echo + exit 1; queue excluded."
+    },
+    "candidate-wheel": {
+      "measured_s": 8.811677,
+      "job_id": 134526,
+      "measured_on": "2026-09-28",
+      "note": "First #905 wheel bootstrap, pipeline11433. Pinned Python3.12 base; no tool installation. Registry/runner cache warmth was not established."
+    },
+    "ci-tooling-refresh": {
+      "measured_s": 677.131175,
+      "job_id": 134911,
+      "measured_on": "2026-09-28",
+      "note": "Corrected #905 seed, pipeline 11461: all five variants built and published in a fresh daemon, with dependency consistency checks. Variants can share base layers inside that daemon; runner image-cache warmth unknown. Queue excluded."
+    },
+    "contract-suite": {
+      "measured_s": 226.9,
+      "job_id": 129105,
+      "measured_on": "2026-09-25",
+      "note": "max of 92 successful runs 2026-09-20..27; slowest was contract-suite."
     },
     "diff-check": {
-      "measured_s": 14.0,
-      "timeout": "5m",
-      "job_id": 109309,
-      "measured_on": "2026-09-13",
-      "note": "Was 208-309s until !1023 moved it off python:3.12-slim; the cost was apt installing git+make, never the diff gate itself."
+      "measured_s": 23.9,
+      "job_id": 121795,
+      "measured_on": "2026-09-20",
+      "note": "max of 363 successful runs 2026-09-20..27; slowest was diff-check. Earlier record: Was 208-309s until !1023 moved it off python:3.12-slim; the cost was apt installing git+make, never the diff gate itself."
     },
-    "resource-policy": {
-      "measured_s": 12.4,
-      "timeout": "5m",
-      "job_id": 109311,
+    "docs-duration-budget": {
+      "measured_s": 22.7,
+      "job_id": 121524,
+      "measured_on": "2026-09-20",
+      "note": "max of 64 successful runs 2026-09-20..27; slowest was docs-duration-budget."
+    },
+    "docs-validation": {
+      "measured_s": 24.8,
+      "job_id": 121796,
+      "measured_on": "2026-09-20",
+      "note": "max of 102 successful runs 2026-09-20..27; slowest was docs-validation."
+    },
+    "dotenv-compose-parity": {
+      "measured_s": 16.26975,
+      "job_id": 149135,
+      "measured_on": "2026-10-06",
+      "note": "slowest of its first 2 successful runs (149135 in pipeline 12565: 16.3s; 149326 in pipeline 12572: 12.4s). before_script is only tooling verify, the cgroup check and `docker compose version`; no daemon, no install."
+    },
+    "e2e-release": {
+      "measured_s": 891.1,
+      "job_id": 125809,
+      "measured_on": "2026-09-23",
+      "note": "max of 52 successful runs 2026-09-20..27; slowest was e2e-release."
+    },
+    "full-suite": {
+      "measured_s": 1343.036472,
+      "job_id": 161501,
+      "measured_on": "2026-10-14",
+      "note": "Slowest shard of the first five-shard full suite, MR !1348 pipeline 13153 (161498-161502: 1323/1235/1251/1343/1239s), after splitting tests/ci/test_mutation_gate_selection.py into three files (okengine#1052). Four-shard baseline before: main 13147 (161338-161341: 1347/1465/1734/1432s). Superseded 1367.8s (job 155315, 2026-10-10)."
+    },
+    "full-suite-combine": {
+      "measured_s": 89.1,
+      "job_id": 134239,
+      "measured_on": "2026-09-28",
+      "note": "MR !1187 pipeline 11420: verify, coverage combine with per-test contexts, JUnit merge, the mutation coverage map (okengine#900), report/json/xml and the per-file branch check over 4 shards. 81.5s over 3 shards in pipeline 11417 (job 134172); 64.4s before contexts (job 132826)."
+    },
+    "hermes-target-contracts": {
+      "measured_s": 1412.3,
+      "job_id": 121911,
+      "measured_on": "2026-09-20",
+      "note": "max of 27 successful runs 2026-09-20..27; slowest was hermes-target-contracts."
+    },
+    "integration-suite": {
+      "measured_s": 848.595917,
+      "job_id": 152458,
+      "measured_on": "2026-10-08",
+      "note": "okengine#1015 re-measure: slowest of four clean runs on 2026-10-08 (152177=769.3s, 151938=781.5s, 151651=784.8s, 152458=848.6s job duration). Superseded 552.6s (job 130022, 2026-09-26). Runs under runner-host disk-I/O pressure were killed by the old inner 840s pytest deadline at ~854s (152288/152307/152308); the inner deadline is recorded under make_deadlines.test-integration."
+    },
+    "lint": {
+      "measured_s": 161.0,
+      "job_id": 125222,
+      "measured_on": "2026-09-22",
+      "note": "max of 360 successful runs 2026-09-20..27; slowest was lint."
+    },
+    "mirror-base-images": {
+      "measured_s": 13.2,
+      "job_id": 126031,
+      "measured_on": "2026-09-23",
+      "note": "max of 8 successful runs 2026-09-20..27; slowest was mirror-base-images."
+    },
+    "mutation-changed": {
+      "measured_s": 1737.7,
+      "job_id": 132009,
+      "measured_on": "2026-09-26",
+      "note": "max of 220 successful runs 2026-09-20..27; slowest was mutation-changed 2/2."
+    },
+    "mutation-critical": {
+      "measured_s": 12933.1,
+      "job_id": 112721,
+      "measured_on": "2026-09-15",
+      "note": "max of the 5 most recent successful runs (none since 2026-09-20); slowest was mutation-critical 2/3."
+    },
+    "mutation-critical-aggregate": {
+      "measured_s": 282.4,
+      "job_id": 109593,
       "measured_on": "2026-09-13",
-      "note": "before_script: [] -- the verifier imports only the stdlib, so nothing is installed."
+      "note": "max of the 5 most recent successful runs (none since 2026-09-20); slowest was mutation-critical-aggregate."
+    },
+    "mutation-critical-preflight": {
+      "measured_s": 691.590526,
+      "job_id": 156947,
+      "measured_on": "2026-10-11",
+      "note": "Slowest successful run WITH this pipeline's coverage map, of the four nightlies 2026-10-07..11 (481.4/503.1/521.3/691.6s: jobs 152951/151331/150138/156947). WITHOUT a map the preflight proves every full-command baseline: job 154390 (pipeline 12826) ran 41 of 47 groups in 1,194s before the old 20m timeout. That path is bounded by the Makefile deadline (make_deadlines.test-mutation-critical-preflight), which this 75m timeout clears (okengine#1047). Earlier record: 354.8s (job 119427, 2026-09-18), before #940 and the write_services split."
+    },
+    "mutation-critical-promotion": {
+      "measured_s": 196.0,
+      "job_id": 132431,
+      "measured_on": "2026-09-27",
+      "note": "max of 300 successful runs 2026-09-20..27; slowest was mutation-critical-promotion."
+    },
+    "mutation-full": {
+      "measured_s": 12706.0,
+      "job_id": 78163,
+      "measured_on": "2026-09-01",
+      "note": "LOWER BOUND: no mutation-full shard has completed since 2026-08-28. Slowest of the three shards of pipeline 2026-09-01 (78162-78164), canceled after 12,704-12,706s of real campaign work; the 2026-09-14 run (111974-111976) failed in setup at 80-92s. 2x this still fits the 12h ceiling, and the gate carries its own deadline below it."
+    },
+    "mutation-full-aggregate": {
+      "measured_s": 16.0,
+      "job_id": 111980,
+      "measured_on": "2026-09-14",
+      "note": "Its only run to reach the script (2026-09-14) exited non-zero because its shards had failed; the aggregation itself is a JSON merge. Re-measure on the next completed campaign."
     },
     "mutation-targets": {
-      "measured_s": 66.4,
-      "timeout": "5m",
-      "job_id": 109320,
-      "measured_on": "2026-09-13",
-      "note": "Was 302-311s on an idle runner; apt held 295 of the 300s. The remaining 66s is this job's own pip install, which it genuinely needs."
+      "measured_s": 134.2,
+      "job_id": 127775,
+      "measured_on": "2026-09-24",
+      "note": "max of 291 successful runs 2026-09-20..27; slowest was mutation-targets. Earlier record: Was 302-311s on an idle runner; apt held 295 of the 300s. The remaining 66s is this job's own pip install, which it genuinely needs."
+    },
+    "pack-parity": {
+      "measured_s": 50.2,
+      "job_id": 122459,
+      "measured_on": "2026-09-20",
+      "note": "max of 139 successful runs 2026-09-20..27; slowest was pack-parity."
+    },
+    "performance-release": {
+      "measured_s": 755.6,
+      "job_id": 129858,
+      "measured_on": "2026-09-26",
+      "note": "max of 52 successful runs 2026-09-20..27; slowest was performance-release."
+    },
+    "postgres-projection-integration": {
+      "measured_s": 36.2,
+      "job_id": 121695,
+      "measured_on": "2026-09-20",
+      "note": "max of 301 successful runs 2026-09-20..27; slowest was postgres-projection-integration."
+    },
+    "public-compatibility": {
+      "measured_s": 816.3,
+      "job_id": 132670,
+      "measured_on": "2026-09-27",
+      "note": "max of 16 successful runs 2026-09-20..27; slowest was public-compatibility: [3.11]."
+    },
+    "public-snapshot": {
+      "measured_s": 838.9,
+      "job_id": 132669,
+      "measured_on": "2026-09-27",
+      "note": "max of 12 successful runs 2026-09-20..27; slowest was public-snapshot."
+    },
+    "publication-policy": {
+      "measured_s": 28.2,
+      "job_id": 122400,
+      "measured_on": "2026-09-20",
+      "note": "max of 36 successful runs 2026-09-20..27; slowest was publication-policy. Earlier record: Initial complete 106-test execution took 19.505943s including shared wheel setup; 104 passed and two configuration-contract assertions failed. This is timing evidence, not a passing qualification claim. The repair removes unused wheel setup and retains the same test population."
+    },
+    "python314-forward": {
+      "measured_s": 194.3,
+      "job_id": 112159,
+      "measured_on": "2026-09-14",
+      "note": "max of the 5 most recent successful runs (none since 2026-09-20); slowest was python314-forward."
+    },
+    "registry-canary": {
+      "measured_s": 12.0,
+      "job_id": 132637,
+      "measured_on": "2026-09-27",
+      "note": "max of 7 successful runs 2026-09-20..27; slowest was registry-canary."
+    },
+    "release-images": {
+      "measured_s": 704.357072,
+      "job_id": 134593,
+      "measured_on": "2026-09-28",
+      "note": "Slowest of the first two #902 producers (134505:630.818117s;134593:704.357072s), fresh per-job daemons. Total includes tooling setup, base pulls, image build/publication and artifacts; runner image-cache warmth unknown and queue excluded."
+    },
+    "resilience-release": {
+      "measured_s": 788.7,
+      "job_id": 126599,
+      "measured_on": "2026-09-23",
+      "note": "max of 52 successful runs 2026-09-20..27; slowest was resilience-release."
+    },
+    "resource-policy": {
+      "measured_s": 27.2,
+      "job_id": 125856,
+      "measured_on": "2026-09-23",
+      "note": "max of 303 successful runs 2026-09-20..27; slowest was resource-policy. Earlier record: before_script: [] -- the verifier imports only the stdlib, so nothing is installed."
+    },
+    "scrub-and-compile": {
+      "measured_s": 36.6,
+      "job_id": 125855,
+      "measured_on": "2026-09-23",
+      "note": "max of 302 successful runs 2026-09-20..27; slowest was scrub-and-compile."
+    },
+    "secret-scan": {
+      "measured_s": 79.8,
+      "job_id": 126865,
+      "measured_on": "2026-09-24",
+      "note": "max of 199 successful runs 2026-09-20..27; slowest was secret-scan."
+    },
+    "security-audit": {
+      "measured_s": 187.8,
+      "job_id": 132601,
+      "measured_on": "2026-09-27",
+      "note": "max of 193 successful runs 2026-09-20..27; slowest was security-audit."
+    },
+    "security-properties": {
+      "measured_s": 307.1,
+      "job_id": 163218,
+      "measured_on": "2026-10-15",
+      "note": "max of the passing runs on pipelines 13227..13274 (2026-10-14..15); slowest was MR pipeline 13264."
+    },
+    "smoke-release": {
+      "measured_s": 616.0,
+      "job_id": 127298,
+      "measured_on": "2026-09-24",
+      "note": "max of 54 successful runs 2026-09-20..27; slowest was smoke-release."
+    },
+    "typecheck": {
+      "measured_s": 147.1,
+      "job_id": 125223,
+      "measured_on": "2026-09-22",
+      "note": "max of 362 successful runs 2026-09-20..27; slowest was typecheck."
+    },
+    "unit-suite": {
+      "measured_s": 195.5,
+      "job_id": 123819,
+      "measured_on": "2026-09-21",
+      "note": "max of 95 successful runs 2026-09-20..27; slowest was unit-suite."
+    },
+    "release-gateway": {
+      "measured_s": 887.143768,
+      "job_id": 160543,
+      "measured_on": "2026-10-13",
+      "note": "Slowest of two successful MR runs (okengine#1048): pipeline 13109 job 160543 (887.1s wall, build 733.3s) and 13105 job 160452 (760.6s, build 612.0s). Hermes clone at the pin, patches, overlay, wheel, docker build on a fresh 28.3.3 dind, no-model boot checks, a 3.12 GB push. Cold per-job daemon; queue excluded."
+    },
+    "release-digests": {
+      "measured_s": 9.634221,
+      "job_id": 159956,
+      "measured_on": "2026-10-12",
+      "note": "Slowest of two MR runs (okengine#1048): pipeline 13085 job 159956 (9.6s) and 13105 job 160453 (8.0s). Tooling verify plus combining two JSON artifacts; queue excluded."
+    }
+  },
+  "unmeasured": {
+    "mutation-mr": {
+      "reason": "new 2026-10-12 (okengine#1046). Its own MR pipeline only exercises the no-target path, which is not a representative runtime. Its timeout is sized from the admission bound instead: an admitted campaign is bounded at MUTATION_MR_BUDGET_SECONDS=1200s, half the 45m timeout. Record the first admitted campaign on a later MR and move it to jobs."
+    },
+    "quality-summary": {
+      "reason": "new 2026-10-12 (okengine#1045): the .post fan-in, an echo after the resource-limit guard. It is skipped whenever a required job fails, so its first green MR pipeline gives the measurement; record that job and move it to jobs."
+    },
+    "runner-audit": {
+      "reason": "new 2026-10-01; runs only on schedule and web pipelines (its token is protected), so it cannot run before merge. Record the first scheduled run and move it to jobs."
+    },
+    "mutation-dispositions": {
+      "reason": "new 2026-10-13 (okengine#1047): the repository-wide survivors.json drift check, moved out of full-suite. Not yet run as its own job; uninstrumented it took 16.5s locally. Record its first MR pipeline run and move it to jobs."
+    },
+    "release-promote": {
+      "reason": "new 2026-10-12 (okengine#1048): runs only in a release version tag pipeline, which cannot run before merge. Record the first release tag run and move it to jobs."
+    },
+    "public-tree-tests": {
+      "reason": "new 2026-10-14 (okengine#1054): the MR-time public-tree slice. Not yet run in CI; locally the broad scope (16 files on main) took 12s of pytest after a ~1s tree build. Record its first MR pipeline run and move it to jobs."
     }
   },
   "make_deadlines": {
@@ -59,10 +314,31 @@
     ],
     "test-security": {
       "variable": "TEST_SECURITY_DEADLINE",
-      "measured_s": 95.46,
-      "job_id": 110365,
-      "measured_on": "2026-09-13",
-      "note": "Slowest of four passing runs (83.2/94.2/94.7/95.5s), pytest's own reported duration for the security layer."
+      "measured_s": 271.81,
+      "job_id": 163359,
+      "measured_on": "2026-10-15",
+      "note": "Slowest of five passing runs on main and MR pipelines 2026-10-14..15 (252.0/253.8/263.3/264.6/271.8s), pytest's own reported duration for the security layer. The layer grew from 95.5s (2026-09-13) to 272s with its test count; at the old 300s deadline it timed out on main 13275 (job 163393)."
+    },
+    "test-contract": {
+      "variable": "TEST_CONTRACT_DEADLINE",
+      "measured_s": 114.13,
+      "job_id": 128511,
+      "measured_on": "2026-09-25",
+      "note": "Slowest of five passing main runs (95.24/100.30/106.52/108.15/114.13s), pytest's own reported duration for the contract layer. Job 128496 was killed at ~90% under the shared 120s (okengine#859)."
+    },
+    "test-integration": {
+      "variable": "TEST_INTEGRATION_DEADLINE",
+      "measured_s": 826.73,
+      "job_id": 152458,
+      "measured_on": "2026-10-08",
+      "note": "Slowest of four clean passes on 2026-10-08 (744.77/762.78/762.88/826.73s, jobs 152177/151651/151938/152458), pytest's own reported duration for the integration layer. Under runner disk-I/O pressure, jobs 152288/152307/152308 were killed at the old 840s cap, and job 152355 ran 885.52s (okengine#1015)."
+    },
+    "test-mutation-critical-preflight": {
+      "variable": "TEST_MUTATION_PREFLIGHT_DEADLINE",
+      "measured_s": 1194.0,
+      "job_id": 154390,
+      "measured_on": "2026-10-10",
+      "note": "LOWER BOUND: the no-map baseline proof (pipeline 12826, the full-suite shard that would have built the map had failed) completed 41 of 47 groups in 1,194s, then the shared 1200s TEST_FULL_DEADLINE killed it during a retried group. Its slowest group took 120s, so six more plus one retry bound the run near 2,034s; the 4200s deadline is 2x that bound. Re-measure on the next no-map night (okengine#1047)."
     }
   }
 }

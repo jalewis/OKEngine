@@ -109,12 +109,15 @@ def test_contradictions_fully_migrated_out_of_engine_fleet():
 
 def test_contradictions_script_is_self_contained():
     """An isolated extension script must not import sibling engine cron libs (it runs
-    from its own /opt/data/scripts/<id>/ dir, not the flat engine scripts dir)."""
+    from its own /opt/data/scripts/<id>/ dir, not the flat engine scripts dir). The one
+    exception is generated_page, reached one level up (/opt/data/scripts/, where
+    deploy-cron-scripts.sh stages it): the dashboard keeps its id through it (okengine#933)."""
     src = (REPO / "extensions" / "okengine.contradictions"
            / "select_contradictions.py").read_text()
     import re
     imports = re.findall(r"^\s*(?:from|import)\s+([a-zA-Z_][\w.]*)", src, re.M)
     allowed = {"__future__", "json", "os", "re", "sys", "collections", "dataclasses",
-               "datetime", "pathlib", "yaml", "typing", "itertools", "math", "functools"}
+               "datetime", "pathlib", "yaml", "typing", "itertools", "math", "functools",
+               "generated_page"}
     foreign = [i for i in imports if i.split(".")[0] not in allowed]
     assert not foreign, f"extension script imports non-stdlib siblings: {foreign}"

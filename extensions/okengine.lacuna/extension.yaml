@@ -60,6 +60,9 @@ config:
   # A field worth analyzing must be dense enough that the geometry is well-sampled — a thin patch
   # makes step 6 extrapolation, not inference. Floor on the cluster's reference count.
   min_density: {type: integer, default: 8}
+  # Namespaces whose links are derived views, not evidence, and never count toward density
+  # (okengine#855). `lacuna` is always excluded; vault-root and INDEX*/_* pages are excluded too.
+  density_exclude_namespaces: {type: string, default: "lacuna,dashboards,operational,briefings"}
   # Don't re-analyze the same field for this many days (rotation across the concept graph).
   reanalyze_days: {type: integer, default: 90}
   # How many of the densest unanalyzed clusters to surface to the agent per run (it produces at
@@ -69,6 +72,11 @@ config:
   # resolve from the vault root. Nominations only reorder otherwise eligible dense fields; they do
   # not bypass min_density, rotation, named-force, confidence, or human-review requirements.
   nominations_path: {type: string, default: ".okengine/lacuna-nominations.json"}
+  # Nominations from okengine.inquiry (okengine#854): an open inquiry's declared `fields`, written
+  # by its dossier lane. Ranked first; may be mapped below min_density down to inquiry_min_density,
+  # with the explicit extrapolation warning. Still need a concept page and respect reanalyze_days.
+  inquiry_nominations_path: {type: string, default: ".okengine/inquiry/lacuna-nominations.json"}
+  inquiry_min_density: {type: integer, default: 3}
   # Ignore old routing hints so a once-material source cannot pin the discovery agenda forever.
   nomination_max_age_days: {type: integer, default: 7}
   # OPERATOR TOPIC OVERRIDE. Empty (default) = autonomous: the densest unanalyzed field, everything

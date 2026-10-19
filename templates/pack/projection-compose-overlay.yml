@@ -26,7 +26,8 @@ services:
     build:
       context: ${ENGINE_DIR:-../engine}
       dockerfile: okengine-projection/Dockerfile
-    image: okengine-projection
+    image: okengine-projection:${OKENGINE_ENGINE_IMAGE_TAG:-unpinned}
+    user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
     restart: unless-stopped
     depends_on:
       postgres: {condition: service_healthy}
@@ -35,6 +36,7 @@ services:
       OKENGINE_PROJECTION_WRITER_DSN: postgresql://okengine:${OKENGINE_PROJECTION_WRITER_PASSWORD}@postgres:5432/okengine
       OKENGINE_PROJECTION_READER_PASSWORD: ${OKENGINE_PROJECTION_READER_PASSWORD}
       OKENGINE_PROJECTION_INTERVAL_SECONDS: ${OKENGINE_PROJECTION_INTERVAL_SECONDS:-3600}
+      OKENGINE_PROJECTION_POLL_SECONDS: ${OKENGINE_PROJECTION_POLL_SECONDS:-15}
       OKENGINE_PROJECTION_MAX_DELETE_PCT: ${OKENGINE_PROJECTION_MAX_DELETE_PCT:-2}
       OKENGINE_PROJECTION_MAX_DELETE_ABS: ${OKENGINE_PROJECTION_MAX_DELETE_ABS:-50}
       TZ: ${TZ:-UTC}

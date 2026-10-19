@@ -900,6 +900,40 @@ def test_a_directory_merely_named_like_the_capture_store_elsewhere_is_still_inge
     assert "2026-01-01-real-article.md" in out
 
 
+def _vault_with_connector_archive(tmp_path):
+    base = tmp_path / "raw" / "connectors" / "news-search"
+    (base / "raw").mkdir(parents=True)
+    (base / "raw" / "0a1b2c.json").write_text(
+        '{"data": {"articles": [{"source_url": "https://a.test/1"},'
+        ' {"source_url": "https://a.test/2"}]}}', encoding="utf-8")
+    rec = base / "records" / "4086a0b3"
+    rec.mkdir(parents=True)
+    (rec / "2026-09-24T08-01-49.json").write_text(
+        '{"connector_id": "news-search", "payload": {"source_url": "https://a.test/1"}}',
+        encoding="utf-8")
+    return tmp_path
+
+
+def test_connector_response_archives_are_never_selected(tmp_path):
+    """THE REGRESSION. `raw/connectors/<id>/raw/<digest>` is a verbatim HTTP response holding a
+    whole search page. Offered as one item it has no single URL: on one live vault 143 runs over
+    10 days produced 9 accepted pages and 71 `source url is required` rejections."""
+    out = _run(_vault_with_connector_archive(tmp_path))
+    assert "news-search/raw/0a1b2c.json" not in out
+    assert "news-search/records/4086a0b3/2026-09-24T08-01-49.json" in out
+
+
+def test_connector_records_whose_path_contains_raw_elsewhere_are_still_selected(tmp_path):
+    """NEGATIVE: only a `raw` segment INSIDE a connector's archive is storage. The leading
+    `raw/` of every path, and a connector literally named `raw`, are not."""
+    rec = tmp_path / "raw" / "connectors" / "raw" / "records" / "x"
+    rec.mkdir(parents=True)
+    (rec / "2026-09-24.json").write_text('{"payload": {"url": "https://a.test/r"}}',
+                                         encoding="utf-8")
+    out = _run(tmp_path)
+    assert "connectors/raw/records/x/2026-09-24.json" in out
+
+
 def test_a_vault_that_is_only_capture_store_selects_nothing_and_says_so(tmp_path):
     (tmp_path / "raw" / "captures" / "objects" / "ab").mkdir(parents=True)
     (tmp_path / "raw" / "captures" / "objects" / "ab" / "blob.html").write_text(
@@ -1011,3 +1045,17 @@ def test_collapsed_revision_siblings_are_reported(tmp_path, capsys):
     assert _main_direct(module) == 0
     out = capsys.readouterr().out
     assert "Revision siblings collapsed to newest:** 1" in out
+
+
+def test_raw_backfill_is_never_told_to_use_a_tool_it_lacks_and_has_room_to_retry(tmp_path):
+    """REGRESSION (okengine#886): the digest told the model to dedupe via update_entity — a tool
+    the raw-backfill actor is never granted — which sent it searching (50 of 57 live runs spent a
+    turn on read tools), and 4 iterations left no room for a retry after a rejection. The reader
+    toolset itself stays: every contracted lane needs it (test_cron_toolset_policy)."""
+    jobs = json.loads((REPO / "config" / "engine-crons.json").read_text())
+    job = next(j for j in jobs if j["name"] == "raw-backfill")
+    assert job["max_iterations"] >= 6
+    (tmp_path / "raw" / "ai").mkdir(parents=True)
+    (tmp_path / "raw" / "ai" / "2026-01-01-a.md").write_text("---\ntitle: A\n---\nbody\n")
+    out = _run(tmp_path)
+    assert "update_entity" not in out and "Do not look for duplicates" in out

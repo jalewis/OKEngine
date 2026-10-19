@@ -7,6 +7,7 @@ import sys
 import types
 from datetime import date, datetime
 from pathlib import Path
+from unittest.mock import create_autospec
 
 import pytest
 
@@ -190,29 +191,15 @@ def test_scan_accounts_for_md_directory_read_and_stat_failures(tmp_path, monkeyp
     def stat(path, *args, **kwargs):
         nonlocal stat_calls
         if path == statless:
-            # Fail EVERY Path.stat for this file; the is_file() gate is satisfied separately
-            # below. The original fixture failed only the SECOND call, which assumed is_file()
-            # routes through Path.stat -- true up to CPython 3.13, FALSE in 3.14, where is_file()
-            # makes zero Path.stat calls. The single mtime stat then succeeded and the assertion
-            # ran against a real timestamp. A fixture that depends on how many times the
-            # interpreter internally calls stat is testing the interpreter, not scan_vault.
+            # scan_vault explicitly stats the file type first, then its mtime.
+            # Fail only the latter; no dependency on interpreter is_file internals.
             stat_calls += 1
-            raise OSError("fixture")
+            if stat_calls > 1:
+                raise OSError("fixture")
         return original_stat(path, *args, **kwargs)
-
-    original_is_file = Path.is_file
-
-    def is_file(path, *args, **kwargs):
-        # `statless` IS a real file; only its stat is broken. Without this, failing every stat
-        # makes is_file() report False, the page is skipped entirely, and the test would pass for
-        # the wrong reason -- never exercising the mtime fallback it exists to check.
-        if path == statless:
-            return True
-        return original_is_file(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_bytes", read)
     monkeypatch.setattr(Path, "stat", stat)
-    monkeypatch.setattr(Path, "is_file", is_file)
     scan = P.scan_vault(root)
     assert scan.skipped_dirs == ["entities/folder.md"]
     assert scan.unreadable == ["entities/unreadable.md: PermissionError"]
@@ -513,6 +500,51 @@ def test_journal_delta_empty_and_unreadable_paths(tmp_path):
     assert P.journal_delta(tmp_path, 1) is None
 
 
+def _restored_vault(tmp_path: Path, epoch: int) -> Path:
+    """A vault restored from a backup taken at `epoch`: its epoch file and journal stop there."""
+    state = tmp_path / ".okengine/corpus"
+    state.mkdir(parents=True)
+    (state / "epoch").write_text(f"{epoch}\n")
+    (state / "journal.jsonl").write_text("".join(
+        json.dumps({"epoch": n, "affected_paths": [{"path": f"wiki/entities/p{n}.md"}]}) + "\n"
+        for n in range(1, epoch + 1)))
+    return tmp_path
+
+
+def test_journal_delta_refuses_a_corpus_epoch_that_went_backwards_after_a_restore(tmp_path):
+    """okengine#1032: the projection checkpoint is at 10, the vault was restored to 5. The empty
+    contiguity range for 11..5 used to pass and return (5, set()) -- keep every pre-restore row."""
+    vault_path = _restored_vault(tmp_path, 5)
+    assert P.journal_delta(vault_path, 10) is None, (
+        "an epoch regression must force a full reconcile, not an empty incremental delta")
+    assert P.journal_delta(vault_path, 4) == (5, {"wiki/entities/p5.md"})
+
+
+def test_project_reconciles_a_restored_vault_instead_of_keeping_pre_restore_rows(
+    tmp_path, monkeypatch
+):
+    class Conn:
+        def transaction(self): return Tx()
+        async def execute(self, _sql): pass
+        async def fetchval(self, _sql):
+            return 10                     # last successful projection, before the restore
+
+    async def state(_conn):
+        return {"entities/after-backup.md": {"path": "entities/after-backup.md", "fm": {}}}, {}
+
+    async def capture(_conn, scan, **kwargs):
+        return {"paths": [row["path"] for row in scan.pages], **kwargs}
+
+    restored = P.Scan([{"path": "entities/p1.md"}], {}, [], [])
+    monkeypatch.setattr(P, "load_projection_state", state)
+    monkeypatch.setattr(P, "scan_vault", lambda *_args, **_kwargs: restored)
+    monkeypatch.setattr(P, "scan_changed", lambda *_args: P.Scan([], {}, [], []))
+    monkeypatch.setattr(P, "run_epoch", capture)
+    result = asyncio.run(P.project(Conn(), _restored_vault(tmp_path, 5)))
+    assert result == {"paths": ["entities/p1.md"], "source_epoch": 5}, (
+        f"a restored vault must be reconciled from disk, not projected incrementally: {result}")
+
+
 def test_scan_changed_parses_only_live_journal_pages(tmp_path):
     (tmp_path / "wiki/entities").mkdir(parents=True)
     (tmp_path / "schema.yaml").write_text(
@@ -536,6 +568,8 @@ def test_scan_changed_counts_excluded_live_pages(tmp_path):
 
 def test_project_incremental_reuses_database_rows_and_parses_only_delta(tmp_path, monkeypatch):
     class Conn:
+        def transaction(self): return Tx()
+        async def execute(self, _sql): pass
         async def fetchval(self, _sql):
             return 4
 
@@ -569,6 +603,8 @@ def test_project_incremental_reuses_database_rows_and_parses_only_delta(tmp_path
 
 def test_project_incremental_skips_replaced_rows_and_decodes_stored_fm(tmp_path, monkeypatch):
     class Conn:
+        def transaction(self): return Tx()
+        async def execute(self, _sql): pass
         async def fetchval(self, _sql):
             return 4
 
@@ -599,6 +635,8 @@ def test_project_reconciles_when_checkpoint_or_journal_is_unusable(
     tmp_path, monkeypatch, checkpoint, delta
 ):
     class Conn:
+        def transaction(self): return Tx()
+        async def execute(self, _sql): pass
         async def fetchval(self, _sql):
             return checkpoint
 
@@ -620,6 +658,8 @@ def test_project_force_reconcile_bypasses_a_usable_incremental_checkpoint(
     tmp_path, monkeypatch
 ):
     class Conn:
+        def transaction(self): return Tx()
+        async def execute(self, _sql): pass
         async def fetchval(self, _sql):
             raise AssertionError("forced reconciliation must not read the checkpoint")
 
@@ -639,6 +679,8 @@ def test_project_force_reconcile_bypasses_a_usable_incremental_checkpoint(
 
 def test_project_reconciliation_refuses_moving_or_active_corpus(tmp_path, monkeypatch):
     class Conn:
+        def transaction(self): return Tx()
+        async def execute(self, _sql): pass
         async def fetchval(self, _sql):
             return None
 
@@ -655,6 +697,8 @@ def test_project_reconciliation_refuses_moving_or_active_corpus(tmp_path, monkey
 
 def test_project_reconciliation_retries_an_active_corpus(tmp_path, monkeypatch):
     class Conn:
+        def transaction(self): return Tx()
+        async def execute(self, _sql): pass
         async def fetchval(self, _sql):
             return None
 
@@ -690,3 +734,215 @@ def test_project_reconciliation_retries_an_active_corpus(tmp_path, monkeypatch):
     monkeypatch.setattr(P, "corpus_epoch", epoch)
     result = asyncio.run(P.project(Conn(), tmp_path))
     assert result["source_epoch"] == 2 and scans == 1
+
+
+# ── paginated directory indexes are structure, not content ──────────────────
+#
+# build_index_tree writes INDEX-pNN.md beside INDEX.md. Only INDEX.md was reserved, so page-2+
+# indexes were projected as content; their writer does not journal, so the incremental projector
+# never re-read them and every sampled one reported "digest drift" hours after the nightly rebuild
+# (84 rows on one live vault).
+
+@pytest.mark.parametrize("name,structural", [
+    ("INDEX.md", True), ("INDEX-p02.md", True), ("index-p10.md", True), ("INDEX-p123.md", True),
+    ("HOT.md", True),
+    ("INDEX-page.md", False), ("myINDEX-p02.md", False), ("notes-p02.md", False),
+    ("INDEX-p.md", False), ("entity.md", False),
+])
+def test_structural_names_cover_paged_indexes_and_nothing_else(name, structural):
+    assert P._structural(name) is structural
+
+
+def test_full_scan_excludes_paged_indexes(tmp_path):
+    root = vault(tmp_path)
+    (root / "wiki/entities/a.md").write_text("---\nid: a\n---\n")
+    (root / "wiki/entities/INDEX-p02.md").write_text("derived page 2")
+    scan = P.scan_vault(root)
+    assert [row["path"] for row in scan.pages] == ["entities/a.md"]
+    assert scan.excluded == 1
+
+
+def test_incremental_scan_excludes_paged_indexes(tmp_path):
+    root = vault(tmp_path)
+    (root / "wiki/entities/INDEX-p03.md").write_text("derived page 3")
+    scan = P.scan_changed(root, {"wiki/entities/INDEX-p03.md"})
+    assert scan.pages == [] and scan.excluded == 1
+
+
+def test_incremental_pass_drops_a_paged_index_projected_before_the_fix(tmp_path, monkeypatch):
+    """Rows already in the database are carried forward by the incremental pass; a stale paged
+    index row must be dropped there, or the drift outlives the fix until a full reconcile."""
+    class Conn:
+        def transaction(self): return Tx()
+        async def execute(self, _sql): pass
+        async def fetchval(self, _sql):
+            return 4
+
+    # The paged index comes FIRST so a `continue` that became `break` would also lose keep.md.
+    prior = {
+        "entities/c/v/INDEX-p45.md": {"path": "entities/c/v/INDEX-p45.md", "fm": {}},
+        "entities/keep.md": {"path": "entities/keep.md", "fm": {}},
+    }
+
+    async def state(_conn):
+        return prior, {}
+
+    async def capture(_conn, scan, **kwargs):
+        return {"paths": [row["path"] for row in scan.pages], **kwargs}
+
+    monkeypatch.setattr(P, "corpus_epoch", lambda _vault: 5)
+    monkeypatch.setattr(P, "journal_delta", lambda *_args: (5, set()))
+    monkeypatch.setattr(P, "load_projection_state", state)
+    monkeypatch.setattr(P, "scan_changed", lambda *_args: P.Scan([], {}, [], []))
+    monkeypatch.setattr(P, "run_epoch", capture)
+    assert asyncio.run(P.project(Conn(), tmp_path))["paths"] == ["entities/keep.md"]
+
+
+def test_a_surrogate_pair_in_frontmatter_is_projected_as_its_character():
+    """okengine#894: a JSON surrogate-pair escape in YAML decodes as two halves; the projection
+    stores the one character they encode, and it is not an error."""
+    row, _ = P.parse_page("sources/a.md",
+                          b'---\ntitle: "Providers \\ud83d\\udd25"\naliases: ["F \\ud83d\\ude00"]\n'
+                          b'version: 3\npublished: 2026-08-06\n---\n')
+    assert row["title"] == "Providers \U0001F525"
+    assert row["aliases"] == ["F \U0001F600"]
+    assert row["fm_error"] is None, "numbers and dates are not text and never flag a page"
+
+
+def test_an_unpaired_surrogate_early_in_frontmatter_still_flags_the_page():
+    """Every later field is clean; the flag from the first one must survive them."""
+    row, _ = P.parse_page("sources/d.md", b'---\ntitle: "Lone \\ud83d"\ntype: source\nversion: 2\n---\n')
+    assert "unpaired UTF-16 surrogate" in row["fm_error"]
+
+
+def test_an_unpaired_surrogate_is_replaced_and_reported_never_dropped():
+    """okengine#894: one unpaired half made asyncpg refuse the row and aborted the whole rebuild
+    (4,483 of 8,382 pages unprojected). The page is projected with U+FFFD and flagged instead."""
+    raw = b'---\ntitle: "Lone \\ud83d"\ntags: ["\\udd25"]\n"k\\udd25": {"n": ["\\ud83d"]}\n---\n# x\n'
+    row, _ = P.parse_page("sources/b.md", raw)
+    assert row["title"] == "Lone \ufffd"
+    assert "unpaired UTF-16 surrogate" in row["fm_error"]
+    fm = json.loads(row["fm"])
+    assert fm == {"title": "Lone \ufffd", "tags": ["\ufffd"], "k\ufffd": {"n": ["\ufffd"]}}
+    for value in (row["title"], row["fm"]):
+        value.encode("utf-8")
+
+
+def test_unreadable_scan_cannot_delete_pages_or_publish_a_successful_epoch():
+    scan = P.Scan([], {}, [], ["entities/private.md: PermissionError"])
+    conn = FakeConn([known_row("entities/private.md", "digest", "private")])
+    with pytest.raises(RuntimeError, match="population is incomplete"):
+        asyncio.run(P.run_epoch(conn, scan))
+    assert conn.executed == [] and conn.link_rows == []
+    with pytest.raises(RuntimeError, match="unreadable"):
+        asyncio.run(P.run_epoch(conn, scan, dry_run=True))
+
+
+@pytest.mark.parametrize("blocked,expected", [("wiki", [".: PermissionError"]),
+    ("wiki/entities", ["entities: PermissionError"]), ("wiki/operational", []),
+    ("wiki/-excluded", [])])
+def test_walk_errors_preserve_unknown_population_but_respect_excluded_namespaces(
+        tmp_path, monkeypatch, blocked, expected):
+    import os
+    root = vault(tmp_path)
+    (root / "wiki/operational").mkdir()
+    (root / "wiki/-excluded").mkdir()
+    original = os.scandir
+    def scandir(path):
+        if Path(path) == root / blocked:
+            raise PermissionError(13, "fixture directory is unreadable", str(path))
+        return original(path)
+    monkeypatch.setattr(os, "scandir", scandir)
+    scan = P.scan_vault(root)
+    assert scan.unreadable == expected
+    if expected:
+        with pytest.raises(RuntimeError, match="population is incomplete"):
+            P.require_readable_scan(scan)
+
+
+@pytest.mark.parametrize("boundary", ["stat", "read_bytes"])
+def test_incremental_unknown_path_cannot_become_deletion(tmp_path, monkeypatch, boundary):
+    root = vault(tmp_path)
+    private = root / "wiki/entities/private.md"
+    private.write_text("---\nid: private\n---\n")
+    original = getattr(Path, boundary)
+
+    def inaccessible(path, *args, **kwargs):
+        if path == private:
+            raise PermissionError("owner-only fixture")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, boundary, inaccessible)
+    scan = P.scan_changed(root, {"wiki/entities/private.md"})
+    assert scan.unreadable == ["wiki/entities/private.md: PermissionError"]
+    conn = FakeConn([known_row("entities/private.md", "digest", "private")])
+    with pytest.raises(RuntimeError, match="population is incomplete"):
+        asyncio.run(P.run_epoch(conn, scan))
+    assert conn.executed == []
+
+
+def test_incremental_non_file_path_is_not_parsed(tmp_path):
+    root = vault(tmp_path)
+    (root / "wiki/entities/folder.md").mkdir()
+    scan = P.scan_changed(root, {"wiki/entities/folder.md"})
+    assert scan.pages == [] and scan.unreadable == []
+
+
+def test_incremental_non_file_does_not_hide_a_later_changed_page(tmp_path):
+    root = vault(tmp_path)
+    (root / "wiki/entities/a-folder.md").mkdir()
+    (root / "wiki/entities/z-page.md").write_text("---\nid: later\n---\n")
+    scan = P.scan_changed(root, {"wiki/entities/a-folder.md", "wiki/entities/z-page.md"})
+    assert [row["path"] for row in scan.pages] == ["entities/z-page.md"]
+    assert scan.unreadable == []
+
+
+def test_unreadable_full_scan_preserves_later_readable_population(tmp_path, monkeypatch):
+    root = vault(tmp_path)
+    blocked = root / "wiki/entities/a-private.md"
+    blocked.write_text("---\nid: private\n---\n")
+    (root / "wiki/entities/z-page.md").write_text("---\nid: later\n---\n")
+    real_stat = Path.stat
+
+    def inaccessible(path, *args, **kwargs):
+        if path == blocked:
+            raise PermissionError("unknown file type")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", create_autospec(Path.stat, side_effect=inaccessible))
+    scan = P.scan_vault(root)
+    assert scan.unreadable == ["entities/a-private.md: PermissionError"]
+    assert [row["path"] for row in scan.pages] == ["entities/z-page.md"]
+    with pytest.raises(RuntimeError, match="population is incomplete"):
+        P.require_readable_scan(scan)
+
+
+def test_incomplete_population_diagnostic_retains_total_and_three_examples():
+    unreadable = [f"entities/private-{i}.md: PermissionError" for i in range(5)]
+    scan = P.Scan([], {}, [], unreadable)
+    with pytest.raises(RuntimeError) as failure:
+        P.require_readable_scan(scan)
+    message = str(failure.value)
+    assert "5 unreadable path(s)" in message
+    assert all(path in message for path in unreadable[:3])
+    assert all(path not in message for path in unreadable[3:])
+    assert scan.unreadable == unreadable, "the complete evidence must survive diagnostic truncation"
+
+
+def test_full_scan_records_inaccessible_type_stat_instead_of_skipping(tmp_path, monkeypatch):
+    root = vault(tmp_path)
+    private = root / "wiki/entities/private.md"
+    private.write_text("---\nid: private\n---\n")
+    original = Path.stat
+
+    def inaccessible(path, *args, **kwargs):
+        if path == private:
+            raise PermissionError("unknown file type")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", inaccessible)
+    scan = P.scan_vault(root)
+    assert scan.unreadable == ["entities/private.md: PermissionError"]
+    assert scan.skipped_dirs == []
+    with pytest.raises(RuntimeError, match="population is incomplete"):
+        P.require_readable_scan(scan)

@@ -89,6 +89,16 @@ def test_cron_mode_writes_dashboard_from_wiki_path(tmp_path, monkeypatch):
     assert cl.main([]) == 0 and cl.main(["--wiki", str(tmp_path / "wiki"), "--max-offenders", "0"]) == 1
 
 
+def test_written_dashboard_carries_the_given_timestamp_and_an_id(tmp_path, monkeypatch):
+    """--now stamps the report, and the page keeps a stable id across rewrites (okengine#933)."""
+    (tmp_path / "wiki" / "concepts").mkdir(parents=True)
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    assert cl.main(["--now", "2026-01-02T03:04:05Z"]) == 0
+    out = (tmp_path / "wiki" / "operational" / "content-lint.md").read_text(encoding="utf-8")
+    assert "updated: 2026-01-02T03:04:05Z" in out
+    assert out.splitlines()[1] == 'id: "operational:content-lint"'
+
+
 def test_scan_vault_and_report(tmp_path):
     wiki = tmp_path / "wiki" / "concepts" / "v"
     wiki.mkdir(parents=True)

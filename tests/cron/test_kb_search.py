@@ -117,3 +117,23 @@ def test_main_success_raw_filter_and_errors(monkeypatch, capsys):
     )
     assert module.main(["needle"]) == 2
     assert capsys.readouterr().err == "qmd failed\n"
+
+
+def test_hot_tier_search_drops_a_just_tombstoned_hit(tmp_path, monkeypatch):
+    """okengine#991 audit 2 [10]: `--tier hot` resurfaced a retired page because its tombstone
+    stamp made it look recent. Uses the real tier_lib against real pages."""
+    module = _load("kb_search_tier_tombstone")
+    wiki = tmp_path / "wiki"
+    (wiki / "entities/a").mkdir(parents=True)
+    (wiki / "entities/a/live.md").write_text("---\ntype: actor\nlast_updated: 2026-08-03\n---\n")
+    (wiki / "entities/a/gone.md").write_text(
+        "---\ntype: actor\nstatus: tombstoned\nlast_updated: 2026-08-03\n---\n")
+    monkeypatch.setattr(module, "_WIKI", wiki)
+    monkeypatch.setattr(module.tz_lib, "deployment_today", lambda: date(2026, 8, 3))
+    monkeypatch.setattr(module.tier_lib, "load_cfg",
+                        lambda vault, namespace="": module.tier_lib._DEFAULT_TIER)
+    output = "qmd://wiki/entities/a/live.md:1\nlive\nqmd://wiki/entities/a/gone.md:1\ngone\n"
+    filtered, dropped = module._filter_by_tier(output, {"hot"})
+    assert "live.md" in filtered and "gone.md" not in filtered and dropped == 1
+    filtered, dropped = module._filter_by_tier(output, {"cold"})
+    assert "gone.md" in filtered and "live.md" not in filtered

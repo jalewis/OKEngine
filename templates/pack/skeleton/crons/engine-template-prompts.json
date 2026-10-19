@@ -11,15 +11,6 @@
   "page-quality-enrich": {
     "prompt_file": "prompts/page-quality-enrich.md"
   },
-  "prediction-candidate-watch": {
-    "prompt_file": "prompts/prediction-candidate-watch.md"
-  },
-  "prediction-grade": {
-    "prompt_file": "prompts/prediction-grade.md"
-  },
-  "prediction-regrade": {
-    "prompt_file": "prompts/prediction-regrade.md"
-  },
   "raw-backfill": {
     "output_contract": {
       "allowed_namespaces": [
@@ -57,9 +48,6 @@
   },
   "source-quality-backfill": {
     "prompt_file": "prompts/source-quality-backfill.md"
-  },
-  "source-staleness-refresh": {
-    "prompt_file": "prompts/source-staleness-refresh.md"
   },
   "trends-refresh": {
     "prompt_file": "prompts/trends-refresh.md"

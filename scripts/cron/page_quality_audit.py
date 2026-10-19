@@ -48,6 +48,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import schema_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
@@ -286,7 +287,7 @@ def main() -> int:
         L.append(f"| {inb} | [[{sub}/{stem}]] | {tier} | {w} | {sec} | {ns} |")
     L.append("")
     DASH.parent.mkdir(parents=True, exist_ok=True)
-    DASH.write_text("\n".join(L) + "\n")
+    generated_page.write(DASH, "\n".join(L) + "\n")
 
     # machine-readable enrich queue for a future enrichment drain. Ensure operational/ exists FIRST
     # — this write and the snapshot below both land there, and a bare vault (no prior operational
@@ -303,7 +304,7 @@ def main() -> int:
               "| date | deficient | empty | ent-stub% | ent-thin% | con-stub% | con-thin% |\n"
               "|---|---|---|---|---|---|---|\n")
     if not SNAP.exists():
-        SNAP.write_text(header)
+        generated_page.write(SNAP, header)
     row = (f"| {today.isoformat()} | {n_def} | {n_empty} "
            f"| {pct('entities','stub'):.0f} | {pct('entities','thin'):.0f} "
            f"| {pct('concepts','stub'):.0f} | {pct('concepts','thin'):.0f} |")

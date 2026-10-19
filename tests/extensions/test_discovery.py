@@ -66,6 +66,23 @@ def test_three_roots_discovered(tmp_path):
                      "demo.charlie": "operator"}
 
 
+def test_trailing_newline_id_cannot_shadow_an_existing_id(tmp_path):
+    """okengine#991: an id carrying a trailing newline (YAML `id: |` block scalar) used to pass the
+    `$`-anchored ID_RE, get keyed as the distinct string 'demo.dup\\n', and so dodge the cross-tier
+    duplicate rule. It must be rejected as an invalid id and never discovered."""
+    m = _mod()
+    engine, pack = _roots(tmp_path)
+    _write_ext(pack / "extensions", "demo.dup")
+    shadow = _write_ext(pack / ".okengine" / "extensions", "demo.dup")
+    (shadow / "extension.yaml").write_text(
+        (shadow / "extension.yaml").read_text(encoding="utf-8").replace(
+            "id: demo.dup", "id: |\n  demo.dup"), encoding="utf-8")
+
+    exts, errors = m.discover(pack, engine_root=engine)
+    assert [e["id"] for e in exts] == ["demo.dup"]
+    assert any(str(shadow) in e and "id" in e for e in errors), errors
+
+
 def test_duplicate_id_across_tiers_rejected(tmp_path):
     """The load-bearing rule: same id in two tiers is a hard FAIL (no shadowing)."""
     m = _mod()
@@ -174,7 +191,7 @@ def test_disabled_without_yaml_and_scalar_config_declarations(tmp_path, monkeypa
     record = {"id": "demo.config", "tier": "pack", "manifest": {
         "id": "demo.config", "config": {"scalar": "default", "object": {"default": 1}},
     }}
-    monkeypatch.setattr(m, "discover", lambda _pack: ([record], []))
+    monkeypatch.setattr(m, "discover", lambda _pack, **_kw: ([record], []))
     monkeypatch.setattr(m, "load_enabled_state", lambda _pack: ({
         "demo.config": {"config": {"scalar": "override"}}
     }, []))

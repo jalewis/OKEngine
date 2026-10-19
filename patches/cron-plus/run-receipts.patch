@@ -110,7 +110,7 @@ index ff929e5..94aed93 100644
          except Exception as e:
              logger.error("agent invocation crashed: %s", e, exc_info=True)
              jobs_mod.mark_job_run(args.job_id, success=False, error=str(e))
-@@ -202,6 +287,25 @@ def main() -> int:
+@@ -202,6 +287,27 @@ def main() -> int:
          local_path = _save_local_output(job, output_doc)
          logger.info("output saved to %s", local_path)
  
@@ -124,6 +124,8 @@ index ff929e5..94aed93 100644
 +            verified_writes = run_receipts.verify_run_completion(
 +                job, started_at,
 +                Path(os.environ.get("WIKI_PATH") or "/opt/vault") / "wiki",
++                gate_skipped=(response.strip() == "[SILENT]"
++                              and not _selected_this_run(job, started_at)),
 +            )
 +            if verified_writes:
 +                job["_okengine_executed_writes"] = verified_writes

@@ -210,6 +210,9 @@ def test_accepted_prediction_can_be_linked_after_the_lacuna_write(vault, monkeyp
 
 
 def test_historical_dangling_lacuna_candidate_can_be_cleared(vault, monkeypatch):
+    """okengine#1028: removing a declared relationship whose target resolves to nothing is repair,
+    not an identity change, so the lane clears it without a grant. The free-text `fill_trigger`
+    beside it is a curated field: its removal is held for review."""
     m, root = vault
     _enable_lacuna_contract(root, monkeypatch)
     path = "lacuna/agentic-ai-standard-of-care"
@@ -230,8 +233,25 @@ def test_historical_dangling_lacuna_candidate_can_be_cleared(vault, monkeypatch)
     monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "enforce")
     repaired = m._update(path, {"prediction_candidate": None, "fill_trigger": None})
     assert repaired.startswith("updated"), repaired
-    assert "predictions/agentic-ai-standard-of-care" not in target.read_text(encoding="utf-8")
+    text = target.read_text(encoding="utf-8")
+    assert "predictions/agentic-ai-standard-of-care" not in text
+    assert "fill_trigger: an externally observable control milestone" in text
     assert not (root / "wiki/predictions/agentic-ai-standard-of-care.md").exists()
+
+
+def test_a_resolving_relationship_is_not_removed_as_dangling(vault, monkeypatch):
+    m, root = vault
+    _enable_lacuna_contract(root, monkeypatch)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    target_page = root / "wiki" / "predictions" / "real.md"
+    target_page.parent.mkdir(parents=True, exist_ok=True)
+    target_page.write_text("---\ntype: prediction\n---\nbody\n", encoding="utf-8")
+    path = "lacuna/agentic-ai-standard-of-care"
+    assert m._create(path, _lacuna_frontmatter(), _lacuna_body()).startswith("created")
+    assert m._update(path, {"prediction_candidate": "predictions/real"}).startswith("updated")
+    assert m._update(path, {"prediction_candidate": None}).startswith("updated")
+    assert "prediction_candidate: predictions/real" in (
+        root / "wiki" / f"{path}.md").read_text(encoding="utf-8")
 
 
 def test_server_resolved_output_contract_supplies_job_write_capability(vault, monkeypatch):
@@ -539,7 +559,8 @@ def test_entity_path_designation_conflict_is_flagged_for_quarantine(vault):
     """The Gentlemen regression: Storm-2698 in the path vs Storm-2697 in aliases."""
     m, root = vault
     res = m._create("entities/gentlemen-ransomware-group-storm-2698",
-                    "type: actor\nname: The Gentlemen\naliases: [Storm-2697]",
+                    "type: actor\nname: The Gentlemen\naliases: [Storm-2697]\n"
+                    f"sources: [{_cite(m, 'The Gentlemen')}]",
                     "A substantive profile body with enough detail for review.")
     assert res.startswith("created") and "flagged for review" in res
     page = next((root / "wiki" / "entities").rglob("gentlemen-ransomware-group-storm-2698.md"))
@@ -549,7 +570,8 @@ def test_entity_path_designation_conflict_is_flagged_for_quarantine(vault):
 
 def test_matching_entity_designation_is_not_flagged(vault):
     m, root = vault
-    res = m._create("entities/storm-2697", "type: actor\nname: Storm-2697\naliases: [The Gentlemen]",
+    res = m._create("entities/storm-2697", "type: actor\nname: Storm-2697\naliases: [The Gentlemen]\n"
+                    f"sources: [{_cite(m, 'Storm-2697')}]",
                     "A substantive profile body with enough detail for review.")
     assert res.startswith("created") and "flagged for review" not in res
     page = next((root / "wiki" / "entities").rglob("storm-2697.md"))
@@ -626,6 +648,66 @@ def test_write_refusal_covers_validator_conformance_exemption(vault):
         assert not write_refused(bn), f"{bn} is a normal page and must remain writable"
 
 
+def test_write_refusal_is_exactly_the_validator_exemption(vault):
+    """okengine#997 B2: ONE predicate for both boundaries. Refused-but-not-exempt is as broken as
+    the converse: the write path used to refuse every lowercase `index-*`, so a valid page such as
+    `index-sickness-pang-principle` (live on a vault) could never be maintained. The read side
+    hides every `index-*`, so the shared predicate reserves them all and the repair renames it."""
+    m, _root = vault
+    sys.path.insert(0, str(REPO))
+    from tools import schema_validator as sv
+
+    battery = ["HEALTH.md", "health.md", "Index.md", "INDEX.md", "INDEX-p02.md", "index-p02.md",
+               "Index-P7.md", "INDEX-glossary.md", "_review-queue.md", ".net-x.md", "README.md",
+               "index-funds.md", "index-sickness-pang-principle.md", "index-pricing.md",
+               "index-p.md", "index-p1x.md", "Index-glossary.md", "healthcare.md", "dotnet-x.md",
+               "health-publisher.md", "page-index.md", "index-page.md"]
+    for bn in battery:
+        exempt = sv.is_reserved_basename(bn) or sv._is_generated_structural(bn)
+        refused = m._reserved_refuse(Path("wiki") / bn) is not None
+        assert exempt == refused, f"{bn}: validator-exempt={exempt} but write-refused={refused}"
+    # every `index-*` is refused AND exempt: the read side hides them all (QA round 2)
+    for bn in ("index-funds.md", "index-sickness-pang-principle.md", "Index-pricing.md"):
+        assert m._reserved_refuse(Path("wiki") / bn) is not None, bn
+    for bn in ("indexing.md", "reindex-funds.md", "concept-index.md"):
+        assert m._reserved_refuse(Path("wiki") / bn) is None, bn
+
+
+def test_every_minting_stand_in_is_writable(vault):
+    """okengine#997 B2: the guard's stand-ins must be names the write path ACCEPTS, or the guard
+    only moves the page from one unmaintainable name to another."""
+    m, root = vault
+    spec = importlib.util.spec_from_file_location(
+        "okf_migrate_997", REPO / "scripts" / "cron" / "okf_migrate.py")
+    okf_migrate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(okf_migrate)       # this checkout's copy, never an installed one
+    sv = okf_migrate._reserved_contract()
+
+    slugs = [n[:-3] for n in sv._OKF_RESERVED_DEFAULT] + [
+        "HEALTH", "Index", ".net-x", "..x", "_scratch", "INDEX-glossary", "index-p01", "Index-P7",
+        "index-funds", "index-sickness-pang-principle"]
+    for slug in slugs:
+        for fm in ({"type": "concept"}, {"type": "publisher"}, {}, {"type": "Threat Note"}):
+            stand_in = okf_migrate.mintable_slug(root, "concepts", slug, fm)
+            assert stand_in != slug, slug
+            assert m._reserved_refuse(Path("wiki") / f"{stand_in}.md") is None, (slug, stand_in)
+
+
+
+def test_model_create_of_a_reserved_or_dot_basename_is_refused_at_any_depth(vault):
+    """okengine#997, model half: the two live offenders' shapes — a reserved name deep in a shard and
+    a dot-leading concept — can never be created through the enforced write path, whatever the
+    case. (The no_agent half is okf_migrate.write_key's minting guard.)"""
+    m, root = vault
+    for rel in ("entities/h/e/health", "entities/h/e/Health", "concepts/_/.net-framework-code-injection",
+                "concepts/i/n/INDEX", "notes/deep/er/still/readme"):
+        out = m._create(rel, {"type": "concept", "name": "X"}, "# X\n")
+        assert out.startswith("refused:"), (rel, out)
+        assert not list((root / "wiki").rglob(rel.rsplit("/", 1)[-1] + ".md")), rel
+    # the near misses stay writable
+    assert not m._create("concepts/h/healthcare", {"type": "concept", "name": "Healthcare"},
+                         "# Healthcare\n").startswith("refused:")
+
 # ── tombstone invariant: no lane may resurrect a tombstoned page ─────────────────────────────────
 
 def test_tombstoned_page_not_resurrected_by_update_patch_append(vault):
@@ -636,7 +718,10 @@ def test_tombstoned_page_not_resurrected_by_update_patch_append(vault):
     m, root = vault
     rel = "entities/g/ghost"                        # canonical shard form (create/tombstone/update all agree)
     m._create(rel, {"type": "entity", "name": "Ghost"}, "# Ghost\n\nBody line.\n")
-    assert m._tombstone(rel, "merged into successor").startswith("tombstoned")
+    # a duplicate names its live canonical (okengine#101)
+    m._create("entities/g/ghost-canonical", {"type": "entity", "name": "Ghost Canonical"}, "# G\n")
+    assert m._tombstone(rel, "merged into successor",
+                        superseded_by="entities/g/ghost-canonical").startswith("tombstoned")
     page = root / "wiki" / "entities" / "g" / "ghost.md"
     before = page.read_text(encoding="utf-8")
     assert m._update(rel, {"type": "entity", "name": "Ghost", "status": "active"}, None).startswith("refused")
@@ -984,6 +1069,8 @@ def test_update_malformed_existing_frontmatter_refused(vault):
 def test_tombstone_retains_file(vault):
     m, root = vault
     m._create("entities/vendor/acme", "type: entity\nname: Acme", "body")
+    # the successor must exist (okengine#101: a tombstone retires a page ONTO a live canonical)
+    m._create("entities/vendor/acme-inc", "type: entity\nname: Acme Inc", "body")
     res = m._tombstone("entities/vendor/acme", "merged into acme-inc",
                        superseded_by="entities/vendor/acme-inc")
     assert res.startswith("tombstoned"), res
@@ -1540,7 +1627,11 @@ def test_separator_hit_with_same_url_converges_legacy_source_id(vault, monkeypat
     )
     assert result.startswith("converged"), result
     assert not (root / "wiki" / "sources" / "2026" / "06" / "agenttesla.md").exists()
-    assert "new observation" in canonical.read_text()
+    # A create redirected onto an existing source page is additive (#962), except that the FULLER
+    # capture's body wins (user decision): "new observation" is longer than "legacy body". The
+    # existing title is kept.
+    text = canonical.read_text()
+    assert "new observation" in text and "title: Legacy title" in text
 
 
 @pytest.mark.parametrize("existing_url,incoming_url", [
@@ -2298,6 +2389,46 @@ def test_pack_declared_list_field_is_coerced(vault):
     assert out["refs"] == ["a", "b", "c"], "a pack-declared list field must be coerced from a scalar"
 
 
+def test_list_field_scalars_split_by_the_fields_declared_shape(vault):
+    """okengine#1005, through the real write path: a `list` field keeps #196's comma split, so long
+    source paths and alias forms are separate items (QA B1/B2), but never cuts inside brackets or a
+    date; a `prose-list` field's scalar is one item, short clauses included."""
+    m, root = vault
+    sy = (root / "schema.yaml").read_text(encoding="utf-8")
+    (root / "schema.yaml").write_text(
+        sy + "\nfield_shapes:\n  assumptions: prose-list\n", encoding="utf-8")
+    p = root / "wiki" / "predictions" / "x.md"
+    paths = ["sources/2026/07/06/skillcloak-evasion-of-llm-agent-skill-scanners-via-encoded-"
+             "payloads-hkust",
+             "sources/2026/07/06/trojpix-pixel-level-trojan-triggers-in-multimodal-models-"
+             "shandong-university"]
+    basis = ("CISA KEV catalog; Oracle PeopleSoft/EBS exploitation observed June 2026 "
+             "(Nissan, Oracle Health); structural factors favor attacker replication")
+    out = m._coerce_fm({
+        "type": "prediction",
+        "sources": ", ".join(paths),
+        "aliases": "Adobe Inc., Adobe Systems",
+        "tags": "vulnerability, rce, uninitialized heap",
+        "basis": basis,
+        "assumptions": "the vendor patches, and attackers move on",
+    }, p)
+    assert out["sources"] == paths
+    assert out["aliases"] == ["Adobe Inc.", "Adobe Systems"]
+    assert out["tags"] == ["vulnerability", "rce", "uninitialized heap"]
+    assert out["basis"] == [basis], "a comma inside brackets is not a delimiter"
+    assert out["assumptions"] == ["the vendor patches, and attackers move on"]
+    assert m._prose_list_fields_for(p) == {"assumptions"}
+    assert m._prose_list_fields_for(None) == set()
+
+
+def test_prose_list_fields_resolve_to_none_when_the_schema_cannot_load(vault, monkeypatch):
+    m, root = vault
+    def boom(_page):
+        raise OSError("unreadable schema")
+    monkeypatch.setattr(m, "_governing", boom)
+    assert m._prose_list_fields_for(root / "wiki" / "predictions" / "x.md") == set()
+
+
 def test_coerce_fm_always_yields_valid_shapes_on_adversarial_input():
     """Property/fuzz: whatever shape an agent authors for a declared list field, _coerce_fm produces
     a dict where that field is a list (or absent) — never a bare string a consumer can crash on.
@@ -2823,3 +2954,802 @@ def test_update_publishes_through_atomic_replace(vault, monkeypatch):
     assert result.startswith("updated "), result
     assert any(destination == page and source.parent == page.parent for source, destination in replacements)
     assert "name: After" in page.read_text(encoding="utf-8")
+
+
+def test_entity_backfill_converge_into_an_existing_page_is_additive(vault, monkeypatch):
+    """entity-backfill CREATES missing entities. When its converge lands on an EXISTING page it may
+    only add: the body is kept, list fields are unioned, existing values are not replaced.
+
+    Live on okcti, 2026-09-30: handed a 2018 Intezer source, the lane "created" Lazarus Group over
+    the existing canonical page -- the MITRE description became a 105-char one-liner, so the
+    ATT&CK guidepost attribution (Lazarus -> North Korea) was withdrawn on the next assessment
+    run. On 11 other pages the lane's `sources` list replaced the page's own, dropping entries."""
+    import yaml
+
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    page = root / "wiki" / "entities" / "l" / "lz.md"
+
+    def fm_body():
+        text = page.read_text()
+        _, fm, body = text.split("---", 2)
+        return yaml.safe_load(fm), body.strip()
+
+    src = root / "wiki" / "sources" / "2018" / "intezer.md"
+    src.parent.mkdir(parents=True)
+    src.write_text("---\ntype: source\ntitle: Intezer 2018\n---\nReport.\n", encoding="utf-8")
+    original = "Lazarus is a North Korean state-sponsored group (MITRE ATT&CK G0032)."
+    out = m._create("entities/l/lz", "type: entity\nname: Lazarus\nid: authority:lz\n"
+                    "description: state group\nsources:\n- MITRE ATT&CK\n- MISP galaxy", original)
+    assert out.startswith("created"), out
+
+    token = m._caller_var.set({"kind": "job", "actor": "cron:entity-backfill"})
+    try:
+        out = m._converge("entities/l/lz", "type: entity\nname: Lazarus\nid: authority:lz\n"
+                          "description: a cybercriminal group\nsources:\n- sources/2018/intezer\n"
+                          "tags:\n- crypto", "A cybercriminal group targeting exchanges.",
+                          "", "description")
+    finally:
+        m._caller_var.reset(token)
+    assert not out.startswith(("rejected", "refused", "error")), out
+    fm, body = fm_body()
+    assert body == original, "an existing body is never replaced by a backfill"
+    assert fm["sources"] == ["MITRE ATT&CK", "MISP galaxy", "sources/2018/intezer"], \
+        "list fields union: the backfill's source is added, none is dropped"
+    assert fm["description"] == "state group", "an existing value is not replaced, nor removed"
+    assert fm["tags"] == ["crypto"], "a new key is still added"
+
+
+def test_entity_backfill_still_creates_and_fills_an_empty_body(vault, monkeypatch):
+    """The negative half: additive-only must not stop the lane doing its job."""
+    import yaml
+
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    token = m._caller_var.set({"kind": "job", "actor": "cron:entity-backfill"})
+    try:
+        out = m._converge("entities/n/new-actor",
+                          "type: entity\nname: New actor\nid: authority:new", "Grounded body.")
+        assert out.startswith(("created", "converged")), out
+        assert "Grounded body." in (root / "wiki/entities/n/new-actor.md").read_text()
+    finally:
+        m._caller_var.reset(token)
+    m._create("entities/e/empty", "type: entity\nname: Empty\nid: authority:empty", "")
+    token = m._caller_var.set({"kind": "job", "actor": "cron:entity-backfill"})
+    try:
+        m._converge("entities/e/empty", "type: entity\nname: Empty\nid: authority:empty",
+                    "Now described.")
+    finally:
+        m._caller_var.reset(token)
+    assert "Now described." in (root / "wiki/entities/e/empty.md").read_text(), \
+        "a page with no body is filled"
+
+
+def test_other_converge_callers_keep_replace_semantics(vault, monkeypatch):
+    """page-quality-enrich and the model-write repair drain recompile whole pages through converge;
+    the additive rule is scoped to entity-backfill only."""
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    m._create("entities/r/rp", "type: entity\nname: Rp\nid: authority:rp", "old body")
+    token = m._caller_var.set({"kind": "job", "actor": "cron:page-quality-enrich"})
+    try:
+        m._converge("entities/r/rp", "type: entity\nname: Rp\nid: authority:rp", "recompiled body")
+    finally:
+        m._caller_var.reset(token)
+    assert "recompiled body" in (root / "wiki/entities/r/rp.md").read_text()
+
+
+def _as_actor(m, actor):
+    return m._caller_var.set({"kind": "job", "actor": actor})
+
+
+def test_entity_backfill_cannot_retype_an_existing_page(vault, monkeypatch):
+    """Re-verify of okengine!1210: `type` passed straight through the additive gate, so the lane could
+    turn an existing `entity` into `malware` (same namespace -> no namespace guard fires)."""
+    import yaml
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    m._create("entities/l/lz", "type: entity\nname: Lazarus\nid: authority:lz", "Curated body.")
+    token = _as_actor(m, "cron:entity-backfill")
+    try:
+        m._converge("entities/l/lz", "type: malware\nname: Lazarus\nid: authority:lz", "")
+    finally:
+        m._caller_var.reset(token)
+    fm = yaml.safe_load((root / "wiki/entities/l/lz.md").read_text().split("---")[1])
+    assert fm["type"] == "entity"
+
+
+def test_entity_backfill_cannot_replace_a_value_held_under_a_drift_alias(drift_vault, monkeypatch):
+    """Re-verify of okengine!1210: the gate compared raw keys, so a canonical key the page holds under
+    its alias (`country`) looked new; _normalize_drift then dropped the page's value for the lane's."""
+    import yaml
+    m, root = drift_vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    page = root / "wiki/entities/a/apt-x.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("---\ntype: entity\nname: APT-X\nid: authority:aptx\ncountry: Russia\n---\nBody.\n",
+                    encoding="utf-8")                      # a legacy page, written before normalization
+    token = _as_actor(m, "cron:entity-backfill")
+    try:
+        out = m._converge("entities/a/apt-x",
+                          "type: entity\nname: APT-X\nid: authority:aptx\nsuspected_origin: CN", "")
+    finally:
+        m._caller_var.reset(token)
+    assert not out.startswith(("rejected", "refused", "error")), out
+    fm = yaml.safe_load(page.read_text().split("---")[1])
+    assert fm.get("suspected_origin", fm.get("country")) == "Russia", fm
+
+
+def test_concept_backfill_converge_into_an_existing_concept_is_additive(vault, monkeypatch):
+    """Re-verify of okengine!1210, sibling lane: concept-backfill mints an id from the title, which can
+    resolve to an existing concept at another path; replace semantics then rewrote its body/sources."""
+    import yaml
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    for name in ("a", "b", "c"):
+        src = root / "wiki/sources" / f"{name}.md"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text(f"---\ntype: source\ntitle: {name}\n---\nx\n", encoding="utf-8")
+    m._create("entities/r/raas", "type: entity\nname: RaaS\nid: authority:raas\n"
+              "sources:\n- sources/a\n- sources/b\ndescription: curated definition", "Curated body.")
+    token = _as_actor(m, "cron:concept-backfill")
+    try:
+        m._converge("entities/r/raas", "type: entity\nname: RaaS\nid: authority:raas\n"
+                    "sources:\n- sources/c\ndescription: a one-liner", "One line.")
+    finally:
+        m._caller_var.reset(token)
+    text = (root / "wiki/entities/r/raas.md").read_text()
+    fm = yaml.safe_load(text.split("---")[1])
+    assert "Curated body." in text
+    assert fm["sources"] == ["sources/a", "sources/b", "sources/c"]
+    assert fm["description"] == "curated definition"
+
+
+_TWO_ALIAS_SCHEMA = _DRIFT_SCHEMA.replace("  country: suspected_origin\n",
+                                          "  country: suspected_origin\n  origin: suspected_origin\n")
+
+
+def test_entity_backfill_cannot_replace_a_value_via_a_different_alias(tmp_path, monkeypatch):
+    """Second re-verify round: the page holds `origin: Russia`, the lane writes `country: CN` -- a
+    DIFFERENT alias of the same canonical field. Normalization of the merge kept the lane's value."""
+    import yaml
+    (tmp_path / "wiki").mkdir()
+    (tmp_path / "schema.yaml").write_text(_TWO_ALIAS_SCHEMA, encoding="utf-8")
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-06-15")
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    sys.modules.pop("write_server", None)
+    m = _load()
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    page = tmp_path / "wiki/entities/a/apt-y.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("---\ntype: entity\nname: APT-Y\nid: authority:apty\norigin: Russia\n---\nBody.\n",
+                    encoding="utf-8")
+    token = _as_actor(m, "cron:entity-backfill")
+    try:
+        out = m._converge("entities/a/apt-y", "type: entity\nname: APT-Y\nid: authority:apty\ncountry: CN", "")
+    finally:
+        m._caller_var.reset(token)
+    assert not out.startswith(("rejected", "refused", "error")), out
+    fm = yaml.safe_load(page.read_text().split("---")[1])
+    assert "China" not in (fm.get("suspected_origin"), fm.get("country")), fm
+    assert "Russia" in (fm.get("suspected_origin"), fm.get("origin")), fm
+
+
+def test_non_additive_converge_still_repairs_an_unhashable_legacy_value(drift_vault, monkeypatch):
+    """Second re-verify round: normalizing the CURRENT page for every caller raised TypeError on an
+    unhashable value under a value-aliased field, so repair lanes could no longer fix such pages."""
+    import yaml
+    m, root = drift_vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    page = root / "wiki/entities/a/apt-z.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("---\ntype: entity\nname: APT-Z\nid: authority:aptz\nstatus: {value: active}\n---\nB.\n",
+                    encoding="utf-8")
+    token = _as_actor(m, "cron:model-write-repair-drain")
+    try:
+        out = m._converge("entities/a/apt-z", "type: entity\nname: APT-Z\nid: authority:aptz\nstatus: live", "")
+    finally:
+        m._caller_var.reset(token)
+    assert not out.startswith(("rejected", "refused", "error")), out
+    assert yaml.safe_load(page.read_text().split("---")[1])["status"] == "live"
+
+
+
+
+def test_entity_backfill_cannot_rename_or_reclassify_a_page_by_adding_keys(vault, monkeypatch):
+    """Re-verify round 5: additive merges still ADDED `title` (every UI prefers it over `name`) and
+    `link_stub`, which would rename Lazarus Group and demote it to a redirect."""
+    import yaml
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    m._create("entities/l/lazarus", "type: entity\nname: Lazarus Group\nid: authority:lazarus\n"
+              "aliases:\n- Hidden Cobra\ndescription: curated", "Curated MITRE body.")
+    token = _as_actor(m, "cron:entity-backfill")
+    try:
+        out = m._converge("entities/l/lazarus", "type: entity\nname: Hidden Cobra\ntitle: Hidden Cobra\n"
+                          "id: authority:lazarus\nlink_stub: true\ndescription: stub\ntags:\n- crypto", "Stub.")
+    finally:
+        m._caller_var.reset(token)
+    assert "converged" in out, out
+    fm = yaml.safe_load((root / "wiki/entities/l/lazarus.md").read_text().split("---")[1])
+    assert "title" not in fm and "link_stub" not in fm, fm
+    # `name: Hidden Cobra` is the page's own alias: the same entity, so a harmless new key lands.
+    assert fm["name"] == "Lazarus Group" and fm["tags"] == ["crypto"], out
+
+
+
+def test_a_short_curated_entity_body_is_not_a_stub(vault, monkeypatch):
+    """Re-verify round 6: a stub floor applied to additive merges would replace a ~60-char curated
+    MITRE line on an actor with a longer one-liner. Only an EMPTY body is filled."""
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    curated = "DPRK state actor (RGB); attribution: North Korea per MITRE G0032."
+    m._create("entities/l/lazarus", "type: entity\nname: Lazarus Group\nid: authority:lazarus\n"
+              "aliases:\n- Hidden Cobra", curated)
+    token = _as_actor(m, "cron:entity-backfill")
+    try:
+        m._converge("entities/l/lazarus", "type: entity\nname: Lazarus Group\nid: authority:lazarus",
+                    "Lazarus is a financially motivated cybercriminal group targeting exchanges, per a 2018 report.")
+    finally:
+        m._caller_var.reset(token)
+    assert curated in (root / "wiki/entities/l/lazarus.md").read_text()
+
+
+def test_an_additive_merge_never_changes_or_stamps_the_page_id(vault, monkeypatch):
+    """Re-verify round 6: `id` always passed, so an alias redirect swapped the page's id, and an
+    id-less page was stamped with an id minted from the incoming title."""
+    import yaml
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    page = root / "wiki/entities/l/lazarus.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("---\ntype: entity\nname: Lazarus Group\n---\nBody.\n", encoding="utf-8")
+    token = _as_actor(m, "cron:entity-backfill")
+    try:
+        m._converge("entities/l/lazarus", "type: entity\ntitle: Hidden Cobra\nname: Hidden Cobra", "")
+    finally:
+        m._caller_var.reset(token)
+    fm = yaml.safe_load(page.read_text().split("---")[1])
+    assert fm.get("id") in (None, ""), fm
+    assert fm["name"] == "Lazarus Group" and "title" not in fm
+
+
+def test_a_backfill_write_for_a_different_document_keeps_the_body_and_is_reviewed(vault, monkeypatch):
+    """Narrow-round re-verify: on an empty-bodied page, a backfill write whose `name` disagrees (a
+    different entity resolved onto it) filled the body with no conflict and no review flag; before
+    v0.15.1 the okengine#901 identity guard kept the body and flagged it."""
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    page = root / "wiki/entities/l/lazarus.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("---\ntype: entity\nname: Lazarus Group\nid: authority:lazarus\n---\n", encoding="utf-8")
+    token = _as_actor(m, "cron:entity-backfill")
+    try:
+        out = m._converge("entities/l/lazarus", "type: entity\nname: Andariel\nid: authority:lazarus",
+                          "Andariel is a DIFFERENT group with its own operations.")
+    finally:
+        m._caller_var.reset(token)
+    assert "identity conflict on `name`" in out, out
+    assert "Andariel is a DIFFERENT group" not in page.read_text()
+
+
+def test_non_additive_converge_registers_the_minted_id_as_before(vault, monkeypatch):
+    """Narrow-round re-verify: the registry line keyed every caller on merged['id'], changing which id
+    a non-additive exact-path converge maps (and raising on a legacy unhashable id)."""
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    page = root / "wiki/entities/a/apt3.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("---\ntype: entity\nname: APT3\nid: [a1, b2]\n---\nBody.\n", encoding="utf-8")
+    out = m._converge("entities/a/apt3", "type: entity\nname: APT3\ntags:\n- x", "")
+    assert out.startswith("converged"), out
+
+
+def test_a_bodyless_backfill_write_for_a_different_document_adds_nothing_and_is_reviewed(vault, monkeypatch):
+    """Narrow-round re-verify 2: with no body, a write whose `name` disagreed still landed the other
+    entity's attributes (suspected_origin, first_seen) and queued no review."""
+    import yaml
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    page = root / "wiki/entities/l/lazarus.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("---\ntype: entity\nname: Lazarus Group\nid: authority:lazarus\n---\n", encoding="utf-8")
+    token = _as_actor(m, "cron:entity-backfill")
+    try:
+        out = m._converge("entities/l/lazarus", "type: entity\nname: Andariel\nid: authority:lazarus\n"
+                          "suspected_origin: South Korea\nfirst_seen: '2015-01-01'", "")
+    finally:
+        m._caller_var.reset(token)
+    fm = yaml.safe_load(page.read_text().split("---")[1])
+    assert "suspected_origin" not in fm and "first_seen" not in fm, fm
+    assert "identity conflict on `name`" in out, out
+
+
+def test_a_title_disagreeing_with_a_held_name_is_an_identity_conflict(vault, monkeypatch):
+    """Narrow-round re-verify 2: only same-key disagreements were seen; `title: Andariel` sent to a
+    page holding `name: Lazarus Group` slipped past and its body filled the empty page."""
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    page = root / "wiki/entities/l/lazarus.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("---\ntype: entity\nname: Lazarus Group\nid: authority:lazarus\n---\n", encoding="utf-8")
+    token = _as_actor(m, "cron:entity-backfill")
+    try:
+        out = m._converge("entities/l/lazarus", "type: entity\ntitle: Andariel\nid: authority:lazarus",
+                          "Andariel is a DIFFERENT group with its own operations.")
+    finally:
+        m._caller_var.reset(token)
+    assert "identity conflict" in out, out
+    assert "Andariel is a DIFFERENT group" not in page.read_text()
+
+
+def test_an_additive_merge_on_a_legacy_list_id_does_not_crash(vault, monkeypatch):
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    page = root / "wiki/entities/a/apt3.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("---\ntype: entity\nname: APT3\nid: [a1, b2]\n---\nBody.\n", encoding="utf-8")
+    token = _as_actor(m, "cron:entity-backfill")
+    try:
+        out = m._converge("entities/a/apt3", "type: entity\nname: APT3\ntags:\n- x", "")
+    finally:
+        m._caller_var.reset(token)
+    assert out.startswith("converged"), out
+
+
+def test_a_backfill_write_reaching_a_page_through_its_alias_is_the_same_entity(vault, monkeypatch):
+    """Narrow-round re-verify 3: a name matching the page's own verified alias (UNC6240 on
+    ShinyHunters, okengine#324) was treated as a different document -- nothing added, false review."""
+    import yaml
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    m._create("entities/s/shinyhunters", "type: entity\nname: ShinyHunters\nid: authority:shiny\n"
+              "aliases:\n- UNC6240", "Curated body.")
+    token = _as_actor(m, "cron:entity-backfill")
+    try:
+        out = m._converge("entities/s/shinyhunters", "type: entity\nname: UNC6240\nid: authority:shiny\n"
+                          "tags:\n- extortion", "")
+    finally:
+        m._caller_var.reset(token)
+    fm = yaml.safe_load((root / "wiki/entities/s/shinyhunters.md").read_text().split("---")[1])
+    assert fm["tags"] == ["extortion"] and fm["name"] == "ShinyHunters"
+    assert "identity conflict" not in out, out
+
+
+# --- okengine#962: create-intent writes never replace an existing page --------------------------
+
+def _seed962(m, path, fm, body):
+    out = m._create(path, fm, body)
+    assert out.startswith("created"), out
+
+
+def test_962_a_create_redirected_onto_an_existing_page_is_additive_for_any_caller(vault, monkeypatch):
+    """broken-wikilinks-drain's stub for [[hidden-cobra]] landed on Lazarus Group via its alias and
+    replaced its name and body."""
+    import yaml
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    _seed962(m, "entities/l/lazarus", "type: entity\nname: Lazarus Group\nid: authority:lazarus\n"
+          "aliases:\n- Hidden Cobra\ndescription: curated", "Curated MITRE body.")
+    token = _as_actor(m, "cron:broken-wikilinks-drain")
+    try:
+        out = m._create("entities/h/hidden-cobra", "type: entity\nname: Hidden Cobra\n"
+                        "description: stub\ntags:\n- dprk", "Stub - backfilled from 1 inbound reference.")
+    finally:
+        m._caller_var.reset(token)
+    assert "converged" in out, out
+    text = (root / "wiki/entities/l/lazarus.md").read_text()
+    fm = yaml.safe_load(text.split("---")[1])
+    assert "Curated MITRE body." in text and fm["name"] == "Lazarus Group"
+    assert fm["description"] == "curated" and fm["tags"] == ["dprk"], fm
+
+
+def test_962_an_explicit_converge_falling_through_create_keeps_replace_semantics(vault, monkeypatch):
+    """Round-7 regression guard: a repair converge whose minted id misses the index falls through
+    _create's dedup; it asked to CONVERGE, so it must still replace (behavior as at 42c66022)."""
+    import yaml
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    _seed962(m, "entities/s/shinyhunters", "type: entity\nname: ShinyHunters\ndescription: curated",
+          "Curated canonical body.")
+    token = _as_actor(m, "cron:model-write-repair-drain")
+    try:
+        out = m._converge("entities/u/unc6240", "type: entity\nname: UNC6240\naliases:\n- ShinyHunters\n"
+                          "description: recompiled\n", "Recompiled corrected body.")
+    finally:
+        m._caller_var.reset(token)
+    assert "converged" in out, out
+    text = (root / "wiki/entities/s/shinyhunters.md").read_text()
+    fm = yaml.safe_load(text.split("---")[1])
+    assert fm["description"] == "recompiled"          # replace semantics for an ordinary field
+    # okengine#1028: the UNC6240 rename of the ShinyHunters page is held for review, and so is the
+    # body that describes it.
+    assert fm["name"] == "ShinyHunters" and fm["needs_review"] is True
+    assert "Curated canonical body." in text and "Recompiled corrected body." not in text
+
+
+def _raw_meta(**extra):
+    return {"type": "source", "url": "https://example.test/x", "title": "Article", "source_kind": "news",
+            "publisher": "Example", "published": "2026-06-15", **extra}
+
+
+def test_962_a_snippet_recapture_keeps_the_full_extract(vault, monkeypatch):
+    import yaml
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    full = "Full curated article body with many paragraphs. " * 3
+    token = _as_actor(m, "cron:raw-backfill")
+    try:
+        assert m._converge_raw_source("raw/a.md", _raw_meta(), "sources/2026/06/full", full).startswith("created")
+        out = m._converge_raw_source("raw/b.md", _raw_meta(), "sources/2026/06/snip", "Snippet.")
+    finally:
+        m._caller_var.reset(token)
+    assert out.startswith("converged"), out
+    text = next((root / "wiki/sources/2026/06").glob("full-*.md")).read_text()
+    assert "Full curated article body" in text and "Snippet." not in text
+    assert yaml.safe_load(text.split("---")[1])["raw"] == ["raw/a.md", "raw/b.md"]
+
+
+def test_962_a_full_capture_upgrades_a_stub_source_body(vault, monkeypatch):
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    full = "Full article body sentence. " * 6
+    token = _as_actor(m, "cron:raw-backfill")
+    try:
+        m._converge_raw_source("raw/a.md", _raw_meta(), "sources/2026/06/article", "Snippet only.")
+        out = m._converge_raw_source("raw/b.md", _raw_meta(), "sources/2026/06/article", full)
+    finally:
+        m._caller_var.reset(token)
+    assert out.startswith("converged"), out
+    text = next((root / "wiki/sources/2026/06").glob("article-*.md")).read_text()
+    assert "Full article body sentence." in text and "Snippet only." not in text
+
+
+def test_962_a_stub_upgrade_never_overrides_an_identity_conflict(vault, monkeypatch):
+    """Round-7 finding: the source-stub upgrade bypassed the okengine#901 identity guard; another
+    record's body landed on a stub page with a different title."""
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    other = "Parcel record for Example Rd 101 with a long and detailed description. " * 3
+    token = _as_actor(m, "cron:raw-backfill")
+    try:
+        # Same URL (so the same page id), but a DIFFERENT record by a non-display identity field:
+        # the #901 case. (A differing title alone on one URL is a retitle, not another document.)
+        m._converge_raw_source("raw/a.md", _raw_meta(subject="properties/synthetic-ct-10"),
+                               "sources/2026/06/parcel", "Parcel read.")
+        out = m._converge_raw_source("raw/b.md", _raw_meta(subject="properties/example-rd-101"),
+                                     "sources/2026/06/parcel", other)
+    finally:
+        m._caller_var.reset(token)
+    assert "identity conflict" in out, out
+    text = next((root / "wiki/sources/2026/06").glob("parcel-*.md")).read_text()
+    assert "Example Rd 101 with a long" not in text
+
+
+def test_962_a_dedup_verified_alias_spelling_is_agreement(vault, monkeypatch):
+    """Round-final residual: dedup matches aliases with normalize_key; the identity check used
+    casefold, so `UNC 6240` vs alias `UNC-6240` raised a false conflict and dropped additions."""
+    import yaml
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    _seed962(m, "entities/s/shinyhunters", "type: entity\nname: ShinyHunters\nid: authority:shiny\n"
+          "aliases:\n- UNC-6240", "Curated body.")
+    token = _as_actor(m, "cron:entity-backfill")
+    try:
+        out = m._converge("entities/s/shinyhunters", "type: entity\nname: UNC 6240\nid: authority:shiny\n"
+                          "tags:\n- extortion", "")
+    finally:
+        m._caller_var.reset(token)
+    assert "identity conflict" not in out, out
+    assert yaml.safe_load((root / "wiki/entities/s/shinyhunters.md").read_text().split("---")[1])["tags"] == [
+        "extortion"]
+
+
+def test_962_alias_accrual_is_kept_but_a_hijacking_alias_is_refused(vault, monkeypatch):
+    """okengine#324 alias accrual on a create redirect still works; an alias that is ANOTHER live
+    entity's name is not added (it would re-route APT38's later writes onto Lazarus)."""
+    import yaml
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    _seed962(m, "entities/l/lazarus", "type: entity\nname: Lazarus Group\nid: authority:lazarus\n"
+          "aliases:\n- Hidden Cobra", "Curated body.")
+    _seed962(m, "entities/a/apt38", "type: entity\nname: APT38\nid: authority:apt38", "APT38 body.")
+    # (A CREATE carrying APT38 as an alias is already refused by dedup as ambiguous; the merge-level
+    # guard matters for a write that reaches Lazarus directly.)
+    token = _as_actor(m, "cron:entity-backfill")
+    try:
+        out = m._converge("entities/l/lazarus", "type: entity\nname: Lazarus Group\nid: authority:lazarus\n"
+                          "aliases:\n- Guardians of Peace\n- APT38", "")
+    finally:
+        m._caller_var.reset(token)
+    assert "converged" in out, out
+    aliases = yaml.safe_load((root / "wiki/entities/l/lazarus.md").read_text().split("---")[1])["aliases"]
+    assert "Guardians of Peace" in aliases, aliases
+    assert "APT38" not in aliases, aliases
+
+
+def test_962_an_alias_one_merge_added_blocks_the_same_alias_on_another_page(vault, monkeypatch):
+    """Re-verify of #962: the in-process index never saw aliases a merge added, so Lazarus and
+    Kimsuky could both gain `Andariel` in one writer process."""
+    import yaml
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    _seed962(m, "entities/l/lazarus", "type: entity\nname: Lazarus Group\nid: authority:lazarus\n"
+             "aliases:\n- Hidden Cobra", "Lazarus body.")
+    _seed962(m, "entities/k/kimsuky", "type: entity\nname: Kimsuky\nid: authority:kimsuky\n"
+             "aliases:\n- Velvet Chollima", "Kimsuky body.")
+    token = _as_actor(m, "cron:broken-wikilinks-drain")
+    try:
+        m._create("entities/h/hidden-cobra", "type: entity\nname: Hidden Cobra\naliases:\n- Andariel", "x")
+        m._create("entities/v/velvet-chollima", "type: entity\nname: Velvet Chollima\naliases:\n- Andariel", "x")
+    finally:
+        m._caller_var.reset(token)
+    fm = lambda rel: yaml.safe_load((root / "wiki" / rel).read_text().split("---")[1])  # noqa: E731
+    holders = [rel for rel in ("entities/l/lazarus.md", "entities/k/kimsuky.md")
+               if "Andariel" in (fm(rel).get("aliases") or [])]
+    assert len(holders) <= 1, holders
+
+
+def test_962_a_retitled_capture_of_the_same_url_still_records_its_backlink(vault, monkeypatch):
+    """Re-verify of #962: a second capture of the same URL under a paraphrased title tripped the
+    identity guard on `title`, which also dropped the append-only `raw` backlink -- the capture
+    was then re-offered forever."""
+    import yaml
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    body = "A full article body with enough meaningful characters to be compiled. " * 2
+    token = _as_actor(m, "cron:raw-backfill")
+    try:
+        m._converge_raw_source("raw/a.md", _raw_meta(), "sources/2026/06/full", body)
+        out = m._converge_raw_source("raw/b.md", _raw_meta(title="Article (updated)"),
+                                     "sources/2026/06/full", body)
+    finally:
+        m._caller_var.reset(token)
+    assert "identity conflict" not in out, out
+    page = next((root / "wiki/sources/2026/06").glob("full-*.md"))
+    assert yaml.safe_load(page.read_text().split("---")[1])["raw"] == ["raw/a.md", "raw/b.md"]
+
+
+def test_962_a_shared_report_url_never_merges_a_different_entity(vault, monkeypatch):
+    """Re-verify round 2: the same-URL shortcut applied to entities; Andariel, stamped with the same
+    report URL as Lazarus and redirected onto it by alias, landed its description and tags."""
+    import yaml
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    _seed962(m, "entities/l/lazarus", "type: entity\nname: Lazarus Group\nid: authority:lazarus\n"
+             "url: https://r.test/report\naliases:\n- Hidden Cobra", "Lazarus body.")
+    token = _as_actor(m, "cron:broken-wikilinks-drain")
+    try:
+        out = m._create("entities/a/andariel", "type: entity\nname: Andariel\nurl: https://r.test/report\n"
+                        "aliases:\n- Lazarus Group\ndescription: South Korea-targeting subgroup", "Andariel body.")
+    finally:
+        m._caller_var.reset(token)
+    fm = yaml.safe_load((root / "wiki/entities/l/lazarus.md").read_text().split("---")[1])
+    assert "description" not in fm and "identity conflict" in out, out
+
+
+def test_962_placeholder_urls_never_identify_a_source(vault, monkeypatch):
+    """Re-verify round 2: `UNKNOWN` is the absence of identity (#515); captures carrying it hashed
+    to one id and fused onto one page, and the same-URL shortcut then let one replace the other."""
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    token = _as_actor(m, "cron:raw-backfill")
+    try:
+        out = m._converge_raw_source("raw/a.md", _raw_meta(url="UNKNOWN"), "sources/2026/06/parcel", "Parcel read.")
+    finally:
+        m._caller_var.reset(token)
+    assert out.startswith("rejected") and "no identity" in out, out
+    assert not list((root / "wiki").rglob("parcel*.md"))
+
+
+def test_962_an_alias_added_by_update_blocks_the_same_alias_on_a_merge(vault, monkeypatch):
+    """Re-verify round 2: _update/_patch never fed the in-process identity index, so an alias added
+    by an update was invisible to the next merge's hijack check."""
+    import yaml
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    _seed962(m, "entities/l/lazarus", "type: entity\nname: Lazarus Group\nid: authority:lazarus\n"
+             "aliases:\n- Hidden Cobra", "Lazarus body.")
+    _seed962(m, "entities/k/kimsuky", "type: entity\nname: Kimsuky\nid: authority:kimsuky\n"
+             "aliases:\n- Velvet Chollima", "Kimsuky body.")
+    assert m._update("entities/k/kimsuky", {"aliases": ["Velvet Chollima", "Andariel"]}).startswith("updated")
+    token = _as_actor(m, "cron:broken-wikilinks-drain")
+    try:
+        m._create("entities/h/hidden-cobra", "type: entity\nname: Hidden Cobra\naliases:\n- Andariel", "x")
+    finally:
+        m._caller_var.reset(token)
+    aliases = yaml.safe_load((root / "wiki/entities/l/lazarus.md").read_text().split("---")[1])["aliases"]
+    assert "Andariel" not in aliases, aliases
+
+
+def test_962_a_fuller_recapture_corrects_a_compiled_source(vault, monkeypatch):
+    """User decision: the fuller capture wins. A bad earlier extraction can still be corrected by a
+    fuller re-extraction (a snippet never overwrites a full extract: test_962_a_snippet_...)."""
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    bad = "Garbled extraction text with cookie banner noise. " * 3
+    good = "The corrected full article body, extracted cleanly from the page. " * 4
+    token = _as_actor(m, "cron:raw-backfill")
+    try:
+        m._converge_raw_source("raw/a.md", _raw_meta(), "sources/2026/06/full", bad)
+        out = m._converge_raw_source("raw/b.md", _raw_meta(), "sources/2026/06/full", good)
+    finally:
+        m._caller_var.reset(token)
+    assert out.startswith("converged"), out
+    text = next((root / "wiki/sources/2026/06").glob("full-*.md")).read_text()
+    assert "corrected full article body" in text and "Garbled" not in text
+
+
+def test_962_an_alias_added_by_an_explicit_converge_blocks_the_same_alias_on_a_merge(vault, monkeypatch):
+    """Re-verify round 3: a non-additive converge never fed the in-process identity index."""
+    import yaml
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    _seed962(m, "entities/l/lazarus", "type: entity\nname: Lazarus Group\nid: authority:lazarus\n"
+             "aliases:\n- Hidden Cobra", "Lazarus body.")
+    _seed962(m, "entities/k/kimsuky", "type: entity\nname: Kimsuky\nid: authority:kimsuky\n"
+             "aliases:\n- Velvet Chollima", "Kimsuky body.")
+    token = _as_actor(m, "cron:page-quality-enrich")
+    try:
+        m._converge("entities/k/kimsuky", "type: entity\nname: Kimsuky\nid: authority:kimsuky\n"
+                    "aliases:\n- Velvet Chollima\n- Andariel", "")
+    finally:
+        m._caller_var.reset(token)
+    token = _as_actor(m, "cron:broken-wikilinks-drain")
+    try:
+        m._create("entities/h/hidden-cobra", "type: entity\nname: Hidden Cobra\naliases:\n- Andariel", "x")
+    finally:
+        m._caller_var.reset(token)
+    aliases = yaml.safe_load((root / "wiki/entities/l/lazarus.md").read_text().split("---")[1])["aliases"]
+    assert "Andariel" not in aliases, aliases
+
+
+def test_962_a_write_carrying_only_a_copied_page_id_never_replaces_a_source_body(vault, monkeypatch):
+    """Re-verify round 4: a source create with no url/title but another page's explicit id was
+    redirected onto it; with nothing to disagree on, the fuller-capture rule replaced its body.
+    Only a POSITIVE same-URL match may replace; otherwise only an empty body is filled."""
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    body = "The curated full article body extracted from the page. " * 3
+    token = _as_actor(m, "cron:raw-backfill")
+    try:
+        m._converge_raw_source("raw/a.md", _raw_meta(), "sources/2026/06/full", body)
+    finally:
+        m._caller_var.reset(token)
+    page = next((root / "wiki/sources/2026/06").glob("full-*.md"))
+    import yaml
+    page_id = yaml.safe_load(page.read_text().split("---")[1])["id"]
+    token = _as_actor(m, "cron:broken-wikilinks-drain")
+    try:
+        m._create("sources/2026/06/other-doc", f"type: source\npublished: '2026-06-15'\nsource_kind: news\n"
+                  f"publisher: Other\nid: {page_id}\n", "A COMPLETELY DIFFERENT document body. " * 8)
+    finally:
+        m._caller_var.reset(token)
+    text = page.read_text()
+    assert "curated full article body" in text and "COMPLETELY DIFFERENT" not in text
+
+
+def test_962_a_legacy_comma_string_alias_list_is_not_duplicated_by_backfill_accrual(vault, monkeypatch):
+    """Re-verify round 5: additive accrual re-added the split parts of a legacy comma-string
+    (with a stray leading space) next to the original string."""
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    page = root / "wiki/entities/l/lazarus.md"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    page.write_text("---\ntype: entity\nname: Lazarus Group\nid: authority:laz\n"
+                    "aliases: Hidden Cobra, Zinc\n---\nCurated.\n")
+    token = _as_actor(m, "cron:entity-backfill")
+    try:
+        m._converge("entities/l/lazarus", "type: entity\nname: Lazarus Group\nid: authority:laz\n"
+                    "aliases:\n- Andariel\n- Zinc\n", "A longer generated body. " * 10)
+    finally:
+        m._caller_var.reset(token)
+    import yaml
+    aliases = yaml.safe_load(page.read_text().split("---")[1])["aliases"]
+    flat = [a.strip() for item in aliases for a in str(item).split(",")]
+    assert sorted(flat) == ["Andariel", "Hidden Cobra", "Zinc"], aliases
+    assert "Curated." in page.read_text()
+
+
+def _backfill_alias_onto_lazarus(m, root, alias):
+    import yaml
+    token = _as_actor(m, "cron:entity-backfill")
+    try:
+        m._converge("entities/l/lazarus", f"type: entity\nname: Lazarus Group\nid: authority:lazarus\n"
+                    f"aliases:\n- {alias}\n", "")
+    finally:
+        m._caller_var.reset(token)
+    return yaml.safe_load((root / "wiki/entities/l/lazarus.md").read_text().split("---")[1])["aliases"]
+
+
+def test_962_an_alias_added_by_patch_blocks_the_same_alias_on_a_merge(vault, monkeypatch):
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    _seed962(m, "entities/l/lazarus", "type: entity\nname: Lazarus Group\nid: authority:lazarus\n"
+             "aliases:\n- Hidden Cobra", "Lazarus body.")
+    _seed962(m, "entities/k/kimsuky", "type: entity\nname: Kimsuky\nid: authority:kimsuky\n"
+             "aliases:\n- Velvet Chollima", "Kimsuky body.")
+    out = m._patch("entities/k/kimsuky", "- Velvet Chollima", "- Velvet Chollima\n- Andariel")
+    assert out.startswith(("patched", "updated")), out
+    assert "Andariel" not in _backfill_alias_onto_lazarus(m, root, "Andariel")
+
+
+@pytest.mark.parametrize("ns,kind", [("concepts", "concept"), ("trends", "trend")])  # before/after "entities"
+def test_962_only_entity_writes_feed_the_alias_index(vault, monkeypatch, ns, kind):
+    """The id-index's name/alias maps are an ENTITY index (id_index._add_identity contract). A
+    concept or trend updated or patched with a name must not block that alias on an entity."""
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    _seed962(m, "entities/l/lazarus", "type: entity\nname: Lazarus Group\nid: authority:lazarus\n"
+             "aliases:\n- Hidden Cobra", "Lazarus body.")
+    extra = "title: DPRK operations\nperiod: 2026-Q3\ndirection: rising\n" if kind == "trend" else ""
+    seeded = m._create(f"{ns}/dprk-ops", f"type: {kind}\nname: DPRK operations\n{extra}aliases:\n- Old", "Body.")
+    assert seeded.startswith("created"), seeded
+    assert m._update(f"{ns}/dprk-ops", {"aliases": ["Old", "Andariel"]}).startswith("updated")
+    m._patch(f"{ns}/dprk-ops", "- Old", "- Old\n- Guardians")
+    aliases = _backfill_alias_onto_lazarus(m, root, "Andariel")
+    assert "Andariel" in aliases, aliases
+    assert "Guardians" in _backfill_alias_onto_lazarus(m, root, "Guardians")
+
+
+def test_962_a_direct_dedup_redirect_defaults_to_additive(vault, monkeypatch):
+    """_dedup_on_create's `creating` defaults to True: any caller that omits it is a create."""
+    import yaml
+    m, root = vault
+    monkeypatch.setattr(m, "_capability_reject", lambda *args, **kwargs: None)
+    monkeypatch.setenv("OKENGINE_OUTPUT_CONTRACT_MODE", "report")
+    _seed962(m, "entities/l/lazarus", "type: entity\nname: Lazarus Group\nid: authority:lazarus\n"
+             "aliases:\n- Hidden Cobra", "Curated body.")
+    p = root / "wiki/entities/h/hidden-cobra.md"
+    out = m._dedup_on_create("entities/h/hidden-cobra", p, {"type": "entity", "name": "Hidden Cobra"},
+                             "A replacement body that must not land.")
+    assert out and "converged" in out, out
+    text = (root / "wiki/entities/l/lazarus.md").read_text()
+    assert "Curated body." in text and "must not land" not in text
+    assert yaml.safe_load(text.split("---")[1])["name"] == "Lazarus Group"
+
+
+def _cite(m, name):
+    """A canonical source that names `name` as a threat group, so creating it is grounded in
+    evidence rather than in the page's own prose (okengine#1012)."""
+    slug = "".join(ch if ch.isalnum() else "-" for ch in name.lower()).strip("-")
+    ref = f"sources/2026/01/01/{slug}-report"
+    page = m._wiki() / f"{ref}.md"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    page.write_text(f"---\ntype: source\ntitle: {name} report\n---\n\n"
+                    f"{name} is a threat group that targeted banks.\n", encoding="utf-8")
+    return ref

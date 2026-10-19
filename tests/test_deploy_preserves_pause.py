@@ -9,9 +9,10 @@ The failure shape is why this needs a test rather than a note: the deploy report
 post-deploy verification passes (an enabled job is not an error), and nothing observable happens
 until the lane's next scheduled fire.
 
-The merge itself is a heredoc inside `deploy-cron-plus-jobs.sh`, so these tests extract and run
-that exact block rather than a reimplementation of it — a copy would drift from the shipped code
-and pass while the deploy stayed broken.
+The merge runs inside `scripts/cron_plus_store.py write` -- the exact file the deploy streams into
+the gateway -- so these tests run that shipped code rather than a reimplementation of it: a copy
+would drift from the shipped code and pass while the deploy stayed broken. (Until okengine#850 it
+was a heredoc in the deploy script that wrote without the scheduler's lock.)
 """
 import json
 import os
@@ -24,30 +25,27 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 DEPLOY = REPO / "scripts" / "deploy-cron-plus-jobs.sh"
+STORE = REPO / "scripts" / "cron_plus_store.py"
 
 
-def _merge_block() -> str:
-    """The pause-preservation python heredoc, lifted verbatim from the deploy script."""
-    text = DEPLOY.read_text(encoding="utf-8")
-    marker = 'RESUME_PAUSED="${RESUME_PAUSED:-0}" "$HOST_PYTHON" - "$DEPLOY_JOBS" "$LIVE_JOBS_TMP" <<\'PY\'\n'
-    start = text.find(marker)
-    assert start >= 0, "pause-preservation block not found — did the deploy script change shape?"
-    start += len(marker)
-    end = text.find("\nPY\n", start)
-    assert end > start
-    return text[start:end]
+def _write(tmp_path: Path, new_jobs, live_text, *, resume=False):
+    """Run the shipped writer exactly as the deploy does (the file on stdin, `python3 - write`)."""
+    home = tmp_path / "cron-plus"
+    home.mkdir(exist_ok=True)
+    incoming, live_p = home / ".jobs.incoming.json", home / "jobs.json"
+    incoming.write_text(json.dumps(new_jobs), encoding="utf-8")
+    if live_text is not None:
+        live_p.write_text(live_text, encoding="utf-8")
+    env = dict(os.environ, RESUME_PAUSED="1" if resume else "0")
+    proc = subprocess.run([sys.executable, "-", "write", str(live_p), str(incoming), "TS"],
+                          input=STORE.read_text(encoding="utf-8"),
+                          capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(live_p.read_text(encoding="utf-8")), proc.stdout
 
 
 def _run(tmp_path: Path, new_jobs: dict, live_jobs, *, resume=False):
-    new_p = tmp_path / "deploy.json"
-    live_p = tmp_path / "live.json"
-    new_p.write_text(json.dumps(new_jobs), encoding="utf-8")
-    live_p.write_text(json.dumps(live_jobs), encoding="utf-8")
-    env = dict(os.environ, RESUME_PAUSED="1" if resume else "0")
-    proc = subprocess.run([sys.executable, "-c", _merge_block(), str(new_p), str(live_p)],
-                          capture_output=True, text=True, env=env)
-    assert proc.returncode == 0, proc.stderr
-    return json.loads(new_p.read_text(encoding="utf-8")), proc.stdout
+    return _write(tmp_path, new_jobs, json.dumps(live_jobs), resume=resume)
 
 
 def _src(**over):
@@ -114,15 +112,11 @@ def test_a_bare_list_live_store_is_handled(tmp_path):
 
 def test_an_unreadable_live_store_deploys_as_generated(tmp_path):
     """First deploy into a pack with no jobs.json must not fail."""
-    new_p = tmp_path / "deploy.json"
-    live_p = tmp_path / "live.json"
-    new_p.write_text(json.dumps(_src()), encoding="utf-8")
-    live_p.write_text("not json at all", encoding="utf-8")
-    proc = subprocess.run([sys.executable, "-c", _merge_block(), str(new_p), str(live_p)],
-                          capture_output=True, text=True,
-                          env=dict(os.environ, RESUME_PAUSED="0"))
-    assert proc.returncode == 0, proc.stderr
-    assert json.loads(new_p.read_text())["jobs"][0]["enabled"] is True
+    out, _ = _write(tmp_path, _src(), "not json at all")
+    assert out["jobs"][0]["enabled"] is True
+    (tmp_path / "fresh").mkdir()
+    out2, _ = _write(tmp_path / "fresh", _src(), None)
+    assert out2["jobs"][0]["enabled"] is True, "no live store at all: deploy as generated"
 
 
 def test_the_deploy_script_documents_the_override():

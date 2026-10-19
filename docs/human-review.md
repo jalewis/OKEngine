@@ -57,11 +57,16 @@ and server-side reviewer identity are set, plus one explicit browser trust mode:
 - `OKENGINE_REVIEW_TRUSTED_NETWORK=1` — no login prompt; every browser that can reach the Cockpit
   is trusted to act as the configured reviewer.
 
-Start the narrowly scoped writer explicitly:
+Start the narrowly scoped writer explicitly: enable its profile in the pack `.env`, then deploy.
 
 ```sh
-docker compose --profile review up -d --build
+echo 'COMPOSE_PROFILES=review' >> .env      # append ,review instead if COMPOSE_PROFILES is already set
+bash "$ENGINE_DIR/scripts/deploy.sh"
 ```
+
+`deploy.sh` builds `okengine-review-write` on this deployment's scoped image tag and labels it. A bare
+`docker compose --profile review up -d --build` builds it unlabeled, which post-deploy verification
+reports as UNATTRIBUTED (okengine#1044 [11]).
 
 `okengine-review-write` publishes no host port, mounts the vault read/write, requires bearer auth,
 and exposes only health, assignment, human decision, and machine-check operations. Cockpit never

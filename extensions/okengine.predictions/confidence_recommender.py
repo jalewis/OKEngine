@@ -18,6 +18,12 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Engine cron libs, appended so this extension's own modules keep precedence: staged one level
+# up (/opt/data/scripts/ holds /opt/data/scripts/<id>/), or scripts/cron/ in a repo checkout.
+_ENGINE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(_ENGINE_ROOT))
+sys.path.append(str(_ENGINE_ROOT.parent / "scripts" / "cron"))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import pred_lib as P  # noqa: E402
 
 SIGNAL_WEIGHT = float(os.environ.get(
@@ -206,7 +212,7 @@ def write_outputs(vault: Path, rows: list[dict]) -> tuple[Path, Path]:
                      f"{len(row['events'])} |")
     if not rows:
         lines += ["", "No pending evidence records had complete scored inputs."]
-    dashboard.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    generated_page.write(dashboard, "\n".join(lines) + "\n")
     return jsonl, dashboard
 
 

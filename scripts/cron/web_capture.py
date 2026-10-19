@@ -20,11 +20,13 @@ import socket
 import time
 import urllib.error
 import urllib.request
+from urllib.error import URLError
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
+from http.client import InvalidURL
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
 
 USER_AGENT = os.environ.get("CAPTURE_USER_AGENT", "okf-engine-capture/1.0")
 TIMEOUT = int(os.environ.get("CAPTURE_TIMEOUT", "20"))
@@ -71,6 +73,38 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# RFC 3986 reserved + unreserved characters, plus "%" so existing %XX escapes pass through intact.
+# Everything else (non-ASCII, spaces, controls, and characters a URI may not carry) is percent-encoded
+# from its UTF-8 bytes. An already-valid URI is therefore returned unchanged.
+_URI_SAFE = "!#$%&'()*+,/:;=?@[]~-._"
+
+
+def iri_to_uri(url: str) -> str:
+    """Convert an IRI (a feed link with a non-ASCII host or path) into an ASCII URI.
+
+    http.client encodes the request line as ASCII, so a raw IRI raised UnicodeEncodeError out of
+    the request and aborted the whole feed run (okengine#882). The host is IDNA-encoded (split from
+    its port first, so a non-ASCII last label is not punycoded together with ":port"); userinfo,
+    path, query and fragment are percent-encoded as UTF-8, leaving existing escapes intact. An ASCII
+    netloc is never touched, so an already-valid URI is returned byte-for-byte.
+    """
+    parts = urlsplit(url)
+    netloc = parts.netloc
+    if netloc and not netloc.isascii():
+        userinfo, at, hostport = netloc.rpartition("@")
+        host, colon, port = hostport, "", ""
+        if not hostport.startswith("[") and ":" in hostport:
+            host, colon, port = hostport.rpartition(":")
+        try:
+            host = ".".join(label.encode("idna").decode("ascii") if label else label
+                            for label in host.split("."))
+        except UnicodeError as exc:
+            raise CaptureError("invalid-url", f"cannot IDNA-encode capture host: {exc}") from exc
+        netloc = f"{quote(userinfo, safe=_URI_SAFE)}{at}{host}{colon}{quote(port, safe=_URI_SAFE)}"
+    return urlunsplit((parts.scheme, netloc, quote(parts.path, safe=_URI_SAFE),
+                       quote(parts.query, safe=_URI_SAFE), quote(parts.fragment, safe=_URI_SAFE)))
+
+
 def _validate_url(url: str) -> None:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
@@ -93,6 +127,7 @@ def _validate_url(url: str) -> None:
 
 class _SafeRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        newurl = iri_to_uri(newurl)  # a Location header may carry an IRI too (okengine#882)
         _validate_url(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -114,6 +149,7 @@ def _retry_after(error: urllib.error.HTTPError, attempt: int) -> float:
 
 def fetch_document(url: str, previous: dict | None = None, *, opener=None) -> tuple[bytes, dict]:
     """Fetch one bounded document and return body plus response metadata."""
+    url = iri_to_uri(url)
     _validate_url(url)
     previous = previous or {}
     headers = {"User-Agent": USER_AGENT,
@@ -154,21 +190,39 @@ def fetch_document(url: str, previous: dict | None = None, *, opener=None) -> tu
                 time.sleep(_retry_after(exc, attempt))
                 continue
             raise CaptureError("http", f"HTTP {exc.code}") from exc
-        except (TimeoutError, urllib.error.URLError, OSError) as exc:
+        except (TimeoutError, URLError, OSError) as exc:
             if attempt < MAX_RETRIES - 1:
                 time.sleep(min(MAX_BACKOFF_S, 2 ** attempt))
                 continue
             raise CaptureError("network", str(exc)) from exc
+        except (ValueError, InvalidURL) as exc:
+            # UnicodeError (a ValueError) or http.client.InvalidURL (an HTTPException, NOT a
+            # ValueError): a URL the HTTP stack still refuses is a per-document failure, never a
+            # crash of the caller's run (okengine#882).
+            raise CaptureError("invalid-url", f"{type(exc).__name__}: {exc}") from exc
     raise CaptureError("network", "retry budget exhausted")  # pragma: no cover - final attempts raise
 
 
 class _HTMLText(HTMLParser):
     BLOCKS = {"article", "blockquote", "br", "div", "h1", "h2", "h3", "h4", "li", "p", "pre"}
     SKIP = {"script", "style", "svg", "template", "noscript"}
+    # Page chrome, not document: always (nav/aside/form), or outside the main content
+    # (header/footer — inside an article they carry its title and byline). Generic HTML5 and
+    # ARIA landmarks, no site knowledge (okengine#886: captured arXiv pages began "Skip to main
+    # content | Search arXiv | ...").
+    CHROME = {"nav", "aside", "form"}
+    CHROME_OUTSIDE_MAIN = {"header", "footer"}
+    CHROME_ROLES = {"navigation", "banner", "contentinfo", "search", "complementary"}
+    MAIN = {"main", "article"}
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
+        self.parts: list[str] = []          # everything readable (the pre-landmark behavior)
+        self.body_parts: list[str] = []     # minus page chrome
+        self.main_parts: list[str] = []     # only inside main/article/role=main
+        self._stack: list[tuple[str, str]] = []   # (tag, "chrome" | "main" | "")
+        self.chrome_depth = 0
+        self.main_depth = 0
         self.skip_depth = 0
         self.title_parts: list[str] = []
         self.in_title = False
@@ -202,8 +256,28 @@ class _HTMLText(HTMLParser):
                 self.canonical = attrs.get("href", "")
             if "license" in rel:
                 self.license = attrs.get("href", "")
-        if tag in self.BLOCKS and self.parts and self.parts[-1] != "\n":
-            self.parts.append("\n")
+        role = attrs.get("role", "").lower()
+        kind = ""
+        if (tag in self.CHROME or role in self.CHROME_ROLES
+                or attrs.get("aria-hidden", "").lower() == "true"
+                or (tag in self.CHROME_OUTSIDE_MAIN and not self.main_depth)):
+            kind = "chrome"
+        elif tag in self.MAIN or role == "main":
+            kind = "main"
+        if tag not in self.VOID:
+            self._stack.append((tag, kind))
+            self.chrome_depth += kind == "chrome"
+            self.main_depth += kind == "main"
+        if tag in self.BLOCKS:
+            self._newline()
+
+    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+            "source", "track", "wbr"}
+
+    def _newline(self):
+        for parts in (self.parts, self.body_parts, self.main_parts):
+            if parts and parts[-1] != "\n":
+                parts.append("\n")
 
     def handle_endtag(self, tag):
         tag = tag.lower()
@@ -211,8 +285,16 @@ class _HTMLText(HTMLParser):
             self.skip_depth -= 1
         if tag == "title":
             self.in_title = False
-        if tag in self.BLOCKS and self.parts and self.parts[-1] != "\n":
-            self.parts.append("\n")
+        # Close back to the matching open tag, tolerating unclosed children (real-world HTML).
+        for i in range(len(self._stack) - 1, -1, -1):
+            if self._stack[i][0] == tag:
+                for _t, kind in self._stack[i:]:
+                    self.chrome_depth -= kind == "chrome"
+                    self.main_depth -= kind == "main"
+                del self._stack[i:]
+                break
+        if tag in self.BLOCKS:
+            self._newline()
 
     def handle_data(self, data):
         if self.skip_depth:
@@ -223,6 +305,10 @@ class _HTMLText(HTMLParser):
         if self.in_title:
             self.title_parts.append(value)
         self.parts.append(value + " ")
+        if not self.chrome_depth:
+            self.body_parts.append(value + " ")
+            if self.main_depth:
+                self.main_parts.append(value + " ")
 
 
 def text_fingerprint(text: str) -> str:
@@ -243,6 +329,24 @@ def text_fingerprint(text: str) -> str:
     return hashlib.sha256(" ".join(text.split()).encode()).hexdigest()
 
 
+MIN_MAIN_CHARS = int(os.environ.get("CAPTURE_MIN_MAIN_CHARS", "200"))
+
+
+def _render(parts: list[str]) -> str:
+    return "\n".join(line.strip() for line in "".join(parts).splitlines() if line.strip())
+
+
+def _best_text(parser: "_HTMLText") -> str:
+    """The document's own text: its main content when the page marks one, else the page minus
+    chrome, else everything — the first that is substantive. Never less than the pre-landmark
+    extraction, so a page without landmarks or with malformed markup extracts exactly as before."""
+    for candidate in (parser.main_parts, parser.body_parts):
+        text = _render(candidate)
+        if len("".join(text.split())) >= MIN_MAIN_CHARS:
+            return text
+    return _render(parser.parts)
+
+
 def extract(body: bytes, content_type: str, final_url: str) -> dict:
     text = body.decode("utf-8", errors="replace")
     if content_type == "text/plain":
@@ -253,8 +357,7 @@ def extract(body: bytes, content_type: str, final_url: str) -> dict:
         parser.feed(text)
     except Exception as exc:
         raise CaptureError("extraction", str(exc)) from exc
-    rendered = "\n".join(
-        line.strip() for line in "".join(parser.parts).splitlines() if line.strip())
+    rendered = _best_text(parser)
     if not rendered:
         raise CaptureError("extraction", "HTML yielded no readable text")
     canonical = urljoin(final_url, parser.canonical) if parser.canonical else final_url

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+from json import JSONDecodeError
 import os
 import re
 import subprocess
@@ -14,13 +15,14 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from yaml import YAMLError
 
 from okengine.compat import engine_root
 
 
-_NAME = re.compile(r"^[a-z][a-z0-9-]{1,79}$")
-_RUN_ID = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
-_LOCK = re.compile(r"^[a-z0-9][a-z0-9/_.-]{0,120}$")
+_NAME = re.compile(r"^[a-z][a-z0-9-]{1,79}\Z")
+_RUN_ID = re.compile(r"^[A-Za-z0-9._:-]{1,160}\Z")
+_LOCK = re.compile(r"^[a-z0-9][a-z0-9/_.-]{0,120}\Z")
 _ARG_TYPES = {"boolean", "string", "int", "float", "page-ref", "enum"}
 _EXECUTION = {"deterministic", "model", "mixed"}
 
@@ -160,7 +162,7 @@ def discover(deployment: Path) -> dict[str, dict[str, Any]]:
     for source in sorted(set(candidates)):
         try:
             raw = yaml.safe_load(source.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError) as exc:
+        except (OSError, YAMLError) as exc:
             raise OperationsError(f"cannot read operation manifest {source}: {exc}") from exc
         manifest = _validate(raw, source, deployment)
         previous = operations.get(manifest["name"])
@@ -226,7 +228,7 @@ def _find_receipt(deployment: Path, run_id: str) -> tuple[Path, dict[str, Any]]:
         raise OperationsError("operation receipt not found" if not matches else "ambiguous run id")
     try:
         receipt = json.loads(matches[0].read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, JSONDecodeError) as exc:
         raise OperationsError(f"invalid operation receipt: {matches[0]}") from exc
     return matches[0], receipt
 
@@ -293,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
             # glob-ok: receipt namespace is operation/run.json by contract
             for path in sorted(base.glob("*/*.json"), reverse=True) if base.is_dir() else []:
                 try: row = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError): continue
+                except (OSError, JSONDecodeError): continue
                 if args.operation and row.get("operation") != args.operation: continue
                 rows.append({key: row.get(key) for key in
                              ("run_id", "operation", "status", "started_at", "finished_at")})
@@ -347,7 +349,7 @@ def main(argv: list[str] | None = None) -> int:
                 target.write_text(json.dumps(request, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             _json(request)
             return 0
-    except (OperationsError, OSError, yaml.YAMLError) as exc:
+    except (OperationsError, OSError, YAMLError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     return 2

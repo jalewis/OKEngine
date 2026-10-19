@@ -4,10 +4,19 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import re
 from pathlib import Path
 
 import yaml
+from yaml import YAMLError
+
+# Engine cron libs, appended so this extension's own modules keep precedence: staged one level
+# up (/opt/data/scripts/ holds /opt/data/scripts/<id>/), or scripts/cron/ in a repo checkout.
+_ENGINE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(_ENGINE_ROOT))
+sys.path.append(str(_ENGINE_ROOT.parent / "scripts" / "cron"))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 
 OUTCOMES = ("unrestricted", "capped-held", "human-review")
 REQUIRED_FIELDS = ("subject", "question", "claim", "status", "as_of", "confidence",
@@ -18,7 +27,7 @@ ABSENCE_REQUIRED_FIELDS = ("expected_observation", "expected_under", "search_sco
                            "detection_probability", "collection_bias", "collection_requirement",
                            "would_strengthen", "would_weaken")
 _FM = re.compile(r"\A---[ \t]*\n(.*?)\n---(?:\n|\Z)", re.S)
-_UTC_SECOND = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_UTC_SECOND = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
 
 
 def _record_sort_key(record: dict) -> tuple[int, str, str, str, str]:
@@ -258,7 +267,7 @@ def _load(path: Path) -> dict | None:
         match = _FM.match(path.read_text(encoding="utf-8"))
         data = yaml.safe_load(match.group(1)) if match else None
         return data if isinstance(data, dict) else None
-    except (OSError, yaml.YAMLError):
+    except (OSError, YAMLError):
         return None
 
 
@@ -270,7 +279,7 @@ def assessment_types(vault: Path) -> set[str]:
         declared = schema.get("assessment_types") or []
         if isinstance(declared, list):
             out.update(str(v) for v in declared if str(v).strip())
-    except (OSError, yaml.YAMLError):
+    except (OSError, YAMLError):
         pass
     return out
 
@@ -293,9 +302,9 @@ def main() -> int:
         rows.append(render_assessment(
             record, result, page=str(path.relative_to(vault / "wiki").with_suffix(""))))
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("---\ntype: dashboard\nid: dashboard:adversarial-evidence-review\n"
-                   "title: Adversarial evidence review\n---\n\n# Adversarial evidence review\n\n" +
-                   ("\n".join(rows) if rows else "_No assessment records found._\n"), encoding="utf-8")
+    generated_page.write(out, "---\ntype: dashboard\nid: dashboard:adversarial-evidence-review\n"
+                         "title: Adversarial evidence review\n---\n\n# Adversarial evidence review\n\n" +
+                         ("\n".join(rows) if rows else "_No assessment records found._\n"))
     print(json.dumps({"wakeAgent": False}))
     return 0
 

@@ -217,6 +217,7 @@ async function openReviewQueue(offset = 0, presetTypes = null) {
     const opts = (values, selected) => `<option value="">all</option>` + values.map(v => `<option value="${esc(v)}" ${v===selected?"selected":""}>${esc(v)}</option>`).join("");
     c.innerHTML = `<div class="review-queue-head"><strong>${d.total} awaiting review</strong><span>showing ${d.total ? d.offset + 1 : 0}–${Math.min(d.total,d.offset+d.items.length)}</span></div>` +
       `<div class="review-metrics"><span>oldest ${d.metrics.oldest_days ?? "—"}d</span><span>assigned ${d.metrics.assigned}</span><span>decisions 30d ${d.metrics.throughput_30d}</span><span>reopened ${d.metrics.reopened}</span></div>` +
+      reviewGlossary(d.glossary) +
       `<div class="review-filters">` +
       `<label>reason<select data-review-filter="reason">${opts(Object.keys(d.facets.reasons||{}),reviewFilters.reason)}</select></label>` +
       `<label>type<select data-review-filter="page_type">${opts(Object.keys(d.facets.types||{}),reviewFilters.page_type)}</select></label>` +
@@ -847,6 +848,26 @@ function reviewAffordance(d) {
     `<div id="review-workspace"></div>`;
 }
 
+// okengine#823: a reason code is an identifier the system invented. Rendering it bare ("why is
+// this page here?" -> "legacy-unspecified") asks the reviewer to know the engine's vocabulary.
+// The server explains exactly the codes present; an unregistered one says so rather than
+// showing jargon.
+function reviewGlossary(rows) {
+  if (!rows || !rows.length) return "";
+  return `<details class="review-glossary" open><summary>What these reasons mean</summary><dl>` +
+    rows.map(r => `<dt><code>${esc(r.code)}</code> — ${esc(r.label)}</dt>` +
+      `<dd>${esc(r.means)}${r.implies ? ` <em>${esc(r.implies)}</em>` : ""}</dd>`).join("") +
+    `</dl></details>`;
+}
+function reviewEffects(effects) {
+  if (!effects) return "";
+  const row = (k, e) => `<tr><td><code>${esc(k)}</code></td><td>${esc(e.judges)}</td>` +
+    `<td class="rq-${esc(e.quarantine)}">${esc(e.quarantine)}</td>` +
+    `<td>${e.note_required ? "required" : "optional"}</td></tr>`;
+  return `<h3>What each decision does</h3><table class="review-effects">` +
+    `<thead><tr><th>Decision</th><th>Judges</th><th>Quarantine</th><th>Note</th></tr></thead><tbody>` +
+    Object.entries(effects).map(([k, e]) => row(k, e)).join("") + `</tbody></table>`;
+}
 function reviewReasons(rows) {
   return (rows || []).map(r => `<li><b>${esc(r.code || "review")}</b>${r.field ? ` · ${esc(r.field)}` : ""}` +
     `<span>${esc(r.detail || "")}</span></li>`).join("");
@@ -877,6 +898,9 @@ async function openReview(path) {
       `<div class="review-head"><strong>Review current version ${d.version}</strong><span>${esc(d.state)}</span></div>` +
       decisionContext +
       `<h3>Why this needs review</h3><ul class="review-reasons">${reviewReasons(d.reasons)}</ul>` +
+      reviewGlossary(d.reason_glossary) +
+      reviewEffects(dc.effects) +
+      (dc.version_lock ? `<p class="review-lock">${esc(dc.version_lock)}</p>` : "") +
       `<h3>Evidence · ${d.evidence_resolved}/${d.evidence_total} linked</h3><div class="review-evidence">${reviewEvidence(d.evidence)}</div>` +
       (machine ? `<h3>Machine checks (not human approval)</h3><ul>${machine}</ul>` : "") +
       (history ? `<h3>Decision history</h3><ul>${history}</ul>` : "") +

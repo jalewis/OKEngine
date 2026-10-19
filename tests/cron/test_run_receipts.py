@@ -945,3 +945,165 @@ def test_multi_input_with_no_edge_never_claims_acceptance(tmp_path):
     assert [item["disposition"] for item in got["items"]] == [
         "deferred-for-review", "deferred-for-review"]
     assert all("writes" not in item for item in got["items"])
+
+
+# --- okengine#817: a wakeAgent=false gate means no agent ever ran. A run that was never asked to
+# do anything cannot have written anything, and demanding a write of it turns every CORRECT skip
+# into a failure. On one live vault that held six lanes red for up to three weeks, each having
+# rightly decided there was no work: base-rates, grade, output-outcome-eval, prediction-schema-drain,
+# regrade, publisher-canonical-drain.
+
+
+def _run_contract_job():
+    return {"id": "lane-1", "output_contract": {"completion": "run"},
+            "_okengine_executed_writes": []}
+
+
+def test_a_gate_skipped_run_owes_no_write(tmp_path):
+    assert r.verify_run_completion(_run_contract_job(),
+                                   datetime(2026, 9, 2, tzinfo=timezone.utc),
+                                   tmp_path, gate_skipped=True) == []
+
+
+def test_a_run_that_actually_ran_still_owes_a_write(tmp_path):
+    """The exemption is for a skipped agent, not for an agent that ran and wrote nothing."""
+    with pytest.raises(r.ReceiptError, match="at least one verified write"):
+        r.verify_run_completion(_run_contract_job(),
+                                datetime(2026, 9, 2, tzinfo=timezone.utc),
+                                tmp_path, gate_skipped=False)
+
+
+def test_the_exemption_defaults_off(tmp_path):
+    """An older caller that does not pass the flag must keep the strict behaviour."""
+    with pytest.raises(r.ReceiptError, match="at least one verified write"):
+        r.verify_run_completion(_run_contract_job(),
+                                datetime(2026, 9, 2, tzinfo=timezone.utc), tmp_path)
+
+
+def test_a_gate_skipped_run_still_verifies_writes_it_did_make(tmp_path):
+    """Belt and braces: exemption means 'owes none', not 'skip verification of real ones'."""
+    (tmp_path / "predictions").mkdir(parents=True)
+    (tmp_path / "predictions" / "p1.md").write_text("---\ntype: prediction\n---\n", encoding="utf-8")
+    job = {"id": "lane-1", "output_contract": {"completion": "run"},
+           "_okengine_executed_writes": [{"path": "wiki/predictions/p1.md"}]}
+    verified = r.verify_run_completion(job, datetime(2026, 9, 2, tzinfo=timezone.utc), tmp_path)
+    assert verified and verified[0]["path"] == "predictions/p1.md"
+
+
+# --- okengine#878: batch-triage lanes are judged per selected item --------------------------------
+# A triage batch whose every item is correctly deferred wrote nothing. Under `completion: run`
+# that failed ("requires at least one verified write"); per-item completion accepts it as long as
+# every selected item carries a reasoned disposition. Driven through a REAL selector and a REAL
+# extension contract so the pieces are proven to fit, not just each in isolation.
+
+_REPO = Path(__file__).parents[2]
+_PRED = _REPO / "extensions" / "okengine.predictions"
+
+
+def _prediction_contract(op):
+    import yaml
+    manifest = yaml.safe_load((_PRED / "extension.yaml").read_text(encoding="utf-8"))
+    return manifest["operations"][op]["output_contract"]
+
+
+def _grade_selection(tmp_path, monkeypatch, capsys):
+    """Run the real grade selector over a vault with two overdue predictions."""
+    import re
+    import sys
+    vault = tmp_path / "vault"
+    preds = vault / "wiki" / "predictions"
+    preds.mkdir(parents=True)
+    for slug in ("p1", "p2"):
+        (preds / f"{slug}.md").write_text(
+            f"---\ntype: prediction\nstatus: open\nresolves_by: 2026-09-01\n---\n# {slug}\n")
+    manifest = tmp_path / "selections" / "grade.json"
+    monkeypatch.setenv("WIKI_PATH", str(vault))
+    monkeypatch.setenv("OKENGINE_SELECTION_MANIFEST", str(manifest))
+    monkeypatch.setenv("OKENGINE_LANE_ID", "lane-878")
+    monkeypatch.setenv("OKENGINE_CONTRACT_DIGEST", "sha256:contract-878")
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-09-20")
+    monkeypatch.syspath_prepend(str(_PRED))
+    spec_ = importlib.util.spec_from_file_location(
+        "grade_selector_878", _PRED / "select_predictions_for_grading.py")
+    selector = importlib.util.module_from_spec(spec_)
+    sys.modules["grade_selector_878"] = selector
+    spec_.loader.exec_module(selector)
+    assert selector.main() == 0
+    template = json.loads(re.search(r"```okengine-receipt\n(\{.*?\})\n```",
+                                    capsys.readouterr().out, re.S).group(1))
+    return vault / "wiki", manifest, template
+
+
+def _triage_job(manifest, contract):
+    return {"id": "lane-878", "output_contract_digest": "sha256:contract-878",
+            "selection_manifest": str(manifest), "output_contract": contract,
+            # the agent read every page (tool calls ran) and wrote nothing
+            "_okengine_executed_tool_calls": 2, "_okengine_executed_writes": []}
+
+
+def test_all_deferred_triage_receipt_verifies_with_zero_writes(tmp_path, monkeypatch, capsys):
+    wiki, manifest, template = _grade_selection(tmp_path, monkeypatch, capsys)
+    for item in template["items"]:
+        item.update(disposition="deferred-for-review",
+                    reason="resolution evidence not yet published", writes=[])
+    response = "```okengine-receipt\n" + json.dumps(template) + "\n```"
+    job = _triage_job(manifest, _prediction_contract("grade"))
+
+    receipt, result = r.verify_response(job, response, wiki)
+
+    assert result["valid"], result["errors"]
+    assert result["counts"]["selected"] == 2
+    assert result["counts"]["deferred-for-review"] == 2
+    assert result["counts"]["accepted"] == 0 and result["counts"]["updated"] == 0
+    # ...and the whole-run write check no longer applies to this lane at all.
+    assert r.verify_run_completion(job, datetime(2026, 9, 20, tzinfo=timezone.utc), wiki) == []
+
+
+def test_whole_run_prediction_lane_with_zero_writes_still_fails(tmp_path):
+    """The deliberate boundary: a publishing lane that woke and wrote nothing is a failure."""
+    contract = _prediction_contract("forecast-review")
+    assert contract["completion"] == "run"
+    job = {"id": "lane-fr", "output_contract": contract, "_okengine_executed_writes": []}
+    with pytest.raises(r.ReceiptError, match="at least one verified write"):
+        r.verify_run_completion(job, datetime(2026, 9, 20, tzinfo=timezone.utc), tmp_path)
+
+
+def test_printed_receipt_vocabulary_is_exactly_what_the_runner_accepts():
+    """The selector-side template and the runner's validator must agree on dispositions."""
+    import sys
+    sys.path.insert(0, str(_REPO / "scripts" / "cron"))
+    import selection_manifest
+    assert set(selection_manifest.RECEIPT_DISPOSITIONS) == r.TERMINAL
+
+
+def test_printed_receipt_template_is_the_exact_runner_identity(tmp_path, capsys):
+    """The template is what the model copies: api 1, the manifest identity, one item per key,
+    and (absent an explicit target) the selected page itself as the write placeholder."""
+    import sys
+    sys.path.insert(0, str(_REPO / "scripts" / "cron"))
+    import selection_manifest as sm
+    manifest = {"lane_id": "lane-1", "contract_digest": "sha256:c", "input_digest": "sha256:i",
+                "selected": ["wiki/predictions/p1.md|sha256:abc", "wiki/entities/e.md"]}
+
+    sm.print_receipt_template(manifest, {"wiki/entities/e.md": "predictions/new.md"})
+
+    out = capsys.readouterr().out
+    template = sm.receipt_template(manifest, {"wiki/entities/e.md": "predictions/new.md"})
+    assert "```okengine-receipt\n" + json.dumps(template, indent=2) + "\n```" in out
+    assert template["api"] == 1
+    assert [i["writes"][0]["path"] for i in template["items"]] == [
+        "wiki/predictions/p1.md", "predictions/new.md"]
+    assert all(i["writes"][0]["sha256"] is None for i in template["items"])
+    parsed = r.parse_response(out[out.index("```okengine-receipt"):],
+                              {"lane_id": "lane-1", "contract_digest": "sha256:c",
+                               "input_digest": "sha256:i", "selected": manifest["selected"]})
+    assert [i["key"] for i in parsed["items"]] == manifest["selected"]
+
+
+def test_print_receipt_template_is_silent_for_an_empty_selection(capsys):
+    import sys
+    sys.path.insert(0, str(_REPO / "scripts" / "cron"))
+    import selection_manifest as sm
+    sm.print_receipt_template({"lane_id": "", "contract_digest": "", "input_digest": "",
+                               "selected": []})
+    assert capsys.readouterr().out == ""

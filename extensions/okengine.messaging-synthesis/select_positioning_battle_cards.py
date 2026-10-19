@@ -112,7 +112,12 @@ def main() -> int:
     print()
     for seg_key, comp_slug, comp in stale:
         card_path = f"briefings/positioning-{seg_key}-{comp_slug.split('/')[-1]}"
-        print(f"--- segment={seg_key} competitor=[[{comp_slug}]] -> write to {card_path} ---")
+        # A card path is stable per (segment, competitor), so a refresh is an UPDATE: creating it
+        # again is refused "already exists" (okengine#877). Say which, so the prompt picks the tool.
+        competitor = comp_slug.split("/")[-1]
+        exists = "yes" if (CARDS_DIR / f"positioning-{seg_key}-{competitor}.md").is_file() else "no"
+        print(f"--- segment={seg_key} competitor=[[{comp_slug}]] -> write to {card_path} "
+              f"(exists: {exists}) ---")
         print(f"  title={comp.get('title')} updated={comp.get('updated')}")
         for a in comp.get("activity", []):
             print(f"    - {a}")

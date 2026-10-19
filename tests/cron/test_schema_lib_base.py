@@ -110,6 +110,41 @@ def test_type_owner_and_field_owners(tmp_path):
     }, "lacuna") == "ext:okengine.lacuna", "composed owner map is authoritative"
 
 
+def test_the_pack_placeholder_is_not_an_owner():
+    """okengine#1026: compose records `pack` as bookkeeping. Red before: type_owner returned it,
+    so no pack owned its own types. `engine` (core types) is unchanged by this fix."""
+    m = _load()
+    composed = {"types": {"malware": {"owner": "okpack-a"}, "vendor": {}, "concept": {}},
+                "owners": {"types": {"malware": "pack", "vendor": "pack", "concept": "engine"}}}
+    assert m.type_owner(composed, "malware") == "okpack-a"
+    assert m.type_owner(composed, "vendor") == "pack", "no real owner: stays as on main, never None"
+    assert m.type_owner(composed, "concept") == "engine"
+    # only the placeholder itself defers: a real principal (sorting after it) is kept, and a
+    # placeholder built at runtime (not the interned literal) still defers
+    built = "".join(["pa", "ck"])
+    assert m.type_owner({"types": {"t": {"owner": "okpack-a"}},
+                         "owners": {"types": {"t": "team-x"}}}, "t") == "team-x"
+    assert m.type_owner({"types": {"t": {"owner": "okpack-a"}},
+                         "owners": {"types": {"t": built}}}, "t") == "okpack-a"
+
+
+def test_the_composed_owner_of_a_real_pack_composition_is_its_declared_owner(tmp_path):
+    m = _load()
+    root = _vault(tmp_path, (
+        "types:\n"
+        "  malware: {required: [type], owner: okpack-a}\n"
+        "  vendor: {required: [type]}\n"
+    ))
+    composed, errors = m.compose_schema(root, fragments=[
+        ("ext:okengine.lacuna", {"owns": {"types": {"lacuna": {"required": ["type"]}}}})])
+    assert not errors, errors
+    assert composed["owners"]["types"]["malware"] == "pack", "the bookkeeping is unchanged"
+    assert m.type_owner(composed, "malware") == "okpack-a"
+    assert m.type_owner(composed, "vendor") == "pack"
+    assert m.type_owner(composed, "concept") == "engine", "core types: unchanged here"
+    assert m.type_owner(composed, "lacuna") == "ext:okengine.lacuna"
+
+
 def test_required_unions_and_pack_can_opt_into_strict_types(tmp_path):
     m = _load()
     # a pack that adds a global required field AND tries to set strict_types: true

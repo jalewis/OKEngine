@@ -107,7 +107,7 @@ new file mode 100644
 index 000000000..937e7d8a3
 --- /dev/null
 +++ b/tests/tools/test_okengine_write_telemetry.py
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,176 @@
 +"""Write receipts require dispatched OKEngine MCP success, not turn prose."""
 +
 +import concurrent.futures
@@ -142,6 +142,43 @@ index 000000000..937e7d8a3
 +    receipt = parse_okengine_write_result(NAME, json.dumps({"result": text}))
 +    assert receipt == {"operation": operation, "path": path,
 +                       "version": version, "tool": NAME}
++
++
++# A per-lane write server's name can exceed the provider's 64-char tool-name limit, and the clamp
++# truncates BEFORE the `__` that separates server from tool. Requiring three `__` components
++# dropped every write those lanes made, and their runs then failed a completion contract while the
++# pages had genuinely changed on disk (v199->v200).
++@pytest.mark.parametrize("server,tool", [
++    ("okengine-write-okengine-predictions-prediction-falsification-search", "append_section"),
++    ("okengine-write-okengine-predictions-candidate-watch", "create_entity"),
++])
++def test_a_clamped_write_tool_name_is_still_recognised(server, tool):
++    from tools.mcp_tool_schema import mcp_prefixed_tool_name
++
++    clamped = mcp_prefixed_tool_name(server, tool)
++    assert len(clamped) <= 64 and clamped.count("__") == 1, clamped
++    receipt = parse_okengine_write_result(
++        clamped, '{"result":"created entities/shard/one.md v2"}')
++    assert receipt is not None and receipt["path"] == "entities/shard/one.md"
++
++
++@pytest.mark.parametrize("not_a_name", [None, 123, b"mcp__okengine_write__create_entity"])
++def test_a_non_string_tool_name_is_rejected(not_a_name):
++    """Dispatch metadata is wire-shaped, not guaranteed typed: the pre-#840 parser guarded this
++    (`if isinstance(name, str) else []`) and the rewrite must keep doing so rather than raising
++    inside telemetry and losing the whole run's writes."""
++    assert parse_okengine_write_result(
++        not_a_name, '{"result":"created entities/a.md v1"}') is None
++
++
++def test_a_short_name_keeps_its_three_components(self_check=None):
++    """The natural form must not regress while the clamped one is accepted."""
++    from tools.mcp_tool_schema import mcp_prefixed_tool_name
++
++    natural = mcp_prefixed_tool_name("okengine-write-okengine-lacuna", "append_section")
++    assert natural.count("__") == 2, natural
++    assert parse_okengine_write_result(
++        natural, '{"result":"created entities/shard/one.md v2"}') is not None
 +
 +
 +@pytest.mark.parametrize("name,result", [
@@ -252,7 +289,7 @@ new file mode 100644
 index 000000000..6cb540be9
 --- /dev/null
 +++ b/tools/okengine_write_telemetry.py
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,113 @@
 +"""Execution-time OKEngine MCP write receipts for one cron fire.
 +
 +The MCP write server's result is the canonical post-shard path. Model-authored
@@ -299,12 +336,37 @@ index 000000000..6cb540be9
 +    return raw
 +
 +
++def _is_write_server_tool(name: object) -> bool:
++    """Is this the dispatched name of an okengine write-server tool?
++
++    Accepts the CLAMPED form as well as the natural one. `mcp_prefixed_tool_name` shortens any
++    name over the provider's 64-char limit to `<truncated>_<8-hex>`, and the truncation can fall
++    before the `__` that separates server from tool -- so a long-named per-lane write server
++    arrives as TWO `__`-separated components, not three:
++
++        mcp__okengine_write_okengine_predictions_prediction_falsification_search__append_section
++        -> mcp__okengine_write_okengine_predictions_prediction_fal_4a3004f3
++
++    Requiring three components dropped every write those lanes made (okengine#840). The run read
++    `writes=[]` and its completion contract failed a run that had genuinely written: on one live
++    vault `predictions/ai-output-provenance-lacuna-fill` went v199->v200 on disk while its receipt
++    recorded nothing. Short-named lanes were unaffected, so it looked lane-specific for weeks.
++
++    The `okengine_write` prefix must still end on a component boundary, so a different server
++    called `okengine_writer` is NOT a write server.
++    """
++    if not isinstance(name, str):
++        return False
++    parts = name.split("__", 2)
++    if len(parts) < 2 or parts[0] != "mcp":
++        return False
++    server = parts[1]
++    return server == "okengine_write" or server.startswith("okengine_write_")
++
++
 +def parse_okengine_write_result(name: str, result: object) -> dict | None:
 +    """Accept an exact write-server success line from a dispatched MCP result."""
-+    parts = name.split("__", 2) if isinstance(name, str) else []
-+    if (len(parts) != 3 or parts[0] != "mcp"
-+            or not (parts[1] == "okengine_write"
-+                    or parts[1].startswith("okengine_write_"))):
++    if not _is_write_server_tool(name):
 +        return None
 +    try:
 +        payload = json.loads(result) if isinstance(result, str) else result

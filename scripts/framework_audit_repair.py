@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from json import JSONDecodeError
 import os
 import subprocess
 import sys
@@ -27,9 +28,17 @@ AUDITS = {
     "year-derivation": "year_derivation_audit.py",
     "implausible-dates": "check_implausible_dates.py",
 }
+#: name -> (script, vault flag, selector args, verify flag). The selector picks one class of a
+#: multi-class script; the verify flag (None = the script's plain dry-run) makes `verify` fail
+#: while repairable work remains, rather than merely re-running the dry-run.
 REPAIRS = {
-    "body-integrity": ("repair_body_integrity.py", "--vault"),
-    "malformed-slugs": ("repair_malformed_slugs.py", "--vault"),
+    "body-integrity": ("repair_body_integrity.py", "--vault", (), None),
+    "malformed-slugs": ("repair_malformed_slugs.py", "--vault", (), None),
+    # okengine#994 [19]: legacy frontmatter shapes, one selectable class each, so the small
+    # scalar-list run and the bulk wikilink run are separate operator decisions.
+    "legacy-scalars": ("repair_legacy_shapes.py", "--vault", ("--classes", "scalars"), "--verify"),
+    "legacy-wikilinks": ("repair_legacy_shapes.py", "--vault", ("--classes", "wikilinks"),
+                         "--verify"),
 }
 
 
@@ -96,7 +105,7 @@ def audit(argv: list[str]) -> int:
     unknown = sorted(set(checks) - AUDITS.keys())
     if unknown:
         parser.error(f"unknown checks: {', '.join(unknown)}")
-    run_id = f"audit-{_now().replace(':', '').replace('+00:00', 'Z')}-{uuid.uuid4().hex[:8]}"
+    run_id = f"audit-{_now().replace('+00:00', 'Z').replace(':', '')}-{uuid.uuid4().hex[:8]}"
     started = _now()
     children = []
     for name in checks:
@@ -120,11 +129,18 @@ def _load_artifact(deployment: Path, kind: str, artifact_id: str) -> tuple[Path,
     path = base / f"{artifact_id}.json"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, JSONDecodeError) as exc:
         raise AuditRepairError(f"cannot read {kind} {artifact_id}: {exc}") from exc
     if payload.get("kind") != kind:
         raise AuditRepairError(f"artifact is not a {kind}: {artifact_id}")
     return path, payload
+
+
+def _args(name: str, deployment: Path, mode: str = "plan") -> list[str]:
+    """A repair script's argv: its vault, its class selector, then the phase flag."""
+    _script, vault_flag, selector, verify_flag = REPAIRS[name]
+    phase = {"plan": [], "apply": ["--apply"], "verify": [verify_flag] if verify_flag else []}[mode]
+    return [vault_flag, str(deployment), *selector, *phase]
 
 
 def _plan(args: argparse.Namespace) -> int:
@@ -134,10 +150,21 @@ def _plan(args: argparse.Namespace) -> int:
     unknown = sorted(set(repairs) - REPAIRS.keys())
     if unknown:
         raise AuditRepairError(f"unknown repairs: {', '.join(unknown)}")
+    input_digest = _digest(deployment)
+    # The plan records each repair's dry run against the very input it digests, so the operator
+    # approves what apply will do; a dry run that fails leaves no plan to apply.
+    dry_runs = [{"repair": name, **_run(REPAIRS[name][0], deployment, _args(name, deployment))}
+                for name in repairs]
+    failed = [child["repair"] for child in dry_runs if child["exit_code"]]
+    if failed:
+        raise AuditRepairError(f"dry run failed for: {', '.join(failed)}")
+    if _digest(deployment) != input_digest:
+        raise AuditRepairError("deployment changed during the dry run; plan again")
     plan_id = f"repair-{uuid.uuid4().hex}"
     plan = {"api": 1, "kind": "plan", "plan_id": plan_id, "created": _now(),
             "from_audit": audit_receipt["run_id"], "deployment": str(deployment),
-            "input_digest": _digest(deployment), "repairs": repairs, "applied_by": None}
+            "input_digest": input_digest, "repairs": repairs, "applied_by": None,
+            "dry_runs": dry_runs}
     path = deployment / ".okengine/operations/plans" / f"{plan_id}.json"
     _atomic_new(path, plan)
     print(json.dumps(plan, indent=2, sort_keys=True) if args.json else
@@ -155,7 +182,7 @@ def _execute(args: argparse.Namespace, *, verify: bool) -> int:
     for receipt_path in (deployment / ".okengine/operations/runs").glob("repair-*.json"):
         try:
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, JSONDecodeError):
             continue
         if receipt.get("plan_id") == plan["plan_id"] and receipt.get("status") == "succeeded":
             prior.append(receipt)
@@ -169,9 +196,9 @@ def _execute(args: argparse.Namespace, *, verify: bool) -> int:
         raise AuditRepairError("deployment changed since plan; create a fresh repair plan")
     children = []
     for name in plan["repairs"]:
-        script, vault_flag = REPAIRS[name]
-        extra = [vault_flag, str(deployment)] + ([] if verify else ["--apply"])
-        children.append({"repair": name, **_run(script, deployment, extra)})
+        mode = "verify" if verify else "apply"
+        children.append({"repair": name,
+                         **_run(REPAIRS[name][0], deployment, _args(name, deployment, mode))})
     status = "succeeded" if all(child["exit_code"] == 0 for child in children) else "failed"
     action = "verify" if verify else "apply"
     run_id = f"repair-{action}-{uuid.uuid4().hex}"

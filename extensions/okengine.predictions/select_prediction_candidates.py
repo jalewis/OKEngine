@@ -19,8 +19,21 @@ import json
 import os
 import sys
 
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# selection_manifest lives one level UP in the staged layout (/opt/data/scripts/<ext-id>/ ->
+# /opt/data/scripts/) and in scripts/cron in the repo layout. Appended, so no shared lib can
+# shadow a sibling of this extension.
+sys.path.append(str(_HERE.parent))
+sys.path.append(str(_HERE.parents[1] / "scripts" / "cron"))
 import pred_lib as P   # noqa: E402
+from selection_manifest import (  # noqa: E402
+    page_selection_key, print_receipt_template, write_selection_manifest)
+
+SELECTION_MANIFEST = Path(os.environ.get(
+    "OKENGINE_SELECTION_MANIFEST", str(P.selection_manifest_path("candidate-watch"))))
 
 N = int(os.environ.get("PREDICTION_CANDIDATE_BATCH_SIZE", "10"))
 RECENT_DAYS = int(os.environ.get("PREDICTION_CANDIDATE_RECENT_DAYS", "30"))
@@ -63,11 +76,19 @@ def main() -> int:
     print(f"  entities cited by a recent source, no open prediction: {len(cands)}")
 
     if len(cands) < MIN_TO_FIRE:
+        # A no-work run still refreshes the manifest: the runner reads a fresh EMPTY selection as
+        # "owes no receipt", while a stale one from an earlier run would demand one.
+        write_selection_manifest([], SELECTION_MANIFEST)
         print(f"  → SKIP: only {len(cands)} candidate(s) (threshold {MIN_TO_FIRE})")
         print(json.dumps({"wakeAgent": False}))
         return 0
 
     chosen = cands[:N]
+    # One receipt item per surfaced entity. The entity page is the INPUT, not the write target:
+    # a filed prediction is a NEW page in predictions/ whose slug the agent chooses, and
+    # deferring is the expected disposition for most entities.
+    selected = [c[5].relative_to(v).as_posix() for c in chosen]
+    manifest = write_selection_manifest(selected, SELECTION_MANIFEST)
     print(f"  batch: {len(chosen)} of {len(cands)}\n")
     print("=== batch ===")
     print(f"Each entity below is cited by a source from the last {RECENT_DAYS} days. File a "
@@ -79,6 +100,8 @@ def main() -> int:
         print(f"## {i}. {name}  ({typ}, {nh} recent source citation(s), updated {lu})")
         print(f"  page: `{rel}`  ·  subject ref: `[[entities/{slug}]]`\n")
 
+    print_receipt_template(manifest, {key: "predictions/<new-prediction-slug>.md"
+                                      for key in selected})
     print(json.dumps({"wakeAgent": True}))
     return 0
 

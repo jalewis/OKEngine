@@ -25,6 +25,8 @@ def _load():
     return m
 
 
+@pytest.mark.timeout(180)   # walks the whole repo four times; timed out at the 30s default on loaded runners
+                            # in MR pipelines 12994, 12993, 12995 and 13021 (file measured at ~50s on CI)
 def test_findings_have_the_contract_shape():
     m = _load()
     # non-network checks against the real repo — must run without raising and emit well-formed findings
@@ -47,6 +49,47 @@ def test_publish_tree_divergence_is_clean_on_source():
     m.check_publish_tree_divergence()
     hits = [f for f in m._findings if f["dimension"] == "publish-tree-divergence"]
     assert not hits, f"unguarded reads of publish-EXCLUDED paths: {[h['file'] for h in hits]}"
+
+
+def test_publish_divergence_checks_only_retained_readers(tmp_path):
+    m = _load()
+    m.REPO = tmp_path
+    m.PUBLISH = tmp_path / "publish.sh"
+    m.PUBLISH.write_text(
+        'EXCLUDE=(\n"private/secret.md" # comments may contain ) and "fake/path"\n'
+        '"tests/private/" "tests/test_private.py"\n)\n'
+    )
+    readers = (
+        "tests/private/test_nested.py", "tests/test_private.py",
+        "tests/private_extra.py", "tests/test_private.py.extra.py", "scripts/public.py",
+    )
+    for name in readers:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('Path("private/secret.md").read_text()\n')
+    (tmp_path / "tests/test_other.py").write_text('Path("secret.md.backup").read_text()\n')
+    (tmp_path / "tests/test_root.py").write_text('(REPO / "secret.md").read_text()\n')
+    (tmp_path / "tests/test_parts.py").write_text('(ROOT / "private" / "secret.md").read_text()\n')
+    (tmp_path / "tests/test_fixture.py").write_text('(pack / "secret.md").read_text()\n')
+    (tmp_path / "tests/test_guarded.py").write_text(
+        'if Path("private/secret.md").is_file():\n'
+        '    Path("private/secret.md").read_text()\n'
+    )
+
+    m.check_publish_tree_divergence()
+
+    assert {f["file"] for f in m._findings} == {
+        "tests/private_extra.py:1", "tests/test_private.py.extra.py:1", "scripts/public.py:1",
+        "tests/test_root.py:1", "tests/test_parts.py:1",
+    }
+
+
+def test_publish_divergence_rejects_unterminated_exclusions(tmp_path):
+    m = _load()
+    m.PUBLISH = tmp_path / "publish.sh"
+    m.PUBLISH.write_text('EXCLUDE=("private/secret.md"\n')
+    with pytest.raises(ValueError, match="unterminated"):
+        m.check_publish_tree_divergence()
 
 
 def test_importorskip_dependencies_are_bound_to_the_full_suite():

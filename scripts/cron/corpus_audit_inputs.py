@@ -92,17 +92,157 @@ def _iter_pathrefs(fm: dict, non_ref_fields: frozenset[str], pathref_re: Any):
                     yield str(field), target
 
 
+# The C (libyaml) loader parses frontmatter ~5x faster than the pure-Python one, but it is not a
+# drop-in, in BOTH directions:
+# - it REJECTS some documents the pure loader accepts (a JSON-style surrogate-pair `\u` escape, as
+#   a real raw capture carried) -- so a C failure falls back to `yaml.safe_load` for that document;
+# - it ACCEPTS some documents the pure loader rejects, which a fallback cannot catch: tabs as
+#   separators (`a:\tb`, a trailing tab), a block-scalar header followed directly by `#` (`|#`),
+#   `?` inside a flow collection (`{a?}`), a bare `!` tag, and the odd line-break/BOM/control
+#   characters. Those documents never reach the C loader: `_c_loader_safe` routes them to the
+#   pure loader up front. (Found by differential fuzzing of both loaders; the regression test
+#   keeps that fuzz running.)
+# Either way the audit reports what `yaml.safe_load` says, whichever loader happened to run.
+_FAST_LOADER = getattr(yaml, "CSafeLoader", None)
+_C_UNSAFE = re.compile(
+    r"[\t\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\ufeff]"  # tabs, controls, odd breaks, BOM
+    r"|[|>][-+0-9]*#"  # block-scalar header glued to a comment
+    r"|(?:^|[\s\[\]{},])!"  # a tag at a node start (C reads a bare `!` as '', pure as None)
+)
+
+# Past this many bytes without a decision the reader stops streaming and falls back to reading the
+# whole file, exactly as the audit always did. Real frontmatter is a few KB; this only bounds the
+# pathological case, it never changes the answer.
+FRONTMATTER_READ_CAP = 256 * 1024
+
+_OPENER_RE = re.compile(r"---\s*\n\Z")
+_CLOSER_RE = re.compile(r"---\s*\Z")
+_BLANK_RE = re.compile(r"\s*\Z")
+_LINE_RE = re.compile(r"[^\n]*\n|[^\n]+")
+
+
+def _frontmatter_prefix(path: Path, cap: int | None = None) -> str | None:
+    """The leading text of `path` that the audit's frontmatter pattern (`corpus_audit._FM_RE`)
+    needs, or None when the file has no frontmatter.
+
+    okengine#880: the audit used to read every file whole, and a raw tree of 226k captures
+    averaging 12 KB made the corpus-audit cron time out on reading bodies it never looks at. This
+    streams lines and stops at the closing `---`, so a capture's body -- however large, however
+    encoded -- is never read.
+
+    The returned prefix gives the SAME `fm_re.match(...).group(1)` as the whole file would:
+    - newlines are translated exactly as `read_text` does (`\\r\\n` and a lone `\\r` become `\\n`);
+    - a first line that is not `---` + whitespace can never open frontmatter, so it stops there;
+    - the opening `---\\s*\\n` may swallow whitespace-only lines, so a closer is only trusted once
+      a non-blank line has been seen after the opener. Before that, the pattern could still pick a
+      later closer in the whole file (`---\\n\\n---\\nX\\n---` matches with group `---\\nX\\n`),
+      so reading continues;
+    - past `cap` bytes it gives up streaming and returns the whole file.
+    """
+    cap = FRONTMATTER_READ_CAP if cap is None else cap
+    parts: list[str] = []
+    nbytes = 0
+    first = True
+    content = False
+    with path.open("rb") as fh:
+        while raw := fh.readline(cap + 1 - nbytes):
+            if first and not raw.startswith(b"---"):
+                return None  # cannot open frontmatter; don't read a long first line to the end
+            nbytes += len(raw)
+            if nbytes > cap:
+                return path.read_text(encoding="utf-8")
+            chunk = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+            parts.append(chunk)
+            for line in _LINE_RE.findall(chunk):
+                if first:
+                    first = False
+                    if not _OPENER_RE.match(line):
+                        return None
+                    continue
+                if content and _CLOSER_RE.match(line):
+                    return "".join(parts)
+                if not _BLANK_RE.match(line):
+                    content = True
+    return "".join(parts)
+
+
+# Single-character tests below use `in "x"` rather than `== "x"`: the operand is always exactly one
+# character, so the two are the same test, and `in` has no identity/ordering twin (`is`, `<=`) that
+# would be an equivalent mutant.
+_FLOW_EVENT = re.compile(r"[\[\]{}?#\"']")
+_QUOTED = {
+    '"': re.compile(r'"(?:[^"\\]|\\.)*"', re.DOTALL),  # backslash escapes
+    "'": re.compile(r"'(?:[^']|'')*'"),  # '' is an escaped quote
+}
+_COMMENT = re.compile(r"#[^\n]*")
+
+
+def _opens_quoted(text: str, i: int) -> bool:
+    """A quote at `i` inside a flow collection starts a quoted scalar only at a node start: right
+    after `[`, `{` or `,`, or after `:` and whitespace. Mid-scalar it is a literal character."""
+    # Only called inside a flow collection, so an opening bracket always precedes `i` and the
+    # scan back stops on it at the latest -- `j` never runs off the front of the text.
+    j = i - 1
+    while text[j] in " \n":
+        j -= 1
+    return text[j] in "[{," or (text[j] in ":" and text[i - 1] in " \n")
+
+
+def _question_in_flow(text: str) -> bool:
+    """True when a `?` may sit inside a flow collection outside a quoted scalar -- the one place the
+    loaders disagree about `?`. Deliberately over-reports: an unbalanced or literal `[`/`{` only
+    sends more documents to the pure loader, never fewer. (Real captures carry flow lists of
+    double-quoted URLs, `["https://x/?p=1"]`, which this correctly leaves on the fast path.)"""
+    depth = 0
+    event = _FLOW_EVENT.search(text)
+    while event:
+        ch, at, resume = event.group(), event.start(), event.end()
+        if ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth = max(0, depth - 1)
+        elif depth:
+            if ch in "?":
+                return True
+            if ch in "#" and text[at - 1] in " \n":  # depth > 0, so at > 0
+                resume = _COMMENT.match(text, at).end()
+            elif ch in "\"'" and _opens_quoted(text, at):
+                quoted = _QUOTED[ch].match(text, at)
+                if not quoted:
+                    return True  # an unterminated quoted scalar is not trusted
+                resume = quoted.end()
+        event = _FLOW_EVENT.search(text, resume)
+    return False
+
+
+def _c_loader_safe(text: str) -> bool:
+    """True when the C loader cannot disagree with the pure one on `text` by ACCEPTING it."""
+    return not (_C_UNSAFE.search(text) or _question_in_flow(text))
+
+
+def _safe_load(text: str) -> Any:
+    """`yaml.safe_load`'s answer, via the C loader when it is installed and safe for `text`."""
+    if _FAST_LOADER is not None and _c_loader_safe(text):
+        try:
+            return yaml.load(text, Loader=_FAST_LOADER)  # noqa: S506  # nosec B506 - CSafeLoader
+        except Exception:
+            pass  # the pure loader decides, exactly as it always did
+    return yaml.safe_load(text)
+
+
 def _frontmatter(path: Path, fm_re: Any) -> dict | None:
     """Parse frontmatter; None on read race, no frontmatter, or YAML error (counted upstream)."""
     try:
-        text = path.read_text(encoding="utf-8")
+        text = _frontmatter_prefix(path)
     except OSError:
         return None  # vanished mid-scan (mover-lane race) — skip, don't crash
+    if text is None:
+        return None
     m = fm_re.match(text)
     if not m:
         return None
     try:
-        fm = yaml.safe_load(m.group(1))
+        fm = _safe_load(m.group(1))
     except yaml.YAMLError:
         return {}  # parse error — distinct from "no frontmatter"
     return fm if isinstance(fm, dict) else {}

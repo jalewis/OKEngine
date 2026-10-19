@@ -27,6 +27,24 @@ rules:
     override: forbidden
     verified_by: [write, ci, cockpit]
 
+  - id: chat-write-back-floor
+    owner: engine
+    description: >-
+      The model-facing chat writer (chat:<platform>) may create pages and extend existing ones in
+      the knowledge namespaces, never replace an existing body, retire a page (including moving
+      `status` to a retirement value), or touch provenance, handling, review or attestation
+      fields. A pack may replace this capability only inside the engine chat ceiling.
+    severity: reject
+    applies_to: {operation: write}
+    enforcement: [write, ci, deploy]
+    evaluator: field-capability
+    remediation: >-
+      Create the page, or update frontmatter and append to a section; leave provenance, handling
+      and review fields to their owning lanes and to human reviewers, and retiring a page to
+      tombstone_entity and the dedup lanes.
+    override: forbidden
+    verified_by: [write, ci, deploy]
+
   - id: engine-strict-type-namespace
     owner: engine
     description: A knowledge page type must be declared and created in its canonical namespace.
@@ -108,5 +126,61 @@ capabilities:
       - last_updated
       - version
     body: deny
+
+  # okengine#983: the reader/cockpit Chat agent (Hermes api_server) writes ONLY through the
+  # okengine-write-chat server, which ensure-runtime binds to this actor. Every chat write is also
+  # queued for human review by the write path, whatever the capability says.
+  chat:api_server:
+    rule_id: chat-write-back-floor
+    operations: [create, update, append]
+    paths: [entities/**, concepts/**]
+    update_fields: ["*"]
+    protected_fields:
+      - maintained_by
+      - discovered_by
+      - created_by
+      - last_modified_by
+      - extension_id
+      - producer_lane
+      - tlp
+      - sensitivity
+      - tombstone_reason
+      - superseded_by
+      # The keys that make a page a redirect, a stub, retired, or canonical for something else
+      # (converge's _NO_ADD_KEYS): chat never retires or demotes a page (okengine#991).
+      - redirect_to
+      - link_stub
+      - tombstoned
+      - canonical
+      - authority
+      - authority_source_url
+      - authority_verified_fields
+      - rejected_aliases
+      - actor_identity_validated
+      - review_state
+      - review_id
+      - reviewed_by
+      - reviewed_on
+      - reviewed_at
+      - reviewed_version
+      - review_method
+      - review_policy
+      - local_only
+      - export_policy
+      - record_checksum
+      - bounded_auto_accept
+      - retrieved_via
+      - dataset
+      - evidence_role
+      - operator_evidence_refs
+    # okengine#993: chat may set an ordinary status (active, draft, monitoring-active, ...) but
+    # never a value the engine treats as retired (policy_plane.RETIREMENT_STATUSES; compared
+    # case- and whitespace-insensitively). The chat ceiling requires at least these.
+    forbidden_values:
+      status: [tombstoned, superseded, retired]
+    body:
+      create: allow
+      update: deny
+      append: append-only
 
 waivers: []

@@ -80,3 +80,14 @@ snapshot / dry-run / roll-forward machinery when a deployed pack is updated:
   it dry-run-safe now.
 - A migration that raises on load fails the whole `upgrade` loudly (no silent skip).
 - Don't delete a migration once shipped — packs may not have applied it yet.
+- **Declare the release that will ship it as `TO`**, above the current `engine_release`. A pack
+  already pinned at `engine_release` selects only `pin < TO`, so a `TO` copied from an older
+  migration is silently never run on it. The release commit that ships the migration registers it
+  in `SHIPPED_MIGRATIONS` (`tests/test_framework_upgrade.py`), and
+  `test_every_shipped_migration_declares_the_release_that_ships_it` fails until it does, and
+  whenever a shipped migration's `TO` changes or leaves (previous release, shipping release]
+  (okengine#1044 [4]).
+- **A prerelease orders before its final.** A migration declared `TO = "v0.16.0"` does not run on
+  a `v0.16.0-rc1` engine; packs run it on the move to `v0.16.0`. To exercise it on an rc canary,
+  declare the first rc that carries it (`TO = "v0.16.0-rc1"`): packs below the rc run it once, on
+  whichever of the rc or the final they reach first (okengine#1032 [25], okengine#1044 [21]).

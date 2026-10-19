@@ -103,16 +103,18 @@ def _converge(
 ) -> str:
     """Upsert a page by id: merge into a live page that already carries the id
     (page+field ownership), else create + claim. (RFC composable-okpacks §5a.)"""
-    # Ownership arbitration keys on the DEPLOYMENT's pack identity (OKENGINE_PACK, injected by
-    # compose), never on the tool argument: `pack or _prov_pack()` let a caller name the owner and
-    # clobber another pack's owned fields with "0 conflicts" (okengine#662). A differing argument is
-    # refused loudly rather than ignored, so a mis-prompted lane surfaces instead of silently
-    # degrading to non-owner writes. Without the env (a legacy single-pack deploy) the argument is
-    # the only identity there is and keeps working.
+    # Ownership arbitration keys on the pack this writer acts for (the deployment's pack.yaml
+    # name, refined to the pack that owns a server-bound composed lane: okengine.pack_principal,
+    # okengine#1027), never on the tool argument: `pack or _prov_pack()` let a caller name the owner
+    # and clobber another pack's owned fields with "0 conflicts" (okengine#662). A differing argument
+    # is refused loudly rather than ignored, so a mis-prompted lane surfaces instead of silently
+    # degrading to non-owner writes. Only an in-process caller with neither pack.yaml nor
+    # OKENGINE_PACK has no identity, and there the argument is the only one; a served write server
+    # refuses to start in that state.
     deployment = _prov_pack()
     if deployment and pack and pack != deployment:
         return (
-            f"refused: pack identity is deployment-pinned (OKENGINE_PACK={deployment}); "
+            f"refused: pack identity is deployment-pinned ({deployment}); "
             f"a caller cannot act as {pack!r} — omit `pack`"
         )
     pack = deployment or pack  # deployment-pinned provenance + field ownership (okengine#90 P3)
@@ -136,7 +138,7 @@ def _converge(
         return _rr
     fm = _coerce_fm(frontmatter_yaml, p)
     if fm is None:
-        return "rejected: frontmatter_yaml is not a valid YAML mapping"
+        return _fm_reject(frontmatter_yaml)
     receipt_reject = _source_receipt_refuse(fm, p)
     if receipt_reject:
         return receipt_reject
@@ -162,14 +164,13 @@ def _converge(
     fm["id"] = pid
     reg = _registry()
     existing_rel = reg.resolve(pid)
-    # A caller may already know the canonical path while supplying a weaker
-    # identity than the page's authority-backed id (for example title "APT3"
-    # beside the existing MITRE id G0022).  Converge is the actor's only upsert
-    # primitive, so an exact live-path hit must take the governed merge path
-    # instead of falling through to _create and endlessly returning "use
-    # update_entity".  Immutable identity fields are preserved by
-    # merge_frontmatter below; path authorization, tombstones, policy, schema,
-    # ownership, and output-contract checks still apply.
+    # A caller may already know the canonical path while supplying a weaker identity than the
+    # page's authority-backed id (for example title "APT3" beside the existing MITRE id G0022).
+    # Converge is the actor's only upsert primitive, so an exact live-path hit must take the
+    # governed merge path instead of falling through to _create and endlessly returning "use
+    # update_entity". Immutable identity fields are preserved by merge_frontmatter below; path
+    # authorization, tombstones, policy, schema, ownership, and output-contract checks still
+    # apply.
     exact_path_fallback = not existing_rel and p.is_file()
     if exact_path_fallback:
         existing_rel = _rel(p)
@@ -225,7 +226,7 @@ def _converge(
             ftype = str(cur_fm.get("type") or fm.get("type") or "").strip()
             owner = schema_lib.type_owner(schema, ftype)
             fos = schema_lib.field_owners(schema, ftype)
-            rm = [s.strip() for s in (remove or "").split(",") if s.strip()]
+            fm, rm, additive, dropped = converge.additive_gate(str(caller.get("actor") or ""), cur_fm, fm, remove, normalize=lambda d: _normalize_drift(d, p)[0], identity=lambda c: _identity_field_conflicts(schema, ftype, c), fold=id_lib.normalize_key, url_identity=_source_identity_url, alias_ok=lambda a: not (set(reg.name_to_rels.get(id_lib.normalize_key(str(a)), [])) | set(reg.alias_to_rels.get(id_lib.normalize_key(str(a)), []))) - {_rel(p)})
             ownership_principal = authenticated_extension_principal or (pack or None)
             # In-gateway extension operations use a server-bound cron identity,
             # not a network token.  The generated actor is exactly
@@ -255,18 +256,28 @@ def _converge(
             # Normalize before authorization so aliases cannot disguise a protected canonical
             # field. Authorization covers both the existing target type and the resulting type:
             # a vendor-scoped lane may not turn that page into malware during convergence.
+            identity_flags, hold_body, held = _identity_hold(p, cur_fm, merged)  # okengine#1028
+            dec.updated = [k for k in dec.updated if k not in held]
+            dec.removed = [k for k in dec.removed if k not in held]
+            if hold_body and body and body.strip() != cur_body.strip():
+                identity_flags.append(_IDENTITY_BODY_HELD)
+            # okengine#901: an identity-field conflict means another document: keep its body
+            id_conflicts = _identity_field_conflicts(schema, ftype, dec.conflicts + dropped)
+            apply_body = bool(body) and not id_conflicts and not hold_body and (not additive or converge.stub_upgrade(cur_body, body, cur_fm if additive == "same-url" else None))
+            if att := _attestation_reject(p, cur_fm, merged, apply_body and body != cur_body):  # okengine#980
+                return att
             merged, drift = _normalize_drift(merged, p)
+            _converge_alias_rule(merged, cur_fm, dec)  # okengine#864
+            # type-strict and alias-aware, like every write path (okengine#983)
             changed_fields = set(rm)
-            changed_fields.update(
-                key for key in set(cur_fm) | set(merged)
-                if cur_fm.get(key) != merged.get(key)
-            )
+            changed_fields.update(_frontmatter_changes(p, cur_fm, merged))
             cap = _capability_reject(
                 p,
                 "converge",
                 page_type=str(cur_fm.get("type") or ""),
                 changed_fields=changed_fields,
-                body_change="replace" if body else "none",
+                body_change="replace" if apply_body else "none",
+                values=merged, stored=cur_fm,
             )
             if cap:
                 return f"rejected: {cap}"
@@ -277,7 +288,8 @@ def _converge(
                     "converge",
                     page_type=resulting_type,
                     changed_fields=changed_fields,
-                    body_change="replace" if body else "none",
+                    body_change="replace" if apply_body else "none",
+                    values=merged, stored=cur_fm,
                 )
                 if cap:
                     return f"rejected: {cap}"
@@ -290,18 +302,17 @@ def _converge(
                 existing_producer_lane=cur_fm.get("producer_lane"),
             )
             review_invalidation = _apply_review_governance(merged, cur_fm)
-            new_body = (
-                cur_body if not body else body
-            )  # same guard as _create/_update (invariant-audit)
+            new_body = body if apply_body else cur_body  # same guard as _create/_update (audit)
+            admission_reject = _actor_admission_reject(merged, new_body, p, cur_fm) or _actor_grounding_reject(p, merged, cur_fm)  # ownership is no license to retype to actor (#1012)
+            if admission_reject:
+                return admission_reject
             _stamp(merged, cur_fm)
             if pack:
                 merged["last_modified_by"] = pack
-            blr = _briefing_link_reject(
-                p, new_body
-            )  # briefings must cite resolvable pages — the same
+            blr = _briefing_link_reject(p, new_body)  # briefings cite resolvable pages: the same
             if blr:  # guard create/update/patch/append enforce (L3)
                 return f"rejected: {blr}"
-            if body:
+            if apply_body:
                 bir = _body_integrity_reject(cur_body, new_body)
                 if bir:
                     return f"rejected: {bir}"
@@ -327,9 +338,7 @@ def _converge(
             pol = _policy_reject(p, merged, "update", prev=cur_fm)
             if pol:
                 return f"rejected: {pol}"
-            tnr = _type_ns_reject_on_change(
-                p, merged, cur_fm
-            )  # type can't drift out of home ns (audit)
+            tnr = _type_ns_reject_on_change(p, merged, cur_fm)  # type can't leave home ns (audit)
             if tnr:
                 return f"rejected: {tnr}"
             fsr = _fabricated_source_reject(p, merged, prev_fm=cur_fm)
@@ -338,15 +347,21 @@ def _converge(
             msr = _missing_source_reject(p, merged, prev_fm=cur_fm)
             if msr:
                 return msr
+            alr = _alias_shape_reject(p, merged, prev_fm=cur_fm)  # #845
+            if alr:
+                return alr
+            if ttr := _tombstone_transition_refuse(cur_fm, merged, p):  # okengine#863
+                return ttr
             # ...then SOFT review flags (categorical confidence verdict, changed
             # review field) — flag, never block.
             review = (
                 review_invalidation
+                + identity_flags
                 + drift
                 + _review_flags(p, merged, prev=cur_fm)
                 + _identity_contradiction_flags(p, merged)
                 + _unresolvable_link_flags(p, new_body)
-                + (_degeneration_flags(new_body) if body else [])
+                + (_degeneration_flags(new_body) if apply_body else [])
             )  # degenerate body attributable at write (M15)
             contract_reject = _contract_reject(p, "converge", merged, new_body, drift)
             if contract_reject:
@@ -362,7 +377,8 @@ def _converge(
                 return precondition
             _corpus_touch(p)
             _atomic_write_text(p, content)
-            reg.by_id[pid] = _rel(p)
+            if not additive or isinstance(merged.get("id"), str): reg.by_id[merged.get("id") if additive else pid] = _rel(p)  # additive: only the page's own (string) id
+            if _namespace(p) == "entities": converge.record_identity(reg, _rel(p), merged)  # #962: aliases any merge added are visible to the next hijack check
             ver = merged.get("version")
             _append_log(f"- {_today()} mcp-write converge {_rel(p)} (id {pid}) v{ver}")
             flags = list(review)
@@ -372,11 +388,12 @@ def _converge(
                     f"owner value {c!r} kept"
                     for k, c, a in dec.conflicts
                 ]
+            body_note = _identity_body_kept(id_conflicts, flags) if id_conflicts and not apply_body and (body or additive) else ""
             note = _queue_review(p, flags) if flags else ""
             return (
                 f"converged into {_rel(p)} (id {pid}) v{ver}: "
                 f"+{len(dec.added)} added, ~{len(dec.updated)} updated, "
-                f"-{len(dec.removed)} removed, {len(dec.conflicts)} conflict(s){note}"
+                f"-{len(dec.removed)} removed, {len(dec.conflicts)} conflict(s){body_note}{note}"
             )
 
     # New id: authorize the proposed page before create + registry claim. Existing pages take the
@@ -385,8 +402,8 @@ def _converge(
         p,
         "converge",
         page_type=str(fm.get("type") or ""),
-        changed_fields=fm.keys(),
-        body_change="replace" if body else "none",
+        changed_fields=_frontmatter_changes(p, {}, fm),
+        body_change="replace" if body else "none", values=fm,
     )
     if cap:
         return f"rejected: {cap}"
@@ -399,7 +416,6 @@ def _converge(
         if cp is not None:
             reg.by_id[pid] = _rel(cp)
     return result
-
 
 def _is_class_description(generic: str) -> bool:
     """True when a title DESCRIBES an adversary instead of NAMING one.
@@ -425,66 +441,39 @@ def _is_class_description(generic: str) -> bool:
     )
 
 
-_GENERIC_ACTOR_LABELS = frozenset(
-    """
-actor|actors|adversary|ai agent|ai agents|ai attacker|ai attackers|attack group|attacker|attackers
-autonomous llm agent|criminal group|cyber criminals|cybercriminal|cybercriminal group|cybercriminals
-hacker|hacker group|hackers|initial access broker|initial access brokers|intruder|intruders|llm agent
-llm agents|malware campaign|outsider|placeholder|ransomware campaign|ransomware gang|ransomware gangs
-ransomware group|threat actor|threat actor name|threat actors|threat group|unknown|unknown actor
-unknown threat actor|unsafe
-""".strip().replace("\n", "|").split("|")
-)
-
-_NON_ACTOR_DEFINITION = re.compile(
-    r"\b(?:is|was|dubbed|described as|documented)\b.{0,100}\b"
-    r"(?:backdoor|malware|implant|loader|ransomware|stealer|trojan|"
-    r"phishing[- ]as[- ]a[- ]service|phishing (?:service|toolkit)|toolkit)\b",
-    re.I | re.S,
-)
-
-
-def _actor_reserved_titles(page_path: Any = None) -> frozenset[str]:
-    """Return schema-declared exact titles that cannot identify an actor.
-
-    Packs own domain vocabulary, so the engine deliberately knows no country or
-    geopolitical names. A mapping allows a pack to reuse its code-to-label
-    assessment vocabulary through a YAML anchor instead of copying names.
-    """
-    if page_path is None:
-        return frozenset()
-    try:
-        if not isinstance(page_path, Path):
-            page_path = _safe(str(page_path))
-        configured = (
-            (_governing(page_path).get("identity_admission") or {})
-            .get("actor", {})
-            .get("excluded_exact_titles", ())
-        )
-    except (AttributeError, OSError, TypeError, ValueError):
-        return frozenset()
-    values = configured.values() if isinstance(configured, Mapping) else configured
-    if isinstance(values, (str, bytes)) or not hasattr(values, "__iter__"):
-        return frozenset()
-    return frozenset(
-        re.sub(r"[^a-z0-9]+", " ", str(value).casefold()).strip()
-        for value in values
-        if str(value).strip()
-    )
-
-
 def _actor_admission_reject(
-    fm: Mapping[str, Any], body: str = "", page_path: Any = None
+    fm: Mapping[str, Any], body: str = "", page_path: Any = None,
+    prev_fm: Optional[Mapping[str, Any]] = None,
 ) -> str | None:
     """Reject an obvious class label or software subject presented as an actor.
 
     This is deliberately high precision. It is a hard admission boundary, not a general entity
     classifier: uncertain identities pass to normal review, while deterministic errors never land.
+
+    Every declared actor type is judged (okengine#1020); see ``actor_types.is_default_actor_type``
+    for why only the engine's own ``actor`` is re-judged on every write to a stored page
+    (``prev_fm``); a declared type is re-judged when the write renames it (okengine#1014).
     """
-    if str(fm.get("type") or "").strip() != "actor":
+    from okengine import actor_grounding, actor_types  # local: rebound into the facade
+
+    schema = _actor_schema(page_path)
+    if not actor_types.is_actor_type(schema, fm.get("type")):
         return None
-    title = str(fm.get("title") or fm.get("name") or "").strip()
+    if (prev_fm is not None and actor_types.is_actor_type(schema, prev_fm.get("type"))
+            and not actor_types.is_default_actor_type(schema, fm.get("type"))
+            and not actor_grounding.renamed(prev_fm, fm, Path(str(page_path)).stem)):  # #1014
+        return None
+    names = actor_grounding.actor_names(fm)
+    title = str(names[0] if names else "").strip()
     generic = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
+    if not generic:
+        # okengine#846: an actor with no name cannot be checked by anything below, and on one live
+        # vault 45 such pages were live -- `autonomous-ai-attacks`, `auto-color`, a publication --
+        # none of which the name-based guards could see.
+        return (
+            "rejected: an actor page must name the actor (`title`, `name` or `aliases`); without "
+            "a name no identity check can run"
+        )
     if generic in _actor_reserved_titles(page_path):
         return (
             "rejected: configured geopolitical entities are attribution values, not named "
@@ -497,7 +486,7 @@ def _actor_admission_reject(
         )
     plain = re.sub(r"[`*_#]+", " ", body[:4000])
     plain = re.sub(r"\s+", " ", plain).strip()
-    contradictory_kind = actor_identity_error(title, body)
+    contradictory_kind = actor_identity_error(title, body) or _actor_source_identity_error(fm)
     if contradictory_kind:
         return (
             "rejected: page evidence defines the subject as a "
@@ -547,7 +536,6 @@ def _actor_admission_reject(
         )
     return None
 
-
 def _actor_payload_reject(
     frontmatter_yaml: str, body: str = "", page_path: Any = None
 ) -> str | None:
@@ -588,6 +576,7 @@ def _entity_backfill_frontmatter(
         "operational",
     }:
         actor_fm.pop("id", None)
+    from okengine import actor_types
     target = _safe(path)
     schema = _governing(target) if target is not None else {}
     allowed = schema_lib.canonical_types(schema)
@@ -607,7 +596,7 @@ def _entity_backfill_frontmatter(
         if replacement:
             actor_fm["type"] = replacement
             ptype = replacement
-    if ptype == "actor":
+    if actor_types.is_actor_type(schema, ptype):
         actor_type = str(actor_fm.get("actor_type") or "").strip()
         allowed_actor_types = {
             "nation-state",
@@ -644,7 +633,9 @@ def _entity_backfill_frontmatter(
         admission_error = _actor_admission_reject(actor_fm, body, path)
         if admission_error:
             return None, admission_error
-        if actor_type not in allowed_actor_types:
+        # `actor_type` is the engine `actor` type's own field, not a declared type's (#1020)
+        if (actor_types.is_default_actor_type(schema, ptype)
+                and actor_type not in allowed_actor_types):
             return None, (
                 "rejected: entity-backfill type actor requires explicit actor_type "
                 "(nation-state, cybercriminal, hacktivist, insider, "
@@ -749,5 +740,38 @@ def _selected_raw_url(selected: list[Any]) -> str:
         )
     except OSError:
         return ""
+    if text.lstrip().startswith(("{", "[")):
+        return _json_raw_url(text)
     match = re.search(r"(?im)^\s*(?:url|source_url)\s*:\s*(https?://\S+)\s*$", text)
     return match.group(1).strip() if match else ""
+
+
+
+def _json_raw_url(text: str) -> str:
+    """The unambiguous URL of a JSON raw capture, or "". Connector records put the item under
+    `payload`; check the record, then `payload`/`data`, else accept a URL only when it is the ONE
+    distinct URL in the document (a multi-item response has no single identity — never guess)."""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return ""
+
+    def direct(node: Any) -> str:
+        for key in ("url", "source_url"):
+            value = node.get(key) if isinstance(node, dict) else None
+            if isinstance(value, str) and re.match(r"https?://\S+$", value.strip()):
+                return value.strip()
+        return ""
+
+    for node in (doc, doc.get("payload"), doc.get("data")) if isinstance(doc, dict) else ():
+        if direct(node):
+            return direct(node)
+    found: set[str] = set()
+    stack: list[Any] = [doc]
+    while stack:
+        node = stack.pop()
+        found.add(direct(node))
+        if isinstance(node, (dict, list)):
+            stack.extend(node.values() if isinstance(node, dict) else node)
+    found.discard("")
+    return found.pop() if len(found) == 1 else ""

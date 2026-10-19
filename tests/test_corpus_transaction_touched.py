@@ -155,20 +155,24 @@ def test_touch_ignores_paths_outside_the_deployment_and_non_wiki_files(tmp_path,
     assert calls.count(v / "wiki" / "entities" / "p0.md") == 2 and len(calls) == 2
 
 
-def test_unreadable_touched_page_journals_an_unknown_before_digest(tmp_path):
-    import os
-    if os.geteuid() == 0:
-        pytest.skip("root reads everything")
+def test_unreadable_touched_page_journals_an_unknown_before_digest(tmp_path, monkeypatch):
+    # The read failure is injected at the file-open boundary rather than with chmod: root reads a
+    # mode-0 file, and the mutation campaign runs as root, so a permission-based version of this
+    # test skipped there and left the OSError handler unguarded.
     v = _vault(tmp_path, 2)
     target = v / "wiki" / "entities" / "p1.md"
-    target.chmod(0)
-    try:
-        with corpus.mutation(v, writer="t", operation="op", tracking="touched"):
+    real_open = Path.open
+
+    def unreadable(path, mode="r", *args, **kwargs):
+        if path == target and "r" in mode:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_open(path, mode, *args, **kwargs)
+
+    with corpus.mutation(v, writer="t", operation="op", tracking="touched"):
+        with monkeypatch.context() as patched:
+            patched.setattr(Path, "open", unreadable)
             corpus.touch(target)
-            target.chmod(0o644)
-            target.write_text("now readable")
-    finally:
-        target.chmod(0o644)
+        target.write_text("now readable")
     rec = _journal(v)[-1]
     assert rec["affected_paths"][0]["before_sha256"] is None
     assert rec["affected_paths"][0]["after_sha256"]

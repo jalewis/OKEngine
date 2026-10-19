@@ -27,6 +27,7 @@ Status legend: **Shipped** — implemented and live · **Active** — being buil
 | [discovery-spec.md](discovery-spec.md) | **Shipped** | the extension discovery scanner |
 | [scoped-mcp-spec.md](scoped-mcp-spec.md) | **Shipped** | per-extension scoped MCP tokens |
 | [policy-plane.md](policy-plane.md) | **Shipped** | canonical rules, field/body capabilities, audit and enforcement coverage |
+| [actor-identity-qualification.md](actor-identity-qualification.md) | **Active** (design milestone; runtime unimplemented) | optional source-backed role identity, governed writer contract and migration barrier (#972) |
 | [sidecar-contract.md](sidecar-contract.md) | **Shipped** (machinery; live execution operator-opt-in) | sidecar extension contract |
 | [application-profile.md](application-profile.md) | **Shipped** | versioned application composition and conformance contract |
 | [multi-source-entity-resolution.md](multi-source-entity-resolution.md) | **Shipped** | MDM / canonical golden-record overlay (epic #38, closed) |

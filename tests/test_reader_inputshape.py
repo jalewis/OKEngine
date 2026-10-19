@@ -60,32 +60,17 @@ def test_value_text_facade_delegates_to_page_metadata(tmp_path, monkeypatch):
 
 
 # ── #21: the unresolved-embed rglob is memoized across renders ──────────────
-class _CountingWiki:
-    """Proxy for the WIKI Path that counts rglob() calls (the expensive full-vault walk)."""
-    def __init__(self, real):
-        self._real = real
-        self.rglob_calls = 0
-
-    def rglob(self, pat):
-        self.rglob_calls += 1
-        return self._real.rglob(pat)
-
-    def __truediv__(self, other):
-        return self._real / other
-
-    def __getattr__(self, name):
-        return getattr(self._real, name)
-
-
 def test_unresolved_embed_rglob_is_cached(tmp_path, monkeypatch):
     ent = tmp_path / "wiki" / "entities" / "a"
     ent.mkdir(parents=True)
     (ent / "apt29.md").write_text("---\ntitle: APT29\n---\n\nembedded body\n", encoding="utf-8")
     m = _load(tmp_path, monkeypatch)
 
-    spy = _CountingWiki(m.WIKI)
-    monkeypatch.setattr(m, "WIKI", spy)
+    from okengine import vault_lookup_cache as vlc
+    walks = []
+    real = vlc._walk
+    monkeypatch.setattr(vlc, "_walk", lambda root: walks.append(root) or real(root))
     body = "see ![[apt29]]"                               # basename embed → misses flat path
-    assert "embedded body" in m.render_md(body)           # resolves via rglob (walk #1)
+    assert "embedded body" in m.render_md(body)           # resolves via the vault walk (#1)
     m.render_md(body)                                     # second render: served from cache
-    assert spy.rglob_calls == 1                           # pre-fix: 2 (one walk per render)
+    assert len(walks) == 1                                # pre-fix: 2 (one walk per render)

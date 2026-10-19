@@ -127,4 +127,5 @@ the file there:
 - `scripts/cron_pack_split.py` — `regen()` folds `_extension_pass(...)` in (a no-op
   when no extension is enabled, so it's zero-impact on existing deployments).
 - `scripts/deploy-cron-scripts.sh` — stages enabled in-gateway extension scripts into
-  `/opt/data/scripts/<id>/` (#128).
+  `/opt/data/scripts/<id>/` (#128), and reports staged dirs the plan no longer stages
+  (`scripts/staged_extensions.py`); `--prune-stale-extensions` removes them (#994).

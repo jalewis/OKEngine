@@ -3,6 +3,8 @@
 # its published ports live on the dind container's interfaces — the job reaches them at the `docker`
 # service hostname, and they must bind 0.0.0.0 there (the base file binds 127.0.0.1, correct for local
 # runs but unreachable across the job<->dind container boundary). Same ports, just not loopback-pinned.
+# Each job owns a fresh daemon and a unique Compose project. Keep the base container names
+# stable inside that isolated daemon: fault injection and memory probes target those names.
 name: okengine-smoke
 services:
   reader:

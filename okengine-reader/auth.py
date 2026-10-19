@@ -4,6 +4,8 @@ from __future__ import annotations
 import base64
 import hmac
 
+from okengine.http_auth import authorization_header
+
 
 class BasicAuth:
     """ASGI Basic authentication with an unauthenticated health endpoint."""
@@ -14,8 +16,7 @@ class BasicAuth:
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") == "http" and scope.get("path") != "/healthz":
-            headers = dict(scope.get("headers") or [])
-            provided = headers.get(b"authorization", b"").decode()
+            provided = authorization_header(scope)
             if not hmac.compare_digest(provided, self._expected):
                 await send({"type": "http.response.start", "status": 401, "headers": [
                     (b"www-authenticate", b'Basic realm="okengine-reader"'),

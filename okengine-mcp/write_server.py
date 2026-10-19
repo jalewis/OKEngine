@@ -33,6 +33,12 @@ from tools.schema_validator import (
 from tools import policy_plane
 from okengine.mcp import scope as _scope
 from okengine.actor_identity import actor_identity_error, has_positive_actor_identity
+# Rebound write-service code (transport._ScopedWriteAuth) resolves names in THIS module.
+from okengine.http_auth import authorization_header  # noqa: F401
+from okengine import attestation as _attestation  # operator-owned attestation (okengine#980)
+from okengine.field_values import same_value as _same_value  # type-strict "unchanged" (#983)
+from okengine.list_scalars import coerce_list_scalar, split_list_scalar  # list scalars (#1005, #1042)
+from okengine.file_fingerprint import fingerprint  # noqa: F401 — cache key for rebound services (#1017)
 from okengine.corpus_transaction import mutation as _corpus_mutation
 from okengine.corpus_transaction import touch as _corpus_touch
 import output_contract_enforce as _output_contract
@@ -211,6 +217,7 @@ from okengine.write_services import (
     integrity,
     patching,
     policy,
+    raw_sources,
     review,
     state as _write_state,
     transactions,
@@ -237,6 +244,7 @@ _install_services(
         transactions,
         patching,
         convergence,
+        raw_sources,
         transport,
     ),
 )
@@ -295,7 +303,7 @@ try:
         if cred not in range(1, 7):
             return "rejected: credibility must be an integer from 1 through 6"
         result = _update(path, {"reliability": rel, "credibility": cred}, None)
-        if _write_actor == "cron:source-quality-backfill" and not result.startswith(
+        if _write_lane == "cron:source-quality-backfill" and not result.startswith(
             ("rejected:", "refused:", "error:")
         ):
             return (
@@ -335,7 +343,7 @@ try:
         adding a section (## Postmortem) — preserves all existing content. Bumps
         version, logs, review-gates."""
         result = _append_section(path, heading, text)
-        if _write_actor == "cron:page-quality-enrich" and not result.startswith(
+        if _write_lane == "cron:page-quality-enrich" and not result.startswith(
             ("rejected:", "refused:", "error:")
         ):
             return (
@@ -376,7 +384,7 @@ try:
         `pack` is deployment-pinned (OKENGINE_PACK) — omit it; a differing value is refused.
         `remove` is a comma-separated list of fields to drop — permitted only for
         fields the caller owns (a non-owner removal is flagged, not applied)."""
-        if _write_actor == "cron:entity-backfill":
+        if _write_lane == "cron:entity-backfill":
             # The selector embeds source frontmatter as evidence. Local models
             # occasionally copy that page's `sources:*` identity into the new
             # entity payload, which creates a guaranteed cross-namespace ID
@@ -388,7 +396,7 @@ try:
                 return error
             frontmatter_yaml = sanitized or ""
         result = _converge(path, frontmatter_yaml, body, pack, remove, expected_sha256)
-        if _write_actor == "cron:entity-backfill":
+        if _write_lane == "cron:entity-backfill":
             if result.startswith(("rejected:", "refused:", "error:")):
                 return (
                     f"{result}\nTERMINAL: do not retry identical arguments. "
@@ -401,9 +409,11 @@ try:
             )
         return result
 
-    _write_actor = os.environ.get("OKENGINE_WRITE_ACTOR")
+    # The engine lane this server is bound to, with any composed `@<pack>` suffix removed: every
+    # lane check below and the tool fence mean the lane, whichever pack drives it (okengine#961).
+    _write_lane = lane_actor(os.environ.get("OKENGINE_WRITE_ACTOR"))
 
-    if _write_actor == "cron:raw-backfill":
+    if _write_lane == "cron:raw-backfill":
 
         @mcp.tool()
         def converge_source(
@@ -432,30 +442,10 @@ try:
                     "rejected: raw-backfill requires exactly one existing raw/ capture "
                     "in its selection manifest"
                 )
-            # Runner-owned selection evidence is authoritative. Never accept a model-supplied
-            # backlink that could cite an unrelated capture or leave the processed item unmarked.
-            fm["raw"] = raw_ref
-            url = str(fm.get("url") or "").strip()
-            if not url:
-                url = _selected_raw_url(selected)
-                if url:
-                    fm["url"] = url
-            if not url:
-                return "rejected: source url is required"
-            identity_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()
-            fm["id"] = f"sources:url-{identity_hash[:20]}"
-            requested = Path(rel)
-            suffix = requested.suffix or ".md"
-            stem = requested.stem
-            canonical = requested.with_name(f"{stem}-{identity_hash[:8]}{suffix}").as_posix()
-            result = _converge(
-                canonical,
-                yaml.safe_dump(fm, sort_keys=False, allow_unicode=True),
-                body,
-                pack,
-                "",
-                expected_sha256,
-            )
+            # Runner-owned selection evidence is authoritative: the backlink is the selected
+            # capture, never a model-supplied one. Identity + seat are shared with the
+            # deterministic raw-compile lane (okengine#862) so both land one page per URL.
+            result = _converge_raw_source(raw_ref, fm, rel, body, pack, expected_sha256)
             if result.startswith(("rejected:", "refused:", "error:")):
                 return (
                     f"{result}\nTERMINAL: do not retry identical arguments. "
@@ -467,7 +457,7 @@ try:
                 "exact fenced okengine-receipt from the prompt now."
             )
 
-    if _write_actor == "cron:concept-backfill":
+    if _write_lane == "cron:concept-backfill":
 
         @mcp.tool()
         def converge_concept(
@@ -529,13 +519,12 @@ try:
     # OKENGINE_WRITE_TOOLS on that lane's server-bound writer (okengine#664 — the table used to
     # carry a private deployment's cron name, which the publish guard aborts on). Once the env is
     # set it is the single runtime source, for engine and pack lanes alike.
-    _actor_name = os.environ.get("OKENGINE_WRITE_ACTOR")
     _env_tools = os.environ.get("OKENGINE_WRITE_TOOLS", "")
     _allowed_actor_tools: set[str] | None
     if _env_tools.strip():
         _allowed_actor_tools = {t.strip() for t in _env_tools.split(",") if t.strip()}
     else:
-        _allowed_actor_tools = _ACTOR_TOOLS.get(_actor_name) if _actor_name else None
+        _allowed_actor_tools = _ACTOR_TOOLS.get(_write_lane)
     if _allowed_actor_tools is not None:
         for _tool in list(mcp._tool_manager._tools):
             if _tool not in _allowed_actor_tools:
@@ -553,6 +542,12 @@ except ImportError:  # pragma: no cover - mcp absent (e.g. host test env)
 
 
 if __name__ == "__main__":  # pragma: no cover - entry guard, also in exclude_also
+    # okengine#1027: fail closed rather than serve writes that carry no pack identity (Hermes hands
+    # a stdio server only its own `env:` map, so the gateway's OKENGINE_PACK never arrives here).
+    from okengine.pack_principal import startup_refusal as _pack_refusal
+    _refusal = _pack_refusal(Path(os.environ.get("WIKI_PATH") or str(VAULT)), os.environ)
+    if _refusal:
+        raise SystemExit(f"okengine-write refusing to start: {_refusal}")
     if mcp is None:
         raise SystemExit("mcp package not installed; cannot run the server")
     transport = os.environ.get("OKENGINE_WRITE_TRANSPORT", "stdio")

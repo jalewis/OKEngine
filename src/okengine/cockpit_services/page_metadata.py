@@ -649,19 +649,10 @@ def _review_reasons(fm: dict, body: str) -> list[dict]:
     return reasons
 
 
-def _legacy_review_current(fm: dict) -> bool:
-    """Compatibility for pre-ledger sign-offs; new writes invalidate their projection."""
-    reviewed = str(fm.get("reviewed_on") or "")[:10]
-    updated = str(fm.get("last_updated") or fm.get("updated") or fm.get("created") or "")[:10]
-    return bool(reviewed and updated and reviewed >= updated)
-
-
 def _requires_review(fm: dict, body: str) -> bool:
-    if fm.get("needs_review") is True or _GROUNDING_REVIEW.search(body or ""):
-        return True
-    if str(fm.get("type") or "") in _review_required_types():
-        return not (str(fm.get("review_state") or "") == "approved" or _legacy_review_current(fm))
-    return False
+    # One rule for every surface (okengine#842): ledger reconciliation asks the same question from
+    # the CLI, and a second copy would close records this worklist still considers live.
+    return requires_review(fm, body, _review_required_types())
 
 
 def _review_records() -> list[dict]:
@@ -726,6 +717,11 @@ def _review_decision_context(fm: dict) -> dict:
         "defer": "More evidence or analysis is required before deciding.",
         "dismiss": "This review item is duplicate, out of scope, or not applicable.",
         "noun": noun,
+        # What each word DOES, which the panel never said: approval and dismissal release the
+        # content, the other three hold it. A reviewer choosing between `reject` and `dismiss`
+        # was choosing between two effects nothing on screen distinguished (okengine#823).
+        "effects": DECISION_EFFECTS,
+        "version_lock": VERSION_LOCK_NOTICE,
     }
 
 
@@ -760,7 +756,10 @@ def _review_detail(cand: Path) -> dict:
         # A prior record remains visible as history, but must never be sent as the id for a
         # decision against the current version. The writer will create the current request.
         "review_id": (current_record or {}).get("review_id"),
-        "reasons": (current_record or record or {}).get("reasons") or _review_reasons(fm, body),
+        "reasons": (reasons := (current_record or record or {}).get("reasons")
+                    or _review_reasons(fm, body)),
+        # The raw rows keep their detail string; this says what the CODE means, once per code.
+        "reason_glossary": explain_reasons(reasons),
         "evidence": evidence,
         "evidence_total": len(evidence),
         "evidence_resolved": sum(1 for row in evidence if row.get("page")),

@@ -36,6 +36,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import schema_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
@@ -158,13 +159,13 @@ def write_report(losses: list[dict], baseline: str | None, today: str) -> None:
         for x in sorted(losses, key=lambda d: d["file"]):
             page = x["file"].replace("wiki/", "").rsplit(".md", 1)[0]
             L.append(f"| [[{page}]] | {', '.join(x['lost'])} |")
-    (OP_DIR / f"field-loss-{today}.md").write_text("\n".join(L) + "\n")
+    generated_page.write(OP_DIR / f"field-loss-{today}.md", "\n".join(L) + "\n")
 
     # one-row/day snapshot for kb-health to read
     header = ("---\ntype: dashboard\ntitle: Field-loss snapshots\n---\n\n"
               "# Field-loss snapshots\n\n| date | losses |\n|---|---|\n")
     if not SNAP.exists():
-        SNAP.write_text(header)
+        generated_page.write(SNAP, header)
     rows = [ln for ln in SNAP.read_text(errors="replace").splitlines()
             if not ln.startswith(f"| {today} |")]
     SNAP.write_text("\n".join(rows).rstrip() + f"\n| {today} | {len(losses)} |\n")

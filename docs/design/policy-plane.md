@@ -69,7 +69,20 @@ Path scope alone cannot protect fields inside an otherwise authorized page. A ca
 - operations: create, update, patch, append, tombstone, converge, flag, review, or import;
 - paths and page types;
 - create/update-field allowlists, optional all-or-nothing `required_fields`, and protected-field denylists;
+- optional `forbidden_values` (`{field: [values]}`): values a changed field may not take, compared
+  case- and whitespace-insensitively after the write's key and value aliases (okengine#993; every
+  `chat:*` capability must forbid at least the retirement statuses on `status`);
 - body behavior: allow, append-only, or deny.
+
+**Converging a new id is a create** (okengine#993, decided). `converge` authorizes merging into an
+existing page; when the id is new, the write path creates the page and checks `create` as well, so a
+capability holding `converge` without `create` cannot create pages. The refusal says so
+("operation 'create' is not allowed (converging a new id is a create)"). This is intended: 9 engine
+crons (orphans-drain, page-quality-enrich, publisher-canonical-drain, schema-classify-drain,
+source-quality-backfill, source-staleness-refresh, review-drain, model-write-repair-drain,
+dedup-same-url) and 3 extension operations (okengine.grounding grounding-check, okengine.dedupe
+entity-merge, okengine.completeness gap-drain) declare `converge` without `create` and must only
+enrich pages that already exist.
 
 The reference monitor evaluates capability before mutation. A violation rejects the whole write and
 leaves the page byte-for-byte unchanged. Server stamps do not broaden authority; authorization is

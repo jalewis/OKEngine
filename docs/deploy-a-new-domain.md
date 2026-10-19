@@ -173,14 +173,26 @@ five-token cron overrides.
    # Only for a portable/shared vault: export a fixed uid AND `sudo chown -R <uid> <pack>`.
    bash <engine-checkout>/scripts/build-engine-image.sh    # -> immutable release+git-sha tag
    bash <engine-checkout>/scripts/ensure-runtime.sh        # seed .hermes-data/config.yaml + install the PINNED cron-plus scheduler plugin (REQUIRED — without it nothing schedules) — MUST precede compose
-   ENGINE_DIR=<engine-checkout> docker compose up -d --build   # --build rebuilds reader/mcp/cockpit on an engine update (plain up -d only builds when ABSENT — #45)
+   ENGINE_DIR=<engine-checkout> docker compose up -d --build   # builds reader/mcp/cockpit UNLABELED (see below); plain up -d only builds when ABSENT (#45)
    CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-scripts.sh       # engine + pack scripts -> /opt/data/scripts; pack data/feeds -> /opt/data/config
    CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-plus-jobs.sh     # regenerated jobs.json -> live (self-heals next_run_at in ~60s)
    ```
    `deploy.sh` also persists the exact `OKENGINE_GATEWAY_IMAGE` and an engine-managed Compose
    override in `.env`. If performing the manual sequence, export that exact image reference before
    Compose. A deployment never follows `hermes-agent:latest`; this permits independent revisions
-   to coexist safely on one host.
+   to coexist safely on one host. The compose-built engine images (reader, mcp, cockpit,
+   review-write, operation-runner, projection) are pinned the same way, scoped to the deployment
+   too: `deploy.sh` writes `OKENGINE_ENGINE_IMAGE_TAG=okengine-<release>-<sha>.<compose project>`
+   to `.env` and pins every engine-built service to it in the override (okengine#1033). For the
+   manual sequence, export that variable before Compose; without it the skeleton builds
+   the shared `:unpinned` tag, and `engine_images.py drift` (run by post-deploy verify) reports the
+   service as SHARED. deploy.sh also exports `OKENGINE_ENGINE_BUILD_TAG` for its own build only, so
+   an image built by any bare `docker compose up --build`, including the manual sequence above, is
+   labeled `unattributed` and reported (okengine#1044 [11]): the manual steps explain deploy.sh, they
+   do not replace it for an image build. deploy.sh also refuses host ports another deployment
+   publishes (`engine_images.py ports`), and
+   it refuses a compose project another directory already runs (`engine_images.py claim`; set a
+   unique `COMPOSE_PROJECT_NAME` when two deployments share a directory name) (okengine#1042).
 6. **Smoke** (the gauntlet): a no_agent cron succeeds, an LLM agent cron succeeds
    (API calls + tools + prompt-cache), a delivery lands, `okengine-mcp` answers
    (`curl :8730/mcp` → 401 without token), and the conformance gate is green
@@ -311,9 +323,12 @@ without the last two steps the chat is either insecure or can't find anything.
    ```bash
    hermes tools disable terminal code_execution file browser computer_use delegation \
      cronjob messaging memory session_search --platform api_server
-   hermes tools enable web --platform api_server          # okengine read+write MCP stay enabled
+   hermes tools enable web --platform api_server          # okengine read MCP + chat writer stay enabled
    ```
-   (Drop `okengine-write` too if you want read-only chat with no write-back.)
+   Chat writes back only through its actor-bound `okengine-write-chat` server (`chat:api_server`,
+   see [`agent-chat.md`](agent-chat.md#what-chat-may-write-okengine983)); never add the generic
+   `okengine-write` to this platform. For read-only chat with no write-back set
+   `OKENGINE_EDITING=0` and recreate the gateway.
 
    > **Enabling `web` is necessary but NOT sufficient — you MUST also configure a search
    > backend key, or the web tools are SILENTLY filtered out** and the agent reports it has no

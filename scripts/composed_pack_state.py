@@ -4,10 +4,16 @@ from __future__ import annotations
 import hashlib
 import ast
 import json
+from json import JSONDecodeError
 import re
 from pathlib import Path
 
 import yaml
+
+# Cosmic Ray's ExceptionReplacer cannot mutate an Attribute inside a tuple-valued except clause
+# (an incompetent run fails the mutation gate). Bind the exception classes to Names instead.
+YamlError = yaml.YAMLError
+JsonDecodeError = json.JSONDecodeError
 
 
 def _hash_bytes(value: bytes) -> str:
@@ -37,7 +43,7 @@ def load(host: Path, name: str) -> dict:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
         return value if isinstance(value, dict) else {}
-    except (OSError, json.JSONDecodeError):
+    except (OSError, JSONDecodeError):
         return {}
 
 
@@ -93,11 +99,84 @@ def source_manifest(pack: Path, shape: str) -> dict:
              "permissions": permissions.get(ns), "tier": tiers.get(ns)}
         for ns in owned
     }
-    return {"manifest_version": 2, "pack": name, "pack_version": str(meta.get("version") or ""),
-            "shape": shape, "lane_scripts": scripts, "cron_jobs": jobs,
-            "shared_support_scripts": {name: all_scripts[name] for name in sorted(support)},
-            "owned_namespaces": namespace_contracts,
-            "scope": "deployable-runtime-assets"}
+    manifest = {"manifest_version": 2, "pack": name, "pack_version": str(meta.get("version") or ""),
+                "shape": shape, "lane_scripts": scripts, "cron_jobs": jobs,
+                "shared_support_scripts": {name: all_scripts[name] for name in sorted(support)},
+                "owned_namespaces": namespace_contracts,
+                "scope": "deployable-runtime-assets"}
+    chat = chat_capabilities(pack)
+    if chat:  # recorded only when declared, so no other pack's manifest changes (okengine#991)
+        manifest["chat_capabilities"] = chat
+    return manifest
+
+
+def chat_capabilities(pack: Path) -> dict:
+    """The `chat:*` capabilities each of the pack's policy files declares, by pack-relative path.
+
+    These are the files `policy_plane.discover_documents` composes when the pack IS the deployment.
+    Installed into a host by install-domain, none of them is composed. An unparseable file
+    declares nothing here; the policy-plane check FAILs it where it is composed."""
+    files = [pack / "policy.yaml", pack / ".okengine" / "policy.yaml",
+             *sorted((pack / "extensions").glob("*/policy.yaml"))]  # glob-ok: flat pack directory
+    found = {}
+    for path in files:
+        try:
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, YamlError):
+            continue
+        capabilities = document.get("capabilities") if isinstance(document, dict) else None
+        if not isinstance(capabilities, dict):
+            continue
+        actors = sorted(str(actor) for actor in capabilities if str(actor).startswith("chat:"))
+        if actors:
+            found[path.relative_to(pack).as_posix()] = actors
+    return found
+
+
+def with_chat_record(accepted: dict, incoming: dict) -> dict:
+    """`accepted` with its chat declaration replaced by `incoming`'s, and nothing else changed.
+
+    install-domain keeps a manifest's last accepted runtime hashes until --refresh accepts the
+    pack update. The chat declaration is not a runtime artifact (a guest's policy files are never
+    installed), so it follows the source on every install (okengine#993)."""
+    merged = {key: value for key, value in accepted.items() if key != "chat_capabilities"}
+    if "chat_capabilities" in incoming:
+        merged["chat_capabilities"] = incoming["chat_capabilities"]
+    return merged
+
+
+def guest_chat_warning(manifest: dict) -> str | None:
+    """Why an installed guest's declared chat capability does nothing in this host, or None."""
+    declared = manifest.get("chat_capabilities")
+    if not isinstance(declared, dict) or not declared:
+        return None
+    where = "; ".join(f"{path} declares {', '.join(map(str, actors))}"
+                      for path, actors in declared.items())
+    if manifest.get("shape") == "subtree":
+        reach = ("its pages live under its wiki/<slug>/ subtree, which the host's chat scope "
+                 "(entities/**, concepts/** by default) does not reach, so Chat cannot write them")
+    else:
+        reach = ("its types are merged into the host schema, so Chat writes them only where the "
+                 "host's own chat capability allows (entities/**, concepts/** by default)")
+    return (f"{manifest.get('pack')}: {where}, which is never composed in this host: the host "
+            f"composes only its own policy files. {reach}. To change what Chat may write here, "
+            "declare it in the host's policy.yaml (okengine#991).")
+
+
+def guest_chat_warnings(host: Path) -> list[str]:
+    """`guest_chat_warning` for every installed guest's manifest. An unreadable manifest is left
+    to `all_installed_drift`, which reports it."""
+    base = host / ".okengine" / "installed-domains"
+    warnings = []
+    for path in sorted(base.glob("*.json")) if base.is_dir() else []:  # glob-ok: flat manifest directory
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, JsonDecodeError):
+            continue
+        warning = guest_chat_warning(manifest) if isinstance(manifest, dict) else None
+        if warning:
+            warnings.append(warning)
+    return warnings
 
 
 def write(host: Path, manifest: dict) -> bool:
@@ -127,7 +206,7 @@ def installed_drift(host: Path, manifest: dict) -> list[str]:
         rows = raw.get("jobs", []) if isinstance(raw, dict) else raw
         jobs = {str(row.get("name")): row for row in rows
                 if isinstance(row, dict) and row.get("name")}
-    except (OSError, json.JSONDecodeError):
+    except (OSError, JSONDecodeError):
         jobs = {}
     for name, expected in (manifest.get("cron_jobs") or {}).items():
         if name not in jobs:
@@ -143,7 +222,7 @@ def all_installed_drift(host: Path) -> list[str]:
     for path in sorted(base.glob("*.json")) if base.is_dir() else []:  # glob-ok: flat manifest directory
         try:
             manifest = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, JSONDecodeError):
             drift.append(f"invalid installed-domain manifest: {path.name}")
             continue
         drift.extend(installed_drift(host, manifest))

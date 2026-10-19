@@ -1,10 +1,11 @@
 # okengine#590 — which file identifies each engine-built image, and where it lands inside it.
 #
 # The gateway image carries an `org.okengine.git_sha` label (build-engine-image.sh stamps it) and
-# deploy.sh rebuilds on drift. The compose-built images cannot use that mechanism: docker-compose.yml
-# belongs to the PACK, so the engine cannot add `build.labels` to it without editing every pack.
-# So these are verified by CONTENT instead — hash declared baked files and trees in the running
-# container against the same source in ENGINE_DIR. One entrypoint alone can stay byte-identical
+# deploy.sh rebuilds on drift; its CONTENT (the carried Hermes patch series) is checked by
+# scripts/hermes_patch_probe.py, post_deploy_verify step [3b2] (okengine#1044 [29]), not here. The compose-built images now carry `org.okengine.engine_image_tag`
+# from the engine-generated override (okengine#1042 [14]): that says which deploy built the image,
+# not what a later edit or a reused build cache put in it. So these are also verified by CONTENT:
+# hash declared baked files and trees in the running container against the same source in ENGINE_DIR. One entrypoint alone can stay byte-identical
 # while the implementation or policy it imports changes.
 #
 # The representative file must be one the image COPIES from ENGINE_DIR (not generated, not vendored),
@@ -38,26 +39,109 @@ services:
       - source_dir: src/okengine
         container_dir: /usr/local/lib/python3.13/site-packages/okengine
         exclude: [data/base-schema.yaml]
+      - source: okengine-mcp/requirements.txt
+        container: /app/requirements.txt
+      # okengine#1042 [2]/[4]: the wheel's non-package runtime members (scripts/build_engine_wheel.py
+      # RUNTIME_MEMBERS). `import schema_lib` resolves to this baked copy; src/okengine and the
+      # entrypoint can agree while it is stale.
+      - source: tools/schema_validator.py
+        container: /usr/local/lib/python3.13/site-packages/tools/schema_validator.py
+      - source: tools/policy_plane.py
+        container: /usr/local/lib/python3.13/site-packages/tools/policy_plane.py
+      - source: okengine-mcp/output_contract_enforce.py
+        container: /usr/local/lib/python3.13/site-packages/output_contract_enforce.py
+      - source: okengine-mcp/converge.py
+        container: /usr/local/lib/python3.13/site-packages/converge.py
+      - source: scripts/cron/id_lib.py
+        container: /usr/local/lib/python3.13/site-packages/id_lib.py
+      - source: scripts/cron/schema_lib.py
+        container: /usr/local/lib/python3.13/site-packages/schema_lib.py
+      - source: scripts/cron/id_index.py
+        container: /usr/local/lib/python3.13/site-packages/id_index.py
+      - source: scripts/cron/okf_migrate.py
+        container: /usr/local/lib/python3.13/site-packages/okf_migrate.py
+      - source: config/base-schema.yaml
+        container: /usr/local/lib/python3.13/site-packages/okengine/data/base-schema.yaml
+  # Reader and cockpit: probe EVERY file their final stage COPYs, not app.py alone (v0.15.11 audit
+  # [16]). v0.15.11 changed only okengine-reader/directory_index.py among the reader's modules; an
+  # app.py-only probe would have called a stale reader in sync whenever src/okengine did not also
+  # move. `tests/test_image_drift.py` derives the expected coverage from each Dockerfile's COPY lines.
   okengine-cockpit:
     source: okengine-cockpit/app.py
     container: /app/app.py
     also:
+      - source_glob: okengine-cockpit/*.py
+        container_dir: /app
+      - source_dir: okengine-cockpit/static
+        container_dir: /app/static
+      - source: okengine-cockpit/requirements.txt
+        container: /app/requirements.txt
       - source_dir: src/okengine
         container_dir: /usr/local/lib/python3.13/site-packages/okengine
         exclude: [data/base-schema.yaml]
+      # okengine#1042 [2]/[4]: the wheel's non-package runtime members (scripts/build_engine_wheel.py
+      # RUNTIME_MEMBERS). `import schema_lib` resolves to this baked copy; src/okengine and the
+      # entrypoint can agree while it is stale.
+      - source: tools/schema_validator.py
+        container: /usr/local/lib/python3.13/site-packages/tools/schema_validator.py
+      - source: tools/policy_plane.py
+        container: /usr/local/lib/python3.13/site-packages/tools/policy_plane.py
+      - source: okengine-mcp/output_contract_enforce.py
+        container: /usr/local/lib/python3.13/site-packages/output_contract_enforce.py
+      - source: okengine-mcp/converge.py
+        container: /usr/local/lib/python3.13/site-packages/converge.py
+      - source: scripts/cron/id_lib.py
+        container: /usr/local/lib/python3.13/site-packages/id_lib.py
+      - source: scripts/cron/schema_lib.py
+        container: /usr/local/lib/python3.13/site-packages/schema_lib.py
+      - source: scripts/cron/id_index.py
+        container: /usr/local/lib/python3.13/site-packages/id_index.py
+      - source: scripts/cron/okf_migrate.py
+        container: /usr/local/lib/python3.13/site-packages/okf_migrate.py
+      - source: config/base-schema.yaml
+        container: /usr/local/lib/python3.13/site-packages/okengine/data/base-schema.yaml
   okengine-reader:
     source: okengine-reader/app.py
     container: /app/app.py
     also:
+      - source_glob: okengine-reader/*.py
+        container_dir: /app
+      - source_dir: okengine-reader/static
+        container_dir: /app/static
+      - source: okengine-reader/requirements.txt
+        container: /app/requirements.txt
       - source_dir: src/okengine
         container_dir: /usr/local/lib/python3.13/site-packages/okengine
         exclude: [data/base-schema.yaml]
+      # okengine#1042 [2]/[4]: the wheel's non-package runtime members (scripts/build_engine_wheel.py
+      # RUNTIME_MEMBERS). `import schema_lib` resolves to this baked copy; src/okengine and the
+      # entrypoint can agree while it is stale.
+      - source: tools/schema_validator.py
+        container: /usr/local/lib/python3.13/site-packages/tools/schema_validator.py
+      - source: tools/policy_plane.py
+        container: /usr/local/lib/python3.13/site-packages/tools/policy_plane.py
+      - source: okengine-mcp/output_contract_enforce.py
+        container: /usr/local/lib/python3.13/site-packages/output_contract_enforce.py
+      - source: okengine-mcp/converge.py
+        container: /usr/local/lib/python3.13/site-packages/converge.py
+      - source: scripts/cron/id_lib.py
+        container: /usr/local/lib/python3.13/site-packages/id_lib.py
+      - source: scripts/cron/schema_lib.py
+        container: /usr/local/lib/python3.13/site-packages/schema_lib.py
+      - source: scripts/cron/id_index.py
+        container: /usr/local/lib/python3.13/site-packages/id_index.py
+      - source: scripts/cron/okf_migrate.py
+        container: /usr/local/lib/python3.13/site-packages/okf_migrate.py
+      - source: config/base-schema.yaml
+        container: /usr/local/lib/python3.13/site-packages/okengine/data/base-schema.yaml
   okengine-review-write:
     source: okengine-mcp/write_server.py
     container: /engine/okengine-mcp/write_server.py
     also:
       - source: config/policy/catalog.yaml
         container: /engine/config/policy/catalog.yaml
+      - source: okengine-mcp/requirements.txt
+        container: /engine/requirements.txt
       - source: tools/policy_plane.py
         container: /usr/local/lib/python3.13/site-packages/tools/policy_plane.py
       - source: tools/schema_validator.py
@@ -104,6 +188,31 @@ services:
         exclude: [data/base-schema.yaml]
       - source_dir: extensions
         container_dir: /engine/extensions
+      - source: scripts/framework_operations.py
+        container: /engine/scripts/framework_operations.py
+      - source: scripts/operation_run.py
+        container: /engine/scripts/operation_run.py
+      - source: okengine-mcp/requirements.txt
+        container: /engine/requirements.txt
+      # okengine#1042 [2]/[4]: the wheel's non-package runtime members (scripts/build_engine_wheel.py
+      # RUNTIME_MEMBERS). `import schema_lib` resolves to this baked copy; src/okengine and the
+      # entrypoint can agree while it is stale.
+      - source: tools/schema_validator.py
+        container: /usr/local/lib/python3.13/site-packages/tools/schema_validator.py
+      - source: okengine-mcp/output_contract_enforce.py
+        container: /usr/local/lib/python3.13/site-packages/output_contract_enforce.py
+      - source: okengine-mcp/converge.py
+        container: /usr/local/lib/python3.13/site-packages/converge.py
+      - source: scripts/cron/id_lib.py
+        container: /usr/local/lib/python3.13/site-packages/id_lib.py
+      - source: scripts/cron/schema_lib.py
+        container: /usr/local/lib/python3.13/site-packages/schema_lib.py
+      - source: scripts/cron/id_index.py
+        container: /usr/local/lib/python3.13/site-packages/id_index.py
+      - source: scripts/cron/okf_migrate.py
+        container: /usr/local/lib/python3.13/site-packages/okf_migrate.py
+      - source: config/base-schema.yaml
+        container: /usr/local/lib/python3.13/site-packages/okengine/data/base-schema.yaml
   okengine-projection:
     source: okengine-projection/service.py
     container: /app/service.py
@@ -111,3 +220,28 @@ services:
       - source_dir: src/okengine
         container_dir: /usr/local/lib/python3.13/site-packages/okengine
         exclude: [data/base-schema.yaml]
+      - source: okengine-projection/requirements.txt
+        container: /app/requirements.txt
+      - source: db/projection-schema.sql
+        container: /app/db/projection-schema.sql
+      # okengine#1042 [2]/[4]: the wheel's non-package runtime members (scripts/build_engine_wheel.py
+      # RUNTIME_MEMBERS). `import schema_lib` resolves to this baked copy; src/okengine and the
+      # entrypoint can agree while it is stale.
+      - source: tools/schema_validator.py
+        container: /usr/local/lib/python3.13/site-packages/tools/schema_validator.py
+      - source: tools/policy_plane.py
+        container: /usr/local/lib/python3.13/site-packages/tools/policy_plane.py
+      - source: okengine-mcp/output_contract_enforce.py
+        container: /usr/local/lib/python3.13/site-packages/output_contract_enforce.py
+      - source: okengine-mcp/converge.py
+        container: /usr/local/lib/python3.13/site-packages/converge.py
+      - source: scripts/cron/id_lib.py
+        container: /usr/local/lib/python3.13/site-packages/id_lib.py
+      - source: scripts/cron/schema_lib.py
+        container: /usr/local/lib/python3.13/site-packages/schema_lib.py
+      - source: scripts/cron/id_index.py
+        container: /usr/local/lib/python3.13/site-packages/id_index.py
+      - source: scripts/cron/okf_migrate.py
+        container: /usr/local/lib/python3.13/site-packages/okf_migrate.py
+      - source: config/base-schema.yaml
+        container: /usr/local/lib/python3.13/site-packages/okengine/data/base-schema.yaml

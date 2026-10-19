@@ -25,7 +25,9 @@ attempt even when every count is zero.
 Source declarations may classify `source_kind` as `primary` or `secondary` and
 `independent_origin` as true or false. Missing declarations remain `unknown`.
 For OPML feeds these are optional `sourceKind` and `independentOrigin`
-attributes on the `<outline>` element.
+attributes on the `<outline>` element. An optional `publisher` attribute declares the organization
+that publishes the feed's items; it's written into each raw item's frontmatter and never
+inferred from the feed label.
 
 ## Retention and privacy
 

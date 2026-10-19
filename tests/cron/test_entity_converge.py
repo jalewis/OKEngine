@@ -157,3 +157,17 @@ def test_main_dry_run_apply_and_approval_shape_errors(tmp_path, capsys):
         assert exc.code == 2
     else:
         raise AssertionError("apply without approval must be a CLI error")
+
+
+def test_union_admits_loser_aliases_through_the_shared_rule():
+    m = _load()
+    out = m._union({"aliases": ["Brown Fox"], "rejected_aliases": ["Grey Fox"]},
+                   [{"aliases": ["brown-fox", "Red Fox", "https://x.example"]},
+                    {"aliases": "Grey Fox"}], [])
+    assert out["aliases"] == ["Brown Fox", "Red Fox"]
+
+
+def test_union_adds_no_aliases_field_when_nobody_has_one():
+    m = _load()
+    out = m._union({"title": "Brown Fox"}, [{"title": "brown fox"}], [])
+    assert "aliases" not in out

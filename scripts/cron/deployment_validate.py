@@ -33,6 +33,7 @@ from pathlib import Path
 
 # Sibling cron lib (staged into DATA/scripts alongside this script; scripts/cron/ in the repo).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import deployment_checks as C  # noqa: E402  (the shared checks library, okengine#405)
 
 
@@ -75,7 +76,7 @@ def main() -> int:
     out = C.VAULT / "wiki" / "operational" / "deployment-validation.md"
     try:
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text("\n".join(L), encoding="utf-8")
+        generated_page.write(out, "\n".join(L))
         dest = "-> wiki/operational/deployment-validation.md"
     except OSError as e:
         # The report file (or its dir) is foreign-owned (root, from a bare `docker exec` write), so

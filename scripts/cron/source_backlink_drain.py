@@ -36,6 +36,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.append(str(Path(__file__).resolve().parent))  # staged sibling libs
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
+
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 SRC_DIR = VAULT / "wiki" / "sources"
 ENT_DIR = VAULT / "wiki" / "entities"
@@ -173,9 +176,13 @@ def main() -> int:
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     out = OUT_DIR / f"source-backlink-drain-{now.date().isoformat()}.md"
+    # `dashboard` is the base-schema type for a generated report (okengine#920): the former
+    # `type: operational` is no type at all, so it was counted as schema drift daily, and a pack
+    # aliasing `operational: concept` then reclassified the report as a knowledge concept.
     lines = [
         "---",
-        "type: operational",
+        "type: dashboard",
+        f'title: "Source-entity backlink drain — {now.date().isoformat()}"',
         "generated_by: source_backlink_drain.py",
         f"created: {now.date().isoformat()}",
         "tags: [sources, entities, propagation, drain, hygiene]",
@@ -195,7 +202,7 @@ def main() -> int:
     else:
         lines.append("✅ No unapplied source→entity declarations found in this pass.")
     lines.append("")
-    out.write_text("\n".join(lines), encoding="utf-8")
+    generated_page.write(out, "\n".join(lines))
     try:
         os.chmod(out, 0o644)   # report file: owner-writable, world-readable (0o646 was world-WRITABLE)
     except OSError:

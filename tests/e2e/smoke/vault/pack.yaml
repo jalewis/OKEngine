@@ -1,0 +1,7 @@
+# The smoke/E2E fixture vault's pack identity. Every deployment's vault declares its pack, and the
+# enforced write server refuses to start without one (okengine#1027), so the fixture carries one
+# exactly as a real deployment does.
+name: okpack-smoke
+version: 0.0.0
+description: Disposable fixture vault for the release smoke, e2e, resilience and performance stacks.
+trust: public

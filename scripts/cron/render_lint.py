@@ -28,13 +28,18 @@ import argparse
 import datetime
 import concurrent.futures
 import json
+from json import JSONDecodeError
 import os
 import re
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from urllib.error import URLError
 from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent))  # staged sibling libs
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 
 # ── the checks (pure; unit-tested) ───────────────────────────────────────────
 
@@ -212,7 +217,7 @@ def load_state(path: Path) -> dict:
         if d.get("version") != _STATE_VERSION or not isinstance(d.get("pages"), dict):
             raise ValueError("unsupported state shape")
         return d
-    except (OSError, ValueError, json.JSONDecodeError) as e:
+    except (OSError, ValueError, JSONDecodeError) as e:
         print(f"render-lint: ignoring corrupt state {path} ({e}); rebuilding baseline", file=sys.stderr)
         return {"version": _STATE_VERSION, "pages": {}}
 
@@ -298,7 +303,7 @@ def main(argv=None) -> int:
 
     try:
         records = enumerate_page_records(a.reader_url)
-    except (urllib.error.URLError, OSError) as e:
+    except (URLError, OSError) as e:
         print(f"render-lint: reader unreachable at {a.reader_url} ({e})", file=sys.stderr)
         return 2
     now = a.now or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -342,7 +347,7 @@ def main(argv=None) -> int:
     if a.write_vault:
         out = Path(a.write_vault) / "wiki" / "operational" / "render-lint.md"
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(render_report(len(records), offenders, now, checked, pending, last_full), encoding="utf-8")
+        generated_page.write(out, render_report(len(records), offenders, now, checked, pending, last_full))
         print(f"render-lint: wrote {out}")
 
     if a.json:

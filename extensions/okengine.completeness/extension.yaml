@@ -57,7 +57,10 @@ operations:
       unknown_fields: reject
       unresolved_links: review
       placeholder_links: reject
-      completion: run
+      # Per selected gap (okengine#878): an honestly skipped gap is a valid outcome, so a run
+      # that fixes nothing must not fail for writing nothing. select_gap_fixes.py writes the
+      # selection manifest and prints the okengine-receipt the runner verifies.
+      completion: per-selected-item
     adversarial_fixtures: [tests/extensions/test_model_output_contracts.py]
     toolsets: [todo, okengine-write, okengine]
     tier: analyze

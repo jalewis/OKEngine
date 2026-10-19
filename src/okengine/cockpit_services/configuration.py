@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from yaml import YAMLError
 import markdown as md
 
 from okengine.html_sanitize import restore_panel_svg, sanitize, stash_panel_svg
@@ -43,7 +44,7 @@ def split_fm(text: str) -> tuple[dict, str]:
         # Python's SafeLoader; explicitly selecting CSafeLoader when available cuts large-vault
         # frontmatter parsing several-fold while retaining the same non-constructor-safe grammar.
         fm = yaml.load(m.group(1), Loader=_FAST_YAML_LOADER) or {}  # nosec B506
-    except (yaml.YAMLError, ValueError):
+    except (YAMLError, ValueError):
         fm = {}
     return (fm if isinstance(fm, dict) else {}), m.group(2)
 
@@ -65,7 +66,7 @@ def load_application_declaration(vault: Path) -> dict | None:
     path = vault / ".okengine" / "application.yaml"
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) if path.is_file() else None
-    except (OSError, yaml.YAMLError):
+    except (OSError, YAMLError):
         return None
     if not isinstance(raw, dict) or not str(raw.get("profile") or "").strip():
         return None
@@ -292,21 +293,24 @@ def _deref_local_links(s: str) -> str:
     return _MD_LOCAL_LINK.sub(r"\1", s)
 
 
-def _embed_rglob(name: str) -> "Path | None":
-    """First match for basename `name` under the generic embed dirs, memoized for the process
-    lifetime. Basename embeds are the norm on sharded OKF vaults, so without this each render
-    re-walks every `_EMBED_DIRS` subtree once per unresolved embed."""
-    if name in _EMBED_PATH_CACHE:
-        return _EMBED_PATH_CACHE[name]
-    hit = None
+def _embed_target(name: str) -> "Path | None":
+    """The first match, in path order, for basename `name` under the generic embed dirs, or None.
+    Path order, not walk order: the walk order is the filesystem's, so two processes could pick
+    different pages for one ambiguous embed."""
     for d in _EMBED_DIRS:
         base = WIKI / d
-        hits = list(base.rglob(name)) if base.is_dir() else []
-        if hits:
-            hit = hits[0]
-            break
-    _EMBED_PATH_CACHE[name] = hit
-    return hit
+        hit = min(base.rglob(name), default=None) if base.is_dir() else None
+        if hit is not None:
+            return hit
+    return None
+
+
+def _embed_rglob(name: str) -> "Path | None":
+    """First match for basename `name` under the generic embed dirs, memoized in
+    `_EMBED_PATH_CACHE`. Basename embeds are the norm on sharded OKF vaults, so without the memo
+    each render re-walks every `_EMBED_DIRS` subtree once per unresolved embed. A remembered path is
+    re-stamped on every hit and a miss expires, so a moved or late page is found (okengine#1024)."""
+    return _EMBED_PATH_CACHE.lookup(name, lambda: _embed_target(name), lambda path: path)
 
 
 def _resolve_embeds(text: str, depth: int = 0) -> str:

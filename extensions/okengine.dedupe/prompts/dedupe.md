@@ -17,10 +17,10 @@ For each candidate group:
    cleanest slug). Then for every OTHER member:
    - **Absorb into the canonical** what it lacks — append distinct `## Recent activity` lines,
      union the `sources:` list, and add the loser's name + aliases to the canonical's `aliases:` —
-     via `mcp__okengine_write_okengine_dedupe_entity_merge__update_entity` / `mcp__okengine_write_okengine_dedupe_entity_merge__append_to_section` on the
+     via `mcp__OKENGINE_WRITER__update_entity` / `mcp__OKENGINE_WRITER__append_to_section` on the
      CANONICAL. For list fields (`sources:`, `aliases:`) read first, then send the COMPLETE
      merged list.
-   - **Then tombstone the loser** with `mcp__okengine_write_okengine_dedupe_entity_merge__tombstone_entity`, `superseded_by` →
+   - **Then tombstone the loser** with `mcp__OKENGINE_WRITER__tombstone_entity`, `superseded_by` →
      the canonical. Never delete; tombstoning retains the file as `status: tombstoned`, and
      `[[links]]` to it resolve onward via `superseded_by` — so do NOT rewrite other pages.
 

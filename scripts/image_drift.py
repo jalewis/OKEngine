@@ -33,11 +33,13 @@ import argparse
 import hashlib
 import json
 import subprocess
+from subprocess import SubprocessError
 import sys
 from pathlib import Path
 
 try:
     import yaml
+    from yaml import YAMLError
 except ImportError:                                    # pragma: no cover - yaml is a hard dep here
     yaml = None                                        # pragma: no cover - same import guard
 
@@ -94,7 +96,7 @@ print(digest.hexdigest())
 def load_manifest(path: Path) -> dict[str, dict[str, str]]:
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError):
+    except (OSError, YAMLError):
         return {}
     services = raw.get("services")
     if not isinstance(services, dict):
@@ -117,6 +119,12 @@ def load_manifest(path: Path) -> dict[str, dict[str, str]]:
             if extra.get("source") and extra.get("container"):
                 probes.append({"source": str(extra["source"]),
                                "container": str(extra["container"])})
+            elif extra.get("source_glob") and extra.get("container_dir"):
+                # `COPY okengine-reader/*.py ./`: every file the glob matches in ENGINE_DIR, each
+                # at <container_dir>/<name>. Expanded at compare time, against the source tree,
+                # so a module added to the service is probed without a manifest edit.
+                probes.append({"source_glob": str(extra["source_glob"]),
+                               "container_dir": str(extra["container_dir"])})
             elif extra.get("source_dir") and extra.get("container_dir"):
                 tree_probe = {"source_dir": str(extra["source_dir"]),
                               "container_dir": str(extra["container_dir"])}
@@ -131,7 +139,7 @@ def load_manifest(path: Path) -> dict[str, dict[str, str]]:
 def _run(args: list[str]) -> str | None:
     try:
         proc = subprocess.run(args, capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, SubprocessError):
         return None
     return proc.stdout.strip() if proc.returncode == 0 else None
 
@@ -178,6 +186,23 @@ def container_hash(container: str, path: str) -> str:
     return _valid_digest(out)
 
 
+def glob_verdict(container: str, engine_dir: Path, pattern: str, container_dir: str) -> str:
+    """One verdict for every file a COPY glob matches. A pattern that matches nothing in the
+    source is unreadable: a probe that compared no file is not evidence of anything."""
+    # glob-ok: a Dockerfile COPY pattern over the ENGINE_DIR source tree, never a vault namespace.
+    matches = sorted(p for p in engine_dir.glob(pattern) if p.is_file())
+    if not matches:
+        return "unreadable"
+    verdicts = []
+    for path in matches:
+        src = file_hash(path)
+        dst = container_hash(container, f"{container_dir.rstrip('/')}/{path.name}")
+        verdicts.append("unreadable" if not src or not dst
+                        else "in_sync" if src == dst else "drifted")
+    return "drifted" if "drifted" in verdicts else (
+        "unreadable" if "unreadable" in verdicts else "in_sync")
+
+
 def compare(manifest: dict, containers: dict, engine_dir: Path) -> dict:
     """Classify each service. `unreadable` is deliberately NOT folded into `drifted`: drift means
     the image was built from other source, unreadable means the check could not be performed, and
@@ -190,6 +215,10 @@ def compare(manifest: dict, containers: dict, engine_dir: Path) -> dict:
             continue
         verdicts = []
         for probe in spec.get("probes") or [spec]:
+            if "source_glob" in probe:
+                verdicts.append(glob_verdict(container, engine_dir, probe["source_glob"],
+                                             probe["container_dir"]))
+                continue
             if "source_dir" in probe and "container_dir" in probe:
                 excluded = probe.get("exclude") or []
                 src = tree_hash(engine_dir / probe["source_dir"], excluded)

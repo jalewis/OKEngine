@@ -9,7 +9,7 @@ watchlist competitors' recent activity shows. Classify each gap HIGH / MED / LOW
 would hurt in a live competitive deal. Be honest — the whole point of this artifact is to keep
 downstream messaging (battle-cards, the messaging brief) from overclaiming.
 
-Write via mcp__okengine_write_okengine_messaging_synthesis_value_prop_gap_refresh__create_entity to the wiki-relative path the wake-gate specified,
+Write via mcp__OKENGINE_WRITER__create_entity to the wiki-relative path the wake-gate specified,
 frontmatter `type: value-prop-snapshot, title: "Value-prop gap snapshot — <date>",
 published: <date>, updated: <date>, prior_snapshot: "[[<prior-path-or-none>]]"`. Body:
 

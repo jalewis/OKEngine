@@ -147,3 +147,38 @@ def test_normalization_refs_scan_races_and_missing_vault_edges(tmp_path, monkeyp
     monkeypatch.setattr(mod, "WIKI", tmp_path / "missing/wiki")
     assert mod.main() == 0
     assert "nothing to index" in capsys.readouterr().out
+
+
+def test_assessments_are_propositions_by_default(tmp_path, monkeypatch):
+    """okengine#854: only predictions were indexed, so an assessment's cited evidence could
+    change or vanish and nothing in the CHE loop would notice."""
+    for name in ("OKENGINE_REEVAL_TYPES", "OKENGINE_REEVALUATION_PROPOSITION_TYPES"):
+        monkeypatch.delenv(name, raising=False)
+    mod = _load()
+    v = _vault(tmp_path)
+    _page(v / "wiki" / "assessments" / "a" / "a1.md",
+          "type: assessment\nstatus: active\nsources: ['[[sources/2026/09/report-a]]']\n"
+          "adversarial_evidence:\n  - {observation: x, source: '[[sources/2026/09/report-b]]'}\n"
+          "  - {observation: y, source: 'Free-text attribution, not a page'}")
+    art = mod.build(v)
+    assert "assessment" in art["proposition_types"] and art["proposition_count"] == 1
+    assert art["edges"]["sources/2026/09/report-a"][0]["via"] == ["sources"]
+    assert art["edges"]["sources/2026/09/report-b"][0]["via"] == ["adversarial_evidence.source"]
+
+
+def test_a_retracted_assessment_is_not_a_live_dependency(tmp_path, monkeypatch):
+    for name in ("OKENGINE_REEVAL_TYPES", "OKENGINE_REEVALUATION_PROPOSITION_TYPES"):
+        monkeypatch.delenv(name, raising=False)
+    mod = _load()
+    v = _vault(tmp_path)
+    _page(v / "wiki" / "assessments" / "a" / "old.md",
+          "type: assessment\nstatus: retracted\nsources: [sources/x]")
+    assert mod.build(v)["proposition_count"] == 0
+
+
+def test_the_manifest_default_and_the_script_default_agree():
+    """Two spellings of one default: the composer injects the manifest's, a manual run falls back
+    to the script's. They drifting apart means the index differs by how it was launched."""
+    m = yaml.safe_load((EXT / "extension.yaml").read_text(encoding="utf-8"))
+    declared = m["config"]["proposition_types"]["default"]
+    assert f'"OKENGINE_REEVALUATION_PROPOSITION_TYPES", "{declared}"' in SCRIPT.read_text()

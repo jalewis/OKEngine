@@ -1,0 +1,4 @@
+# Engine-managed vault-owner contract; preserves operator overrides and read-only mount.
+services:
+  okengine-projection:
+    user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"

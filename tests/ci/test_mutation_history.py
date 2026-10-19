@@ -185,3 +185,121 @@ def test_end_to_end_on_the_write_path_scenario(tmp_path, capsys):
     assert code == 1
     assert "okengine-mcp/write_server.py: no score in the last 5 runs" in out
     assert "tools/policy_plane.py" not in out, "a healthy target must not be listed"
+
+
+# ── okengine#943: a carried-forward score is fresh only within the re-baseline window ─────────
+
+def _carried(run_at: str, measured_at, score: float = 95.0) -> dict:
+    reused = {"pipeline_id": 1, "measured_at": measured_at} if measured_at != "absent" else True
+    return {"generated_at": run_at,
+            "targets": [{"path": "w.py", "score": score, "reused": reused}]}
+
+
+@pytest.mark.parametrize(("run_at", "measured_at", "counted"), [
+    ("2026-10-08T04:00:00Z", "2026-10-01T04:00:00Z", True),     # exactly the window
+    ("2026-10-08T04:00:01Z", "2026-10-01T04:00:00Z", False),    # one second past it
+    ("2026-10-02T04:00:00Z", "2026-10-01T04:00:00Z", True),
+    ("2026-10-01T04:00:00Z", "2026-10-02T04:00:00Z", False),    # measured after the run: bogus
+    ("2026-10-02T04:00:00Z", "absent", False),                  # undatable carry
+    ("2026-10-02T04:00:00Z", "not a date", False),
+    ("2026-10-02T04:00:00Z", "2026-10-01T04:00:00", False),     # naive timestamp
+    ("2026-10-02T04:00:00Z", 17, False),
+    (None, "2026-10-01T04:00:00Z", False),                      # the run itself is undated
+])
+def test_a_carried_score_counts_as_measured_only_within_the_window(run_at, measured_at, counted):
+    mod = _mod()
+    assert (mod.measured_paths(_carried(run_at, measured_at)) == {"w.py"}) is counted
+
+
+def test_a_target_carried_past_the_window_accrues_a_dropout_streak(tmp_path, capsys):
+    """A lane that reused one old measurement forever would otherwise read as measured every
+    night. Three runs carrying a 10-day-old score are a three-run streak."""
+    mod = _mod()
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    for index, day in enumerate(("2026-10-11", "2026-10-12", "2026-10-13"), 1):
+        (runs / f"summary-{index}.json").write_text(json.dumps(
+            _carried(f"{day}T04:00:00Z", "2026-10-01T04:00:00Z")), encoding="utf-8")
+    code = mod.main(["--summaries", str(runs), "--manifest",
+                     str(_manifest(tmp_path, "w.py", critical=("w.py",))), "--critical-only"])
+    assert code == 1
+    assert "w.py: no score in the last 3 runs" in capsys.readouterr().out
+    assert mod.main(["--summaries", str(runs), "--manifest",
+                     str(_manifest(tmp_path, "w.py", critical=("w.py",))), "--critical-only",
+                     "--rebaseline-days", "14"]) == 0
+
+
+def test_the_watcher_window_defaults_to_seven_days_and_rejects_nonsense(tmp_path):
+    mod = _mod()
+    assert mod.DEFAULT_REBASELINE_DAYS == 7
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    with pytest.raises(SystemExit, match="--rebaseline-days must be at least 1"):
+        mod.main(["--summaries", str(runs), "--rebaseline-days", "0"])
+
+
+# ── okengine#1047: newest-first means by pipeline id, not by string ───────────────────────────
+
+def _named(tmp_path, named_runs):
+    directory = tmp_path / "summaries"
+    directory.mkdir(exist_ok=True)
+    for pipeline_id, run in named_runs:
+        (directory / f"summary-{pipeline_id}.json").write_text(json.dumps(run), encoding="utf-8")
+    return directory
+
+
+def test_newest_first_orders_pipeline_ids_numerically_across_a_digit_boundary(tmp_path):
+    """`summary-9947` sorts after `summary-13159` as a string. Read that way, every four-digit
+    pipeline counted as newer than every five-digit one, and the watcher reported six critical
+    targets as unmeasured for 16 runs -- the 16 four-digit summaries, which predate those targets --
+    while the actual newest run (13159) had scored all six."""
+    m = _mod()
+    directory = _named(tmp_path, [(9947, _run(a=None)), (10196, _run(a=None)),
+                                  (13159, _run(a=100.0))])
+    runs = m.load_summaries(directory)
+    assert runs == [_run(a=100.0), _run(a=None), _run(a=None)], \
+        "summaries must come back newest pipeline id first"
+
+
+def test_a_target_scored_in_the_newest_five_digit_run_has_no_streak(tmp_path, capsys):
+    """The okengine#1047 window, reduced: 16 four-digit runs from before the target existed, then
+    five-digit runs ending in one that scored it. The newest run measured it, so there is no
+    streak to report."""
+    m = _mod()
+    old = [(7000 + i, _run(**{"tools/policy_plane.py": 90.0})) for i in range(16)]
+    new = [(12608, _run(**{"src/okengine/attestation.py": 100.0, "tools/policy_plane.py": 90.0})),
+           (13011, {"targets": []}),
+           (13159, _run(**{"src/okengine/attestation.py": 100.0, "tools/policy_plane.py": 90.0}))]
+    directory = _named(tmp_path, old + new)
+    manifest = _manifest(tmp_path, "src/okengine/attestation.py", "tools/policy_plane.py",
+                         critical=("src/okengine/attestation.py", "tools/policy_plane.py"))
+    code = m.main(["--summaries", str(directory), "--manifest", str(manifest),
+                   "--threshold", "3", "--critical-only"])
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "attestation.py" not in out
+
+
+def test_a_real_streak_still_fails_across_a_digit_boundary(tmp_path, capsys):
+    """Negative fixture: the ordering fix must not hide a target that genuinely stopped being
+    measured. Scored in the four-digit runs, unscored in the three newest five-digit ones."""
+    m = _mod()
+    directory = _named(tmp_path, [(9998, _run(a=90.0)), (9999, _run(a=90.0)),
+                                  (10000, _run(a=None)), (10001, _run(a=None)),
+                                  (10002, _run(a=None))])
+    code = m.main(["--summaries", str(directory), "--manifest", str(_manifest(tmp_path, "a")),
+                   "--threshold", "3"])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "a: no score in the last 3 runs" in out
+
+
+def test_names_without_a_pipeline_id_still_load_in_a_stable_order(tmp_path):
+    """A local archive need not use pipeline ids; such names still sort deterministically."""
+    m = _mod()
+    directory = tmp_path / "summaries"
+    directory.mkdir()
+    (directory / "local-b.json").write_text(json.dumps(_run(b=1.0)), encoding="utf-8")
+    (directory / "local-a.json").write_text(json.dumps(_run(a=1.0)), encoding="utf-8")
+    (directory / "summary-5.json").write_text(json.dumps(_run(c=1.0)), encoding="utf-8")
+    assert m.load_summaries(directory) == [_run(c=1.0), _run(b=1.0), _run(a=1.0)]

@@ -704,3 +704,254 @@ def test_upstream_removal_after_capture_creates_retraction_revision(monkeypatch,
     removed = next(page for page in pages if "revision-" in page.name).read_text()
     assert "source_retraction: true" in removed
     assert "capture_dead_letter:" in removed
+
+
+def _run_publisher_feeds(monkeypatch, tmp_path, outlines: str) -> dict[str, str]:
+    m = _load(monkeypatch)
+    opml = tmp_path / "feeds.opml"
+    opml.write_text(f"<opml><body>{outlines}</body></opml>")
+
+    def fetch(url, _state=None):
+        slug = url.split("//")[1].split(".")[0]
+        return (f"<rss><channel><item><guid>{slug}</guid><title>{slug}</title>"
+                f"<link>https://article.test/{slug}</link></item></channel></rss>").encode(), {}
+
+    monkeypatch.setattr(m, "fetch", fetch)
+    assert m.main(["--opml", str(opml), "--out-dir", str(tmp_path / "raw"),
+                   "--state", str(tmp_path / "state.json")]) == 0
+    return {p.name: p.read_text() for p in (tmp_path / "raw").glob("*.md")}
+
+
+def test_declared_publisher_reaches_the_raw_frontmatter(monkeypatch, tmp_path):
+    """REGRESSION (okengine#862): feed raws carried only `source_feed`, the prompt (correctly)
+    forbids a feed label as `publisher`, so raw-backfill guessed one from the URL — 162
+    `missing required field(s): publisher` rejections on one live vault in 3 days."""
+    pages = _run_publisher_feeds(monkeypatch, tmp_path,
+                                 '<outline text="arXiv cs.CL" xmlUrl="https://cscl.test/rss"'
+                                 ' publisher="arXiv"/>')
+    (page,) = pages.values()
+    assert 'publisher: "arXiv"' in page
+    assert 'source_feed: "arXiv cs.CL"' in page, "feed label stays in source_feed, not publisher"
+
+
+def test_undeclared_publisher_is_never_inferred(monkeypatch, tmp_path):
+    """NEGATIVE: no attribute (or a blank one) writes no `publisher:` line — the feed label is
+    never promoted to a publisher."""
+    pages = _run_publisher_feeds(
+        monkeypatch, tmp_path,
+        '<outline text="Some Feed" xmlUrl="https://plain.test/rss"/>'
+        '<outline text="Blank" xmlUrl="https://blank.test/rss" publisher="  "/>')
+    assert len(pages) == 2
+    assert all("publisher:" not in page for page in pages.values())
+
+
+# --- okengine#882: one bad item link must not abort the feed run ------------------------------
+
+_TWO_ITEMS = """<rss><channel>
+  <item><guid>bad</guid><title>Bad Link</title><link>https://article.test/bad</link></item>
+  <item><guid>good</guid><title>Good Link</title><link>https://article.test/good</link></item>
+</channel></rss>""".encode()
+
+
+def _capture_result(m, url, observed_at):
+    state = {"content_hash": "a" * 64, "canonical_url": url, "final_url": url,
+             "object_ref": "objects/a", "revision_ref": "revisions/a"}
+    return m.web_capture.CaptureResult(
+        url, url, url, "a" * 64, "a" * 64, "text/html", observed_at, "objects/a",
+        "revisions/a", "Captured", "Good", "", "", "", [], True, state)
+
+
+def test_capture_unicode_error_dead_letters_that_item_and_continues(monkeypatch, tmp_path):
+    m = _load(monkeypatch)
+    opml = tmp_path / "feeds.opml"
+    opml.write_text('<opml><body><outline text="Feed" xmlUrl="https://feed.test/rss"/></body></opml>')
+    monkeypatch.setattr(m, "fetch", lambda *_a: (_TWO_ITEMS, {}))
+    attempted = []
+
+    def capture(_root, url, *, native_id, publisher, previous, observed_at):
+        attempted.append(url)
+        if url.endswith("/bad"):
+            raise UnicodeEncodeError("ascii", "/ü", 1, 2, "ordinal not in range(128)")
+        return _capture_result(m, url, observed_at)
+
+    monkeypatch.setattr(m.web_capture, "capture", capture)
+    captures = tmp_path / "captures"
+    assert m.main(["--opml", str(opml), "--out-dir", str(tmp_path / "raw"),
+                   "--capture-dir", str(captures), "--capture-full-text",
+                   "--state", str(tmp_path / "state.json")]) == 0
+    assert attempted == ["https://article.test/bad", "https://article.test/good"]
+    assert list((tmp_path / "raw").glob("*good*.md")), "the item after the bad link was lost"
+    letters = [json.loads(p.read_text()) for p in captures.glob("dead-letter/*/*.json")]
+    assert [(d["requested_url"], d["category"]) for d in letters] == [
+        ("https://article.test/bad", "invalid-url")]
+    assert "UnicodeEncodeError" in letters[0]["error"]
+
+
+def test_feed_run_captures_an_iri_link_through_the_real_capture_path(monkeypatch, tmp_path):
+    m = _load(monkeypatch)
+    opml = tmp_path / "feeds.opml"
+    opml.write_text('<opml><body><outline text="Feed" xmlUrl="https://feed.test/rss"/></body></opml>')
+    rss = """<rss><channel><item><guid>iri</guid><title>Umlaut</title>
+      <link>https://article.test/nachrichten/über-uns</link></item></channel></rss>""".encode()
+    monkeypatch.setattr(m, "fetch", lambda *_a: (rss, {}))
+    monkeypatch.setattr(m.web_capture, "_validate_url", lambda _url: None)
+    requested = []
+
+    class Response:
+        status = 200
+        headers = {"Content-Type": "text/plain"}
+
+        def __init__(self, url):
+            self.url = url
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def read(self, _size=-1):
+            return b"Article body text"
+
+        def geturl(self):
+            return self.url
+
+    def ascii_only_open(req, _timeout):  # http.client encodes the request line as ASCII
+        requested.append(req.full_url)
+        req.full_url.encode("ascii")
+        return Response(req.full_url)
+
+    monkeypatch.setattr(m.web_capture, "_default_open", ascii_only_open)
+    captures = tmp_path / "captures"
+    assert m.main(["--opml", str(opml), "--out-dir", str(tmp_path / "raw"),
+                   "--capture-dir", str(captures), "--capture-full-text",
+                   "--state", str(tmp_path / "state.json")]) == 0
+    assert requested == ["https://article.test/nachrichten/%C3%BCber-uns"]
+    assert not list(captures.glob("dead-letter/*/*.json"))
+    assert list(captures.glob("objects/*/*"))
+
+
+def test_capture_invalid_url_dead_letters_that_item_and_continues(monkeypatch, tmp_path):
+    import http.client
+    m = _load(monkeypatch)
+    opml = tmp_path / "feeds.opml"
+    opml.write_text('<opml><body><outline text="Feed" xmlUrl="https://feed.test/rss"/></body></opml>')
+    monkeypatch.setattr(m, "fetch", lambda *_a: (_TWO_ITEMS, {}))
+
+    def capture(_root, url, *, native_id, publisher, previous, observed_at):
+        if url.endswith("/bad"):
+            raise http.client.InvalidURL("URL can't contain control characters")
+        return _capture_result(m, url, observed_at)
+
+    monkeypatch.setattr(m.web_capture, "capture", capture)
+    captures = tmp_path / "captures"
+    assert m.main(["--opml", str(opml), "--out-dir", str(tmp_path / "raw"),
+                   "--capture-dir", str(captures), "--capture-full-text",
+                   "--state", str(tmp_path / "state.json")]) == 0
+    assert list((tmp_path / "raw").glob("*good*.md"))
+    letters = [json.loads(p.read_text()) for p in captures.glob("dead-letter/*/*.json")]
+    assert [d["category"] for d in letters] == ["invalid-url"]
+
+
+@pytest.mark.parametrize("title", [
+    "Baseten on Hugging Face Inference Providers \U0001F525",
+    "\U0001F52C An Oscar, Two Asteroids, and the Algorithm",
+    "control \x85\x07 and a quote \" stay escaped",
+])
+def test_a_captured_title_reads_back_exactly_through_yaml(monkeypatch, tmp_path, title):
+    """okengine#894: JSON's ASCII escaping wrote an emoji as a surrogate PAIR, which YAML decodes as
+    two lone surrogates -- a title no page, projection or UTF-8 encoder can hold."""
+    import yaml
+
+    m = _load(monkeypatch)
+    item = {"id": "https://feed.test/a", "link": "https://feed.test/a", "title": title,
+            "summary": "s", "published": "2026-09-26T00:00:00+00:00",
+            "authors": ["Ann \U0001F600"]}
+    path = m.write_item(tmp_path / "raw", "Feed \U0001F4F0", item, "ai")
+    fm = yaml.safe_load(path.read_text(encoding="utf-8").split("---")[1])
+    assert fm["title"] == title
+    assert fm["source_feed"] == "Feed \U0001F4F0"
+    assert fm["authors"] == ["Ann \U0001F600"]
+    assert not any("\ud800" <= c <= "\udfff" for c in fm["title"])
+
+
+def test_the_capture_body_is_written_verbatim_even_when_it_quotes_an_escape(monkeypatch, tmp_path):
+    """Only frontmatter is rewritten (okengine#894): an article that quotes a surrogate escape --
+    before a markdown rule that looks like a frontmatter fence -- keeps its own text."""
+    m = _load(monkeypatch)
+    body = "Python writes \\ud83d\\udd25 for a flame.\n---\nAfter the rule."
+    item = {"id": "https://feed.test/b", "link": "https://feed.test/b", "title": "Escapes",
+            "summary": "", "captured_text": body, "published": "2026-09-26T00:00:00+00:00"}
+    text = m.write_item(tmp_path / "raw", "Feed", item, "ai").read_text(encoding="utf-8")
+    assert text.endswith(body + "\n")
+
+
+@pytest.mark.parametrize("failure_at, rotate_guid, changed", [
+    (0, False, False), (0, True, False), (None, True, False),
+    (None, True, True), (1, True, False),
+], ids=["recover-stable-guid", "recover-rotating-guid", "unchanged-rotating-guid",
+        "changed-rotating-guid", "transient-block-no-duplicate"])
+def test_first_successful_capture_lands_after_failure_without_guid_churn(
+        monkeypatch, tmp_path, failure_at, rotate_guid, changed):
+    """Real fetch/parse/extract/archive/ledger path; only HTTP and DNS are replaced."""
+    import io
+    from unittest.mock import create_autospec
+    from urllib.response import addinfourl
+    m = _load(monkeypatch)
+    opml = tmp_path / "feeds.opml"
+    opml.write_text('<opml><body><outline text="Official" publisher="Lab" '
+                    'xmlUrl="https://feed.test/rss"/></body></opml>')
+    phase = {"number": 0}
+
+    def feed_response(request, timeout):
+        guid = str(phase["number"]) if rotate_guid else "stable"
+        body = (f'<rss><channel><item><guid>{guid}</guid><title>Report</title>'
+                '<link>https://article.test/report</link><description>Discovery excerpt</description>'
+                '<pubDate>Fri, 18 Sep 2026 10:00:00 GMT</pubDate></item></channel></rss>').encode()
+        return addinfourl(io.BytesIO(body), {}, request.full_url, 200)
+
+    def article_response(request, timeout):
+        if phase["number"] == failure_at:
+            raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, None)
+        article = (b"Updated findings after replication." if changed and phase["number"] > 0
+                   else b"A complete report with observations and limitations.")
+        return addinfourl(io.BytesIO(b"<main>" + article + b"</main>"),
+                         {"Content-Type": "text/html"}, request.full_url, 200)
+
+    monkeypatch.setattr(m.urllib.request, "urlopen", create_autospec(m.urllib.request.urlopen,
+                                                                  side_effect=feed_response))
+    monkeypatch.setattr(m.web_capture, "_default_open", create_autospec(
+        m.web_capture._default_open, side_effect=article_response))
+    monkeypatch.setattr(m.socket, "getaddrinfo", create_autospec(
+        m.socket.getaddrinfo, return_value=[(2, 1, 6, "", ("8.8.8.8", 443))]))
+    args = ["--opml", str(opml), "--out-dir", str(tmp_path / "raw/feeds"),
+            "--capture-dir", str(tmp_path / "raw/captures"), "--state", str(tmp_path / "state.json"),
+            "--capture-full-text", "--collection-ledger", str(tmp_path / "ledger")]
+    for n in range(3):
+        phase["number"] = n
+        assert m.main(args) == 0
+    pages = list((tmp_path / "raw/feeds").glob("*.md"))
+    captured = [p for p in pages if "## Captured content" in p.read_text()]
+    assert len(captured) == (2 if changed else 1), "each acquired text revision must land exactly once"
+    assert len(pages) == 1 + int(failure_at == 0) + int(changed)
+    assert any("A complete report with observations and limitations." in p.read_text() for p in captured)
+    if changed:
+        assert any("Updated findings after replication." in p.read_text() for p in captured)
+    attempts = m.collection_ledger.load_attempts(tmp_path / "ledger")
+    assert [r["accepted"] for r in attempts] == ([1, 1, 0] if failure_at == 0 or changed else [1, 0, 0])
+    assert [r["dead_letter"] for r in attempts] == [int(n == failure_at) for n in range(3)]
+    assert attempts[-1]["deduped"] == 1 and attempts[-1]["outcome"] == "success"
+
+
+def test_capture_link_index_keeps_latest_observation_per_feed(monkeypatch):
+    m = _load(monkeypatch)
+    old = {"requested_url": "https://www.article.test/report/", "retrieved_at": "2026-09-19T00:00:00Z"}
+    new = {"requested_url": "https://article.test/report", "retrieved_at": "2026-09-20T00:00:00Z"}
+    other = {"requested_url": "https://article.test/report"}
+    assert m.capture_link_index({"https://feed.test/rss\0new": new, "https://feed.test/rss\0old": old,
+                                 "https://other.test/rss\0id": other}) == {
+        "https://feed.test/rss\0link:article.test/report": new,
+        "https://other.test/rss\0link:article.test/report": other}
+    assert m.capture_link_index({"legacy": new, "feed\0bad": None,
+                                 "feed\0missing": {}, "feed\0blank": {"requested_url": "  "},
+                                 "feed\0list": {"requested_url": ["url"]}}) == {}

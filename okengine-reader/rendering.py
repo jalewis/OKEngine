@@ -9,6 +9,7 @@ from urllib.parse import quote, urlparse
 import markdown as md
 from okengine.html_sanitize import (ALLOWED_ATTRS, ALLOWED_TAGS, PANEL_SVG_RE,
                                     restore_panel_svg, sanitize, stash_panel_svg)
+from okengine.vault_lookup_cache import BasenameIndex, VaultLookupCache
 import yaml
 
 WIKI: Path | None = None
@@ -30,6 +31,7 @@ def configure(
         WIKI = wiki
         _LINK_TITLE_CACHE.clear()
         _EMBED_PATH_CACHE.clear()
+        _BASENAME_INDEX.clear()
     _READ_HEAD = read_head
     _EXCLUDED_DIRS = excluded_dirs
     _NS_DIRS = ns_dirs
@@ -80,34 +82,42 @@ def split_fm(text: str) -> tuple[dict, str]:
     return (fm if isinstance(fm, dict) else {}), m.group(2)
 
 
-_LINK_TITLE_CACHE: dict = {}
+# okengine#1024: a hit is revalidated against its file's fingerprint and a miss expires, so a page
+# written, moved or retitled after the first render is seen without recreating the container.
+_LINK_TITLE_CACHE = VaultLookupCache()
+
+
+def _link_target(key: str) -> "Path | None":
+    """The page a link target names: the exact vault path, else its canonical basename match."""
+    try:
+        cand = (WIKI / (key + ".md")).resolve()
+        if cand.is_file() and _WITHIN(WIKI, cand):
+            return cand
+        return _resolve_basename(Path(key).name + ".md")
+    except (OSError, ValueError):   # ValueError: a NUL byte in the target
+        return None
+
+
+def _page_title(path: Path) -> str | None:
+    """The page's human title (frontmatter `title`/`name`), or None when it has none."""
+    try:
+        fm, _ = split_fm(_READ_HEAD(path))
+    except OSError:
+        return None
+    return (str(fm.get("title") or fm.get("name") or "").strip()) or None
 
 
 def _link_title(target: str) -> str | None:
     """The target page's human title (frontmatter `title`/`name`) for friendlier wikilink text —
     so a citation reads 'EvilTokens: a phishing attack…' instead of the raw slug
     `eviltokens-a-phishing-attack…`. Resolves a flat-form target to its sharded page (basename).
-    Returns None when there's no real title (caller falls back to the slug). Cached for the
-    process lifetime (titles are stable; the reader restarts on deploy)."""
+    Returns None when there's no real title (caller falls back to the slug). Memoized in
+    `_LINK_TITLE_CACHE`, which re-reads a page that changed and forgets a miss after its TTL."""
     target = (target or "").strip()
     if not target or "://" in target:
         return None
-    if target in _LINK_TITLE_CACHE:
-        return _LINK_TITLE_CACHE[target]
-    title = None
     key = target[:-3] if target.endswith(".md") else target
-    try:
-        cand = (WIKI / (key + ".md")).resolve()
-        hit = cand if (cand.is_file() and _WITHIN(WIKI, cand)) else None
-        if hit is None:
-            hit = _resolve_basename(Path(key).name + ".md")
-        if hit is not None:
-            fm, _ = split_fm(_READ_HEAD(hit))
-            title = (str(fm.get("title") or fm.get("name") or "").strip()) or None
-    except OSError:
-        pass
-    _LINK_TITLE_CACHE[target] = title
-    return title
+    return _LINK_TITLE_CACHE.lookup(target, lambda: _link_target(key), _page_title)
 
 
 def _wl_display(m) -> str:
@@ -138,7 +148,11 @@ def _deref_local_links(s: str) -> str:
     return _MD_LOCAL_LINK.sub(r"\1", s)
 
 
-_EMBED_PATH_CACHE: dict = {}
+_EMBED_PATH_CACHE = VaultLookupCache()
+# Every basename the two memos above resolve, from one walk of the vault. Their hits expire together
+# after RESOLVE_TTL, and a walk per re-resolved link stalled a link-heavy page for 32 s on a live
+# vault every five minutes (okengine#1044 [24]).
+_BASENAME_INDEX = BasenameIndex()
 
 
 def _resolve_basename(name: str) -> "Path | None":
@@ -149,7 +163,7 @@ def _resolve_basename(name: str) -> "Path | None":
     len==1 gate rendered a multi-source entity as "missing" (invariant-audit #16 / L7)."""
     if not WIKI.is_dir():
         return None
-    hits = [p for p in WIKI.rglob(name) if not _skip(p.name)]
+    hits = [p for p in _BASENAME_INDEX.paths(WIKI, name) if not _skip(p.name)]
     if len(hits) > 1:
         excl = _EXCLUDED_DIRS()
         pref = [p for p in hits if not (_NS_DIRS(p) & excl)] or hits
@@ -159,14 +173,11 @@ def _resolve_basename(name: str) -> "Path | None":
 
 
 def _embed_rglob(name: str) -> "Path | None":
-    """Canonical vault match for a basename `name` (`…​.md`), memoized for the process lifetime
-    (mirrors `_LINK_TITLE_CACHE`). Basename embeds ![[apt29]] are the norm on sharded OKF
-    vaults, so without this each render re-walks the WHOLE tree once per unresolved embed."""
-    if name in _EMBED_PATH_CACHE:
-        return _EMBED_PATH_CACHE[name]
-    hit = _resolve_basename(name)
-    _EMBED_PATH_CACHE[name] = hit
-    return hit
+    """Canonical vault match for a basename `name` (`…​.md`), memoized in `_EMBED_PATH_CACHE`.
+    Basename embeds ![[apt29]] are the norm on sharded OKF vaults, so without the memo each render
+    re-walks the WHOLE tree once per unresolved embed. A remembered path is re-stamped on every hit,
+    so a reshelved page is found again rather than read at its old path (okengine#1024)."""
+    return _EMBED_PATH_CACHE.lookup(name, lambda: _resolve_basename(name), lambda path: path)
 
 
 def _resolve_embeds(text: str, depth: int = 0) -> str:

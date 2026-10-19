@@ -141,3 +141,22 @@ def test_main_discovers_namespace_declared_only_by_subdomain(tmp_path, monkeypat
     )
     assert m.main() == 0
     assert "| widgets |" in m.DASH.read_text()
+
+
+def test_count_namespace_puts_tombstoned_pages_in_cold(tmp_path, monkeypatch):
+    """okengine#991 audit 2 [10]: a just-tombstoned page (only `last_updated`, stamped by the
+    tombstone) was counted HOT, so the tier dashboard disagreed with HOT.md and INDEX.md."""
+    today = date(2026, 6, 15)
+    w = tmp_path / "wiki"
+    (w / "entities/a").mkdir(parents=True)
+    (w / "sources/2026/06").mkdir(parents=True)
+    (w / "entities/a/live.md").write_text("---\ntype: actor\nlast_updated: 2026-06-15\n---\n")
+    (w / "entities/a/gone.md").write_text(
+        "---\ntype: malware\nstatus: tombstoned\nlast_updated: 2026-06-15\n---\n")
+    (w / "sources/2026/06/live.md").write_text("---\ntype: source\n---\n")
+    (w / "sources/2026/06/gone.md").write_text("---\ntype: source\nstatus: Tombstoned\n---\n")
+    m = _load(tmp_path, monkeypatch)
+    cfg = m.tier_lib._DEFAULT_TIER
+    for ns in ("entities", "sources"):
+        counts = m._count_namespace(ns, cfg["namespaces"][ns], cfg, today)
+        assert counts == {"hot": 1, "warm": 0, "cold": 1}, (ns, counts)

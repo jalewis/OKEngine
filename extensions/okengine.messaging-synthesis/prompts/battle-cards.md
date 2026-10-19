@@ -9,9 +9,12 @@ visible on one of the capability-anchor pages in the digest above — if you can
 it's not a real wedge, drop it. Do not invent product features. Do not soften a competitor's real
 advantage into "where we win" — put it under "Where they win" instead.
 
-For each (competitor, segment) pair, write via mcp__okengine_write_okengine_messaging_synthesis_positioning_battle_cards__create_entity to the
-wiki-relative path the wake-gate specified, frontmatter `type: battle-card, title: "<Competitor>
-vs <product> — <segment>", published: <date>, updated: <date>`. Body:
+For each (competitor, segment) pair, write to the wiki-relative path the wake-gate specified. The
+digest marks each card `exists: yes` or `exists: no`: refresh an existing card with
+mcp__OKENGINE_WRITER__update_entity (full frontmatter and body), and create a missing one with
+mcp__OKENGINE_WRITER__create_entity — creating a card that exists is refused. Frontmatter
+`type: battle-card, title: "<Competitor> vs <product> — <segment>", published: <date>,
+updated: <date>` (keep the card's original `published` on a refresh). Body:
 
 ```
 # <Competitor> vs <product> — <segment>

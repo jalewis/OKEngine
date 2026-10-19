@@ -6,9 +6,11 @@ Output is deterministic — same vault state → same selection → idempotent r
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 import os
 import hashlib
 import json
+from json import JSONDecodeError
 import re
 import sys
 import unicodedata
@@ -78,6 +80,20 @@ BULK_DIR = os.environ.get("BULK_DIR", "bulk")
 # At the default one-item batch that is years of agent invocations spent on storage internals
 # before the actual articles drain. 141 such paths had already been marked processed.
 CAPTURE_DIR = os.environ.get("CAPTURE_DIR", "captures")
+# The declarative source-connector ARCHIVE (source_connector.py, default `raw/connectors`) has
+# the same shape: `<archive.path>/records/…` holds one normalized record per item (the
+# compilable artifact) and `<archive.path>/raw/<digest>` holds the verbatim HTTP response —
+# a whole search page of N articles. Offered as one item, a response has no single URL, so
+# every run on it was rejected (`source url is required`) or wrote an arbitrary article from
+# the page. Storage, not content.
+CONNECTOR_DIR = os.environ.get("CONNECTOR_DIR", "connectors")
+
+
+def is_connector_response_archive(rel: str) -> bool:
+    """True for a verbatim connector HTTP response (`raw/<CONNECTOR_DIR>/<path…>/raw/<file>`)."""
+    parts = rel.split("/")
+    return (len(parts) >= 5 and parts[0] == "raw" and parts[1] == CONNECTOR_DIR
+            and "raw" in parts[3:-1])
 
 # Bulk-import mtime clusters: epoch-second timestamps shared by many files from
 # a single sync/restore operation. When derive_year falls back to mtime and the
@@ -159,7 +175,7 @@ def _save_offered(d: dict[str, int]) -> None:
 def _load_terminal_completions() -> set[str]:
     try:
         value = json.loads(COMPLETION_LEDGER.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, JSONDecodeError):
         return set()
     if not isinstance(value, dict):
         return set()
@@ -350,33 +366,13 @@ def quarantine_reason(path: Path) -> str | None:
     return None
 
 
-def main() -> int:
-    lane_id = os.environ.get("OKENGINE_LANE_ID", "").strip()
-    contract_digest = os.environ.get("OKENGINE_CONTRACT_DIGEST", "").strip()
-    if not lane_id or not contract_digest:
-        missing = [
-            name for name, value in (
-                ("OKENGINE_LANE_ID", lane_id),
-                ("OKENGINE_CONTRACT_DIGEST", contract_digest),
-            ) if not value
-        ]
-        print(
-            "ERROR: receipt contract unavailable; missing " + ", ".join(missing),
-            file=sys.stderr,
-        )
-        return 1
-    if not VAULT.exists():
-        print(f"ERROR: vault not found at {VAULT}", file=sys.stderr)
-        print(f"# Batch selection failed: vault not found at `{VAULT}`")
-        return 1
+def scan_raw() -> SimpleNamespace:
+    """Every raw capture and which are still uncompiled — THE definition of the queue.
 
+    Shared by the raw-backfill selector and the deterministic raw-compile lane (okengine#862) so
+    the two can never disagree about what is processed, excluded, or deferred."""
     sources_dir = VAULT / "wiki" / "sources"
     raw_dir = VAULT / "raw"
-    if not raw_dir.exists():
-        _clear_selection_manifest()
-        print('{"wakeAgent": false}')
-        return 0
-
     processed: set[str] = set()
     if sources_dir.exists():
         for src in sources_dir.rglob("*.md"):
@@ -428,7 +424,7 @@ def main() -> int:
         if p.name.lower() == "link.md" and not (p.parent / "content.txt").is_file():
             continue
         rel = str(p.relative_to(VAULT))
-        if rel.startswith(f"raw/{CAPTURE_DIR}/"):
+        if rel.startswith(f"raw/{CAPTURE_DIR}/") or is_connector_response_archive(rel):
             capture_store_skipped += 1
             continue
         reason = quarantine_reason(p)
@@ -486,6 +482,47 @@ def main() -> int:
             if normalize_path(item[0]) == CONTROLLED_TARGET
         ]
     deferred_older = len(unprocessed_all) - len(unprocessed)
+    return SimpleNamespace(
+        processed=processed, all_raw=all_raw, capture_store_skipped=capture_store_skipped,
+        bogus_paths=bogus_paths, quarantined_raw=quarantined_raw,
+        collapsed_revisions=collapsed_revisions, terminal_completions=terminal_completions,
+        completed=completed, unprocessed_all=unprocessed_all, unprocessed=unprocessed,
+        deferred_older=deferred_older)
+
+
+def main() -> int:
+    lane_id = os.environ.get("OKENGINE_LANE_ID", "").strip()
+    contract_digest = os.environ.get("OKENGINE_CONTRACT_DIGEST", "").strip()
+    if not lane_id or not contract_digest:
+        missing = [
+            name for name, value in (
+                ("OKENGINE_LANE_ID", lane_id),
+                ("OKENGINE_CONTRACT_DIGEST", contract_digest),
+            ) if not value
+        ]
+        print(
+            "ERROR: receipt contract unavailable; missing " + ", ".join(missing),
+            file=sys.stderr,
+        )
+        return 1
+    if not VAULT.exists():
+        print(f"ERROR: vault not found at {VAULT}", file=sys.stderr)
+        print(f"# Batch selection failed: vault not found at `{VAULT}`")
+        return 1
+
+    raw_dir = VAULT / "raw"
+    if not raw_dir.exists():
+        _clear_selection_manifest()
+        print('{"wakeAgent": false}')
+        return 0
+
+    scan = scan_raw()
+    processed, all_raw = scan.processed, scan.all_raw
+    capture_store_skipped, bogus_paths = scan.capture_store_skipped, scan.bogus_paths
+    quarantined_raw, collapsed_revisions = scan.quarantined_raw, scan.collapsed_revisions
+    terminal_completions, completed = scan.terminal_completions, scan.completed
+    unprocessed_all, unprocessed = scan.unprocessed_all, scan.unprocessed
+    deferred_older = scan.deferred_older
 
     # Offer counts are visibility, never completion. Invalid/empty compiled pages and rejected writes
     # remain retryable regardless of how many times they were offered.
@@ -593,10 +630,13 @@ def main() -> int:
           "unknown field — never write placeholder strings such as `undefined`. If `publisher` is "
           "absent, identify it from the article URL or leave it unset; do not substitute "
           "`source_feed`, `source_channel`, or `matched_query`.\n")
-    print("If a raw file DUPLICATES a story that already has a source page (different slug), do NOT "
-          "create a second page — instead APPEND this raw path to that existing source's `raw:` list "
-          "(via `mcp__okengine_write__update_entity`). That records it as processed so it stops being "
-          "re-queued; leaving it unmarked is what made the lane loop on duplicates.\n")
+    # Duplicates need no search: a source's identity is its URL, so converging a capture of an
+    # already-compiled URL lands on that page and appends this raw path to its `raw:` list
+    # (okengine#886). The old instruction named update_entity, which this actor is never
+    # granted, and sent the model searching: 50 of 57 runs spent a turn on read tools.
+    print("Write the page with the one write tool you have. A capture of an article that already "
+          "has a source page needs no search: identity is the URL, so the write converges onto "
+          "that page and records this raw path there. Do not look for duplicates.\n")
     selected_keys = [rel for rel, _, _ in chosen]
     manifest = {"api": 1, "selected": selected_keys,
                 "input_digest": "sha256:" + hashlib.sha256(

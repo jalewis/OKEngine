@@ -132,7 +132,7 @@ def test_discovery_schema_and_frontmatter_edge_paths(tmp_path, monkeypatch):
 
 
 def test_dashboard_variants_cover_unrated_recent_and_empty(tmp_path, monkeypatch):
-    m=_load();dash=tmp_path/"dashboards";dash.mkdir()
+    m=_load();dash=tmp_path/"wiki"/"dashboards";dash.mkdir(parents=True)
     monkeypatch.setattr(m,"DASH_DIR",dash)
     pages=[
       {"_name":"a","_sub":"actors","type":"actor","name":"A","confidence":"high",
@@ -163,7 +163,7 @@ def test_main_without_sources_omits_source_specific_dashboards(tmp_path, monkeyp
     assert m.main()==0
     assert not (wiki/"dashboards/latest-recent-ingest.md").exists()
 def test_confidence_dashboard_surfaces_and_orders_full_qualitative_scale(tmp_path, monkeypatch):
-    m = _load(); dash = tmp_path / "dashboards"; dash.mkdir()
+    m = _load(); dash = tmp_path / "wiki" / "dashboards"; dash.mkdir(parents=True)
     monkeypatch.setattr(m, "DASH_DIR", dash)
     pages = [
         {"_name": label, "_sub": "predictions", "type": "prediction",

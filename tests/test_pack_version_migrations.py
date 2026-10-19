@@ -9,6 +9,7 @@ recorded installed version survives `framework reconcile` accepting pack.yaml.up
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -655,3 +656,190 @@ def test_install_domain_existing_member_runs_guest_migrations(tmp_path, monkeypa
     assert (host / "MIGRATED-tax.txt").read_text() == "done"
     st = _state(host)
     assert st["pack_versions"]["okpack-tax"] == "0.2.0" and "tax-0-2-0" in st["applied"]
+
+
+def test_a_consumed_snapshot_is_reported_not_fatal(tmp_path, capsys, monkeypatch):
+    """okengine#819 at the runner: another transaction already rolled back from this snapshot and
+    deleted it. The refused rollback must be REPORTED (the original failure still returns 1) and
+    cleanup must tolerate the snapshot being gone -- neither may take the process down."""
+    import shutil
+    m = _load("framework_upgrade")
+    m.VALIDATOR = lambda p: (True, "ok (test)")
+    v = _vault(tmp_path)
+    (v / "wiki" / "page.md").write_text("original", encoding="utf-8")
+    _migration(v, id_="bad", frm="0.1.0", to="0.2.0", fail=True)
+
+    def consumed(_vault, snapshot, *_a, **_kw):
+        shutil.rmtree(snapshot, ignore_errors=True)
+        raise FileNotFoundError("snapshot consumed by another transaction")
+    monkeypatch.setattr(m, "restore", consumed)
+
+    assert m.run_pack_migrations(v, "okpack-mig", "0.1.0", "0.2.0", apply=True) == 1
+    captured = capsys.readouterr()
+    assert "NOT rolled back: snapshot consumed" in captured.err
+    assert "ROLLED BACK" not in captured.out
+
+
+def test_an_unreadable_state_file_stops_pack_migrations_without_replaying(tmp_path, capsys):
+    """okengine#991 [5], pack half: torn state used to read as "nothing applied", so every pack
+    migration in the span replayed. The runner must refuse and leave the vault untouched."""
+    m = _load("framework_upgrade")
+    v = _vault(tmp_path)
+    _migration(v, id_="mig1", frm="0.1.0", to="0.2.0")
+    state = v / ".okengine" / "migrations-state.json"
+    state.parent.mkdir(parents=True)
+    state.write_text('{"pack_applied": {"okpack-mig": ["mig1"]', encoding="utf-8")
+
+    assert m.run_pack_migrations(v, "okpack-mig", "0.1.0", "0.2.0", apply=True) == 1
+
+    assert not (v / "MIGRATED-mig1.txt").exists(), "an applied pack migration was replayed"
+    assert "migrations-state.json" in capsys.readouterr().err
+    assert state.read_text(encoding="utf-8") == '{"pack_applied": {"okpack-mig": ["mig1"]'
+
+
+# --- okengine#991: an unreadable migration state refuses BEFORE any caller mutates the vault ----
+
+_TORN = '{"pack_versions": {"okpack-tax": "0.1'
+
+
+def _tear_state(vault: Path) -> Path:
+    state = vault / ".okengine" / "migrations-state.json"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(_TORN, encoding="utf-8")
+    return state
+
+
+def _tree(root: Path) -> dict:
+    return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def test_install_domain_update_of_an_existing_member_refuses_a_torn_state(tmp_path, monkeypatch,
+                                                                          capsys):
+    mid = _load_install_domain()
+    host, guest = _id_host(tmp_path), _id_guest(tmp_path, "0.1.0")
+    assert mid.main([str(host), str(guest), "--apply"]) == 0
+    _tear_state(host)
+    guest = _id_guest(tmp_path, "0.2.0")
+    before = _tree(host)
+
+    assert mid.main([str(host), str(guest), "--apply"]) == 1
+
+    assert _tree(host) == before
+    assert "migrations-state.json" in capsys.readouterr().err
+
+
+def test_pull_update_refuses_a_torn_state_before_copying_upstream_files(tmp_path, capsys):
+    fp = _load("framework_pull")
+    src, env = _pack_repo(tmp_path)
+    dest = tmp_path / "deploy"
+    assert fp.main([str(src), str(dest), "--no-validate",
+                    "--catalog", str(tmp_path / "no-catalog.json")]) == 0
+    _bump_upstream(src, env)
+    _tear_state(dest)
+    before = _tree(dest)
+
+    with pytest.raises(SystemExit) as exc:
+        fp.main([str(src), str(dest), "--update", "--apply-migrations", "--no-validate",
+                 "--catalog", str(tmp_path / "no-catalog.json")])
+
+    assert "migrations-state.json" in str(exc.value.code)
+    assert _tree(dest) == before, "pull --update copied upstream files before refusing"
+
+
+def test_a_forced_pull_that_keeps_a_torn_state_fails_cleanly_at_the_baseline(tmp_path,
+                                                                             monkeypatch):
+    """A forced subdir pull copies over the existing dir and keeps its .okengine state. Recording
+    the baseline then meets the torn file: a clean error, not a traceback."""
+    fp = _load("framework_pull")
+    src, _env = _pack_repo(tmp_path)
+    dest = tmp_path / "deploy"
+    dest.mkdir()
+    state = _tear_state(dest)
+
+    def keep_existing(_spec, target, _force):
+        shutil.copytree(src, target, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".git"))
+    monkeypatch.setattr(fp, "fetch", keep_existing)
+
+    with pytest.raises(SystemExit) as exc:
+        fp.main([str(src), str(dest), "--force", "--no-validate",
+                 "--catalog", str(tmp_path / "no-catalog.json")])
+
+    assert "migrations-state.json" in str(exc.value.code)
+    assert state.read_text(encoding="utf-8") == _TORN
+
+
+# --- okengine#1042 [5]/[27]: the pack-version path orders a prerelease before its final --------
+
+def test_rc_installed_pack_runs_the_migration_that_targets_its_final(tmp_path, capsys):
+    """[5]: 0.4.0-rc1 -> 0.4.0 with a TO=0.4.0 migration. The 3-tuple compare called the two
+    equal, returned 0 without running the migration and recorded the pack as 0.4.0."""
+    m = _load("framework_upgrade")
+    m.VALIDATOR = lambda p: (True, "ok (test)")
+    v = _vault(tmp_path)
+    _migration(v, id_="final", frm="0.4.0-rc1", to="0.4.0")
+    assert m.run_pack_migrations(v, "okpack-mig", "0.4.0-rc1", "0.4.0", apply=True) == 0
+    assert (v / "MIGRATED-final.txt").read_text() == "done", capsys.readouterr().out
+    state = _state(v)
+    assert state["pack_versions"]["okpack-mig"] == "0.4.0"
+    assert state["pack_applied"]["okpack-mig"] == ["final"]
+
+
+def test_a_final_to_its_own_rc_is_a_refused_downgrade_not_an_equal_noop(tmp_path, capsys):
+    """[5] reverse: installed 0.4.0, incoming 0.4.0-rc1 is a rollback; it must be reported."""
+    m = _load("framework_upgrade")
+    v = _vault(tmp_path)
+    _migration(v, id_="final", frm="0.4.0-rc1", to="0.4.0")
+    assert m.run_pack_migrations(v, "okpack-mig", "0.4.0", "0.4.0-rc1", apply=True) == 0
+    assert "downgrade" in capsys.readouterr().out.lower()
+    assert not (v / "MIGRATED-final.txt").exists()
+
+
+def test_an_rc_checkpoint_precedes_its_final_in_a_multi_step_span(tmp_path):
+    """[27]: the checkpoint compare used the lossy 3-tuple, so an rc step and its final looked
+    like one target. A hard kill after the rc step must checkpoint the rc, not stay at the floor."""
+    m = _load("framework_upgrade")
+    v = _vault(tmp_path)
+    _migration(v, id_="rc", frm="0.3.0", to="0.4.0-rc1")
+    d = v / "migrations"
+    (d / "m_0_4_0_rc1_0_4_0_final.py").write_text(
+        'ID = "final"\nFROM = "0.4.0-rc1"\nTO = "0.4.0"\nDESCRIPTION = "kill"\n'
+        'def apply(pack, dry_run):\n    raise SystemExit("simulated hard kill")\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match="hard kill"):
+        m.run_pack_migrations(v, "okpack-mig", "0.3.0", "0.4.0", apply=True)
+    state = _state(v)
+    assert state["pack_applied"]["okpack-mig"] == ["rc"]
+    assert state["pack_versions"]["okpack-mig"] == "0.4.0-rc1"
+
+
+def test_changelog_impact_includes_the_final_section_after_an_rc():
+    """[27]: changelog_impact used the lossy 3-tuple, so (0.4.0-rc1, 0.4.0] was empty."""
+    m = _load("framework_upgrade")
+    meta = _load("engine_meta")
+    text = ("# Changelog\n\n## 0.4.0 — 2026-10-01\n- Migration impact: re-shelve x/.\n\n"
+            "## 0.4.0-rc1 — 2026-09-20\n- Migration impact: rc step.\n\n"
+            "## 0.3.0 — 2026-09-01\n- Migration impact: none.\n")
+    lines = m.changelog_impact(text, "0.4.0-rc1", "0.4.0", meta)
+    assert lines == ["0.4.0: - Migration impact: re-shelve x/."], lines
+    lines = m.changelog_impact(text, "0.3.0", "0.4.0", meta)
+    assert [line.split(":")[0] for line in lines] == ["0.4.0", "0.4.0-rc1"], lines
+
+
+def test_an_intermediate_checkpoint_waits_for_every_sibling_of_that_target(tmp_path):
+    """Two migrations share the intermediate 0.2.0 target of a 0.1.0 -> 0.3.0 span. A kill after the
+    first must keep the floor at 0.1.0, or a resume would skip its sibling forever."""
+    m = _load("framework_upgrade")
+    v = _vault(tmp_path)
+    _migration(v, id_="stepA", frm="0.1.0", to="0.2.0")
+    _migration(v, id_="stepC", frm="0.2.0", to="0.3.0")
+    (v / "migrations" / "m_0_1_0_0_2_0_stepB.py").write_text(
+        'ID = "stepB"\nFROM = "0.1.0"\nTO = "0.2.0"\nDESCRIPTION = "kill"\n'
+        'def apply(pack, dry_run):\n    raise SystemExit("simulated hard kill")\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match="hard kill"):
+        m.run_pack_migrations(v, "okpack-mig", "0.1.0", "0.3.0", apply=True)
+    state = _state(v)
+    assert state["pack_applied"]["okpack-mig"] == ["stepA"]
+    assert state["pack_versions"]["okpack-mig"] == "0.1.0"

@@ -221,3 +221,128 @@ def test_remaining_shape_date_and_fail_open_edges(tmp_path, monkeypatch):
         lambda *_a: (_ for _ in ()).throw(RuntimeError("bad schema")),
     )
     assert ig.guard({"type": "source"}, vault=tmp_path) == []
+
+
+# --- okengine#1012: a direct writer creating an actor gets the write path's grounding ---------------
+
+ACTOR_SCHEMA = SCHEMA.replace("  prediction:\n", "  actor:\n    required: [type]\n  prediction:\n")
+
+
+def _source_page(v: Path, ref: str, body: str) -> str:
+    page = v / "wiki" / f"{ref}.md"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    page.write_text(f"---\ntype: source\ntitle: Report\n---\n\n{body}\n", encoding="utf-8")
+    return ref
+
+
+def test_guard_reports_an_actor_its_sources_do_not_ground_on_create(tmp_path):
+    ig = _load("importer_guard", REPO / "scripts" / "cron" / "importer_guard.py")
+    v = _vault(tmp_path, ACTOR_SCHEMA)
+    ref = _source_page(v, "sources/a", "ANY.RUN has identified Wazza, a new phishkit.")
+    fm = {"type": "actor", "title": "ANY.RUN", "sources": [ref],
+          "review_state": "approved", "authority": "x"}
+    problems = ig.guard(fm, vault=v, creating=True)
+    assert any("not grounded" in p and "reporting organization" in p for p in problems), problems
+    assert fm["needs_review"] is True and "review_state" not in fm, "approval must be revoked"
+
+
+def test_guard_accepts_an_affirmed_or_curated_actor_on_create(tmp_path):
+    ig = _load("importer_guard", REPO / "scripts" / "cron" / "importer_guard.py")
+    v = _vault(tmp_path, ACTOR_SCHEMA)
+    ref = _source_page(v, "sources/b", "LockBit claimed the attack on the bank.")
+    assert ig.guard({"type": "actor", "title": "LockBit", "sources": [ref]}, vault=v,
+                    creating=True) == []
+    # the importer of a curated list IS that list's mirror: its provenance label vouches
+    assert ig.guard({"type": "actor", "title": "APT28", "sources": ["MITRE ATT&CK"]}, vault=v,
+                    creating=True) == []
+
+
+def test_guard_judges_actor_grounding_only_on_a_create(tmp_path):
+    """An enrichment rewrite of a stored actor is not re-litigated, and other types never are."""
+    ig = _load("importer_guard", REPO / "scripts" / "cron" / "importer_guard.py")
+    v = _vault(tmp_path, ACTOR_SCHEMA)
+    assert ig.guard({"type": "actor", "title": "Unsourced"}, vault=v) == []
+    assert ig.guard({"type": "source", "title": "Unsourced"}, vault=v, creating=True) == []
+    assert any("unsourced" in p for p in ig.guard({"type": "actor", "title": "Unsourced"},
+                                                  vault=v, creating=True))
+
+
+def test_guard_says_so_when_the_grounding_library_cannot_load(tmp_path, monkeypatch):
+    """Never fail-open on identity: an unchecked record is reported, not silently admitted."""
+    ig = _load("importer_guard", REPO / "scripts" / "cron" / "importer_guard.py")
+    v = _vault(tmp_path, ACTOR_SCHEMA)
+    monkeypatch.setitem(sys.modules, "okengine.actor_grounding", None)
+    problems = ig.guard({"type": "actor", "title": "LockBit", "sources": ["MITRE ATT&CK"]},
+                        vault=v, creating=True)
+    assert any("grounding unavailable" in p for p in problems), problems
+
+
+def test_actor_grounding_options_are_keyword_only(tmp_path):
+    ig = _load("importer_guard", REPO / "scripts" / "cron" / "importer_guard.py")
+    v = _vault(tmp_path, ACTOR_SCHEMA)
+    for call in (lambda: ig.actor_identity_problems({}, v), lambda: ig.guard({}, v)):
+        try:
+            call()
+        except TypeError:
+            continue
+        raise AssertionError("a positional vault must be refused")
+
+
+def test_only_an_actor_is_judged_whatever_its_spelling_sorts_as(tmp_path):
+    """A type that sorts before or after "actor" is not one; an actor built at runtime is."""
+    ig = _load("importer_guard", REPO / "scripts" / "cron" / "importer_guard.py")
+    v = _vault(tmp_path, ACTOR_SCHEMA)
+    assert ig.actor_identity_problems({"type": "account", "title": "X"}, vault=v) == []
+    assert ig.actor_identity_problems({"type": "zone", "title": "X"}, vault=v) == []
+    runtime_actor = "".join(["act", "or"])
+    assert ig.actor_identity_problems({"type": runtime_actor, "title": "X"}, vault=v)
+
+
+def test_guard_canonicalizes_a_type_alias(tmp_path):
+    ig = _load("importer_guard", REPO / "scripts" / "cron" / "importer_guard.py")
+    v = _vault(tmp_path, ACTOR_SCHEMA + "type_aliases: {threat-actor: actor, a-actor: actor}\n")
+    for alias in ("threat-actor", "a-actor"):
+        fm = {"type": alias, "title": "APT28", "sources": ["MITRE ATT&CK"]}
+        assert ig.guard(fm, vault=v, creating=True) == []
+        assert fm["type"] == "actor", alias
+
+
+def test_guard_item_shapes_hold_for_well_formed_values(tmp_path):
+    ig = _load("importer_guard", REPO / "scripts" / "cron" / "importer_guard.py")
+    schema = SCHEMA + """\
+  records:
+    _item: {shape: dict}
+    tags: {shape: list}
+    meta: {shape: dict}
+    label: {shape: str}
+    flag: {shape: bool}
+"""
+    v = _vault(tmp_path, schema)
+    good = {"type": "prediction", "records": [{"tags": ["a"], "meta": {"k": 1}, "label": "x",
+                                               "flag": True}]}
+    assert ig.guard(good, vault=v) == []
+    bad = {"type": "prediction", "records": [{"tags": "a", "meta": "k", "label": 3, "flag": "y"}]}
+    problems = ig.guard(bad, vault=v)
+    for expected in ("must be a list", "must be an object", "must be a string", "must be a boolean"):
+        assert any(expected in p for p in problems), (expected, problems)
+
+
+# --- okengine#1020: every declared actor type, not the literal `actor` ------------------------------
+
+def test_guard_grounds_a_declared_actor_type_on_create(tmp_path):
+    """Red before okengine#1020: an importer creating `intrusion-set` pages skipped grounding."""
+    ig = _load("importer_guard", REPO / "scripts" / "cron" / "importer_guard.py")
+    v = _vault(tmp_path, SCHEMA.replace(
+        "  prediction:\n", "  intrusion-set:\n    required: [type]\n    role: actor\n  prediction:\n"))
+    ref = _source_page(v, "sources/a", "ANY.RUN has identified Wazza, a new phishkit.")
+    problems = ig.guard({"type": "intrusion-set", "title": "ANY.RUN", "sources": [ref]},
+                        vault=v, creating=True)
+    assert any("not grounded" in p for p in problems), problems
+    assert ig.guard({"type": "intrusion-set", "title": "ANY.RUN", "sources": [ref]}, vault=v) == []
+
+
+def test_guard_does_not_ground_an_undeclared_type(tmp_path):
+    ig = _load("importer_guard", REPO / "scripts" / "cron" / "importer_guard.py")
+    v = _vault(tmp_path, SCHEMA.replace(
+        "  prediction:\n", "  intrusion-set:\n    required: [type]\n  prediction:\n"))
+    assert ig.guard({"type": "intrusion-set", "title": "ANY.RUN"}, vault=v, creating=True) == []

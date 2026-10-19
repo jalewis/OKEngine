@@ -515,6 +515,24 @@
       ],
       "retirement_criteria": "Retire when the supported DeepSeek production endpoint reliably emits one local bridge invocation per tool call or supports validated strict schemas for the bridge.",
       "conflict_risk": "high"
+    },
+    {
+      "original_id": "25",
+      "introduced_for_target": true,
+      "status": "ported",
+      "artifact": "patches/target-v2026.9.14/25-mcp-cron-plus-runner-child.patch",
+      "owner": "okengine-maintainers",
+      "classification": "upstream-candidate",
+      "purpose": "Keep cron-plus runner processes out of the stdio MCP child-PID delta so MCP connect cleanup cannot kill them.",
+      "rationale": "cron-plus runners are direct gateway children, so a runner spawned during an MCP stdio connect is tracked as that server's process and killed by the stale-connection cleanup (okengine#1010: four runners killed on one gateway start). The marker is matched against argv[1:] like the native TUI and jdtls markers, and is added from tools/mcp_tool_discovery.py, the gateway's MCP entry point and an already-carried surface, so the patch stays inside the governed 35-file budget.",
+      "upstream_surfaces": [
+        "tools/mcp_tool_discovery.py"
+      ],
+      "tests": [
+        "tests/tools/test_okengine_mcp_cron_plus_child.py"
+      ],
+      "retirement_criteria": "Retire when upstream Hermes excludes plugin-spawned non-MCP children from the stdio spawn delta (for example by tracking the SDK-spawned process directly instead of diffing the gateway's children), or when cron-plus no longer spawns runners as direct gateway children.",
+      "conflict_risk": "low"
     }
   ]
 }

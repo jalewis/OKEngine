@@ -39,3 +39,10 @@ not-assessed subjects remain explicit separate buckets. The label shows `◇`, m
 confidence, and the number awaiting human review. Selecting a value lists both its subject pages
 and assessment records. Selecting `Not assessed` lists the uncovered subjects. Canonical subject
 fields never fill a missing assessment.
+
+Country coverage retains its terminal state labels and aggregate buckets. New coverage payloads may
+provide `reason_details`, an array of reference diagnostics with category, reference, origin, reason,
+resolution reason, and blocking/contextual disposition. The existing terminal link exposes these
+escaped details through its accessible label and title, and opens the pack's actor-review-status
+dashboard. Existing payloads containing only `reason` retain their original fallback. Current ledger
+judgments still take precedence, preserving their country, confidence, and human review rendering.

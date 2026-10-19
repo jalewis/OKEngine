@@ -326,6 +326,15 @@ Every job runs as a **separate subprocess** of the gateway with three cost tiers
 - **Full agent lanes** — synthesis jobs (briefs, quadrants, grading) that
   always involve a model, with per-lane model routing (§11.1).
 
+Every lane carries two declarations about its output. `output_contract` (agent lanes) says
+what it **may** write and is enforced at every write
+([`model-write-contracts.md`](model-write-contracts.md)). `expect:` (every lane) says what it
+**should** produce: `produces` (N pages of a namespace or type per window), `drains` (a queue
+that shrinks), `maintains` (an artifact kept younger than a max age) and `may_idle` (a gate
+that may skip, up to N runs). It is validated at `framework validate` and evaluated from
+artifacts on the fleet-health dashboard, so a lane that runs but has stopped producing is
+visible without an alert ([`lane-expectations.md`](lane-expectations.md)).
+
 Operational contracts learned the hard way (§14):
 
 - **A host timeout is a kill, not a budget.** `HERMES_CRON_SCRIPT_TIMEOUT`
@@ -900,7 +909,8 @@ scripts/build-engine-image.sh  pin-verified image build
 scripts/ensure-runtime.sh      pre-compose runtime seeding + hazard unlocks
 scripts/deploy-cron-*.sh       deploy surfaces
 extensions/okengine.*/         the 15 first-party extensions
-patches/                       the 10 carried Hermes patches + apply.sh
+patches/                       apply.sh + the 24 carried patch artifacts (active series:
+                               patches/target-v2026.9.14/)
 docs/                          per-topic depth (overview, guides, design specs,
                                upgrade records, operational lessons)
 tests/                         regressions — every fix ships one

@@ -208,3 +208,48 @@ def test_quiet_digest_skips_indexes_closed_predictions_and_old_gaps(tmp_path, mo
     out = capsys.readouterr().out
     assert "Quiet window" in out
     assert '"wakeAgent": true' in out
+
+
+def test_a_freshness_date_below_a_long_frontmatter_list_is_read(tmp_path, monkeypatch, capsys):
+    """okengine#993: the selector parsed a 4000-char window, so a page whose date sat below a long
+    list parsed as {} and dropped out of the digest."""
+    wiki = tmp_path / "wiki"
+    now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+    today = now.date().isoformat()
+    raw = "".join(f"- raw/market/{today}-a-long-capture-name-{i:04d}.md\n" for i in range(120))
+    source = wiki / "sources" / f"{now.year:04d}" / f"{now.month:02d}" / "long.md"
+    _page(source, f"type: source\nraw:\n{raw}title: Long envelope\npublished: {today}\n")
+    _page(wiki / "actors" / "long-actor.md",
+          f"type: actor\nsources:\n{raw}created: {today}\nlast_updated: {today}\n")
+    assert source.read_text().index("published:") > 4000
+    m = _load(tmp_path)
+    monkeypatch.setattr(m, "_knowledge_namespaces", lambda: ("actors",))
+
+    assert m.main() == 0
+    out = capsys.readouterr().out
+    assert "Fresh sources (1" in out and "Long envelope" in out
+    assert "new  [[actors/long-actor]]" in out
+
+
+def test_a_tombstoned_page_is_not_fresh_or_moved(tmp_path, monkeypatch, capsys):
+    """okengine#993: retiring a page stamps last_updated, so a just-tombstoned page was listed as
+    "updated" movement. Retired is not recent (tier_lib, build_hot_set)."""
+    wiki = tmp_path / "wiki"
+    now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+    today = now.date().isoformat()
+    month = wiki / "sources" / f"{now.year:04d}" / f"{now.month:02d}"
+    _page(month / "retired-source.md",
+          f"type: source\ntitle: Retired source\npublished: {today}\nstatus: Tombstoned\n")
+    _page(month / "live-source.md", f"type: source\ntitle: Live source\npublished: {today}\n")
+    _page(wiki / "actors" / "merged-away.md",
+          f"type: actor\ncreated: 2025-01-01\nlast_updated: {today}\nstatus: tombstoned\n")
+    _page(wiki / "actors" / "live.md", f"type: actor\ncreated: 2025-01-01\nlast_updated: {today}\n")
+    m = _load(tmp_path)
+    monkeypatch.setattr(m, "_knowledge_namespaces", lambda: ("actors",))
+
+    assert m.main() == 0
+    out = capsys.readouterr().out
+    assert "Fresh sources (1" in out and "Live source" in out
+    assert "Retired source" not in out
+    assert "Entity/concept movement (1" in out and "updated  [[actors/live]]" in out
+    assert "merged-away" not in out

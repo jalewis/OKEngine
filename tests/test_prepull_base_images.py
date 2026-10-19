@@ -33,15 +33,35 @@ SCRIPT = REPO / "ci" / "prepull_base_images.sh"
 pytestmark = pytest.mark.skipif(not SCRIPT.is_file(), reason="prepull script absent")
 
 
+#: What the default fake resolver answers: every host has an A record, so the diagnosis runs to
+#: completion and attributes the failure elsewhere. Each call is logged to `resolver.log`.
+_DEFAULT_GETENT = ('#!/bin/sh\necho "$1 $2" >> "$(dirname "$0")/resolver.log"\n'
+                   'case "$1" in\n  ahostsv4) echo "192.0.2.1 STREAM $2" ;;\n'
+                   '  ahostsv6) echo "2001:db8::1 STREAM $2" ;;\nesac\n')
+
+
+def _executable(path: Path, body: str) -> Path:
+    path.write_text(body, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    return path
+
+
 def _run(tmp_path, docker_body, extra_env=None, cwd=None):
-    """Run the script with a fake `docker` on PATH."""
+    """Run the script with a fake `docker` on PATH.
+
+    okengine#1060: any test whose docker fails reaches diagnose_environment(), which resolves four
+    Docker Hub hosts. With the real `getent` that is live DNS, and a resolver that hangs instead of
+    answering pushed test_exhausting_every_retry_fails_the_job past its timeout during a CI DNS
+    outage. So the resolver and `ip` default to fakes in tmp_path/bin; a test that wants the real
+    ones must pass PREPULL_GETENT / PREPULL_IP in extra_env explicitly."""
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
-    fake = bindir / "docker"
-    fake.write_text("#!/usr/bin/env bash\n" + docker_body, encoding="utf-8")
-    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    _executable(bindir / "docker", "#!/usr/bin/env bash\n" + docker_body)
+    fake_getent = _executable(bindir / "fake-getent", _DEFAULT_GETENT)
+    fake_ip = _executable(bindir / "fake-ip", "#!/bin/sh\nexit 0\n")   # no default IPv6 route
     env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}",
-               PREPULL_ATTEMPTS="3", PREPULL_SLEEP="0")
+               PREPULL_ATTEMPTS="3", PREPULL_SLEEP="0",
+               PREPULL_GETENT=str(fake_getent), PREPULL_IP=str(fake_ip))
     env.update(extra_env or {})
     return subprocess.run(["bash", str(SCRIPT)], cwd=str(cwd or REPO), env=env,
                           capture_output=True, text=True, timeout=60)
@@ -67,6 +87,24 @@ def test_exhausting_every_retry_fails_the_job(tmp_path):
     assert result.returncode != 0
     assert "FAILED after 3 attempts" in result.stderr
     assert "diagnosis" in result.stderr, "the failure must run the measured diagnosis, not just fail"
+
+
+def test_the_default_run_never_reaches_the_real_resolver(tmp_path):
+    """okengine#1060 guard. A tripwire `getent` sits first on PATH, where the script's own default
+    (`getent`) would find it. The failing run must still diagnose, through the fake resolver, and
+    never invoke the tripwire: the default _run() cannot reach live DNS."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    tripped = tmp_path / "real-resolver-called"
+    _executable(bindir / "getent", f'#!/bin/sh\necho "$@" >> {tripped}\nexit 2\n')
+    _executable(bindir / "ip", f'#!/bin/sh\necho "ip $@" >> {tripped}\nexit 0\n')
+    result = _run(tmp_path, "exit 1\n")
+    assert result.returncode != 0
+    assert "diagnosis" in result.stderr, "the guard needs the diagnosis path to have run"
+    assert not tripped.exists(), (
+        f"the default _run() reached the resolver on PATH: {tripped.read_text(encoding='utf-8')}")
+    calls = (bindir / "resolver.log").read_text(encoding="utf-8").splitlines()
+    assert "ahostsv4 production.cloudfront.docker.com" in calls, calls
 
 
 def test_it_retries_and_recovers(tmp_path):

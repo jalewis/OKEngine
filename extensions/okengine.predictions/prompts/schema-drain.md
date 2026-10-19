@@ -30,22 +30,23 @@ For each page in the batch, IN ORDER:
    - **unparseable confidence** → the numeric or qualitative value the body's certainty language
      supports.
 3. Apply with a SINGLE merge write per page:
-   `mcp__okengine_write_okengine_predictions_prediction_schema_drain__update_entity(path="predictions/<slug>", frontmatter_yaml="<only the
+   `mcp__OKENGINE_WRITER__update_entity(path="predictions/<slug>", frontmatter_yaml="<only the
    corrected/added fields>")` — this MERGES the given keys and leaves the body untouched.
 
 HARD rules:
 - **Never fabricate.** If a required field genuinely cannot be derived from the page (no date, no
-  subject anywhere), do NOT invent one — leave it, and list that page under "needs human review" in
-  your summary with what's missing and why.
+  subject anywhere), do NOT invent one — leave it, and dispose that page `deferred-for-review` in the
+  receipt, naming what's missing and why.
 - Only write the fields the digest flagged. Do NOT rewrite the body, add sections, or touch
   unrelated frontmatter (`sources`, other fields). `update_entity` bumps version/last_updated on
   its own.
 - **Batch-container files** (flagged with ⚑ in the digest) are NOT yours to fix — splitting or
-  re-typing them is a human decision. Do not edit them; just restate them under "needs human
-  review" so the operator sees them.
+  re-typing them is a human decision. Do not edit them; the digest already surfaces them to the
+  operator, and they are not receipt items.
 
-End with a per-page summary: what you set on each, and any page left for human review (with the
-reason).
+Record every page's outcome in the final receipt (below) instead of a prose summary: a page you
+wrote is `updated`; a page left for human review is `deferred-for-review` with a reason naming
+what is missing and why.
 # Model-write boundary
 
-Process only selector-named items. Ground claims in pages you read, use only okengine-write mutations allowed by the lane contract, and never edit logs directly. Finish with a receipt for every selected item: `path: written | deferred | rejected — reason`.
+Process only selector-named items. Ground claims in pages you read, use only okengine-write mutations allowed by the lane contract, and never edit logs directly. Finish by returning ONLY the fenced `okengine-receipt` the selector printed above, with exactly one item per selected key (do not add, drop or rename keys). Dispositions: `accepted` or `updated` for an item you actually wrote (list the page in `writes`; the runner supplies the hashes); otherwise `deferred-for-review`, `insufficient-evidence`, `rejected-out-of-scope`, `duplicate` or `failed`, each with a concrete `reason` and no `writes`. A batch in which every item is honestly deferred or rejected is a successful run — never write just to have written. A page you normalized is `updated`; a page left for human review (a field that cannot be derived from the page) is `deferred-for-review` whose `reason` names the missing field and why. Batch-container files are not selected items and never appear in the receipt.

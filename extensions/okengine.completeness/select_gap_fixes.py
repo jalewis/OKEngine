@@ -31,9 +31,22 @@ import sys
 from pathlib import Path
 
 import yaml
+from yaml import YAMLError
+
+_HERE = Path(__file__).resolve().parent
+# selection_manifest lives one level UP in the staged layout (/opt/data/scripts/<ext-id>/ ->
+# /opt/data/scripts/) and in scripts/cron in the repo layout. Appended: no shadowing.
+sys.path.append(str(_HERE.parent))
+sys.path.append(str(_HERE.parents[1] / "scripts" / "cron"))
+from selection_manifest import print_receipt_template, write_selection_manifest  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
+SELECTION_MANIFEST = Path(os.environ.get(
+    "OKENGINE_SELECTION_MANIFEST",
+    str(Path(os.environ.get("HERMES_HOME") or str(VAULT / ".hermes-data"))
+        / "cron-plus" / "selections" / "okengine.completeness:gap-drain.json"),
+))
 RULES_FILE = os.environ.get(
     "COMPLETENESS_RULES",
     os.environ.get("OKENGINE_COMPLETENESS_RULES_FILE", "config/completeness-rules.yaml"),
@@ -54,28 +67,38 @@ def _fm(p: Path) -> dict:
         return {}
 
 
+def _dry(message: str) -> int:
+    """A no-work exit. The manifest is refreshed EMPTY on every such path: the runner treats a
+    fresh empty selection as "owes no receipt", while a stale one left by an earlier run would
+    demand a receipt for work this run never selected."""
+    write_selection_manifest([], SELECTION_MANIFEST)
+    print(message)
+    print(json.dumps({"wakeAgent": False}))
+    return 0
+
+
+def _subject_path(subject: object) -> str:
+    """The page an accepted fix writes: the gap's subject, as a wiki-relative `.md` path."""
+    rel = str(subject or "").strip().strip("[]").partition("|")[0].removeprefix("wiki/")
+    return rel if rel.endswith(".md") else f"{rel}.md"
+
+
 def main() -> int:
     f = VAULT / RULES_FILE
     if not f.is_file():
-        print(f"# no completeness rules at {RULES_FILE} — nothing to drain")
-        print(json.dumps({"wakeAgent": False}))
-        return 0
+        return _dry(f"# no completeness rules at {RULES_FILE} — nothing to drain")
     try:
         document = yaml.safe_load(f.read_text()) or {}
         if not isinstance(document, dict) or not isinstance(document.get("rules", []), list):
             raise ValueError("rules document must be a mapping with a rules list")
         rules = {r["id"]: r for r in document.get("rules", [])
                  if isinstance(r, dict) and r.get("id")}
-    except (yaml.YAMLError, ValueError):
-        print("# rules file unparseable — refusing to drain")
-        print(json.dumps({"wakeAgent": False}))
-        return 0
+    except (YAMLError, ValueError):
+        return _dry("# rules file unparseable — refusing to drain")
     fixable = {rid: r for rid, r in rules.items() if r.get("fix") in ("agent", "agent-draft")}
     if not fixable:
-        print("# no rule is marked fix: agent|agent-draft — the queue is operator-only by "
-              "the pack's own declaration; nothing to drain")
-        print(json.dumps({"wakeAgent": False}))
-        return 0
+        return _dry("# no rule is marked fix: agent|agent-draft — the queue is operator-only by "
+                    "the pack's own declaration; nothing to drain")
 
     gaps = []
     gdir = WIKI / "gaps"
@@ -88,12 +111,14 @@ def main() -> int:
                 continue
             gaps.append((str(fm.get("first_seen") or "9999"), p, fm))
     if not gaps:
-        print("# no open gaps under agent-fixable rules — the drain is dry")
-        print(json.dumps({"wakeAgent": False}))
-        return 0
+        return _dry("# no open gaps under agent-fixable rules — the drain is dry")
 
     gaps.sort()
     surfaced = gaps[:BATCH]
+    # One receipt item per surfaced GAP (the gap page is the stable identity: two rules can
+    # share a subject). An accepted fix writes the SUBJECT page; the gap page is never touched.
+    selected = [f"wiki/{p.relative_to(WIKI).as_posix()}" for _, p, _ in surfaced]
+    manifest = write_selection_manifest(selected, SELECTION_MANIFEST)
     print("=== gap-drain wake-gate (okengine.completeness) ===")
     print(f"  fixable rules: {sorted(fixable)} · open fixable gaps: {len(gaps)} · "
           f"surfaced: {len(surfaced)} (GAP_DRAIN_BATCH={BATCH}; the rest drain next run)")
@@ -109,6 +134,8 @@ def main() -> int:
         if mode == "agent-draft":
             print("   DRAFT MODE: your fix must set `needs_review: true` on the subject page.")
         print()
+    print_receipt_template(manifest, {key: _subject_path(fm.get("subject"))
+                                      for key, (_, _, fm) in zip(selected, surfaced)})
     print(json.dumps({"wakeAgent": True}))
     return 0
 

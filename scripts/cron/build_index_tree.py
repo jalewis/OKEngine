@@ -27,24 +27,30 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import yaml
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import generated_page  # noqa: E402 — the shared structural-page predicate (okengine#994 [23])
 import schema_lib  # noqa: E402
+from okengine.file_fingerprint import fingerprint  # noqa: E402 — importable once schema_lib has set up the package
+from active_view_lib import (  # noqa: E402
+    FRONTMATTER_RE, frontmatter_block, is_retired_actor, read_frontmatter)
 import tz_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
 MAX_ENTRIES = 500
-_FM_RE = re.compile(r"\A---[ \t]*\n(.*?\n)---", re.S)
-_STRUCT = {"INDEX.md", "index.md", "log.md", "BUNDLE.md", "HEALTH.md", "AGENTS.md"}
+_FM_RE = FRONTMATTER_RE
 
 
 def _listable(name: str) -> bool:
-    """A page worth listing in an INDEX — not structural/scaffolding. Excludes _STRUCT
-    (INDEX/log/BUNDLE/HEALTH/AGENTS) and any `_`-prefixed file (the _about namespace
-    description card, _review-queue, etc.) — those exist but are not navigable pages."""
-    return name not in _STRUCT and not name.startswith("_")
+    """A page worth listing in an INDEX or counting as content — not structural/scaffolding.
+
+    Delegates to generated_page.is_exempt, the one predicate backfill_ids and the generated-page
+    writers already share: the reserved files (INDEX/log/BUNDLE/HEALTH/AGENTS/README/HOT), this
+    generator's own INDEX-pNN pagination, any `_`- or `.`-prefixed file (the _about namespace card,
+    _review-queue) and backups. okengine#994 [23]: a private list here missed INDEX-pNN, so a
+    paginated directory listed its own page 2..N as rows, and the counts below took in every
+    INDEX/INDEX-pNN/_about file (vendor-risk inflated about 24%)."""
+    return not generated_page.is_exempt(Path(name))
 
 _SCHEMA = schema_lib.governing_schema(VAULT)
 # Non-knowledge top-level dirs to skip. The pack declares its derived/operational
@@ -66,17 +72,8 @@ def _discover_namespaces(wiki: Path) -> list[str]:
 
 
 def _fm(p: Path) -> dict:
-    try:
-        m = _FM_RE.match(p.read_text(encoding="utf-8", errors="replace")[:4000])
-    except OSError:
-        return {}
-    if not m:
-        return {}
-    try:
-        d = yaml.safe_load(m.group(1))
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
+    """The page's whole frontmatter (active_view_lib.read_frontmatter: no leading-window cap)."""
+    return read_frontmatter(p)
 
 
 def _title(p: Path, fm: dict) -> str:
@@ -106,17 +103,89 @@ def _created(fm: dict) -> str:
     return ""
 
 
+# Retirement verdicts for this run, keyed by (path, file fingerprint). _count_md runs at every
+# ancestor level, so without this each page's frontmatter was read and YAML-parsed (depth + 2)
+# times: about 5x the lane's runtime on a 100k-page vault, past a 600 s HERMES_CRON_SCRIPT_TIMEOUT
+# (v0.15.3 release audit). The key was (path, mtime_ns) until okengine#1017: a page retired within
+# the same timestamp tick as its first count kept its stale "live" verdict.
+_RETIRED: dict[tuple[Path, tuple], bool] = {}
+
+
+def _retired(p: Path, fm: dict | None = None) -> bool:
+    fp = fingerprint(p)
+    if fp is None:
+        return False
+    key = (p, fp)
+    hit = _RETIRED.get(key)
+    if hit is None:
+        if fm is None:
+            # okf_migrate.is_tombstoned matches only `status: tombstoned` (any case), so a page
+            # whose frontmatter envelope (the same whole envelope _fm parses) never spells it is
+            # live without a YAML parse.
+            hit = ("tombstoned" in frontmatter_block(p).lower()
+                   and is_retired_actor(_fm(p), VAULT, p))
+        else:
+            hit = is_retired_actor(fm, VAULT, p)
+        _RETIRED[key] = hit
+    return hit
+
+
 def _count_md(d: Path) -> int:
-    return sum(1 for _ in d.rglob("*.md"))
+    """Content pages under d: the same population gen_index lists, so a namespace's count, the
+    BUNDLE entity_count and the HEALTH total agree with the rows a reader can open."""
+    return sum(1 for p in d.rglob("*.md") if _listable(p.name) and not _retired(p))
+
+
+def _owned_pagination(p: Path, fm: dict, rel: str) -> bool:
+    """Recognize this generator's numbered artifacts, never arbitrary corpus pages."""
+    match = re.fullmatch(r"INDEX-p(0[2-9]|[1-9]\d+)\.md", p.name)
+    if not match:
+        return False
+    number = int(match[1])
+    if fm.get("type") != "dashboard" or fm.get("title") != f"Index: {rel} (p{number})":
+        return False
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:             # gone mid-scan: nothing left to own or remove
+        return False
+    envelope = _FM_RE.match(text)
+    if not envelope:
+        return False
+    lines = text[envelope.end():].lstrip("\n").splitlines()
+    if len(lines) < 8:
+        return False
+    heading = re.fullmatch(rf"# Index: {re.escape(rel)} — page {number}/([1-9][0-9]*)", lines[0])
+    if not heading:
+        return False
+    total = int(heading[1])
+    if total < number or len(lines[2].split()) != total + 1:
+        return False
+    prefix = "" if rel == "." else rel + "/"
+    nav = "Pages: " + " ".join("**1**" if i == 1 else f"[[{prefix}INDEX-p{i:02d}|{i}]]"
+                                 for i in range(1, total + 1))
+    return lines[1:8] == ["", nav, "", f"## Pages ({number})", "",
+                         "| Page | Type | Created | Updated | Title |", "|---|---|---|---|---|"]
 
 
 def gen_index(d: Path, now: str) -> None:
     """Write INDEX.md for directory d (immediate children), then recurse."""
     subdirs = sorted(x for x in d.iterdir() if x.is_dir() and not x.name.startswith("."))
     files = sorted(x for x in d.glob("*.md") if _listable(x.name))  # glob-ok: per-directory INDEX; gen_index recurses into subdirs
+    numbered = sorted(d.glob("INDEX-p*.md"))  # glob-ok: this directory's own pagination candidates
     # One fm read per file, then NEWEST-CREATED FIRST (empty created sorts last; ties stay
     # alphabetical via the stable sort above) — an INDEX's first job is surfacing new pages.
+    rel = d.relative_to(WIKI).as_posix() or "."
     entries = [(f, _fm(f)) for f in files]
+    retired = {f for f, fm in entries if _retired(f, fm)}
+    # Retired actors stay on disk, so this remains scoped on repeat regeneration.
+    # Leave pre-existing nonactor pagination behavior outside this direct repair.
+    owned = {f for f in numbered if _owned_pagination(f, _fm(f), rel)} if retired else set()
+    entries = [(f, fm) for f, fm in entries if f not in retired]
+    files = [f for f, _ in entries]
+    needed = {d / f"INDEX-p{i:02d}.md" for i in range(2, (len(entries) - 1) // MAX_ENTRIES + 2)}
+    for p in needed:
+        if retired and p.exists() and p not in owned:
+            raise FileExistsError(f"Refusing to overwrite non-generated pagination file: {p}")
     entries.sort(key=lambda e: _created(e[1]) or "0000-00-00", reverse=True)
     rel = d.relative_to(WIKI).as_posix() or "."
     prefix = "" if rel == "." else rel + "/"
@@ -161,6 +230,8 @@ def gen_index(d: Path, now: str) -> None:
             (d / f"INDEX-p{i:02d}.md").write_text("\n".join(pl), encoding="utf-8")
     else:
         (d / "INDEX.md").write_text("\n".join(lines), encoding="utf-8")
+    for obsolete in owned - needed:
+        obsolete.unlink()
     for sd in subdirs:
         gen_index(sd, now)
 

@@ -1,8 +1,8 @@
 """Shared helpers for the prediction wake-gate selectors (okengine#36).
 
 Generic over any OKF vault that defines a `prediction` type (status / subject /
-resolves_by). No domain knowledge. Used by select_prediction_candidates.py,
-select_predictions_for_grading.py, select_regrade_batch.py.
+resolves_by). No domain knowledge. Used by the prediction wake-gate selectors
+(select_prediction_candidates.py, select_predictions_for_grading.py, select_regrade_batch.py, ...).
 """
 from __future__ import annotations
 
@@ -37,6 +37,16 @@ _RESERVED = re.compile(r"^(INDEX|index)([.-]|$)")
 
 def vault() -> Path:
     return Path(os.environ.get("WIKI_PATH", "/opt/vault"))
+
+
+def selection_manifest_path(operation: str) -> Path:
+    """Default selection-manifest location for a per-selected-item lane of this extension.
+
+    The deployed runner always exports OKENGINE_SELECTION_MANIFEST (cron_pack_split stamps it
+    for every per-selected-item job); this default only serves a manual or local run.
+    """
+    home = os.environ.get("HERMES_HOME") or str(vault() / ".hermes-data")
+    return Path(home) / "cron-plus" / "selections" / f"okengine.predictions:{operation}.json"
 
 
 def today_iso() -> str:

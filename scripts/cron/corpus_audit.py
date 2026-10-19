@@ -39,10 +39,14 @@ Pure ``no_agent`` script — the numbers ARE the deliverable; emits ``wakeAgent=
 always. Idempotent (rewrites the dashboard wholesale each run). Tolerates pages vanishing
 mid-scan (glob-then-read race with mover lanes).
 
+Usage: corpus_audit.py [--report-only|--dry-run] (print the metrics, write no dashboard). argv is
+parsed before any vault read: an ignored ``--help`` once rewrote a live dashboard (okengine#1034).
+
 Env: WIKI_PATH (default /opt/vault) · CORPUS_AUDIT_MAX_EXAMPLES (3)
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -64,6 +68,8 @@ import corpus_audit_render  # noqa: E402
 import engine_package  # noqa: E402  — makes `okengine` importable when this file is
 engine_package.ensure()  # loaded BY PATH by an external consumer (okpacks-library#89)
 from okengine.actor_identity import actor_identity_error  # noqa: E402
+from okengine import actor_grounding as actor_grounding_lib  # noqa: E402  — okengine#1012
+from okengine import attestation as attestation_lib  # noqa: E402  — okengine#980
 from provenance_lib import DRIFT, NOVEL, enum_rules as _enum_rules  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
@@ -93,7 +99,7 @@ OVERMATCH_MIN_NEWS = int(os.environ.get("CORPUS_AUDIT_OVERMATCH_MIN_NEWS", "3"))
 # A catalogue identifier: a short prefix then a number (APT31, TA412, G0035, BE2). Short by nature
 # and never an ordinary word, so the floor must not touch it. Deliberately GENERIC -- the engine
 # ships no vendor's numbering scheme, only the SHAPE of "a prefix and a number".
-_STRUCTURED_ID = re.compile(r"^[A-Za-z]{1,6}[-_ ]?\d{1,5}$")
+_STRUCTURED_ID = re.compile(r"^[A-Za-z]{1,6}[-_ ]?\d{1,5}\Z")
 # Alias-fragmentation detector (the Gentlemen / Storm-2697 repro: one actor split across six
 # actor pages sharing the alias "The Gentlemen"). Identity tokens shorter than this are too
 # generic to cluster on (avoids merging distinct actors on a shared short token like "apt").
@@ -126,12 +132,8 @@ JUDGMENT_KIND_FIELD = os.environ.get("CORPUS_AUDIT_JUDGMENT_KIND_FIELD", "").str
 _CARRIER_PROSE_RE = re.compile(
     r"(?:identified|described|reported|found|listed|catalogued)\s+in\s+the\s+"
     r"([A-Za-z][A-Za-z0-9 ._-]{1,40}?)\s*(?:dataset|database|data\s?set|feed)\b", re.I)
-DERIVED_PANEL_HEADINGS = {
-    "incoming backlinks",
-    "outbound references",
-    "referenced by",
-    "references",
-}
+DERIVED_PANEL_HEADINGS = {"incoming backlinks", "outbound references", "referenced by",
+                          "references"}
 
 
 def _body_integrity_counts(body: str) -> tuple[int, int]:
@@ -226,7 +228,7 @@ PREDICTION_UNGRADED = {"expired-ungraded", "expired"}
 # A frontmatter scalar that LOOKS like a bare wiki-relative page path (namespace/…/slug): lowercase
 # slug segments joined by '/', no spaces, no URL scheme (no ':'), not a [[wikilink]] (no '['). Used
 # to flag references a move/reshard left dangling — the assessment-`subject:` class (#336).
-_PATHREF_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*(?:/[a-z0-9][a-z0-9._-]*)+$")
+_PATHREF_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*(?:/[a-z0-9][a-z0-9._-]*)+\Z")
 
 
 # Fields whose values are path-SHAPED but are NOT graph edges, so a "dangling ref" finding on them
@@ -248,15 +250,10 @@ _SHAPE_CHECKS = {
 }
 
 
-
 NON_REF_FIELDS = frozenset({
     "id", "raw", "path", "raw_path", "field_mapped", "canonical_key", "slug", "url_slug",
     "watch_lane",
 })
-
-
-
-
 
 
 _slug_identity = corpus_audit_inputs._slug_identity
@@ -339,6 +336,8 @@ def audit(vault: Path) -> dict:
         provenance_lib=provenance_lib,
         raw_capture_health=raw_capture_health,
         schema_lib=schema_lib,
+        attestation=attestation_lib,
+        actor_grounding=actor_grounding_lib,
     ))
 
 def render(state: dict, today: str) -> str:
@@ -353,16 +352,20 @@ def render(state: dict, today: str) -> str:
         max_clusters=MAX_CLUSTERS,
     )
 
-def main() -> int:
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="corpus_audit.py", description="Corpus-integrity audit.")
+    ap.add_argument("--report-only", "--dry-run", dest="report_only", action="store_true",
+                    help="compute and print the metrics without writing the dashboard")
+    args = ap.parse_args(argv)   # before ANY vault access: --help / a bad argument has no effects
     if not WIKI.is_dir():
         print(f"corpus-audit | no wiki/ under {VAULT} — nothing to audit")
         print(json.dumps({"wakeAgent": False}))   # JSON sentinel, not bare string (audit HIGH #8)
         return 0
     state = audit(VAULT)
-    DASH_DIR.mkdir(parents=True, exist_ok=True)
-    (DASH_DIR / "corpus-audit.md").write_text(
-        render(state, date.today().isoformat()), encoding="utf-8"
-    )
+    if not args.report_only:
+        DASH_DIR.mkdir(exist_ok=True)   # WIKI exists (checked above); DASH_DIR is its child
+        page = render(state, date.today().isoformat())
+        (DASH_DIR / "corpus-audit.md").write_text(page, encoding="utf-8")
     n_drift = sum(rec["count"] for vals in state["drift"].values() for rec in vals.values())
     n_novel = sum(rec["count"] for vals in state["novel"].values() for rec in vals.values())
     dead = [
@@ -387,6 +390,7 @@ def main() -> int:
         f"page(s), {state['body_integrity']['derived_panel_pages']} derived-panel page(s), "
         f"{state['body_integrity']['leaked_frontmatter_pages']} leaked-frontmatter page(s) | "
         f"{state['parse_errors']} parse errors"
+        + (" | report-only: dashboard NOT written" if args.report_only else "")
     )
     print(json.dumps({"wakeAgent": False}))   # JSON sentinel, not bare string (audit HIGH #8)
     return 0

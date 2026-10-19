@@ -34,6 +34,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import schema_lib  # noqa: E402
 import tz_lib  # noqa: E402
 
@@ -293,7 +294,7 @@ def append_history(today: date, q_rows, pages) -> None:
     )
     OP_DIR.mkdir(parents=True, exist_ok=True)
     if not HISTORY_PATH.exists():
-        HISTORY_PATH.write_text(header)
+        generated_page.write(HISTORY_PATH, header)
     existing = HISTORY_PATH.read_text(errors="replace")
     # idempotent per day: drop any existing row for today, then append
     lines = [ln for ln in existing.splitlines()
@@ -308,7 +309,7 @@ def main() -> int:
     pages = total_pages()
 
     DASH_PATH.parent.mkdir(parents=True, exist_ok=True)
-    DASH_PATH.write_text(render(today, q_rows, pages))
+    generated_page.write(DASH_PATH, render(today, q_rows, pages))
     append_history(today, q_rows, pages)
 
     print("=== kb-health ===")

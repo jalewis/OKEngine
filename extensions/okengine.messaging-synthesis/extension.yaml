@@ -49,7 +49,10 @@ operations:
     output_contract: &messaging_contract
       api: 1
       allowed_namespaces: [briefings]
-      allowed_types: [battle-card, marketing-pulse, value-prop-snapshot, messaging-brief]
+      # `briefing` is the CANONICAL type: packs alias these four to it (see README), and the write
+      # path stores the canonical type, so without it every create was refused after
+      # normalization and every update of a stored card was refused outright (okengine#877).
+      allowed_types: [briefing, battle-card, marketing-pulse, value-prop-snapshot, messaging-brief]
       operations: [create, update, converge]
       required_fields: [type, title]
       required_relationships: []

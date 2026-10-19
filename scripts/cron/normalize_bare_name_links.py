@@ -33,6 +33,12 @@ from pathlib import Path
 
 import yaml
 
+sys.path.append(str(Path(__file__).resolve().parent))  # staged sibling libs
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
+import engine_package  # noqa: E402 — `okengine` importable when this tree is loaded by path
+engine_package.ensure()
+from okengine.list_scalars import split_list_scalar  # noqa: E402
+
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
 ENT_DIR = WIKI / "entities"
@@ -82,7 +88,7 @@ def build_index() -> tuple[dict, set]:
         # to pre-existing/bypassed data). Coerce to a list before concatenating.
         aliases = fm.get("aliases") or []
         if isinstance(aliases, str):
-            aliases = [a.strip() for a in aliases.split(",") if a.strip()]
+            aliases = split_list_scalar(aliases)   # as the write path coerces it (#1042 [19])
         elif not isinstance(aliases, list):
             aliases = []
         names = [fm.get("name")] + aliases + [p.stem]
@@ -150,10 +156,10 @@ def main() -> int:
     if not DRY_RUN and (links_fixed or OUT_DIR.is_dir()):
         try:
             OUT_DIR.mkdir(parents=True, exist_ok=True)
-            (OUT_DIR / "bare-name-link-normalize.md").write_text(
-                f"---\ntype: report\ntitle: Bare-name link normalization\n---\n\n"
-                f"Last run fixed **{links_fixed}** bare-name link(s) across {pages_changed} page(s).\n",
-                encoding="utf-8")
+            generated_page.write(
+                OUT_DIR / "bare-name-link-normalize.md",
+                f"---\ntype: dashboard\ntitle: Bare-name link normalization\n---\n\n"
+                f"Last run fixed **{links_fixed}** bare-name link(s) across {pages_changed} page(s).\n")
         except OSError:
             pass
     print('{"wakeAgent": false}')

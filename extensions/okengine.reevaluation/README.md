@@ -5,11 +5,17 @@ document refresh (`drafts/che-evaluation.md` §3/§6 — internal doc, snapshot-
 
 1. **Edge index** (`edge_index.py`, this extension, okengine#234) — a `no_agent` lane
    rebuilding `wiki/.reevaluation-edges.json`: every OPEN proposition → every evidence page
-   it cites (frontmatter ref fields + `evidence[].source` + body wikilinks). Runs every 6h,
-   24 minutes before the regrade cycle.
-2. **Dependency-aware selector** (okengine#235, shipped) — walks changed-sources-since-
-   watermark through the edge index so the regrade agent gets *"sources THIS proposition
-   cites changed"* instead of the all-open × all-recent cross-join.
+   it cites (frontmatter ref fields + `evidence[].source` + `adversarial_evidence[].source` +
+   body wikilinks). Propositions default to `prediction,assessment`. Runs every 6h, 24 minutes
+   before the regrade cycle.
+2. **Dependency-aware selectors** — one per proposition class, each reading only its own rows:
+   - predictions: `okengine.predictions` regrade (okengine#235) walks changed-sources-since-
+     watermark through the edge index, so the regrade agent gets *"sources THIS proposition
+     cites changed"* instead of the all-open × all-recent cross-join;
+   - assessments: `okengine.inquiry` inquiry-analyze (okengine#854) reselects an inquiry's
+     assessment when a page it cites was rewritten after it, or a page in its `sources` was
+     removed. Before this, assessments were not indexed at all, so an assessment's evidence
+     could change or vanish and nothing in the loop noticed.
 
 The `continuous-hypothesis` application profile (#247) now validates that every bound proposition
 class is included in this index and has declared reassessment, resolution, and measurement

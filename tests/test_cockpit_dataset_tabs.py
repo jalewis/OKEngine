@@ -919,3 +919,88 @@ def test_a_supporting_assessment_always_states_at_least_its_status(tmp_path, mon
     assert supporting["type"] == "assessment"
     assert supporting["facts"] == [{"label": "Status", "value": "active"},
                                    {"label": "Evidence state", "value": "assessed"}], supporting
+
+
+def test_terminal_reason_details_explain_blockers_with_escaped_reference_origin(tmp_path, monkeypatch):
+    m = _terminal_vault(tmp_path, monkeypatch, {'entities/q/qilin': {
+        'state': 'collection-required', 'reason': 'Country evidence incomplete',
+        'question_kind': 'actor-country-linkage', 'reason_details': [
+            {'category': 'contextual-provenance', 'reference': '<script>publisher</script>',
+             'origin': 'entities/q/qilin:sources', 'reason': 'unrecognized-reference',
+             'resolution_reason': 'unrecognized-reference', 'disposition': 'blocking'},
+            {'category': 'collection-task', 'reference': 'collection-requirement:task',
+             'origin': 'assessments/a:adversarial_evidence', 'reason': 'recognized-collection-task',
+             'disposition': 'contextual'},
+            {'category': 'conflicting-country-claims', 'reason': 'two independent country claims'},
+            'malformed detail', {}]}})
+    html = m.api_tab('t')['boxes'][0]['html']
+    assert 'Collection required' in html
+    assert 'Bounded question: actor-country-linkage' in html
+    assert 'entities/q/qilin:sources' in html
+    assert '&lt;script&gt;publisher&lt;/script&gt;' in html and '<script>' not in html
+    assert 'collection task' in html and 'contextual' in html
+    assert 'conflicting country claims' in html
+    assert 'data-page="dashboards/actor-review-status"' in html
+
+
+def test_a_quote_in_a_reason_detail_cannot_break_out_of_the_title_attribute(tmp_path, monkeypatch):
+    """reason_details text lands in title="..." / aria-label="..."; an unescaped quote closed the
+    attribute and injected a live event handler (v0.15.4 release audit)."""
+    m = _terminal_vault(tmp_path, monkeypatch, {'entities/q/qilin': {
+        'state': 'collection-required', 'reason': 'r',
+        'question_kind': 'actor-country-linkage', 'reason_details': [
+            {'category': 'documentary', 'reference': 'x" onmouseover="alert(1)',
+             'origin': "o' onfocus='alert(2)", 'reason': 'unrecognized-reference',
+             'disposition': 'blocking'}]}})
+    html = m.api_tab('t')['boxes'][0]['html']
+    assert 'onmouseover="alert(1)' not in html and "onfocus='alert(2)" not in html
+    assert 'x&quot; onmouseover=&quot;alert(1)' in html
+
+
+@pytest.mark.parametrize('details', [None, 'malformed', [], ['malformed']])
+def test_old_or_malformed_reason_details_keep_existing_fallback(tmp_path, monkeypatch, details):
+    m = _terminal_vault(tmp_path, monkeypatch, {'entities/q/qilin': {
+        'state': 'collection-required', 'reason': 'Original explanation', 'reason_details': details}})
+    html = m.api_tab('t')['boxes'][0]['html']
+    assert 'Original explanation' in html and 'Bounded question' not in html
+
+
+def test_malformed_detail_does_not_hide_later_readable_blocker(tmp_path, monkeypatch):
+    m = _terminal_vault(tmp_path, monkeypatch, {'entities/q/qilin': {
+        'state': 'collection-required', 'reason': 'Country evidence incomplete',
+        'reason_details': ['malformed detail', {
+            'category': 'documentary', 'reference': 'sources/readable-later',
+            'origin': 'entities/q/qilin:evidence', 'reason': 'missing-document'}]}})
+    html = m.api_tab('t')['boxes'][0]['html']
+    assert 'sources/readable-later' in html and 'missing-document' in html
+    assert 'Collection required' in html
+
+
+@pytest.mark.parametrize('question_kind', [None, '', 'actor-identity-scope'])
+def test_readable_terminal_details_explain_default_or_explicit_question(tmp_path, monkeypatch, question_kind):
+    terminal = {'state': 'collection-required', 'reason': 'Evidence incomplete',
+                'reason_details': [{'category': 'documentary', 'reference': 'sources/missing'}]}
+    if question_kind is not None:
+        terminal['question_kind'] = question_kind
+    m = _terminal_vault(tmp_path, monkeypatch, {'entities/q/qilin': terminal})
+    html = m.api_tab('t')['boxes'][0]['html']
+    expected_question = question_kind or 'actor-country-linkage'
+    assert f'Bounded question: {expected_question}' in html
+    assert 'sources/missing' in html
+
+
+@pytest.mark.parametrize('confidence,pending', [(0.85,False), (0.35,True)])
+def test_assessed_country_precedes_structured_coverage_without_changing_confidence(tmp_path, monkeypatch, confidence, pending):
+    m = _terminal_vault(tmp_path, monkeypatch, {'entities/q/qilin': {
+        'state':'collection-required', 'reason':'Unread unrelated evidence',
+        'reason_details':[{'category':'contextual-provenance', 'reference':'publisher'}]}})
+    _mk(tmp_path, 'assessments/a/country.md',
+        'type: assessment\nassessment_kind: actor-country-linkage\nsubject: entities/q/qilin\n'
+        'status: active\nepistemic_status: assessed\nassessed_value: CN\n'
+        f'confidence: {confidence}\nneeds_review: {str(pending).lower()}\n'
+        'as_of: 2026-10-02\n')
+    html = m.api_tab('t')['boxes'][0]['html']
+    assert 'CN' in html and f'{round(confidence*100)}%' in html and '◇' in html
+    assert ('⚠' in html) is pending
+    assert 'Collection required' not in html and 'Unread unrelated evidence' not in html
+    assert 'data-page="assessments/a/country"' in html

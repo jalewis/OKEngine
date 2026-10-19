@@ -39,7 +39,7 @@ def test_caller_and_capability_kind_checks_use_value_equality(auth, monkeypatch)
     page = root / "wiki/entities/a/acme.md"
     called = []
     monkeypatch.setattr(m, "_effective_policy", lambda: {"capabilities": {}})
-    monkeypatch.setattr(m.policy_plane, "evaluate_capability", lambda *_a: called.append(True))
+    monkeypatch.setattr(m.policy_plane, "evaluate_capability", lambda *_a, **_k: called.append(True))
 
     token = m._caller_var.set({"kind": dynamic("admin"), "actor": "admin"})
     try:
@@ -230,3 +230,93 @@ def test_scope_refusal_authorizes_the_normalized_path(auth, monkeypatch):
     monkeypatch.setattr(m, "_authorize_write", lambda path: observed.append(path) or True)
     assert m._wauth_refusal("entities/../entities/a/acme") is None
     assert observed == ["entities/a/acme.md"]
+
+
+# ---- okengine#884: no page path in ANY namespace carries a control character -------------------
+
+@pytest.mark.parametrize("path", [
+    "concepts/l/l/llm-assisted-cybercrime\nslug: llm-assisted-cybercrime\ntags:\n- x",
+    "concepts/p/r/prompt-injection.md\n<parameter=frontmatter_yaml>\ntype: concept",
+    'sources/2026/08/16/item?id=1"\nauthors: ["x"]',
+    "sources/2026/9/tab\there",
+    "concepts/bell\x07",
+    "concepts/del\x7f",
+])
+def test_a_path_with_a_control_character_is_refused_in_every_namespace(auth, path):
+    """A model's leaked tool-call XML put frontmatter INTO the path argument; 15 pages across four
+    live vaults were written with newline-laden file names outside entities/."""
+    m, _root = auth
+    assert m._safe(path) is None, repr(path)
+
+
+def test_ordinary_paths_outside_entities_are_unaffected(auth):
+    m, _root = auth
+    assert m._safe("concepts/l/l/llm-assisted-cybercrime") is not None
+    # a space outside entities/ is still accepted: live vaults hold such pages and they must stay
+    # writable; only entities/ refuses whitespace (okengine#240)
+    assert m._safe("sources/2025/10/09/2025-10-09 (Update A)-cisa-icsa-25-282-01") is not None
+
+
+# ---- okengine#885: flag/review capability checks see the page's real type ----------------------
+
+@pytest.fixture
+def flag_lane(tmp_path, monkeypatch):
+    import json as _json
+    (tmp_path / "wiki/entities/a/c").mkdir(parents=True)
+    (tmp_path / "wiki/entities/s/t").mkdir(parents=True)
+    (tmp_path / "wiki/entities/a/c/acme.md").write_text(
+        "---\ntype: actor\nid: entities:acme\ntitle: Acme\n---\n# Acme\n", encoding="utf-8")
+    (tmp_path / "wiki/entities/s/t/stuxnet.md").write_text(
+        "---\ntype: malware\nid: entities:stuxnet\ntitle: Stuxnet\n---\n# Stuxnet\n", encoding="utf-8")
+    (tmp_path / "schema.yaml").write_text(
+        "okf: {required: [type]}\ntypes: {actor: {required: [type]}, malware: {required: [type]}}\n",
+        encoding="utf-8")
+    jobs = tmp_path / "jobs.json"
+    jobs.write_text(_json.dumps({"jobs": [{"name": "flag-lane", "output_contract": {
+        "api": 1, "allowed_namespaces": ["entities"], "allowed_types": ["actor"],
+        "operations": ["flag"], "required_fields": [], "required_relationships": [],
+        "body": {"required": False}, "unknown_fields": "review", "unresolved_links": "review",
+        "placeholder_links": "review", "completion": "run"}}]}), encoding="utf-8")
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_CRON_JOBS", str(jobs))
+    monkeypatch.setenv("OKENGINE_WRITE_ACTOR", "cron:flag-lane")
+    name = f"write_server_flag_lane_{id(tmp_path)}"
+    spec = importlib.util.spec_from_file_location(name, SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    oce = sys.modules.get("output_contract_enforce")
+    if oce is not None and hasattr(oce, "_cache"):
+        oce._cache.update(key=None, jobs={})
+    return module
+
+
+def test_a_lane_may_flag_a_page_of_a_type_it_is_granted(flag_lane):
+    out = flag_lane._flag("entities/a/c/acme", "needs a second look")
+    assert "page type '' is not allowed" not in out, out
+    assert out.startswith(("flagged", "already flagged")), out
+
+
+def test_a_lane_may_not_flag_a_page_of_a_type_it_is_not_granted(flag_lane):
+    out = flag_lane._flag("entities/s/t/stuxnet", "needs a second look")
+    assert out.startswith("rejected") and "page type 'malware' is not allowed" in out, out
+
+
+def test_effective_policy_cache_sees_a_same_size_rewrite_within_one_tick(auth, monkeypatch):
+    """okengine#1017: the policy cache key was each document's mtime alone, so a policy edited
+    within the same timestamp tick as the previous compose kept enforcing the old policy."""
+    m, root = auth
+    document = root / "policy.yaml"
+    document.write_text("version: 1\n", encoding="utf-8")
+    composed = []
+    monkeypatch.setattr(m.policy_plane, "discover_documents", lambda _root: [document])
+    monkeypatch.setattr(
+        m.policy_plane, "compose_documents",
+        lambda paths: composed.append(paths[0].read_text()) or {"text": composed[-1]},
+    )
+    m._policy_cache.update(key=None, value=None)
+    assert m._effective_policy() == {"text": "version: 1\n"}
+    before = document.stat()
+    document.write_text("version: 2\n", encoding="utf-8")
+    os.utime(document, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert m._effective_policy() == {"text": "version: 2\n"}

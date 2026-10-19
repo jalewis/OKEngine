@@ -31,6 +31,9 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.append(str(Path(__file__).resolve().parent))  # staged sibling libs
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
+
 # ── threshold (tuned for precision: only clear degeneration trips it) ─────────
 # A pure line-length signal was tried and dropped: this vault writes one paragraph per line, so a
 # coherent 2–3k-char paragraph (a verbose incident writeup) is normal and tripped it. The word-salad
@@ -148,7 +151,7 @@ def main(argv=None) -> int:
     if write_vault:
         out = Path(write_vault) / "wiki" / "operational" / "content-lint.md"
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(render_report(total, offenders, a.now or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")), encoding="utf-8")
+        generated_page.write(out, render_report(total, offenders, a.now or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")))
         print(f"content-lint: wrote {out}")
 
     if a.json:

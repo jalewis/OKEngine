@@ -25,9 +25,10 @@ def _load(root):
 
 def test_frontmatter_reader_fails_closed(tmp_path, monkeypatch):
     module = _load(tmp_path)
-    missing = tmp_path / "missing.md"
+    module.WIKI.mkdir()
+    missing = module.WIKI / "missing.md"
     assert module._fm(missing) == {}
-    malformed = tmp_path / "bad.md"
+    malformed = module.WIKI / "bad.md"
     malformed.write_text("---\ntype: [\n---\n")
     assert module._fm(malformed) == {}
 
@@ -100,7 +101,7 @@ def test_apply_dry_run_move_failure_and_main_idempotency(tmp_path, monkeypatch):
 def test_schema_discovery_oversized_and_apply_filesystem_edges(tmp_path, monkeypatch):
     module = _load(tmp_path)
     module.WIKI.mkdir()
-    plain = tmp_path / "plain.md"
+    plain = module.WIKI / "plain.md"
     plain.write_text("body")
     assert module._fm(plain) == {}
 

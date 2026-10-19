@@ -55,7 +55,7 @@ b. Decide: does the candidate genuinely relate to the orphan?
      both tagged with one broad topic tag); that's not specific enough.
 
 c. If YES: patch the candidate's frontmatter `related:` array with
-   `mcp__okengine_write__update_entity`. If the candidate
+   `mcp__OKENGINE_WRITER__update_entity`. If the candidate
    has NO `related:` field yet, add one as a multi-line YAML list:
 
    ```yaml
@@ -129,10 +129,10 @@ No Telegram delivery; this stays local.
 WRITE VIA THE MCP WRITE PATH (G1/G1.1) — NOT file_write/patch
 ─────────────────────────────────────────────────────────────────
 - RESCUE (preferred): add the orphan to a qualifying candidate's `related:` via
-  `mcp__okengine_write__update_entity`, path: the candidate,
+  `mcp__OKENGINE_WRITER__update_entity`, path: the candidate,
   frontmatter_yaml: "related: [<COMPLETE list including the new \"[[<orphan>]]\">]".
   ⚠ `related:` is a LIST — read the candidate first and send the FULL updated list
   (a list key REPLACES, it does not append).
-- NO candidate qualifies → `mcp__okengine_write__append_to_section`, path: the
+- NO candidate qualifies → `mcp__OKENGINE_WRITER__append_to_section`, path: the
   orphan, heading: "Triage note", text: the 2 strongest candidates + why none worked.
 file_read to read; do NOT use file_write/patch for wiki pages.

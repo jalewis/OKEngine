@@ -7,6 +7,8 @@ import os
 import re
 from pathlib import Path
 
+from okengine.file_fingerprint import fingerprint
+
 _WIKILINK = re.compile(r"\[\[([^\]|#\n]+)")
 _PLACEHOLDER = re.compile(r"\[[^\]\n]+\]\(\s*#\s*\)")
 _cache = {"key": None, "jobs": {}}
@@ -124,7 +126,9 @@ def _digest(contract: dict) -> str:
 def _jobs() -> dict:
     path = Path(os.environ.get("OKENGINE_CRON_JOBS") or
                 "/opt/data/cron-plus/jobs.json")
-    key = (str(path), path.stat().st_mtime_ns if path.is_file() else None)
+    # File fingerprint, not mtime: a contract changed within the same timestamp tick as the previous
+    # load must not keep being enforced in its old form (okengine#1017).
+    key = (str(path), fingerprint(path) if path.is_file() else None)
     if key != _cache["key"]:
         rows = []
         try:
@@ -141,6 +145,11 @@ def resolve(caller: dict) -> tuple[dict | None, str | None]:
     if caller.get("kind") != "job":
         return None, None
     actor = str(caller.get("actor") or "")
+    # Only a `cron:` actor names a cron lane. Any other server-bound actor (a `chat:` writer,
+    # okengine#983) has no lane contract to resolve: it is governed by its catalog capability
+    # alone, and an actor with none still fails closed in policy_plane.evaluate_capability.
+    if not actor.startswith("cron:"):
+        return None, None
     lane = actor.removeprefix("cron:")
     job = _jobs().get(lane)
     if not job:

@@ -455,3 +455,226 @@ def test_config_keys_are_read_from_env_by_selector():
         f"config keys with no OKENGINE_LACUNA_<KEY> read in {SELECTOR.name}: {missing} — the config "
         "block would silently no-op."
     )
+
+
+# ── inquiry nominations (okengine#854 step 3) ───────────────────────────────
+
+def _inquiry_nominate(vault: Path, field: str, *, nominated_at="2026-06-26"):
+    path = vault / ".okengine" / "inquiry" / "lacuna-nominations.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"nominations": [{
+        "field": field, "source": "inquiry/ai-risk",
+        "reason": "inquiry question: How likely is it?", "nominated_at": nominated_at,
+    }]}), encoding="utf-8")
+
+
+def test_an_inquiry_field_is_mapped_below_the_floor_with_the_extrapolation_warning(tmp_path):
+    """The vault said what it is researching: that field ranks first even though it is thinner
+    than the autonomous floor, and the digest says the result is extrapolation."""
+    _dense_field(tmp_path, slug="latency", n=12)
+    _dense_field(tmp_path, slug="safety-alignment", n=4)          # 4 < 8, >= inquiry floor 3
+    _inquiry_nominate(tmp_path, "concepts/s/safety-alignment")
+    out = _run_gate(tmp_path, OKENGINE_LACUNA_BATCH_SIZE="1")
+    assert '"wakeAgent": true' in out
+    assert "concept: safety-alignment" in out and "concept: latency" not in out
+    assert "inquiry nomination — inquiry/ai-risk" in out
+    assert "EXTRAPOLATION" in out
+    assert "inquiry field nominations: 1 (1 eligible, floor 3)" in out
+
+
+def test_an_inquiry_field_below_the_inquiry_floor_is_not_mapped(tmp_path):
+    """NEGATIVE: a declaration lowers the floor, it does not remove it."""
+    _dense_field(tmp_path, slug="safety-alignment", n=2)
+    _inquiry_nominate(tmp_path, "safety-alignment")
+    out = _run_gate(tmp_path)
+    assert '"wakeAgent": false' in out and "(0 eligible, floor 3)" in out
+
+
+def test_an_inquiry_field_with_no_concept_page_is_not_mapped(tmp_path):
+    """NEGATIVE: lacuna maps a NAMED field, never a dangling link, whoever nominated it."""
+    for i in range(5):
+        _page(tmp_path, f"entities/x-{i}.md", "See [[concepts/ghost-field]].\n")
+    _inquiry_nominate(tmp_path, "ghost-field")
+    assert '"wakeAgent": false' in _run_gate(tmp_path)
+
+
+def test_a_stale_inquiry_nomination_is_ignored(tmp_path):
+    """The dossier re-dates live nominations daily; an old row means the lane stopped."""
+    _dense_field(tmp_path, slug="safety-alignment", n=4)
+    _inquiry_nominate(tmp_path, "safety-alignment", nominated_at="2026-06-01")
+    out = _run_gate(tmp_path)
+    assert '"wakeAgent": false' in out and "inquiry field nominations: 0" in out
+
+
+def test_a_material_nomination_still_cannot_bypass_density_beside_an_inquiry_one(tmp_path):
+    """NEGATIVE: the lower floor belongs to inquiry declarations only."""
+    _dense_field(tmp_path, slug="thin-material", n=4)
+    _dense_field(tmp_path, slug="safety-alignment", n=4)
+    _nominate(tmp_path, "thin-material")
+    _inquiry_nominate(tmp_path, "safety-alignment")
+    out = _run_gate(tmp_path, OKENGINE_LACUNA_BATCH_SIZE="5")
+    assert "concept: safety-alignment" in out and "concept: thin-material" not in out
+
+
+def test_the_inquiry_nomination_config_is_declared():
+    cfg = _manifest()["config"]
+    assert cfg["inquiry_nominations_path"]["default"] == ".okengine/inquiry/lacuna-nominations.json"
+    assert cfg["inquiry_min_density"]["default"] == 3
+
+
+@pytest.mark.parametrize("n,warned", [(4, True), (8, False), (10, False)])
+def test_the_extrapolation_warning_marks_exactly_the_fields_below_the_floor(tmp_path, n, warned):
+    """At or above min_density an inquiry field is ordinary inference; only below it is the
+    result extrapolation."""
+    _dense_field(tmp_path, slug="safety-alignment", n=n)
+    _inquiry_nominate(tmp_path, "safety-alignment")
+    out = _run_gate(tmp_path, OKENGINE_LACUNA_BATCH_SIZE="1")
+    assert "concept: safety-alignment" in out
+    assert ("EXTRAPOLATION" in out) is warned
+
+
+def test_an_inquiry_field_outranks_a_denser_material_nomination(tmp_path):
+    """Declared research direction beats a routed story, even when the story's field is denser."""
+    _dense_field(tmp_path, slug="material-field", n=12)
+    _dense_field(tmp_path, slug="inquiry-field", n=9)
+    _nominate(tmp_path, "material-field")
+    _inquiry_nominate(tmp_path, "inquiry-field")
+    out = _run_gate(tmp_path, OKENGINE_LACUNA_BATCH_SIZE="1")
+    assert "concept: inquiry-field" in out and "concept: material-field" not in out
+
+
+def test_equal_density_fields_break_ties_by_name(tmp_path):
+    _dense_field(tmp_path, slug="beta-field", n=9)
+    _dense_field(tmp_path, slug="alpha-field", n=9)
+    out = _run_gate(tmp_path, OKENGINE_LACUNA_BATCH_SIZE="1")
+    assert "concept: alpha-field" in out and "concept: beta-field" not in out
+
+
+# ── density counts evidence, not derived views (okengine#855) ───────────────
+
+def _links(vault: Path, rels, slug="field-x"):
+    for rel in rels:
+        _page(vault, rel, f"See [[concepts/{slug}]].\n")
+
+
+def test_a_field_linked_only_by_dashboards_has_no_density(tmp_path):
+    """NEGATIVE: on a live vault 4 of a field's 7 'referencing pages' were generated dashboards."""
+    _page(tmp_path, "concepts/field-x.md", "---\ntype: concept\n---\nx\n")
+    _links(tmp_path, [f"dashboards/d{i}.md" for i in range(12)])
+    out = _run_gate(tmp_path)
+    assert '"wakeAgent": false' in out and "concept clusters >= 8 refs: 0" in out
+
+
+def test_only_evidence_counts_toward_density(tmp_path):
+    _page(tmp_path, "concepts/field-x.md", "---\ntype: concept\n---\nx\n")
+    _links(tmp_path, [f"entities/e{i}.md" for i in range(8)]
+           + [f"dashboards/d{i}.md" for i in range(4)] + ["briefings/b.md", "operational/o.md",
+              "lacuna/l.md", "index.md", "HOT.md", "entities/INDEX.md", "entities/INDEX-p02.md",
+              "entities/_scaffold.md"])
+    out = _run_gate(tmp_path)
+    assert "concept: field-x  (8 referencing pages)" in out
+    assert "surround_density: `8 links · entities 8`" in out
+
+
+def test_derived_namespaces_are_configurable_but_lacuna_is_always_excluded(tmp_path):
+    _page(tmp_path, "concepts/field-x.md", "---\ntype: concept\n---\nx\n")
+    _links(tmp_path, [f"dashboards/d{i}.md" for i in range(8)] + ["lacuna/l.md"])
+    out = _run_gate(tmp_path, OKENGINE_LACUNA_DENSITY_EXCLUDE_NAMESPACES="")
+    assert "concept: field-x  (8 referencing pages)" in out   # dashboards counted, lacuna not
+
+
+def test_the_density_exclusion_default_is_declared():
+    cfg = _manifest()["config"]
+    assert cfg["density_exclude_namespaces"]["default"] == "lacuna,dashboards,operational,briefings"
+
+
+# --- tombstones are neither evidence nor seats -----------------------------
+TOMB = "---\ntype: entity\nstatus: tombstoned\n---\n"
+
+
+def test_tombstoned_citers_do_not_make_a_field_dense(tmp_path):
+    """REGRESSION: tombstones keep their files, so link-counting kept counting them. On a live
+    vault 18 leaked test-fixture pages were tombstoned and their links still ranked a fixture
+    concept as the densest field."""
+    _page(tmp_path, "concepts/fixture.md", "---\ntype: concept\n---\nx\n")
+    for i in range(10):
+        _page(tmp_path, f"entities/t{i}.md", TOMB + "Links [[concepts/fixture]].\n")
+    assert '"wakeAgent": false' in _run_gate(tmp_path)
+
+
+def test_a_tombstoned_concept_page_is_not_a_field(tmp_path):
+    _dense_field(tmp_path)
+    _page(tmp_path, "concepts/latency.md",
+          "---\ntype: concept\nstatus: tombstoned\n---\nretired\n")
+    assert '"wakeAgent": false' in _run_gate(tmp_path)
+
+
+def test_a_retired_analysis_does_not_hold_its_field(tmp_path):
+    """A tombstoned lacuna page (e.g. one mapped from leaked fixtures) must not keep its field
+    out of rotation for 90 days."""
+    _dense_field(tmp_path)
+    _page(tmp_path, "lacuna/retired.md", "---\ntype: lacuna\nstatus: tombstoned\n"
+          "updated: 2026-06-20\nfield_mapped: concepts/latency\n---\nretired\n")
+    assert '"wakeAgent": true' in _run_gate(tmp_path)
+
+
+def test_tombstone_helpers_in_process(tmp_path, monkeypatch):
+    """The same rules exercised in-process, so coverage measures them (scripts/extensions are
+    not packages; a subprocess-only test reads as covered while unmeasured)."""
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    mod = _load("select_lacuna_field_tomb", SELECTOR)
+    assert mod._tombstoned("---\nstatus: tombstoned\n---\n")
+    assert mod._tombstoned("---\nstatus: 'Tombstoned'\n---\n")
+    assert not mod._tombstoned("---\nstatus: active\n---\nstatus: tombstoned in prose\n")
+    assert not mod._tombstoned("no frontmatter\n")
+    assert mod._has_concept_page("nothing") is False                    # no concepts/ dir
+    _page(tmp_path, "concepts/a/live.md", "---\ntype: concept\n---\n")
+    _page(tmp_path, "concepts/b/live.md", TOMB)                          # tombstoned twin
+    _page(tmp_path, "concepts/dead.md", TOMB)
+    (tmp_path / "wiki" / "concepts" / "gone.md").symlink_to(tmp_path / "missing.md")
+    assert mod._has_concept_page("live") is True
+    assert mod._has_concept_page("dead") is False
+    assert mod._has_concept_page("gone") is False                       # unreadable
+    for i in range(3):
+        _page(tmp_path, f"entities/t{i}.md", TOMB + "[[concepts/live]]\n")
+    _page(tmp_path, "entities/ok.md", "[[concepts/live]]\n")
+    refs, _by_ns = mod._clusters()
+    assert refs["live"] == {"entities/ok.md"}
+    _page(tmp_path, "lacuna/r.md", "---\ntype: lacuna\nstatus: tombstoned\nupdated: 2026-06-20\n"
+          "field_mapped: concepts/live\n---\n")
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-06-26")
+    assert "live" not in mod._recently_analyzed()
+    sys.modules.pop("select_lacuna_field_tomb", None)
+
+
+def test_skipped_pages_never_end_a_scan_early(tmp_path, monkeypatch):
+    """Every skip is a `continue`, never an early exit: retired or non-lacuna pages interleaved
+    with live ones (more than any iteration order could put all after them) lose nothing."""
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path))
+    monkeypatch.setenv("OKENGINE_MCP_WRITE_DATE", "2026-06-26")
+    for i in range(12):
+        # density: retired citers interleaved with live ones
+        _page(tmp_path, f"entities/d{i:02d}/retired.md", TOMB + "[[concepts/busy]]\n")
+        _page(tmp_path, f"entities/d{i:02d}/live.md", "[[concepts/busy]]\n")
+        # rotation: a non-lacuna page (type sorts AFTER "lacuna") and a retired one beside each
+        # real analysis; neither counts, and neither may stop the scan
+        _page(tmp_path, f"lacuna/r{i:02d}/other.md", "---\ntype: source\nupdated: 2026-06-20\n"
+              f"field_mapped: concepts/other-{i}\n---\n")
+        _page(tmp_path, f"lacuna/r{i:02d}/retired.md", "---\ntype: lacuna\nstatus: tombstoned\n"
+              f"updated: 2026-06-20\nfield_mapped: concepts/retired-{i}\n---\n")
+        _page(tmp_path, f"lacuna/r{i:02d}/real.md", "---\ntype: lacuna\nupdated: 2026-06-20\n"
+              f"field_mapped: concepts/mapped-{i}\n---\n")
+        # concept seat: unreadable twins beside the one live page
+        (tmp_path / "wiki" / "concepts" / f"s{i:02d}").mkdir(parents=True)
+        (tmp_path / "wiki" / "concepts" / f"s{i:02d}" / "seat.md").symlink_to(tmp_path / "nope.md")
+    _page(tmp_path, "concepts/zz/seat.md", "---\ntype: concept\n---\n")
+    mod = _load("select_lacuna_field_scan", SELECTOR)
+    try:
+        refs, _by_ns = mod._clusters()
+        assert len(refs["busy"]) == 12, "every live citer counts; retired ones never end the walk"
+        analyzed = mod._recently_analyzed()
+        assert {f"mapped-{i}" for i in range(12)} <= analyzed
+        assert not any(s.startswith(("other-", "retired-")) for s in analyzed)
+        assert mod._has_concept_page("seat") is True
+    finally:
+        sys.modules.pop("select_lacuna_field_scan", None)

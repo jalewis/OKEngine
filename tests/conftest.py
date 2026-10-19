@@ -9,14 +9,32 @@ from __future__ import annotations
 
 import ast
 import gc
+import importlib.util
 import json
+import os
 import inspect
 import re
+import runpy
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _verify_ci_tmpfs(request):
+    """Fail before tests if CI's actual tmp_path storage falls back to disk."""
+    if os.environ.get("OKENGINE_CI_TEST_TMPFS") == "1":
+        helper = Path(__file__).parents[1] / "ci/test_tmpfs.py"
+        if helper.is_file():
+            verifier = runpy.run_path(str(helper))
+        else:
+            raise pytest.UsageError("CI tmpfs verification requested but its private helper is unavailable")
+        # A declared tmp_path_factory dependency would classify EVERY unit as I/O.
+        # Request it dynamically only for this session-level infrastructure check.
+        tmp_path_factory = request.getfixturevalue("tmp_path_factory")
+        verifier["verify"](tmp_path_factory.getbasetemp())
 
 
 PRIMARY_LAYERS = (
@@ -49,9 +67,40 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     group.addoption("--strict-layer-skips", action="store_true", default=False)
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+_INSTALLED_DIRS = frozenset({"site-packages", "dist-packages"})
+
+
+def okengine_source_problem(origin: str | None, repo_root: Path) -> str | None:
+    """Why the resolved ``okengine`` package is not this checkout's, or None when it is.
+
+    okengine#994 [24]: ~/.venvs/okengine carries an EDITABLE okengine that points at whichever
+    engines/ worktree last ran ``pip install -e``, so a gate run from a release worktree silently
+    tested another checkout's source. Accepted: this checkout's ``src/`` (PYTHONPATH, an editable
+    install of this clone, or the mutation lane's detached worktree, whose conftest is its own) and
+    a regular installed distribution under site-packages/dist-packages (CI installs the candidate
+    wheel built from this commit). Anything else is another source tree. Unimportable is not this
+    guard's finding (the tests that need the package fail on their own), and neither is a root
+    without src/okengine, such as a disposable policy fixture that copies this conftest."""
+    src = (repo_root / "src").resolve()
+    if origin is None or not (src / "okengine").is_dir():
+        return None             # nothing to shadow: a disposable conftest copy has no src/okengine
+    path = Path(origin).resolve()
+    if path.is_relative_to(src) or _INSTALLED_DIRS & set(path.parts):
+        return None
+    return (f"okengine resolves to {path.parent}, not this checkout's {src}: these tests would "
+            "run against another worktree's source. Run them with PYTHONPATH=src:okengine-mcp "
+            "(e.g. `PYTHONPATH=src:okengine-mcp python -m pytest tests/ "
+            "--import-mode=importlib`).")
+
+
 def pytest_configure(config: pytest.Config) -> None:
     global _STRICT_SKIPS
     _STRICT_SKIPS = bool(config.getoption("--strict-layer-skips"))
+    spec = importlib.util.find_spec("okengine")
+    problem = okengine_source_problem(spec.origin if spec else None, REPO_ROOT)
+    if problem:
+        raise pytest.UsageError(problem)
 
 
 def _relative(item: pytest.Item) -> str:
@@ -63,37 +112,78 @@ def _relative(item: pytest.Item) -> str:
         return path.as_posix()
 
 
+def _read_function(current: object, module_name: str | None) -> tuple[str, tuple[object, ...]] | None:
+    """`current`'s source and the same-module functions it calls by name, or None when it has no
+    readable, parseable source."""
+    try:
+        source = inspect.getsource(current)
+    except (OSError, TypeError):
+        return None
+    try:
+        tree = ast.parse(source)
+    except (IndentationError, SyntaxError):
+        return source, ()
+    namespace = getattr(current, "__globals__", {})
+    helpers = []
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if not isinstance(call.func, ast.Name):
+            continue
+        helper = namespace.get(call.func.id)
+        if inspect.isfunction(helper) and getattr(helper, "__module__", None) == module_name:
+            helpers.append(helper)
+    return source, tuple(helpers)
+
+
+# okengine#1059: collection read and parsed each test's source, and every helper it reaches, once
+# per collected item and twice per item (the skip check and the layer inference). Parametrized
+# cases and shared helpers made that ~46,000 getsource calls for ~15,700 items, three quarters of a
+# collection that took ~100 s of unit-suite's 120 s deadline in CI. Each function is read once.
+_FUNCTION_SOURCES: dict[tuple[object, str | None], tuple[str, tuple[object, ...]] | None] = {}
+_ITEM_SOURCES: dict[tuple[object, str | None], str] = {}
+
+
+def _function_source(current: object, module_name: str | None):
+    key = (getattr(current, "__func__", current), module_name)
+    try:
+        return _FUNCTION_SOURCES[key]
+    except KeyError:
+        found = _FUNCTION_SOURCES[key] = _read_function(current, module_name)
+        return found
+    except TypeError:               # an unhashable callable: read it uncached
+        return _read_function(current, module_name)
+
+
+def _expanded_source(obj: object) -> str:
+    module_name = getattr(obj, "__module__", None)
+    pending = [obj]
+    seen: set[int] = set()
+    chunks: list[str] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        found = _function_source(current, module_name)
+        if found is None:
+            continue
+        source, helpers = found
+        chunks.append(source)
+        pending.extend(helpers)
+    return "\n".join(chunks)
+
+
 def _source(item: pytest.Item) -> str:
     obj = getattr(item, "obj", None)
     if obj is not None:
-        module_name = getattr(obj, "__module__", None)
-        pending = [obj]
-        seen: set[int] = set()
-        chunks: list[str] = []
-        while pending:
-            current = pending.pop()
-            if id(current) in seen:
-                continue
-            seen.add(id(current))
-            try:
-                source = inspect.getsource(current)
-            except (OSError, TypeError):
-                continue
-            chunks.append(source)
-            try:
-                tree = ast.parse(source)
-            except (IndentationError, SyntaxError):
-                continue
-            namespace = getattr(current, "__globals__", {})
-            for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
-                if not isinstance(call.func, ast.Name):
-                    continue
-                helper = namespace.get(call.func.id)
-                if (inspect.isfunction(helper)
-                        and getattr(helper, "__module__", None) == module_name):
-                    pending.append(helper)
-        if chunks:
-            return "\n".join(chunks)
+        key = (getattr(obj, "__func__", obj), getattr(obj, "__module__", None))
+        try:
+            expanded = _ITEM_SOURCES.get(key)
+            if expanded is None:
+                expanded = _ITEM_SOURCES[key] = _expanded_source(obj)
+        except TypeError:           # an unhashable test object: expand it uncached
+            expanded = _expanded_source(obj)
+        if expanded:
+            return expanded
     try:
         return Path(str(item.path)).read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -162,11 +252,24 @@ def pytest_runtest_call(item: pytest.Item):
     # Do not charge a unit for cyclic garbage accumulated by every test that ran before it. Without
     # this boundary, an otherwise sub-5ms test can happen to trigger a generation collection and be
     # reported above the 100ms contract depending only on suite order and runner heap state.
-    if _STRICT_SKIPS and item.get_closest_marker("unit"):
+    #
+    # Collecting generation 0 first is not enough: the automatic FULL (generation-2) collection
+    # scans the whole session heap, which in the unit layer is ~15,000 collected items, and it
+    # fires on whichever test's allocations cross the threshold. Measured in python:3.12-slim: the
+    # single unit test (of 2590) that hit a gen-2 collection used 0.196s CPU, 0.192s of it inside
+    # the collector, while the same test alone used 0.005s. So the automatic collector is paused
+    # for the timed call only. A test's own computation, including an explicit gc.collect(), is
+    # still billed in full.
+    unit = bool(_STRICT_SKIPS and item.get_closest_marker("unit"))
+    collector_was_enabled = gc.isenabled()
+    if unit:
         gc.collect(0)
+        gc.disable()
     started = time.process_time()
     yield
     item._okengine_cpu_duration = time.process_time() - started
+    if unit and collector_was_enabled:
+        gc.enable()
     item.user_properties.append(
         ("okengine_cpu_seconds", f"{item._okengine_cpu_duration:.6f}")
     )
@@ -191,6 +294,23 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
             f"({report.duration:.3f}s wall); optimize it or classify it in the "
             "appropriate non-unit layer"
         )
+
+
+@pytest.fixture(autouse=True)
+def _restore_process_environment():
+    """Every test starts from the environment the previous one found.
+
+    Several write-path helpers set WIKI_PATH / OKENGINE_MCP_WRITE_DATE / OKENGINE_BASE_SCHEMA
+    straight into os.environ and never restore them, so under pytest-randomly each later test
+    inherited whichever values ran last: a write-path test saw "today" as another file's pinned
+    date and rejected its own fixture as future-dated, depending only on order. Restoring the
+    whole environment after every test removes the class instead of chasing each helper.
+    """
+    saved = dict(os.environ)
+    yield
+    if os.environ != saved:
+        os.environ.clear()
+        os.environ.update(saved)
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -12,6 +12,13 @@
     "prompt": "{{PACK}} feed pull: fetch the {{DOMAIN}} OPML into raw/{{DOMAIN}}/ for the ingest lane. Pure script, wakeAgent=false.",
     "script": "/opt/data/scripts/{{PACK_UNDERSCORE}}_feed_fetch.py",
     "deliver": "local",
-    "no_agent": true
+    "no_agent": true,
+    "expect": {
+      "maintains": {
+        "artifact": "raw/{{DOMAIN}}",
+        "max_age": "12x"
+      }
+    },
+    "_expect_note": "What 'working' means for this lane (docs/lane-expectations.md): the newest capture under raw/{{DOMAIN}} is younger than 12 schedule cadences. Until feeds.opml is populated it reads 'never met' on the fleet-health dashboard — which is true."
   }
 ]

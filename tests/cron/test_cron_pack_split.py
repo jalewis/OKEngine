@@ -114,19 +114,37 @@ def test_engine_prompt_file_split_drops_only_resolved_prompt():
     }]
 
 
+def _split_through_sources(m, jobs, tmp_path):
+    """split() the live fleet, write each half where regen reads it, and load it back the way
+    regen does. A `prompt_file` lane's text lives only in its file (split drops it), so an
+    in-memory merge(split(x)) cannot restore it; reading the halves back resolves each file
+    against its own root: the engine repo for the engine half, the pack for the pack's halves."""
+    parts = m.split(jobs, m._tier_map(m.TIERS))
+    pack = tmp_path / "pack"
+    (pack / "crons").mkdir(parents=True)
+    _seed_pack_prompts(m, jobs, pack)
+    m.ENGINE_CRONS_FILE = tmp_path / "engine-crons.json"
+    m.ENGINE_CRONS_FILE.write_text(m._dump_list(parts[m.ENGINE_CRONS]))
+    (pack / "crons" / m.DOMAIN_CRONS).write_text(m._dump_list(parts[m.DOMAIN_CRONS]))
+    (pack / "crons" / m.DOMAIN_PROMPTS).write_text(m._dump_prompts(parts[m.DOMAIN_PROMPTS]))
+    return {m.ENGINE_CRONS: m._load_jobs(m.ENGINE_CRONS_FILE),
+            m.DOMAIN_CRONS: m._load_jobs(pack / "crons" / m.DOMAIN_CRONS),
+            m.DOMAIN_PROMPTS: m._load_prompts(pack / "crons" / m.DOMAIN_PROMPTS),
+            m.EXTENSIONS: parts[m.EXTENSIONS]}, parts
+
+
 @pytest.mark.external
-def test_round_trip_is_lossless():
+def test_round_trip_is_lossless(tmp_path):
     m = _mod()
     jobs = _live_jobs(m)
-    tier_of = m._tier_map(m.TIERS)
-    parts = m.split(jobs, tier_of)
-    merged = m.merge(parts[m.ENGINE_CRONS], parts[m.DOMAIN_CRONS], parts[m.DOMAIN_PROMPTS],
-                     extensions=parts[m.EXTENSIONS])
+    halves, _parts = _split_through_sources(m, jobs, tmp_path)
+    merged = m.merge(halves[m.ENGINE_CRONS], halves[m.DOMAIN_CRONS], halves[m.DOMAIN_PROMPTS],
+                     extensions=halves[m.EXTENSIONS])
     assert m._canon(jobs) == m._canon(merged), "merge(split(x)) != x — boundary lossy"
 
 
 @pytest.mark.external
-def test_engine_template_prompt_moves_to_pack_and_returns():
+def test_engine_template_prompt_moves_to_pack_and_returns(tmp_path):
     """An engine-template job's prompt is stripped from the engine half and lives
     only in the domain pack, but the merge restores it byte-for-byte."""
     m = _mod()
@@ -135,11 +153,23 @@ def test_engine_template_prompt_moves_to_pack_and_returns():
     et = [j for j in jobs if tier_of.get(j["name"]) == "engine-template" and j.get("prompt")]
     if not et:
         pytest.skip("no engine-template jobs carry a prompt")
-    parts = m.split(jobs, tier_of)
+    halves, parts = _split_through_sources(m, jobs, tmp_path)
     engine_by_name = {j["name"]: j for j in parts[m.ENGINE_CRONS]}
-    sample = et[0]["name"]
-    assert "prompt" not in engine_by_name[sample], "engine half leaked a domain prompt"
-    assert parts[m.DOMAIN_PROMPTS][sample] == et[0]["prompt"], "pack prompt mismatch"
+    for job in et:
+        sample = job["name"]
+        assert "prompt" not in engine_by_name[sample], f"engine half leaked {sample}'s domain prompt"
+        assert sample in parts[m.DOMAIN_PROMPTS], f"{sample}'s prompt did not move to the pack"
+    # The live prompt is the DEPLOYED text: the prompt file or inline prompt, composed with any
+    # output contract by merge(), bound to its writer (bind_contract_writers) and stamped with the
+    # discovery contract when the fleet is written (_dump_jobs). Compare that same pipeline's
+    # output, not the stored source, which is pre-composition (okengine#994 D).
+    deployed = json.loads(m._dump_jobs(m.bind_contract_writers(m.merge(
+        halves[m.ENGINE_CRONS], halves[m.DOMAIN_CRONS], halves[m.DOMAIN_PROMPTS],
+        tier_of=tier_of, extensions=halves[m.EXTENSIONS]))))["jobs"]
+    by_name = {j["name"]: j for j in deployed}
+    for job in et:
+        assert job["name"] in by_name, f"{job['name']} did not come back from the pack"
+        assert by_name[job["name"]]["prompt"] == job["prompt"], f"{job['name']}: pack prompt mismatch"
 
 
 @pytest.mark.external
@@ -200,12 +230,37 @@ def test_sanitize_unpauses_a_runtime_paused_job():  # invariant-audit HIGH
     assert shipped_off["enabled"] is False                          # source disable preserved
 
 
+def _seed_pack_prompts(m, jobs, pack_root):
+    """Copy the generating pack's prompts/ into the scratch pack (okengine#994 D).
+
+    split() keeps a lane's `prompt_file` and drops its resolved text on purpose (the file is the
+    source), so the pack's prompts/ is a SOURCE the round trip needs and cannot rebuild from the
+    live fleet: the live `prompt` is the composed text, not the file. Without this, a fleet whose
+    pack supplies prompt files (an engine-template lane's, or its own domain lanes') raised
+    FileNotFoundError at regen even with no drift at all. The pack is CRON_PACK_DIR, the deployment
+    that generated config/cron-plus-jobs.json. Only when NO pack is named (CRON_PACK_DIR unset, the
+    placeholder) are the inputs unknowable, so only then skip loudly naming them. A named pack
+    without prompts/ is the wrong pack or real drift: proceed and let regen fail."""
+    if m.PACK_DIR != Path(m.PACK_DIR_PLACEHOLDER):
+        source = m.PACK_DIR / "prompts"
+        if source.is_dir():
+            __import__("shutil").copytree(source, pack_root / "prompts")
+        return
+    outside_engine = sorted({j["prompt_file"] for j in jobs if isinstance(j.get("prompt_file"), str)
+                             and not (m.REPO / j["prompt_file"]).is_file()})
+    if outside_engine:
+        pytest.skip(f"the live fleet needs pack prompt file(s) {outside_engine} and no pack is "
+                    "named: set CRON_PACK_DIR to the deployment that generated "
+                    "config/cron-plus-jobs.json to run this live-fleet round trip.")
+
+
 def _seed_slice2(m, tmp_path):
     """Point the module's file paths at tmp and seed sources from the real jobs."""
     jobs = _live_jobs(m)
     parts = m.split(jobs, m._tier_map(m.TIERS))
     pack = tmp_path / "pack" / "crons"
     pack.mkdir(parents=True)
+    _seed_pack_prompts(m, jobs, tmp_path / "pack")
     (tmp_path / "engine-crons.json").write_text(m._dump_list(parts[m.ENGINE_CRONS]))
     (pack / m.DOMAIN_CRONS).write_text(m._dump_list(parts[m.DOMAIN_CRONS]))
     (pack / m.DOMAIN_PROMPTS).write_text(m._dump_prompts(parts[m.DOMAIN_PROMPTS]))
@@ -241,7 +296,7 @@ def test_regen_tolerates_pack_without_crons_dir(tmp_path):  # invariant-audit #1
     m.PACK_DIR.mkdir()
     (m.PACK_DIR / "pack.yaml").write_text("name: engineonly-pack\n")
     m.ENGINE_CRONS_FILE.write_text(m._dump_list([{
-        "name": "eng-a", "schedule": {"expr": "0 7 * * *"}, "max_iterations": 2,
+        "name": "eng-a", "schedule": {"expr": "0 7 * * *"}, "max_iterations": 2, "prompt": "p",
     }]))
     merged = m.regen()                                  # must NOT raise FileNotFoundError
     assert m.JOBS.is_file()
@@ -776,3 +831,462 @@ def test_artifact_contract_schema_fails_loudly():
     assert truthy_non_boolean == [
         "job 'ambiguous' artifact_contract is only valid for no_agent jobs"
     ]
+
+
+# --- okengine#814: _canon compares the jobs' SOURCE. A `prompt` resolved from a `prompt_file` is
+# derived — split drops it deliberately and deploy re-resolves it — so comparing it reports the
+# boundary lossy when nothing was lost. Exercised directly here rather than through the live fleet
+# file, which is gitignored: relying on it is why this went unnoticed in CI and only failed on a
+# host that happened to have one.
+
+
+def test_canon_ignores_a_prompt_resolved_from_a_prompt_file():
+    m = _mod()
+    with_text = {"name": "drain", "prompt_file": "prompts/cron/drain.md", "prompt": "resolved"}
+    without = {"name": "drain", "prompt_file": "prompts/cron/drain.md"}
+    assert m._canon([with_text]) == m._canon([without])
+
+
+def test_canon_still_compares_a_prompt_that_has_no_prompt_file():
+    """An inline prompt IS the source, so losing it must still be caught."""
+    m = _mod()
+    inline = {"name": "lane", "prompt": "inline text"}
+    dropped = {"name": "lane"}
+    assert m._canon([inline]) != m._canon([dropped])
+
+
+def test_canon_still_compares_every_other_field_of_a_prompt_file_job():
+    m = _mod()
+    a = {"name": "drain", "prompt_file": "p.md", "prompt": "x", "schedule": {"expr": "0 1 * * *"}}
+    b = {"name": "drain", "prompt_file": "p.md", "prompt": "y", "schedule": {"expr": "0 2 * * *"}}
+    assert m._canon([a]) != m._canon([b]), "only the derived prompt is exempt, nothing else"
+
+
+# ---------------------------------------------------------------------------
+# per-lane write-server name length (okengine#840)
+# ---------------------------------------------------------------------------
+def _dispatched_name(server: str, tool: str) -> str:
+    """A faithful local model of Hermes `tools/mcp_tool_schema.mcp_prefixed_tool_name`.
+
+    Reimplemented rather than imported: Hermes is a pinned EXTERNAL dependency and is not on
+    the path in CI. Keeping the algorithm here means the gate's limit is pinned to the
+    ALGORITHM, not to a magic number someone can quietly widen.
+    """
+    import hashlib
+    import re as _re
+    san = lambda v: _re.sub(r"[^A-Za-z0-9_]", "_", str(v or ""))
+    full = f"mcp__{san(server)}__{san(tool)}"
+    if len(full) <= 64:
+        return full
+    suffix = "_" + hashlib.sha256(full.encode("utf-8")).hexdigest()[:8]
+    return full[:64 - len(suffix)] + suffix
+
+
+def test_the_writer_name_limit_is_exactly_where_the_separator_survives():
+    """The gate's constant must BE the clamp boundary, not a number near it.
+
+    `parse_okengine_write_result` splits the dispatched name on `__` and identifies the write
+    server from the second component. Once the clamp truncates past the server/tool separator
+    the name collapses to two components and the write is no longer attributed -- so the
+    largest safe server name is the longest one whose `__` still survives truncation.
+    """
+    m = _mod()
+    limit = m.CONTRACT_WRITER_NAME_MAX
+    shortest_tool = "patch_entity"   # 12 chars; the least-pressure case
+
+    def server_of(name: str) -> str | None:
+        parts = _dispatched_name(name, shortest_tool).split("__", 2)
+        return parts[1] if len(parts) >= 3 else None
+
+    at_limit = "w" * limit
+    assert server_of(at_limit) == at_limit, (
+        f"a {limit}-char server name does not survive dispatch; the gate's limit is too high")
+
+    over = "w" * (limit + 1)
+    assert server_of(over) != over, (
+        f"a {limit + 1}-char server name still survives; the gate's limit is needlessly strict")
+
+
+def test_an_over_length_lane_is_rejected(monkeypatch):
+    """The negative fixture: the gate must reject the defect it claims to prevent.
+
+    contract_writer_name now bounds every name, so a real lane can no longer produce the defect
+    through the derivation. Reverting the derivation to its pre-#840 form is exactly the
+    regression this branch of the gate exists to catch, so that is the fixture.
+    """
+    m = _mod()
+    name = "okpack-market-intel-weekly-capability-frontier-digest"   # a real live lane
+    assert m.validate_contract_writer_names(
+        [{"name": name, "output_contract": {"api": 1}}]) == [], "bounded form must pass"
+    monkeypatch.setattr(m, "contract_writer_name", m.unbounded_writer_name)
+    errors = m.validate_contract_writer_names([{"name": name, "output_contract": {"api": 1}}])
+    assert len(errors) == 1, errors
+    assert name in errors[0] and "840" in errors[0], errors[0]
+
+
+def test_a_lane_at_the_limit_passes():
+    """49 is still the line for a writer a pack names explicitly -- the derivation aims at 36."""
+    m = _mod()
+    at_limit = "okengine-write-" + "a" * (m.CONTRACT_WRITER_NAME_MAX - len("okengine-write-"))
+    over = at_limit + "a"
+    assert len(at_limit) == m.CONTRACT_WRITER_NAME_MAX
+    assert m.validate_contract_writer_names([{"name": "x", "enabled_toolsets": [at_limit]}]) == []
+    assert m.validate_contract_writer_names([{"name": "x", "enabled_toolsets": [over]}])
+
+@pytest.mark.parametrize("job,why", [
+    ({"name": "x" * 90, "no_agent": True, "output_contract": {"api": 1}},
+     "no_agent lanes never reach a per-lane write server"),
+    ({"name": "x" * 90},
+     "a lane with no output_contract is not routed to a contract writer"),
+])
+def test_lanes_that_never_get_a_contract_writer_are_exempt(job, why):
+    m = _mod()
+    assert m.validate_contract_writer_names([job]) == [], why
+
+
+def test_the_engine_half_is_clean_under_its_own_gate():
+    """The engine ships no lane that would lose its own writes."""
+    m = _mod()
+    engine = json.loads((REPO / "config" / "engine-crons.json").read_text())
+    engine = engine if isinstance(engine, list) else engine.get("jobs", [])
+    assert m.validate_contract_writer_names(engine) == []
+
+
+# ---------------------------------------------------------------------------
+# bounded writer names (okengine#840 root fix)
+# ---------------------------------------------------------------------------
+def _write_tools() -> list[str]:
+    """Every tool write_server.py registers, read from its source rather than restated."""
+    import ast
+    tree = ast.parse((REPO / "okengine-mcp" / "write_server.py").read_text(encoding="utf-8"))
+    tools = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for dec in node.decorator_list:
+                fn = dec.func if isinstance(dec, ast.Call) else dec
+                if isinstance(fn, ast.Attribute) and fn.attr == "tool":
+                    tools.append(node.name)
+    assert tools, "no @mcp.tool registrations found -- write_server.py changed shape"
+    return tools
+
+
+def test_the_write_tool_budget_covers_every_registered_tool():
+    """WRITER_NAME_TARGET is sized to the longest write tool. A longer tool added later would
+    clamp on every bounded lane, silently, so it must fail here first -- and raising the budget
+    shortens the target, which renames every bounded writer on the next deploy."""
+    m = _mod()
+    longest = max(_write_tools(), key=len)
+    assert len(longest) <= m._LONGEST_WRITE_TOOL, (
+        f"write tool {longest!r} ({len(longest)} chars) exceeds the budget of "
+        f"{m._LONGEST_WRITE_TOOL}; raise _LONGEST_WRITE_TOOL knowing it renames bounded writers")
+
+
+LONG_LANES = [
+    "okengine.predictions:prediction-falsification-search",
+    "okengine.predictions:candidate-watch",
+    "okpack-market-intel-weekly-capability-frontier-digest",
+    "okpack-threat-landscape-weekly-brief",
+]
+
+
+@pytest.mark.parametrize("name", LONG_LANES)
+def test_a_long_lane_gets_a_writer_name_that_survives_dispatch(name):
+    """The derivation itself now keeps every writer inside the separator-survival limit."""
+    m = _mod()
+    writer = m.contract_writer_name(name)
+    assert len(writer) <= m.WRITER_NAME_TARGET, (writer, len(writer))
+    assert writer.startswith("okengine-write-"), "prefix matchers downstream key on this"
+    for tool in _write_tools():
+        literal = f"mcp__{writer.replace('-', '_')}__{tool}"
+        assert _dispatched_name(writer, tool) == literal, (
+            f"{tool} clamps on {writer}: a prompt naming {literal} would name a tool the model "
+            f"never sees")
+
+
+def test_a_short_lane_keeps_its_existing_writer_name():
+    """Bounding must not rename a server that already works -- that would churn live config
+    for lanes that were never affected."""
+    m = _mod()
+    assert m.contract_writer_name("okengine.lacuna") == "okengine-write-okengine-lacuna"
+    at_limit = "a" * (m.WRITER_NAME_TARGET - len("okengine-write-"))
+    assert m.contract_writer_name(at_limit) == f"okengine-write-{at_limit}"
+
+
+def test_bounded_names_are_deterministic_and_distinct():
+    """Two lanes sharing a long common prefix must not collapse onto one write identity."""
+    m = _mod()
+    a = "okengine.predictions:prediction-structural-backfill"
+    b = "okengine.predictions:prediction-structural-backfill-v2"
+    assert m.contract_writer_name(a) == m.contract_writer_name(a)
+    assert m.contract_writer_name(a) != m.contract_writer_name(b)
+
+
+def test_two_lanes_bound_to_one_writer_are_rejected():
+    """A writer name is an identity: one server carries one OKENGINE_WRITE_ACTOR. Two lanes that
+    derive the same name would silently write as each other."""
+    m = _mod()
+    jobs = [{"name": "a.b", "output_contract": {"api": 1}},
+            {"name": "a-b", "output_contract": {"api": 1}}]      # both slug to "a-b"
+    errors = m.validate_contract_writer_names(jobs)
+    assert any("collide" in e for e in errors), errors
+
+
+def test_an_explicit_over_length_writer_toolset_is_rejected():
+    """A pack can name a writer directly in enabled_toolsets, bypassing the derivation."""
+    m = _mod()
+    long_writer = "okengine-write-" + "x" * 60
+    errors = m.validate_contract_writer_names(
+        [{"name": "short", "enabled_toolsets": [long_writer]}])
+    assert len(errors) == 1 and long_writer in errors[0], errors
+
+
+def test_the_fleet_derives_no_over_length_writer():
+    """Every contracted lane on this host's live fleet now passes -- the bound, not a rename."""
+    m = _mod()
+    # the live artifact predates the bound; regen re-binds it, so validate what regen produces
+    assert m.validate_contract_writer_names(m.bind_contract_writers(_live_jobs(m))) == []
+
+
+def test_rebinding_a_pre_bound_artifact_leaves_one_writer_per_lane():
+    """A dumped pre-#840 artifact names the old writer explicitly; rebinding must REPLACE it."""
+    m = _mod()
+    name = "okengine.predictions:candidate-watch"
+    stale = m.unbounded_writer_name(name)
+    job = {"name": name, "output_contract": {"api": 1},
+           "enabled_toolsets": ["file_read", stale, "okengine"]}
+    (bound,) = m.bind_contract_writers([job])
+    writers = [t for t in bound["enabled_toolsets"] if t.startswith("okengine-write")]
+    assert writers == [m.contract_writer_name(name)], writers
+    assert bound["enabled_toolsets"][0] == "file_read", "toolset order must be preserved"
+
+
+def test_a_job_naming_an_unregistered_writer_is_reported():
+    """The stage-only deploy hazard: regen renamed the writer, ensure-runtime has not run."""
+    m = _mod()
+    jobs = [{"name": "lane-a", "enabled_toolsets": ["file_read", "okengine-write-lane-a"]},
+            {"name": "lane-b", "enabled_toolsets": ["okengine-write-lane-a"]}]
+    errors = m.unregistered_writers(jobs, {"mcp_servers": {"okengine-write": {}}})
+    assert len(errors) == 1, errors
+    assert "okengine-write-lane-a" in errors[0] and "['lane-a', 'lane-b']" in errors[0], errors[0]
+
+
+def test_a_non_dict_job_entry_is_ignored_by_the_registration_check():
+    """A malformed entry is the shape validators' verdict; it must not crash this one."""
+    m = _mod()
+    assert m.unregistered_writers(["not-a-job", None, 7],
+                                  {"mcp_servers": {"okengine-write": {}}}) == []
+
+
+def test_registered_writers_and_non_writer_toolsets_pass():
+    m = _mod()
+    jobs = [{"name": "a", "enabled_toolsets": ["okengine-write", "okengine-write-a", "okengine",
+                                               "file_read"]}]
+    assert m.unregistered_writers(
+        jobs, {"mcp_servers": {"okengine-write": {}, "okengine-write-a": {}}}) == []
+
+
+@pytest.mark.parametrize("config", [{}, {"mcp_servers": None}, {"mcp_servers": ["a"]}, None])
+def test_a_config_without_a_server_map_registers_nothing(config):
+    """No readable mcp_servers map means no writer is registered -- never a silent pass."""
+    m = _mod()
+    assert m.unregistered_writers([{"name": "a", "enabled_toolsets": ["okengine-write"]}], config)
+
+
+def _promptfile_pack(m, tmp_path, prompt_text="Write the brief.\n"):
+    """An engine half with one lane, and a pack whose domain lane takes its prompt from a file."""
+    m.ENGINE_CRONS_FILE = tmp_path / "engine-crons.json"
+    m.PACK_DIR = tmp_path / "pack"
+    m.JOBS = tmp_path / "cron-plus-jobs.json"
+    (m.PACK_DIR / "crons").mkdir(parents=True)
+    (m.PACK_DIR / "prompts").mkdir()
+    (m.PACK_DIR / "pack.yaml").write_text("name: pack\n")
+    (m.PACK_DIR / "prompts" / "brief.md").write_text(prompt_text)
+    m.ENGINE_CRONS_FILE.write_text(m._dump_list([{
+        "name": "eng-a", "schedule": {"expr": "0 7 * * *"}, "max_iterations": 2, "prompt": "p",
+    }]))
+    (m.PACK_DIR / "crons" / m.DOMAIN_CRONS).write_text(json.dumps([{
+        "id": "b1", "name": "pack-brief", "schedule": {"expr": "5 20 * * 0"}, "max_iterations": 4,
+        "prompt_file": "prompts/brief.md",
+    }]))
+
+
+def test_regen_resolves_a_domain_lanes_prompt_file(tmp_path):
+    """A pack domain lane that names a prompt_file must deploy WITH that prompt. Single-pack regen
+    read domain crons with a bare json.loads, so the file never resolved and four model lanes on
+    one deployment ran for a week on their selector output alone (the composed path, via
+    discover_packs, always resolved it)."""
+    m = _mod()
+    _promptfile_pack(m, tmp_path)
+    merged = {j["name"]: j for j in m.regen()}
+    assert merged["pack-brief"]["prompt"] == "Write the brief."
+    deployed = {j["name"]: j for j in json.loads(m.JOBS.read_text())["jobs"]}
+    assert deployed["pack-brief"]["prompt"].startswith("Write the brief.\n")   # + engine stamps
+
+
+def test_regen_refuses_a_model_lane_whose_prompt_is_empty(tmp_path):
+    m = _mod()
+    _promptfile_pack(m, tmp_path, prompt_text="   \n")
+    with pytest.raises(SystemExit) as raised:
+        m.regen()
+    assert "'pack-brief': model lane has an empty prompt" in str(raised.value)
+    assert "prompt_file 'prompts/brief.md' did not resolve" in str(raised.value)
+    assert not m.JOBS.exists(), "a refused regen must write nothing"
+
+
+def test_validate_agent_prompts_scope():
+    m = _mod()
+    jobs = [{"name": "ok", "prompt": "do it"},
+            {"name": "script", "no_agent": True},
+            {"name": "off", "enabled": False},
+            {"name": "blank", "prompt": "  "},
+            {"name": "bare"}]
+    assert m.validate_agent_prompts(jobs) == [
+        "job 'blank': model lane has an empty prompt (no prompt or prompt_file); "
+        "it would run on its selector output alone",
+        "job 'bare': model lane has an empty prompt (no prompt or prompt_file); "
+        "it would run on its selector output alone",
+    ]
+
+
+# --- okengine#994 D: the live-fleet round trip seeds the generating pack's prompts/ -------------
+# The live-fleet tests above skip in CI (no config/cron-plus-jobs.json). These rebuild the deploy-
+# checkout case from a synthetic deployment, so the seeding is exercised everywhere.
+
+def _synthetic_deployment(m, tmp_path):
+    """A deployment that supplies an engine-template lane's prompt as a FILE (the house shape),
+    regenerated into a fleet file the way a roll's deploy.sh leaves one in the checkout."""
+    src = tmp_path / "deployment"
+    (src / "crons").mkdir(parents=True)
+    (src / "prompts").mkdir()
+    (src / "pack.yaml").write_text("name: okpack-synthetic\n")
+    (src / "prompts" / "raw-backfill.md").write_text("Backfill this pack's raw captures.\n")
+    (src / "crons" / m.DOMAIN_PROMPTS).write_text(json.dumps(
+        {"raw-backfill": {"prompt_file": "prompts/raw-backfill.md"}}))
+    m.PACK_DIR = src
+    m.JOBS = tmp_path / "checkout-config" / "cron-plus-jobs.json"
+    m.JOBS.parent.mkdir()
+    m.regen()
+    return src
+
+
+def test_a_round_trip_seeds_the_generating_packs_prompt_files(tmp_path):
+    m = _mod()
+    _synthetic_deployment(m, tmp_path)
+    live = m.JOBS
+    jobs = _seed_slice2(m, tmp_path / "scratch")
+    assert (tmp_path / "scratch" / "pack" / "prompts" / "raw-backfill.md").is_file()
+    raw = next(j for j in jobs if j["name"] == "raw-backfill")
+    assert raw["prompt_file"] == "prompts/raw-backfill.md"
+    assert raw["prompt"].startswith("Backfill this pack's raw captures.")
+    m.dump_from_live(str(live))             # raised FileNotFoundError before the seeding
+    out = json.loads(m.JOBS.read_text())["jobs"]
+    ne = lambda js: [j for j in js if not j.get("extension")]
+    assert m._canon(ne(out)) == m._canon(ne(jobs))
+
+
+def test_the_round_trip_still_fails_when_the_pack_lost_a_prompt_file(tmp_path):
+    """Strictness: seeding copies the pack's prompts/, it does not invent them. A fleet whose
+    prompt file is gone from the named pack is real drift, and the round trip must fail."""
+    m = _mod()
+    src = _synthetic_deployment(m, tmp_path)
+    (src / "prompts" / "raw-backfill.md").unlink()
+    (src / "prompts" / "unrelated.md").write_text("x\n")
+    live = m.JOBS
+    _seed_slice2(m, tmp_path / "scratch")
+    with pytest.raises(FileNotFoundError, match="raw-backfill.md"):
+        m.dump_from_live(str(live))
+
+
+def test_a_fleet_needing_pack_prompts_with_no_pack_named_skips_loudly(tmp_path):
+    m = _mod()
+    src = _synthetic_deployment(m, tmp_path)
+    m.PACK_DIR = Path(m.PACK_DIR_PLACEHOLDER)
+    with pytest.raises(pytest.skip.Exception, match=r"prompts/raw-backfill\.md.*CRON_PACK_DIR"):
+        _seed_slice2(m, tmp_path / "scratch")
+    assert src.is_dir()
+
+
+def test_a_fleet_whose_prompt_files_are_all_engine_owned_needs_no_pack(tmp_path):
+    m = _mod()
+    m.PACK_DIR = tmp_path / "no-such-pack"
+    jobs = [{"name": "orphans-drain", "prompt_file": "prompts/cron/orphans-drain.md"},
+            {"name": "inline", "prompt": "p"}]
+    assert (m.REPO / "prompts/cron/orphans-drain.md").is_file()
+    _seed_pack_prompts(m, jobs, tmp_path / "pack")      # neither copies nor skips
+    assert not (tmp_path / "pack").exists()
+
+
+def test_a_named_pack_without_prompts_fails_the_round_trip_rather_than_skipping(tmp_path):
+    """A NAMED pack with no prompts/ is the wrong pack or real drift: the round trip must run and
+    fail at regen. Only an unset CRON_PACK_DIR (the placeholder) makes the inputs unknowable."""
+    m = _mod()
+    _synthetic_deployment(m, tmp_path)
+    live = m.JOBS
+    wrong = tmp_path / "other-deployment"
+    wrong.mkdir()
+    (wrong / "pack.yaml").write_text("name: okpack-other\n")
+    m.PACK_DIR = wrong
+    _seed_slice2(m, tmp_path / "scratch")              # must not skip
+    with pytest.raises(FileNotFoundError, match="raw-backfill.md"):
+        m.dump_from_live(str(live))
+
+
+def test_runs_is_the_single_definition_of_the_deployed_set():
+    """okengine#1029: `runs` is the filter the deployed artifact and ensure-runtime's lane writers
+    share. Enabled is the default; only an explicit disable keeps a lane out of the deployment."""
+    m = _mod()
+    assert m.runs({"name": "a"}) is True
+    assert m.runs({"name": "a", "enabled": True}) is True
+    assert m.runs({"name": "a", "enabled": False}) is False
+    dumped = json.loads(m._dump_jobs([{"name": "b", "enabled": False}, {"name": "a"}]))["jobs"]
+    assert [j["name"] for j in dumped] == ["a"]
+
+
+# ---------------------------------------------------------------------------
+# okengine#1044 [8]/[18]: a lane's `write_tools` is validated, never silently widened
+# ---------------------------------------------------------------------------
+# `write_tools` narrows a lane's server-bound writer (okengine#664). A string, an empty list, a list
+# of blanks or a misspelled tool used to collapse to "no narrowing" (the full tool surface) or to
+# an allowlist that matches nothing (zero tools), and every gate agreed because each side derived
+# from the same unchecked value.
+
+def test_the_known_write_tools_are_exactly_what_write_server_registers():
+    """The allowlist a lane may name is read against write_server.py's own @mcp.tool registrations,
+    so a tool added or renamed there fails here instead of making a valid lane unvalidatable."""
+    assert _mod().WRITE_TOOL_NAMES == frozenset(_write_tools())
+
+
+@pytest.mark.parametrize("tools", [
+    ["update_entity"],
+    ["create_entity", " append_to_section "],
+    ["record_machine_review", "converge_source", "converge_concept"],
+])
+def test_a_well_formed_write_tools_declaration_is_accepted(tools):
+    m = _mod()
+    job = {"name": "okpack-alpha-lane", "write_tools": tools}
+    assert m.validate_write_tools([job, {"name": "okpack-alpha-free"}]) == []
+    assert m.write_tools_declaration(job) == (",".join(t.strip() for t in tools), None)
+
+
+def test_an_absent_write_tools_means_no_narrowing():
+    assert _mod().write_tools_declaration({"name": "l"}) == (None, None)
+
+
+@pytest.mark.parametrize("value,needle", [
+    ("update_entity", "must be a list"),
+    (None, "must be a list"),
+    ({"update_entity": True}, "must be a list"),
+    ([], "names no tool"),
+    ([" ", ""], "names no tool"),
+    (["update_entity", 7], "not a tool name"),
+    (["update_entiy"], "unknown write tool 'update_entiy'"),
+    (["update_entity", "link_pages"], "unknown write tool 'link_pages'"),
+    (["zz_typo", "update_entity", "aa_typo"], "unknown write tool 'aa_typo', 'zz_typo' in"),
+])
+def test_a_malformed_write_tools_declaration_is_a_fleet_error(value, needle):
+    m = _mod()
+    job = {"name": "okpack-alpha-lane", "write_tools": value}
+    tools, error = m.write_tools_declaration(job)
+    assert tools is None and needle in error, error
+    errors = dict(m.fleet_errors([job]))["cron write-tools errors"]
+    assert len(errors) == 1 and "okpack-alpha-lane" in errors[0] and needle in errors[0], errors

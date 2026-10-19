@@ -40,9 +40,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from urllib.error import URLError
 from pathlib import Path
 
 import yaml
+from yaml import YAMLError
 
 # The narration tells, kept identical to run_receipts._NARRATED_TAG so the pre-flight and the
 # post-hoc detector agree on what a dropped call looks like.
@@ -76,10 +78,23 @@ async def _tools_for(actor: str) -> list:
     return await W.mcp.list_tools()
 
 
+def tool_schema(tool) -> dict:
+    """A tool's JSON input schema under either MCP SDK (okengine#874): MCP 2 renamed
+    `Tool.inputSchema` to `input_schema`, and reading the old name failed EVERY lane with an
+    AttributeError, so the probe reported UNKNOWN fleet-wide. A tool carrying neither is a named
+    error, never a silent empty schema -- an empty schema would probe a lane with no arguments."""
+    for attr in ("input_schema", "inputSchema"):
+        schema = getattr(tool, attr, None)
+        if schema is not None:
+            return schema
+    raise ValueError(f"tool {getattr(tool, 'name', '?')!r} exposes no input schema "
+                     "(neither input_schema nor inputSchema)")
+
+
 def build_array(server_key: str, tools) -> list[dict]:
     prefix = "mcp__" + server_key.replace("-", "_") + "__"
     return [{"type": "function", "name": prefix + t.name, "strict": False,
-             "description": t.description or "", "parameters": t.inputSchema}
+             "description": t.description or "", "parameters": tool_schema(t)}
             for t in tools]
 
 
@@ -108,7 +123,7 @@ def probe(url: str, model: str, tools: list[dict], timeout: int) -> str:
         # here and at startup, so `file:` and custom schemes from config.yaml cannot reach it.
         with urllib.request.urlopen(req, timeout=timeout) as r:  # nosec B310
             body = json.loads(r.read().decode("utf-8", "replace"))
-    except (urllib.error.URLError, OSError, ValueError):
+    except (URLError, OSError, ValueError):
         return "unreachable"
     calls, text = 0, []
     for item in body.get("output") or []:
@@ -144,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
     data = Path(args.data)
     try:
         cfg = load_config(data)
-    except (OSError, ValueError, yaml.YAMLError) as exc:
+    except (OSError, ValueError, YAMLError) as exc:
         print(f"probe: cannot read config.yaml: {exc}", file=sys.stderr)
         return 2
     model_cfg = cfg.get("model") or {}

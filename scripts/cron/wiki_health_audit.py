@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import lint_watcher  # noqa: E402
 import rebuild_index  # noqa: E402
 import tz_lib  # noqa: E402
@@ -151,7 +152,7 @@ def render_report(
     )
     lines = [
         "---",
-        "type: lint",
+        "type: dashboard",
         f'title: "Wiki health audit — {generated.date().isoformat()}"',
         f"generated_at: {generated.isoformat()}",
         "generator: wiki-health-audit",
@@ -315,7 +316,7 @@ def main() -> int:
         details, schema_report,
     )
 
-    _atomic_write(report, body)
+    _atomic_write(report, generated_page.with_id(report, body))
     append_log(generated, report, queues)
     _atomic_write(rebuild_index.INDEX, rebuild_index.render_index())
     commit_baseline(latest, generated)

@@ -1,5 +1,6 @@
-"""P3 regression: N-way cron composition — per-pack engine-template instances,
-pack-prefixed domain jobs, fail-loud on bad prompts."""
+"""P3 regression: N-way cron composition — the driving pack's engine-template instance,
+pack-prefixed domain jobs, fail-loud on bad prompts. One pack drives a lane (okengine#968);
+two drivers are rejected in test_compose_deployable.py."""
 import importlib.util
 import sys
 from pathlib import Path
@@ -28,14 +29,15 @@ def test_two_packs_compose_without_collision():
         {"name": "packA", "domain": [{"name": "digest", "schedule": "0 9 * * *"}],
          "prompts": {"entity-backfill": "promptA"}},
         {"name": "packB", "domain": [{"name": "digest", "schedule": "0 10 * * *"}],
-         "prompts": {"entity-backfill": "promptB"}},
+         "prompts": {}},
     ]
     jobs, errors = cps.merge_packs(ENGINE, packs, TIER_OF)
     assert errors == []
     names = {j["name"] for j in jobs}
     assert "reshelve" in names                                  # pure engine ships
     assert "entity-backfill" not in names                       # the bare stub does not
-    assert {"entity-backfill@packA", "entity-backfill@packB"} <= names   # per-pack instances
+    assert "entity-backfill@packA" in names                     # the driving pack's instance
+    assert not any(n.endswith("@packB") for n in names)         # packB drives nothing
     assert {"packA:digest", "packB:digest"} <= names            # pack-prefixed, no collision
     # the instances carry the pack's prompt + the engine def
     inst = next(j for j in jobs if j["name"] == "entity-backfill@packA")

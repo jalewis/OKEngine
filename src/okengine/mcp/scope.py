@@ -21,6 +21,8 @@ import json
 import os
 from pathlib import Path
 
+from okengine.file_fingerprint import fingerprint
+
 
 def store_path() -> Path:
     vault = Path(os.environ.get("WIKI_PATH") or "/opt/vault")
@@ -32,12 +34,12 @@ _cache: dict = {"mtime": None, "records": []}
 
 
 def load_records() -> list[dict]:
-    """Load token records, mtime-cached. Each: {ext_id, token_sha256, read_scopes,
-    write_scopes, status}. Missing/unparseable store -> []."""
+    """Load token records, cached on the store's file fingerprint (``_cache["mtime"]`` holds it; an
+    mtime-only key kept a token revoked within the same timestamp tick resolving, okengine#1017).
+    Each: {ext_id, token_sha256, read_scopes, write_scopes, status}. Missing/unparseable store -> []."""
     p = store_path()
-    try:
-        mt = p.stat().st_mtime
-    except OSError:
+    mt = fingerprint(p)
+    if mt is None:
         _cache["mtime"], _cache["records"] = None, []
         return []
     if _cache["mtime"] != mt:

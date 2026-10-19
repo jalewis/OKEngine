@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import re
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
@@ -13,6 +14,13 @@ from statistics import median
 import yaml
 
 import pred_lib as P
+
+# Engine cron libs, appended so this extension's own modules keep precedence: staged one level
+# up (/opt/data/scripts/ holds /opt/data/scripts/<id>/), or scripts/cron/ in a repo checkout.
+_ENGINE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(_ENGINE_ROOT))
+sys.path.append(str(_ENGINE_ROOT.parent / "scripts" / "cron"))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 
 _FM = re.compile(r"\A---\s*\n(.*?)\n---\s*(?:\n|\Z)", re.S)
 _REF = re.compile(r"\[\[([^\]|#]+)")
@@ -302,7 +310,7 @@ def compute_base_rates(vault: Path | None = None) -> tuple[list[dict], Path, Pat
     dashboard = vault / "wiki" / "dashboards" / "base-rate-metrics.md"
     _write_jsonl(state, rows)
     dashboard.parent.mkdir(parents=True, exist_ok=True)
-    dashboard.write_text(render_base_rates(rows, today, bool(events)), encoding="utf-8")
+    generated_page.write(dashboard, render_base_rates(rows, today, bool(events)))
     return rows, state, dashboard
 
 
@@ -409,5 +417,5 @@ def compute_output_outcomes(vault: Path | None = None) -> tuple[list[dict], Path
     dashboard = vault / "wiki" / "dashboards" / "output-outcome-metrics.md"
     _write_jsonl(state, rows)
     dashboard.parent.mkdir(parents=True, exist_ok=True)
-    dashboard.write_text(render_output_outcomes(rows, today, bool(events)), encoding="utf-8")
+    generated_page.write(dashboard, render_output_outcomes(rows, today, bool(events)))
     return rows, state, dashboard

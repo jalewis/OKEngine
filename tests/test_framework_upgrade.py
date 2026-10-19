@@ -2,8 +2,10 @@
 import importlib.util
 import json
 import os
+import re
 import pytest
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -345,11 +347,12 @@ def test_roll_forward_gate_samples_page_conformance(tmp_path, monkeypatch):  # i
     assert not any("good.md" in f for f in fails), fails
 
 
-def test_main_apply_gate_fails_returns_one(tmp_path, monkeypatch):
+def test_main_apply_gate_fails_on_a_pin_bump_only_returns_three(tmp_path, monkeypatch):
+    """No migration ran, so a gate FAIL is a validate FAIL, exit 3, not 1 (okengine#1042 [28])."""
     m = _mod()
     pack = _pack(tmp_path, "v0.1.0")
     monkeypatch.setattr(m, "VALIDATOR", lambda p: (False, "stub: broken"))
-    assert m.main([str(pack), "--apply", "--migrations-dir", str(tmp_path / "none")]) == 1
+    assert m.main([str(pack), "--apply", "--migrations-dir", str(tmp_path / "none")]) == 3
 
 
 def test_main_apply_gate_passes_returns_zero(tmp_path, monkeypatch):
@@ -431,6 +434,21 @@ def test_snapshot_copies_source_excludes_runtime(tmp_path):
     assert (tree / ".hermes-data" / "config.yaml").read_text() == "model: deepseek-v4-pro\n"
     assert not (tree / ".hermes-data" / "big.log").exists()  # other runtime remains excluded
     assert json.loads((snap / "manifest.json").read_text())["to"] == "v0.5.0"
+
+
+def test_snapshot_and_rollback_never_scope_framework_backups(tmp_path):
+    """okengine#1032 QA N2: `.okengine/backups` holds backup archives and the backup's staging
+    hardlinks of the whole corpus. An upgrade must neither copy it into a snapshot nor treat a backup
+    written after the snapshot as an addition to roll back."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    staged = pack / ".okengine/backups/.staging/.staging-x/wiki/page.md"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("staged\n")
+    snap = m.snapshot(pack, "snap-backups")
+    assert not (snap / "tree/.okengine/backups").exists()
+    (pack / ".okengine/backups/vault-1.tar.gz").write_bytes(b"archive")
+    assert m.added_since_snapshot(pack, snap) == set()
 
 
 def test_runtime_config_migration_is_rollback_scoped(tmp_path):
@@ -1197,3 +1215,634 @@ def test_record_state_without_provenance_and_deleted_absence_restore(tmp_path):
     }), encoding="utf-8")
     changed, errors = m.restore_saved_snapshot(pack, snap)
     assert (changed, errors) == (0, [])
+
+
+# --- okengine#819: a rollback must never be able to quarantine the whole deployment.
+# On a live vault two transactions held one snapshot: the pack-migration runner adopted
+# install-domain's (same pack/to keys, no confirmed_good_at), rolled back from it and DELETED it,
+# and install-domain's own rollback then ran against a missing tree. `added` is by definition
+# "live files absent from the snapshot", so an empty snapshot made it the entire deployment:
+# 110,263 files moved aside, wiki/ emptied, and the run still printed "110263 files restored".
+
+
+def _vault_with_snapshot(tmp_path, pages=4):
+    m = _mod()
+    vault = tmp_path / "vault"
+    (vault / "wiki" / "entities").mkdir(parents=True)
+    (vault / "schema.yaml").write_text("types: {}\n", encoding="utf-8")
+    for i in range(pages):
+        (vault / "wiki" / "entities" / f"p{i}.md").write_text(f"---\nid: e{i}\n---\n{i}\n",
+                                                              encoding="utf-8")
+    snap = m.snapshot(vault, "20260101T000000", {"pack": "okpack-x", "to": "0.2.0"})
+    return m, vault, snap
+
+
+def _scoped(m, vault):
+    return set(m._scope_files(vault, (vault / m.SNAPSHOTS_REL).resolve()))
+
+
+def test_restore_refuses_a_snapshot_whose_tree_was_deleted(tmp_path):
+    m, vault, snap = _vault_with_snapshot(tmp_path)
+    before = _scoped(m, vault)
+    import shutil
+    shutil.rmtree(snap / "tree")
+    with pytest.raises(FileNotFoundError, match="can restore\\s+NOTHING|restore\\s*$|NOTHING"):
+        m.restore(vault, snap, added=set(before), modified=set())
+    assert _scoped(m, vault) == before, "a refused rollback must not move anything"
+    assert not (vault / ".okengine" / "rolled-back").exists()
+
+
+def test_restore_refuses_an_empty_snapshot_tree(tmp_path):
+    """Deleted and empty are the same hazard: snap_set is empty either way."""
+    m, vault, snap = _vault_with_snapshot(tmp_path)
+    before = _scoped(m, vault)
+    for f in list((snap / "tree").rglob("*")):
+        if f.is_file():
+            f.unlink()
+    with pytest.raises(FileNotFoundError):
+        m.restore(vault, snap, added=set(before), modified=set())
+    assert _scoped(m, vault) == before
+
+
+def test_an_empty_snapshot_with_nothing_to_quarantine_is_a_legal_no_op(tmp_path):
+    """The hazard is an empty snapshot paired with a non-empty `added` set. A rollback plan that
+    quarantines nothing cannot destroy anything, and restore_saved_snapshot relies on that."""
+    m, vault, snap = _vault_with_snapshot(tmp_path)
+    before = _scoped(m, vault)
+    import shutil
+    shutil.rmtree(snap / "tree")
+    (snap / "tree").mkdir()
+    assert m.restore(vault, snap, added=set(), modified=set()) == 0
+    assert _scoped(m, vault) == before
+
+
+def test_restore_still_rolls_back_normally(tmp_path):
+    """The guard must not break the rollback it protects."""
+    m, vault, snap = _vault_with_snapshot(tmp_path)
+    (vault / "wiki" / "entities" / "added-by-migration.md").write_text("---\nid: new\n---\n",
+                                                                       encoding="utf-8")
+    page = vault / "wiki" / "entities" / "p0.md"
+    page.write_text("---\nid: e0\n---\nMUTATED\n", encoding="utf-8")
+    added = {Path("wiki/entities/added-by-migration.md")}
+    modified = {Path("wiki/entities/p0.md")}
+    n = m.restore(vault, snap, added=added, modified=modified)
+    assert n >= 1
+    assert not (vault / "wiki" / "entities" / "added-by-migration.md").exists()
+    assert (vault / ".okengine" / "rolled-back" / snap.name
+            / "wiki" / "entities" / "added-by-migration.md").is_file()
+    assert "MUTATED" not in page.read_text(encoding="utf-8")
+
+
+def test_a_pack_runner_does_not_adopt_another_transactions_snapshot(tmp_path):
+    """install-domain's manifest carries the same pack/to keys. Adopting it is what deleted a
+    snapshot another caller still held."""
+    m, vault, _ = _vault_with_snapshot(tmp_path)
+    foreign = m.snapshot(vault, "20260101T000001", {
+        "operation": "install-domain", "pack": "okpack-x", "from": "0.1.0", "to": "0.2.0"})
+    found = m._unfinished_pack_snapshot(vault, "okpack-x", "0.2.0")
+    assert found is not None and found.name != foreign.name, found
+
+
+def test_a_pack_runner_still_recovers_its_own_unfinished_snapshot(tmp_path):
+    m, vault, snap = _vault_with_snapshot(tmp_path)
+    found = m._unfinished_pack_snapshot(vault, "okpack-x", "0.2.0")
+    assert found == snap
+
+
+def test_a_confirmed_snapshot_is_never_recovered(tmp_path):
+    m, vault, snap = _vault_with_snapshot(tmp_path)
+    m.confirm_snapshot_good(snap, "2026-01-01T00:00:00Z")
+    assert m._unfinished_pack_snapshot(vault, "okpack-x", "0.2.0") is None
+
+
+def test_a_validated_engine_upgrade_confirms_its_snapshot_so_retention_prunes_it(tmp_path, monkeypatch):
+    """okengine#914: the engine-upgrade path pruned only confirmed snapshots but never confirmed its
+    own, so every roll left another full vault copy (129G on one deployment). A snapshot whose
+    upgrade passed the roll-forward gate is confirmed, and count retention then applies."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    monkeypatch.setattr(m, "VALIDATOR", lambda p: (True, "stub: ok"))
+    older = m.snapshot(pack, "20260101T000000", {"to": "v0.4.0"})
+    m.confirm_snapshot_good(older, "2026-01-01T01:00:00Z")          # a previous, confirmed roll
+    md = _transform_migration(tmp_path / "migs", id_="t1", frm="v0.4.0", to="v0.5.0")
+
+    assert m.main([str(pack), "--apply", "--migrations-dir", str(md), "--keep-snapshots", "1"]) == 0
+
+    snaps = sorted((pack / m.SNAPSHOTS_REL).iterdir())
+    assert not older.exists(), "the previous roll's confirmed snapshot is pruned at keep=1"
+    assert len(snaps) == 1
+    manifest = json.loads((snaps[0] / "manifest.json").read_text())
+    assert manifest.get("confirmed_good_at"), "the validated upgrade's snapshot is confirmed"
+
+
+def test_an_unvalidated_engine_upgrade_leaves_its_snapshot_unconfirmed(tmp_path):
+    """--no-validate proves nothing about the upgrade, so its snapshot stays a recovery point."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    md = _transform_migration(tmp_path / "migs", id_="t1", frm="v0.4.0", to="v0.5.0")
+
+    assert m.main([str(pack), "--apply", "--no-validate", "--migrations-dir", str(md)]) == 0
+
+    (snap,) = (pack / m.SNAPSHOTS_REL).iterdir()
+    assert "confirmed_good_at" not in json.loads((snap / "manifest.json").read_text())
+
+
+# --- okengine#991: crash consistency, rollback scope, fail-closed gate, exit contract ----------
+
+def _counting_migration(dir_, *, id_, frm, to):
+    """A NON-idempotent migration: every apply appends a line, so a replay is observable."""
+    dir_.mkdir(parents=True, exist_ok=True)
+    (dir_ / f"m_{id_}.py").write_text(
+        f'ID = "{id_}"\nFROM = "{frm}"\nTO = "{to}"\nDESCRIPTION = "append"\n'
+        f'def apply(pack, dry_run):\n'
+        f'    if not dry_run:\n'
+        f'        with (pack / "applied.log").open("a") as f: f.write("{id_}\\n")\n'
+        f'    return ["append {id_}"]\n',
+        encoding="utf-8")
+    return dir_
+
+
+def test_a_torn_migration_state_file_refuses_to_replay_applied_migrations(tmp_path, monkeypatch):
+    """A hard kill mid-write used to leave truncated JSON that read_state parsed as {} ("nothing
+    applied"), so the next run replayed every migration in (pin, target] on a live vault. A state
+    file that cannot be read is unknown, never empty: the upgrade must stop without running
+    anything."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    md = _counting_migration(tmp_path / "migs", id_="m1", frm="v0.4.0", to="v0.5.0")
+    (pack / "applied.log").write_text("m1\n")              # m1 already ran once
+    state = pack / m.STATE_REL
+    state.parent.mkdir(parents=True)
+    state.write_text('{"engine_version": "v0.5.0", "appl')  # torn mid-write
+    monkeypatch.setattr(m, "VALIDATOR", lambda p: (True, "stub: ok"))
+
+    rc = m.main([str(pack), "--apply", "--migrations-dir", str(md)])
+
+    assert rc == 1, "a corrupt migration state must fail the upgrade, not read as 'nothing applied'"
+    assert (pack / "applied.log").read_text() == "m1\n", "the applied migration was replayed"
+    assert state.read_text() == '{"engine_version": "v0.5.0", "appl'  # evidence left for the operator
+
+
+@pytest.mark.parametrize("body", ["{broken", "[]", '"text"'])
+def test_read_state_raises_on_unreadable_state_instead_of_returning_empty(tmp_path, body):
+    m = _mod()
+    state = tmp_path / m.STATE_REL
+    state.parent.mkdir(parents=True)
+    state.write_text(body)
+    with pytest.raises(m.MigrationStateError, match="migrations-state.json"):
+        m.read_state(tmp_path)
+
+
+def test_record_state_never_leaves_a_partial_file_when_interrupted(tmp_path, monkeypatch):
+    """A kill between writing and committing the new state must leave the previous state intact."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    m.record_state(pack, "v0.5.0", ["m1"], "t0")
+    before = (pack / m.STATE_REL).read_text()
+
+    def killed(*_a, **_k):
+        raise KeyboardInterrupt("killed before commit")
+    monkeypatch.setattr(m.os, "replace", killed)
+    with pytest.raises(KeyboardInterrupt):
+        m.record_state(pack, "v0.6.0", ["m2"], "t1")
+
+    assert (pack / m.STATE_REL).read_text() == before
+    assert m.read_state(pack)["applied"] == ["m1"]
+
+
+def test_write_pin_never_leaves_a_partial_file_when_interrupted(tmp_path, monkeypatch):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0", hermes="v2026.6.19")
+    before = (pack / "engine.version").read_text()
+
+    def killed(*_a, **_k):
+        raise KeyboardInterrupt("killed before commit")
+    monkeypatch.setattr(m.os, "replace", killed)
+    with pytest.raises(KeyboardInterrupt):
+        m.write_pin(pack, "v0.5.0", "v2026.7.1")
+
+    assert (pack / "engine.version").read_text() == before
+    assert m.read_pin(pack) == ("v0.4.0", "v2026.6.19")
+
+
+def test_rollback_restores_the_runtime_env_a_migration_rewrote(tmp_path, monkeypatch):
+    """The DeepSeek migration rewrites .hermes-data/.env, but the snapshot only carried
+    .hermes-data/config.yaml, so a rolled-back upgrade kept the new model in .env while the pin
+    and state reverted -- the operator was told the pack was unchanged."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    env = pack / ".hermes-data" / ".env"
+    env.parent.mkdir()
+    env.write_text("OKENGINE_LLM_MODEL=deepseek-chat\n")
+    md = _transform_migration(tmp_path / "migs", id_="t1", frm="v0.4.0", to="v0.5.0",
+                              target=".hermes-data/.env")
+    monkeypatch.setattr(m, "VALIDATOR", lambda p: (False, "stub: broken"))
+
+    assert m.main([str(pack), "--apply", "--migrations-dir", str(md)]) == 1
+
+    assert env.read_text() == "OKENGINE_LLM_MODEL=deepseek-chat\n"
+    assert m.read_pin(pack)[0] == "v0.4.0"
+
+
+def test_every_runtime_file_a_shipped_migration_targets_is_in_the_rollback_scope(tmp_path, monkeypatch):
+    """Detector for the class: a migration may only rewrite files a rollback can restore. Every
+    config the shipped model migration rewrites that sits under an excluded runtime tree must be
+    carried by the snapshot explicitly."""
+    m = _mod()
+    monkeypatch.syspath_prepend(str(REPO / "scripts" / "cron"))
+    import deepseek_policy
+    pack = _pack(tmp_path, "v0.4.0")
+    hidden = [rel for rel in deepseek_policy.ACTIVE_CONFIGS
+              if rel.parts[0] in m.SNAPSHOT_EXCLUDES]
+    assert hidden, "fixture premise: some migration target sits under an excluded runtime tree"
+    for rel in hidden:
+        (pack / rel).parent.mkdir(parents=True, exist_ok=True)
+        (pack / rel).write_text(f"original {rel}\n")
+
+    tree = m.snapshot(pack, "scope") / "tree"
+
+    missing = [str(rel) for rel in hidden if not (tree / rel).is_file()]
+    assert not missing, f"migration targets a rollback cannot restore: {missing}"
+
+
+def test_a_crashing_validator_fails_the_roll_forward_gate_closed(tmp_path, monkeypatch):
+    """A validator that raises proves nothing about the migrated pack. It used to return
+    (True, 'validation skipped'), so the upgrade exited 0 and confirmed its snapshot good."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    md = _transform_migration(tmp_path / "migs", id_="t1", frm="v0.4.0", to="v0.5.0")
+    monkeypatch.setattr(m, "RECOMPOSE_SCHEMA", lambda _pack: None)
+    real_spec = importlib.util.spec_from_file_location
+
+    def spec(name, *args, **kwargs):
+        if name == "framework_validate":
+            raise ImportError("validator refactor broke its import")
+        return real_spec(name, *args, **kwargs)
+    monkeypatch.setattr(m.importlib.util, "spec_from_file_location", spec)
+
+    rc = m.main([str(pack), "--apply", "--migrations-dir", str(md)])
+
+    assert rc == 1
+    assert not (pack / "data.txt").exists(), "the unvalidated migration was not rolled back"
+    assert m.read_pin(pack)[0] == "v0.4.0"
+
+
+def test_exit_codes_separate_a_failed_reconcile_from_nothing_to_do(tmp_path, monkeypatch):
+    """deploy.sh step [0/6] continues on 2 (nothing attempted: ahead/unknown pin) and stops on any
+    other failure. A migration that cannot even load is a failed reconcile, not 'nothing to do'."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    md = tmp_path / "migs"
+    md.mkdir()
+    (md / "m_bad.py").write_text("raise ValueError('boom')\n", encoding="utf-8")
+    assert m.main([str(pack), "--apply", "--migrations-dir", str(md)]) == 1
+
+    ahead = tmp_path / "ahead"
+    ahead.mkdir()
+    (ahead / "engine.version").write_text("version: v999.0.0\n")
+    assert m.main([str(ahead), "--apply", "--migrations-dir", str(tmp_path / "none")]) == 2
+
+
+@pytest.mark.parametrize("pin", ["version: v999.0.0\n", "version: not-a-version\n"])
+def test_an_unreadable_state_outranks_an_ahead_or_unparseable_pin(tmp_path, pin):
+    """Precedence of the exit contract: an unreadable migration state is exit 1 (deploy aborts)
+    even when the pin alone would be exit 2 (nothing attempted, deploy continues)."""
+    m = _mod()
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "engine.version").write_text(pin)
+    state = pack / m.STATE_REL
+    state.parent.mkdir(parents=True)
+    state.write_text("{torn")
+    assert m.main([str(pack), "--apply", "--migrations-dir", str(tmp_path / "none")]) == 1
+
+
+def test_atomic_rewrite_keeps_an_owner_only_file_owner_only(tmp_path):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    m.record_state(pack, "v0.5.0", ["m1"], "t0")
+    state = pack / m.STATE_REL
+    state.chmod(0o600)
+    (pack / "engine.version").chmod(0o600)
+
+    m.record_state(pack, "v0.6.0", ["m2"], "t1")
+    m.write_pin(pack, "v0.6.0", None)
+
+    assert state.stat().st_mode & 0o777 == 0o600
+    assert (pack / "engine.version").stat().st_mode & 0o777 == 0o600
+
+
+# --- okengine#1032 [25]: a prerelease orders before its final ----------------------------------
+
+def test_migration_added_between_rc_and_final_is_selected(tmp_path):
+    """A canary pinned at v0.15.12-rc1 upgrading to v0.15.12 must run the TO=v0.15.12 migration.
+    The 3-tuple comparison made (rc1, final] an empty range and skipped it."""
+    m, meta = _mod(), _meta()
+    md = _migration(tmp_path / "migs", id_="late", frm="v0.15.12-rc1", to="v0.15.12")
+    _migration(md, id_="early", frm="v0.15.11", to="v0.15.12-rc1")
+    migs = m.load_migrations(md)
+    assert [x.id for x in m.applicable(migs, "v0.15.12-rc1", "v0.15.12", meta)] == ["late"]
+    assert [x.id for x in m.applicable(migs, "v0.15.11", "v0.15.12", meta)] == ["early", "late"]
+    assert [x.id for x in m.applicable(migs, "v0.15.11", "v0.15.12-rc1", meta)] == ["early"]
+
+
+def test_plan_lists_the_rc_to_final_migration(tmp_path):
+    m, meta = _mod(), _meta()
+    md = _migration(tmp_path / "migs", id_="late", frm="v0.15.12-rc1", to="v0.15.12")
+    pl = m.plan_upgrade(_pack(tmp_path, "v0.15.12-rc1"), "v0.15.12", None,
+                        m.load_migrations(md), meta)
+    assert pl.status == "compatible"
+    assert [x.id for x in pl.migrations] == ["late"]
+
+
+def test_an_rc_engine_does_not_rewrite_a_final_pin_down(tmp_path):
+    m, meta = _mod(), _meta()
+    pl = m.plan_upgrade(_pack(tmp_path, "v0.15.12"), "v0.15.12-rc1", None, [], meta)
+    assert pl.status == "ahead"
+
+
+@pytest.mark.parametrize("lower,higher", [
+    ("v0.15.12-dev1", "v0.15.12-a1"),
+    ("v0.15.12a1", "v0.15.12-alpha.2"),
+    ("v0.15.12-alpha.2", "v0.15.12b1"),
+    ("v0.15.12-beta.3", "v0.15.12-rc1"),
+    ("v0.15.12-rc1", "v0.15.12rc.2"),
+    ("v0.15.12-rc2", "v0.15.12-rc10"),
+    ("v0.15.12-c1", "v0.15.12"),
+    ("v0.15.12-RC9", "engine-v0.15.12"),
+    ("v0.15.12", "v0.15.13-dev"),
+    ("v0.15.9", "v0.15.10-rc1"),
+])
+def test_release_key_orders_prereleases_before_their_final(lower, higher):
+    m = _mod()
+    assert m.release_key(lower) < m.release_key(higher)
+
+
+@pytest.mark.parametrize("spelling", ["v0.15.12", "0.15.12", "engine-v0.15.12", "v0.15.12-hotfix",
+                                      "v0.15.12abc", "v0.15.12+build.5", "v0.15.12-rcx"])
+def test_a_non_prerelease_suffix_keeps_the_final_meaning(spelling):
+    m = _mod()
+    assert m.release_key(spelling) == (0, 15, 12, 9, 0)
+
+
+def test_release_key_of_an_unparseable_version_is_none():
+    m = _mod()
+    assert m.release_key(None) is None and m.release_key("") is None and m.release_key("main") is None
+    assert m.release_key("v0.15.12-rc") == (0, 15, 12, 3, 0)
+
+
+@pytest.mark.parametrize("same", [
+    ("v1.2.3a4", "v1.2.3-alpha.4"),
+    ("v1.2.3b4", "v1.2.3-beta4"),
+    ("v1.2.3c4", "v1.2.3-rc4"),
+    ("v1.2.3-pre4", "v1.2.3rc.4"),
+])
+def test_prerelease_spellings_of_one_stage_compare_equal(same):
+    m = _mod()
+    assert m.release_key(same[0]) == m.release_key(same[1])
+
+
+def test_prerelease_stages_follow_pep_440_order():
+    m = _mod()
+    chain = ["v1.2.3.dev9", "v1.2.3a9", "v1.2.3b9", "v1.2.3rc9", "v1.2.3"]
+    keys = [m.release_key(v) for v in chain]
+    assert keys == sorted(keys) and len(set(keys)) == len(keys)
+    assert [k[3] for k in keys] == [0, 1, 2, 3, 9]
+
+
+def test_the_same_release_spelled_differently_is_not_ahead(tmp_path):
+    """A pin and a target that differ only in spelling are one release, never `ahead`."""
+    m, meta = _mod(), _meta()
+    pl = m.plan_upgrade(_pack(tmp_path, "0.15.12"), "v0.15.12", None, [], meta)
+    assert pl.status == "compatible"
+
+
+def test_an_unparseable_pin_selects_every_migration_up_to_the_target(tmp_path):
+    m, meta = _mod(), _meta()
+    md = _migration(tmp_path / "migs", id_="first", frm="v0.0.0", to="v0.0.1")
+    _migration(md, id_="second", frm="v0.0.1", to="v0.1.0")
+    migs = m.load_migrations(md)
+    assert [x.id for x in m.applicable(migs, "main", "v0.1.0", meta)] == ["first", "second"]
+    assert m.applicable(migs, "v0.0.0", "main", meta) == []
+
+
+def test_merged_migrations_list_an_rc_before_its_final(tmp_path):
+    """okengine#1042 [27]: load_all_migrations sorted on the lossy 3-tuple, so an rc migration and
+    its final tied and fell back to id order ("a-final" before "z-rc")."""
+    m = _mod()
+    engine = _migration(tmp_path / "engine-migs", id_="a-final", frm="v0.15.12-rc1", to="v0.15.12")
+    _migration(engine, id_="z-rc", frm="v0.15.11", to="v0.15.12-rc1")
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    assert [x.id for x in m.load_all_migrations(engine, pack)] == ["z-rc", "a-final"]
+
+
+# --- okengine#1042 [28]: a pin-bump-only validate FAIL is not a migration failure ---------------
+
+def test_a_pin_bump_only_validate_fail_exits_three_and_names_validate(tmp_path, monkeypatch, capsys):
+    """No migration ran, so a roll-forward validate FAIL predates the upgrade or comes from the new
+    engine's checks. It used to exit 1, which deploy.sh reported as 'a migration failed'."""
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    md = tmp_path / "no-migs"
+    md.mkdir()
+    monkeypatch.setattr(m, "RECOMPOSE_SCHEMA", lambda _pack: None)
+    monkeypatch.setattr(m, "VALIDATOR", lambda p: (False, "framework validate -> exit 1"))
+    rc = m.main([str(pack), "--apply", "--migrations-dir", str(md)])
+    out = capsys.readouterr().out
+    assert rc == 3, out
+    assert "no migration ran" in out and "framework validate" in out
+    assert m.read_pin(pack)[0] == "v0.4.0", "the pin bump was not rolled back"
+
+
+def test_a_pin_bump_only_upgrade_with_a_passing_validate_still_exits_zero(tmp_path, monkeypatch):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    md = tmp_path / "no-migs"
+    md.mkdir()
+    monkeypatch.setattr(m, "RECOMPOSE_SCHEMA", lambda _pack: None)
+    monkeypatch.setattr(m, "VALIDATOR", lambda p: (True, "ok"))
+    assert m.main([str(pack), "--apply", "--migrations-dir", str(md)]) == 0
+    assert m.read_pin(pack)[0] != "v0.4.0"
+
+
+# --- okengine#1044 [20]: `deploy.sh --skip-validate` must not leak a vault copy per roll ---------
+# deploy.sh --skip-validate reaches `framework upgrade --apply --no-validate` (#1042 [28]). That
+# path snapshots the whole pack and prunes, but never confirms, so the snapshot is never
+# count-pruned: one full wiki/ + data/ copy per engine roll, the okengine#914 leak. A pin-bump-only
+# upgrade transformed nothing, so its snapshot guards nothing a validate could have caught: it is
+# confirmed and pruned. One that ran migrations stays an unconfirmed recovery point (above).
+
+import contextlib  # noqa: E402
+import io  # noqa: E402
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+def _upgrade_cli(pack, *flags):
+    """`framework.py upgrade` exactly as deploy.sh runs it: the real CLI, from the pack dir, with
+    no test PYTHONPATH."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    return subprocess.run([sys.executable, str(REPO / "scripts" / "framework.py"), "upgrade",
+                           str(pack), "--apply", *flags],
+                          cwd=pack, capture_output=True, text=True, timeout=300, env=env)
+
+
+def test_a_pin_bump_only_upgrade_without_validate_leaves_no_unprunable_snapshot(tmp_path):
+    pack = _pack(tmp_path, "v0.4.0")
+    (pack / "wiki").mkdir()
+    none = tmp_path / "no-migrations"      # isolates the run from the engine's real registry
+    none.mkdir()
+    (pack / "wiki" / "page.md").write_text("x\n", encoding="utf-8")
+    snapshots = pack / ".okengine" / "snapshots"
+
+    for _ in range(3):                       # three rolls at --keep-snapshots 1
+        (pack / "engine.version").write_text("version: v0.4.0\n", encoding="utf-8")
+        proc = _upgrade_cli(pack, "--no-validate", "--keep-snapshots", "1",
+                            "--migrations-dir", str(none))
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "pin bump only" in proc.stdout
+
+    kept = sorted(snapshots.iterdir())
+    assert len(kept) <= 1, f"unprunable snapshots accumulated: {[p.name for p in kept]}"
+    for snap in kept:
+        assert json.loads((snap / "manifest.json").read_text()).get("confirmed_good_at")
+
+
+def test_an_unvalidated_upgrade_that_ran_migrations_says_how_to_release_its_snapshot(tmp_path):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    md = _transform_migration(tmp_path / "migs", id_="t1", frm="v0.4.0", to="v0.5.0")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert m.main([str(pack), "--apply", "--no-validate", "--migrations-dir", str(md)]) == 0
+    (snap,) = (pack / m.SNAPSHOTS_REL).iterdir()
+    assert f"--confirm-snapshot-good {snap.name}" in out.getvalue()
+
+
+def test_no_snapshot_and_no_validate_with_migrations_prints_no_snapshot_advice(tmp_path):
+    m = _mod()
+    pack = _pack(tmp_path, "v0.4.0")
+    md = _transform_migration(tmp_path / "migs", id_="t1", frm="v0.4.0", to="v0.5.0")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert m.main([str(pack), "--apply", "--no-validate", "--no-snapshot",
+                       "--migrations-dir", str(md)]) == 0
+    assert "--confirm-snapshot-good" not in out.getvalue()
+    assert not (pack / m.SNAPSHOTS_REL).exists()
+
+
+# --- okengine#1044 [4]: a shipped migration's TO is pinned to the release that shipped it -------
+
+# Every engine migration that shipped in a tagged release: ID -> (TO, the release that shipped it).
+# A RELEASE commit registers each migration it ships here; the gate below fails until it does.
+# Never remove or edit an entry: packs may not have applied the migration yet (migrations/README).
+SHIPPED_MIGRATIONS = {
+    "okengine-deepseek-v4-1-flash": ("v0.14.0", "v0.14.0"),
+}
+_FILENAME_VERSIONS = re.compile(
+    r"^m_v(\d+)_(\d+)_(\d+)(?:[a-z]+\d*)?_v(\d+)_(\d+)_(\d+)(?:[a-z]+\d*)?_[a-z0-9_]+\.py$")
+
+
+def _changelog_releases() -> list:
+    text = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
+    return re.findall(r"^## (v\d+\.\d+\.\d+\S*)\s*$", text, re.M)
+
+
+def migration_version_errors(migrations, release, releases, shipped) -> list:
+    """Why a migration in `migrations` would be skipped by, or mis-ordered for, deployed packs.
+
+    `release` is engine_release; `releases` every released version (CHANGELOG headings); `shipped`
+    the SHIPPED_MIGRATIONS ledger. A deployed pack's pin is at most `release`, and applicable()
+    selects pin < TO <= target, so a migration not yet shipped must declare TO > `release` or no
+    pack already on `release` ever runs it. A shipped one must keep the TO it shipped with, and
+    that TO must lie in (the release before the one that shipped it, that release]."""
+    key = _mod().release_key
+    errors = []
+    present = {m.id for m in migrations}
+    errors += [f"{mid}: shipped in {shipped[mid][1]} but its file is gone (never delete a shipped "
+               "migration)" for mid in sorted(set(shipped) - present)]
+    for mig in migrations:
+        frm, to = key(mig.from_version), key(mig.to_version)
+        name = Path(mig.source_path).name
+        encoded = _FILENAME_VERSIONS.match(name)
+        if not encoded:
+            errors.append(f"{mig.id}: file {name} is not named m_<from>_<to>_<slug>.py")
+        elif (tuple(map(int, encoded.groups()[:3])), tuple(map(int, encoded.groups()[3:]))) != (
+                frm[:3], to[:3]):
+            errors.append(f"{mig.id}: file {name} says {encoded.groups()} but FROM/TO declare "
+                          f"{mig.from_version} -> {mig.to_version}")
+        if not frm < to:
+            errors.append(f"{mig.id}: FROM {mig.from_version} is not below TO {mig.to_version}")
+        if mig.id not in shipped:
+            if not to > key(release):
+                errors.append(
+                    f"{mig.id}: TO {mig.to_version} is not above engine_release {release}, so a "
+                    "pack already pinned at it never runs this migration. Declare the release "
+                    "that will ship it, or, in the release commit that ships it, register it in "
+                    "SHIPPED_MIGRATIONS")
+            continue
+        declared_to, shipped_in = shipped[mig.id]
+        earlier = [key(r) for r in releases if key(r) < key(shipped_in)]
+        if mig.to_version != declared_to:
+            errors.append(f"{mig.id}: TO changed from {declared_to} (shipped) to {mig.to_version}")
+        if key(shipped_in) > key(release):
+            errors.append(f"{mig.id}: registered as shipped in {shipped_in}, after engine_release "
+                          f"{release}")
+        if not (max(earlier, default=()) < key(declared_to) <= key(shipped_in)):
+            errors.append(f"{mig.id}: TO {declared_to} is outside (previous release, {shipped_in}]")
+    return errors
+
+
+def test_every_shipped_migration_declares_the_release_that_ships_it():
+    m, meta = _mod(), _meta()
+    migrations = m.load_migrations(m.DEFAULT_MIGRATIONS_DIR)
+    assert migrations, "the engine migrations directory loaded nothing"
+    assert migration_version_errors(migrations, meta.engine_release(), _changelog_releases(),
+                                    SHIPPED_MIGRATIONS) == []
+
+
+def test_the_changelog_lists_engine_release():
+    assert _meta().engine_release() in _changelog_releases()
+
+
+def _fake(mid, frm, to, name=None):
+    name = name or "m_{}_{}_slug.py".format(*(v.replace(".", "_").replace("-", "") for v in (frm, to)))
+    return SimpleNamespace(id=mid, from_version=frm, to_version=to, source_path=f"/x/{name}")
+
+
+_RELEASES = ["v0.15.13", "v0.15.12", "v0.14.0", "v0.13.8"]
+
+
+@pytest.mark.parametrize("migration,shipped,expected", [
+    # copied a template's TO: packs already at v0.15.13 would never run it
+    (_fake("new", "v0.15.12", "v0.15.13"), {}, "is not above engine_release v0.15.13"),
+    (_fake("new", "v0.15.11", "v0.15.12"), {}, "is not above engine_release v0.15.13"),
+    # a shipped migration whose TO was edited afterwards
+    (_fake("old", "v0.13.8", "v0.14.1", "m_v0_13_8_v0_14_0_slug.py"),
+     {"old": ("v0.14.0", "v0.14.0")}, "TO changed from v0.14.0"),
+    # registered as shipped in a release whose predecessor is already at or above its TO
+    (_fake("old", "v0.13.0", "v0.13.8"), {"old": ("v0.13.8", "v0.14.0")}, "outside (previous"),
+    (_fake("old", "v0.13.8", "v0.14.0"), {"old": ("v0.14.0", "v0.15.14")}, "after engine_release"),
+    (_fake("new", "v0.15.13", "v0.15.14", "m_v0_15_13_v0_15_15_slug.py"), {}, "but FROM/TO"),
+    (_fake("new", "v0.15.13", "v0.15.14", "migration.py"), {}, "is not named"),
+    (_fake("new", "v0.15.14", "v0.15.14"), {}, "is not below TO"),
+])
+def test_a_mis_versioned_migration_is_reported(migration, shipped, expected):
+    errors = migration_version_errors([migration], "v0.15.13", _RELEASES, shipped)
+    assert any(expected in e for e in errors), errors
+
+
+def test_a_deleted_shipped_migration_is_reported():
+    errors = migration_version_errors([], "v0.15.13", _RELEASES, {"gone": ("v0.14.0", "v0.14.0")})
+    assert errors == ["gone: shipped in v0.14.0 but its file is gone (never delete a shipped "
+                      "migration)"]
+
+
+@pytest.mark.parametrize("migration,shipped", [
+    (_fake("next", "v0.15.13", "v0.15.14"), {}),                      # unreleased, next patch
+    (_fake("next", "v0.15.13", "v0.16.0-rc1"), {}),                  # runs on the rc canary too
+    (_fake("old", "v0.13.8", "v0.14.0"), {"old": ("v0.14.0", "v0.14.0")}),
+    (_fake("rc", "v0.15.12", "v0.15.13-rc1"), {"rc": ("v0.15.13-rc1", "v0.15.13")}),
+])
+def test_a_correctly_versioned_migration_passes(migration, shipped):
+    assert migration_version_errors([migration], "v0.15.13", _RELEASES, shipped) == []

@@ -209,7 +209,7 @@ def test_extension_requirement_and_enabled_resolution_branches(tmp_path, monkeyp
         discover=lambda _p: ([{"id": "x"}], []),
         load_enabled_state=lambda _p: ({"x": {}}, []),
         resolve_enabled=lambda enabled, discovered: ({"x": {}}, []),
-        _load_disabled=lambda _p: set(),
+        stale_disabled_errors=lambda _p, _d: [],
     )
     monkeypatch.setattr(v, "_discovery_mod", lambda: good_disc)
     r = v.Report()
@@ -220,7 +220,8 @@ def test_extension_requirement_and_enabled_resolution_branches(tmp_path, monkeyp
         discover=lambda _p: ([{"id": "okengine.current"}], []),
         load_enabled_state=lambda _p: ({}, []),
         resolve_enabled=lambda enabled, discovered: ({}, []),
-        _load_disabled=lambda _p: {"okengine.renamed"},
+        stale_disabled_errors=lambda _p, _d: [
+            "FAIL: disabled extension 'okengine.renamed' is not discovered in any tier"],
     )
     monkeypatch.setattr(v, "_discovery_mod", lambda: stale_disabled_disc)
     r = v.Report()
@@ -368,6 +369,11 @@ def test_env_dotenv_vault_and_runtime_shape_branches(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_text("# c\nbad\nA='one'\nB=\"two\"\n")
     assert v._read_dotenv(tmp_path) == {"A": "one", "B": "two"}
+    # okengine#993 R1: compose resolves `${X}` from the process, then the whole .env.
+    env.write_text("E=${PROC_ONLY_993}\nF=${LATER}\nLATER=1\n")
+    monkeypatch.setenv("PROC_ONLY_993", "0")
+    assert v._read_dotenv(tmp_path) == {"E": "0", "F": "1", "LATER": "1"}
+    env.write_text("# c\nbad\nA='one'\nB=\"two\"\n")
     monkeypatch.setattr(v.subprocess, "run", lambda *_a, **_k: SimpleNamespace(returncode=0))
     r = v.Report()
     v.check_env(tmp_path, r)
@@ -721,7 +727,7 @@ def test_metadata_early_returns_and_enabled_owner_success(tmp_path, monkeypatch)
     state.write_text("enabled: {}\n")
     monkeypatch.setattr(v, "_discovery_mod", lambda: SimpleNamespace(
         discover=lambda _p: ({}, []), load_enabled_state=lambda _p: ({}, []),
-        resolve_enabled=lambda *_a: ({}, [])))
+        resolve_enabled=lambda *_a: ({}, []), stale_disabled_errors=lambda *_a: []))
     r = v.Report()
     v.check_enabled_extensions_resolve(tmp_path, r)
     assert r.rows == []
@@ -972,3 +978,182 @@ def test_unreadable_override_file_warns_rather_than_passing(tmp_path):
     r = v.Report()
     rt.check_trust_exposure_overrides(_with_override(tmp_path, "trust_exposure: [unclosed\n"), r)
     assert "unreadable" in _messages(r)
+
+
+def test_an_unloadable_writer_name_rule_reports_undetectable_not_clean(monkeypatch):
+    """A rule that cannot be loaded must never read as a passing lane (okengine#840).
+
+    The write-server length check borrows its limit from cron_pack_split by path. If that load
+    fails the honest answer is "undetectable" -- returning no errors would certify a lane the
+    gate never actually inspected.
+    """
+    import importlib.util as _iu
+    spec = _iu.spec_from_file_location(
+        "okengine_fvc_undetectable", REPO / "scripts" / "framework_validate_crons.py")
+    fvc = _iu.module_from_spec(spec)
+    spec.loader.exec_module(fvc)
+
+    # an explicitly named writer bypasses the (bounded) derivation, so it can still be over
+    over = [{"name": "x", "enabled_toolsets": ["okengine-write-" + "x" * 60]}]
+    assert fvc._writer_name_errors(over), "fixture must be over the limit when the rule loads"
+
+    def boom(*a, **k):
+        raise ImportError("cron_pack_split is unavailable")
+    monkeypatch.setattr(_iu, "spec_from_file_location", boom)
+
+    errors = fvc._writer_name_errors(over)
+    assert len(errors) == 1, errors
+    assert "UNDETECTABLE" in errors[0], errors[0]
+    assert errors[0] != [], "an unloadable rule must not report the lane clean"
+
+
+def test_an_unknown_type_role_fails_and_the_actor_role_does_not(tmp_path):
+    """okengine#1020, okengine#1032 [24]: a misspelled role silently leaves a type out of every
+    actor guard, and a WARN let it ship, so it FAILs."""
+    v = _load("framework_validate_branch_role")
+    (tmp_path / "schema.yaml").write_text(
+        "okf: {required: [type]}\ntypes:\n"
+        "  intrusion-set: {required: [type], role: Actor}\n"
+        "  threat-actor: {required: [type], role: actors}\n"
+        "  malware: {required: [type]}\n  broken: scalar\n")
+    r = v.Report()
+    v.check_schema(tmp_path, r)
+    rows = [row for row in r.rows if row[1] == "schema.types.role"]
+    assert len(rows) == 1 and rows[0][0] == "FAIL", rows
+    assert "threat-actor: 'actors'" in rows[0][2] and "intrusion-set" not in rows[0][2]
+    (tmp_path / "schema.yaml").write_text(
+        "okf: {required: [type]}\ntypes:\n  intrusion-set: {required: [type], role: actor}\n")
+    r = v.Report()
+    v.check_schema(tmp_path, r)
+    assert not [row for row in r.rows if row[1] == "schema.types.role"]
+
+
+def _fragment_ext(pack: Path, ext_id: str, role) -> None:
+    ext = pack / "extensions" / ext_id
+    (ext / "schema").mkdir(parents=True)
+    (ext / "extension.yaml").write_text(
+        f"id: {ext_id}\nname: {ext_id}\nversion: 0.1.0\nschema: [schema/f.schema.yaml]\n")
+    spec = {"required": ["type"]} | ({"role": role} if role else {})
+    import yaml as _yaml
+    (ext / "schema" / "f.schema.yaml").write_text(
+        _yaml.safe_dump({"owns": {"types": {"intrusion-set": spec}}}))
+
+
+def test_an_unknown_role_on_an_extension_owned_type_fails(tmp_path):
+    """okengine#1032 [24]: compose copies a fragment's owned type verbatim, so its role reaches the
+    same actor resolver and must meet the same vocabulary."""
+    v = _load("framework_validate_fragment_role")
+    (tmp_path / "schema.yaml").write_text("okf: {required: [type]}\ntypes: {}\n")
+    _fragment_ext(tmp_path, "acme.bad", "threat-actor")
+    _fragment_ext(tmp_path, "acme.good", "actor")
+    r = v.Report()
+    v.check_enabled_extensions_resolve(tmp_path, r)
+    rows = [row for row in r.rows if "owns.types.role" in row[1]]
+    assert [(row[0], row[1].split()[0]) for row in rows] == [("FAIL", "ext:acme.bad")], rows
+    assert "intrusion-set: 'threat-actor'" in rows[0][2]
+
+
+def test_fragment_roles_skip_shapes_that_declare_no_types():
+    from scripts import framework_validate_pack as fvp
+    frags = {Path("d/a.yaml"): None, Path("d/b.yaml"): {"owns": "x"}, Path("d/c.yaml"): {"owns": {}}}
+    r = fvp.Report()
+    fvp.check_fragment_type_roles(
+        [None, {"manifest": None}, {"id": "e", "dir": "d", "manifest": {"schema": None}},
+         {"id": "e", "dir": "d", "manifest": {"schema": ["a.yaml", "b.yaml", "c.yaml"]}}],
+        frags.get, r)
+    assert r.rows == []
+    # a malformed record does not end the scan: a bad fragment after it still FAILs
+    frags[Path("d/bad.yaml")] = {"owns": {"types": {"t": {"role": "actors"}}}}
+    fvp.check_fragment_type_roles(
+        [{"manifest": None}, {"id": "e", "dir": "d", "manifest": {"schema": ["bad.yaml"]}}],
+        frags.get, r)
+    assert [row[0] for row in r.rows] == ["FAIL"], r.rows
+
+
+def _owned_pack(tmp_path: Path, name: str | None, owners: dict, guests=()) -> Path:
+    import json as _json
+    import yaml as _yaml
+    (tmp_path / "pack.yaml").write_text(f"name: {name}\n" if name else "version: 1.0.0\n")
+    for guest in guests:
+        d = tmp_path / ".okengine" / "installed-domains"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{guest}.json").write_text(_json.dumps({"pack": guest, "cron_jobs": []}))
+    types = {t: {"required": ["type"]} | ({"owner": o} if o else {}) for t, o in owners.items()}
+    (tmp_path / "schema.yaml").write_text(
+        _yaml.safe_dump({"okf": {"required": ["type"]}, "types": types}))
+    return tmp_path
+
+
+@pytest.mark.parametrize("owners, guests, failing", [
+    # a pack folded into this one (owner names it, but no installed-domains manifest exists)
+    # ("aaa", owner-less, sorts first: a type with no owner must not end the scan)
+    ({"aaa": None, "actor": "okpack-mine", "intrusion-set": "okpack-folded",
+      "software": "okpack-folded"}, (), ["okpack-folded"]),
+    # a renamed pack / an author typo
+    ({"actor": "my-pack"}, (), ["my-pack"]),
+    # a bundle whose re-stamped name hid its host (okengine#1032 [11])
+    ({"actor": "okpack-host"}, ("okpack-guest",), ["okpack-host"]),
+])
+def test_a_type_owner_no_lane_can_act_for_fails(tmp_path, owners, guests, failing):
+    """okengine#1032 [11], [15]: converge compares the owner with the write principal by equality,
+    so an owner that is neither the pack.yaml name nor a co-installed pack can never be met."""
+    v = _load("framework_validate_owner_bad")
+    name = "okpack-cti" if "okpack-host" in owners.values() else "okpack-mine"
+    pack = _owned_pack(tmp_path, name, owners, guests)
+    r = v.Report()
+    v.check_schema(pack, r)
+    rows = [row for row in r.rows if row[1] == "schema.types.owner"]
+    assert [row[0] for row in rows] == ["FAIL"] * len(failing), rows
+    for owner, row in zip(failing, rows):
+        assert repr(owner) in row[2] and f"pack.yaml name {name!r}" in row[2], row
+        assert f"co-installed {sorted(guests)}):" in row[2], row
+
+
+def test_every_reachable_type_owner_passes(tmp_path):
+    v = _load("framework_validate_owner_ok")
+    pack = _owned_pack(tmp_path, "okpack-mine", {
+        "actor": "okpack-mine", "cve": "okpack-guest", "x-lacuna": "ext:okengine.lacuna",
+        "core": "engine", "free": None}, guests=("okpack-guest",))
+    r = v.Report()
+    v.check_schema(pack, r)
+    rows = [row for row in r.rows if row[1] == "schema.types.owner"]
+    assert [row[0] for row in rows] == ["OK"], rows
+
+
+def test_a_deployment_that_also_lists_itself_as_co_installed_still_owns_its_types(tmp_path):
+    """The principals are a union: a manifest naming the deployment pack (or `engine`) must not
+    cancel it out."""
+    from scripts import framework_validate_pack as fvp
+    pack = _owned_pack(tmp_path, "okpack-mine", {"actor": "okpack-mine", "core": "engine"},
+                       guests=("okpack-mine", "engine"))
+    r = fvp.Report()
+    fvp.check_type_owners(pack, {"actor": {"owner": "okpack-mine"}, "core": {"owner": "engine"}}, r)
+    assert [row[0] for row in r.rows] == ["OK"], r.rows
+
+
+def test_type_owners_need_a_pack_name_and_a_declared_owner(tmp_path):
+    from scripts import framework_validate_pack as fvp
+    r = fvp.Report()
+    fvp.check_type_owners(_owned_pack(tmp_path, None, {"actor": "x"}), {"actor": {"owner": "x"}}, r)
+    assert r.rows == [], "a nameless pack.yaml is its own FAIL; nothing to compare here"
+    fvp.check_type_owners(_owned_pack(tmp_path, "p", {"actor": None}),
+                          {"actor": {"required": ["type"]}, "y": "scalar"}, r)
+    assert r.rows == [], "no declared owner: nothing to report"
+
+
+@pytest.mark.parametrize(("text", "fails"), [
+    ("version: 1.0.0\ntrust: public\n", True),              # nameless: the basename default hid it
+    ("name: '  '\nversion: 1.0.0\ntrust: public\n", True),  # blank
+    ("name: okpack-x\nversion: 1.0.0\ntrust: public\n", False),
+])
+def test_a_pack_yaml_without_a_literal_name_fails_validate(tmp_path, text, fails):
+    """okengine#1027 (v0.15.11 invariant audit #2/#8): load_pack_meta defaults `name` to the
+    directory basename, so a nameless pack.yaml validated clean while every write server refused
+    to start after the gateway recreate. The literal name is what the write servers read."""
+    v = _load("framework_validate_branch_pack_name")
+    (tmp_path / "pack.yaml").write_text(text)
+    r = v.Report()
+    v.check_pack_meta(tmp_path, r)
+    failed = [detail for sev, check, detail in r.rows if sev == "FAIL" and check == "pack.yaml name"]
+    assert bool(failed) is fails, r.rows
+    assert all("okengine#1027" in detail for detail in failed)

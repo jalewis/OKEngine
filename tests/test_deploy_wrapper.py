@@ -178,7 +178,8 @@ def test_deploy_reconciles_engine_pin_before_validate():  # okengine#359
     bypasses ALL checks). okengine#359."""
     dp = SCRIPT.read_text()
     assert "NO_UPGRADE" in dp and "--no-upgrade" in dp, "no --no-upgrade opt-out"
-    assert 'framework.py" upgrade "$PACK" --apply' in dp, "deploy no longer runs framework upgrade to reconcile the pin"
+    assert 'framework.py" upgrade "$PACK" "${_upgrade_flags[@]}"' in dp and "_upgrade_flags=(--apply)" in dp, \
+        "deploy no longer runs framework upgrade --apply to reconcile the pin"
     i0, i1 = dp.find("[0/6]"), dp.find("[1/6]")
     assert 0 <= i0 < i1, "the pin reconcile ([0/6]) must run BEFORE the validate gate ([1/6])"
     # reconcile is guarded on the pack actually having a pin to reconcile

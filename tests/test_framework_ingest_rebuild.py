@@ -121,23 +121,22 @@ def test_manifest_shape_and_yaml_errors(tmp_path):
 
 def test_sources_hydrate_reconcile_and_failure(tmp_path, monkeypatch):
     d = dep(tmp_path)
-    code, _, err = call(m.sources, ["hydrate", str(d), "--missing-body"])
-    assert code == 1 and "feed configuration not found" in err
-    feeds = d / "feeds"
-    feeds.mkdir(exist_ok=True)
-    (feeds / "feeds.opml").write_text("<opml/>")
     calls = []
 
     def run(script, deployment, args=None):
         calls.append((script, args))
-        return result(0 if script == "feed_fetch.py" else 3)
+        return result(0 if script in {"source_hydrate.py", "@source-hydrate"} else 3)
 
     monkeypatch.setattr(m, "_run", run)
     code, out, _ = call(
         m.sources, ["hydrate", str(d), "--missing-body", "--json"]
     )
     assert code == 0 and json.loads(out)["operation"] == "hydrate"
-    assert "--capture-full-text" in calls[-1][1]
+    assert calls[-1] == ("source_hydrate.py", ["--limit", "20"])
+    code, out, _ = call(m.sources, ["hydrate", str(d), "--missing-body", "--source",
+                                    "sources/a.md", "--limit", "2", "--apply", "--json"])
+    assert code == 0
+    assert calls[-1] == ("@source-hydrate", ["--limit", "2", "--source", "sources/a.md", "--apply"])
     code, out, _ = call(m.sources, ["reconcile", str(d), "--json"])
     assert code == 3 and json.loads(out)["status"] == "failed"
     assert calls[-1][0] == "classify_sources.py"
@@ -163,3 +162,53 @@ def test_rebuild_all_derived_reports_child_failure(tmp_path, monkeypatch):
         "backlinks_refresh.py",
         "@postgres-projection",
     ]
+
+
+def test_sources_reports_missing_deployment(tmp_path):
+    code, _, err = call(m.sources, ["hydrate", str(tmp_path / "absent"), "--missing-body"])
+    assert code == 1 and "not an OKEngine deployment" in err
+
+
+def test_source_repairs_execute_in_the_deployed_gateway(tmp_path):
+    from unittest.mock import create_autospec, patch
+    d = dep(tmp_path)
+    identity = m.subprocess.CompletedProcess([], 0, "1003:1042\n", "")
+    failure = m.subprocess.CompletedProcess([], 7, "", "capture failed")
+    run = create_autospec(m.subprocess.run, side_effect=[identity, failure])
+    with patch.object(m.subprocess, "run", run):
+        observed = m._run("@source-hydrate", d, ["--source", "sources/a.md", "--apply"])
+    assert observed.returncode == 7
+    assert run.call_args_list[0].args[0] == ["docker", "compose", "exec", "-T", "gateway",
+                                           "stat", "-c", "%u:%g", "/opt/data"]
+    assert run.call_args_list[0].kwargs["cwd"] == d
+    assert run.call_args.args[0] == ["docker", "compose", "exec", "-T", "--user", "1003:1042",
+                                    "gateway", "python",
+                                    "/opt/data/scripts/source_hydrate.py", "--source",
+                                    "sources/a.md", "--apply"]
+    assert run.call_args.kwargs["cwd"] == d
+    assert run.call_args.kwargs["capture_output"] is True
+    assert run.call_args.kwargs["text"] is True
+    assert run.call_args.kwargs["check"] is False
+
+
+def test_source_repair_identity_lookup_failure_prevents_capture(tmp_path):
+    from unittest.mock import create_autospec, patch
+    d = dep(tmp_path)
+    failure = m.subprocess.CompletedProcess([], 9, "", "gateway unavailable")
+    run = create_autospec(m.subprocess.run, return_value=failure)
+    with patch.object(m.subprocess, "run", run):
+        code, out, _ = call(m.sources, ["hydrate", str(d), "--missing-body", "--apply"])
+    assert code == 9 and "gateway unavailable" in out
+    assert run.call_count == 1, "capture must not run after identity lookup fails"
+
+
+def test_source_repair_refuses_root_or_malformed_runtime_owner(tmp_path):
+    from unittest.mock import create_autospec, patch
+    d = dep(tmp_path)
+    for owner in ("0:0", "0:1003", "", "1003", "-1:1003", "1003:root", "1003:1003\n0:0"):
+        identity = m.subprocess.CompletedProcess([], 0, owner, "")
+        run = create_autospec(m.subprocess.run, return_value=identity)
+        with patch.object(m.subprocess, "run", run):
+            code, _, err = call(m.sources, ["hydrate", str(d), "--missing-body", "--apply"])
+        assert code == 1 and "non-root UID:GID" in err, owner
+        assert run.call_count == 1, f"unsafe owner {owner!r} must not reach capture"

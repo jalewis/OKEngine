@@ -43,6 +43,13 @@ from pathlib import Path
 
 import yaml
 
+# Engine cron libs, appended so this extension's own modules keep precedence: staged one level
+# up (/opt/data/scripts/ holds /opt/data/scripts/<id>/), or scripts/cron/ in a repo checkout.
+_ENGINE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(_ENGINE_ROOT))
+sys.path.append(str(_ENGINE_ROOT.parent / "scripts" / "cron"))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
+
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 DASH_PATH = VAULT / "wiki" / "dashboards" / "contradictions.md"
 
@@ -419,11 +426,11 @@ def main() -> int:
         print(f"    {cls}: {by_class.get(cls, 0)}")
 
     DASH_PATH.parent.mkdir(parents=True, exist_ok=True)
-    rendered = render_dashboard(items, today)
+    rendered = generated_page.with_id(DASH_PATH, render_dashboard(items, today))
     if DASH_PATH.exists() and DASH_PATH.read_text() == rendered:
         print(f"  dashboard: unchanged ({DASH_PATH.relative_to(VAULT)})")
     else:
-        DASH_PATH.write_text(rendered)
+        DASH_PATH.write_text(rendered, encoding="utf-8")
         print(f"  dashboard: updated ({DASH_PATH.relative_to(VAULT)})")
 
     print()

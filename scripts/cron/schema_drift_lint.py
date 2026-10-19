@@ -37,6 +37,7 @@ for _p in ("/opt/hermes", str(Path(__file__).resolve().parents[2])):
 from tools.schema_validator import schema_reject_reason  # type: ignore[import]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # scripts/cron, for sibling libs
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import tz_lib  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
@@ -62,7 +63,10 @@ def _bucket(reason: str) -> str:
     if reason.startswith("missing YAML"):
         return "no-frontmatter"
     if reason.startswith("missing required"):
-        return "typeless (no type:)"
+        # The OKF floor is more than `type` (the base schema also requires `id`), so a page that
+        # declares its type but lacks another floor field is not typeless.
+        missing = reason.partition(": ")[2].split(", ")
+        return "typeless (no type:)" if "type" in missing else "missing OKF-required field(s)"
     if reason.startswith("type '"):
         return "missing required field(s)"
     if "not valid YAML" in reason or "not a YAML mapping" in reason:
@@ -138,7 +142,7 @@ def main() -> int:
     lines.append("")
 
     REPORT.parent.mkdir(parents=True, exist_ok=True)
-    REPORT.write_text("\n".join(lines), encoding="utf-8")
+    generated_page.write(REPORT, "\n".join(lines))
 
     print(f"schema-drift-lint: {bad:,}/{scanned:,} non-conformant "
           f"({pct:.2f}% conformant) -> {REPORT.relative_to(VAULT)}")

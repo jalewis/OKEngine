@@ -151,6 +151,19 @@ class FrameworkOperationsTests(unittest.TestCase):
         code, _, _ = self.call("status", str(self.deployment), "failed")
         self.assertEqual(code, 1)
 
+    def test_history_skips_an_unreadable_receipt_without_hiding_older_runs(self):
+        # Receipts are listed newest-name-first; a corrupt one must be skipped, not end the walk
+        # (okengine#1046: a surviving continue -> break mutant on the history loop).
+        runs = self.deployment / ".okengine/operations/runs/fixture-review"
+        runs.mkdir(parents=True)
+        (runs / "zz-corrupt.json").write_text("{")
+        (runs / "aa-older.json").write_text(json.dumps({
+            "run_id": "aa-older", "operation": "fixture-review", "status": "succeeded",
+        }))
+        code, output, _ = self.call("history", str(self.deployment), "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual([row["run_id"] for row in json.loads(output)["runs"]], ["aa-older"])
+
     def test_empty_list_unknown_operation_and_receipt_failures(self):
         (self.deployment / "operations/fixture/operation.yaml").unlink()
         code, output, _ = self.call("list", str(self.deployment))

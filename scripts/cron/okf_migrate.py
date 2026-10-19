@@ -282,9 +282,27 @@ def find_page(root: Path, namespace: str, slug: str) -> Path | None:
     base = root / "wiki" / namespace
     if not base.is_dir():
         return None
-    hits = [p for p in base.rglob(f"{slug}.md") if p.stem == slug]
+    # Case-insensitive (okengine#883): the importer's canonical slug is lowercase, but a page an
+    # agent wrote as `CVE-2025-62673.md` IS that page. An exact-stem match missed it, so nvd-import
+    # re-created a lowercase copy daily and the separator guard quarantined it daily. An exact match
+    # still wins; only case is ignored -- separators are NOT folded (slug_identity detects those
+    # collisions but never authorizes treating them as one page).
+    folded = slug.casefold()
+    try:
+        candidates = base.rglob(f"{slug}.md", case_sensitive=False)
+    except TypeError:  # Python < 3.12 has no case_sensitive; the stem filter below decides
+        candidates = base.rglob("*.md")
+    # Never an engine-GENERATED file (okengine#997): folding case made `index` resolve to the
+    # deepest generated INDEX.md, and the writer overwrote it. And a RESERVED stem matches only its
+    # exact case: `health` is never the root-style `HEALTH.md`, whatever directory it sits in.
+    sv = _reserved_contract()
+    exact_only = sv.is_reserved_basename(f"{slug}.md")
+    hits = [p for p in candidates if p.stem.casefold() == folded
+            and not sv.is_engine_generated(p.name) and (p.stem == slug or not exact_only)]
     if not hits:
         return None
+    exact = [p for p in hits if p.stem == slug]
+    hits = exact or hits
     # A LIVE copy outranks any tombstone regardless of depth (okengine#663): a retired page never
     # holds a seat (build_map), so an importer's update must land on the live page, not be routed
     # INTO a deeper tombstone. A lone tombstone is still returned so callers can see the slug is
@@ -331,6 +349,176 @@ def desired_key(root: Path, namespace: str, slug: str, fm: dict | None = None) -
     return f"{base_key.rsplit('/', 1)[0]}/{seg}/{slug}" if seg else base_key
 
 
+# ── reserved basenames (okengine#997) ────────────────────────────────────────────────────────
+# A page minted under a name the OKF contract reserves (`health.md`, `index.md`, …) or under a
+# dot-leading name is a page nothing can maintain or list: the write path refuses the name, and the
+# validator, id-index and INDEX builders skip it. Two live pages were minted that way. The reserved
+# set is NOT restated here — it is read from tools/schema_validator, the source the write path's
+# refusal is already bound to (test_write_refusal_covers_validator_conformance_exemption), so the
+# minting guard cannot drift from the refusal it exists to avoid.
+
+_RESERVED_CONTRACT = None
+
+
+def _import_paths() -> None:
+    """Make `tools.schema_validator` importable when this file is loaded BY PATH: the engine root
+    (a checkout or a pack's cron env) and the gateway's baked `/opt/hermes`, appended so an
+    installed copy always wins; plus the `okengine` package the validator imports."""
+    here = Path(__file__).resolve().parent
+    for p in (str(here), str(here.parent.parent), "/opt/hermes"):
+        if p not in sys.path:
+            sys.path.append(p)
+    try:
+        import engine_package
+    except ModuleNotFoundError:     # a wheel install ships no bootstrap: okengine is installed there
+        return
+    engine_package.ensure()
+
+
+def _reserved_contract():
+    """The `tools.schema_validator` module — imported lazily, so a consumer that never mints keeps
+    importing this module with no new dependency, and FAILING LOUD (never open) if it is absent
+    or predates the shared predicate.
+
+    In a checkout or image layout (`<root>/scripts/cron/okf_migrate.py` beside `<root>/tools/`)
+    the sibling validator IS this version, so it is put first when nothing has imported `tools`
+    yet: a host venv carries a stale installed `tools` that would otherwise shadow it."""
+    global _RESERVED_CONTRACT
+    if _RESERVED_CONTRACT is None:
+        root = Path(__file__).resolve().parent.parent.parent
+        if (root / "tools" / "schema_validator.py").is_file() and "tools" not in sys.modules:
+            sys.path.insert(0, str(root))
+        try:
+            from tools import schema_validator
+        except ModuleNotFoundError:
+            _import_paths()
+            from tools import schema_validator
+        if not hasattr(schema_validator, "is_reserved_basename"):
+            raise ImportError(f"{schema_validator.__file__} predates okengine#997 (no "
+                              "is_reserved_basename): a stale baked or installed validator; "
+                              "rebuild the image so it matches this okf_migrate")
+        _RESERVED_CONTRACT = schema_validator
+    return _RESERVED_CONTRACT
+
+
+def reserved_basename(path, names: frozenset | None = None) -> bool:
+    """True when `path`'s basename can never name a content page — `schema_validator.
+    is_reserved_basename` (the ONE predicate the write path's refusal and the validator also use)
+    with the governing pack's `reserved_files`. `names` is the directory's `_reserved_names`, when
+    a whole-vault scan has already resolved it."""
+    path = Path(path)
+    if names is None:
+        names = _reserved_names(path.parent)
+    return _reserved_contract().is_reserved_basename(path.name, names)
+
+
+def _reserved_names(directory: Path) -> frozenset:
+    """The pack-reserved basenames governing files in `directory` (the validator's resolution).
+    Deliberately uncached here: the write path is long-running and a pack may change its schema
+    under it."""
+    return _reserved_contract().reserved_files_for(str(directory / "_.md"))
+
+
+_KIND_SEG = re.compile(r"[^a-z0-9]+")
+
+
+def _kind(page_type) -> str:
+    """A page type as a slug segment; `page` when untyped."""
+    return _KIND_SEG.sub("-", str(page_type or "").lower()).strip("-") or "page"
+
+
+def _dotted(slug: str) -> str:
+    """Leading dots spelled out: `.net-x` -> `dotnet-x`."""
+    return re.sub(r"^\.+", lambda mt: "dot" * len(mt.group(0)), slug)
+
+
+def mintable_slug(root: Path, namespace: str, slug: str, fm: dict | None = None) -> str:
+    """`slug` itself when a page may be minted under it; otherwise a deterministic stand-in.
+
+    Leading dots become the word `dot` (`.net-x` -> `dotnet-x`). A still-reserved name gets the
+    page type as a suffix (`health` -> `health-publisher`; `page` when untyped), and a prefix
+    shape a suffix cannot rescue (`index-p01`, `_x`) gets it as a prefix instead. Raises
+    ValueError when no candidate is mintable (a pack reserving all of them)."""
+    base = Path(root) / "wiki" / namespace
+    if not reserved_basename(base / f"{slug}.md"):
+        return slug
+    dotted, kind = _dotted(slug), _kind((fm or {}).get("type"))
+    for cand in (dotted, f"{dotted}-{kind}", f"{kind}-{dotted}"):
+        if not reserved_basename(base / f"{cand}.md"):
+            return cand
+    raise ValueError(f"no mintable basename for {namespace}/{slug}: every candidate is reserved "
+                     f"by the governing schema")
+
+
+def _standin_page(root: Path, namespace: str, slug: str, fm: dict) -> Path | None:
+    """A LIVE page already holding a stand-in of reserved `slug` in ANY form — `<slug>-<type>`
+    for any declared type, `-page`, `<type>-<slug>`, the spelled-out dot form — so a writer of
+    another type, or an untyped one, converges on it instead of forking a second page (the #54
+    loop, after a repair renamed `health` to `health-publisher`). A page carrying the writer's
+    own `id` wins; otherwise the first by path."""
+    base = root / "wiki" / namespace
+    if not base.is_dir():
+        return None
+    sv = _reserved_contract()
+    dotted = _dotted(slug)
+    kinds = {_kind(t) for t in (_governing_schema(root, namespace).get("types") or {})}
+    kinds |= {"page", _kind(fm.get("type"))}
+    names = ({dotted} | {f"{dotted}-{k}" for k in kinds} | {f"{k}-{dotted}" for k in kinds})
+    names = {n.casefold() for n in names} - {slug.casefold()}
+    hits = []
+    for p in sorted(base.rglob("*.md")):  # rglob-ok: reached only for a reserved slug — rare
+        if p.stem.casefold() not in names or sv.is_engine_generated(p.name):
+            continue
+        pfm = _fm_at(root, p.relative_to(root / "wiki").as_posix()[:-3])
+        if not is_tombstoned(pfm):
+            hits.append((p, pfm))
+    want = str(fm.get("id") or "").strip()
+    owned = [p for p, pfm in hits if want and str(pfm.get("id") or "").strip() == want]
+    return (owned or [p for p, _ in hits] or [None])[0]
+
+
+def _derived_or_hidden(rel: Path, derived) -> bool:
+    """A file under an engine-derived namespace or a hidden directory — never content. (`_` is
+    NOT a hidden prefix for a directory: it is the by-letter bucket for non-alphabetic slugs.)"""
+    return any(part in derived or part.startswith(".") for part in rel.parts[:-1])
+
+
+def reserved_name_pages(root: Path) -> list[tuple[str, bool]]:
+    """(wiki-relative path, tombstoned) for every CONTENT page sitting under a reserved or
+    dot-leading basename — the detector the deployment check and the repair lane share.
+
+    "Reserved" is the shared `schema_validator.is_reserved_basename`, so this flags everything the
+    minting guard blocks and the write path refuses. A content page is a typed page inside a
+    namespace. Not flagged: a domain root's own files (root dashboards, AGENTS/log/index — the
+    wiki root or a sub-domain root holding a schema.yaml), the engine's generated INDEX tree and
+    `_` scaffolding when it is a `dashboard`, anything under an engine-derived namespace or a
+    hidden directory, and a structural file carrying no `type`."""
+    root = Path(root)
+    wiki = root / "wiki"
+    if not wiki.is_dir():
+        return []
+    generated = _reserved_contract().is_engine_generated   # also bootstraps `okengine` by path
+    from okengine.schema_exclusions import RESERVED_DERIVED_NAMESPACES
+    out: list[tuple[str, bool]] = []
+    reserved_in: dict[Path, frozenset] = {}               # one schema resolution per directory
+    for p in sorted(wiki.rglob("*.md")):  # rglob-ok: whole-vault detector; names filtered before any read
+        d = p.parent
+        if d not in reserved_in:
+            reserved_in[d] = _reserved_names(d)
+        if not reserved_basename(p, reserved_in[d]):
+            continue                                       # the cheap name test first: ~all files
+        rel = p.relative_to(wiki)
+        if (_derived_or_hidden(rel, RESERVED_DERIVED_NAMESPACES) or d == wiki
+                or (d / "schema.yaml").is_file()):
+            continue
+        fm = _fm_at(root, rel.as_posix()[:-3])
+        ptype = str(fm.get("type") or "").strip()
+        if not ptype or (ptype == "dashboard" and generated(p.name)):
+            continue                     # structural, or the engine's own INDEX tree/scaffolding
+        out.append((rel.as_posix(), is_tombstoned(fm)))
+    return out
+
+
 def write_key(root: Path, namespace: str, slug: str, fm: dict | None = None) -> str:
     """Wiki-relative key (no .md) a direct writer should use.
 
@@ -340,11 +528,29 @@ def write_key(root: Path, namespace: str, slug: str, fm: dict | None = None) -> 
     to mint pages in the base bucket makes the daily reshard job and importer recreate opposite
     sides of a partition collision forever (okengine#243).
 
+    A NEW page is never minted under a reserved or dot-leading basename (okengine#997): the slug
+    passes through ``mintable_slug`` first. A live page already holding the slug's stand-in under
+    ANY form wins (``_standin_page``), then a live page still sitting under the reserved name
+    itself, updated where it is until the repair lane renames it — forking a copy beside either is
+    #54. A tombstone at the reserved name holds nothing.
+
     ``canonical_key`` remains the base partition key used by the migration/oversize detector;
     direct writers and collision cleanup should use this helper.
     """
     root = Path(root)
     fm = fm or {}
+    safe = mintable_slug(root, namespace, slug, fm)
+    if safe != slug:
+        held = _standin_page(root, namespace, slug, fm)
+        if held is None:
+            legacy = find_page(root, namespace, slug)
+            # a tombstone never holds a seat (#663): a retired legacy name mints the stand-in
+            if legacy is not None and not is_tombstoned(
+                    _fm_at(root, legacy.relative_to(root / "wiki").as_posix()[:-3])):
+                held = legacy
+        if held is not None:
+            return held.relative_to(root / "wiki").as_posix()[:-3]
+    slug = safe
     desired = desired_key(root, namespace, slug, fm)
     desired_path = root / "wiki" / f"{desired}.md"
     # An occupied seat is only "taken" by a LIVE page; a tombstone there must not swallow the
@@ -370,6 +576,48 @@ def _is_reshard_bucket(cur: str, new: str, pcfg: dict, slug: str, fm: dict) -> b
             and cp[:-2] == np[:-1] and cp[-2] == seg)
 
 
+def placeable_pages(root: Path, namespace: str):
+    """Yield (current key, slug, frontmatter) for every LIVE page the drain may place.
+
+    The single enumeration build_map moves from, so anything that must reason about "which pages
+    would move" sees exactly the population the mover acts on: generated/reserved files, pages
+    without parseable mapping frontmatter, and tombstones (okengine#520 — retired pages never move,
+    never claim a seat) are excluded here and nowhere else."""
+    base = root / "wiki" / namespace
+    for p in sorted(base.rglob("*.md")):  # rglob-ok: whole-namespace drain enumeration (the mover's population)
+        slug = p.stem
+        if slug.startswith("_") or slug in ("index", "INDEX", "log", "README") \
+                or slug.startswith("INDEX-p"):
+            continue
+        try:
+            fmm = _FM_RE.match(p.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        if not fmm:
+            continue
+        try:
+            fm = yaml.safe_load(fmm.group(1))
+        except Exception:
+            continue
+        if not isinstance(fm, dict) or is_tombstoned(fm):
+            continue
+        yield p.relative_to(root / "wiki").as_posix()[:-3], slug, fm
+
+
+def drain_target(namespace: str, cur: str, slug: str, fm: dict, pcfg: dict,
+                 canonical: set) -> "str | None":
+    """Where the drain would MOVE the page at `cur` under partition config `pcfg`, or None when
+    it stays put — already canonical, un-bucketable (flat / no usable date / unknown type), or
+    sitting in a valid `reshard_by` sub-bucket of its canonical seat. Taking `pcfg` explicitly lets
+    a caller ask the same question of a PROPOSED partitioning before it is written (install-domain
+    --refresh proves a partitioning change moves no page). Raises ValueError on an unknown strategy,
+    exactly as the mover does."""
+    new = _new_key(namespace, slug, fm, pcfg, canonical)
+    if not new or new == cur or _is_reshard_bucket(cur, new, pcfg, slug, fm):
+        return None
+    return new
+
+
 def build_map(root: Path, namespace: str, only_types: set[str] | None = None,
               only_year: str | None = None) -> tuple[dict[str, str], list[tuple[str, str]]]:
     """(old-key -> new-key, collisions) for EVERY page under the namespace whose current
@@ -388,36 +636,16 @@ def build_map(root: Path, namespace: str, only_types: set[str] | None = None,
     schema = _governing_schema(root, namespace)
     pcfg = _partition_cfg(schema, namespace)
     canonical = set((schema.get("types") or {}).keys())
-    base = root / "wiki" / namespace
     m: dict[str, str] = {}
     collisions: list[tuple[str, str]] = []
-    for p in sorted(base.rglob("*.md")):
-        slug = p.stem
-        if slug.startswith("_") or slug in ("index", "INDEX", "log", "README") \
-                or slug.startswith("INDEX-p"):
-            continue
-        try:
-            fmm = _FM_RE.match(p.read_text(encoding="utf-8", errors="replace"))
-        except OSError:
-            continue
-        if not fmm:
-            continue
-        try:
-            fm = yaml.safe_load(fmm.group(1))
-        except Exception:
-            continue
-        if not isinstance(fm, dict):
-            continue
+    for cur, slug, fm in placeable_pages(root, namespace):
         if only_types is not None and str(fm.get("type") or "").strip() not in only_types:
             continue
-        if is_tombstoned(fm):
-            continue                       # retired: never moves, never claims a seat
-        cur = p.relative_to(root / "wiki").as_posix()[:-3]
-        new = _new_key(namespace, slug, fm, pcfg, canonical)
+        new = drain_target(namespace, cur, slug, fm, pcfg, canonical)
         if new and only_year and new.startswith(f"{namespace}/") \
                 and not new.startswith(f"{namespace}/{only_year}/"):
             new = None
-        if not new or new == cur or _is_reshard_bucket(cur, new, pcfg, slug, fm):
+        if not new:
             continue                       # already canonical, OR a valid reshard sub-bucket (don't revert)
         # collision guard: the canonical seat is already taken by a DIFFERENT file
         if (root / "wiki" / (new + ".md")).is_file():
@@ -454,13 +682,15 @@ def make_path_rewriter(move_map: dict[str, str]):
     reference dangling — the exact break that stranded assessment subjects when big `entities/`
     buckets split a level deeper. This matches each old key as a WHOLE path token: the
     boundaries keep `entities/a/foo` from matching inside a longer slug (`entities/a/foobar`)
-    or an already-deeper path, and the `[`/`/` lookbehind leaves `[[…]]` links (and paths that
-    are themselves segments of a longer path) to the wikilink rewriter. Longest-key-first so a
-    key that is a prefix of another can't shadow it."""
+    or an already-deeper path, and the `[[`/`/` lookbehind leaves `[[…]]` links (and paths that
+    are themselves segments of a longer path) to the wikilink rewriter. A SINGLE `[` is a YAML
+    flow list (`related: [entities/a/foo]`), whose first item is a bare reference like any other
+    (okengine#994: excluding every `[` left it dangling). Longest-key-first so a key that is a
+    prefix of another can't shadow it."""
     if not move_map:
         return re.compile(r"(?!x)x"), (lambda mt: mt.group(0))   # matches nothing
     alt = "|".join(re.escape(k) for k in sorted(move_map, key=len, reverse=True))
-    pat = re.compile(r"(?<![\w/\-\[])(" + alt + r")(?![\w/\-])")
+    pat = re.compile(r"(?<![\w/\-])(?<!\[\[)(" + alt + r")(?![\w/\-])")
 
     def repl(mt):
         return move_map.get(mt.group(1), mt.group(0))

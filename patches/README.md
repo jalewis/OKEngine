@@ -13,7 +13,16 @@ table below are retained as the historical `v2026.7.7.2` set so old deployments 
 `apply.sh` selects the target directory from the manifest pin.
 
 **Apply:** `patches/apply.sh /path/to/hermes-checkout` (idempotent; the target-contract gate
-verifies the selected artifacts against the exact manifest tag and SHA).
+verifies the selected artifacts against the exact manifest tag and SHA). `apply.sh` itself refuses
+a checkout whose `HEAD` is not the manifest `pinned_sha` (exit 2) and a directory that is not the
+top level of its own git checkout (exit 1): the active series is sequential, so `git apply` offsets
+are expected and only the exact commit proves each hunk landed where it was cut (okengine#1042).
+
+**Dependency overrides (not patches):** the image build also installs engine-pinned Python
+packages over Hermes's frozen `uv.lock`, after Hermes is installed, without editing Hermes or its
+lock. Each is recorded with its reason in `engine-manifest.yaml` `runtime.dependency_overrides`.
+Today that is croniter 6.2.4 over the lock's 6.0.0, whose next-fire arithmetic is wrong across DST
+for cron-plus; re-evaluate each override on a Hermes bump and drop it once the lock catches up.
 
 Everything else the engine adds is **overlay** (new files — see
 `engine-manifest.yaml`) or **plugins** (Hermes' plugin system) — neither needs a
@@ -26,7 +35,8 @@ header/surface drift, a missing test, or a breached patch/change budget. Release
 the validated inventory digest and aggregate risk counts, binding the downstream burden to the
 audited release.
 
-The budget is 24 patches and 30 distinct touched upstream files. Crossing either threshold—or
+The budget is 24 patches and 35 distinct touched upstream files (`policy` in
+[`target-v2026.9.14/inventory.json`](target-v2026.9.14/inventory.json); both are at their ceiling). Crossing either threshold—or
 resolving conflicts in the same high-risk surface on two consecutive Hermes upgrades—requires an
 architecture decision between a formal adapter and a maintained downstream runtime. A bump must
 attempt the inventory against an unmodified pinned Hermes checkout, run every declared test, record
@@ -48,7 +58,7 @@ not a reason to retain a patch indefinitely.
 | 11 | `11-http-status-retry-policy.patch` | `agent/agent_init.py`, `agent/conversation_loop.py` | Add opt-in per-HTTP-status attempt and fallback policy. This lets shared local inference pools treat capacity `503` as backoff (not provider failover), cap `500` retries, and fail fast on deterministic `404`/`504` responses without changing provider defaults. |
 | 12 | `12-mcp-resource-uri-guidance.patch` | `tools/mcp_tool.py` | Make the MCP resource contract explicit in schemas and failed `file://` calls: only use URIs returned by `list_resources`; use `read_file` for explicit local paths and `get_page` for vault pages. Prevents provider-independent tool loops observed with Qwen and DeepSeek. |
 | 13 | `13-cron-executed-tool-calls.patch` | `cron/scheduler.py` | Publish the number of assistant turns that actually carried tool calls onto the job dict (`_okengine_executed_tool_calls`), so the receipt verifier can refuse a run that returned a well-formed receipt having executed nothing (okengine#477). Counted exactly as `agent/turn_finalizer.py` counts its own `tool_turns` diagnostic. Written onto the job dict because cron-plus hands `run_job()` the same object it later hands its receipt check — no return signature changes, no other caller affected. |
-| 14 | `14-cron-executed-writes.patch` | `cron/scheduler.py` | Publish the writes a run ACTUALLY executed onto the job dict (`_okengine_executed_writes`), taking the **canonical** path from the write tool's own result (`created <path> v<n>`), which `write_server` emits AFTER `_partitioned_create_path` shards the page. The model reports the FLAT path it requested, so receipts failed "accepted write does not exist" for writes that had succeeded, and hand-transcribed sha256 digests were unreliable (okengine#469/#478). Same publish-onto-the-job-dict mechanism as patch 13. |
+| 14 | `14-cron-executed-writes.patch` | `cron/scheduler.py` | Publish the writes a run ACTUALLY executed onto the job dict (`_okengine_executed_writes`), taking the **canonical** path from the write tool's own result (`created <path> v<n>`), which `write_server` emits AFTER `_partitioned_create_path` shards the page. The model reports the FLAT path it requested, so receipts failed "accepted write does not exist" for writes that had succeeded, and hand-transcribed sha256 digests were unreliable (okengine#469/#478). Same publish-onto-the-job-dict mechanism as patch 13. Recognises the **clamped** tool name too: `mcp_prefixed_tool_name` shortens anything over the provider's 64-char limit to `<truncated>_<8hex>`, which can truncate away the `__` between server and tool, so a long-named per-lane write server arrives with TWO components, not three. Requiring three silently dropped every write those lanes made and failed their completion contracts against pages that had genuinely changed (okengine#840). |
 | 15 | `15-model-metadata-probe-cache.patch` | `agent/model_metadata.py` | Memoize `detect_local_server_type()` per normalized base_url. The probe walks a capability ladder (LM Studio → ollama → llama.cpp → vLLM) in which all but the matching rung necessarily 404; with no cache and five call sites including per-request paths, every agent init re-walked it — the inference host measured ~150 failed probes/hour arriving as bursts of 4 per lane start. Server type cannot change without a restart and this process is per-cron-job, so a per-process memo is safe; negative results are cached too (okengine#478). |
 | 16 | `16-model-metadata-probe-shape.patch` | `agent/model_metadata.py` | Stop issuing requests the server cannot answer. (a) Remember which `/props` URL a base actually responds on — llama.cpp builds differ (`/v1/props` current, `/props` older) and the probe tried the prefixed form FIRST on every metadata fetch, so a `/props` server ate a guaranteed 404 each time (86 counted in one sample window). (b) Skip the per-model `GET /v1/models/<model>` when the server is llama.cpp, which serves no such endpoint (9 counted). Complements patch 15, which memoized the capability ladder itself (okengine#484). |
 | 17 | `17-qwen-coder-responses-api.patch` | `run_agent.py`, `agent/agent_init.py`, `agent/codex_responses_adapter.py`, `agent/codex_runtime.py` | Route custom-provider Qwen Coder models through Hermes' existing `codex_responses` transport and normalize every request at the shared wire boundary. This covers reconstructed max-iteration summaries and retries as well as normal turns, and emits content-free shape diagnostics on HTTP 400. The local service implements Responses tool calls; its Chat Completions compatibility route is retired. Other custom-provider models remain conservative and retain upstream transport selection (okengine#492/#500). |
@@ -68,7 +78,10 @@ v0.18.2's web-provider registry resolves ANY `register_web_search_provider()` pl
 (was 06) — native in `tools/approval.py`; the read-echo write guard (half of old
 02); the `no_agent` cron short-circuit (half of old 03).
 
-If a patch fails to apply after a Hermes bump, `git apply --3way` it against the
+While rebasing the series onto a new Hermes commit, before the manifest pin moves, run
+`OKENGINE_ALLOW_UNPINNED_HERMES=1 patches/apply.sh <checkout>`; it warns that placement is not
+proven. Then add the new tag's arm to the `case "$PIN"` statement in `apply.sh` (an unmapped pin
+exits 3), move the manifest pin, and re-run `apply.sh` on the pinned commit with no override. If a patch fails to apply after a Hermes bump, `git apply --3way` it against the
 new version, resolve, and regenerate the `.patch` (`git diff <sha^> <sha> -- <file>`).
 Full bump records (internal): `docs/hermes-upgrades/v2026.7.7.2-v0.18.2.md`,
 `docs/hermes-upgrades/v2026.7.1-v0.18.0.md`.

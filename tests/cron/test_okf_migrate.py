@@ -320,3 +320,120 @@ def test_namespace_discovery_and_frontmatter_edges(tmp_path):
     pat, repl = m.make_path_rewriter({"entities/a/old": "entities/a/new"})
     assert pat.sub(repl, "entities/a/old entities/a/missing") == \
         "entities/a/new entities/a/missing"
+
+
+# ---- okengine#883: the same slug under another CASE is the same page -----------------------
+
+def _entity(root, rel, body="---\ntype: vulnerability\n---\n"):
+    p = root / "wiki" / "entities" / f"{rel}.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(body)
+    return p
+
+
+def test_find_page_finds_an_upper_case_page_by_its_lower_case_slug(tmp_path):
+    """nvd-import looked up `cve-2025-62673`, missed an agent's `CVE-2025-62673.md`, and wrote a
+    lowercase duplicate every day -- which the separator guard then quarantined every day."""
+    m = _mod()
+    upper = _entity(tmp_path, "c/v/CVE-2025-62673")
+    assert m.find_page(tmp_path, "entities", "cve-2025-62673") == upper
+
+
+def test_find_page_prefers_the_exact_spelling_when_both_cases_exist(tmp_path):
+    m = _mod()
+    _entity(tmp_path, "c/v/CVE-2025-62673")
+    lower = _entity(tmp_path, "c/cve-2025-62673")      # shallower, but the exact spelling
+    assert m.find_page(tmp_path, "entities", "cve-2025-62673") == lower
+
+
+def test_find_page_does_not_fold_separators(tmp_path):
+    """Case is the only thing ignored: `agent_tesla` is a collision for review, never the same seat
+    as `agent-tesla` (slug_identity detects it but never authorizes a merge)."""
+    m = _mod()
+    _entity(tmp_path, "a/agent_tesla")
+    assert m.find_page(tmp_path, "entities", "agent-tesla") is None
+
+
+def test_find_page_matches_case_insensitively_without_rglob_case_sensitive(tmp_path, monkeypatch):
+    """Python 3.11 (still supported) has no Path.rglob(case_sensitive=...): the fallback scan must
+    give the same answer."""
+    m = _mod()
+    upper = _entity(tmp_path, "c/v/CVE-2025-62673")
+    real_rglob = pathlib.Path.rglob
+
+    def rglob_311(self, pattern, **kwargs):
+        if kwargs:
+            raise TypeError("rglob() got an unexpected keyword argument 'case_sensitive'")
+        return real_rglob(self, pattern)
+    monkeypatch.setattr(pathlib.Path, "rglob", rglob_311)
+    assert m.find_page(tmp_path, "entities", "cve-2025-62673") == upper
+    assert m.find_page(tmp_path, "entities", "agent-tesla") is None
+
+
+def test_find_page_fallback_scan_ignores_every_other_page(tmp_path, monkeypatch):
+    """The 3.11 fallback scans EVERY page in the namespace, so the stem comparison alone decides
+    what counts: pages that sort before or after the slug -- and sit deeper, so they would win the
+    depth tie-break if admitted -- must never be returned."""
+    m = _mod()
+    upper = _entity(tmp_path, "c/v/CVE-2025-62673")
+    _entity(tmp_path, "a/a/a/a/aaa-sorts-before")
+    _entity(tmp_path, "z/z/z/z/zzz-sorts-after")
+    real_rglob = pathlib.Path.rglob
+
+    def rglob_311(self, pattern, **kwargs):
+        if kwargs:
+            raise TypeError("rglob() got an unexpected keyword argument 'case_sensitive'")
+        return real_rglob(self, pattern)
+    monkeypatch.setattr(pathlib.Path, "rglob", rglob_311)
+    assert m.find_page(tmp_path, "entities", "cve-2025-62673") == upper
+    assert m.find_page(tmp_path, "entities", "CVE-2025-62673") == upper
+
+
+def test_find_page_prefers_the_exact_upper_case_spelling_over_a_deeper_lower_case_copy(tmp_path):
+    """Exact-spelling preference is symmetric: an upper-case slug keeps its own page even when a
+    lower-case copy sits deeper (which would otherwise win the depth tie-break)."""
+    m = _mod()
+    upper = _entity(tmp_path, "c/CVE-2025-62673")
+    _entity(tmp_path, "c/v/e/cve-2025-62673")
+    assert m.find_page(tmp_path, "entities", "CVE-2025-62673") == upper
+
+
+def test_find_page_picks_one_case_variant_deterministically_when_neither_is_exact(tmp_path):
+    """Two case variants of one slug already on disk is a duplicate; neither is the requested
+    spelling. The choice must not depend on directory order: same depth, so the path order
+    decides, and asking in any case returns the same page every run."""
+    m = _mod()
+    first = _entity(tmp_path, "c/v/CVE-2025-62673")
+    _entity(tmp_path, "c/v/Cve-2025-62673")
+    assert m.find_page(tmp_path, "entities", "cve-2025-62673") == first
+    assert m.find_page(tmp_path, "entities", "cVe-2025-62673") == first
+
+
+def test_write_key_never_creates_a_third_copy_beside_two_case_variants(tmp_path):
+    """The seat a direct writer gets for a slug that already exists in two other cases is one of
+    the existing copies, never a fresh lowercase third."""
+    m = _mod()
+    (tmp_path / "schema.yaml").write_text(
+        "partitioning:\n  namespaces:\n    entities: {strategy: by-letter}\n")
+    first = _entity(tmp_path, "c/v/CVE-2025-62673")
+    _entity(tmp_path, "c/v/Cve-2025-62673")
+    key = m.write_key(tmp_path, "entities", "cve-2025-62673", {"type": "vulnerability"})
+    assert key == "entities/c/v/CVE-2025-62673"
+    assert tmp_path / "wiki" / f"{key}.md" == first
+
+
+# ---- okengine#994: a bare reference that opens a YAML flow list is a reference ---------------
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("related: [entities/a/old]", "related: [entities/a/new]"),
+    ("related: [entities/a/old, entities/a/old]", "related: [entities/a/new, entities/a/new]"),
+    ("see [[entities/a/old]]", "see [[entities/a/old]]"),          # a wikilink: not this rewriter's
+    ("see [[entities/a/old|Old]]", "see [[entities/a/old|Old]]"),
+    ("x/entities/a/old", "x/entities/a/old"),                      # a segment of a longer path
+    ("-entities/a/old", "-entities/a/old"),
+    ("entities/a/old-er", "entities/a/old-er"),                    # a longer slug
+])
+def test_the_path_rewriter_takes_a_flow_list_item_and_leaves_wikilinks(text, expected):
+    m = _mod()
+    pat, repl = m.make_path_rewriter({"entities/a/old": "entities/a/new"})
+    assert pat.sub(repl, text) == expected

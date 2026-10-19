@@ -281,3 +281,83 @@ def test_enable_dry_run_uses_effective_set_not_just_explicit():  # invariant-aud
     body = src[src.index("def _cmd_enable"):src.index("def _cmd_disable")]
     assert "effective_enabled" in body, \
         "enable dry-run must build want_ids from effective_enabled, not just load_enabled_state"
+
+
+# --- okengine#994 [26]: a core (default-on) extension must be disableable from the CLI ---------
+
+def _write_core_ext(tmp_path, ext_id="okengine.demo-core"):
+    """A tier-1 `core: true` extension in the isolated engine root (see _isolate_engine_tier)."""
+    d = _write_ext(tmp_path / "_no_engine_exts", ext_id)
+    man = yaml.safe_load((d / "extension.yaml").read_text())
+    man["core"] = True
+    (d / "extension.yaml").write_text(yaml.safe_dump(man), encoding="utf-8")
+    return ext_id
+
+
+def _effective(pack):
+    disc = _disc()
+    exts, errors = disc.discover(pack)
+    assert errors == []
+    return disc.effective_enabled(pack, exts)[0]
+
+
+def test_cli_disable_opts_out_a_core_default_on_extension(tmp_path, capsys):
+    """`disable <core id>` printed "not enabled (nothing to do)" and exited 0 while the extension
+    stayed active: the explicit `enabled:` map never lists a default-on core id. It must write the
+    documented `disabled:` opt-out, drop the lane, and say so."""
+    ext_id = _write_core_ext(tmp_path)
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    assert ext_id in _effective(pack), "fixture premise: a core extension is on by default"
+    assert [j for j in _comp().extension_jobs(pack)[0]], "fixture premise: the core lane runs"
+
+    assert _cli().main(["disable", str(pack), ext_id]) == 0
+    out = capsys.readouterr().out
+    assert f"disabled: {ext_id}" in out and "nothing to do" not in out
+    assert ext_id not in _effective(pack)
+    state = yaml.safe_load((pack / ".okengine" / "extensions.yaml").read_text())
+    assert state["disabled"] == [ext_id] and ext_id not in state["enabled"]
+    assert _comp().extension_jobs(pack) == ([], [])
+
+
+def test_cli_disable_core_is_idempotent_and_reenable_restores_it(tmp_path, capsys):
+    ext_id = _write_core_ext(tmp_path)
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    cli = _cli()
+    assert cli.main(["disable", str(pack), ext_id]) == 0
+    capsys.readouterr()
+    state_file = pack / ".okengine" / "extensions.yaml"
+    before = state_file.read_bytes()
+    assert cli.main(["disable", str(pack), ext_id]) == 0
+    assert f"already disabled (core opt-out): {ext_id}" in capsys.readouterr().out
+    assert state_file.read_bytes() == before, "a repeat disable must not rewrite state"
+    assert cli.main(["enable", str(pack), ext_id]) == 0
+    assert ext_id in _effective(pack)
+    assert "disabled" not in yaml.safe_load(state_file.read_text())
+
+
+def test_cli_disable_non_core_unenabled_stays_a_no_op(tmp_path, capsys):
+    """Negative space: a present, non-core, never-enabled pack extension is still a no-op and
+    writes no state, and an unknown id is not mistaken for a core one."""
+    _write_core_ext(tmp_path)
+    pack = tmp_path / "pack"
+    _write_ext(pack, "demo.alpha")
+    cli = _cli()
+    for ext_id in ("demo.alpha", "demo.unknown"):
+        assert cli.main(["disable", str(pack), ext_id]) == 0
+        assert f"not enabled: {ext_id} (nothing to do)" in capsys.readouterr().out
+    assert not (pack / ".okengine" / "extensions.yaml").exists()
+
+
+def test_cli_disable_refuses_to_guess_core_status_on_broken_discovery(tmp_path, capsys):
+    """With an ambiguous tree (the same id in two tiers) the CLI cannot tell whether the id is a
+    default-on core extension, so it must fail loud and change nothing rather than exit 0."""
+    _write_core_ext(tmp_path, "okengine.demo-core")
+    pack = tmp_path / "pack"
+    _write_ext(pack, "demo.alpha")
+    _write_ext(pack / ".okengine", "demo.alpha")          # operator tier duplicates the pack id
+    assert _cli().main(["disable", str(pack), "okengine.demo-core"]) == 1
+    err = capsys.readouterr().err
+    assert "multiple tiers" in err and "nothing was changed" in err
+    assert not (pack / ".okengine" / "extensions.yaml").exists()

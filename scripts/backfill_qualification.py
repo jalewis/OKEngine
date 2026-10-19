@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+from json import JSONDecodeError
 import re
 import sys
 from datetime import datetime, timezone
@@ -99,7 +100,7 @@ def qualify(pack: Path, since: datetime) -> list[dict]:
                 continue
             try:
                 receipts.append(json.loads(path.read_text()))
-            except (OSError, json.JSONDecodeError):
+            except (OSError, JSONDecodeError):
                 receipts.append({"valid": False, "errors": ["unreadable receipt"]})
         receipt_required = job.get("receipt_mode") == "enforce"
         errors = []

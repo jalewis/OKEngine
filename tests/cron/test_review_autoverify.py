@@ -94,7 +94,8 @@ def test_single_B_holds_but_two_distinct_B_clear(tmp_path):
 def test_linked_source_page_grades_by_publisher(tmp_path):
     v = _vault(tmp_path)
     _page(v / "wiki" / "sources" / "2026" / "07" / "ms-report.md",
-          {"type": "source", "publisher": "Microsoft", "url": "https://example.com/x"})
+          {"type": "source", "publisher": "Microsoft", "url": "https://example.com/x"},
+          "Spider claimed the intrusion at the bank.\n")
     page = v / "wiki" / "entities" / "s" / "spider.md"
     _page(page, {"type": "actor", "name": "Spider", "needs_review": True,
                  "sources": ["sources/2026/07/ms-report"]})
@@ -244,7 +245,8 @@ def test_two_pages_same_publisher_are_one_voice_not_corroboration(tmp_path):
     v = _vault(tmp_path)
     for i in (1, 2):
         _page(v / "wiki" / "sources" / "2026" / "07" / f"urlhaus-{i}.md",
-              {"type": "source", "publisher": "URLhaus", "url": f"https://example.com/{i}"})
+              {"type": "source", "publisher": "URLhaus", "url": f"https://example.com/{i}"},
+              "SameVoice claimed the attack. Mixed claimed the breach.\n")
     same = v / "wiki" / "entities" / "s" / "same-voice.md"
     _page(same, {"type": "actor", "name": "SameVoice", "needs_review": True,
                  "sources": ["sources/2026/07/urlhaus-1", "sources/2026/07/urlhaus-2"]})
@@ -354,7 +356,7 @@ def test_yaml_true_text_with_nonboolean_decoded_value_is_skipped(tmp_path,monkey
 SELF_SCHEMA = SCHEMA + "types:\n  source: {required: [type]}\n"
 
 
-def _src(vault, rel, publisher=None, flagged=True):
+def _src(vault, rel, publisher=None, flagged=True, body="body"):
     p = vault / "wiki" / f"{rel}.md"
     p.parent.mkdir(parents=True, exist_ok=True)
     fm = "---\ntype: source\n"
@@ -362,7 +364,7 @@ def _src(vault, rel, publisher=None, flagged=True):
         fm += f"publisher: {publisher}\n"
     if flagged:
         fm += "needs_review: true\n"
-    p.write_text(fm + "---\n\nbody\n", encoding="utf-8")
+    p.write_text(fm + f"---\n\n{body}\n", encoding="utf-8")
     return p
 
 
@@ -724,7 +726,7 @@ def test_more_corroboration_than_the_bar_still_clears(tmp_path, capsys):
                                                 "  URLhaus: {reliability: B}\n  ThirdWire: {reliability: B}"),
         encoding="utf-8")
     for n, pub in (("b1", "MISP galaxy"), ("b2", "URLhaus"), ("b3", "ThirdWire")):
-        _src(v, f"sources/{n}", pub, flagged=False)
+        _src(v, f"sources/{n}", pub, flagged=False, body="X claimed the attack.")
     p = v / "wiki" / "entities" / "x.md"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("---\ntype: actor\nneeds_review: true\nsources:\n"
@@ -940,7 +942,8 @@ def test_consensus_counts_publishers_not_pages(tmp_path):
     v = _vault(tmp_path)
     for n in ("one", "two"):
         _page(v / "wiki" / "sources" / f"{n}.md",
-              {"type": "source", "publisher": "MISP galaxy", "published": "2026-01-01"})
+              {"type": "source", "publisher": "MISP galaxy", "published": "2026-01-01"},
+              "APT Dup claimed the attack.\n")
     page = v / "wiki" / "entities" / "a" / "apt-dup.md"
     _page(page, {"type": "actor", "name": "APT Dup", "needs_review": True,
                  "sources": ["sources/one", "sources/two"]})
@@ -1534,3 +1537,322 @@ def test_governed_subject_scan_survives_every_unreadable_page(tmp_path, capsys):
     for slug in ("skipped", "hidden", "raw"):
         assert _fm(v / "wiki" / "entities" / "a" / f"{slug}.md")["attribution_confidence"] == "high", (
             f"{slug}: an unreadable or name-skipped page governs nothing")
+
+
+# --- okengine#820: re-stamping must not orphan a wrapped value's continuation lines.
+# yaml.safe_dump wraps a long scalar, and this lane's own basis string is long. Stripping the stamp
+# with `^key:.*$` removed the first physical line only; the indented remainder was pulled tight
+# against the PRECEDING key by the blank-line squeeze, and YAML folded it into that key's value.
+# On one live vault: `actor_type: cybercriminal` -> "cybercriminal Malpedia'" and 87 pages besides,
+# one of which (`recent_news: 0 Malpedia'`) crashed a consumer's int() and killed a lane for 20 days.
+
+
+def _wrapped_page(tmp_path, extra_lines):
+    """A page whose stamp has been re-dumped by ANOTHER lane, so its long basis is WRAPPED.
+
+    This lane writes its own stamp on one line; the wrap appears when an importer (or any lane that
+    parses and re-dumps a page) runs `yaml.safe_dump`, whose default width is 80. The corpus form is
+    exactly the pair below. The corruption therefore needs both writers, which is why it surfaced
+    only once the basis grew past the wrap point.
+    """
+    v = _vault(tmp_path)
+    _page(v / "wiki" / "sources" / "2026" / "07" / "ms.md",
+          {"type": "source", "publisher": "Microsoft", "url": "https://example.com/a"},
+          "Actor X claimed the attack.\n")
+    page = v / "wiki" / "entities" / "a" / "actor-x.md"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    page.write_text(
+        "---\n"
+        "type: actor\n"
+        "name: Actor X\n"
+        "needs_review: true\n"
+        "sources:\n- sources/2026/07/ms\n"
+        + extra_lines +
+        "auto_verified_basis: '1 A-grade source: Microsoft; 2 B-grade sources: MISP galaxy,\n"
+        "  Malpedia'\n"
+        "auto_verified_at: '2026-09-01T00:00:00Z'\n"
+        "---\n\nbody\n", encoding="utf-8")
+    assert _load(v).main([]) == 0
+    return page
+
+
+def test_a_wrapped_basis_does_not_leak_into_the_preceding_key(tmp_path):
+    page = _wrapped_page(tmp_path, "actor_type: cybercriminal\nstatus: active\n")
+    fm = _fm(page)
+    assert fm["actor_type"] == "cybercriminal", fm["actor_type"]
+    assert fm["status"] == "active", fm["status"]
+    assert "Malpedia" not in page.read_text(encoding="utf-8"), "orphaned continuation survived"
+
+
+def test_no_orphaned_continuation_line_breaks_a_numeric_field(tmp_path):
+    """`recent_news: 0 Malpedia'` is what crashed a consumer's int() and killed a lane for 20 days."""
+    page = _wrapped_page(tmp_path, "version: 2\nrecent_news: 0\nconfidence: medium\n")
+    fm = _fm(page)
+    assert fm["version"] == 2 and isinstance(fm["version"], int), fm["version"]
+    assert fm["recent_news"] == 0 and isinstance(fm["recent_news"], int), fm["recent_news"]
+    assert fm["confidence"] == "medium", fm["confidence"]
+
+
+@pytest.mark.parametrize("dumped", [True, False], ids=["safe_dump-shape", "indented-shape"])
+def test_the_stamp_regex_consumes_block_sequences_too(tmp_path, dumped):
+    """A stripped key whose value is a block sequence must go entirely, not leave its items.
+
+    Parametrized over both layouts on purpose. `yaml.safe_dump` emits sequence items UNINDENTED
+    (`consensus:\n- one`), and an earlier version of this test used the indented form only — so it
+    passed against a regex that walked straight past the real shape, leaving `- one` orphaned at
+    column 0 and making the whole frontmatter unparseable.
+    """
+    m = _load(_vault(tmp_path))
+    if dumped:
+        block = yaml.safe_dump({"consensus": ["one", "two"]}, sort_keys=False,
+                               default_flow_style=False)
+        assert "\n- one" in block, "safe_dump is expected to emit items unindented"
+    else:
+        block = "consensus:\n  - one\n  - two\n"
+    head = "type: actor\nstatus: active\n" + block + "version: 3\n"
+    out = m._STAMP_KEY_RE.sub("", head)
+    out = "\n".join(line for line in out.splitlines() if line.strip())
+    parsed = yaml.safe_load(out)
+    assert parsed == {"type": "actor", "status": "active", "version": 3}, parsed
+
+
+# ---- a basis must not leave the page contradicting itself (okengine#563) ------------------------
+
+def test_stamping_an_outranking_basis_drops_the_stale_page_grade(tmp_path, capsys):
+    """Live finding: a model lane copied a source's `reliability: B` onto an actor; this lane later
+    stamped "1 A-grade source" and the page then contradicted itself, so the write path refused every
+    later write to it (nine pages on one vault, Gallium among them)."""
+    v = _vault(tmp_path)
+    page = v / "wiki" / "entities" / "g" / "gallium.md"
+    _page(page, {"type": "actor", "name": "GALLIUM", "needs_review": True,
+                 "reliability": "B", "credibility": 3, "sources": ["Microsoft"]})
+    assert _load(v).main([]) == 0
+    fm = _fm(page)
+    assert "A-grade" in fm["auto_verified_basis"]
+    assert "reliability" not in fm and "credibility" not in fm
+    assert "drop entities/g/gallium.md: page reliability B contradicts" in capsys.readouterr().out
+    import sys
+    sys.path.insert(0, str(REPO))
+    from tools import schema_validator
+    assert schema_validator._contradicting_grade_reason("entities/g/gallium.md", fm) is None, \
+        "the stamped page must pass the write path's own contradiction rule"
+
+
+def test_a_grade_the_basis_supports_is_kept(tmp_path):
+    v = _vault(tmp_path)
+    page = v / "wiki" / "entities" / "a" / "apt-y.md"
+    _page(page, {"type": "actor", "name": "APT Y", "needs_review": True,
+                 "reliability": "A", "credibility": 2, "sources": ["Microsoft"]})
+    assert _load(v).main([]) == 0
+    fm = _fm(page)
+    assert fm["reliability"] == "A" and fm["credibility"] == 2
+
+
+def test_a_source_page_keeps_its_own_grade(tmp_path):
+    """On a source the Admiralty grade grades that source; only knowledge pages are corrected."""
+    v = _vault(tmp_path)
+    page = v / "wiki" / "sources" / "s" / "report.md"
+    _page(page, {"type": "source", "needs_review": True, "reliability": "C",
+                 "sources": ["Microsoft"]})
+    assert _load(v).main([]) == 0
+    assert _fm(page).get("reliability") == "C"
+
+
+@pytest.mark.parametrize("fm", [
+    {"reliability": "B", "auto_verified_basis": "1 A-grade source: Microsoft"},
+    {"reliability": "F", "auto_verified_basis": "2 B-grade sources: X, Y; 1 A-grade source: Z"},
+    {"reliability": "A", "auto_verified_basis": "1 A-grade source: Microsoft"},
+    {"reliability": "C", "auto_verified_basis": "2 B-grade sources: X, Y"},
+    {"reliability": "B"}, {"auto_verified_basis": "1 A-grade source: M"},
+    {"reliability": "Z", "auto_verified_basis": "1 A-grade source: M"}, {},
+    {"reliability": "b", "auto_verified_basis": "1 A-grade source: M"},
+])
+def test_the_shared_rule_agrees_with_the_write_paths(fm):
+    """Two surfaces judge the same contradiction: the baked validator and schema_lib (autoverify,
+    corpus audit). A rule that disagrees between them is the trap this fix closes."""
+    import sys
+    sys.path.insert(0, str(REPO))
+    sys.path.insert(0, str(REPO / "scripts" / "cron"))
+    import schema_lib
+    from tools import schema_validator
+    assert bool(schema_lib.contradicting_reliability(fm)) == \
+        bool(schema_validator._contradicting_grade_reason("entities/x.md", fm))
+
+
+def test_the_shared_rule_judges_a_basis_about_to_be_stamped():
+    import sys
+    sys.path.insert(0, str(REPO / "scripts" / "cron"))
+    import schema_lib
+    assert schema_lib.contradicting_reliability({"reliability": "C"}, "1 A-grade source: M") == ("C", "A")
+    assert schema_lib.contradicting_reliability({"reliability": "C"}, "") is None
+
+
+def test_a_declared_actor_type_whose_evidence_defines_a_non_actor_is_held(tmp_path, capsys):
+    """okengine#1020: the contradiction hold reads every type the schema declares `role: actor`.
+    Red before: only `type: actor` was checked, so an A-grade source cleared this page."""
+    v = _vault(tmp_path, SCHEMA + "  intrusion-set: {required: [type], role: actor}\n")
+    page = v / "wiki" / "entities" / "t" / "terminalfix.md"
+    _page(
+        page,
+        {"type": "intrusion-set", "title": "TerminalFix", "needs_review": True,
+         "sources": ["Microsoft"]},
+        "A new ClickFix variant, dubbed TerminalFix, tricks users into running commands.",
+    )
+    assert _load(v).main([]) == 0
+    assert _fm(page)["needs_review"] is True
+    assert "actor evidence defines a clickfix variant" in capsys.readouterr().out
+
+
+def test_an_undeclared_type_is_not_read_as_an_actor(tmp_path):
+    v = _vault(tmp_path, SCHEMA + "  intrusion-set: {required: [type]}\n")
+    page = v / "wiki" / "entities" / "t" / "terminalfix.md"
+    _page(page, {"type": "intrusion-set", "title": "TerminalFix", "needs_review": True,
+                 "sources": ["Microsoft"]},
+          "A new ClickFix variant, dubbed TerminalFix, tricks users into running commands.")
+    assert _load(v).main([]) == 0
+    assert "needs_review" not in _fm(page)
+
+
+# --- okengine#1014: an actor its cited sources do not ground is held ---------------------------------
+
+def test_an_ungrounded_actor_is_held_even_with_a_grade_a_source(tmp_path, capsys):
+    """Red before okengine#1014: an A-grade source that only says the sandbox vendor IDENTIFIED a
+    phishkit cleared an `ANY.RUN` actor, because the hold read only the page's own profile."""
+    v = _vault(tmp_path)
+    _page(v / "wiki" / "sources" / "2026" / "10" / "wazza.md",
+          {"type": "source", "publisher": "Microsoft", "id": "src:wazza"},
+          "ANY.RUN has identified Wazza, a new phishkit targeting banks.\n")
+    page = v / "wiki" / "entities" / "a" / "anyrun.md"
+    _page(page, {"type": "actor", "name": "ANY.RUN", "needs_review": True,
+                 "sources": ["src:wazza"]}, "ANY.RUN is a threat group.\n")
+    assert _load(v).main([]) == 0
+    assert _fm(page)["needs_review"] is True
+    assert "not grounded in its cited sources (source_defines_non_actor" in capsys.readouterr().out
+
+
+def test_a_grounded_actor_still_clears_and_an_unverifiable_one_keeps_its_honest_stamp(tmp_path):
+    """The hold is for sources that do not ground the actor. A page with no resolvable source is
+    unverifiable, and okengine#554/#563 publish it as `unverified-no-evidence`, unchanged."""
+    v = _vault(tmp_path)
+    _page(v / "wiki" / "sources" / "2026" / "10" / "crew.md",
+          {"type": "source", "publisher": "Microsoft", "id": "src:crew"},
+          "Night Crew claimed the intrusion at a regional bank.\n")
+    grounded = v / "wiki" / "entities" / "n" / "night-crew.md"
+    _page(grounded, {"type": "actor", "name": "Night Crew", "needs_review": True,
+                     "sources": ["sources/2026/10/crew"]})
+    dangling = v / "wiki" / "entities" / "d" / "dangling.md"
+    _page(dangling, {"type": "actor", "name": "Dangling", "needs_review": True,
+                     "sources": ["sources/2026/10/missing"]})
+    assert _load(v).main([]) == 0
+    assert _fm(grounded)["review_status"] == "auto-verified"
+    assert _fm(dangling)["review_status"] == "unverified-no-evidence"
+
+
+def test_the_source_index_is_built_only_when_an_actor_needs_it(tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    _page(v / "wiki" / "sources" / "a.md", {"type": "source", "publisher": "Microsoft"})
+    m = _load(v)
+    calls = []
+    monkeypatch.setattr(m, "_source_ids", lambda: calls.append(1) or {})
+    assert m.main([]) == 0
+    assert calls == [], "no actor page, no source scan"
+    unreadable = v / "wiki" / "sources" / "b.md"
+    unreadable.mkdir(parents=True)
+    _page(v / "wiki" / "sources" / "c.md", {"type": "source", "id": 7})
+    _page(v / "wiki" / "sources" / "d.md", {"type": "source", "id": "src:d"})
+    assert _load(v)._source_ids() == {"src:d": "sources/d"}
+
+
+def test_a_curated_label_vouches_beside_a_source_that_does_not_affirm(tmp_path):
+    """The hold uses the corpus audit's verdict, where the importer's curated label vouches."""
+    v = _vault(tmp_path)
+    _page(v / "wiki" / "sources" / "2026" / "10" / "mention.md",
+          {"type": "source", "publisher": "Microsoft"}, "Night Crew was mentioned in passing.\n")
+    page = v / "wiki" / "entities" / "n" / "night-crew.md"
+    _page(page, {"type": "actor", "name": "Night Crew", "needs_review": True,
+                 "sources": ["sources/2026/10/mention", "MITRE ATT&CK"]})
+    assert _load(v).main([]) == 0
+    assert _fm(page)["review_status"] == "auto-verified"
+
+
+# --- v0.15.11 audit: declared actor types and walk-up sub-domains ------------------------------------
+
+_DECLARED = (SCHEMA + "  intrusion-set: {required: [type], role: actor}\n"
+             "type_aliases: {apt-group: intrusion-set}\n")
+
+
+@pytest.mark.parametrize("ptype", ["intrusion-set", "Intrusion-Set", "apt-group"])
+def test_a_declared_actor_type_publishes_like_an_actor(tmp_path, ptype):
+    """Red before: the always-publish default was the literal {"actor"}, so a `role: actor` type
+    with weak evidence went back behind the evidence bar #554 removed (874 of 1,209 actor pages)."""
+    v = _vault(tmp_path, _DECLARED)
+    page = v / "wiki" / "entities" / "n" / "no-evidence.md"
+    _page(page, {"type": ptype, "name": "NoEvidence", "needs_review": True})
+    assert _load(v).main([]) == 0
+    fm = _fm(page)
+    assert "needs_review" not in fm and fm["review_status"] == "unverified-no-evidence", fm
+
+
+def test_a_declared_actor_type_keeps_the_grounding_and_contradiction_holds(tmp_path):
+    v = _vault(tmp_path, _DECLARED)
+    _page(v / "wiki" / "sources" / "wazza.md", {"type": "source", "publisher": "Microsoft"},
+          "ANY.RUN has identified Wazza, a new phishkit targeting banks.\n")
+    ungrounded = v / "wiki" / "entities" / "a" / "anyrun.md"
+    _page(ungrounded, {"type": "intrusion-set", "name": "ANY.RUN", "needs_review": True,
+                       "sources": ["sources/wazza"]})
+    variant = v / "wiki" / "entities" / "t" / "terminalfix.md"
+    _page(variant, {"type": "intrusion-set", "name": "TerminalFix", "needs_review": True},
+          "A new ClickFix variant, dubbed TerminalFix, tricks users into running commands.\n")
+    assert _load(v).main([]) == 0
+    assert _fm(ungrounded)["needs_review"] is True
+    assert _fm(variant)["needs_review"] is True
+
+
+def test_an_explicit_list_overrides_and_warns_about_a_left_out_actor_type(tmp_path, capsys):
+    schema = _DECLARED.replace("types:\n", "review_autoverify:\n  always_publish_types: [actor]\n"
+                                           "types:\n", 1)
+    v = _vault(tmp_path, schema)
+    page = v / "wiki" / "entities" / "n" / "no-evidence.md"
+    _page(page, {"type": "intrusion-set", "name": "NoEvidence", "needs_review": True})
+    assert _load(v).main([]) == 0
+    assert _fm(page)["needs_review"] is True, "the pack's explicit list is taken as written"
+    out = capsys.readouterr().out
+    assert "WARN: actor type 'intrusion-set' is not in review_autoverify.always_publish_types" in out
+    assert out.count("WARN: actor type 'intrusion-set'") == 1
+    assert "WARN: actor type 'actor'" not in out
+
+
+def test_a_sub_domain_declared_actor_type_is_judged_by_its_own_schema(tmp_path, capsys):
+    """Red before: the lane read only the ROOT schema, so a sub-domain's `role: actor` was invisible
+    and its ungrounded page was cleared on its A-grade source."""
+    v = _vault(tmp_path, SCHEMA + "  intrusion-set: {required: [type]}\n")
+    sub = v / "wiki" / "cti"
+    sub.mkdir(parents=True)
+    (sub / "schema.yaml").write_text("types:\n  intrusion-set: {required: [type], role: actor}\n"
+                                     "  source: {required: [type]}\n", encoding="utf-8")
+    _page(v / "wiki" / "sources" / "wazza.md", {"type": "source", "publisher": "Microsoft"},
+          "ANY.RUN has identified Wazza, a new phishkit targeting banks.\n")
+    page = sub / "entities" / "anyrun.md"
+    _page(page, {"type": "intrusion-set", "name": "ANY.RUN", "needs_review": True,
+                 "sources": ["sources/wazza"]})
+    root_page = v / "wiki" / "entities" / "anyrun.md"
+    _page(root_page, {"type": "intrusion-set", "name": "ANY.RUN", "needs_review": True,
+                      "sources": ["sources/wazza"]})
+    assert _load(v).main([]) == 0
+    assert _fm(page)["needs_review"] is True, capsys.readouterr().out
+    assert "needs_review" not in _fm(root_page), "the root does not declare the type"
+
+
+def test_a_sub_domain_actor_type_left_out_of_an_explicit_list_warns_once(tmp_path, capsys):
+    v = _vault(tmp_path, SCHEMA.replace("types:\n", "review_autoverify:\n  always_publish_types: "
+                                         "[actor]\ntypes:\n", 1))
+    sub = v / "wiki" / "cti"
+    sub.mkdir(parents=True)
+    (sub / "schema.yaml").write_text("types:\n  intrusion-set: {required: [type], role: actor}\n",
+                                     encoding="utf-8")
+    for slug in ("a", "b"):
+        _page(sub / "entities" / f"{slug}.md", {"type": "intrusion-set", "name": slug.upper(),
+                                                 "needs_review": True})
+    assert _load(v).main([]) == 0
+    out = capsys.readouterr().out
+    assert out.count("WARN: actor type 'intrusion-set' is not in review_autoverify") == 1, out

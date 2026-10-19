@@ -56,12 +56,12 @@ def test_basename_fallback_blocks_symlink_that_resolves_outside_vault(tmp_path, 
             "escaped", wiki=wiki, skip=lambda _name: False, excluded_dirs=lambda: set(),
             namespaces=lambda _path: set(),
             within=lambda root, path: path.resolve().is_relative_to(root.resolve()),
-            split_frontmatter=module.split_fm,
+            tombstoned=module._tombstoned,
         )
     assert error.value.status_code == 403
 
 
-def test_tombstoned_skipped_exact_page_reaches_final_block_guard(tmp_path, monkeypatch):
+def test_tombstoned_exact_page_is_not_found_rather_than_served(tmp_path, monkeypatch):
     wiki = tmp_path / "wiki"
     page = wiki / "entities" / "blocked.md"
     page.parent.mkdir(parents=True)
@@ -73,9 +73,9 @@ def test_tombstoned_skipped_exact_page_reaches_final_block_guard(tmp_path, monke
             "entities/blocked", wiki=wiki, skip=lambda name: name == "blocked.md",
             excluded_dirs=lambda: set(), namespaces=lambda _path: set(),
             within=lambda root, path: path.resolve().is_relative_to(root.resolve()),
-            split_frontmatter=module.split_fm,
+            tombstoned=module._tombstoned,
         )
-    assert error.value.status_code == 403
+    assert error.value.status_code == 404
 
 
 def test_basic_auth_rejects_bad_credentials_and_allows_health(tmp_path, monkeypatch):
@@ -419,15 +419,14 @@ def test_backlink_scan_build_artifact_and_cache_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(m.time, "time", lambda: now)
     assert m._artifact_backlinks()["concepts/topic"]
     assert m._artifact_backlinks()["concepts/topic"]
+    # okengine#1017: each rewrite lands in the same timestamp tick as the cached read (mtime
+    # pinned), as it does on a fast disk; the cache must still notice it.
+    pinned = artifact.stat().st_mtime_ns
     artifact.write_text("{bad")
-    # Force an observably newer artifact even on coarse-resolution CI filesystems;
-    # a same-tick rewrite legitimately retains the mtime-keyed cache entry.
-    os.utime(artifact, (now + 2, now + 2))
+    os.utime(artifact, ns=(pinned, pinned))
     assert m._artifact_backlinks() is None
     artifact.write_text('{"wrong":[]}')
-    # A rewrite can land on the original cached mtime (especially on fast/coarse CI filesystems),
-    # in which case returning the cached map is correct. Make this malformed shape observably newer.
-    os.utime(artifact, (now + 4, now + 4))
+    os.utime(artifact, ns=(pinned, pinned))
     assert m._artifact_backlinks() is None
 
     artifact.unlink()
@@ -592,3 +591,215 @@ def test_backlink_filter_build_and_refresh_lock_branches(tmp_path, monkeypatch):
             return False
     monkeypatch.setattr(m, "_BL_LOCK", Locked())
     assert m._refresh_backlinks_async() is None
+
+
+def test_backlinks_endpoint_never_waits_for_the_graph_build(tmp_path, monkeypatch):
+    """The graph is prewarmed in the background at startup so a request never blocks on the
+    build. While it is still building, the endpoint answers with what is ready (nothing),
+    instead of waiting for the build to finish."""
+    (tmp_path / "wiki").mkdir()
+    m = _load(tmp_path, monkeypatch)
+    built = {"entities/a/alpha": [{"path": "sources/one"}]}
+
+    def load_backlinks(blocking=False):
+        return built if blocking else {}   # a waiting caller would get the finished graph
+
+    monkeypatch.setattr(m, "_load_backlinks", load_backlinks)
+    result = m.api_backlinks("entities/a/alpha")
+    assert result == {"path": "entities/a/alpha", "count": 0, "backlinks": []}
+
+
+def _directory_index():
+    sys.path.insert(0, str(APP.parent))
+    import directory_index
+    return directory_index
+
+
+@pytest.mark.parametrize("text,limit,length", [
+    # an envelope inside the head: just the head
+    ("---\ntype: a\n---\nbody body body\n", 20, 20),
+    # a closing delimiter past the head: read on, doubling the head, through it
+    ("---\n" + "x: 1\n" * 10 + "---\nbody\n" + "tail\n" * 10, 8, 64),
+    # the delimiter straddles a chunk boundary
+    ("---\nab\n---\nbody\n" + "tail\n" * 10, 8, 16),
+    # the first newline itself lies past the head
+    ("---" + " " * 20 + "\na: 1\n---\nbody\n", 4, 32),
+    # a delimiter right after the opener line is the earliest possible close
+    ("---\n\n---\nbody\n", 4, 8),
+    # ...but the opener's own newline cannot double as the closing one
+    ("---\n---\nab\n---\nbody\n" + "tail\n" * 10, 4, 16),
+    # never closed: the whole file, then stop
+    ("---\na: 1\nb: 2\n", 4, 14),
+    # no envelope: the head only
+    ("plain text that is long\n", 5, 5),
+])
+def test_read_head_extends_through_the_frontmatter_envelope(tmp_path, text, limit, length):
+    page = tmp_path / "page.md"
+    page.write_text(text)
+    assert _directory_index().read_head(page, limit) == text[:length]
+
+
+def test_read_head_reads_no_further_than_the_closing_chunk(tmp_path):
+    page = tmp_path / "page.md"
+    page.write_text("---\n" + "k: v\n" * 4 + "---\n" + "body\n" * 100)
+    assert _directory_index().read_head(page, 8) == ("---\n" + "k: v\n" * 4 + "---\nbody\nbo")[:32]
+
+
+def test_backlink_artifact_same_size_rewrite_within_one_tick_is_reloaded(tmp_path, monkeypatch):
+    """okengine#1017: the artifact cache was keyed on mtime alone, so a rebuild landing in the
+    same timestamp tick as the previous read kept serving the old backlink map."""
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    m = _load(tmp_path, monkeypatch)
+    artifact = wiki / ".backlinks.json"
+    artifact.write_text('{"backlinks":{"concepts/aaa":[]}}')
+    assert set(m._artifact_backlinks()) == {"concepts/aaa"}
+    before = artifact.stat()
+    artifact.write_text('{"backlinks":{"concepts/bbb":[]}}')
+    os.utime(artifact, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert set(m._artifact_backlinks()) == {"concepts/bbb"}
+
+
+def test_root_namespaces_see_a_same_size_schema_rewrite_within_one_tick(tmp_path):
+    """okengine#1017: the declared-namespace cache was keyed on the schema's mtime alone, so a
+    schema edited within the same timestamp tick kept the previous namespace set."""
+    module = _directory_index()
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    schema = tmp_path / "schema.yaml"
+    schema.write_text("partitioning: {namespaces: {aaa: {}}}\n", encoding="utf-8")
+    assert module._root_namespaces(wiki) == {"aaa"}
+    before = schema.stat()
+    schema.write_text("partitioning: {namespaces: {bbb: {}}}\n", encoding="utf-8")
+    os.utime(schema, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert module._root_namespaces(wiki) == {"bbb"}
+
+
+def test_page_revision_changes_on_a_same_size_rewrite_within_one_tick(tmp_path):
+    """okengine#1017: the revision was mtime_ns:size, so render-lint skipped a page rewritten with
+    the same size in the same timestamp tick as if it were unchanged."""
+    module = _directory_index()
+    page = tmp_path / "page.md"
+    page.write_text("body aaa\n", encoding="utf-8")
+    first = module._revision(page, page.stat())
+    before = page.stat()
+    page.write_text("body bbb\n", encoding="utf-8")
+    os.utime(page, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert module._revision(page, page.stat()) != first
+
+
+_SETTLED = 10 * 1_000_000_000  # well past file_fingerprint's settle window
+
+
+def _restat(st, **changes):
+    """A stat result with some fields replaced: a ctime, inode or device change made exactly,
+    rather than hoping the filesystem clock ticks between two calls."""
+    fields = {name: getattr(st, name)
+              for name in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_mode")}
+    fields.update(changes)
+    return SimpleNamespace(**fields)
+
+
+def _newest(st) -> int:
+    return max(st.st_mtime_ns, st.st_ctime_ns)
+
+
+def test_a_settled_page_revision_is_the_legacy_mtime_size_token(tmp_path):
+    """okengine#1023: render-lint stores this token per page. v0.15.10 changed its format and so
+    invalidated every stored check; a settled page must carry exactly the pre-v0.15.10 token."""
+    module = _directory_index()
+    page = tmp_path / "page.md"
+    page.write_text("settled body\n", encoding="utf-8")
+    st = page.stat()
+    assert module._revision(page, st, _newest(st) + _SETTLED) == f"{st.st_mtime_ns}:{st.st_size}"
+
+
+@pytest.mark.parametrize("change", [
+    pytest.param(lambda st: {"st_ctime_ns": st.st_ctime_ns + 3_000_000_000}, id="chmod-ctime-only"),
+    pytest.param(lambda st: {"st_ino": st.st_ino + 1, "st_dev": st.st_dev + 1}, id="restore-or-move"),
+])
+def test_a_metadata_only_change_keeps_a_settled_page_revision(tmp_path, change):
+    """okengine#1023: a chmod -R, a backup restore or a vault move changes ctime, inode or device
+    but not the content, and must not send every page back to render-lint."""
+    module = _directory_index()
+    page = tmp_path / "page.md"
+    page.write_text("settled body\n", encoding="utf-8")
+    st = page.stat()
+    moved = _restat(st, **change(st))
+    before = module._revision(page, st, _newest(st) + _SETTLED)
+    assert module._revision(page, moved, _newest(moved) + _SETTLED) == before
+
+
+def test_a_same_tick_same_size_rewrite_of_an_unsettled_page_changes_its_revision(tmp_path):
+    """The okengine#1017 protection the legacy token alone lacks: inside the settle window the
+    content digest tells two same-size, same-mtime versions apart."""
+    module = _directory_index()
+    page = tmp_path / "page.md"
+    page.write_text("body aaa\n", encoding="utf-8")
+    st = page.stat()
+    first = module._revision(page, st, _newest(st))
+    page.write_text("body bbb\n", encoding="utf-8")
+    os.utime(page, ns=(st.st_atime_ns, st.st_mtime_ns))
+    rewritten = _restat(page.stat(), st_ctime_ns=st.st_ctime_ns)
+    assert rewritten.st_size == st.st_size and rewritten.st_mtime_ns == st.st_mtime_ns
+    assert module._revision(page, rewritten, _newest(st)) != first
+
+
+def test_a_page_changes_revision_at_most_once_as_it_settles(tmp_path):
+    """okengine#1023: render-lint re-checks a page each time its token changes. A fresh page seen
+    unsettled, then touched by a chmod inside the window, then settled, has one content and must
+    present at most two tokens (one re-check), not three."""
+    module = _directory_index()
+    page = tmp_path / "page.md"
+    page.write_text("fresh body\n", encoding="utf-8")
+    st = page.stat()
+    chmodded = _restat(st, st_ctime_ns=st.st_ctime_ns + 500_000_000)
+    seen = [
+        module._revision(page, st, _newest(st)),
+        module._revision(page, chmodded, _newest(chmodded)),
+        module._revision(page, chmodded, _newest(chmodded) + _SETTLED),
+    ]
+    assert seen[0] == seen[1], "a ctime-only change inside the window must not re-check the page"
+    assert len(set(seen)) == 2, seen
+
+
+def test_page_revision_is_empty_when_the_page_vanishes_mid_read(tmp_path):
+    module = _directory_index()
+    page = tmp_path / "page.md"
+    page.write_text("body\n", encoding="utf-8")
+    stat = page.stat()
+    page.unlink()
+    assert module._revision(page, stat) == ""
+
+
+def test_an_unchanged_backlink_artifact_is_served_from_the_reader_cache(tmp_path, monkeypatch):
+    """The fingerprint comparison must be equality: a fresh key tuple is never identical, so an
+    identity check would re-parse the artifact on every request."""
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    m = _load(tmp_path, monkeypatch)
+    (wiki / ".backlinks.json").write_text('{"backlinks":{"concepts/aaa":[]}}')
+    first = m._artifact_backlinks()
+    assert m._artifact_backlinks() is first
+
+
+def test_revision_inventory_skips_only_a_page_that_vanished_mid_scan(tmp_path, monkeypatch):
+    """A page that disappears between stat and hash is left out; the scan continues."""
+    module = _directory_index()
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    for name in ("a", "b", "c"):
+        (wiki / f"{name}.md").write_text(name, encoding="utf-8")
+    real = module._revision
+    calls = []
+
+    def first_vanishes(path, stat):
+        calls.append(path)
+        return "" if len(calls) == 1 else real(path, stat)
+
+    monkeypatch.setattr(module, "_revision", first_vanishes)
+    response, _cache = module.revision_inventory(
+        wiki=wiki, cache=(float("-inf"), []), ttl=0, excluded_dirs=frozenset,
+        skip=lambda _name: False, reserved=lambda _path: False, namespaces=lambda _path: frozenset())
+    assert len(calls) == 3
+    assert len(response["pages"]) == 2

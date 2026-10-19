@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import difflib
 import hashlib
 import importlib.util
@@ -12,6 +13,7 @@ import sys
 from pathlib import Path
 
 import yaml
+from yaml import YAMLError
 
 ENGINE = Path(__file__).resolve().parent.parent
 BASE = ENGINE / "templates/pack/skeleton/docker-compose.yml"
@@ -45,7 +47,7 @@ def _init_module():
 def _pack(pack: Path) -> dict:
     try:
         value = yaml.safe_load((pack / "pack.yaml").read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
+    except (OSError, YAMLError) as exc:
         raise DeploymentError(f"cannot load pack.yaml: {exc}") from exc
     if not isinstance(value, dict) or not value.get("name"):
         raise DeploymentError("pack.yaml must declare name")
@@ -126,13 +128,30 @@ def render(pack: Path) -> str:
     return yaml.safe_dump(base, sort_keys=False, width=1000)
 
 
+# Copies of a pack inside a pack: `framework backup` staging (hardlinks of the whole corpus) and
+# backups, and `framework upgrade` snapshot trees. Their pack.yaml is not a deployment (okengine#1032).
+_NESTED_COPY_DIRS = ("backups", "snapshots")
+
+
+def _nested_copy(path: Path) -> bool:
+    """Whether `path` lies inside a pack's `.okengine/backups` or `.okengine/snapshots` (judged on
+    the absolute path, so a scan rooted inside `.okengine` is covered too)."""
+    parts = path.resolve().parts
+    return any(a == ".okengine" and b in _NESTED_COPY_DIRS for a, b in zip(parts, parts[1:]))
+
+
 def discover_packs(roots: list[Path]) -> list[Path]:
     packs = set()
     for root in roots:
-        if (root / "pack.yaml").is_file():
+        if (root / "pack.yaml").is_file() and not _nested_copy(root):
             packs.add(root.resolve())
         elif root.is_dir():
-            packs.update(path.parent.resolve() for path in root.rglob("pack.yaml"))
+            for dirpath, dirnames, filenames in os.walk(root):
+                here = Path(dirpath)
+                # never descend into a pack's backups or snapshot trees
+                dirnames[:] = [n for n in dirnames if not _nested_copy(here / n)]
+                if "pack.yaml" in filenames and not _nested_copy(here):
+                    packs.add(here.resolve())
     return sorted(packs)
 
 
@@ -151,7 +170,7 @@ def parity(roots: list[Path]) -> list[str]:
             current = (pack / "docker-compose.yml").read_text(encoding="utf-8")
             if current != effective:
                 errors.append(f"{pack}: docker-compose.yml differs from engine render")
-        except (DeploymentError, OSError, ValueError, yaml.YAMLError) as exc:
+        except (DeploymentError, OSError, ValueError, YAMLError) as exc:
             errors.append(f"{pack}: {exc}")
     return errors
 
@@ -221,7 +240,7 @@ def main(argv: list[str]) -> int:
         print(f"migrated allowed differences to {pack / 'deployment.compose.yaml'}; "
               "docker-compose.yml and .env were not changed")
         return 0
-    except (DeploymentError, OSError, ValueError, yaml.YAMLError) as exc:
+    except (DeploymentError, OSError, ValueError, YAMLError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 

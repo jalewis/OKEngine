@@ -28,23 +28,29 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-import yaml
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import frontmatter_lib  # noqa: E402
+import okf_migrate  # noqa: E402
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
 WINDOW_H = int(os.environ.get("BRIEF_WINDOW_HOURS", "24"))
 MAX_ITEMS = int(os.environ.get("BRIEF_MAX_ITEMS", "15"))
 DUE_DAYS = int(os.environ.get("BRIEF_DUE_DAYS", "7"))
-_FM = re.compile(r"\A---[ \t]*\n(.*?\n)---", re.S)
 
 
 def _fm(p: Path) -> dict:
-    try:
-        m = _FM.match(p.read_text(encoding="utf-8", errors="replace")[:4000])
-        d = yaml.safe_load(m.group(1)) if m else {}
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
+    """The page's whole frontmatter envelope. A 4000-char window parsed a page whose date sat
+    below a long list as {} and dropped it from the digest (okengine#993)."""
+    return frontmatter_lib.read_frontmatter(p)
+
+
+def _live_fm(p: Path) -> dict:
+    """The page's frontmatter, or {} for a retired page, which then offers no freshness date.
+    Tombstoning stamps `last_updated`, so a just-retired page read as fresh movement; retired is
+    not recent (tier_lib, build_hot_set)."""
+    fm = _fm(p)
+    return {} if okf_migrate.is_tombstoned(fm) else fm
 
 
 def _date_value(v) -> date | None:
@@ -147,7 +153,7 @@ def main() -> int:
             for p in d.rglob("*.md"):
                 if p.name.startswith(("_", "INDEX")):
                     continue
-                fm = _fm(p)
+                fm = _live_fm(p)
                 pd, rejected = _fresh_date(fm.get("published") or fm.get("ingested"),
                                            since, today)
                 if rejected:
@@ -167,7 +173,7 @@ def main() -> int:
         for p in d.rglob("*.md"):
             if p.name.startswith(("_", "INDEX")):
                 continue
-            fm = _fm(p)
+            fm = _live_fm(p)
             if str(fm.get("type") or "").lower() in {"source", "briefing", "prediction", "gap",
                                                       "dashboard"}:
                 continue

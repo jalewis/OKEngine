@@ -1457,3 +1457,52 @@ def test_remaining_single_flight_and_index_branch_pairs(tmp_path, monkeypatch):
     (static / "index.html").write_text("plain")
     monkeypatch.setattr(module, "STATIC", static)
     assert module.index() == "plain"
+
+
+def test_backlink_artifact_same_size_rewrite_within_one_tick_is_reloaded(tmp_path, monkeypatch):
+    """okengine#1017: the artifact cache was keyed on mtime alone, so a rebuild landing in the
+    same timestamp tick as the previous read kept serving the old backlink map."""
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    module = _load(tmp_path, monkeypatch, "cockpit_backlink_same_tick")
+    artifact = wiki / ".backlinks.json"
+    artifact.write_text('{"backlinks":{"concepts/aaa":[]}}')
+    assert set(module._artifact_backlinks()) == {"concepts/aaa"}
+    before = artifact.stat()
+    artifact.write_text('{"backlinks":{"concepts/bbb":[]}}')
+    os.utime(artifact, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert set(module._artifact_backlinks()) == {"concepts/bbb"}
+
+
+def test_deck_render_cache_sees_a_same_size_rewrite_within_one_tick(tmp_path, monkeypatch):
+    """okengine#1017: the rendered-PDF cache was named after the deck's whole-second mtime, so a
+    deck rewritten within the same second kept serving the previous render."""
+    (tmp_path / "wiki").mkdir()
+    module = _load(tmp_path, monkeypatch, "cockpit_deck_same_tick")
+    deck = tmp_path / "deck.md"
+    deck.write_text("# deck aaa")
+    monkeypatch.setattr(module, "_MARP", "/usr/bin/marp")
+    monkeypatch.setattr(module, "_DECK_CACHE", tmp_path / "cache")
+
+    def render(cmd, **kwargs):
+        Path(cmd[-1]).write_bytes(Path(cmd[1]).read_bytes())
+
+    monkeypatch.setattr(module.subprocess, "run", render)
+    assert module._render_deck_pdf(deck).read_bytes() == b"# deck aaa"
+    before = deck.stat()
+    deck.write_text("# deck bbb")
+    os.utime(deck, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert module._render_deck_pdf(deck).read_bytes() == b"# deck bbb"
+
+
+def test_deck_render_is_refused_when_the_deck_vanishes_before_its_fingerprint(tmp_path, monkeypatch):
+    (tmp_path / "wiki").mkdir()
+    module = _load(tmp_path, monkeypatch, "cockpit_deck_vanished")
+    deck = tmp_path / "deck.md"
+    deck.write_text("# deck")
+    monkeypatch.setattr(module, "_MARP", "/usr/bin/marp")
+    monkeypatch.setattr(module, "_DECK_CACHE", tmp_path / "cache")
+    from unittest import mock
+    monkeypatch.setattr(module, "fingerprint", mock.create_autospec(module.fingerprint, return_value=None))
+    monkeypatch.setattr(module.subprocess, "run", lambda *a, **k: pytest.fail("rendered a vanished deck"))
+    assert module._render_deck_pdf(deck) is None

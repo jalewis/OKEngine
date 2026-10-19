@@ -163,6 +163,12 @@ The operator enables a cron by setting `enabled: true` **and choosing their own 
 the suggested cadence in the README, not as a working schedule. `validate.py` fails the
 build if a committed cron is `enabled: true`.
 
+Each cron also declares **`expect:`**, what "working" means for it, so the fleet-health
+dashboard can tell a lane that runs from one that produces (the scaffold's feed-fetch ships
+`maintains: {artifact: raw/<domain>, max_age: 12x}`). A new domain cron states its own, e.g.
+`produces: {namespace: briefings, at_least: 1, per: 1d}` for the daily brief. Shapes and
+evaluation: the engine's `docs/lane-expectations.md`.
+
 Plus the **engine-driven ingest lane** (`crons/engine-template-prompts.json`): prompts
 the engine schedules to compile raw→entities, score sources, classify types, enrich
 thin pages, and grade predictions. All ingest crons are **local-only** (no web tools —

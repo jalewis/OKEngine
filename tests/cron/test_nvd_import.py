@@ -19,8 +19,10 @@ def _load(monkeypatch):
     migrate = types.ModuleType("okf_migrate")
 
     def find_page(root, namespace, slug):
+        # Mirrors the real contract: the stem matches case-insensitively (okengine#883).
         base = Path(root) / "wiki" / namespace
-        hits = list(base.rglob(f"{slug}.md")) if base.exists() else []
+        hits = [p for p in base.rglob("*.md") if p.stem.casefold() == slug.casefold()] \
+            if base.exists() else []
         return hits[0] if hits else None
 
     migrate.find_page = find_page
@@ -368,3 +370,43 @@ def test_main_network_observations_strict_and_entrypoint(monkeypatch, tmp_path, 
     with pytest.raises(SystemExit) as exc:
         runpy.run_path(str(SCRIPT), run_name="__main__")
     assert exc.value.code == 0
+
+
+def _load_real(monkeypatch):
+    """nvd_import wired to the REAL okf_migrate and importer_guard (no stubs): the create-or-update
+    path is only as good as the page lookup it actually calls."""
+    for name in ("okf_migrate", "importer_guard"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
+    spec = importlib.util.spec_from_file_location("shared_nvd_import_real", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_second_import_run_updates_the_existing_upper_case_page_instead_of_duplicating(
+        monkeypatch, tmp_path):
+    """okengine#883. An agent wrote `CVE-2025-62673.md`; nvd-import asks for `cve-2025-62673`.
+    Run the importer twice: both runs must land on the existing page, and the namespace must
+    still hold exactly one file for the CVE."""
+    m = _load_real(monkeypatch)
+    (tmp_path / "schema.yaml").write_text(
+        "partitioning:\n  namespaces:\n    entities: {strategy: by-letter}\n", encoding="utf-8")
+    existing = tmp_path / "wiki" / "entities" / "c" / "v" / "CVE-2025-62673.md"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("---\ntype: vulnerability\ncve_id: CVE-2025-62673\ntitle: CVE-2025-62673\n"
+                        "---\nagent-written body\n", encoding="utf-8")
+
+    first = m.apply_record(tmp_path, m.nvd_record(_raw("CVE-2025-62673", 9.8, "CRITICAL")),
+                           "vulnerability", stub_new=True, all_severities=True,
+                           today="2026-09-24", dry_run=False)
+    second = m.apply_record(tmp_path, m.nvd_record(_raw("CVE-2025-62673", 8.1, "HIGH")),
+                            "vulnerability", stub_new=True, all_severities=True,
+                            today="2026-09-25", dry_run=False)
+
+    pages = sorted(p.relative_to(tmp_path / "wiki").as_posix()
+                   for p in (tmp_path / "wiki" / "entities").rglob("*.md"))
+    assert pages == ["entities/c/v/CVE-2025-62673.md"], f"importer duplicated the page: {pages}"
+    assert (first, second) == ("enriched", "enriched")
+    fm, body = m._read_page(existing)
+    assert fm["cvss_base"] == 8.1 and "agent-written body" in body

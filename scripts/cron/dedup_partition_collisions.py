@@ -4,7 +4,17 @@
 When a partition-unaware writer put the same slug at more than one path (the flat root AND the
 canonical shard, or a wrong-shaped shard like `security-incidents/YYYY/` vs the canonical
 `YYYY/MM/`), this collapses every copy onto the ONE canonical page: union-merge the frontmatter,
-keep the fullest body, delete the losers, and rewrite `[[links]]` that pointed at a dropped path.
+keep the fullest body, delete the losers, and rewrite `[[links]]` (and bare path refs such as a
+frontmatter `subject: entities/a/foo`) that pointed at a dropped path.
+
+CASE-ONLY variants are the same page (okengine#883): `entities/c/v/CVE-x.md` beside
+`entities/c/v/cve-x.md` is one subject on a case-sensitive filesystem. okf_migrate.find_page is
+case-insensitive but prefers the EXACT spelling when both exist, so an agent updating one spelling
+and an importer updating the other never converge on their own. Copies are therefore grouped by
+their stem with CASE folded (see _case_key) and collapsed onto one canonical spelling (see
+_canonical_stem). Only case is folded: separators and other characters are NOT, because
+id_lib.slug_identity's folding (`ip-10-1-11-1` vs `ip-10-11-1-1`) detects collisions but never
+authorizes a merge.
 
 This is the "dedup pass" that okf_migrate.build_map deliberately HOLDS collisions back for (it
 refuses to move a page onto an occupied seat). The winning path is chosen by
@@ -63,11 +73,59 @@ def _scalar_conflicts(copies: list[dict]) -> dict[str, list]:
     return {k: v for k, v in seen.items() if len(v) > 1}
 
 
+_RESERVED_FOLDED = frozenset(s.lower() for s in _SKIP)
+_PAGINATED_INDEX = re.compile(r"index-p\d+")
+
+
 def _is_content(slug: str) -> bool:
     # generated per-directory artifacts (INDEX, paginated INDEX-p02/03, _* scaffolding) are NOT
     # addressable content — the same stem legitimately recurs in every shard dir, so they must
     # never be treated as duplicate content (matches okf_migrate.build_map's skip list).
-    return not (slug.startswith("_") or slug.startswith("INDEX") or slug in _SKIP)
+    # Now that copies are grouped with case folded, the reserved names are matched case-folded
+    # too: `Log.md`/`LOG.md` or `Index.md`/`index.md` are generated/reserved files, never a
+    # duplicate page to delete. Only the EXACT reserved names (and paginated `index-pNN`) fold;
+    # a real page such as `Indexing-attacks` stays content.
+    folded = slug.lower()
+    return not (slug.startswith("_") or slug.startswith("INDEX") or folded in _RESERVED_FOLDED
+                or _PAGINATED_INDEX.fullmatch(folded))
+
+
+def _case_key(stem: str) -> str:
+    """The grouping key for case-only variants: each character lower-cased ONLY where that is a
+    one-to-one case mapping. Deliberately not str.casefold(), which is a character fold as well
+    (`ß` -> `ss`), and never a separator fold (id_lib.slug_identity): two stems share a key iff
+    they have the same length and differ at most in the case of individual characters."""
+    return "".join(ch if (lo := ch.lower())[1:] else lo for ch in stem)   # [1:]: lower() expanded
+
+
+def _canonical_stem(stems: list[str]) -> str:
+    """The surviving spelling for a group of case-only variants. Deterministic, never by mtime.
+
+    Why this rule, rather than okf_migrate.canonical_key()/write_key(): those keys fold only the
+    SHARD directories (`_letter`/`_second` lower-case them), and echo the slug they are given, so
+    they place a page but cannot choose between `CVE-x` and `cve-x`. The spelling is chosen here:
+
+      1. the fewest capitals, so the all-lowercase spelling wins whenever the group has one.
+         That is the engine's identity form: id_lib.normalize_key lower-cases every id key
+         (`cve:cve-2024-1234`, `entities:arxiv`), so it is the one spelling that equals the
+         page's own `id` key, and it is the slug nvd-import writes for the `entities` page model
+         (`cve_id.lower()`). Without an all-lowercase spelling, the fewest capitals is the
+         closest to that form;
+      2. then code-point order, so the choice never depends on walk order.
+
+    Any stable choice converges now: find_page folds case, so once one spelling is left every
+    writer, including one whose own slug is spelled differently (nvd-import's upper-case `cves`
+    model), finds and updates it instead of minting another copy."""
+    return min(stems, key=lambda s: (sum(ch.isupper() for ch in s), s))
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    # On a case-insensitive filesystem the capitalized "loser" IS the destination file; unlinking
+    # it would delete the merged page.
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
 
 
 def _read(p: Path) -> tuple[dict, str]:
@@ -118,12 +176,12 @@ def dedup_namespace(root: Path, ns: str, apply: bool) -> tuple[dict[str, str], l
     for p in base.rglob("*.md"):
         if not _is_content(p.stem):
             continue
-        by_slug.setdefault(p.stem, []).append(p)
+        by_slug.setdefault(_case_key(p.stem), []).append(p)
 
     move_map: dict[str, str] = {}
     review: list[str] = []
     removed = 0
-    for slug, paths in by_slug.items():
+    for paths in by_slug.values():
         if len(paths) < 2:
             continue
         # deterministic order: deepest (most-canonical-looking) first, then lexical
@@ -136,6 +194,8 @@ def dedup_namespace(root: Path, ns: str, apply: bool) -> tuple[dict[str, str], l
         tombs = [t for t in parsed if okf_migrate.is_tombstoned(t[1])]
         if not live:
             continue        # duplicate tombstones: redirects are load-bearing, not this drain's call
+        # One spelling for the group; an exact-name group has exactly one stem already.
+        slug = _canonical_stem(sorted({p.stem for p, _fm, _b in live}))
         merged_fm = _merge_fm([fm for _p, fm, _b in live])
         conflicts = _scalar_conflicts([fm for _p, fm, _b in live])
         survivor_id = str(merged_fm.get("id") or "").strip()
@@ -152,6 +212,13 @@ def dedup_namespace(root: Path, ns: str, apply: bool) -> tuple[dict[str, str], l
         desired = okf_migrate.desired_key(root, ns, slug, merged_fm)
         if (wiki / (desired + ".md")) in {p for p in redundant}:
             canonical = desired                      # take the seat a redundant redirect held
+        elif desired not in live_keys and any(_case_key(k) == _case_key(desired) for k in live_keys):
+            # the declared seat is held by a live copy in ANOTHER spelling (#883): the survivor
+            # takes that seat under the canonical spelling. write_key would instead return a stale
+            # flat copy that happens to carry the exact spelling (find_page prefers the exact
+            # spelling over depth). A seat held in the exact spelling goes to write_key, which
+            # returns it as-is.
+            canonical = desired
         else:
             canonical = okf_migrate.write_key(root, ns, slug, merged_fm)   # writer/reshard contract
         # redundant tombstones ELSEWHERE point at the survivor too: retired, links rewritten below
@@ -182,7 +249,7 @@ def dedup_namespace(root: Path, ns: str, apply: bool) -> tuple[dict[str, str], l
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(f"---\n{head}\n---\n\n{winner_body}\n", encoding="utf-8")
             for p in losers:
-                if p.resolve() != dest.resolve():
+                if not _same_file(p, dest):      # also covers p == dest
                     try:
                         p.unlink()
                         removed += 1
@@ -195,6 +262,9 @@ def _rewrite_links(root: Path, ns: str, move_map: dict[str, str], apply: bool) -
     if not move_map:
         return 0
     pat, repl = okf_migrate.make_rewriter(move_map, ns)
+    # Bare path refs too (a frontmatter `subject: entities/c/v/CVE-x`, as reshard does since
+    # okengine#336): on a case-sensitive filesystem a ref to the removed spelling would dangle.
+    bare_pat, bare_repl = okf_migrate.make_path_rewriter(move_map)
     changed = 0
     for p in (root / "wiki").rglob("*.md"):
         if "/.git/" in p.as_posix():
@@ -203,7 +273,7 @@ def _rewrite_links(root: Path, ns: str, move_map: dict[str, str], apply: bool) -
             c = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if f"[[{ns}/" not in c:
+        if f"{ns}/" not in c:
             continue
         # Count ACTUAL rewrites, not `re.subn`'s match count: make_rewriter's repl returns the link
         # UNCHANGED for any target not in move_map (every `[[ns/…]]` link is a match), so subn's tally
@@ -218,6 +288,7 @@ def _rewrite_links(root: Path, ns: str, move_map: dict[str, str], apply: bool) -
             return out
 
         new_c = pat.sub(_repl, c)
+        new_c = bare_pat.sub(lambda m, _r=bare_repl: _repl(m, _r), new_c)
         if n[0] and new_c != c:
             changed += n[0]
             if apply:

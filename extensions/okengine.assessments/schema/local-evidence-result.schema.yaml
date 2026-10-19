@@ -33,3 +33,17 @@ properties:
       required: [reference, origin, reason]
   held_alias_matches: {type: array}
   malformed: {type: array}
+  selection_policy:
+    type: object
+    required: [contract, assessment_kinds, current_statuses, archived_statuses]
+    properties:
+      contract: {const: question-scoped/v1}
+  reference_diagnostics:
+    type: array
+    items:
+      type: object
+      required: [reference, origin, category, disposition, blocking, reason]
+      properties:
+        category: {enum: [documentary, contextual-provenance, collection-task, assessment-conclusion]}
+        disposition: {enum: [blocking, contextual]}
+        blocking: {type: boolean}

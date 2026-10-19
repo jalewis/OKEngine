@@ -103,6 +103,7 @@ def _within(base: Path, path: Path) -> bool:
         return False
 def split_fm(text: str) -> tuple[dict, str]:
     return _renderer().split_fm(text)
+_tombstoned = directory_index.tombstone_check(split_fm)
 def _link_title(target: str) -> str | None:
     return _renderer()._link_title(target)
 def _wl_display(match) -> str:
@@ -188,8 +189,7 @@ def _top_dirs() -> list[str]:
 def _pages_of_types(types: frozenset[str]) -> list[dict]:
     """Every page across all non-excluded namespaces whose `type` is in `types`."""
     out = [pg for sub in _top_dirs() for pg in _scan_dir(sub)
-           if pg["type"].lower() in types
-           and pg.get("status", "").lower() != "tombstoned"]
+           if pg["type"].lower() in types]
     out.sort(key=lambda r: (r["title"].lower(), r["path"]))
     return out
 _FM_SCAN_BYTES = 16384
@@ -298,8 +298,8 @@ def _dir_is_derived(md_paths: list[Path]) -> bool:
 @app.get("/api/tree")
 def api_tree():
     return browse.tree(
-        wiki=WIKI, excluded_dirs=_excluded_dirs, skip=_skip, reserved=_reserved_seg,
-        namespaces=_ns_dirs, is_derived=_dir_is_derived, rail_top=_rail_top_section,
+        wiki=WIKI, excluded_dirs=_excluded_dirs, skip=_skip,
+        is_derived=_dir_is_derived, rail_top=_rail_top_section, scan=_scan_dir,
     )
 
 @app.get("/api/groups")
@@ -334,7 +334,7 @@ def _ns_about(dir: str) -> str:
 def _resolve_page(path: str) -> Path:
     return browse.resolve_page(
         path, wiki=WIKI, skip=_skip, excluded_dirs=_excluded_dirs,
-        namespaces=_ns_dirs, within=_within, split_frontmatter=split_fm,
+        namespaces=_ns_dirs, within=_within, tombstoned=_tombstoned,
     )
 
 _META_PANEL_SKIP = {"title", "name", "type", "version", "raw"}
@@ -469,7 +469,7 @@ def api_download(request: Request, fmt: str, path: str = Query(...)):
 @app.get("/api/search")
 def api_search(request: Request, q: str = Query(...), limit: int = 40):
     return search.search(
-        request, q, limit, wiki=WIKI, guard=_guard, semaphore=_SEARCH_SEM,
+        request, q, limit, wiki=WIKI, guard=_guard, semaphore=_SEARCH_SEM, tombstoned=_tombstoned,
         excluded_dirs=_excluded_dirs, namespaces=_ns_dirs, subprocess_module=subprocess,
     )
 
@@ -563,7 +563,7 @@ def api_backlinks(path: str = Query(...), limit: int = 100):
     """Pages that reference `path` via the precomputed wikilink graph. `path` is the
     wiki-relative key without .md (e.g. 'concepts/example-topic')."""
     key = path[:-3] if path.endswith(".md") else path
-    refs = _load_backlinks(blocking=False).get(key, [])    # never block on the build
+    refs = backlinks.live(_load_backlinks(blocking=False).get(key, []), WIKI, _tombstoned)
     return {"path": key, "count": len(refs),
             "backlinks": refs[:max(1, min(limit, 500))]}
 

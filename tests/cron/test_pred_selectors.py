@@ -112,7 +112,8 @@ def test_regrade_needs_open_and_recent_sources(tmp_path, monkeypatch):
     wake, out = _run(_load("select_regrade_batch"))
     assert wake is True
     assert "open predictions: 2" in out                  # both open ones
-    assert "fresh" in out and "old" not in out            # only recent source
+    # only the recent source (match the slug: the printed receipt template says "placeholder")
+    assert "fresh" in out and "s-old" not in out
 
 
 def test_regrade_digest_specifies_canonical_evidence_fields(tmp_path, monkeypatch):

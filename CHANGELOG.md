@@ -14,21 +14,1283 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
 > **About panel** (reader/cockpit deployment purpose + composition from live state); and now **pack
 > bundles** (v0.10.0). If you are jumping from v0.3.5, read v0.4.0 onward.
 
-## Unreleased
+## v0.15.18
+
+PATCH. Fixes a defect in v0.15.17's new `scheduler-dst` deployment check, which blocked the
+v0.15.17 roll at its first host. Ships everything in v0.15.17 (the cron-plus DST fall-back fold
+policy). Deployment scope: **this release, before 2026-11-01**, in place of v0.15.17. No image
+change; the gateway must be recreated, which a `--release-digests` roll does (see v0.15.17).
 
 ### Fixed
-- `install-domain` no longer refuses a pack its own undeclared namespace. A namespace the host
-  schema is silent about, holding only pages whose types the incoming pack owns exclusively, is
-  adopted with a WARN naming the reshelve the merge will cause; a namespace the host declares, or
-  one holding a type both packs claim, still FAILs. `--refresh` was unreachable for every
-  namespace-owning pack before this (okengine#812).
+- **Root-owned bytecode in the cron-plus plugin tree** (okengine#1064). Post-deploy verify runs
+  the `scheduler-dst` check as root in the gateway. Since v0.15.17 the check imports the deployed
+  plugin to judge its fall-back policy, and it wrote `__pycache__/*.pyc` owned by root into
+  `/opt/data/plugins/cron-plus`, so the same verify FAILed its ownership check on every run.
+  `croniter_dst_selftest.py` now imports and runs the plugin with bytecode writing off, and the
+  check also passes `-B`.
+
+### Upgrade notes
+- Deploy as for v0.15.17. A host that already ran v0.15.17's verify has root-owned files under
+  `.hermes-data/plugins/cron-plus/__pycache__/`; remove them before deploying
+  (`docker exec -u root <gateway> rm -rf /opt/data/plugins/cron-plus/__pycache__`), or the
+  ownership check stays FAIL.
+
+## v0.15.17
+
+PATCH. Fixes how the cron-plus scheduler handles the repeated hour when clocks fall back
+(2026-11-01 in America/New_York). Deployment scope: **this release, before 2026-11-01.**
+No image change: `deploy.sh` reapplies the carried cron-plus patches. The scheduler runs inside
+the gateway process and loads them only at start, so **the gateway must be recreated** after the
+patches land. A `--release-digests` roll does this (the per-release `.tested` gateway tag
+changes); a host-built deploy must `--force-recreate` the gateway.
+
+### Fixed
+- **DST fall-back fold** (okengine#1055, okengine#1061 [4]). The pinned cron-plus guard compared
+  croniter's next slot with the claim time. A daily `30 1 * * *` lane claimed a minute late fired
+  again at 01:30 EST, and every hourly fixed-minute lane (`usage-rollup`, `12 * * * *`) lost its
+  01:MM EST run. The new carried patch `patches/cron-plus/dst-fold.patch` (overlay
+  `dst_fold.py`) decides from the slot: an explicit hour fires once in the repeated hour, an hour
+  field starting with `*` fires in both passes (Vixie cron / cronie semantics).
 
 ### Added
-- `install-domain --accept-trust-exposure --reason "<why>"` records an operator's acceptance of
-  serving a more-private guest at the host's trust in `<host>/.okengine/coinstall-overrides.yaml`.
-  The record is keyed to both trust values, so changing either revokes it; `framework validate`
-  reports every standing acceptance, and stale ones. A gate that cannot be satisfied gets bypassed
-  silently — this makes the decision reviewable instead (okengine#813).
+- `croniter_dst_selftest.py --cron-plus DIR` runs the installed plugin's own `compute_next_run` on
+  the repeated hour. The `scheduler-dst` deployment check (post-deploy verify, daily validator)
+  passes the gateway's plugin, so it judges the deployed scheduler, not only croniter.
+
+### Upgrade notes
+- Deploy as for v0.15.16: `deploy.sh --release-digests <list>` per host from a clone of the tag.
+  `install-cron-plus.sh` applies `dst-fold.patch` at step 2.
+- Post-deploy verify `[scheduler-dst]` must report `cron-plus compute_next_run passes 3 fall-back
+  case(s)`. That check loads the plugin files from disk, so also confirm the gateway started after
+  them: `docker inspect -f '{{.State.StartedAt}}' <gateway>` must be newer than
+  `.hermes-data/plugins/cron-plus/dst_fold.py` (okengine#1062 tracks a standing check).
+
+## v0.15.16
+
+PATCH. Hardens the CI-tested-digest deploy introduced in v0.15.15 and adds detectors for the
+v0.15.15 invariant-audit candidates (okengine#1057). `deploy.sh --release-digests` now checks that
+every image it needs can be fetched, by its pinned digest, before it writes any pin, and it resolves
+the registry host itself instead of relying on the host's DNS failover (okengine#1058). Deployment
+scope: **next release.** Deploy tooling only (`scripts/deploy.sh`, `scripts/release_load.py`); no
+baked runtime code changed.
+
+### Upgrade notes
+- Deploy as for v0.15.15: fetch the release's `tested-digests.json` and run
+  `deploy.sh --release-digests <list>` per host from a clone of the tag (docs/release-digests.md).
+- The tested-digest list is now kept at `<pack>/.okengine/generated/tested-digests.json`, written
+  only after a verified load; `OKENGINE_TESTED_DIGESTS` points there, so deleting the downloaded
+  copy no longer breaks `post_deploy_verify.sh`.
+- The gateway's tested tag is now scoped like the engine images
+  (`hermes-agent:okengine-<release>-<sha>.<project>.tested`), so two packs on one host no longer
+  share it.
+
+### Fixes
+- `release_load` preflight: every required image that is not already local is checked with
+  `crane digest` against its pinned digest before `.env` or the image override is touched; the
+  registry host is resolved once and passed to the loader with `--add-host` (okengine#1058, !1364).
+- An engine image with no CI release service mapping is a named failure instead of a `KeyError`;
+  the six hand-maintained engine-image tables are held to one agreement test (okengine#1057 [5],
+  [9], [10], !1364).
+- The durable tested-digest list and the pack-scoped gateway tag (okengine#1057 [6], [11], !1364).
+
+### CI and tooling (no runtime change)
+- The release lanes rerun when anything under `okengine-operations/` changes, not only its
+  Dockerfile; the input detector also reads the release-build compose file (okengine#1057 [4],
+  !1362).
+- New detectors: rebound write-service code must resolve every global in the `write_server`
+  facade (okengine#1057 [3]); the gateway release lane's `changes:` list must cover the image
+  lane's (okengine#1057 [8]) (!1363).
+- The prepull tests no longer reach the real resolver (okengine#1060, !1363).
+- Test-policy collection reads each function's source once: local collection 32 s → 11.8 s, CI
+  well under its 120 s deadline (okengine#1059, !1361).
+- A backup test waits out the ctime tick of every file it touches, ending a nightly flake (!1360).
+- v0.15.16 invariant-audit candidates (all low, none release-blocking) are tracked in okengine#1061.
+
+## v0.15.15
+
+PATCH. A security fix for the MCP servers, an authentication fix, and the first release the fleet
+deploys from the images CI tested (okengine#1048). The pinned `mcp` 1.28.1 never reclaimed stateful
+Streamable HTTP sessions, so any client that could reach the read or write MCP endpoint could grow
+its memory without bound (CVE-2026-59951); `mcp` 1.30.0 expires sessions idle for 30 minutes, caps
+them at 10,000 and limits request bodies to 4 MiB. An `Authorization` header that is not valid
+Latin-1 or base64 now gets a 401 instead of a 500 (okengine#966). Deployment scope: **fleet
+required.** **Baked: the okengine-mcp, review-write and operations images (`mcp` pin) and the
+write path (`okengine-mcp/`, okengine#966).**
+
+### Upgrade notes
+- **Deploy the tested images:** fetch the release's `tested-digests.json` from the package
+  registry and run `deploy.sh --release-digests <list>` per host from a clone of the tag
+  (docs/release-digests.md). Nothing is built on the host; `post_deploy_verify.sh` must PASS
+  "every running engine image is one CI tested". Each deploy host needs the read-registry
+  credential file (`~/.config/okengine/registry.env`, mode 0600).
+- **Rollback** to v0.15.14 is a host-built deploy from a v0.15.14 clone: that release has no
+  tested-digest list. Later releases roll back by digest.
+- An MCP HTTP client that drops its stream and stays idle for 30 minutes now gets a 404 and must
+  initialize a new session.
+
+### Fixes
+- `mcp` 1.30.0 for CVE-2026-59951; the CI tooling images were refreshed with it (!1358).
+- Undecodable `Authorization` headers get a 401 on the read and write MCP servers (okengine#966,
+  !1226).
+- `deploy.sh --release-digests` (v0.15.15 invariant audit, !1359): `release_load` no longer deletes
+  an image it just loaded by removing crane's placeholder name, its only tag, before the deployment's
+  tags hold it; and a failed load restores `.env` and `docker-compose.okengine-image.yml` instead of
+  leaving them pinned to images that were never loaded.
+
+### CI and tooling (no runtime change)
+- okengine#1048 phase 3: CI builds, boots and records every release image, including the gateway;
+  a version tag promotes the tested digests; `deploy.sh --release-digests` deploys them (!1342,
+  !1343, !1344).
+- okengine#1047: the critical-mutation nightly is green again (mutation-history order, an actor
+  grounding survivor, the HTTP client timeout and carried floor waivers: !1354, !1355, !1356).
+- Five full-suite shards; heavy work stays on the CI nodes; the runner audit fails a private CI server
+  runner that carries heavy or light (okengine#1052, !1348, !1352).
+- Tests that read publish-excluded files are caught on the MR (okengine#1054, !1351); the registry
+  canary checks the Chrome download hosts (!1353); the security layer's deadlines match its measured
+  runtime (!1357).
+- v0.15.15 invariant-audit candidates not fixed here are tracked in okengine#1057.
+
+## v0.15.14
+
+PATCH. The v0.15.13 invariant-audit follow-ups (okengine#1044), the v0.15.14 audit fixes, a
+gateway scheduler fix for daylight saving time, and CI work that changes no runtime behavior.
+The reader no longer stalls on link-heavy pages: dangling and ambiguous wikilinks resolve through
+one shared basename index instead of a full vault walk per link (32-73 s renders measured on live
+vaults, now under 0.5 s). The gateway image carries croniter 6.2.4, so cron-plus computes the
+next fire correctly across DST; with the croniter 6.0.0 that Hermes's lock installs, daily lanes
+would have fired an hour late on 2026-11-01 and twice on 2027-03-14. Deployment scope: **fleet
+required, full `deploy.sh` per host.** **Baked: rebuild the gateway image (croniter pin, engine
+wheel); `deploy.sh` rebuilds the reader and cockpit images (`vault_lookup_cache.py`, reader
+rendering and backlinks).**
+
+### Upgrade notes
+- **Rebuild the gateway image first** (`build-engine-image.sh` with `OKENGINE_TAG`), then run a
+  **full `deploy.sh` per host**. The image build runs a DST self-test and refuses to produce an
+  image whose scheduler computes DST wrong.
+- **New check `scheduler-dst`** (`deployment_checks`): runs `scripts/cron/croniter_dst_selftest.py`
+  under the gateway's own interpreter. Wrong DST math or a missing croniter FAILs; a self-test
+  that cannot run is UNDETECTABLE, never a pass.
+- **Deploy refuses a host-port conflict** before recreating anything (okengine#1044 [25]), now
+  from any working directory.
+- **Sidecar wrappers** use the deployment's own compose project and the per-pack read MCP URL
+  (okengine#1044 [5]); regenerate them with `framework extensions sidecar-generate`.
+- **Restore** reports directory modes it could not apply (including pre-v0.15.13 archives) and
+  still rebinds the deployment identity (okengine#1044 [19]/[22]/[23]).
+
+### Fixed
+- Reader re-resolution: one basename index shared by a render, stamped when its walk finishes so
+  a slow disk cannot turn it back into one walk per link (okengine#1044 [24], v0.15.14 audit).
+- Gateway scheduler: croniter 6.2.4 pinned engine-side (Hermes unmodified), recorded in
+  `engine-manifest.yaml` `runtime.dependency_overrides`.
+- HOT.md and `tier_of` agree on the open set for a pack's own `hot_set` (okengine#1044 [7]/[12]);
+  a `hot_set` without sections, a section without `kind`, a non-mapping section and a scalar
+  `open_values` no longer crash the lane (v0.15.14 audit).
+- `deploy.sh` reads the `.env` uid pin with compose semantics; `check_crons` judges ownership by
+  the gateway's `HERMES_UID`, not the deployer's uid (okengine#1044 [1]/[9] and W1).
+- Lane `write_tools` declarations are validated; sidecar op names cannot collide with extension
+  names (okengine#1044 W2).
+- Migration `TO` versions are pinned to the release that shipped them (okengine#1044 [4]).
+
+### CI (no runtime change)
+- Jobs start on real `needs:` with a final fan-in gate (okengine#1045).
+- Mutation: bare-name exception lint (okengine#1046), main campaigns diff from the last green
+  campaign (policy B), automatic diff-scoped mutation on small MRs, a `mutation-dispositions`
+  job, and an unblocked nightly critical campaign (okengine#1047).
+- CI records the digests of the images it tested; post-deploy verify checks running images
+  against that list when one is present (okengine#1048 phases 1-2).
+- Unit CPU budgets no longer bill an automatic garbage collection to the running test
+  (okengine#1051).
+
+## v0.15.13
+
+PATCH. The v0.15.12 invariant-audit follow-ups (okengine#1042), the backup follow-ups
+(okengine#1041) and host-side verify import pinning (okengine#1043). Backup `prune`/`list` no
+longer match another pack's archives, a failed SQLite online backup fails closed, and restore
+publishes the job store under its lock; the write-path corpus libraries order and cap HOT.md
+deterministically, split legacy scalar aliases the way the write path does, re-resolve cached
+lookups and date the ledger in the deployment zone; every engine image probes all wheel runtime
+members and deploy refuses a compose project another directory owns; generated lane writers are
+re-derived from their lane and orphaned extension tokens are revoked; prerelease versions order
+before their final; and `post_deploy_verify.sh` step [9] judges with the checkout being deployed.
+Deployment scope: **fleet required, full `deploy.sh` per host** (not stage-only). **Baked: rebuild
+the gateway image (`okengine-mcp/converge.py`, `write_server.py`, `id_index.py`, the engine
+wheel's write services and identity guard); `deploy.sh` rebuilds the reader, cockpit,
+review-write and projection images.**
+
+### Upgrade notes
+- **Rebuild the gateway image first** (`build-engine-image.sh` with `OKENGINE_TAG`), then run a
+  **full `deploy.sh` per host**. A stage-only deploy leaves `id_index.py` drifted and
+  `check_write_path_libs` FAILs.
+- **Every `okengine-write*` server gains `TZ`** from the deployment's zone when ensure-runtime
+  reconciles `config.yaml`; the gateway recreate in `deploy.sh` applies it (okengine#1042 [36]).
+- **Generated lane writers are re-derived.** ensure-runtime rewrites a generated writer's
+  `OKENGINE_OUTPUT_CONTRACT_MODE` and `OKENGINE_WRITE_TOOLS` when they disagree with its lane,
+  and leaves every other line alone (okengine#1042 [3]/[18]).
+- **`deploy.sh` refuses a compose project another directory owns** (`engine_images.py claim`);
+  docker unavailable is a WARN (okengine#1042 [8]).
+- **Engine image drift** reports SHARED for an engine image not on its deployment-scoped tag, and
+  post-deploy verify WARNs UNATTRIBUTED on an image built without the provenance label until it is
+  rebuilt (okengine#1042 [12], [14]).
+- **`patches/apply.sh` enforces the pinned Hermes SHA** and refuses a directory that is not the
+  top of the Hermes tree (okengine#1042 [34], [35]).
+- **`framework upgrade --apply` exits 3 when validation fails** after the upgrade, and passes
+  `--skip-validate` through (okengine#1042 [28]).
+- **Backup:** archives are matched by their exact `<pack>-<stamp>.tar.gz` name; `restore` re-creates
+  directory modes and publishes `jobs.json` atomically under `jobs.json.lock`. Stop the gateway
+  before `restore --force` as before (okengine#1041, okengine#1042 [0] [6] [7] [29]).
+- **`framework extensions forget <pack> <id>`** removes a stale `disabled:` entry; deploy revokes
+  tokens of extensions that no longer exist (okengine#1042 [9]/[20], [32]).
+
+### Fixed
+- Backup prune/list prefix collision, fail-closed SQLite snapshot, locked job-store restore,
+  directory modes, cap allocation to settle and in-place writers, direct-invocation import path
+  (!1325; okengine#1041, okengine#1042 [0] [6] [7] [29]).
+- `post_deploy_verify.sh` step [9] runs from `scripts/post_deploy_selfchecks.py` with imports
+  pinned to the deployed checkout; a crashed step is a FAIL; drift peer 3b reports both-sides
+  unreadable; remediation hints name the check (!1324; okengine#1043, okengine#1042 [15] [16] [21] [22]).
+- Image provenance: every wheel runtime member and copied file probed in all six images,
+  compose-project ownership claim, shared-tag drift, provenance labels, unconfigured running
+  services, Dockerfile map completeness (!1323; okengine#1042 [2]/[4] [8] [12] [13]/[31] [14] [24] [25]).
+- Lane writers re-derived, ownership gate real-invocation tested, orphan tokens revoked,
+  `extensions forget`, multi-operation sidecars get their extension's token (!1327; okengine#1042
+  [3]/[18] [9]/[20] [23] [32] [33]).
+- Prerelease-aware version ordering on the pack-migration path and pins, active patch series in
+  release evidence, nested Hermes tree and pinned SHA in `apply.sh`, upgrade validation exit
+  (!1322; okengine#1042 [5]/[27] [10] [28] [34] [35]).
+- HOT.md cap order and truncation note, open values from the composed tier block, alias
+  splitting, wrapped cockpit titles, lookup-cache re-resolution, writer ledger timezone, registry
+  census step (!1326, baked; okengine#1042 [11] [17] [19] [26] [30]/[38] [36] [37]).
+- CI: 120s/180s timeouts for real-invocation and repo-walking tests, measured durations for the
+  shard planner, `.suite-run` 50m (!1327, !1328).
+- v0.15.13 invariant audit: the cockpit ref-title reader falls back to the title line when
+  frontmatter parses but cannot be constructed (an impossible date raised ValueError and made the
+  assessments tab 500), and `post_deploy_verify.sh` grades a step [9] driver failure as a FAIL,
+  not a WARN. The remaining audit candidates are tracked as follow-ups.
+
+## v0.15.12
+
+PATCH. Each deployment renders lane writers from its own fleet and prunes foreign ones
+(okengine#1029); compose-built engine images get immutable, deployment-scoped tags with a drift
+check (okengine#1033); the shared-word actor alias tie no longer accepts organization or software
+names, and `framework validate` FAILs a type owner that no lane can act for (okengine#1030);
+reader and cockpit lookup memos revalidate (okengine#1024); release lanes run on every baked
+source (okengine#1031); cron scripts reject unknown arguments (okengine#1034); and the v0.15.11
+invariant-audit follow-ups land, including a short backup fence and gated extension identity
+grants (okengine#1032). Deployment scope: **fleet required, full `deploy.sh` per host** (not
+stage-only). **Baked: rebuild the gateway image; `deploy.sh` rebuilds the reader, cockpit,
+review-write and projection images.**
+
+### Upgrade notes
+- **Rebuild the gateway image first** (`build-engine-image.sh` with `OKENGINE_TAG`): the engine
+  wheel's `okengine.actor_grounding` (#1030) and `tools/policy_plane.py` (#1032 [6]) are on the
+  write path. Then run a **full `deploy.sh` per host**, never a stage-only deploy.
+- **A stage-only `deploy-cron-plus-jobs.sh` FAILs until the host has run ensure-runtime.**
+  ensure-runtime now renders `okengine-write-<lane>` servers from the deployment's own fleet
+  (`scripts/lane_writers.py`) and removes engine-generated writers for lanes the deployment does
+  not run. The jobs deploy refuses a `config.yaml` that still registers such a stale foreign
+  writer ("write server(s) for lanes this deployment does not run"). `deploy.sh` runs
+  ensure-runtime first and force-recreates the gateway, so a normal deploy passes.
+- **Every compose-built engine container is recreated once.** `deploy.sh` pins the reader, mcp,
+  review-write, operation-runner, cockpit and projection services to
+  `<repo>:okengine-<release>-<sha>[-dirty].<compose project>` (`OKENGINE_ENGINE_IMAGE_TAG` in
+  `.env`, applied through `docker-compose.okengine-image.yml` for the services the deployment
+  defines). A pack's own `image: okengine-reader` lines need no edit. Old per-release tags
+  accumulate; prune `okengine-*:okengine-<old release>-*` periodically.
+- **`deploy.sh` fails closed** (exit 1, before bring-up) when a `COMPOSE_FILE` entry does not exist,
+  when the engine revision cannot be resolved (`git rev-parse` fails), or when the tag cannot be
+  derived. A tag is never built from an `unknown` sha.
+- **`framework validate` now FAILs** a `types.<t>.owner` that is not the `pack.yaml` name, a
+  co-installed pack, `engine` or `ext:<id>`, and an unknown `types.<t>.role` (it was a WARN), on
+  pack types and on extension-owned types. A pack whose types still name a former bundle or a
+  folded pack as owner must fix that before it rolls.
+- **Bundle pulls keep the host's `name`.** `_apply_bundle_identity` re-stamps only `description`
+  and `mission`, so the composed name stays the write principal and the declared owner.
+- **`deploy.sh` reconciles the extension token store** (`framework extensions reconcile-tokens`)
+  from the current manifests. A stale record is rewritten in place with a WARN, without token
+  rotation; a discovery failure aborts the deploy. Stores that lag their manifests are brought
+  back to the declared scopes.
+- **Pack- and operator-tier extension `identity_edit` grants need acceptance.** Run
+  `framework extensions enable <pack> <id> --accept-identity-edit`. The acceptance is bound to a
+  digest of the extension id and its whole `write_policy`; widening it needs a new acceptance.
+  Without one, the token drops the grant and identity changes are held for review. First-party
+  `okengine.*` extensions keep their declared grant.
+- **Post-deploy verification runs more checks.** Step [9] runs every registered check except
+  the in-container ones, so `reserved-basenames` (FAIL on a reserved-basename page with content),
+  `source-identity` and `tool-search` now run at deploy time. It also WARNs when a running
+  container's image ID differs from what its compose image reference resolves to now.
+- **Backups hold the corpus fence briefly.** See Backup and restore below. A restore prints a
+  warning naming `consistency.rewritten_after_fence` when the manifest lists files that kept
+  changing after the fence.
+
+### Deploy and runtime (host-side)
+- **Lane writers from the deployment's own fleet (okengine#1029, !1312).** `lane_writers.py`
+  builds the lane set in memory with `cron_pack_split.build_fleet(pack)` plus the `cron:`
+  capabilities of `.okengine/effective-policy.json`, never from the shared
+  `config/cron-plus-jobs.json`, so it also works on a fresh deploy. A writer is pruned only when
+  its name is the one the engine derives from its `cron:` actor and its `command` and `args` are
+  the engine's write server; `okengine-write`, `okengine-write-chat`,
+  `okengine-write-source-quality` and operator-added servers are never touched. Nothing is pruned
+  without a known lane set or from a `config.yaml` that does not parse. `--dry-run` prints the
+  plan. A broken fleet now fails ensure-runtime loudly. `deploy.sh` no longer regenerates the
+  shared split for ensure-runtime.
+- **Deployment-scoped engine image tags (okengine#1033, !1317, !1319).** `scripts/engine_images.py`
+  derives the tag, writes the override and runs the drift check (unreadable docker state is
+  undetectable, never a pass). `image_tag()` refuses any sha that is not 4 to 40 lowercase hex
+  characters, optionally ending in `-dirty`.
+- **Reader and cockpit image provenance probes every copied file (#1032 [16], !1317).**
+  `image_drift.py` gains a `source_glob` probe; the reader and cockpit entries probe `*.py`,
+  `static/` and `requirements.txt`.
+- **Partial gateway overlay Dockerfiles removed (#1032 [18], !1317).** They copied write-path code
+  to paths nothing imports. Hotfixes go through a patch release and `build-engine-image.sh`.
+- **Extension token store (#1032 [12] [17], !1318).** New
+  `framework extensions reconcile-tokens <pack> [--check]`; `--check` reports drift and exits 1. A
+  record for an extension that is not enabled is reported, never dropped.
+- **`framework upgrade` orders prereleases (#1032 [25], !1313).** `release_key()` orders
+  dev < a < b < rc < final, so a migration added between an rc and its final is selected.
+- **`check_provenance_env` follows `pack.yaml` (#1032 [20], !1313).** It WARNs when `pack.yaml`
+  declares no `name`, and when a gateway `OKENGINE_PACK` disagrees with it.
+
+### Write path (baked)
+- **Shared-word alias tie (okengine#1030, !1316).** New `actor_grounding.extends_name`: a shared
+  distinctive word ties a new name to a kept one only when every other word it adds is a kind word
+  (group, APT, team, gang, ransomware, RaaS, ...), a numeral or a tracker designator. Names that
+  add an organization or software word ("... Labs", "... Bank", "... Stealer", "Cobalt Strike")
+  must ground on their own or be glossed by a cited source. A legacy scalar `aliases` or `sources`
+  value splits like the list it stands for (#1032 [23]).
+- **Granted extension writes pass policy validation (#1032 [6], !1318).**
+  `policy_plane.validate_capability(..., caller=True)` accepts a well-formed `identity_edit` on a
+  caller capability; it rejected every write by a granted extension before. A policy document
+  still may not carry a grant.
+
+### Reader and cockpit (baked)
+- **Revalidating lookup memos (okengine#1024, !1315).** The reader's embed and link-title memos and
+  the cockpit's embed and `_ref_title` memos use `okengine.vault_lookup_cache.VaultLookupCache`:
+  a hit is served only while its source file's fingerprint is unchanged, a miss expires after
+  60 s, and each memo is LRU-bounded at 4096 entries. A retitled, moved or newly created page
+  shows without a container recreate. The cockpit's `_ref_title` refuses paths outside the wiki.
+- **Per-page governing actor schema in the cockpit (#1032 [10] [19], !1315).** A type declared
+  `role: actor` only in a walk-up sub-domain's schema is quarantined like an actor on that
+  sub-domain's pages, and does not leak to root pages.
+
+### Backup and restore
+- **Short backup fence (#1032 [0], !1314).** `framework backup create` holds `stable_corpus` only
+  to walk the corpus and hardlink it into `.okengine/backups/.staging/`; the `.hermes-data` walk,
+  gzip, hashing, SQLite online backups and runtime files run after the fence is released. Known
+  in-place writers (`log.md`, `*.jsonl`, `.okengine/*.json`), files written within the settle
+  window and recent hot files (64 MB budget) are copied on the first attempt. A file rewritten in
+  place after the fence triggers a rebuild that copies only the changed files; forced copies under
+  one fence are capped at 2,000 files and 128 MB. After 3 attempts the archive is kept and the
+  still-changing files are listed in `consistency.rewritten_after_fence`. Without hardlinks, files
+  are read after the fence and rechecked (`corpus_snapshot: read-after-fence`). Stale staging
+  directories are swept under a lock.
+- **Restore re-arms cron-plus privately and under its lock (#1032 [26], !1314).** `jobs.json` keeps
+  its mode and owner and is rewritten under `jobs.json.lock`.
+- **Projector reconciles a restored vault (#1032 [9], !1314, baked: projection image).** A corpus
+  epoch below the checkpoint forces a full reconcile instead of an empty delta. Epoch reuse after
+  a restore that advances past the checkpoint is follow-up okengine#1035.
+- `framework_deployment.discover_packs` and `framework upgrade` snapshots ignore pack copies under
+  `.okengine/backups` and `.okengine/snapshots` (!1314).
+
+### Detection and review
+- **Cron scripts reject unknown arguments (okengine#1034, !1313).** `corpus_audit.py` parses argv
+  before touching the vault; `--help` exits 0, an unknown argument exits 2, and `--report-only`
+  (alias `--dry-run`) prints the metrics without writing the dashboard. A subprocess detector runs
+  every converted `scripts/cron/*.py` with an unknown argument; the 53 not yet converted are on a
+  shrink-only allowlist.
+- `registry_coverage` uses `review_autoverify.refusal()`, the lane's own refusal ladder, so held
+  actor pages are counted, not ranked (#1032 [21], !1313).
+
+### CI and tests
+- **Release lanes run on every baked release-image source (okengine#1031, !1309).** The MR
+  `changes:` list covers `src/`, `okengine-mcp/`, `okengine-reader/`, `okengine-cockpit/`, the
+  smoke fixtures and the wheel's members, derived and checked by a test with a negative fixture.
+- **Smoke images are scoped (okengine#1033, !1310).** The smoke stack builds
+  `okengine-smoke-<svc>:${SMOKE_RUN_ID:-local}`, so a local build never moves a deployment's tag.
+- `hermes-target-contracts` selects on every input it consumes (#1032 [13], !1313).
+- Full-suite shards are rebalanced from CI-measured durations and the shard timeout is 48 minutes
+  (!1308); the shard budget checks weigh an unrecorded test file like the planner (!1311).
+- The documented carried-patch count is derived from the manifest (#1032 [28], !1313).
+
+### Issues
+- Fixed and closed: okengine#1024, okengine#1029, okengine#1030, okengine#1031, okengine#1032,
+  okengine#1033, okengine#1034.
+- Follow-ups: okengine#1035 (projection epoch reuse after a restore), okengine#1025 (operator-tier
+  extension trust acceptance).
+
+## v0.15.11
+
+PATCH. Write servers act for their pack, identity changes on existing pages are held for review,
+actor guards follow the composed schema's declared actor types, and actor renames are judged
+(okengine#1014, okengine#1020, okengine#1026, okengine#1027, okengine#1028). The reader's page
+revision token is restored for settled pages (okengine#1023). Deployment scope: **fleet
+required**. **Baked: rebuild the gateway, reader, cockpit and review-write images.**
+
+### Upgrade notes
+- **Rebuild the gateway, reader, cockpit and review-write images first**, then run `deploy.sh`
+  per host. The staged crons that import the new `okengine.*` modules (`corpus_audit`,
+  `importer_guard`, `review_autoverify`, `active_view_lib`) roll together with the image, never
+  ahead of it. `scripts/cron/schema_lib.py` is baked too; a stage-only deploy leaves the write path
+  on the old library.
+- **Run `ensure-runtime` and recreate the gateway**, so every write server receives
+  `OKENGINE_PACK` in its `env:` map.
+- **Regenerate the cron fleet.** Output-contract digests changed.
+- **A deployment whose `pack.yaml` has no `name` refuses to start its write servers.** Give a
+  nameless `pack.yaml` a literal `name` before upgrading. `framework validate` now FAILs a
+  `pack.yaml` with no literal (or a blank) `name`, and `deploy.sh` refuses before it recreates the
+  gateway when a write server would lack a principal (new step 2b, below).
+- **Packs that keep actors under other type names must declare `role: actor`** on those types
+  (`types.<t>.role: actor`). Until they do, the actor guards skip those types and the audit reports
+  them as undeclared.
+
+### Write path (baked)
+- **Write servers act for their pack (okengine#1027, !1299).** Hermes starts stdio MCP servers
+  with a filtered environment, so `OKENGINE_PACK` never reached a write server and every agent
+  lane wrote with no pack principal. The new `okengine.pack_principal` takes the deployment pack
+  from the `name` in `pack.yaml` (`OKENGINE_PACK` only where `pack.yaml` declares none; a
+  disagreement is refused). A server-bound cron lane of a co-installed or composed pack acts for
+  that pack; a pack the deployment does not hold never becomes a principal. `write_server.py`
+  refuses to start without exactly one principal, and `ensure-runtime.sh` renders `OKENGINE_PACK`
+  into every `okengine-write*` `env:` map.
+- **Identity changes are held for review (okengine#1028, !1299).** On an existing page, a changed
+  `type`, `title` or `name`, a dropped alias, or a removed or emptied curated field is held unless
+  the caller holds an `identity_edit` grant: the stored value is kept, the change is queued for
+  review, and the rest of the write applies. The guard (`okengine.identity_guard`) runs on update,
+  patch and converge, including a dedup-redirected create. Grants live in a lane's output
+  contract; a lane that creates pages can never hold one, a pack may only narrow an engine lane's
+  grant, and malformed grants grant nothing. The operator principal holds every grant.
+- **Citation lists are merged, never dropped (!1299).** Converge unions `sources` and `basis` for
+  every caller; a dropped citation in update or patch is a curated removal held for review. A
+  lane may clear a relationship value of its own contract when every stored target is dangling
+  (a wiki path whose stem no page in the vault carries).
+- **The composed `pack` owner placeholder resolves to a declared owner (okengine#1026, !1298).**
+  Since v0.14.0 every pack was a non-owner of its own types, so `remove=` and every changed field
+  on its pages were conflicts. `type_owner` now resolves a `pack` entry to the type's declared
+  `types.<t>.owner`; without one it stays `pack`, so nothing is loosened.
+- **`title` and `name` are one identity (!1305).** A page's effective name is what the identity
+  index keys it by: `name`, else `title`, else its stem. Adding the display key a page lacks, with a
+  value that differs from that effective name, is a held rename: the addition is dropped and the
+  change is queued for review. Naming a page what it is already called still applies. A held
+  field's key-alias spellings are dropped with it, so an alias cannot bring back a held display
+  key. Baked: `okengine.identity_guard` and `write_services/review.py`.
+- **Actor types come from the composed schema (okengine#1020, !1296).** Every actor guard,
+  detector and panel tested the literal `type == "actor"`, so a pack that keeps actors under other
+  type names got no grounding and a vacuous audit count of 0. `okengine.actor_types` resolves
+  `actor`, every type that declares `role: actor`, and their `type_aliases`. A pack-declared actor
+  type is judged on create and on a retype into it, never on stored pages. `framework validate`
+  WARNs on an unknown `role`. Actor names fall back to aliases, then the slug.
+- **Actor renames are judged (okengine#1014, !1297).** A write that gives a stored actor a new
+  title, name or alias must ground that name like a create, unless a cited source ties it to a
+  kept name (a vendor gloss, an alias cue, a slash or a shared distinctive word). Respellings and
+  dropped names are not renames. A rename of an unsourced actor onto a name the deployment already
+  holds as a non-actor is refused. The grounding predicate also refuses absence-of-evidence
+  sentences, a third party's claims, software named as the subject when a source defines it as
+  software, and a pack's geopolitical titles.
+
+### Detection and review
+- `corpus_audit` reads **undetectable**, never 0, when no page carries a declared actor type, and
+  WARNs on a type that the corpus's own actor references point at but that is not declared
+  (`actor_types_undeclared`) (!1296, !1297).
+- `review_autoverify` holds an actor page whose cited sources resolve but do not ground it (!1297).
+- **Declared actor types always publish (!1304).** Without an explicit list, every declared actor
+  type (`role: actor`, its aliases, any capitalization) gets the #554 always-publish default in
+  `review_autoverify`, as `actor` does. A pack's explicit `review_autoverify.always_publish_types`
+  is still taken as written, with a WARN for each declared actor type it leaves out. Each page is
+  judged against its own governing (sub-domain) schema for actor detection, the grounding hold,
+  required fields and always-publish. `registry_coverage` uses the same rule. Staged only.
+- New `write-principal` deployment check in the daily validator, `framework doctor` and
+  post-deploy verify (!1299).
+
+### Deploy gates
+- **`deploy.sh` step 2b (!1305).** After `ensure-runtime` renders the writers and before any
+  `compose up` or recreate, `deploy.sh` runs `scripts/check_write_principal.py`. It cannot be
+  skipped (`--skip-validate` skips judgment, not an outage), and a WARN also stops the deploy.
+- **The baked-engine preflight is derived, not hand-listed (!1305).** `scripts/lib/baked_imports.py`
+  scans every `okengine.*` and `tools.*` import in what `deploy-cron-scripts.sh` stages (the cron
+  scripts, the runtime compose helpers, `extensions/`, enabled pack and operator extensions, and
+  the pack's scripts and connectors) and runs each in the gateway's venv. A stage-only roll onto
+  an image that cannot satisfy one is refused, naming every missing import. An import inside a
+  `try` that tolerates `ImportError` is optional and is not probed.
+
+### Reader (baked)
+- **Page revision token (okengine#1023, !1301).** A settled page's revision token is the legacy
+  `mtime_ns:size` again, so render-lint's stored baseline matches without a reset, and a restore,
+  move or `chmod` no longer invalidates it. An unsettled page's token still carries a content hash,
+  keeping the v0.15.10 same-tick protection.
+
+### CI and tests
+- The cockpit datasets service imports `YAMLError` by its bare name, so the mutation gate can
+  mutate it (!1300).
+- The smoke fixture vault declares its pack, and the smoke stack prints a failing service's last
+  log lines (!1302).
+- `integration-suite`, `hermes-target-contracts`, `public-snapshot` and `public-compatibility`
+  run on the CI nodes' heavy slot, with a routing detector for heavy jobs (!1292, !1295).
+
+### Issues
+- Fixed and closed: okengine#1014, okengine#1020, okengine#1023, okengine#1026, okengine#1027,
+  okengine#1028.
+
+## v0.15.10
+
+PATCH. Every file-backed cache is keyed on one shared file fingerprint instead of mtime alone
+(okengine#1017, !1293). Deployment scope: **fleet required**. **Baked: rebuild the gateway,
+reader and cockpit images**, and roll the image before staging the cron scripts.
+
+### Operator actions for the roll
+- **Build the gateway, reader and cockpit images first, then run `deploy.sh` per host.** The
+  staged `schema_lib.py` and `build_index_tree.py` import the new `okengine.file_fingerprint`
+  module from the image. The stage preflight now refuses to stage onto an image that lacks it,
+  as it already refused one without `is_reserved_basename`.
+
+### Caches (baked)
+- **File-backed caches no longer serve stale data within one timestamp tick (okengine#1017).**
+  A cache keyed only on a file's mtime missed a rewrite inside one filesystem timestamp tick, so
+  the write path could validate against an outdated schema. One shared key,
+  `okengine.file_fingerprint`, replaces it: the file's device, inode, size, `mtime_ns` and
+  `ctime_ns`, plus a SHA-256 of the content while the file's newest timestamp is within 2 s of now
+  (unsettled). A settled file costs one `stat()`. It covers 13 sites:
+  - the write path's schema caches (`schema_lib` base, governing and composed schemas) and the
+    validator's schema load;
+  - the extension scope token store, so a revoked token stops resolving within the same tick;
+  - the authorization effective policy and output-contract enforcement's jobs store;
+  - the index builder's retirement cache;
+  - the backlink caches in the MCP server, the reader and the cockpit;
+  - the reader's root-namespace cache and page revision token, and the cockpit's deck-render
+    cache.
+- A standing test pins every remaining mtime read in engine code to a reviewed non-cache use
+  (an age check, a sort, a window or a tripwire), so the list only shrinks.
+
+### Issues
+- okengine#1017 is fixed and closed.
+- Follow-up filed: okengine#1019 (same-tick misses in mtime comparisons and watermarks that are
+  not caches).
+
+## v0.15.9
+
+PATCH. A new actor page must be grounded in its cited sources (okengine#1012, !1288). Deployment
+scope: **fleet required**. **Baked write-path change: gateway image rebuild**
+(`src/okengine/write_services/{integrity,convergence,transactions,patching}.py` and the new
+`src/okengine/actor_grounding.py`). Staged cron scripts roll too (`importer_guard.py`,
+`corpus_audit*.py`).
+
+### Operator actions for the roll
+- **Build the image first, then run `deploy.sh` per host.** Existing pages are not changed; the
+  new audit metrics list them for review.
+
+### Write path (baked)
+- **A new or retyped actor is grounded in its sources (okengine#1012).** A model lane could mint
+  a non-actor (a sandbox vendor, a hosting provider, a campaign name, a nation-nexus adjective, a
+  name no source contains) as `type: actor` through the enforced write path, because every
+  identity check read the profile the model had just written. Now `create`, `update`, `patch`
+  and `converge` refuse a create of an actor page, or a retype of any page to `actor`, unless a
+  cited source grounds it:
+  - The source must name the subject by its title or name. An alias counts only when it is tied
+    to the subject: it shares a distinctive word with the title or name, appears in one sentence
+    with the name and an alias cue ("also known as", "tracked as" and the like), or is
+    slash-joined with it.
+  - The source must affirm the subject as an adversary in its own words around the mention: role
+    grammar, agent verbs, passive agents ("attributed to X"), a named kind, a list under an
+    adversary heading, naming phrases, or an attribution field. A tracker designator named in a
+    source body affirms itself. Hedged or negated sentences, headline-only mentions and a name
+    that only modifies another noun do not count.
+  - A curated record vouches without prose only for its own subject's actor record, and only when
+    marked `evidence_role: curated-authority`. That field is operator-owned, so a model write
+    cannot set it. Provenance labels are not evidence for a model write.
+  - A name equal to its publisher must be affirmed by a source; no curated record or label can
+    vouch for it.
+  - Refusals carry a reason code: `unsourced`, `no_resolvable_source`, `name_absent_from_sources`,
+    `name_equals_publisher`, `source_defines_non_actor` or `no_source_affirms_actor`. An
+    unresolvable or unreadable source is not evidence. An update to an existing actor is not
+    re-judged, and lane ownership does not bypass the check on a retype.
+- The predicate lives in one new library, `okengine.actor_grounding`.
+
+### Deterministic writers and detection
+- `importer_guard.guard(fm, vault=..., creating=True)` applies the same predicate to a direct
+  writer's create; there, provenance labels vouch. It reports and never fails open. The default
+  stays `creating=False`, so no current direct writer changes behavior until it opts in.
+- `corpus_audit` adds two WARN metrics: `actor_identity_ungrounded_pages`, a review list with a
+  per-reason breakdown, and `actor_identity_unsourced_pages`. Both report **undetectable** when the
+  grounding library is missing.
+
+### Issues
+- okengine#1012 is fixed and closed.
+- Follow-ups filed: okengine#1013 (v0.15.8 invariant-audit candidates waived for the release),
+  okengine#1014 (actor grounding follow-ups: renames, the autoverify hold, predicate residuals,
+  and pack direct writers opting into `creating=True`).
+
+## v0.15.8
+
+PATCH. cron-plus runners are no longer killed by the gateway's MCP startup cleanup, and an
+orphaned run record no longer keeps the healthcheck red (okengine#1010, !1286). Deployment scope:
+**fleet required**. **Baked: gateway image rebuild** for carried Hermes patch 25. The cron-plus
+change is stage-only.
+
+### Operator actions for the roll
+- **Build the image first, then run `deploy.sh` per host.** Nothing to run after the roll.
+
+### Carried Hermes patches (baked)
+- **MCP cleanup no longer kills cron-plus runners (okengine#1010).** The stdio MCP transport
+  identifies a new server as the change in the gateway's direct children across the spawn, and
+  cron-plus runners are direct gateway children too. A runner spawned while MCP discovery was
+  connecting was tracked as that server's process and killed by the stale-connection cleanup,
+  leaving its run record `running`. The new carried patch
+  `25-mcp-cron-plus-runner-child.patch` adds the `cron-plus/runner.py` argv marker to Hermes'
+  MCP child-pid exclusion markers. It does this from `tools/mcp_tool_discovery.py`, an
+  already-carried surface, so the touched-upstream-file count stays at 35. The carried set is now
+  24 patch artifacts. Carried patches are applied at image build, so this needs a gateway image
+  rebuild and roll.
+
+### cron-plus (stage-only)
+- **Per-tick orphan reconciliation (okengine#1010).** Orphaned run records were closed only when
+  the same lane started again, so one killed run kept the gateway healthcheck red until that
+  lane's next run. Each scheduler tick now closes the newest dead `running` record of every lane,
+  reading only each lane's newest record. A run that closes its own record during the liveness
+  probe keeps its outcome, and a sweep failure is logged without stopping the schedule. It is
+  applied by `install-cron-plus.sh` during deploy.
+
+### Issues
+- okengine#1010 is fixed and closed.
+- Follow-up filed: okengine#1011 (add pid-namespace and start-time identity to orphan
+  reconciliation).
+
+## v0.15.7
+
+PATCH. The operator-tier trust gate keys on what an extension runs (okengine#1004), and list-field
+scalars keep prose whole (okengine#1005). Deployment scope: **fleet required**. **Baked write-path
+change: gateway image rebuild** (`src/okengine/list_scalars.py`, `write_services/validation.py`,
+`okengine-mcp/write_server.py`, `scripts/cron/schema_lib.py`; !1283). Staged cron scripts roll too.
+
+### Operator actions for the roll
+- **Build the image first, then run `deploy.sh` per host.**
+- **After the roll, run `framework repair --repairs legacy-scalars`** where its dry run plans
+  pages. `--apply` refuses unless the deployment's runtime stamp says v0.15.7 or later.
+
+### Write path (baked)
+- **List-field scalars keep prose whole (okengine#1005, !1283).** The write path and the
+  legacy-shape repair lane share one rule (`okengine.list_scalars`). A `list` field splits on its
+  commas, but never at a comma inside brackets, a date or a number. A new `field_shapes` value,
+  `prose-list`, declares a list of sentences, and a scalar written for one is kept as a single
+  item. The assessments extension declares `alternatives`, `assumptions`,
+  `would_increase_confidence` and `would_decrease_confidence` as `prose-list`. `basis` and
+  `adversarial_evidence` stay `list`, because engine consumers read their items as references.
+- **`repair_legacy_shapes.py --apply` now requires an engine runtime of v0.15.7 or later**, so the
+  gateway that serves the repaired pages applies the same rule. The lane's reshape-only check
+  accepts either reading of a scalar (its delimited items or the whole string); a split inside
+  brackets is a data change.
+
+### Extensions
+- **The operator-tier trust gate keys on what runs (okengine#1004, !1281).** An operator-tier
+  extension labelled `trust: declarative` that shipped a script entrypoint (in a manifest block or
+  a `crons/*.cron.json` drop-in) passed `enable`, validation and the load-time re-check without a
+  recorded acceptance, then was staged and scheduled in the gateway. Now:
+  - Acceptance is required when an operator-tier extension is `trust: in-gateway` **or** runs
+    gateway code (`extension_discovery.runs_gateway_code`): a non-sidecar operation that names a
+    script, an operation shipped with top-level `*.py`, a toolset outside the no-code allowlist
+    (`okengine`, `okengine-write*`, `web`, `todo`, `no_mcp`, `file_read*`), or an unreadable
+    drop-in.
+  - `trust: declarative` declares no operation at all, prompt or script, manifest or drop-in.
+    Discovery, both validators and the composer reject it, and `--allow-untrusted` cannot get
+    around it. A declarative extension with no operation composes to no job.
+  - An empty `trust_accepted: {}` no longer counts as acceptance for a manifest with no `trust` key.
+
+### Crons
+- **`build_hot_set` reads its clock once per run (!1284).** A run that straddled midnight UTC could
+  cut its `recent` and `open` windows on different days. The tests pin the date, which removes a
+  midnight flake in `test_default_hot_set_window_and_cap`.
+
+### CI
+- The mutation timeouts of the six targets that run `tests/extensions/test_trust_gate.py` are
+  re-measured from CI (82 s JUnit sum) and raised to at least twice that baseline (!1282).
+
+### Issues
+- okengine#1004 is fixed and closed.
+- Follow-ups filed: okengine#1005 (v0.15.6 invariant-audit candidates waived for the release; the
+  comma-split and hot-set clock items above came from it), okengine#1006 (`test_trust_gate.py`
+  cost in CI), okengine#1007 (a prose
+  `basis`/`adversarial_evidence` scalar with a plain comma is still split), okengine#1008
+  (`select_daily_brief` mixes UTC and local clocks).
+
+## v0.15.6
+
+PATCH. Follow-ups from the v0.15.4 and v0.15.5 release audits (okengine#994, okengine#995), the
+victim guard's defender post-modifier (okengine#996), and reserved page names (okengine#997).
+Deployment scope: **fleet required**. **Baked write-path changes: gateway image rebuild** for
+`src/okengine/actor_identity.py` (!1271, !1275), the reserved-name predicate in
+`tools/schema_validator.py`, `scripts/cron/okf_migrate.py` and `write_services/policy.py` (!1277),
+and the stored-echo repair in `write_services/{authorization,transactions,patching}.py` (!1278).
+Staged cron scripts roll too.
+
+### Operator actions for the roll
+- **Build the image first, then run `deploy.sh` per host.** `deploy-cron-scripts.sh` now checks
+  the gateway's baked `tools.schema_validator.is_reserved_basename` before it stages anything and
+  refuses to stage onto an image that predates it. `okf_migrate` refuses to load against such a
+  validator (an `ImportError`, not a silent fail-open), so the staged scripts and the image roll
+  together (!1277).
+- **Operator-tier extensions need a recorded trust acceptance (okengine#994 [14], !1276).** An
+  operator-tier `trust: in-gateway` extension with no recorded acceptance is neither staged nor
+  scheduled, and `framework validate` (deploy step 1) FAILs naming the command:
+  `framework extensions enable <deployment> <id> --allow-untrusted`, run once. The accept also
+  reconciles the extension's token to its current manifest scopes, which can widen a token minted
+  before the manifest gained scopes: review the manifest's scopes before accepting.
+- **Post-roll repairs.** Run them only after the roll:
+  - `framework repair --repairs malformed-slugs` (okengine#997). Before the roll, a no_agent
+    writer would re-mint the reserved name on its next run. Run the dry run first: a
+    tombstone whose `superseded_by` does not resolve is reported as an error for a manual fix, and
+    scaffold-shaped pages such as `_template.md` are listed for review, never renamed.
+  - `framework repair --repairs legacy-scalars`, then, as a separate decision, `legacy-wikilinks`
+    (okengine#994 [19]). Apply refuses unless the deployment's runtime stamp
+    (`.hermes-data/engine-runtime.yaml`) says v0.15.6 or later. Run the scalar class first; the
+    wikilink class can touch many pages on a large vault. See `docs/audit-and-repair.md` for the
+    audit, plan, apply and verify commands.
+
+### Write path (baked)
+- **Victim guard recognizes every adversary self-description (okengine#995, !1271).** The source
+  role cue list was closed, so an actor described only as a hacktivist, cybercrime, espionage or
+  state-sponsored group was rejected as a `victim organization`. The cues now cover those terms
+  and the related adversary vocabulary (whole-token, case-folded). Affiliation cues
+  (`state-sponsored`, `nation-state`, bare `hacker`) count only before an adversary kind such as
+  group, actor or gang, not before broad nouns like organization or team. Defender modifiers
+  (ethical, white/grey/gray hat, red/blue/purple team, bug bounty, CTF, student, academic,
+  university, pentest and others) break the descriptor. Words that name defenders as often as
+  adversaries (`fraud`, `financially motivated`, `cyber`, `state`) are deliberately not cues. The
+  !1268 head-noun rule and the "attributed claims still count" decision are unchanged.
+- **Victim guard checks the head noun's post-modifier for defender members (okengine#996,
+  !1275).** "a hacking group of ethical hackers", "a hacking collective of students" and "a hacker
+  group that runs a conference" are rejected as a `victim organization` again. The scan reads a
+  membership phrase (`of`, `consisting of`, `comprising`, `including`), a relative clause whose
+  verb constitutes, runs or hosts the group, and a copula's noun complement. A clause with any
+  other verb ("that targets university researchers") names a target, tool or lure and is not
+  scanned. Regular plurals are matched. The scan stays linear.
+- **No page is minted under a reserved or dot-leading basename (okengine#997, !1277).**
+  `schema_validator.is_reserved_basename` is the one predicate for the OKF reserved names (plus
+  the pack's `reserved_files`, case-insensitive), dot-leading names, `_` scaffolding, `INDEX.md`,
+  `INDEX-*` and `index-*`. The validator's exemption, the write path's refusal
+  (`policy._reserved_refuse`), the `okf_migrate.write_key` minting guard and the detector all call
+  it. `write_key` mints a stand-in (`<slug>-<type>` or `<type>-<slug>`) and reuses a live page that
+  already holds one. `find_page` never returns an engine-generated file, and a tombstone at a
+  reserved name no longer takes the write. The detector FAILs a live page under a reserved or
+  dot-leading name and WARNs on tombstones and scaffold-shaped pages. The new
+  `repair_malformed_slugs` reserved-name path renames live pages to their stand-in, keeps the
+  `id`, rewrites links, sends a tombstone's inbound references to its `superseded_by` target, and
+  runs as one corpus transaction.
+- **A correct repair of a legacy field shape is stored (okengine#994 [19], !1278).** The #991
+  stored-echo guard replaced a sent value with the stored one for judging and for storing, so a
+  write that sent the canonical shape of a legacy value (a scalar list field as a list, a
+  `[[link]]` as the plain path) was reported `updated` while the legacy shape was put back.
+  Judging is unchanged; storage now keeps a JSON date echo's stored date, stores a reshape in its
+  canonical shape and stores a real change as sent. Operator-owned attestation fields stay byte
+  for byte (#980). `_preserve_immutable` keeps the canonical shape of a stored immutable value
+  without flagging it, so a patch to a page with a legacy `discovered_by` no longer sets a
+  spurious `needs_review`; a real change is still reverted and flagged, now compared
+  type-strictly. Every check in `_update`/`_patch` that compares the write with the stored page
+  reads canonical views of both sides, so echoing a legacy multi-value `aliases` or `sources` no
+  longer records a removed alias or refuses the write.
+
+### Repair lanes
+- **Legacy-shape repair lane (okengine#994 [19], !1278).** `scripts/cron/repair_legacy_shapes.py`
+  is registered in `framework repair` as `legacy-scalars` and `legacy-wikilinks`. The canonical
+  value is the write path's own `_coerce_fm`. A field changes only when the reshape keeps the same
+  items in order; a canonical form that would lose data (`[[x|Label]]`, an anchor, a collapsed
+  duplicate) is skipped and reported. Attested pages, operator-owned fields, tombstoned, reserved
+  and refused pages are skipped. Only a repaired key's bytes change. `framework repair plan` records
+  every selected repair's dry run, and `verify` fails while a planned repair remains.
+- **Repair lanes keep CRLF bytes; `malformed-slugs` leaves no dangling links (okengine#994, !1279).**
+  - The legacy-shape lane read and wrote pages with newline translation, so a CRLF page came back
+    entirely LF. Pages are now read and written untranslated, and a repaired key's new lines take
+    that line's own ending. Verification asserts that every byte outside the edited spans is
+    unchanged.
+  - `malformed-slugs` now plans every move first and refuses two pages claiming the same new name.
+    It renames inside one corpus transaction, then rewrites references in one pass with the
+    whole-token `okf_migrate` rewriters, keeping CRLF. Before this:
+    - pages that linked to each other were left with dangling links;
+    - a page's link to itself did not follow its rename;
+    - a slug that is a prefix of another corrupted the longer one's links;
+    - the dry-run count disagreed with apply.
+    Files are now reported by their original path, and a failed write is reported as an error.
+  - `okf_migrate.make_path_rewriter` (baked) no longer skips a path right after a single `[`. The
+    first item of a YAML flow list (`related: [entities/x]`) and bracketed paths in prose are now
+    rewritten by every rename and dedup lane; `[[wikilinks]]` are unchanged.
+
+### Fail-closed (okengine#994, !1276)
+- **budget_guard** (#994 [9]): an unreadable `state.db` (missing, unopenable, locked, corrupt, or
+  without a token column) is unknown usage, not zero. The guard never resumes, never self-heals
+  orphans and never pauses on a guess; a paused guard still re-pauses re-enabled crons, and the
+  tick exits 1. With no budget set, as on every deployment today, the guard is a no-op.
+- **Operator trust acceptance** (#994 [14]): see Operator actions. `enable --allow-untrusted`
+  records `trust_accepted` in the enabled-state entry; disable drops it.
+- **entity_link** (#994 [20]): a bare scalar alias or source is a one-item list instead of a
+  crash; a YAML boolean is never a name.
+- **question_kind** (#994 [21]): an explicit `question_kind` outside the policy vocabulary keeps
+  the reference blocking (`unknown-question-kind`) instead of demoting it to contextual.
+
+### Generated pages and deploy checks (okengine#994, !1272, !1274)
+- HOT.md drops every tombstoned page, not only retired actors (#994 [11]).
+- The INDEX tree uses the shared `generated_page.is_exempt` predicate, so a paginated index no
+  longer lists its own pagination pages, and namespace, BUNDLE and HEALTH counts exclude
+  INDEX/INDEX-pNN/_about/log files (#994 [23]). Content totals fall accordingly, by about 2-3%
+  on a large vault.
+- `deployment_checks.run()` FAILs an unknown check name instead of dropping it, and post-deploy
+  verify reports a staged `deployment_checks.py` that predates `chat-capability` as stale (#994
+  [15]).
+- `deploy-cron-scripts.sh` reports staged extension directories that the stage plan no longer
+  contains, and removes them only with `--prune-stale-extensions` (#994 [27]).
+- `framework extensions disable <core id>` opts a default-on core extension out instead of
+  printing "not enabled" and leaving it active (#994 [26]).
+
+### Environment and backup (okengine#994, !1273)
+- Host `doctor`, `status` and post-deploy verify judge the gateway environment that compose builds
+  from the pack `.env`, not the operator's shell (#994 [16]).
+- `ensure-runtime.sh` reads `OKENGINE_MCP_TOKEN` with `dotenv_lib` (compose grammar), rewrites
+  every spelling on regeneration, and FAILs the deploy if compose would not hand the containers
+  the new token (#994 [17]). Appended pins no longer glue onto an unterminated last line.
+- `hermes_uid.sh` `_okengine_env_file_val` is last-wins with interpolation, like compose (#994 A).
+- A no-secrets backup records the names (never the values) of `.hermes-data/.env` keys it does not
+  carry, and restore lists them (#994 B).
+
+### CI and tests
+- New `dotenv-compose-parity` job runs the compose cases with compose required, so a missing
+  compose FAILs instead of skipping (#994 [18], !1273).
+- `hermes-target-contracts` watches `patches/apply.sh`, `patches/cron-plus/**` and
+  `scripts/install-cron-plus.sh`, and runs the shipped `apply.sh` twice to prove the series is
+  idempotent (#994 [22], !1272).
+- The test session refuses to start when `okengine` resolves from outside this checkout's `src/`
+  or an installed wheel (#994 [24], !1274). The `test_dump_from_live` round trip seeds the
+  generating pack's prompt files (#994 D, !1274).
+- `CHANGELOG.md` records #973 (!1266) and its victim-guard fix (!1268) under v0.15.5 (!1270).
+
+### Issues
+- okengine#996 is fixed and closed. okengine#997 stays open until the live `malformed-slugs` repair
+  runs. okengine#994 and okengine#995 are umbrella audit issues: the items above are fixed, and
+  both stay open for their remaining items.
+- Follow-ups filed: okengine#998 (victim guard: appositive and unlisted post-modifier defender
+  forms), okengine#999 (read-side `INDEX`-prefix and `.bak` skips hide writable pages),
+  okengine#1000 (`field_values.same_value` misjudges YAML-anchored values as changed),
+  okengine#1002 (write-path reshape rule and the legacy-shapes lane disagree; `_coerce_fm` is not
+  idempotent), okengine#1003 (`malformed-slugs`: bare references to a collision-refused slug with a
+  space can be corrupted).
+
+## v0.15.5
+
+PATCH. Follow-ups from v0.15.4 (okengine#993). Deployment scope: **fleet required**. Baked write
+path: gateway image rebuild (chat status rule); the reader image rebuilds (whole-envelope tombstone
+read); staged cron scripts roll (resharder and frontmatter readers).
+
+- **Chat cannot retire a page (okengine#993).** A new capability key, `forbidden_values`, holds a
+  field to a value deny-list. The chat floor forbids moving `status` to a retirement value
+  (`tombstoned`, `superseded`, `retired`), case- and whitespace-insensitively, after field and value
+  aliasing, on every frontmatter-writing path. A legacy stored value that an alias maps to a
+  retirement status cannot be normalized into retirement by an unrelated chat edit. A pack's chat
+  replacement may widen the list but never drop or narrow it. Converging a new id still requires
+  `create`, now stated in the refusal; chat stays refused under walk-up sub-domains.
+- **Partition loop fixed (okengine#993).** `reshard-oversized` read only the first 4000 characters
+  of frontmatter, so a long-frontmatter source got a different shard than the reshelve drain gave
+  it and moved back and forth every day. It now uses the drain's own reader. Views, the daily
+  brief, the Wardley map and the conformance and grounding audits share one streaming, uncapped
+  frontmatter reader; the daily brief no longer lists a tombstoned page as fresh or updated, and
+  `rebuild-index` treats an impossible date as unparseable instead of crashing.
+- **Reader sees long-frontmatter tombstones (okengine#993).** The reader's head read extends until
+  the frontmatter closes, so a retired actor with tens of kilobytes of frontmatter is hidden like
+  any other.
+- **Deploy gates match Hermes (okengine#993).** The actor-less-writer gate follows Hermes' full
+  platform-config precedence (`gateway.platforms`, `platforms`, `gateway.<x>`, top-level blocks,
+  relay URL), sees photon credentials stored in `auth.json`, and treats a default-bound chat writer
+  as bound. The shared `.env` reader resolves `${VAR}` in compose's order. `deploy.sh` pins the
+  reader's `OKENGINE_EDITING` to the `.env` value so the reader and gateway agree.
+- **Smaller fixes (okengine#993).** Whole-value regex validators across the engine anchor with `\Z`
+  (the detector now scans every source tree). `patches/apply.sh` reports a failed checkout
+  snapshot. `install-domain` records a guest pack's chat declaration even on a re-install without
+  `--refresh`.
+- **Descriptive threat-actor identities (okengine#973, !1266) with a hardened victim guard (!1268).**
+  Original sources may now establish a dual-role actor through a descriptive identity ("X is a
+  cybercriminal ransomware group"). The descriptor must head the noun phrase: a cue word must
+  modify the actor noun directly, and prepositions, victim/target/defender nouns, possessives and
+  "hit by …" end it, so a victim ("X is a victim of ransomware group Akira", "an APT group's
+  target") stays rejected as a victim organization. The role scan is linear (a 200 KB source page
+  went from 36 s to 0.03 s on the write path).
+
+## v0.15.4
+
+PATCH. Security and reliability follow-ups from the v0.15.3 release audits (okengine#991), plus
+question-scoped country evidence (okengine#992). Deployment scope: **fleet required** (security).
+Baked write path: gateway image rebuild (the chat write policy). The read-MCP image also rebuilds
+(`tier_lib`), and the reader needs `OKENGINE_EDITING` passed through in hand-maintained pack
+composes (the pack skeleton now does this).
+
+- **Chat write policy (okengine#991).** A chat write under a walk-up sub-domain is held to the
+  same namespace ceiling as a top-level one, judged by the page's namespace position (shard
+  directories such as `entities/t/_/` are ordinary storage). The chat floor also protects
+  `redirect_to`, `link_stub`, `tombstoned` and `canonical`. A read-modify-write that echoes a
+  stored date or legacy value back is no longer read as a protected-field change, for any writer.
+  A chat create that dedups into an existing page is refused with a message naming that page.
+  `framework validate` and `install-domain` warn when an installed guest pack ships a chat
+  capability that is never composed.
+- **Deploy and runtime gates (okengine#991).** One shared `.env` reader (`scripts/cron/dotenv_lib.py`)
+  matches `docker compose` for comments, `export`, quotes, CRLF and duplicates; ensure-runtime,
+  `framework validate` and the in-gateway check all use it, so `OKENGINE_EDITING=0` in `.env`
+  reliably unbinds the chat writer. The actor-less-writer gate now sees messaging platforms that
+  pinned Hermes enables from credentials alone, and reads `.hermes-data/.env` as Hermes does. A
+  new in-gateway check FAILs when a bound chat writer has no capability in the baked catalog.
+- **Engine upgrades fail closed (okengine#991).** Migration state and pin files are written
+  atomically; an unreadable state file stops the upgrade instead of replaying every migration.
+  `deploy.sh` stops when an engine migration fails or rolls back (an ahead pin still falls
+  through to validate). Rollback snapshots cover `.hermes-data/.env`. A crashing validator rolls
+  the upgrade back.
+- **Backup restore and extension checks (okengine#991).** Restore refuses to run as root and
+  never pins uid 0; non-secret `.env` settings (timezone, schedule, tuning) are carried by an
+  explicit allowlist, values must be printable, and restore lists the keys it did not carry. A
+  crashing post-restore validator fails the restore. `framework validate` reports extension
+  discovery faults even without an enabled-extensions map. Whole-value regex validators in
+  `scripts/` anchor with `\Z`, guarded by a detector test.
+- **Generated views and tiering (okengine#991).** Retired actors with long frontmatter are hidden
+  from the index tree and hot set, which now share one uncapped frontmatter reader. Any
+  tombstoned page tiers cold (`tier_lib`); on large vaults this moves hundreds of tombstoned
+  sources and entities to cold and lets long-frontmatter pages leave cold.
+- **Carried patches (okengine#991).** `patches/apply.sh` is idempotent on re-runs and names the
+  patch a drift actually sits in (exit 2 on every failure path); the patch-integrity tests cover
+  the live target series.
+- **Release-audit fixes.** A secrets-excluded backup no longer archives `.hermes-data/.env`
+  (Hermes' credential file). Backup now carries `OKENGINE_EDITING`, `API_SERVER_ENABLED` and
+  `COMPOSE_PROFILES`, so a restored read-only deployment stays read-only, and a duplicated `.env`
+  key resolves last-wins as compose does. Cockpit HTML escaping covers quotes, so vault-derived
+  text in `title`/`aria-label` attributes cannot inject markup.
+- **Question-scoped country evidence (okengine#992).** Country evidence references are scoped to
+  the question, collection blockers are explained, and canonical operator provenance is preserved
+  in scoped evidence.
+
+## v0.15.3
+
+PATCH. Write-path identity and authority hardening. Deployment scope: **fleet required**
+(security). Baked write path: gateway image rebuild; the image and staged cron scripts must roll
+together (`corpus_audit` imports the new `okengine.attestation` module), then `ensure-runtime` and
+a gateway recreate (the Agent Chat writer registration and `platform_toolsets.api_server`
+migration, okengine#983).
+
+- **The Agent Chat writes through its own actor-bound writer (okengine#983).** On every
+  deployment `platform_toolsets.api_server` bound the generic `okengine-write`, which carries no
+  `OKENGINE_WRITE_ACTOR`, so the write path treated the reader/cockpit Chat agent as admin: no
+  capability, no namespace limit, no review. Chat now writes only through `okengine-write-chat`
+  (actor `chat:api_server`, tools `create_entity`/`update_entity`/`append_to_section`), held to a
+  catalog floor: create/update/append in `entities/` and `concepts/`, frontmatter-only updates,
+  no provenance, handling, review or attestation fields, and every chat write queued for human
+  review. Capabilities gain per-operation `body` modes (a single string still applies to every
+  operation). A pack may replace an engine-declared `chat:*` capability, and nothing else, inside
+  an engine ceiling that composition and `framework validate` enforce. `ensure-runtime` registers
+  the chat writer and migrates existing configs (honoring `OKENGINE_EDITING`); `framework
+  validate` and the in-gateway deployment check FAIL any model-facing platform that can reach the
+  actor-less writer, with the CLI exempt by a named operator-surface rule. A `chat:` actor no
+  longer resolves as a cron lane in the output contract. Field-change checks (the update
+  capability check and the #980 attestation guard) compare values type-strictly via canonical YAML,
+  so `0` stored over `false` is a change, and a pack `field_aliases` key is judged under its
+  canonical name. Because `deploy.sh` validates before ensure-runtime migrates, `framework
+  validate` reports a pre-#983 `api_server` list as a pending migration (WARN) rather than
+  failing the upgrade that removes it; any binding the migration does not remove still FAILs.
+- **An alias-matched create no longer recurses.** A create whose alias matches a live entity
+  the id index does not hold yet (a page a lane wrote straight to disk) looped converge → create
+  → dedup until the interpreter's recursion limit, and was rejected as "not valid YAML" (or
+  crashed on Python 3.11). It is now refused by name and flagged for review.
+- **Retired actors leave generated navigation (okengine#975).** `build-index-tree`,
+  `build-hot-set` and `rebuild-index` omit an explicitly tombstoned actor (its type resolved
+  through the governing schema's aliases) from listings, counts and pagination, while keeping
+  every other page and the generator's own pagination ownership checks. The index tree judges
+  each page once per run (cached by path and mtime, with a `tombstoned` pre-filter before any
+  YAML parse), so its counts stay a directory walk on large vaults.
+- **Composed `@<pack>` write actors keep their engine lane's checks (okengine#961).** On a
+  composed host a lane's writer is bound as `cron:<lane>@<pack>`. Every lane-keyed write-path check
+  compared the raw actor, so a composed lane got the full write-tool surface and a contract-derived
+  `update_fields: ["*"]` capability instead of its lane's. One normalizer (`state.lane_actor`) now
+  feeds the tool fence, the lane-specific checks, capability lookup and the converge rule.
+- **The N-way compose path produces a safe job store (okengine#968).** `compose` and
+  `regen_composed` now go through the same finishing step and gate list as `regen` (extension
+  pass, actor-bound writers, every validator). One driver per engine-template lane: two packs
+  driving the same lane is a hard error. A composed instance keeps the engine job id.
+- **A pack cannot take another lane's write identity (okengine#969).** `regen`, `compose`,
+  `framework validate`, `framework extensions validate` and a new deploy-time ownership check
+  refuse a pack-authored job or pack/operator-tier extension operation that would bind another
+  lane's write server: an `@` in a domain job name, a name equal to or folding to an engine lane
+  (`Trends-Refresh`), an explicit foreign `okengine-write-*` (including the baseline
+  source-quality server and every tier-1 extension operation's server, enabled or not), a stale
+  server another pack left registered, or the generic actor-less `okengine-write` on a model lane.
+- **`CRON_PACK_DIR` is required (okengine#970).** `regen`, `regen_composed`, `compose` and `dump`
+  refuse an unset or missing pack directory instead of silently using the `/path/to/pack`
+  placeholder (which produced an engine-only fleet). `cron_pack_split check` runs the shared
+  `fleet_errors()` gate list.
+- **Vulnerability subjects are not admitted as threat actors (okengine#973, !1232, !1236).**
+  Actor admission checks the effective normalized actor on create, update, converge and patch,
+  and rejects vulnerability-led prose, while keeping a named actor whose next sentence describes
+  its activity. Baked write path.
+- **Main's nightly critical mutation campaign is green again (!1237).** Line-keyed survivor
+  dispositions re-keyed after code moved; tests that only killed their mutants on Python 3.13+ or
+  as a non-root user fixed; `mcp/projection.py` and `write_services/convergence.py` back above
+  their 90% floors. A new test runs the public-snapshot boundary in the normal suite.
+- Design: source-backed actor identity qualification contracts (okengine#972; docs only).
+
+- **Curated-authority attestation is operator-owned (okengine#980).** The local-evidence
+  resolver treats a source as an attested authority record when an actor lists it in
+  `operator_evidence_refs` and it carries `local_only`/`export_policy`/`retrieved_via`/`dataset`/
+  `record_checksum`; a pack policy may then auto-accept a bounded claim from it with no URL
+  check. Every model lane with a `sources` or `entities` namespace could write those fields:
+  `page-quality-enrich` turned an ordinary blog post into an attested record and linked it from
+  the actor in two `update_entity` calls. Every MCP write (job lane, extension, or the unbound
+  stdio writer the chat agent uses) must now preserve `operator_evidence_refs`, `local_only`,
+  `export_policy`, `record_checksum`, `bounded_auto_accept`, `retrieved_via`, `dataset` and
+  `evidence_role` exactly, and may not change an attested record's `publisher` or body. The
+  deterministic importer that writes records directly is unaffected; so are scoring and other
+  enrichment of an attested record. `corpus_audit` reports attestation on a non-source page, on a
+  page a model lane created, `operator_evidence_refs` naming an unattested page, and `operator_evidence_refs` naming no page by exact path. The resolver now resolves `operator_evidence_refs` by exact page path only (no id/URL fallback), and an attested record's `vendor`, `id`, `url` and authority-id lookup keys are frozen with its `publisher`; the check runs after pack field aliases resolve. Baked write
+  path: gateway image rebuild (`src/okengine/attestation.py`, `write_services`).
+
+## v0.15.2
+
+PATCH. Closes the remaining paths that could replace an existing page's curated content.
+Deployment scope: **fleet required** (data integrity). Baked write path: gateway image rebuild;
+`raw_compile.py` is stage-only.
+
+- A write that asked to CREATE and was redirected by dedup (alias, URL, authority id) onto an
+  existing page, or a raw capture of an already-compiled URL, now merges additively, whoever the
+  caller is. Before, `broken-wikilinks-drain` could replace a canonical page through its alias, and
+  a snippet re-capture could replace a full extract. An explicit converge that falls through
+  `_create` keeps replace semantics. On a source page the FULLER capture's body wins: a snippet
+  never overwrites a full extract, and a fuller re-extraction can still correct one. This never
+  crosses an identity conflict. Alias accrual on a merge is kept,
+  except for an alias another live page already holds as a name or alias. Dedup-verified alias
+  spellings count as agreement (`normalize_key`). List-valued identity fields are compared, not
+  unioned (okengine#962). Baked write path: gateway image rebuild.
+
+## v0.15.1
+
+PATCH. Prevents incomplete PostgreSQL projections and conflicting projector mutations.
+Deployment scope: **fleet required** for projection data integrity. Gateway and sidecar
+images must be rebuilt; existing operator owner overrides remain visible.
+
+- The projector uses the vault owner's UID/GID in new scaffolds and generated overlays for
+  existing deployments, retaining non-root execution and a read-only vault mount (#950).
+- Unreadable pages or directories fail reconciliation and health before rows can be deleted
+  or an incomplete epoch marked successful. Typed reads reject legacy incomplete epochs (#950).
+- PostgreSQL transaction locks serialize bootstrap, reconciliation, incremental refresh, and
+  scratch verification. Rollback/cancellation release the lock; a five-minute lock timeout
+  bounds acquisition. Bootstrap commits before scanning so its view DDL does not pause readers
+  for the duration of a rebuild (#951).
+- Deploy persists its verified host `ENGINE_DIR` and exact `OKENGINE_SOURCE_SHA` in the
+  owner-only deployment `.env`, preserving unrelated operator settings and overlays (#952).
+- `entity-backfill` may only ADD to an existing page when identity resolution lands its converge
+  on one: the existing body is kept (an empty page is still filled), list fields such as `sources`
+  are unioned, existing values are kept, and `remove` is ignored. It had been replacing canonical
+  pages wholesale -- 69 pages across four deployments in four days: an actor's MITRE description
+  replaced by a one-line summary (which withdrew a downstream ATT&CK attribution), and on 11 pages
+  `sources` entries dropped. Scoped by the server-bound write actor; lanes that
+  recompile whole pages through converge keep replace semantics. Baked write path: gateway image
+  rebuild. The rule also covers `concept-backfill` (same create-missing role), matches a composed
+  lane's `@<pack>` actor name, never retypes a page, and treats a value held under a drift alias as
+  present -- each found by the adversarial re-verify of the first fix.
+
+## v0.15.0
+
+MINOR. Source identity no longer fuses different records that share a service endpoint URL, and a converge that disagrees on an identity field keeps the existing body. Packs can declare their own identity fields (a new schema key), which is why this is a MINOR release. **Baked write-path change** (`src/okengine/write_services`, #901): rolling it needs a gateway image rebuild.
+
+### Write path
+- A bare service endpoint URL (ArcGIS `.../query`, `.../MapServer/<n>`, `.../FeatureServer/<n>`, Socrata `.../resource/<id>.json`, with no query string) identifies a service, not a document. It no longer mints a source identity, so records read from one endpoint stop converging into whichever page claimed the URL first. A record-specific URL (`.../query?where=...`) keeps its identity. The rule lives in one shared place used by the write path, `deployment_checks`, and the `reid_sources_by_url` / `dedup_sources_by_url` operator scripts (okengine#901).
+- When a converge's frontmatter merge conflicts on an identity field, the existing body is kept byte-identical and the page is flagged for review, instead of being overwritten. The engine's identity fields are `title`, `name`, `subject` and `url`; a pack adds its own with the new optional schema key `types.<type>.identity_fields` (see `docs/authoring-a-pack.md`) (okengine#901).
+- raw-compile rejects a capture whose URL is a bare service endpoint, as it rejects a capture with no URL (okengine#901; the re-offer of such a capture is okengine#942).
+
+### Reader
+- The reader hides tombstoned pages wherever it finds pages: namespace counts, directory listings, search results, backlinks, and links (a link to a tombstone resolves to a live same-name copy, or 404). Before this, only display groups and same-name fallback filtered them, so a retired page stayed one click away. `/api/page-revisions` still lists everything, because standing detectors read it. Rolling this release rebuilds the reader image.
+
+### Crons
+- Single-pack cron regeneration resolves a domain lane's `prompt_file`. Before this, such a lane deployed with an **empty prompt** and ran on the cron wrapper plus its selector output alone. On one deployment a pack's four model lanes ran that way for a week. Regeneration now also refuses an enabled model lane with an empty prompt before writing anything. This lands at deploy time, so rolling this release regenerates the affected lanes with their prompts.
+
+### Repair and detection
+- Slug attribution treats unreadable run records within one second of the snapshot as uncertain, accounting for coarse file timestamps. Exact nanosecond boundaries keep older records excluded, and readable run timestamps and declared-artifact attribution retain their existing contracts (okengine#946).
+- `dedup_partition_collisions` also repairs case-only duplicate pages (`CVE-x.md` beside `cve-x.md`). The survivor is the spelling with the fewest capitals; separators are never folded. It keeps the lane's union merge, link rewriting and `needs_review` semantics, and never removes generated `INDEX`/`log`/`README` files in any case (okengine#883).
+- The cron-plus slug guard fails a job only when it can attribute the collision to that job: the job declared the file as its own artifact, or no other lane ran in its window. Otherwise it records the collision as `unattributed` with the overlapping lanes, and the bystander job is not failed. Stage-only, applied by `install-cron-plus.sh`. Run records are judged with a 2 s allowance for coarse file timestamps, so a record written just after the window opened is not mistaken for one written before it (okengine#883).
+- `deployment_checks.check_source_identity` WARNs on source pages that carry a bare service-endpoint URL, and no longer suggests merging them as same-URL duplicates (okengine#901).
+
+### CI
+- The diff-only docs gates no longer run in scheduled or manual pipelines. They failed closed there for lack of a diff base, and that lint-stage failure skipped every later job: from 2026-09-19 to 2026-09-29, no nightly critical-mutation campaign ran (okengine#783). The survivors that built up meanwhile in `corpus_transaction` and `output_contract_enforce` are killed or dispositioned.
+- The mutation budget pre-check prices a target from its coverage-guided selection when a fresh map covers it, so whole-range release replays are no longer refused on full-command estimates (okengine#941).
+- Release-test images are built once per candidate, and consumers verify them by digest (okengine#902). Verified tooling environments are prebuilt, and one source-attributed engine wheel is shared across jobs (okengine#905).
+
+## v0.14.9
+
+PATCH. Restores tag-to-code agreement again: the fleet was rolled from post-v0.14.8 `main` (462245f2) under the v0.14.8 marker, which the release checklist forbids. Also keeps generated-page identity, removes snippet evidence from inquiry analysis, and repairs source hydration and feed-capture recovery. **Baked write-path change** (`okf_migrate`, #915): rolling it needs a gateway image rebuild.
+
+**Behavior change (#923):** inquiry analysis no longer counts discovery snippets, failed captures or unhydrated sources as article evidence. Deployments whose inquiry evidence is snippet-only will hold that analysis until real content is backfilled (`sources hydrate --missing-body`).
+
+### Collection and sources
+- Inquiry analysis derives acquisition state from raw provenance; a writer label cannot promote a snippet, and raw-compile records acquisition state on new pages (okengine#923).
+- `sources hydrate --missing-body` inventories existing sources, previews by default and repairs with bounded `--apply` through the raw-compile write contract, preserving identity, content and raw references (okengine#923). It runs capture as the deployment's worker uid, never root (okengine#934).
+- A feed item whose first capture failed is recovered on its first later success, without churning revisions when a publisher rotates GUIDs (okengine#928).
+- `dedup-same-url` skips generated pages and pages without frontmatter when counting inbound links (okengine#886).
+
+### Generated pages
+- Engine-generated pages keep their `id` across whole-file rewrites and carry exactly the id `backfill_ids` would stamp, so the id backfill converges (okengine#933). Engine reports are typed `dashboard`, a base-schema type (okengine#920).
+- `schema_drift_lint` buckets a typed page that lacks only OKF-required fields (such as `id`) as "missing OKF-required field(s)", not "typeless".
+- `year_derivation_audit` walks `raw/` in sorted order.
+
+### Packs and upgrades
+- `install-domain --refresh` applies an owned namespace's partitioning change after proving no page moves; co-install preflight WARNs instead of failing for an owned namespace (okengine#915).
+- Engine upgrades confirm their pre-upgrade snapshot once the vault validates, so `--keep-snapshots` prunes them; before, every roll kept a full vault copy forever (okengine#914).
+- `prompt_lint` derives a lane's receipt requirement from its contract and selector (okengine#916).
+- The pack skeleton no longer ships prompt keys that match no engine lane (okengine#929).
+
+### CI
+- `full-suite` runs as four shards combined into one coverage and JUnit verdict (okengine#898).
+- Mutation testing selects, per mutant, the tests that cover its lines from a per-test coverage map built by the same suite run; every selection survivor is re-checked against the full test command, and a missing or stale map falls back to the full command (okengine#900). Target timeouts are held to at least twice the measured baseline (okengine#895).
+- Coverage measures scripts that tests launch as subprocesses from another directory; five previously invisible cron scripts are now covered to 100%.
+
+## v0.14.8
+
+PATCH. Restores tag-to-code agreement: the fleet had been rolled from post-v0.14.7 `main` under the v0.14.7 marker, which the release checklist forbids. Also adds unencodable-text guards, a pack-currency check, same-URL source merging, entity-to-source linking, and declared lane expectations. **Baked write-path changes** (#894, #886 raw-source convergence): rolling it needs a gateway image rebuild.
+
+### Write path and projection
+- Frontmatter with a UTF-16 surrogate pair is rejoined into its character. An unpaired half is refused, naming the field; it has no UTF-8 encoding (okengine#894).
+- The projection rebuild isolates a page with unencodable text: it projects the page with U+FFFD and flags `fm_error`, instead of aborting the whole rebuild (okengine#894).
+- A second capture of a compiled URL appends its raw backlink instead of minting a second page, and raw
+  backlinks are append-only in converge whoever writes (okengine#886).
+
+### Collection and raw sources
+- Feed titles keep astral characters (emoji) instead of JSON surrogate escapes, and raw-compile repairs legacy captures (okengine#894).
+- raw-compile carries a capture's provenance verbatim, fills stub pages, and treats captured brackets as text (okengine#886).
+- Capture extracts the document, not the page chrome (okengine#886).
+- New `dedup-same-url` lane merges sources that share a URL and refuses placeholder URLs. Its weekly scheduled run is a dry-run report; merging needs an operator's `--apply` (okengine#886).
+- raw-backfill is never told to use a tool it lacks. Deployments run with Hermes' tool-search bridge off, and `deployment_checks` WARNs when it is on (okengine#886).
+
+### Lanes
+- New `entity-link` lane links new sources to the existing entities they name, so trends and lacuna have sources to work from (okengine#888).
+- Every lane declares `expect:`, what "working" means, validated for engine, extension and pack lanes (okengine#890, okengine#893).
+- forecast-review may write where its selector sends it. trends-refresh nominates rising topics when no entity moves. lacuna ignores tombstoned pages and checks a concept's seats in a deterministic order.
+
+### Deployment verification
+- `framework validate` compares every installed pack, host and composed, with its configured source (`OKENGINE_PACK_SOURCES`, read at each checkout's `origin/main`). It reports BEHIND with the pending `Migration impact:` lines, AHEAD, or UNDETECTABLE, never a vacuous pass. The release checklist runs it before a roll (okengine#896).
+- The post-deploy ownership sweep re-stats each stray, so a temp file renamed away mid-sweep is transient, not a FAIL.
+
+### CI
+- `full-suite`'s timeout is 45m, a stopgap: the single-job suite measured 1,619–1,800 s against 30m and timed
+  out green changes. Sharding is okengine#898.
+
+## v0.14.7
+
+PATCH — capability-policy and write-contract repairs that had left several lanes red on every
+gateway, per-item receipts for batch-triage lanes, and the invariant-audit findings from the
+v0.14.6 cycle. **Baked write-path changes** (#863, #864, #875, #876, #879, #883, #884, #885,
+#887): rolling this release needs a gateway image rebuild, not a stage-only deploy.
+
+### Write path
+- Only `tombstone_entity` may retire a page; update, patch and converge refuse a live→tombstoned
+  transition (okengine#863).
+- Converge keeps existing aliases and records the ones it removes as `rejected_aliases`, so an
+  importer cannot restore them (okengine#864).
+- A page path in any namespace is refused if it carries a control character (okengine#884).
+- Governed write tools refuse an undeclared argument by name instead of silently dropping it —
+  `content` for `body` no longer fails as an empty body (okengine#879).
+- `find_page` matches case-insensitively, so an importer stops re-creating a case-variant
+  duplicate daily (okengine#883).
+- A negated distinctness phrase ("not a separate entity") reads as a duplicate verdict
+  (okengine#887).
+
+### Capability policy
+- `allowed_types: ["*"]` means any type; engine lanes' writes to typed pages were refused
+  fleet-wide (okengine#876).
+- Policy audit discovers first-party extensions from the runtime engine root, not the baked one
+  (okengine#875).
+- Flag and review capability checks see the page's stored type (okengine#885).
+
+### Lanes and receipts
+- Batch-triage prediction and completeness lanes report per-item dispositions instead of being
+  graded "must write" (okengine#878).
+- messaging-synthesis contracts allow `briefing`, and the battle-cards selector tells the model
+  which cards already exist (okengine#877).
+- The tool-call probe reads MCP 2's `input_schema` (okengine#874).
+- Raw-backfill recovers URLs from JSON connector records, feeds declare their publisher, and
+  raw-compile attaches a capture to the page already holding its URL (okengine#862).
+
+### Review
+- The review queue lists every page `requires_review()` flags (okengine#867); every reconcile
+  reason code has a glossary entry (okengine#866); the review-record fallback no longer
+  collapses subjects across sub-domains (okengine#868).
+- The inquiry-analyze prompt asks for the absence-evidence fields its consumer requires
+  (okengine#865).
+
+### Operations and CI
+- Corpus audit parses only raw captures' frontmatter, with the C YAML loader where it agrees
+  with the pure one (okengine#880).
+- The runtime-ownership check judges a symlink by its own owner, not its target's (okengine#881).
+- Feed fetch requests a non-ASCII (IRI) link as a URI, and one bad link no longer fails the run
+  (okengine#882).
+- `cron_pack_split` surfaces `pack.yaml` load errors instead of falling back to the directory
+  name (okengine#857); the post-deploy ownership sweep lists exactly what it counted
+  (okengine#858); the contract layer has its own measured deadline (okengine#859).
+
+## v0.14.6
+
+PATCH — write-path identity invariants, cron job-store concurrency, inquiry-driven
+analysis, and a batch of review, projection and deploy-verification fixes. **Baked
+write-path changes** (#845, #846, library#101, the shared alias rule): rolling this
+release needs a gateway image rebuild, not a stage-only deploy.
+
+### Write path and identity
+- An alias must be a single name; an actor page must name its actor; a tombstone
+  retires a page onto the same identity (okengine#845, okengine#846, library#101).
+- One alias rule for every writer, deterministic lanes included, and names a review
+  removed stay out on re-import.
+- Corpus audit treats names that differ only in spacing as one identity (library#99).
+- Autoverify never leaves a page whose stamped basis contradicts its own
+  `reliability`/`credibility` grade.
+- Generated structural artifacts are exempt from the collision guard (okengine#836).
+- A pack lane that seats pages by the drain's base key fails (okengine#818).
+
+### Cron fleet
+- Deploy and the cron-plus scheduler share one job-store lock; post-deploy drift
+  compares only the fields the deploy wrote (okengine#850).
+- Every prompt's write-tool name derives from the lane binding; regen fails on a
+  stale hardcoded writer name (okengine#852).
+- Jobs compare by source, not by a prompt resolved from a file (okengine#814).
+- A `wakeAgent=false` run owes no write receipt; a run record whose worker died is
+  closed out; the stale-run probe is scoped to receipts (okengine#817, okengine#835).
+- A lane that stays red re-alerts, and the cockpit shows how long the oldest lane
+  has been red (okengine#817).
+- Clamped MCP tool names are recognized in write telemetry, and derived write-server
+  names are bounded so none clamp (okengine#840).
+
+### Inquiry and lacuna
+- `inquiry-analyze` answers standing questions and reevaluation indexes assessments;
+  collected evidence is attributed to the inquiry term that found it; an inquiry's
+  declared fields steer lacuna; inquiry stays opt-in and gets a step budget that
+  covers its evidence (okengine#854).
+- Lacuna field density counts evidence, not derived views (okengine#855).
+
+### Projection, review and deploy
+- The projection re-projects when the corpus changes, not only hourly
+  (okengine#851); paginated INDEX pages are structure, not content (okengine#856).
+- A pre-verify reconcile that loses a write race is a WARN, not a failed bring-up
+  (okengine#853); the host-side policy digest ignores the container `.env`, and the
+  projection timeout is configurable.
+- Review records join by a reshard-proof, vault-relative subject key; unreachable
+  review records are reconciled; the review vocabulary and registry coverage are
+  explained where the decision is made (okengine#822, okengine#832, okengine#842,
+  okengine#823).
+- Stamp-key stripping consumes continuation lines and unindented block-sequence items
+  (okengine#833); a curated-guard restore no longer duplicates its comment.
+- Rollback never runs against a snapshot that can restore nothing (okengine#819).
+- `install-domain` adopts a pack's own undeclared namespace with a WARN instead of
+  refusing it, and counts a co-installed guest's ownership (okengine#812, okengine#816).
+- `install-domain --accept-trust-exposure --reason "<why>"` records a reviewable
+  acceptance of serving a more-private guest at the host's trust, keyed to both
+  trust values and reported by `framework validate` (okengine#813).
+- A vault's runtime state is no longer tracked in the engine repo (okengine#847).
+
+### Merged after this section was drafted, included in the tag (okengine#861)
+- The daily-brief lane's step budget covers every source its digest lists.
+- Private pack names are gone from engine comments and test fixtures; the public-snapshot guard
+  had rejected four of them.
+- The mutation debt accumulated since v0.14.5 is paid down: 19 modules re-measured over the
+  release range, each surviving mutant killed by a test or recorded as equivalent. The cron-plus
+  run-record sweep now skips an undecodable record (`ValueError`, which covers `JSONDecodeError`
+  and `UnicodeDecodeError`) instead of crashing.
+
+### Release process
+- private CI-only qualification with explicit publication approval; the public snapshot
+  no longer leaks control-plane files; the public GitHub CI workflow and badge are
+  restored.
+- A test catches a method that has drifted out of its class.
 
 ## v0.14.5
 

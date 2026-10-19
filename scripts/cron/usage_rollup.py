@@ -23,7 +23,7 @@ from pathlib import Path
 DEFAULT_DATA_DIR = "/opt/data"
 SETTLE_SECONDS = 120                       # skip a log still being written; count it next rollup
 _MODEL = re.compile(r"model=([a-z0-9/._:-]+)")
-_LOGNAME = re.compile(r"^(.+?)-(\d{8})-\d{6}\.log$")
+_LOGNAME = re.compile(r"^(.+?)-(\d{8})-\d{6}\.log\Z")
 
 
 # Locally-served models (custom/ollama provider) cost $0 but carry no `:free` marker — the

@@ -19,10 +19,23 @@ _FENCE = re.compile(r"```([^\n`]*)\n?(.*?)```", re.S)
 _CANONICAL_OPEN = re.compile(r"```okengine-receipt[ \t]*(?:\n|$)")
 
 
-def verify_run_completion(job: dict, started_at, wiki: Path) -> list[dict]:
-    """Read back the governed writes promised by a whole-run contract."""
+def verify_run_completion(job: dict, started_at, wiki: Path,
+                          gate_skipped: bool = False) -> list[dict]:
+    """Read back the governed writes promised by a whole-run contract.
+
+    `gate_skipped` says the wake-gate returned wakeAgent=false, so no agent ever ran. A run that
+    was never asked to do anything cannot have written anything, and demanding a write of it turns
+    every CORRECT skip into a failure: on one live vault that held six lanes red for up to three
+    weeks (okengine#817), each one having decided, rightly, that there was no work.
+
+    The per-selected-item path already draws this distinction — a clean wakeAgent=false gate owes
+    no receipt, while an agent that HAD work selected and still went silent is a real failure. The
+    caller applies the same test here, so a silent agent with work selected is still not exempt.
+    """
     contract = job.get("output_contract") or {}
     if contract.get("completion") != "run" or job.get("no_agent") is True:
+        return []
+    if gate_skipped:
         return []
     writes = job.get("_okengine_executed_writes") or []
     if not isinstance(writes, list) or not writes:

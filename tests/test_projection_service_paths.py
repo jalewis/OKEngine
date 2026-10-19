@@ -380,34 +380,91 @@ def test_run_service_once_reports_a_failed_rebuild_on_stderr_and_exits_nonzero(s
     assert "projection rebuild failed: RuntimeError: no database" in capsys.readouterr().err
 
 
-def test_the_long_running_loop_survives_a_failed_cycle_and_sleeps_before_retrying(
+def test_the_long_running_loop_survives_a_failed_cycle_and_retries_after_a_short_backoff(
         service, capsys, monkeypatch):
-    """A rebuild that raises must not kill the service — the next interval is the retry."""
+    """A rebuild that raises must not kill the service. It retries after RETRY_SECONDS -- not a
+    whole interval, which on the hourly default left the projection unusable for an hour."""
     attempts = []
 
     async def rebuild():
         attempts.append(1)
         if len(attempts) == 1:
             raise RuntimeError("transient")
-        return epoch_stats()
+        raise Stop
 
-    class Stop(Exception):
+    class Stop(BaseException):      # not Exception: the loop must not swallow the test's exit
         pass
 
     slept = []
 
     async def sleep(seconds):
         slept.append(seconds)
-        if len(slept) == 2:
-            raise Stop
 
     service.rebuild = rebuild
-    service.INTERVAL_SECONDS = 3600
     monkeypatch.setattr(service.asyncio, "sleep", sleep)
     with pytest.raises(Stop):
         asyncio.run(service.run_service(False))
-    assert len(attempts) == 2 and slept == [3600, 3600]
+    assert len(attempts) == 2 and slept == [60], "a failed rebuild retries after one minute"
     assert "transient" in capsys.readouterr().err
+
+
+class _Stop(BaseException):         # not Exception: the loop must not swallow the test's exit
+    pass
+
+
+def _loop(service, monkeypatch, states, *, rebuilds=2, interval=60, poll=15):
+    """Drive the real loop: `states` is what each poll of the corpus returns (epoch, active)."""
+    calls, slept = [], []
+    polls = iter(states)
+
+    async def rebuild():
+        calls.append(1)
+        if len(calls) > rebuilds - 1 and len(calls) == rebuilds:
+            raise _Stop
+        return epoch_stats(corpus_epoch=10)
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    service.rebuild = rebuild
+    service.INTERVAL_SECONDS, service.POLL_SECONDS = interval, poll
+    monkeypatch.setattr(service.asyncio, "sleep", sleep)
+    monkeypatch.setattr(service, "corpus_state", lambda: next(polls))
+    with pytest.raises(_Stop):
+        asyncio.run(service.run_service(False))
+    return calls, slept
+
+
+def test_a_corpus_write_triggers_a_rebuild_on_the_next_poll(service, monkeypatch):
+    """okengine#851: the refresh follows the corpus, not the clock."""
+    calls, slept = _loop(service, monkeypatch, [(10, False), (11, False)])
+    assert len(calls) == 2 and slept == [15, 15], "rebuilt after the second poll saw epoch 11"
+
+
+def test_a_mutation_in_flight_is_waited_out_before_projecting(service, monkeypatch):
+    calls, slept = _loop(service, monkeypatch, [(11, True), (11, True), (11, False)])
+    assert slept == [15, 15, 15], "no rebuild while active.json says a mutation is mid-flight"
+
+
+def test_a_quiet_vault_is_still_refreshed_at_the_interval(service, monkeypatch):
+    """Without writes the projection must still refresh before it ages past its staleness limit;
+    the last poll step is trimmed to the interval rather than overshooting it."""
+    calls, slept = _loop(service, monkeypatch, [(10, False)] * 5, interval=40, poll=15)
+    assert slept == [15, 15, 10] and len(calls) == 2
+
+
+def test_corpus_state_reads_the_live_epoch_and_the_in_flight_marker(service, tmp_path):
+    state = tmp_path / ".okengine" / "corpus"
+    assert service.corpus_state(tmp_path) == (0, False), "no corpus state yet reads as epoch 0"
+    state.mkdir(parents=True)
+    (state / "epoch").write_text("12\n", encoding="ascii")
+    (state / "active.json").write_text("{}", encoding="utf-8")
+    assert service.corpus_state(tmp_path) == (12, True)
+
+
+def test_corpus_state_defaults_to_the_projector_vault(service, monkeypatch, tmp_path):
+    monkeypatch.setattr(service.projector, "VAULT", tmp_path)
+    assert service.corpus_state() == (0, False)
 
 
 # --- the CLI ---------------------------------------------------------------------------------------
@@ -479,3 +536,45 @@ def test_main_installs_a_sigterm_handler_that_exits_cleanly(service):
     with pytest.raises(SystemExit) as exited:
         handler(signal.SIGTERM, None)
     assert exited.value.code == 0
+
+
+def _load_service(monkeypatch, poll):
+    monkeypatch.setenv("OKENGINE_PROJECTION_POLL_SECONDS", poll)
+    spec = importlib.util.spec_from_file_location(
+        "projection_service_poll", REPO / "okengine-projection/service.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("poll, expected", [("0", 1), ("-5", 1), ("1", 1), ("15", 15)])
+def test_the_poll_interval_is_at_least_one_second(monkeypatch, poll, expected):
+    assert _load_service(monkeypatch, poll).POLL_SECONDS == expected
+
+
+def _wait(service, monkeypatch, projected, budget, states, poll=15):
+    slept, polls = [], iter(states)
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    service.POLL_SECONDS = poll
+    monkeypatch.setattr(service.asyncio, "sleep", sleep)
+    monkeypatch.setattr(service, "corpus_state", lambda: next(polls))
+    asyncio.run(service.wait_for_change(projected, budget))
+    return slept
+
+
+def test_an_epoch_that_moved_backwards_is_a_change(service, monkeypatch):
+    """An unreadable epoch reads as 0 (read_epoch): that is a different corpus, not a quiet one."""
+    assert _wait(service, monkeypatch, 10, 60, [(0, False)]) == [15]
+
+
+def test_an_unchanged_epoch_is_compared_by_value(service, monkeypatch):
+    big = int("10000000001")
+    assert _wait(service, monkeypatch, big, 30, [(int("10000000001"), False)] * 2) == [15, 15]
+
+
+def test_an_exhausted_budget_does_not_poll(service, monkeypatch):
+    assert _wait(service, monkeypatch, 10, -1, []) == []
+    assert _wait(service, monkeypatch, 10, 0, []) == []

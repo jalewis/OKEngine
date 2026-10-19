@@ -27,6 +27,7 @@ from tools.schema_validator import (
 )
 from tools import policy_plane
 from okengine.mcp import scope as _scope
+from okengine.list_scalars import coerce_list_scalar
 import output_contract_enforce as _output_contract
 
 import id_lib, schema_lib, id_index, converge, okf_migrate
@@ -128,6 +129,18 @@ def _list_fields_for(page_path) -> set:
         except Exception:
             pass
     return lf
+
+
+def _prose_list_fields_for(page_path) -> set:
+    """The page's `prose-list` fields (okengine#1005), from its COMPOSED schema: a scalar written
+    for one is a single item, never split on commas. Empty when the schema can't load, so the
+    field then splits like any list field -- the lane reads the same answer from here."""
+    if page_path is None:
+        return set()
+    try:
+        return schema_lib.prose_list_fields(_governing(page_path))
+    except Exception:
+        return set()
 
 
 def _base_int_fields() -> frozenset:
@@ -291,10 +304,12 @@ def _int_shape_reject(p, fm) -> Optional[str]:
     return None
 
 
-def _normalize_refs(fm: dict, list_fields=frozenset()) -> dict:
+def _normalize_refs(fm: dict, list_fields=frozenset(), prose_fields=frozenset()) -> dict:
     """Canonicalize frontmatter values at the single enforced-write chokepoint (so every extension's
     writes are fixed at once). Three coercions:
-      - a schema-declared list field written as a scalar string -> a list (okengine#196);
+      - a schema-declared list field written as a scalar string -> a list (okengine#196): split
+        on its delimiting commas, or kept as one item when the field is a `prose-list`
+        (`okengine.list_scalars`, #1005);
       - a bare `[[x]]` wikilink string -> the plain path `x` (agents write `[[wikilinks]]`, but in a
         frontmatter VALUE that mangles — `field_mapped: [[c/x]]` -> `[[ "c/x" ]]`);
       - a list that mangled into nested lists, or holds `[[..]]` strings, -> a flat list of paths.
@@ -303,9 +318,8 @@ def _normalize_refs(fm: dict, list_fields=frozenset()) -> dict:
         return fm
     for k, v in list(fm.items()):
         if k in list_fields and isinstance(v, str):
-            fm[k] = [
-                s.strip() for s in v.split(",") if s.strip()
-            ]  # scalar list-field -> list (#196)
+            # scalar list-field -> list (#196); a prose-list field's scalar is one item (#1005)
+            fm[k] = coerce_list_scalar(v, k in prose_fields)
         elif isinstance(v, str):
             fm[k] = _strip_wikilink(v)
         elif _looks_like_ref_list(v):
@@ -319,10 +333,11 @@ def _coerce_fm(frontmatter_yaml: Union[str, dict, None], page_path=None) -> Opti
     (wikilink -> plain path; scalar -> list for the page's schema-declared list fields). `page_path`
     selects the governing schema's list fields; None falls back to the universal base set."""
     list_fields = _list_fields_for(page_path)
+    prose_fields = _prose_list_fields_for(page_path)
     if frontmatter_yaml is None:
         return {}
     if isinstance(frontmatter_yaml, dict):
-        return _normalize_refs(dict(frontmatter_yaml), list_fields)
+        return _admit_text(_normalize_refs(dict(frontmatter_yaml), list_fields, prose_fields))
     try:
         loaded = yaml.safe_load(frontmatter_yaml)
     except Exception:
@@ -331,7 +346,62 @@ def _coerce_fm(frontmatter_yaml: Union[str, dict, None], page_path=None) -> Opti
         return {}
     if not isinstance(loaded, dict):
         return None
-    return _normalize_refs(loaded, list_fields)
+    return _admit_text(_normalize_refs(loaded, list_fields, prose_fields))
+
+
+def _admit_text(fm: dict) -> Optional[dict]:
+    """Frontmatter with surrogate pairs rejoined, or None (refused) if any half is unpaired."""
+    joined = _join_surrogate_pairs(fm)
+    return None if _unpaired_surrogate_field(joined) else joined
+
+
+def _join_surrogate_pairs(value: Any) -> Any:
+    """Rejoin UTF-16 surrogate PAIRS in every string of a frontmatter value (okengine#894).
+
+    A JSON habit writes an emoji as `"\\ud83d\\udd25"`; YAML decodes each half alone. A
+    well-formed pair is one character, so it is rejoined; a half with no partner is left for
+    _unpaired_surrogate_field to refuse."""
+    if isinstance(value, str):
+        try:
+            return value.encode("utf-16-le", "surrogatepass").decode("utf-16-le")
+        except UnicodeDecodeError:
+            return value
+    if isinstance(value, list):
+        return [_join_surrogate_pairs(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _join_surrogate_pairs(v) for k, v in value.items()}
+    return value
+
+
+def _unpaired_surrogate_field(fm: dict) -> Optional[str]:
+    """The first field whose text still holds an unpaired surrogate, else None. Such a value is
+    not text: it has no UTF-8 encoding, and one of them aborted a whole projection rebuild."""
+    for key, value in fm.items():
+        if _holds_surrogate(key) or _holds_surrogate(value):
+            return str(key)
+    return None
+
+
+def _holds_surrogate(value: Any) -> bool:
+    if isinstance(value, str):
+        return any("\ud800" <= c <= "\udfff" for c in value)
+    if isinstance(value, dict):
+        return any(_holds_surrogate(k) or _holds_surrogate(v) for k, v in value.items())
+    return isinstance(value, list) and any(_holds_surrogate(v) for v in value)
+
+
+def _fm_reject(frontmatter_yaml: Union[str, dict, None]) -> str:
+    """Why _coerce_fm refused `frontmatter_yaml`, named for the author."""
+    try:
+        loaded = (frontmatter_yaml if isinstance(frontmatter_yaml, dict)
+                  else yaml.safe_load(frontmatter_yaml or ""))
+    except Exception:
+        loaded = None
+    field = _unpaired_surrogate_field(_join_surrogate_pairs(loaded)) if isinstance(loaded, dict) else None
+    if field is None:
+        return "rejected: frontmatter_yaml is not a valid YAML mapping"
+    return (f"rejected: frontmatter `{field}` holds an unpaired UTF-16 surrogate "
+            "(\\uD800-\\uDFFF), which is not text; write the character itself (okengine#894)")
 
 
 def _compose(fm: dict, body: str) -> str:

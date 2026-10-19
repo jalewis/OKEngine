@@ -27,7 +27,7 @@ _ORDER = {"FAIL": 0, "WARN": 1, "INFO": 2}
 def resolve(deployment: str) -> tuple[Path | None, str]:
     """Validate + configure the checks for a host deployment dir. Returns (path, error): on success
     error is '' and the checks library is pointed at VAULT=<dep>, DATA=<dep>/.hermes-data, HERMES
-    unset (no baked image on the host)."""
+    unset (no baked image on the host), and the gateway env compose builds from <dep>/.env."""
     dep = Path(deployment).expanduser()
     if not dep.is_dir():
         return None, f"deployment directory not found: {dep}"
@@ -36,7 +36,9 @@ def resolve(deployment: str) -> tuple[Path | None, str]:
                       "pass the pack/vault root")
     data = dep / ".hermes-data"
     # HERMES unset on the host: keep it a non-existent path so write-path libs report 'undetectable'.
-    C.configure(dep, data=data, hermes=dep / ".no-baked-image-on-host")
+    # The checks judge the gateway's environment, which on the host is what compose hands it from
+    # the pack .env, never the operator's shell (okengine#994 [16]).
+    C.configure(dep, data=data, hermes=dep / ".no-baked-image-on-host", env=C.host_env(dep))
     return dep, ""
 
 

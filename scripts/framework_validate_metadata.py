@@ -34,6 +34,13 @@ class MetadataChecks:
             # it just contributes no domain ids yet. Nudge, don't fail. (A bundle owns nothing BY
             # DESIGN — okengine#181 — so it's exempt; check_bundle validates its recipe instead.)
             r.warn("pack.yaml owns", "declares no owned types/namespaces (inherits the engine core)")
+        # The write servers read the literal `name` (okengine.pack_principal), never the directory
+        # basename load_pack_meta defaults to: a nameless pack.yaml validated clean here while every
+        # write server refused to start after the recreate (okengine#1027).
+        from okengine.pack_principal import declared_pack
+        if not declared_pack(pack):
+            r.fail("pack.yaml name", "no `name`: every write server refuses to start without the "
+                   "pack it writes for (okengine#1027). Add `name: <pack>` to pack.yaml.")
         r.ok("pack.yaml", f"{meta['name']} v{meta['version']} "
              f"({meta['trust']}; owns {len(meta['owns_types'])} type(s), "
              f"{len(meta['owns_namespaces'])} namespace(s))")
@@ -113,6 +120,22 @@ class MetadataChecks:
         # pack-repo CI) for the whole existing fleet, which lags this convention. Surface it so authors
         # complete owns for safe future composition, without blocking a working deploy (invariant-audit
         # #351; severity corrected after the v0.13.1 fleet roll showed every pack tripping it).
+        # A COMPOSED host declares its guests' types and namespaces because install-domain merged
+        # them in; they are owned, just not by this pack. Two records already say so:
+        # .okengine/installed-domains/<pack>.json (owned_namespaces, written since #270) and
+        # composed-schema.yaml's per-type `owner:`. Without consulting them, the only way to
+        # silence this warning is to add a guest's type to the HOST's owns.types — a false claim,
+        # and exactly the double-declared ownership okengine#811 found on a live deployment, where
+        # the host claimed 6 of a guest's 8 types and no gate noticed (okengine#816).
+        guest_types, guest_ns = _installed_domain_ownership(pack, sch)
+        contested = (owns_types & guest_types) | (owns_ns & guest_ns)
+        if contested:
+            r.warn("pack.yaml owns vs installed domains",
+                   f"this pack's owns and an installed domain's BOTH claim: {sorted(contested)} — "
+                   f"composed packs must own disjointly; relinquish them here or transfer "
+                   f"ownership deliberately (okengine#811)")
+        owns_types = owns_types | guest_types
+        owns_ns = owns_ns | guest_ns
         for t in sorted((schema_types - base_types) - owns_types):
             r.warn("pack.yaml owns.types",
                    f"schema.yaml declares non-core type '{t}' but it is not in owns.types — compose-preview "
@@ -154,3 +177,33 @@ class MetadataChecks:
             r.ok("bundle recipe",
                  f"host {meta['bundle_host']} + composes {len(meta['bundle_compose'])} pack(s): "
                  f"{', '.join(meta['bundle_compose'])}")
+
+
+def _installed_domain_ownership(pack: Path, schema: dict) -> "tuple[set, set]":
+    """(types, namespaces) owned by packs that install-domain has composed into this host.
+
+    Namespaces come from each `.okengine/installed-domains/<pack>.json` (`owned_namespaces`,
+    written since #270); types from the composed schema's per-type `owner:`, which install-domain
+    stamps. A host with neither record yields empty sets, so a standalone pack behaves exactly as
+    before this existed.
+    """
+    import json as _json
+
+    base = pack / ".okengine" / "installed-domains"
+    installed, namespaces = set(), set()
+    for path in sorted(base.glob("*.json")) if base.is_dir() else []:  # glob-ok: flat manifest dir
+        try:
+            manifest = _json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(manifest, dict):
+            continue
+        installed.add(str(manifest.get("pack") or path.stem))
+        owned = manifest.get("owned_namespaces")
+        if isinstance(owned, (dict, list)):
+            namespaces |= {str(n) for n in owned}
+    if not installed:
+        return set(), set()
+    types = {str(name) for name, spec in (schema.get("types") or {}).items()
+             if isinstance(spec, dict) and str(spec.get("owner") or "") in installed}
+    return types, namespaces

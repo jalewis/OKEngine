@@ -38,7 +38,19 @@ def ensure(pack: Path, engine: Path) -> list[str]:
         raise ValueError(f"{pack} has no docker-compose.yml")
     env_path = pack / ".env"
     lines, values = _read_env(env_path)
+    owners = {}
+    # Match deploy.sh's export-over-persisted-value precedence. Refuse root and
+    # malformed owner IDs before touching credentials or generated configuration.
+    for key in ("HERMES_UID", "HERMES_GID"):
+        owner = os.environ.get(key) or values.get(key) or "10000"
+        if not owner.isascii() or not owner.isdecimal() or int(owner) <= 0:
+            raise ValueError(f"{key} must be a positive non-root numeric owner ID")
+        owners[key] = owner
     changes = []
+    for key, owner in owners.items():
+        if values.get(key) != owner:
+            _set(lines, key, owner)
+            changes.append(f"pinned {key} for the projection owner contract")
 
     writer = values.get("OKENGINE_PROJECTION_WRITER_PASSWORD", "")
     if writer in PLACEHOLDERS:
@@ -82,6 +94,24 @@ def ensure(pack: Path, engine: Path) -> list[str]:
             except OSError:
                 pass
             changes.append("removed legacy generated projection overlay")
+
+    # Native snapshots need the same owner contract as newly rendered scaffolds.
+    # Keep operator overlays visible; this generated file changes only the projector user.
+    owner_overlay = ".hermes-data/projection-owner-compose.yml"
+    owner_file = pack / owner_overlay
+    owner_file.parent.mkdir(parents=True, exist_ok=True)
+    owner_body = (engine / "templates/pack/projection-owner-compose.yml").read_text(encoding="utf-8")
+    if not owner_file.is_file() or owner_file.read_text(encoding="utf-8") != owner_body:
+        owner_file.write_text(owner_body, encoding="utf-8")
+        changes.append("materialized projection owner overlay")
+    # Read the updated lines: the compatibility overlay may have just been added above.
+    compose_value = next((line.split("=", 1)[1] for line in lines
+                          if line.startswith("COMPOSE_FILE=")), "docker-compose.yml")
+    compose_files = [part for part in compose_value.split(":") if part]
+    if owner_overlay not in compose_files:
+        compose_files.append(owner_overlay)
+        _set(lines, "COMPOSE_FILE", ":".join(compose_files))
+        changes.append("enabled projection owner overlay")
 
     env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     os.chmod(env_path, 0o600)

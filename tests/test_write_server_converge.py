@@ -72,7 +72,8 @@ def test_converge_create_fallback_rejects_generic_actor_for_admin(tmp_path, monk
 def test_converge_create_fallback_accepts_evidenced_named_actor(tmp_path, monkeypatch):
     monkeypatch.delenv("OKENGINE_WRITE_ACTOR", raising=False)
     m = _load(tmp_path, "types:\n  actor: {required: [type]}\n")
-    out = m._converge("entities/comment-crew.md", "type: actor\ntitle: Comment Crew\n",
+    out = m._converge("entities/comment-crew.md",
+                      f"type: actor\ntitle: Comment Crew\nsources: [{_cite(m, 'Comment Crew')}]\n",
                       "Comment Crew is a named adversary cluster documented in source reports.")
     assert out.startswith("created"), out
     assert list((tmp_path / "wiki" / "entities").rglob("comment-crew.md"))
@@ -237,6 +238,13 @@ def test_actor_reserved_title_schema_edges(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "_governing", lambda _path: (_ for _ in ()).throw(ValueError("bad")))
     assert m._actor_reserved_titles(page) == frozenset()
 
+    # okengine#1020: a malformed block or a non-mapping schema reserves nothing
+    monkeypatch.setattr(m, "_governing", lambda _path: {"identity_admission": ["Iran"]})
+    assert m._actor_reserved_titles(page) == frozenset()
+    monkeypatch.setattr(m, "_governing", lambda _path: ["not", "a", "schema"])
+    assert m._actor_reserved_titles(page) == frozenset()
+    assert m._actor_schema(page) == {}
+
 
 def test_authority_id_merges_into_one_canonical_page(tmp_path):
     m = _load(tmp_path)
@@ -358,9 +366,12 @@ def test_scoped_extension_token_is_composed_type_owner_for_removal(tmp_path, mon
     finally:
         m._caller_var.reset(token)
 
-    assert "-1 removed" in repaired, repaired
+    # okengine#1028: ownership lets the extension past the conflict, but a removal of a curated
+    # field is an identity change. Without an `identity_edit` grant it is held for review.
+    assert "-0 removed" in repaired, repaired
+    assert "identity change held" in (tmp_path / "wiki" / "log.md").read_text()
     fm = _read_id(m, "lacuna/gap.md")
-    assert "prediction_candidate" not in fm
+    assert fm["prediction_candidate"] == "predictions/missing"
     assert "ext:okengine.lacuna" in fm["maintained_by"]
     assert fm["needs_review"] is True
 
@@ -380,7 +391,7 @@ def test_scoped_extension_token_is_composed_type_owner_for_removal(tmp_path, mon
         )
     finally:
         m._caller_var.reset(token)
-    assert "+1 added" in restored, restored
+    assert "~1 updated" in restored, restored   # the held removal left the field in place
     contract = {
         "api": 1,
         "allowed_namespaces": ["lacuna"],
@@ -394,6 +405,7 @@ def test_scoped_extension_token_is_composed_type_owner_for_removal(tmp_path, mon
         "unresolved_links": "review",
         "placeholder_links": "reject",
         "completion": "run",
+        "identity_edit": {"fields": ["remove"]},   # the lane's explicit grant (okengine#1028)
     }
     raw = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     jobs = tmp_path / "jobs.json"
@@ -778,6 +790,9 @@ def test_converge_authority_redirect_rechecks_reserved_file(tmp_path):
 
 def test_converge_capability_uses_target_type_and_includes_removed_fields(tmp_path, monkeypatch):
     m = _load(tmp_path)
+    # Granted identity edits (okengine#1028), so this pins the capability: still a second gate.
+    from okengine import identity_guard
+    monkeypatch.setattr(m, "_identity_edit_grant", lambda: identity_guard.ALL)
     page = tmp_path / "wiki/entities/v/victim.md"
     page.parent.mkdir(parents=True)
     page.write_text(
@@ -823,6 +838,9 @@ def test_converge_capability_uses_target_type_and_includes_removed_fields(tmp_pa
 
 def test_converge_allows_authorized_resulting_type_transition(tmp_path, monkeypatch):
     m = _load(tmp_path)
+    from okengine import identity_guard   # a lane granted the retype (okengine#1028)
+    monkeypatch.setattr(m, "_identity_edit_grant", lambda: identity_guard.Permission(
+        frozenset({"type"})))
     page = tmp_path / "wiki/entities/v/victim.md"
     page.parent.mkdir(parents=True)
     page.write_text(
@@ -1085,3 +1103,232 @@ def test_unrelated_job_actor_cannot_claim_composed_extension_ownership(tmp_path,
         m._caller_var.reset(token)
     assert "1 conflict" in result
     assert _read_id(m, "lacuna/gap.md")["prediction_candidate"] == "predictions/missing"
+
+
+# --- actor admission: the software-definition window, the body budget and the backfill dump ----
+# The critical campaign left these boundaries unpinned (nightly 2026-10-03). `backdoor` is used as
+# the software kind on purpose: it is a software kind for the convergence check but not for
+# actor_identity.actor_identity_error, so these cases reach the window logic under test.
+
+ACTOR_SCHEMA = "types:\n  actor: {required: [type]}\n  malware: {required: [type]}\n"
+SOFTWARE_REFUSAL = "defines the subject as software/tooling"
+
+
+def _admit(m, body, title="Foo"):
+    return m._actor_admission_reject({"type": "actor", "title": title}, body, None)
+
+
+def _definition_ending_at(offset: int) -> str:
+    """Filler, then `Foo is a backdoor` with the definition match ending at `offset`."""
+    definition = "Foo is a backdoor"
+    # One unbroken filler word: a run of spaces would be collapsed by the admission check's
+    # whitespace normalization and shift every offset.
+    text = "x" * (offset - len(definition) - 1) + " " + definition
+    assert len(text) == offset and text.endswith(definition) and " Foo is" in text
+    return text
+
+
+def test_an_actor_word_right_after_a_software_definition_keeps_the_page_an_actor(tmp_path):
+    """`Foo is a backdoor group` names a group. The definition ends at character 70 here: an
+    actor word in the following window must be read, never an empty or misplaced window."""
+    m = _load(tmp_path, ACTOR_SCHEMA)
+    body = _definition_ending_at(70) + " group tracked by several vendors"
+    assert _admit(m, body) is None
+    assert SOFTWARE_REFUSAL in _admit(m, _definition_ending_at(70) + " used by many crews")
+
+
+@pytest.mark.parametrize(("filler", "admitted"), [(63, True), (64, False)])
+def test_the_actor_word_window_is_exactly_seventy_characters(tmp_path, filler, admitted):
+    m = _load(tmp_path, ACTOR_SCHEMA)
+    suffix = " " + "w" * filler + " group"  # `group` ends 70 (inside) or 71 (outside) chars on
+    body = _definition_ending_at(70) + suffix + " and more"
+    result = _admit(m, body)
+    assert (result is None) is admitted, result
+    if not admitted:
+        assert SOFTWARE_REFUSAL in result
+
+
+@pytest.mark.parametrize(("leading_words", "admitted"), [(5, True), (6, False)])
+def test_only_the_first_six_words_after_the_definition_are_read(tmp_path, leading_words, admitted):
+    m = _load(tmp_path, ACTOR_SCHEMA)
+    body = "Foo is a backdoor " + "w " * leading_words + "group linked to the intrusions"
+    result = _admit(m, body)
+    assert (result is None) is admitted, result
+
+
+@pytest.mark.parametrize(("last_char_index", "refused"), [(3999, True), (4000, False)])
+def test_admission_reads_the_first_4000_body_characters(tmp_path, last_char_index, refused):
+    """The definition's final letter sits at index 3999 (read) or 4000 (not read)."""
+    m = _load(tmp_path, ACTOR_SCHEMA)
+    body = _definition_ending_at(last_char_index + 1) + " in the wild"
+    assert body[last_char_index] == "r" and body[: last_char_index + 1].endswith("backdoor")
+    result = _admit(m, body)
+    assert (result is not None) is refused, result
+    if refused:
+        assert SOFTWARE_REFUSAL in result
+
+
+def test_a_descriptive_word_outside_the_allowlist_is_not_a_software_definition(tmp_path):
+    m = _load(tmp_path, ACTOR_SCHEMA)
+    assert _admit(m, "Foo is a popular backdoor.") is None
+    assert SOFTWARE_REFUSAL in _admit(m, "Foo is a modular backdoor.")
+
+
+def test_a_short_title_ending_in_actor_is_a_class_description(tmp_path):
+    m = _load(tmp_path, ACTOR_SCHEMA)
+    assert "generic class labels" in _admit(m, "", title="Rogue Actor")
+    assert "generic class labels" in _admit(m, "", title="Some Rogue State Actor")
+    assert _admit(m, "", title="Five Words Ending In Actor") is None
+
+
+def test_this_ransomware_in_the_body_needs_a_software_title_to_refuse(tmp_path):
+    m = _load(tmp_path, ACTOR_SCHEMA)
+    assert _admit(m, "Foo deployed the ransomware against hospitals.") is None
+    assert SOFTWARE_REFUSAL in _admit(
+        m, "Foo deployed the ransomware against hospitals.", title="Foo Ransomware")
+
+
+def _backfill_schema(*types):
+    return "types:\n" + "".join(f"  {t}: {{required: [type]}}\n" for t in types)
+
+
+def test_entity_backfill_keeps_key_order_and_unicode_verbatim(tmp_path):
+    m = _load(tmp_path, _backfill_schema("publisher"))
+    cleaned, error = m._entity_backfill_frontmatter(
+        "entities/cafe", "type: publisher\ntitle: Café Média\n")
+    assert error is None
+    assert cleaned == "type: publisher\ntitle: Café Média\nname: Café Média\n"
+
+
+def test_entity_backfill_keeps_an_existing_name_for_a_named_publisher(tmp_path):
+    m = _load(tmp_path, _backfill_schema("publisher"))
+    cleaned, error = m._entity_backfill_frontmatter(
+        "entities/acme", "type: publisher\ntitle: Acme Research Blog\nname: Acme\n")
+    assert error is None
+    assert __import__("yaml").safe_load(cleaned)["name"] == "Acme"
+
+
+def test_entity_backfill_applies_actor_checks_only_to_type_actor(tmp_path):
+    """A type that sorts before `actor` is not an actor: no actor_type or evidence demanded."""
+    m = _load(tmp_path, _backfill_schema("account", "actor"))
+    cleaned, error = m._entity_backfill_frontmatter(
+        "entities/acme", "type: account\ntitle: Acme Billing\n")
+    assert error is None
+    assert __import__("yaml").safe_load(cleaned)["type"] == "account"
+
+
+def test_entity_backfill_actor_named_only_by_name_is_checked_against_that_name(tmp_path):
+    m = _load(tmp_path, _backfill_schema("actor"))
+    cleaned, error = m._entity_backfill_frontmatter(
+        "entities/mirage-kitten", "type: actor\nname: Mirage Kitten\nactor_type: nation-state\n",
+        "Mirage Kitten is a named threat actor associated with state-directed operations.",
+    )
+    assert error is None, error
+    assert __import__("yaml").safe_load(cleaned)["actor_identity_validated"] is True
+
+
+@pytest.mark.parametrize("argument", ["zeta-pack", "alpha-pac"])
+def test_converge_refuses_any_pack_argument_that_differs_from_the_deployment(
+        tmp_path, monkeypatch, argument):
+    """Both a pack name sorting after the deployment's and one sorting before it are refused."""
+    m = _load(tmp_path)
+    monkeypatch.setenv("OKENGINE_PACK", "alpha-pack")
+    out = m._converge("entities/acme.md", "type: vendor\ntitle: Acme Corp", "body", pack=argument)
+    assert out.startswith("refused: pack identity is deployment-pinned"), out
+    assert not list((tmp_path / "wiki" / "entities").rglob("acme*.md"))
+
+
+def _cite(m, name):
+    """A canonical source that names `name` as a threat group, so creating it is grounded in
+    evidence rather than in the page's own prose (okengine#1012)."""
+    slug = "".join(ch if ch.isalnum() else "-" for ch in name.lower()).strip("-")
+    ref = f"sources/2026/01/01/{slug}-report"
+    page = m._wiki() / f"{ref}.md"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    page.write_text(f"---\ntype: source\ntitle: {name} report\n---\n\n"
+                    f"{name} is a threat group that targeted banks.\n", encoding="utf-8")
+    return ref
+
+
+# --- okengine#1026: a pack owns its own types --------------------------------------------------------
+
+_COMPOSED_1026 = {
+    "types": {"malware": {"required": ["type"], "owner": "okpack-a"},
+              "vendor": {"required": ["type"]},
+              "lacuna": {"required": ["type"]}},
+    "partitioning": {"namespaces": {"entities": {"strategy": "flat"},
+                                    "lacuna": {"strategy": "flat"}}},
+    # what compose_schema records: the placeholder `pack`, and an extension principal
+    "owners": {"types": {"malware": "pack", "vendor": "pack", "lacuna": "ext:okengine.lacuna"}},
+}
+
+
+def _composed_1026(tmp_path, monkeypatch, pack):
+    monkeypatch.setenv("OKENGINE_PACK", pack)
+    m = _load(tmp_path, "types:\n  malware: {required: [type]}\n  vendor: {required: [type]}\n"
+                        "  lacuna: {required: [type]}\n")
+    monkeypatch.setattr(m, "_governing", lambda _path: _COMPOSED_1026)
+    for rel, kind in (("entities/aquabot.md", "malware"), ("entities/acme.md", "vendor"),
+                      ("lacuna/gap.md", "lacuna")):
+        page = m._safe(rel)   # the seat the write path resolves (entities shard by letter)
+        page.parent.mkdir(parents=True, exist_ok=True)
+        page.write_text(f"---\ntype: {kind}\nid: x:{page.stem}\ntitle: {page.stem.title()}\n"
+                        "category: threat-actor\ntactic: old\n---\nbody\n", encoding="utf-8")
+    return m
+
+
+@pytest.mark.parametrize("rel, kind", [("entities/aquabot.md", "malware")])
+def test_a_pack_converging_into_its_own_type_may_change_and_remove_fields(
+        tmp_path, monkeypatch, rel, kind):
+    """Red before okengine#1026: the composed owner was the literal `pack`, so the deployment pack
+    was a non-owner of its own types -- `remove=` and every field change were conflicts (the
+    `category: threat-actor` strip on a live deployment was refused on all four pages)."""
+    m = _composed_1026(tmp_path, monkeypatch, "okpack-a")
+    removed = m._converge(rel, {"type": kind, "id": f"x:{Path(rel).stem}"}, remove="category")
+    assert "-1 removed" in removed and "conflict(s)" in removed and "0 conflict" in removed, removed
+    changed = m._converge(rel, {"type": kind, "id": f"x:{Path(rel).stem}", "tactic": "new"})
+    assert "0 conflict" in changed, changed
+    fm = _read_id(m, rel)
+    assert "category" not in fm and fm["tactic"] == "new"
+
+
+def test_another_pack_is_still_refused_on_a_declared_owners_type(tmp_path, monkeypatch):
+    m = _composed_1026(tmp_path, monkeypatch, "okpack-b")
+    out = m._converge("entities/aquabot.md", {"type": "malware", "id": "x:aquabot",
+                                              "tactic": "hijack"}, remove="category")
+    assert "2 conflict" in out, out
+    fm = _read_id(m, "entities/aquabot.md")
+    assert fm["category"] == "threat-actor" and fm["tactic"] == "old"
+
+
+def test_an_extension_owned_type_keeps_its_extension_owner(tmp_path, monkeypatch):
+    m = _composed_1026(tmp_path, monkeypatch, "okpack-a")
+    out = m._converge("lacuna/gap.md", {"type": "lacuna", "id": "x:gap"}, remove="category")
+    assert "1 conflict" in out, out
+    assert _read_id(m, "lacuna/gap.md")["category"] == "threat-actor"
+
+
+_VARIANTS_1026 = {
+    "remove_category": ({}, "category"),
+    "change_field": ({"tactic": "new"}, ""),
+    "replace_title": ({"title": "Publisher Inc"}, ""),
+    "retype": ({"type": "malware"}, ""),
+}
+
+
+@pytest.mark.parametrize("pack", [None, "okpack-a", "okpack-b"])
+@pytest.mark.parametrize("variant", sorted(_VARIANTS_1026))
+def test_a_type_with_no_declared_owner_is_no_looser_than_before(tmp_path, monkeypatch, pack,
+                                                               variant):
+    """QA of !1298: resolving the placeholder to None switched ownership OFF for a type with no
+    declared owner, so a caller with no pack (or another pack) could remove, change, rename and
+    retype (`cve` -> `publisher` on a live vault). With no real owner it stays refused, as before."""
+    m = _composed_1026(tmp_path, monkeypatch, pack or "")
+    if pack is None:
+        monkeypatch.delenv("OKENGINE_PACK", raising=False)
+    extra, remove = _VARIANTS_1026[variant]
+    before = _read_id(m, "entities/acme.md")
+    out = m._converge("entities/acme.md", {"type": "vendor", "id": "x:acme", **extra}, remove=remove)
+    after = _read_id(m, "entities/acme.md")
+    for key in ("type", "title", "category", "tactic"):
+        assert after.get(key) == before.get(key), (variant, pack, key, out)

@@ -31,14 +31,24 @@ import os
 import re
 import sys
 
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# selection_manifest: one level up when staged, scripts/cron in the repo (appended — no shadowing).
+sys.path.append(str(_HERE.parent))
+sys.path.append(str(_HERE.parents[1] / "scripts" / "cron"))
 import pred_lib as P  # noqa: E402
+from selection_manifest import (  # noqa: E402
+    page_selection_key, print_receipt_template, write_selection_manifest)
 # Reuse the sibling audit's deterministic horizon math (single source) rather than re-derive the
 # bucket with judgment — #326 [24].
 from prediction_schema_audit import _horizon_for, _parse_date  # noqa: E402
 
 BATCH_SIZE = int(os.environ.get("PSD_BATCH_SIZE", "5"))
 MIN_HITS = int(os.environ.get("PSD_MIN_HITS", "1"))
+SELECTION_MANIFEST = Path(os.environ.get(
+    "OKENGINE_SELECTION_MANIFEST", str(P.selection_manifest_path("prediction-schema-drain"))))
 
 # `active` is canonical (open synonym, base-schema open_values). Only genuinely non-canonical
 # statuses are drift.
@@ -122,7 +132,7 @@ def classify(fm: dict, body: str) -> tuple[list[str], bool]:
 
 def main() -> int:
     v = P.vault()
-    needs: list[tuple] = []       # (rel, issues, fm)
+    needs: list[tuple] = []       # (rel, issues, fm, path)
     batch_containers: list[str] = []
 
     for p, fm in P.predictions(v):
@@ -131,9 +141,15 @@ def main() -> int:
         if is_batch:
             batch_containers.append(rel)
         elif issues:
-            needs.append((rel, issues, fm))
+            needs.append((rel, issues, fm, p))
 
     batch = needs[:BATCH_SIZE]
+    wake = len(needs) >= MIN_HITS
+    # Batch-containers are NOT receipt items: they are flagged for a human, never agent-fixed.
+    # Below the wake threshold nothing is selected, so the fresh manifest is empty and a
+    # wakeAgent=false run owes no receipt.
+    selected = [page_selection_key(p, v) for _, _, _, p in batch] if wake else []
+    manifest = write_selection_manifest(selected, SELECTION_MANIFEST)
     print("=== prediction-schema-drain wake-gate ===")
     print(f"  vault: {v}")
     print(f"  predictions with fixable value drift: {len(needs)}")
@@ -142,14 +158,15 @@ def main() -> int:
         print(f"    ⚑ [[{rel}]] — split into individual prediction files OR re-type; human decides")
     print()
     print(f"=== batch ({len(batch)} of {len(needs)}, max {BATCH_SIZE} per run) — process IN ORDER ===")
-    for i, (rel, issues, fm) in enumerate(batch, 1):
+    for i, (rel, issues, fm, _p) in enumerate(batch, 1):
         print(f"{i}. [[{rel}]]")
         for iss in issues:
             print(f"   - {iss}")
     print()
     # Batch-containers do NOT drive the wake — the agent can't fix them, so waking to re-flag
     # every run would spin forever. Only fixable value drift wakes the agent.
-    print(json.dumps({"wakeAgent": len(needs) >= MIN_HITS}))
+    print_receipt_template(manifest)
+    print(json.dumps({"wakeAgent": wake}))
     return 0
 
 

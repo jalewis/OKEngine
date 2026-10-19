@@ -59,10 +59,6 @@ UNMEASURED_TREES: dict[str, str] = {
 # Individual files inside a MEASURED tree that the floor cannot reach, each with the reason.
 # A per-file exemption is a bigger lever than a pragma, so it is held to the same standard.
 UNMEASURED_FILES: dict[str, str] = {
-    "ci/cosmic_http_exec.py": (
-        "This three-line process adapter imports Cosmic Ray, which exists only inside the mutation "
-        "job image, and delegates directly to Cosmic Ray's HTTP executor without engine behavior."
-    ),
     "ci/postgres_projection_integration.py": (
         "This module is itself the live PostgreSQL integration test program; measuring the test "
         "would describe which assertions executed, not coverage of the projection service it tests."

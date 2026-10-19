@@ -31,6 +31,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -42,11 +43,25 @@ _ROOT = _HERE.parent
 DEFAULT_MIGRATIONS_DIR = _ROOT / "migrations"
 STATE_REL = Path(".okengine") / "migrations-state.json"
 SNAPSHOTS_REL = Path(".okengine") / "snapshots"
+# `framework backup` archives and its in-flight staging dir (hardlinks of the whole corpus): never
+# part of the migrated source, so never copied into a snapshot or rolled back (okengine#1032).
+BACKUPS_REL = Path(".okengine") / "backups"
 # Runtime/generated/VCS trees the snapshot+rollback scope skips — migrations transform the pack
 # SOURCE (schema, crons, wiki, configs, .okengine state), not these.
 SNAPSHOT_EXCLUDES = {".git", ".hermes-data", "tmp", "logs",
                      "node_modules", ".venv", "__pycache__",
                      "rolled-back"}   # quarantine of files a rollback set aside (#32) — never re-scoped
+# Files inside an excluded runtime tree that engine migrations may still rewrite. The snapshot
+# carries exactly these, so a rollback restores them with the rest of the pack (okengine#991 [13]:
+# the DeepSeek migration rewrites `.hermes-data/.env` as well as `.hermes-data/config.yaml`).
+RUNTIME_SCOPE_FILES = (Path(".hermes-data") / "config.yaml", Path(".hermes-data") / ".env")
+
+
+class MigrationStateError(RuntimeError):
+    """The migration state file exists but cannot be read as a state record.
+
+    Never treat it as empty: an empty record means "nothing applied", which replays every migration
+    in the span on a live vault (okengine#991 [5])."""
 
 
 def _engine_meta():
@@ -124,19 +139,67 @@ def read_pin(pack: Path):
 
 
 def read_state(pack: Path) -> dict:
+    """The recorded migration state, ``{}`` only when no state file exists.
+
+    An unreadable or non-object file raises MigrationStateError: "no data" and "data says nothing
+    was applied" are different answers, and only the second may schedule migrations."""
     f = pack / STATE_REL
-    if f.is_file():
-        try:
-            return json.loads(f.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
+    if not f.is_file():
+        return {}
+    try:
+        state = json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise MigrationStateError(_state_error(f, f"unreadable ({exc})")) from exc
+    if not isinstance(state, dict):
+        raise MigrationStateError(_state_error(f, f"not a JSON object ({type(state).__name__})"))
+    return state
+
+
+def _state_error(path: Path, problem: str) -> str:
+    return (f"migration state {path} is {problem}. Refusing to treat it as empty, which would "
+            "replay every migration. Restore it from the newest snapshot under "
+            ".okengine/snapshots/*/tree/.okengine/migrations-state.json, or repair it by hand; "
+            "do not delete it.")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Durably replace `path`: a hard kill leaves the old file or the new one, never a torn one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)   # keep an owner-only file owner-only
+    except FileNotFoundError:
+        mode = None
+    with tmp.open("w", encoding="utf-8") as stream:
+        stream.write(text)
+        stream.flush()
+        os.fsync(stream.fileno())
+    if mode is not None:
+        os.chmod(tmp, mode)
+    os.replace(tmp, path)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+# A release key that orders prereleases BEFORE their final (okengine#1032 [25]). engine_meta._semver
+# keeps only X.Y.Z, so v0.15.12-rc1 and v0.15.12 compared equal: a migration with TO=v0.15.12 fell
+# outside (rc1, final] and was skipped, and an rc checkout rewrote a final pin down to the rc. The
+# key lives in engine_meta (one definition for satisfies_pin and every comparison here, #1042 [27]).
+_VERSIONS = _engine_meta()   # a private, unpatched instance: the order is not a test seam
+
+
+def release_key(version) -> Optional[tuple]:
+    """(X, Y, Z, stage, n) for the first release in `version`, or None when there is none."""
+    return _VERSIONS.release_key(version)
 
 
 def applicable(migrations: list, pin: str, target: str, meta) -> list:
     """Migrations whose to_version is in (pin, target], ascending by to_version."""
     def key(v):
-        return meta._semver(v) or (0, 0, 0)
+        return release_key(v) or ()   # unparseable sorts below every release
     # A migration whose to_version doesn't parse to vX.Y.Z would fall back to (0,0,0), so
     # `pin < (0,0,0)` is always False and it is SILENTLY dropped from every (pin, target] range —
     # it never runs, no error, the pack is marked upgraded but un-migrated. A misdeclared
@@ -168,7 +231,7 @@ def plan_upgrade(pack: Path, target, target_hermes, migrations, meta) -> Plan:
         return Plan("unknown", pin, target, target_hermes)
     if pin == target:
         return Plan("current", pin, target, target_hermes)
-    if meta._semver(pin) > meta._semver(target):
+    if release_key(pin) > release_key(target):
         # This command has no down-migrations. Treating an ahead pin as an "upgrade" selected an
         # empty migration range and then silently rewrote the pack to the older running engine.
         return Plan("ahead", pin, target, target_hermes)
@@ -200,7 +263,7 @@ def write_pin(pack: Path, version: str, hermes_pin: Optional[str]) -> None:
              f"version: {version}"]
     if hermes_pin:
         lines.append(f"hermes_pin: {hermes_pin}")
-    ev.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _atomic_write_text(ev, "\n".join(lines) + "\n")
 
 
 def migration_provenance(migration: Migration) -> dict:
@@ -215,8 +278,6 @@ def migration_provenance(migration: Migration) -> dict:
 
 def record_state(pack: Path, target: str, applied_ids: list, now_iso: str,
                  *, provenance: Optional[dict] = None) -> None:
-    f = pack / STATE_REL
-    f.parent.mkdir(parents=True, exist_ok=True)
     state = read_state(pack)
     state["engine_version"] = target
     state["applied"] = sorted(set(state.get("applied", [])) | set(applied_ids))
@@ -225,7 +286,7 @@ def record_state(pack: Path, target: str, applied_ids: list, now_iso: str,
     state.setdefault("history", []).append(
         {"at": now_iso, "to": target, "migrations": list(applied_ids),
          **({"migration_provenance": provenance} if provenance else {})})
-    f.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    _atomic_write_text(pack / STATE_REL, json.dumps(state, indent=2) + "\n")
 
 
 def apply_upgrade(pack: Path, plan: Plan, now_iso: str) -> list:
@@ -302,7 +363,7 @@ def load_all_migrations(engine_dir: Path, pack: Path) -> list:
                 f"migration of the same id (to_version {prior.to_version}) — the pack would silently "
                 "SUPPRESS the engine migration. Give the pack migration a UNIQUE id.")
         by_id[m.id] = m
-    return sorted(by_id.values(), key=lambda m: (meta._semver(m.to_version) or (0, 0, 0), m.id))
+    return sorted(by_id.values(), key=lambda m: (release_key(m.to_version) or (), m.id))
 
 
 def preview_upgrade(pack: Path, plan: Plan) -> list:
@@ -330,8 +391,12 @@ def _default_validator(pack: Path):
         if rc != 0:
             return (False, f"framework validate → exit {rc}")
         return (True, "framework validate → exit 0")
-    except Exception as e:                  # never let a broken validator wedge an upgrade
-        return (True, f"validation skipped ({e})")
+    except Exception as e:
+        # Fail CLOSED (okengine#991 [14]). A validator that crashed proved nothing about the
+        # migrated pack; passing here certified it and confirmed its snapshot prunable. The
+        # rollback leaves the pack as it was; `--no-validate` is the explicit operator override.
+        return (False, f"framework validate crashed ({type(e).__name__}: {e}) — the migrated pack "
+                       "is unvalidated, so it is not accepted")
 
 
 def _page_failure_map(root: Path) -> dict:
@@ -485,19 +550,21 @@ RECOMPOSE_SCHEMA = _recompose_schema
 # --- snapshot + automatic rollback (Phase 3) ---------------------------------
 
 def _scope_files(root: Path, snapshots_abs: Path):
-    """Relative paths of files under `root`, skipping SNAPSHOT_EXCLUDES + the snapshots dir."""
+    """Relative paths of files under `root`, skipping SNAPSHOT_EXCLUDES, the snapshots dir and the
+    backups dir."""
+    skipped = {snapshots_abs, (root / BACKUPS_REL).resolve()}
     for dirpath, dirnames, filenames in os.walk(root):
         dp = Path(dirpath)
         dirnames[:] = [d for d in dirnames
-                       if d not in SNAPSHOT_EXCLUDES and (dp / d).resolve() != snapshots_abs]
+                       if d not in SNAPSHOT_EXCLUDES and (dp / d).resolve() not in skipped]
         for f in filenames:
             yield (dp / f).relative_to(root)
-    # The gateway's operator-owned config is runtime state, but engine migrations may perform
-    # narrowly-scoped model-ID migrations on it. Include only this file so rollback remains
-    # transactional without copying caches, cron state, databases, or other .hermes-data content.
-    runtime_config = root / ".hermes-data" / "config.yaml"
-    if runtime_config.is_file():
-        yield runtime_config.relative_to(root)
+    # The gateway's operator-owned config and env are runtime state, but engine migrations may
+    # perform narrowly-scoped model-ID migrations on them. Include only these files so rollback
+    # remains transactional without copying caches, cron state, databases, or other .hermes-data.
+    for rel in RUNTIME_SCOPE_FILES:
+        if (root / rel).is_file():
+            yield rel
 
 
 def _copy_scoped_file(src: Path, dst: Path) -> None:
@@ -713,6 +780,18 @@ def restore(pack: Path, snap_dir: Path, added: Optional[set] = None,
     tree = snap_dir / "tree"
     snapshots_abs = (pack / SNAPSHOTS_REL).resolve()
     snap_set = set(_scope_files(tree, (tree / SNAPSHOTS_REL).resolve()))
+    # A snapshot with no files can only do damage here (okengine#819). `added` is BY DEFINITION
+    # "live files absent from the snapshot", so an empty snap_set makes it the whole deployment:
+    # the quarantine loop moves every file aside and the restore loop has nothing to put back.
+    # That is exactly what happened on a live vault — 110,263 files quarantined, `wiki/` emptied,
+    # and the run still printed "110263 files restored" — because one caller had already deleted
+    # the snapshot another caller still held. Refuse: a rollback that classifies the ENTIRE tree as
+    # migration-added is never right, whatever put the snapshot in that state.
+    if added and not snap_set:
+        raise FileNotFoundError(
+            f"refusing to quarantine {len(added)} file(s) against a snapshot that can restore "
+            f"NOTHING: {tree} is missing or empty. The snapshot may have been consumed by another "
+            f"transaction (okengine#819). Nothing was moved.")
     # QUARANTINE (never unlink) the `added` set. The added/modified capture is a non-atomic walk at
     # real vault scale, so a page a concurrent lane/MCP writes during the apply→validate window can be
     # misclassified as migration-added; deleting it would destroy live content (invariant-audit #32).
@@ -800,19 +879,7 @@ def installed_pack_version(vault: Path, name: str, fallback: Optional[str] = Non
 
 def _write_state(vault: Path, state: dict) -> None:
     """Atomically durably replace migration state so a hard kill cannot leave partial JSON."""
-    f = vault / STATE_REL
-    f.parent.mkdir(parents=True, exist_ok=True)
-    tmp = f.with_suffix(f.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as stream:
-        stream.write(json.dumps(state, indent=2) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(tmp, f)
-    directory_fd = os.open(f.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+    _atomic_write_text(vault / STATE_REL, json.dumps(state, indent=2) + "\n")
 
 
 def record_pack_version(vault: Path, name: str, version: str) -> None:
@@ -857,9 +924,15 @@ def _unfinished_pack_snapshot(vault: Path, name: str, incoming: str) -> Optional
             metadata = json.loads(manifest.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        # `operation` marks a snapshot another transaction owns and is still holding — notably
+        # install-domain's, whose manifest carries the same pack/to keys as ours. Adopting it made
+        # this runner roll back from it and DELETE it while install-domain still held the
+        # reference, and install-domain's own rollback then ran against a missing tree
+        # (okengine#819). Only recover a transaction this runner wrote.
         if (isinstance(metadata, dict) and metadata.get("pack") == name
                 and str(metadata.get("to")) == incoming
-                and not metadata.get("confirmed_good_at")):
+                and not metadata.get("confirmed_good_at")
+                and not metadata.get("operation")):
             matches.append(directory)
     return max(matches, key=lambda item: item.name) if matches else None
 
@@ -877,7 +950,7 @@ def changelog_impact(changelog_text: Optional[str], installed: str, incoming: st
     section without one is surfaced as such rather than silently skipped."""
     if not changelog_text:
         return []
-    lo, hi = meta._semver(installed), meta._semver(incoming)
+    lo, hi = release_key(installed), release_key(incoming)
     if lo is None or hi is None:
         return []
     out = []
@@ -890,10 +963,10 @@ def changelog_impact(changelog_text: Optional[str], installed: str, incoming: st
         out.append(f"{section_ver}: " + ("; ".join(impact) if impact
                                          else "(no migration-impact line in CHANGELOG)"))
     for ln in changelog_text.splitlines():
-        m2 = re.match(r"##\s+v?(\d+\.\d+\.\d+)\b", ln)
+        m2 = re.match(r"##\s+(v?\d+\.\d+\.\d+\S*)", ln)
         if m2:
             _flush()
-            v = meta._semver(m2.group(1))
+            v = release_key(m2.group(1))
             section_ver = m2.group(1) if (v and lo < v <= hi) else None
             section_lines = []
         elif section_ver is not None:
@@ -926,7 +999,7 @@ def run_pack_migrations(vault: Path, name: str, installed: Optional[str], incomi
         print(f"  pack version: {name} installed version unknown — baselined at {incoming}; "
               f"apply any older CHANGELOG migration steps manually")
         return 0
-    iv, nv = meta._semver(installed), meta._semver(incoming)
+    iv, nv = release_key(installed), release_key(incoming)   # an rc orders before its final
     if iv == nv:
         if record and installed_pack_version(vault, name) is None:
             record_pack_version(vault, name, incoming)
@@ -939,10 +1012,11 @@ def run_pack_migrations(vault: Path, name: str, installed: Optional[str], incomi
     try:
         migs = load_migrations(mdir)
         span = applicable(migs, installed, incoming, meta)   # raises on unparseable to_version (#178)
+        state = read_state(vault)                            # MigrationStateError is a RuntimeError
     except (RuntimeError, ValueError) as e:
         print(f"ERROR: pack migrations ({name}): {e}", file=sys.stderr)
         return 1
-    applied = _pack_applied_ids(read_state(vault), name)
+    applied = _pack_applied_ids(state, name)
     pending = [m for m in span if m.id not in applied]
     print(f"  pack version: {installed} → {incoming}  ({name})")
     for line in changelog_impact(changelog_text, installed, incoming, meta):
@@ -1027,8 +1101,8 @@ def run_pack_migrations(vault: Path, name: str, installed: Optional[str], incomi
             # pack_versions after the first makes a hard-kill resume see installed == incoming and
             # skip its siblings forever. Persist every completed id immediately, but advance the
             # version checkpoint only after the last pending migration for that target succeeds.
-            if (meta._semver(m.to_version) < nv
-                    and not any(meta._semver(later.to_version) == meta._semver(m.to_version)
+            if (release_key(m.to_version) < nv
+                    and not any(release_key(later.to_version) == release_key(m.to_version)
                                 for later in pending[index + 1:])):
                 checkpoint_version = m.to_version
             _record_pack_applied(vault, name, checkpoint_version, [m.id], now_iso)
@@ -1054,12 +1128,19 @@ def run_pack_migrations(vault: Path, name: str, installed: Optional[str], incomi
         record_pack_version(vault, name, incoming)
         confirm_snapshot_good(snap, datetime.now(timezone.utc).isoformat())
     except (Exception, KeyboardInterrupt) as e:
-        n = restore(vault, snap, added=added_since_snapshot(vault, snap),
-                    modified=changed_since_snapshot(vault, snap))
-        shutil.rmtree(snap, ignore_errors=True)
         print(f"    ✗ pack migration FAILED mid-apply: {e}")
-        print(f"    ↩ ROLLED BACK ({n} files restored) — vault unchanged; added files "
-              f"quarantined under .okengine/rolled-back/, not deleted.")
+        try:
+            n = restore(vault, snap, added=added_since_snapshot(vault, snap),
+                        modified=changed_since_snapshot(vault, snap))
+            print(f"    ↩ ROLLED BACK ({n} files restored) — vault unchanged; added files "
+                  f"quarantined under .okengine/rolled-back/, not deleted.")
+        except FileNotFoundError as rollback_error:
+            # A refused rollback (okengine#819) must not replace the failure that caused it, and
+            # must not take the process down: the vault is untouched precisely BECAUSE nothing was
+            # moved. Report both and let the caller decide.
+            print(f"    !! NOT rolled back: {rollback_error}", file=sys.stderr)
+        finally:
+            shutil.rmtree(snap, ignore_errors=True)
         return 1
     # Freeze added/modified BEFORE the slow validation gate — same live-vault-write
     # protection as the engine path (#12). The state record above is inside `modified`,
@@ -1168,12 +1249,17 @@ def main(argv: list) -> int:
         return 0
     meta = _engine_meta()
     target, htag = meta.engine_release(), meta.hermes_pin()
+    # Exit contract (deploy.sh step [0/6] depends on it): 2 = nothing attempted (ahead/unknown
+    # pin, usage) — deploy continues and validate reports; 1 = a reconcile that should have run
+    # FAILED (migration load error, unreadable state, rollback) — deploy must stop, because validate
+    # passes a same-series pin and would ship the un-migrated pack (okengine#991 [6]); 3 = a
+    # pin-bump-only upgrade (no migration) rolled back on a `framework validate` FAIL (#1042 [28]).
     try:
         migrations = load_all_migrations(Path(a.migrations_dir), pack)   # engine + pack-local
-    except RuntimeError as e:
+        plan = plan_upgrade(pack, target, htag, migrations, meta)
+    except RuntimeError as e:                    # includes MigrationStateError
         print(f"ERROR: {e}", file=sys.stderr)
-        return 2
-    plan = plan_upgrade(pack, target, htag, migrations, meta)
+        return 1
     print(render(plan))
     if plan.status == "unknown":
         return 2
@@ -1236,6 +1322,17 @@ def main(argv: list) -> int:
         print("  (pin bump only — no migration transforms)")
     print("  state recorded in .okengine/migrations-state.json")
     if a.no_validate:
+        if snap and not plan.migrations:
+            # A pin-bump-only upgrade transformed nothing, so there is nothing an unvalidated run
+            # leaves unproven and nothing this snapshot could restore that the pin itself does not
+            # name. Left unconfirmed, count retention never prunes it: `deploy.sh --skip-validate`
+            # reaches here on every roll and leaked one full vault copy each time (okengine#1044
+            # [20], the okengine#914 class).
+            confirm_snapshot_good(snap, datetime.now(timezone.utc).isoformat())
+        elif snap:
+            print(f"  snapshot {snap.name} stays an UNCONFIRMED recovery point (--no-validate proved "
+                  "nothing about the migration), so retention will not prune it. Once the pack is "
+                  f"observed good: framework upgrade {pack} --confirm-snapshot-good {snap.name}")
         if snap:
             prune_snapshots(pack, a.keep_snapshots)
         return 0
@@ -1268,9 +1365,22 @@ def main(argv: list) -> int:
         else:
             print("  ✗ vault no longer validates, and --no-snapshot was set: NO automatic "
                   "rollback. Restore the pack manually.")
+        if not plan.migrations:
+            # Exit 3 (okengine#1042 [28]): no migration ran, so this FAIL predates the upgrade or
+            # comes from the new engine's checks. deploy.sh must not report it as a failed migration.
+            print("  no migration ran: `framework validate` FAILs on this pack at the new pin "
+                  "(a pre-existing FAIL or a new engine check). Run `framework validate "
+                  f"{pack}` to see it.")
+            return 3
         return 1
     print("  ✓ vault still validates")
     if snap:
+        # The upgrade this snapshot guarded passed its roll-forward gate, so it is no longer a
+        # recovery point: mark it good so count retention can prune it (okengine#914). Without
+        # this, every `deploy.sh` roll left an unconfirmed full copy of the vault that nothing ever
+        # pruned -- 129G of them on one deployment. A crash before this line leaves it unconfirmed,
+        # and so still recoverable.
+        confirm_snapshot_good(snap, datetime.now(timezone.utc).isoformat())
         prune_snapshots(pack, a.keep_snapshots)
     return 0
 

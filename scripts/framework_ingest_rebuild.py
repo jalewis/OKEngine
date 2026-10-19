@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -48,6 +49,19 @@ def _run(script: str, dep: Path, args: list[str] | None = None) -> subprocess.Co
         return subprocess.run(
             ["docker", "compose", "run", "--rm", "okengine-projection",
              "python", "/app/service.py", "--reconcile"],
+            cwd=dep, env=os.environ.copy(), text=True, capture_output=True, check=False)
+    if script == "@source-hydrate":
+        identity = subprocess.run(
+            ["docker", "compose", "exec", "-T", "gateway", "stat", "-c", "%u:%g", "/opt/data"],
+            cwd=dep, env=os.environ.copy(), text=True, capture_output=True, check=False)
+        if identity.returncode:
+            return identity
+        user = identity.stdout.strip()
+        if not re.fullmatch(r"[1-9][0-9]*:[0-9]+", user):
+            raise IngestError("cannot hydrate: gateway runtime owner must be a non-root UID:GID")
+        return subprocess.run(
+            ["docker", "compose", "exec", "-T", "--user", user, "gateway", "python",
+             "/opt/data/scripts/source_hydrate.py", *(args or [])],
             cwd=dep, env=os.environ.copy(), text=True, capture_output=True, check=False)
     env = os.environ.copy()
     env["WIKI_PATH"] = str(dep)
@@ -127,24 +141,26 @@ def sources(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="framework sources")
     sub = parser.add_subparsers(dest="command", required=True)
     hydrate = sub.add_parser("hydrate"); hydrate.add_argument("deployment"); hydrate.add_argument("--missing-body", action="store_true", required=True); hydrate.add_argument("--json", action="store_true")
+    hydrate.add_argument("--source", action="append")
+    hydrate.add_argument("--limit", type=int, default=20)
+    hydrate.add_argument("--apply", action="store_true")
     reconcile = sub.add_parser("reconcile"); reconcile.add_argument("deployment"); reconcile.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
         dep = _dep(args.deployment)
         if args.command == "hydrate":
-            opml = dep / "feeds/feeds.opml"
-            if not opml.is_file():
-                raise IngestError(f"feed configuration not found: {opml}")
-            command = ["--opml", str(opml), "--out-dir", str(dep / "raw/feeds"),
-                       "--state", str(dep / ".okengine/feed-state.json"), "--capture-full-text",
-                       "--capture-dir", str(dep / "raw/captures")]
-            result = _run("feed_fetch.py", dep, command)
+            command = ["--limit", str(args.limit)]
+            for page in args.source or []:
+                command.extend(["--source", page])
+            if args.apply:
+                command.append("--apply")
+            result = _run("@source-hydrate" if args.apply else "source_hydrate.py", dep, command)
         else:
             result = _run("classify_sources.py", dep, ["--vault", str(dep)])
         payload = {"operation": args.command, "status": "succeeded" if result.returncode == 0 else "failed",
                    "stdout": result.stdout, "stderr": result.stderr}
         print(json.dumps(payload, indent=2, sort_keys=True) if args.json else
-              f"Sources {args.command}: {payload['status']}")
+              f"Sources {args.command}: {payload['status']}\n{result.stdout}{result.stderr}")
         return result.returncode
     except IngestError as exc:
         print(f"ERROR: {exc}", file=sys.stderr); return 1

@@ -556,6 +556,65 @@ def test_a_pack_owning_no_types_cannot_claim_a_populated_namespace(tmp_path):
     m.check_namespaces(host, pack)
     fail = [msg for level, area, msg in m.FINDINGS if level == "FAIL" and area == "namespaces"]
     assert fail and "declares no owned types" in fail[0], m.FINDINGS
+
+
+# --- okengine#915: ownership of an installed namespace is the installed-domain record, not
+# partitioning equality. A pack whose partitioning changed upstream must stay refreshable.
+
+
+def _record_owned(host: Path, pack_name: str, namespace: str) -> None:
+    owned = host / ".okengine" / "installed-domains" / f"{pack_name}.json"
+    owned.parent.mkdir(parents=True, exist_ok=True)
+    owned.write_text(json.dumps({"pack": pack_name, "owned_namespaces": {
+        namespace: {"partitioning": {"strategy": "flat"}, "permissions": None, "tier": None}}}))
+
+
+def test_owned_namespace_with_changed_partitioning_is_a_warning_not_a_collision(tmp_path):
+    m = _mod()
+    host, pack = _adoption_case(tmp_path, host_declares=True)
+    _record_owned(host, "okpack-demo", "hyp")
+    m.check_namespaces(host, pack)
+    assert not any(level == "FAIL" for level, _, _ in m.FINDINGS), m.FINDINGS
+    warn = [msg for level, area, msg in m.FINDINGS if level == "WARN" and area == "namespaces"]
+    assert len(warn) == 1, m.FINDINGS
+    assert "this pack's installed namespace but its partitioning changed" in warn[0], warn
+    assert "host {'strategy': 'flat'} vs pack {'strategy': 'by-letter'}" in warn[0], warn
+    assert "only after proving no existing page moves" in warn[0], warn
+
+
+def test_another_packs_ownership_record_does_not_make_the_namespace_ours(tmp_path):
+    m = _mod()
+    host, pack = _adoption_case(tmp_path, host_declares=True)
+    _record_owned(host, "okpack-somebody-else", "hyp")
+    m.check_namespaces(host, pack)
+    fail = [msg for level, area, msg in m.FINDINGS if level == "FAIL" and area == "namespaces"]
+    assert fail and "already exists in host" in fail[0], m.FINDINGS
+    assert not any(level == "WARN" for level, _, _ in m.FINDINGS), m.FINDINGS
+
+
+def test_owned_record_for_a_different_namespace_does_not_cover_this_one(tmp_path):
+    m = _mod()
+    host, pack = _adoption_case(tmp_path, host_declares=True)
+    _record_owned(host, "okpack-demo", "elsewhere")
+    m.check_namespaces(host, pack)
+    assert any(level == "FAIL" and area == "namespaces" for level, area, _ in m.FINDINGS), m.FINDINGS
+
+
+
+def test_an_owned_partitioning_change_does_not_end_the_namespace_scan(tmp_path):
+    """The owned namespace sorts first; a foreign collision after it must still be reported."""
+    m = _mod()
+    host, pack = _adoption_case(tmp_path, host_declares=True)
+    (pack / "schema.yaml").write_text("partitioning:\n  namespaces:\n    hyp: {strategy: by-letter}\n"
+                                      "    zoo: {strategy: flat}\n")
+    (host / "schema.yaml").write_text("partitioning:\n  namespaces:\n    hyp: {strategy: flat}\n"
+                                      "    zoo: {strategy: by-letter}\n")
+    (host / "wiki" / "zoo").mkdir()
+    _record_owned(host, "okpack-demo", "hyp")
+    m.check_namespaces(host, pack)
+    fails = [msg for level, area, msg in m.FINDINGS if level == "FAIL" and area == "namespaces"]
+    assert len(fails) == 1 and "wiki/zoo/" in fails[0], m.FINDINGS
+
 # --- okengine#813: an exposure an operator has considered and accepted is recorded, keyed to the
 # exact trust pair, and still reported. A gate that cannot be satisfied gets bypassed instead.
 

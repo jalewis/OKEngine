@@ -18,11 +18,19 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 import yaml
+
+# Engine cron libs, appended so this extension's own modules keep precedence: staged one level
+# up (/opt/data/scripts/ holds /opt/data/scripts/<id>/), or scripts/cron/ in a repo checkout.
+_ENGINE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(_ENGINE_ROOT))
+sys.path.append(str(_ENGINE_ROOT.parent / "scripts" / "cron"))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
@@ -137,7 +145,7 @@ def main() -> int:
         L.append(f"| {e['date'] or '—'} | {e['type']} | {e['score']:g} | [[{e['ref']}]] |")
     L.append("")
     DASH.parent.mkdir(parents=True, exist_ok=True)
-    DASH.write_text("\n".join(L) + "\n", encoding="utf-8")
+    generated_page.write(DASH, "\n".join(L) + "\n")
 
     # one-row/day snapshot so the ledger size trends
     try:
@@ -145,7 +153,7 @@ def main() -> int:
         header = ("---\ntype: dashboard\ntitle: Event-ledger snapshots\n---\n\n"
                   "# Event-ledger snapshots\n\n| date | events |\n|---|---|\n")
         if not SNAP.exists():
-            SNAP.write_text(header, encoding="utf-8")
+            generated_page.write(SNAP, header)
         row = f"| {_today()} | {len(events)} |"
         lines = [ln for ln in SNAP.read_text(encoding="utf-8").splitlines()
                  if not ln.startswith(f"| {_today()} |")]

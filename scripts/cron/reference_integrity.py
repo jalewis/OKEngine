@@ -20,6 +20,9 @@ from pathlib import Path
 
 import yaml
 
+sys.path.append(str(Path(__file__).resolve().parent))  # staged sibling libs
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
+
 VAULT = Path(os.environ.get("WIKI_PATH", "/opt/vault"))
 WIKI = VAULT / "wiki"
 OUT_JSON = WIKI / "dashboards" / "reference-integrity.json"
@@ -153,7 +156,7 @@ def main(argv=None) -> int:
         f"{', '.join(f'`{c}`' for c in item['candidates'])} |"
         for item in findings
     )
-    OUT_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    generated_page.write(OUT_MD, "\n".join(lines) + "\n")
     print(
         f"reference-integrity: {payload['missing_targets']} missing targets, "
         f"{payload['inbound_references']} inbound, repaired {repaired_refs} refs/{repaired_pages} pages"

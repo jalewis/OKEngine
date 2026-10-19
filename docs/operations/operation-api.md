@@ -90,11 +90,10 @@ The **engine** owns the run — the entrypoint is a worker (`scripts/operation_r
 ## Enabling a pack operation
 
 The pack installer adds its operation name to `OKENGINE_OPERATION_ALLOW` without modifying tokens.
-Start the operator services with:
-
-```bash
-docker compose --profile review up -d --build
-```
+Start the operator services by enabling the `review` profile in the pack `.env`
+(`COMPOSE_PROFILES=review`) and re-running `deploy.sh`, which builds and labels their images. A bare
+`docker compose --profile review up -d --build` builds them unlabeled, reported as UNATTRIBUTED by
+post-deploy verification.
 
 Do not expose the operation runner port. Add an operation to the allowlist only after its manifest,
 plan behavior, locks, receipts, and recovery path have passed conformance and integration tests.

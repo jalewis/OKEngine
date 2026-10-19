@@ -15,7 +15,7 @@ For each peg:
 Drop a candidate rather than force an angle that doesn't actually connect to a real capability.
 7 max — quality over volume.
 
-Write via mcp__okengine_write_okengine_messaging_synthesis_content_pegs__create_entity to the wiki-relative path the wake-gate specified,
+Write via mcp__OKENGINE_WRITER__create_entity to the wiki-relative path the wake-gate specified,
 frontmatter `type: marketing-pulse, title: "Content pegs — week of <date>", published: <date>,
 updated: <date>`. Body: `# Content pegs — week of <date>` then one subsection per peg (`## <Hook>`
 with Signal/Our angle/Suggested format as bullets). If nothing survives filtering, write the page

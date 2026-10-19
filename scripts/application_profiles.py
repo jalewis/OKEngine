@@ -15,13 +15,14 @@ import re
 from pathlib import Path
 
 import yaml
+from yaml import YAMLError  # bare name: cosmic-ray cannot mutate a dotted except target
 
 
 ENGINE_ROOT = Path(__file__).resolve().parents[1]
 DECLARATION = Path(".okengine/application.yaml")
-ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
-ROLE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
-VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+ID_RE = re.compile(r"^[a-z][a-z0-9-]*\Z")
+ROLE_RE = re.compile(r"^[a-z][a-z0-9_]*\Z")
+VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)\Z")
 
 
 class ApplicationProfileError(ValueError):
@@ -31,7 +32,7 @@ class ApplicationProfileError(ValueError):
 def _load(path: Path) -> dict:
     try:
         value = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError) as exc:
+    except (OSError, YAMLError) as exc:
         raise ApplicationProfileError(f"{path}: cannot load YAML: {exc}") from exc
     if not isinstance(value, dict):
         raise ApplicationProfileError(f"{path}: top level must be a mapping")

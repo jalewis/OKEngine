@@ -123,3 +123,47 @@ def test_cron_jobs_dst_gate_uses_scheduler_timezone_precedence():
     text = (REPO / "scripts" / "deploy-cron-plus-jobs.sh").read_text()
     assert '_okengine_env_file_val "$PACK_DIR" CRON_TZ' in text
     assert 'DEPLOY_TZ="${PACK_CRON_TZ:-${TZ:-${PACK_TZ:-UTC}}}"' in text
+
+
+# --- okengine#994 A: the .env reader is compose's, through dotenv_lib -------------------------------
+# `_okengine_env_file_val` had its own first-wins parser. compose, dotenv_lib and backup resolve a
+# duplicated key LAST-wins, so a duplicated HERMES_UID split the uid the deploy scripts wrote as from
+# the uid the gateway ran as, and a duplicated TZ split cron expansion from the container clock.
+
+
+def test_a_duplicated_key_resolves_last_wins_like_compose(tmp_path):
+    (tmp_path / ".env").write_text("HERMES_UID=1001\nTZ=UTC\nHERMES_UID=1003\nTZ=America/New_York\n")
+    assert _env_file_val(tmp_path, "HERMES_UID").stdout == "1003"
+    assert _env_file_val(tmp_path, "TZ").stdout == "America/New_York"
+    assert _resolve(tmp_path) == "1003", "the resolver must follow the value compose hands the gateway"
+
+
+def test_an_interpolated_value_resolves_as_compose_resolves_it(tmp_path):
+    (tmp_path / ".env").write_text("HERMES_UID=${PACK_UID}\nPACK_UID=1003\n")
+    got = _env_file_val(tmp_path, "HERMES_UID")
+    assert got.returncode == 0 and got.stdout == "1003", (got.stdout, got.stderr)
+
+
+def test_an_empty_value_is_not_a_pin_and_falls_through_to_the_tree_owner(tmp_path):
+    without_pin = _resolve(tmp_path)          # tree owner (or the 10000 last resort under root)
+    (tmp_path / ".env").write_text("HERMES_UID=\nHERMES_GID= # unset\n")
+    assert _env_file_val(tmp_path, "HERMES_UID").returncode != 0
+    assert _resolve(tmp_path) == without_pin
+
+
+def test_the_reader_works_after_the_caller_changes_directory(tmp_path):
+    """The parser path is fixed when the library is sourced, so a relative source plus a later `cd`
+    (deploy scripts change directory) still reaches dotenv_lib."""
+    (tmp_path / ".env").write_text("HERMES_UID=1003\n")
+    r = subprocess.run(
+        ["bash", "-c", '. lib/hermes_uid.sh; cd /; _okengine_env_file_val "$1" HERMES_UID', "bash",
+         str(tmp_path)],
+        capture_output=True, text=True, cwd=REPO / "scripts")
+    assert r.returncode == 0 and r.stdout == "1003", r.stderr
+
+
+def test_the_shell_reader_has_no_parser_of_its_own():
+    text = LIB.read_text(encoding="utf-8")
+    assert "dotenv_lib.py" in text and '" get "' in text
+    assert "shlex" not in text and "re.compile" not in text, \
+        "hermes_uid.sh must delegate to dotenv_lib, not parse .env itself"

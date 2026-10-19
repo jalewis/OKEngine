@@ -324,3 +324,38 @@ def test_main_limit_with_explicit_workers_leaves_pending(tmp_path, monkeypatch, 
     assert seen == [(["a"], 2)]
     payload = capsys.readouterr().out
     assert '"pending": 1' in payload
+
+
+def _directory_index():
+    import sys
+    sys.path.insert(0, str(REPO / "okengine-reader"))
+    import directory_index
+    return directory_index
+
+
+def test_a_stored_legacy_check_of_an_unchanged_settled_page_still_counts(tmp_path):
+    """okengine#1023: render-lint's state holds the reader revision it checked each page at. The
+    v0.15.10 reader changed the token format, so every stored pre-v0.15.10 check stopped matching.
+    The reader's token for an unchanged settled page must equal what render-lint stored."""
+    di = _directory_index()
+    page = tmp_path / "page.md"
+    page.write_text("settled body\n", encoding="utf-8")
+    st = page.stat()
+    stored = {"version": rl._STATE_VERSION,
+              "pages": {"page": {"updated": f"{st.st_mtime_ns}:{st.st_size}", "violations": []}}}
+    revision = di._revision(page, st, max(st.st_mtime_ns, st.st_ctime_ns) + 10_000_000_000)
+    selected, current = rl.plan_incremental([{"path": "page", "revision": revision}], stored, 500)
+    assert selected == []
+    _offenders, checked, pending = rl.apply_incremental(stored, current, {}, "2026-10-10T07:30:00Z")
+    assert (checked, pending) == (1, 0)
+
+
+def test_an_unrechecked_stale_entry_is_kept_for_a_later_match():
+    """A run re-checks only its batch. An entry whose revision does not match is left as stored,
+    neither dropped nor rewritten, so it counts again once the reader serves its token."""
+    state = {"pages": {"a": {"updated": "1:9", "violations": ["literal-wikilink"]},
+                       "b": {"updated": "2:9", "violations": []}}}
+    current = {"a": "1:9:" + "f" * 32, "b": "2:9:" + "e" * 32}
+    rl.apply_incremental(state, current, {"b": []}, "now")
+    assert state["pages"]["a"] == {"updated": "1:9", "violations": ["literal-wikilink"]}
+    assert state["pages"]["b"] == {"updated": current["b"], "violations": []}

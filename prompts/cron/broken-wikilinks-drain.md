@@ -38,7 +38,7 @@ the inbound sources support it. Do NOT mint a name-only stub if the sources
 let you write a paragraph.
 
 Action: Create `wiki/entities/<slug>.md` with
-`mcp__okengine_write__create_entity`. Frontmatter:
+`mcp__OKENGINE_WRITER__create_entity`. Frontmatter:
 
 ```yaml
 ---
@@ -78,7 +78,7 @@ brackets break `yaml.safe_load`.
 Target like `[[Acme Corp]]` where `entities/acme-corp.md` exists, or
 `[[entities/Acme-Corp]]` (case drift). Action: rewrite each citing source
 page to use the canonical path `[[entities/acme-corp]]` with
-`mcp__okengine_write__patch_entity` — touch ONLY the broken wikilink,
+`mcp__OKENGINE_WRITER__patch_entity` — touch ONLY the broken wikilink,
 never other content.
 
 Do NOT create a stub.
@@ -156,11 +156,11 @@ No Telegram delivery; this stays local.
 WRITE VIA THE MCP WRITE PATH (G1/G1.1) — NOT file_write/patch
 ─────────────────────────────────────────────────────────────────
 Apply curation with the enforced MCP tools (file_read still reads):
-- MISSING ENTITY → `mcp__okengine_write__create_entity`, path "entities/<slug>",
+- MISSING ENTITY → `mcp__OKENGINE_WRITER__create_entity`, path "entities/<slug>",
   frontmatter type: <one of your pack's types> + the type's required fields
   (incl sources), body: the lead + >=1 analysis section. Required fields are
   enforced; create refuses dupes.
-- TYPO / VARIANT / bare-publisher link in a CITING page → `mcp__okengine_write__patch_entity`,
+- TYPO / VARIANT / bare-publisher link in a CITING page → `mcp__OKENGINE_WRITER__patch_entity`,
   path: the citing page, old_string: "[[<broken target>]]", new_string: "[[<correct>]]".
   old_string must be UNIQUE in that page (include surrounding text if the link
   recurs). It preserves the rest of the page and rejects dropping any frontmatter field.

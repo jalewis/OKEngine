@@ -258,3 +258,20 @@ def test_a_body_ref_that_cannot_be_stat_ed_is_not_counted(vault, monkeypatch):
     path, content = _page(vault, "entities/z/eio.md", "type: actor\nname: Z\nid: entities:z\n",
                           "## Sources\n- [[sources/2026/07/07/register-story]]\n")
     assert m.conformance_reject_reason(path, content) is None
+
+
+@pytest.mark.parametrize(("count", "shown"), [
+    (2, "(sources/s0, sources/s1)"),
+    (3, "(sources/s0, sources/s1, sources/s2)"),
+    (4, "(sources/s0, sources/s1, sources/s2, …)"),
+])
+def test_the_message_lists_at_most_three_refs_and_marks_the_rest(vault, count, shown):
+    """The rejection names the first three cited sources and marks more with an ellipsis, at
+    exactly the 3/4 boundary. okengine#1047: these mutants of `refs[:3]` and `len(refs) > 3`
+    survived in nightly 13159 and held tools/schema_validator.py at 89.37% under its 90% floor."""
+    m = _load()
+    for index in range(count):
+        _src(vault, f"sources/s{index}")
+    body = "## Sources\n" + "".join(f"- [[sources/s{index}]]\n" for index in range(count))
+    reason = m._body_only_citation_reason("wiki/entities/z/z.md", {"type": "actor"}, body, vault)
+    assert reason.startswith(f"cites {count} source(s) only in body prose {shown} — move"), reason

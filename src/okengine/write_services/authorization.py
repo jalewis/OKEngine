@@ -27,14 +27,21 @@ from tools.schema_validator import (
 )
 from tools import policy_plane
 from okengine.mcp import scope as _scope
+from okengine.write_services.state import lane_actor
 import output_contract_enforce as _output_contract
+from okengine import attestation as _attestation
+from okengine.field_values import same_value as _same_value
+from okengine.file_fingerprint import fingerprint
 
 import id_lib, schema_lib, id_index, converge, okf_migrate
 _RECORD_DATE_FIELDS = ("published", "updated", "created", "last_updated")
 
 
 def _today() -> str:
-    """ISO date (YYYY-MM-DD) for the wiki/log.md ledger lines. Injectable for tests."""
+    """ISO date (YYYY-MM-DD) for the wiki/log.md ledger lines: the deployment's LOCAL day, from the
+    process TZ. A stdio writer gets TZ only from its own `env:` map (Hermes filters the gateway's
+    environment), which ensure-runtime binds and the `timezone` deployment check verifies
+    (okengine#1042 [36]). Injectable for tests."""
     override = os.environ.get("OKENGINE_MCP_WRITE_DATE")
     if override:
         return override
@@ -79,7 +86,24 @@ ACTOR_TOOLS: dict[str, set[str]] = {
         "append_to_section",
         "converge_entity",
     },
+    # okengine#983: the Chat agent's writer. ensure-runtime also pins OKENGINE_WRITE_TOOLS to this
+    # set; the table is the fallback when that env is absent.
+    "chat:api_server": {"create_entity", "update_entity", "append_to_section"},
 }
+
+
+def _chat_review_flags() -> list[str]:
+    """okengine#983: every write by a model-facing chat writer needs a human disposition.
+
+    Chat answers a person in real time and writes back what it found on the web, with no lane
+    contract and no selector behind it; on one deployment it rewrote an actor's related-actor
+    attribution unreviewed. So the write lands, and is always queued for review."""
+    actor = str(_caller().get("actor") or "")
+    # A literal, not a module constant: these helpers are rebound into the write_server facade,
+    # which carries functions, not this module's constants.
+    if not actor.startswith("chat:"):
+        return []
+    return [f"chat write by {actor} requires human disposition (okengine#983)"]
 
 
 def _caller() -> dict:
@@ -95,10 +119,11 @@ def _caller() -> dict:
 
 
 def _effective_policy() -> dict:
-    """Load composed policy with cheap mtime invalidation for long-lived servers."""
+    """Load composed policy with cheap file-fingerprint invalidation for long-lived servers (an
+    mtime-only key kept enforcing a policy edited within the same timestamp tick, okengine#1017)."""
     vault = Path(os.environ.get("WIKI_PATH") or str(VAULT))
     paths = policy_plane.discover_documents(vault)
-    key = tuple((str(path), path.stat().st_mtime_ns if path.exists() else None) for path in paths)
+    key = tuple((str(path), fingerprint(path)) for path in paths)
     if _policy_cache["key"] != key:
         _policy_cache["value"] = policy_plane.compose_documents(paths)
         _policy_cache["key"] = key
@@ -106,13 +131,17 @@ def _effective_policy() -> dict:
 
 
 def _capability_reject(
-    p: Path, operation: str, *, page_type: str = "", changed_fields=(), body_change: str = "none"
+    p: Path, operation: str, *, page_type: str = "", changed_fields=(), body_change: str = "none",
+    values: Optional[dict] = None, stored: Optional[dict] = None,
 ) -> Optional[str]:
-    """Enforce the authenticated caller's operation/type/field/body authority.
+    """Enforce the authenticated caller's operation/type/field/body/value authority.
 
     This runs before every filesystem mutation.  A rejected attempt is emitted as
     the common structured finding and the human MCP response retains a concise
-    policy rule ID and remediation.
+    policy rule ID and remediation. `values` is the frontmatter the write would store; it is
+    judged after the write's own key and value aliasing (`_normalize_drift`), so a pack alias
+    cannot carry a forbidden value past `forbidden_values`; `stored` is the page as stored, raw
+    (okengine#993).
     """
     caller = _caller()
     if caller.get("kind") == "admin":
@@ -128,8 +157,15 @@ def _capability_reject(
             # A catalog capability is an intentional, potentially narrower engine
             # policy (for example source-quality's two-field update). Only derive the
             # generic cron capability when the authenticated actor has no such entry.
-            if actor not in policy.get("capabilities", {}):
-                declared = _output_contract.capability(caller)
+            # A composed instance (`cron:<job>@<pack>`) runs the same engine lane, so
+            # without an entry of its own it inherits the lane's (okengine#961).
+            capabilities = policy.get("capabilities", {})
+            if actor not in capabilities:
+                lane = lane_actor(actor)
+                declared = (
+                    capabilities[lane] if lane in capabilities
+                    else _output_contract.capability(caller)
+                )
         case "extension":
             declared = caller.get("write_capability")
             # Existing extension manifests remain path-scoped until they opt into
@@ -141,8 +177,11 @@ def _capability_reject(
         policy = dict(policy)
         policy["capabilities"] = dict(policy.get("capabilities", {}))
         policy["capabilities"][actor] = declared
+    resulting = None if values is None else _normalize_drift(dict(values), p)[0]
     result = policy_plane.evaluate_capability(
-        policy, actor, operation, _rel(p), page_type, changed_fields, body_change
+        policy, actor, operation, _rel(p), page_type, changed_fields, body_change,
+        _qualified_namespace(p),  # the namespace: sub-domain aware; shard dirs below never count
+        values=resulting, stored=stored,
     )
     if result is None:
         return None
@@ -191,6 +230,116 @@ def _contract_reject(
     if mode != "enforce":
         return None
     return "output_contract." + detail
+
+
+def _field_aliases(p: Path) -> dict:
+    """The governing pack's key renames ({alias: canonical}), as `_normalize_drift` applies them."""
+    aliases = drift_policy(str(p)).get("field_aliases") or {}
+    return aliases if isinstance(aliases, dict) else {}
+
+
+def _alias_renamed(fm: dict, aliases: dict) -> dict:
+    """`fm` with the pack's KEY renames applied exactly as `_normalize_drift` will before the
+    write commits: one pass in declaration order, so a chain (`{hx: hy, hy: tlp}`) lands where the
+    write lands it. Only keys: value aliases cannot introduce a protected key, and applying them
+    to a stored page would trip over legacy unhashable values. A rename to an empty or non-string
+    name is not applied (the field is judged under its own name, which fails closed)."""
+    out = dict(fm)
+    for alias, canonical in aliases.items():
+        if alias in out and isinstance(canonical, str) and canonical:
+            value = out.pop(alias)
+            if out.get(canonical) in (None, "", [], {}):
+                out[canonical] = value
+    return out
+
+
+def _frontmatter_changes(p: Path, before: dict, after: dict) -> list[str]:
+    """The fields a write changes: the page exactly as stored versus the page the write stores.
+
+    Every write path's capability check reads this, so the check and the write cannot disagree.
+    `before` is compared RAW, as it is on disk; `after` is renamed by the same key pass the write
+    applies to the whole committed frontmatter (`_alias_renamed`, `_normalize_drift`'s key pass),
+    stored keys included. So a key the write materializes counts as a change whoever wrote the
+    alias: a stored `hy` that the write renames onto `tlp` is a change to `tlp` (okengine#983).
+    Compared type-strictly (`field_values.same_value`): `0` over `false` is a change although
+    `0 == False`, and a verbatim echo of canonically-keyed frontmatter is not. A field present on
+    only one side has changed."""
+    old = dict(before)
+    new = _alias_renamed(after, _field_aliases(p))
+    return sorted((key for key in set(old) | set(new)
+                   if key not in old or key not in new or not _same_value(new[key], old[key])),
+                  key=str)
+
+
+def _stored_echoes(p: Path, stored: dict, patch: dict) -> dict:
+    """`patch` as the write is JUDGED: every value that only re-sends the stored value is replaced
+    by the stored value.
+
+    A read-modify-write cannot always send a stored value back verbatim. JSON has no date type, so
+    a tool echoes `reviewed_on: 2026-09-01` as the string "2026-09-01"; and the write path itself
+    coerces what it receives (`_coerce_fm`: a scalar list field becomes a list, a `[[link]]` a plain
+    path), so an echo of a legacy stored shape arrives reshaped. Neither is a mutation, and judged
+    raw each read as a protected-field change. Judged against this mapping, an echo changes nothing
+    and the type-strict comparison still decides every real change: `0` over `false` is not an
+    echo (okengine#991). What the write STORES is `_stored_repairs`."""
+    return {key: stored[key] if key in stored and _echo_kind(p, key, stored[key], sent) else sent
+            for key, sent in patch.items()}
+
+
+def _stored_repairs(p: Path, stored: dict, patch: dict) -> dict:
+    """`patch` as the write STORES it: a JSON date echo keeps the stored date, and a reshaped echo
+    stores the canonical shape (okengine#994 [19]).
+
+    A sent value that is the write path's canonical shape of the stored value (`_coerce_fm` of the
+    stored value: a legacy scalar list field as a list, a `[[link]]` as the plain path) is the same
+    data, so `_stored_echoes` judges it no change; it is also exactly what the write path makes of
+    every value it is sent. Keeping the legacy shape instead silently discarded the repair, and
+    left such a page unrepairable through the write path. Operator-owned attestation fields are
+    the exception: an MCP write must leave them exactly as stored (okengine#980), so an echo of one
+    keeps the stored value byte for byte and only their importer repairs them."""
+    frozen = _attestation_frozen(p, stored)
+    return {key: stored[key]
+            if key in stored and _keeps_stored(_echo_kind(p, key, stored[key], sent), key, frozen)
+            else sent
+            for key, sent in patch.items()}
+
+
+def _keeps_stored(kind: Optional[str], key: Any, frozen: frozenset) -> bool:
+    return kind == "date" or (kind == "reshape" and key in frozen)
+
+
+def _attestation_frozen(p: Path, stored: dict) -> frozenset:
+    """The patch keys (alias spellings included) whose stored value an MCP write must keep exactly:
+    the operator-owned attestation fields, plus the record identity of an attested page."""
+    fields = set(_attestation.OPERATOR_FIELDS)
+    if _attestation.carries_attestation(stored):
+        fields.update(_attestation.RECORD_IDENTITY_FIELDS)
+    aliases = _field_aliases(p)
+    return frozenset(fields | {alias for alias, canonical in aliases.items() if canonical in fields})
+
+
+def _echo_kind(p: Path, key: Any, stored_value: Any, sent: Any) -> Optional[str]:
+    """How `sent` only re-sends `stored_value`: "date" (the JSON spelling of a stored date),
+    "reshape" (the write path's canonical shape of it), or None (a real change)."""
+    if isinstance(stored_value, datetime.date) and isinstance(sent, str):
+        # The JSON spelling of a YAML date or timestamp: the string the stored value loads from.
+        try:
+            return "date" if _same_value(yaml.safe_load(sent), stored_value) else None
+        except Exception:  # YAMLError, or RecursionError on pathological nesting: not an echo
+            return None
+    reshaped = _coerce_fm({key: stored_value}, p)
+    return "reshape" if reshaped is not None and _same_value(sent, reshaped.get(key)) else None
+
+
+def _attestation_reject(p: Path, prev: dict, new: dict, body_changed: bool) -> Optional[str]:
+    """okengine#980: refuse an MCP write that alters operator-owned attestation.
+
+    The stored page is compared RAW against what the write will store: the new frontmatter
+    renamed exactly as `_normalize_drift` will before the write commits. An alias whose
+    canonical name is a protected key would otherwise carry the write past this check under its
+    alias spelling, and a stored alias key the write renames onto one is a change too (#983)."""
+    return _attestation.mcp_write_refusal(
+        dict(prev), _alias_renamed(new, _field_aliases(p)), body_changed)
 
 
 def _apply_extension_provenance(
@@ -357,6 +506,12 @@ def _safe(path: str) -> Optional[Path]:
     # Page basenames are identifiers, not prose. Whitespace and run-on names are
     # strong evidence that an extraction lane passed a sentence as the slug
     # (okengine#240). Reject at the boundary before such pages become links.
+    # A control character is never part of a page path in any namespace (okengine#884). A model
+    # whose tool-call XML leaked put the frontmatter INTO the path argument, and the write landed
+    # as a file named `llm-assisted-cybercrime\nslug: ...\ntags: ...md` -- 15 such pages across
+    # four live vaults, invisible to readers and breaking every line-based lane that lists paths.
+    if any(ord(ch) < 32 or ch == "\x7f" for ch in rel):
+        return None
     raw_name = rel.rsplit("/", 1)[-1]
     raw_stem = raw_name[:-3] if raw_name.endswith(".md") else raw_name
     if rel.startswith("entities/") and (

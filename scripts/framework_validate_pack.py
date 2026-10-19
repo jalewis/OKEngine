@@ -11,6 +11,89 @@ from scripts.framework_validate_report import Report
 from okengine.schema_exclusions import exclusion_globs_from_schema, excluded_namespaces_from_schema
 
 
+#: The values of ``types.<t>.role`` the engine reads (okengine.actor_types.ACTOR_ROLE).
+KNOWN_TYPE_ROLES = frozenset({"actor"})
+
+
+def unknown_type_roles(types) -> list[str]:
+    """``"<type>: <role>"`` for every type whose declared ``role`` the engine does not read."""
+    if not isinstance(types, dict):
+        return []
+    return sorted(
+        f"{name}: {spec.get('role')!r}" for name, spec in types.items()
+        if isinstance(spec, dict) and spec.get("role") is not None
+        and str(spec.get("role")).strip().casefold() not in KNOWN_TYPE_ROLES)
+
+
+def check_type_roles(check: str, types, r: Report) -> None:
+    """FAIL an unknown ``types.<t>.role`` (okengine#1020, okengine#1032 [24]).
+
+    Every actor guard resolves its types through one comparison with ``actor``, so a typo
+    ("actors", "threat-actor") does not fail anywhere: it silently drops the type from grounding,
+    review holds, the cockpit exclusions and the corpus audit, which then reports a clean count
+    over a narrower population. A WARN let that ship, so an unknown role is a FAIL."""
+    bad = unknown_type_roles(types)
+    if bad:
+        r.fail(check, f"unknown role(s) {bad}; the only role the engine reads is `actor`. An "
+               "unknown role silently leaves the type out of every actor guard: use `role: actor` "
+               "or drop the key")
+
+
+def check_fragment_type_roles(extensions, load_yaml, r: Report) -> None:
+    """FAIL an unknown role on a type an extension fragment owns (``owns.types.<t>.role``).
+
+    ``compose_schema`` copies an owned type definition verbatim, so a fragment's role reaches the
+    same actor resolver as a pack's and must meet the same vocabulary (okengine#1032 [24])."""
+    for record in extensions or []:
+        manifest = record.get("manifest") if isinstance(record, dict) else None
+        if not isinstance(manifest, dict):
+            continue
+        for rel in manifest.get("schema") or []:
+            frag = load_yaml(Path(record.get("dir") or ".") / str(rel))
+            owns = frag.get("owns") if isinstance(frag, dict) else None
+            types = owns.get("types") if isinstance(owns, dict) else None
+            check_type_roles(f"ext:{record.get('id')} {rel} owns.types.role", types, r)
+
+
+def check_type_owners(pack: Path, types: dict, r: Report) -> None:
+    """FAIL a ``types.<t>.owner`` no writer on this deployment can ever act for (okengine#1032
+    [11], [15]).
+
+    Converge compares a type's owner with the write principal by equality, and the principal is
+    the ``name`` in ``<vault>/pack.yaml`` or a pack co-installed under
+    ``.okengine/installed-domains/`` (okengine.pack_principal). An owner that is neither (a renamed
+    pack, a typo, a pack folded into this one, a bundle whose re-stamped name hid its host) makes
+    every lane a non-owner of those pages: each update or removal of an existing owned field
+    becomes a conflict and is silently kept at its old value. Ownership is not loosened here; the
+    owner must name a principal that exists. ``engine`` and ``ext:<id>`` owners are checked by
+    their own gates."""
+    from okengine.pack_principal import declared_pack, installed_domain_jobs
+
+    deployment = declared_pack(pack)
+    if not deployment:
+        return  # the nameless pack.yaml is its own FAIL (check_pack_meta); nothing to compare
+    guests = set(installed_domain_jobs(pack))
+    principals = {deployment, "engine"} | guests
+    stray: dict[str, list[str]] = {}
+    for name, spec in types.items():
+        owner = spec.get("owner") if isinstance(spec, dict) else None
+        if owner is None:
+            continue
+        owner = str(owner).strip()
+        if owner.startswith("ext:") or owner in principals:
+            continue
+        stray.setdefault(owner, []).append(str(name))
+    for owner, names in sorted(stray.items()):
+        r.fail("schema.types.owner",
+               f"owner {owner!r} of {sorted(names)} is not a write principal here (pack.yaml "
+               f"name {deployment!r}, co-installed {sorted(guests)}): "
+               "no lane can ever own these pages, so every change to or removal of an owned field "
+               "is kept as a conflict. Point `owner:` at the pack that writes them (the pack.yaml "
+               "name for this pack's own lanes), or co-install it with `framework install-domain`")
+    if not stray and any(isinstance(spec, dict) and spec.get("owner") for spec in types.values()):
+        r.ok("schema.types.owner", f"every declared owner is a write principal ({deployment})")
+
+
 class PackChecks:
     def __init__(
         self, *, engine_root: Path, yaml_module, load_yaml, engine_meta, version_re, placeholders
@@ -109,6 +192,8 @@ class PackChecks:
             set(base_types) if isinstance(base_types, dict) else set()
         )
         self._check_engine_inputs(sch, effective_type_names, r)
+        if isinstance(types, dict):
+            check_type_owners(pack, types, r)
 
     def _check_engine_inputs(self, sch: dict, type_names: set, r: Report) -> None:
         """The OPTIONAL engine cron inputs (type_aliases, classify_hints,
@@ -141,6 +226,8 @@ class PackChecks:
                     )
                 if not unknown and not shadow:
                     r.info("schema.type_aliases", f"{len(aliases)} alias(es)")
+        types = sch.get("types") if isinstance(sch.get("types"), dict) else {}
+        check_type_roles("schema.types.role", types, r)
         hints = sch.get("classify_hints")
         if hints is not None:
             if not isinstance(hints, dict):
@@ -430,7 +517,11 @@ class PackChecks:
         # Required: the pack must pin the engine release it targets, AND that pin must
         # match the engine running this validator — you validate (and deploy) against
         # one engine, so the pack must declare that one. This is the single coupling
-        # that catches engine/pack drift (the okpack-cti engine-v0.1.0 case).
+        # that catches engine/pack drift (the okpack-cti engine-v0.1.0 case). It is not the whole
+        # story: every roll restamps this pin, so the PACK can sit releases behind its source
+        # while the pin reads current (okengine#896) -- report that alongside.
+        from scripts import pack_currency
+        pack_currency.check(pack, r)
         ev = pack / "engine.version"
         if not ev.is_file():
             r.fail(
@@ -508,6 +599,7 @@ class PackChecks:
                 r.warn("feeds/*.opml", "no OPML feed lists (pack may be query/enrichment-only)")
             return
         import xml.etree.ElementTree as ET
+        from xml.etree.ElementTree import ParseError
         from urllib.parse import urlparse
 
         def safe_root(path: Path) -> ET.Element:
@@ -523,7 +615,7 @@ class PackChecks:
         for f in opmls:
             try:
                 root = safe_root(f)
-            except (OSError, ET.ParseError) as e:
+            except (OSError, ParseError) as e:
                 r.fail(f"feeds/{f.name} parses", f"XML error: {str(e)[:120]}")
                 continue
             found = [

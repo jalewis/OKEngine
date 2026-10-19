@@ -20,7 +20,7 @@ OKENGINE_PROJECTION_READER_DSN=postgresql://okengine_reader:URL_ENCODED_READER_P
 Then deploy normally; PostgreSQL and the projector start with the rest of the stack:
 
 ```bash
-ENGINE_DIR=/path/to/okengine docker compose up -d --build
+bash /path/to/okengine/scripts/deploy.sh
 docker compose logs -f okengine-projection
 ```
 
@@ -81,3 +81,32 @@ or filesystem path. The weekly `--verify` run continuously proves this recovery 
   temporarily changing both guards for an intentional removal.
 - **Many unresolved links**: inspect resolution distribution first. Exact, ID, alias, slug,
   ambiguous, and unresolved are deliberately distinct facts.
+
+## Writer concurrency and vault ownership
+
+All projection mutations acquire a PostgreSQL transaction-scoped advisory lock before
+bootstrap DDL, checkpoint reads, or canonical scanning. Reconciliation and journal refresh
+therefore cannot interleave their page UPSERTs, stale-row deletion, and link replacement.
+Scratch verification uses the same lock so its live comparison is stable. Ordinary SELECT
+consumers do not acquire this lock. Acquisition has a five-minute lock timeout; cancellation
+or failure rolls back and releases the lock, and the service reports the failed operation.
+
+The projector runs as the same `HERMES_UID:HERMES_GID` as vault readers and writers and
+retains its read-only vault mount. Deploy generates an owner overlay for existing native
+and compatibility Compose snapshots; operator overlays remain visible. An unreadable page
+or directory makes reconciliation, journal refresh, and health fail before deletion or a
+successful epoch. Missing journal paths are deletion evidence only after an explicit stat
+confirms absence; other filesystem errors remain recorded as unknown population.
+Typed consumers also reject legacy successful epochs whose recorded scan had unreadable
+paths. Fix ownership/readability and perform a complete reconciliation before certifying
+population completeness.
+
+`deploy.sh` records its verified host engine checkout as `ENGINE_DIR` and its exact revision
+as `OKENGINE_SOURCE_SHA` in the deployment's owner-only `.env`, preserving other settings.
+This corrects obsolete or absent contexts for later bare Compose builds. `ENGINE_DIR` is a
+host build path; it is not a container import root. To inspect a context against an expected
+qualified revision, use `python scripts/engine_source_guard.py /path/to/engine --expected-sha
+<full-sha>`. The build context must be the canonical checkout root; a subdirectory cannot
+inherit its parent's revision. Linked worktrees and canonical path aliases are supported.
+A different revision or a missing checkout fails; updating the persisted context
+uses the supported deploy procedure after qualification.

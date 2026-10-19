@@ -23,7 +23,9 @@ else the pack dir name minus its `okpack-` prefix) — never an ad-hoc name.
 Dry-run by default (prints the exact plan); `--apply` writes. Idempotent: every merge is
 key-based (type name / rule id / job name / prompt key / xmlUrl / persona marker), so a
 re-run applies nothing. `--refresh` replaces changed runtime artifacts only when the pack's
-ownership manifest proves they belong to that co-installed domain. Runs `coinstall_preflight`
+ownership manifest proves they belong to that co-installed domain; the only schema change it
+carries is an owned namespace's partitioning, and only after proving no existing page would move
+(scripts/partition_refresh.py). Runs `coinstall_preflight`
 first and refuses on FAIL.
 
 The write-path probes (invalid page under the subtree must REJECT; host pages untouched)
@@ -39,10 +41,12 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+from json import JSONDecodeError
 import re
 import shutil
 import sys
 import xml.etree.ElementTree as ET
+from xml.etree.ElementTree import ParseError
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -620,7 +624,8 @@ def merge_namespaces(host: Path, pack: Path, plan: Plan) -> None:
             actual_tier = ((hs.get("tier") or {}).get("namespaces") or {}).get(ns)
             if hns.get(ns) != expected_part or actual_perm != expected_perm or actual_tier != expected_tier:
                 plan.fail(f"namespace '{ns}' is recorded as owned by {pname}, but its host "
-                          "partitioning/permission/tier contract has drifted; reconcile explicitly")
+                          "partitioning/permission/tier contract has drifted; reconcile explicitly "
+                          "(a partitioning-only change that moves no page is carried by --refresh)")
             else:
                 plan.info(f"namespace '{ns}' is already installed and owned by {pname}")
             continue
@@ -670,7 +675,7 @@ def merge_feeds(host: Path, pack: Path, plan: Plan) -> None:
         return
     try:
         sroot, droot = _safe_xml(src.read_bytes()), _safe_xml(dst.read_bytes())
-    except (OSError, ET.ParseError) as e:
+    except (OSError, ParseError) as e:
         plan.fail(f"feeds OPML unparseable: {e}")
         return
     have = {o.get("xmlUrl") for o in droot.iter("outline") if o.get("xmlUrl")}
@@ -1066,7 +1071,17 @@ def install_taxonomy(host: Path, pack: Path, slug: str, plan: Plan, *, refresh: 
     if refresh:
         # Refresh is deliberately a runtime-only corridor. Schema, cockpit, feeds, rules, and
         # persona are additive composition contracts and need a fresh bundle composition—not a
-        # cron update that might partially rewrite the write boundary.
+        # cron update that might partially rewrite the write boundary. The ONE schema change a
+        # refresh carries is an owned namespace's partitioning, and only once it is proven to move
+        # no existing page; planned first so a failed rewrite aborts before any runtime write.
+        try:
+            legacy_owned = (f"# co-installed ({pack_name(pack)}, framework install-domain)"
+                            in (host / "schema.yaml").read_text(encoding="utf-8"))
+        except OSError:
+            legacy_owned = False
+        _load_mod("partition_refresh.py").plan_owned_partitioning(
+            host, pack, plan, owned=set((manifest.get("owned_namespaces") or {}).keys()),
+            legacy_owned=legacy_owned, pack_label=pack_name(pack))
         merge_crons(host, pack, plan, refresh=True,
                     owned=set((manifest.get("cron_jobs") or {}).keys()))
         merge_lane_scripts(host, pack, plan, refresh=True,
@@ -1127,12 +1142,12 @@ def _legacy_runtime_ownership(host: Path, pack: Path) -> dict:
     try:
         incoming_raw = json.loads((pack / "crons" / "domain-crons.json").read_text())
         incoming = incoming_raw.get("jobs", []) if isinstance(incoming_raw, dict) else incoming_raw
-    except (OSError, json.JSONDecodeError):
+    except (OSError, JSONDecodeError):
         incoming = []
     try:
         host_raw = json.loads((host / "crons" / "domain-crons.json").read_text())
         host_jobs = host_raw.get("jobs", []) if isinstance(host_raw, dict) else host_raw
-    except (OSError, json.JSONDecodeError):
+    except (OSError, JSONDecodeError):
         host_jobs = []
     present = {str(row.get("name")) for row in host_jobs if isinstance(row, dict)}
     owned_jobs, owned_scripts = {}, {}
@@ -1188,6 +1203,16 @@ def main(argv: list[str]) -> int:
               file=sys.stderr)
         return 2
     slug = domain_slug(pack, ns.under)
+    # The host's migration state holds every member's installed version and applied migrations.
+    # Refuse an unreadable one BEFORE anything is written (the trust acceptance below included):
+    # a new member would otherwise merge, recompose and only then fail to record its baseline,
+    # leaking the transaction snapshot (okengine#991).
+    fu = _load_mod("framework_upgrade.py")
+    try:
+        fu.read_state(host)
+    except fu.MigrationStateError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     # collision gate first — a FAIL here is a real conflict, never force past it.
     # Gate on what actually LANDS: the additions file (taxonomy) or the subdomain
@@ -1231,6 +1256,9 @@ def main(argv: list[str]) -> int:
     incoming_manifest = state.source_manifest(pack, shape)
     ownership = prior_manifest or (_legacy_runtime_ownership(host, pack) if ns.refresh else {})
     plan = Plan(ns.apply)
+    chat_warning = state.guest_chat_warning(incoming_manifest)  # okengine#991
+    if chat_warning:
+        plan.warn(chat_warning)
     if shape == "subtree":
         install_subtree(host, pack, slug, plan)
     else:
@@ -1239,7 +1267,6 @@ def main(argv: list[str]) -> int:
     # A pack-version migration is one logical update with the install-domain edits planned above.
     # Snapshot BEFORE those edits, otherwise the migration runner's own pre-migration snapshot can
     # only roll back to an already-partially-updated deployment.
-    fu = _load_mod("framework_upgrade.py")
     incoming_ver = str(incoming_manifest.get("pack_version") or "") or None
     installed_ver = (fu.installed_pack_version(
         host, pname, fallback=str(prior_manifest.get("pack_version") or "") or None)
@@ -1267,6 +1294,10 @@ def main(argv: list[str]) -> int:
         if not runtime_changed or ns.refresh or not prior_manifest:
             if state.write(host, manifest):
                 print(f"  recorded ownership manifest: {state.manifest_path(host, pname)}")
+        # The chat declaration is not a runtime artifact: it is never installed, only reported, so
+        # holding the accepted hashes back must not hold it back too (okengine#993).
+        elif state.write(host, state.with_chat_record(prior_manifest, manifest)):
+            print(f"  recorded chat declaration: {state.manifest_path(host, pname)}")
     if rc == 0 and plan.steps and ns.apply and shape == "taxonomy":
         # The taxonomy merge edited the host root schema.yaml — but the RUNTIME write path PREFERS
         # <host>/.okengine/composed-schema.yaml (base ⊕ pack ⊕ extensions) whenever an enabled
@@ -1312,11 +1343,20 @@ def main(argv: list[str]) -> int:
                                       changelog_text=changelog, record=ns.apply,
                                       apply_hint="--apply") != 0:
                 if update_snapshot is not None:
-                    added = fu.added_since_snapshot(host, update_snapshot)
-                    modified = fu.changed_since_snapshot(host, update_snapshot)
-                    n = fu.restore(host, update_snapshot, added=added, modified=modified)
-                    shutil.rmtree(update_snapshot, ignore_errors=True)
-                    print(f"  ↩ domain update transaction ROLLED BACK ({n} files restored)")
+                    # The migration runner may already have rolled this transaction back and
+                    # removed the snapshot; restoring from a tree that is gone would quarantine the
+                    # whole deployment (okengine#819). Say so instead of destroying the vault.
+                    try:
+                        added = fu.added_since_snapshot(host, update_snapshot)
+                        modified = fu.changed_since_snapshot(host, update_snapshot)
+                        n = fu.restore(host, update_snapshot, added=added, modified=modified)
+                        print(f"  ↩ domain update transaction ROLLED BACK ({n} files restored)")
+                    except FileNotFoundError as exc:
+                        print(f"  !! domain update transaction NOT rolled back: {exc}",
+                              file=sys.stderr)
+                    finally:
+                        shutil.rmtree(update_snapshot, ignore_errors=True)
+                        update_snapshot = None
                 return 1
         elif ns.apply and incoming_ver and incoming_ver != "0.0.0":
             fu.record_pack_version(host, pname, incoming_ver)

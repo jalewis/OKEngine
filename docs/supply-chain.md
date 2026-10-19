@@ -104,7 +104,12 @@ This is the biggest bump — it can require rebasing the carried `patches/`.
    git ls-remote --tags https://github.com/NousResearch/hermes-agent.git <new-tag>
    # for an annotated tag, dereference to the commit it points at (the ^{} ref)
    ```
-3. Re-run `patches/apply.sh` against the new clone; rebase any patch that fails.
+3. Add the new tag's arm to the `case "$PIN"` statement in `patches/apply.sh`, pointing at the
+   series directory you rebase (a pin it does not map exits 3), then run
+   `patches/apply.sh <new-clone>`. The clone is at the new `pinned_sha`, so no override is needed;
+   rebase any patch that fails. Rebasing before step 2, while the manifest still pins the old
+   commit, needs `OKENGINE_ALLOW_UNPINNED_HERMES=1` (apply.sh exits 2 on any other commit; see
+   INSTALL.md, "Upgrading Hermes").
 4. `bash scripts/build-engine-image.sh` — it clones the tag and **fails** unless
    the clone's `HEAD` equals `pinned_sha`, so a moved/retagged upstream can't slip
    in unnoticed. Update `pinned_version`/`pinned_tag`/`pinned_sha` together.

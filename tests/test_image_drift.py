@@ -429,7 +429,12 @@ def test_every_probe_of_every_service_exists_in_this_repo():
     mod = _load()
     for service, spec in sorted(mod.load_manifest(MANIFEST).items()):
         for probe in spec["probes"]:
-            if "source_dir" in probe:
+            if "source_glob" in probe:
+                assert list(REPO.glob(probe["source_glob"])), (
+                    f"{service}: glob probe {probe['source_glob']} matches nothing in this repo")
+                assert probe["container_dir"].startswith("/"), \
+                    f"{service}: container dir must be absolute"
+            elif "source_dir" in probe:
                 assert (REPO / probe["source_dir"]).is_dir(), (
                     f"{service}: tree probe {probe['source_dir']} does not exist in this repo"
                 )
@@ -637,3 +642,163 @@ def test_stale_review_policy_drifts_even_when_write_server_agrees(tmp_path, monk
     assert result["drifted"] == ["okengine-review-write"] and not result["in_sync"], (
         "unchanged write_server.py must not mask stale baked policy rules"
     )
+
+
+# --- v0.15.11 audit [16]: the reader and cockpit probe EVERY file their image COPYs ---------------
+
+def _final_stage_copies(dockerfile: Path) -> list[tuple[str, str]]:
+    """(source, absolute destination) for each COPY from the build context in the final stage.
+    `COPY --from=<stage>` is not from ENGINE_DIR; earlier stages build a wheel probed as a tree."""
+    lines = dockerfile.read_text(encoding="utf-8").splitlines()
+    final = max(i for i, line in enumerate(lines) if line.startswith("FROM "))
+    workdir, copies = "/", []
+    for line in lines[final:]:
+        words = line.split()
+        if words[:1] == ["WORKDIR"]:
+            workdir = words[1]
+        elif words[:1] == ["COPY"] and not any(w.startswith("--from") for w in words):
+            *sources, dest = words[1:]
+            dest = dest if dest.startswith("/") else f"{workdir.rstrip('/')}/{dest.lstrip('./')}"
+            copies += [(src.rstrip("/"), dest.rstrip("/") or "/") for src in sources]
+    return copies
+
+
+def _covered(source: str, dest: str, probes: list[dict]) -> bool:
+    for probe in probes:
+        if probe.get("source_glob") == source and probe["container_dir"] == dest:
+            return True
+        if probe.get("source_dir") == source and probe["container_dir"] == dest:
+            return True
+        if probe.get("source") == source and probe.get("container") in (
+                dest, f"{dest}/{Path(source).name}"):
+            return True
+    return False
+
+
+def _engine_dockerfiles() -> dict[str, str]:
+    """Dockerfile -> manifest service, from the map deploy.sh pins images by (okengine#1042 [4])."""
+    spec = importlib.util.spec_from_file_location("engine_images_map", REPO / "scripts/engine_images.py")
+    images = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(images)
+    return dict(images.ENGINE_DOCKERFILES)
+
+
+ENGINE_DOCKERFILES = _engine_dockerfiles()
+
+
+def test_the_manifest_lists_exactly_the_engine_built_images():
+    assert set(_load().load_manifest(MANIFEST)) == set(ENGINE_DOCKERFILES.values())
+
+
+@pytest.mark.parametrize("dockerfile,service", sorted(ENGINE_DOCKERFILES.items()))
+def test_every_file_the_image_copies_is_probed(service, dockerfile):
+    """[16]: the reader entry probed app.py and src/okengine only; directory_index.py (the #1023
+    render-lint fix), auth.py, static/ and nine more modules were never hashed, so a stale reader
+    read as in sync whenever src/okengine did not also move. Derive coverage from the COPY lines."""
+    copies = _final_stage_copies(REPO / dockerfile)
+    assert copies, f"{dockerfile}: no final-stage COPY found; the parser is stale"
+    probes = _load().load_manifest(MANIFEST)[service]["probes"]
+    missing = [c for c in copies if not _covered(*c, probes)]
+    assert not missing, f"{service}: COPY'd from ENGINE_DIR but never probed: {missing}"
+
+
+def test_copy_coverage_detector_flags_the_pre_fix_reader_manifest():
+    """Negative fixture: the v0.15.11 reader entry (app.py + the wheel tree) must fail."""
+    copies = _final_stage_copies(REPO / "okengine-reader/Dockerfile")
+    old = [{"source": "okengine-reader/app.py", "container": "/app/app.py"},
+           {"source_dir": "src/okengine", "container_dir": "/usr/local/lib/python3.13/site-packages/okengine"}]
+    assert ("okengine-reader/*.py", "/app") in copies
+    assert [c for c in copies if not _covered(*c, old)]
+
+
+def test_a_glob_probe_loads_and_a_malformed_one_is_dropped(tmp_path):
+    (tmp_path / "m.yaml").write_text(
+        "services:\n  svc:\n    source: a.py\n    container: /app/a.py\n    also:\n"
+        "      - {source_glob: 'r/*.py', container_dir: /app}\n"
+        "      - {source_glob: 'r/*.py'}\n", encoding="utf-8")
+    assert _load().load_manifest(tmp_path / "m.yaml")["svc"]["probes"][1:] == [
+        {"source_glob": "r/*.py", "container_dir": "/app"}]
+
+
+def _glob_manifest():
+    return {"svc": {"source": "r/app.py", "container": "/app/app.py",
+                    "probes": [{"source_glob": "r/*.py", "container_dir": "/app/"}]}}
+
+
+@pytest.mark.parametrize("stale", ["0" * 64, "f" * 64])
+def test_a_changed_sibling_module_drifts_the_service(tmp_path, monkeypatch, stale):
+    mod = _load()
+    root = _engine(tmp_path, **{"r/app.py": "same", "r/directory_index.py": "new revision"})
+    # The two digests sort below and above any real one: drift must not depend on the order.
+    image = {"/app/app.py": mod.file_hash(root / "r/app.py"), "/app/directory_index.py": stale}
+    monkeypatch.setattr(mod, "container_hash", lambda c, p: image.get(p, ""))
+    assert mod.compare(_glob_manifest(), {"svc": "c"}, root)["drifted"] == ["svc"]
+
+
+def test_probes_after_a_glob_probe_are_still_compared(tmp_path, monkeypatch):
+    mod = _load()
+    root = _engine(tmp_path, **{"r/app.py": "a", "r/requirements.txt": "pinned"})
+    image = {"/app/app.py": mod.file_hash(root / "r/app.py"), "/app/requirements.txt": "0" * 64}
+    monkeypatch.setattr(mod, "container_hash", lambda c, p: image.get(p, ""))
+    manifest = {"svc": {"source": "r/app.py", "container": "/app/app.py", "probes": [
+        {"source_glob": "r/*.py", "container_dir": "/app"},
+        {"source": "r/requirements.txt", "container": "/app/requirements.txt"}]}}
+    assert mod.compare(manifest, {"svc": "c"}, root)["drifted"] == ["svc"]
+
+
+def test_glob_probe_in_sync_and_unreadable(tmp_path, monkeypatch):
+    mod = _load()
+    root = _engine(tmp_path, **{"r/app.py": "a", "r/auth.py": "b", "r/static/x.js": "c"})
+    image = {"/app/app.py": mod.file_hash(root / "r/app.py"),
+             "/app/auth.py": mod.file_hash(root / "r/auth.py")}
+    monkeypatch.setattr(mod, "container_hash", lambda c, p: image.get(p, ""))
+    assert mod.compare(_glob_manifest(), {"svc": "c"}, root)["in_sync"] == ["svc"]
+    (root / "r" / "new_module.py").write_text("added after the image was built")
+    assert mod.compare(_glob_manifest(), {"svc": "c"}, root)["unreadable"] == ["svc"], \
+        "a module the image lacks cannot be compared, and must not read as in sync"
+
+
+def test_a_glob_that_matches_nothing_is_unreadable_not_in_sync(tmp_path, monkeypatch):
+    mod = _load()
+    root = _engine(tmp_path)
+    monkeypatch.setattr(mod, "container_hash", lambda c, p: pytest.fail("nothing to compare"))
+    assert mod.compare(_glob_manifest(), {"svc": "c"}, root)["unreadable"] == ["svc"]
+
+
+# --- okengine#1042 [2]/[4]: every image probes the wheel's non-package runtime members ----------
+
+SITE = "/usr/local/lib/python3.13/site-packages"
+
+
+def _wheel_members() -> dict[str, str]:
+    spec = importlib.util.spec_from_file_location("build_engine_wheel_map",
+                                                  REPO / "scripts/build_engine_wheel.py")
+    wheel = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(wheel)
+    return dict(wheel.RUNTIME_MEMBERS)
+
+
+def _unprobed_wheel_members(probes: list[dict]) -> list[str]:
+    return [source for source, target in sorted(_wheel_members().items())
+            if not any(p.get("source") == source and p.get("container") == f"{SITE}/{target}"
+                       for p in probes)]
+
+
+@pytest.mark.parametrize("dockerfile,service", sorted(ENGINE_DOCKERFILES.items()))
+def test_every_wheel_runtime_member_is_probed(service, dockerfile):
+    """[2]/[4]: all six images `pip install` the engine wheel, which bakes schema_lib, okf_migrate,
+    the validator and base-schema at site-packages top level. Only review-write probed them, so a
+    cockpit whose `import schema_lib` resolved to a stale copy read as in sync."""
+    text = (REPO / dockerfile).read_text(encoding="utf-8")
+    assert "COPY --from=wheel" in text, f"{dockerfile} no longer installs the wheel; revisit"
+    probes = _load().load_manifest(MANIFEST)[service]["probes"]
+    missing = _unprobed_wheel_members(probes)
+    assert not missing, f"{service}: wheel runtime members baked but never probed: {missing}"
+
+
+def test_wheel_member_detector_flags_the_pre_fix_cockpit_manifest():
+    """Negative fixture: the pre-#1042 cockpit entry (app/glob/static/requirements/src tree)."""
+    old = [{"source": "okengine-cockpit/app.py", "container": "/app/app.py"},
+           {"source_glob": "okengine-cockpit/*.py", "container_dir": "/app"},
+           {"source_dir": "src/okengine", "container_dir": f"{SITE}/okengine"}]
+    assert "scripts/cron/schema_lib.py" in _unprobed_wheel_members(old)

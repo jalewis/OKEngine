@@ -64,6 +64,18 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from okengine.actor_identity import actor_identity_error
+from okengine.file_fingerprint import fingerprint, token as fingerprint_token  # noqa: F401 — rebound service bodies
+from yaml import YAMLError  # noqa: F401 — rebound service bodies (datasets._actor_schema)
+# Bare names for rebound service except tuples; cosmic-ray cannot mutate dotted ones (#1046).
+from json import JSONDecodeError  # noqa: F401 — rebound service bodies
+from urllib.error import URLError  # noqa: F401 — rebound service bodies
+from okengine.review_policy import requires_review  # noqa: F401 — used by rebound service bodies
+from okengine.review_vocabulary import (  # noqa: F401 — used by rebound service bodies
+    DECISION_EFFECTS,
+    REASON_GLOSSARY,
+    VERSION_LOCK_NOTICE,
+    explain_reasons,
+)
 from okengine.schema_exclusions import excluded_namespaces_from_schema
 
 from auth import BasicAuth as _BasicAuth, exposure_refusal
@@ -293,31 +305,6 @@ async def _track_active_requests(request: Request, call_next):
 # outside the labels vocabulary" — the drill to the drift offenders.
 
 
-@functools.lru_cache(maxsize=4096)
-def _ref_title(rel: str) -> str:
-    """The `title` of the page at `rel`, or "" when it cannot be read."""
-    path = WIKI / f"{rel}.md"
-    if not path.is_file():
-        return ""
-    # Read to the END OF FRONTMATTER, not a fixed byte window. A first attempt capped at 2048 bytes
-    # and silently missed `scattered-spider`, whose `title:` sits at line 67 behind a 60-alias
-    # list — the board then fell back to the slug and displayed "scattered spider" beside properly
-    # titled peers. Frontmatter length is bounded by the frontmatter; file length is not.
-    try:
-        with path.open(encoding="utf-8", errors="replace") as fh:
-            if fh.readline().rstrip("\n").strip() != "---":
-                return ""
-            for _ in range(400):  # a sane ceiling on frontmatter lines
-                line = fh.readline()
-                if not line or line.rstrip("\n").strip() == "---":
-                    return ""
-                if line.startswith("title:"):
-                    return line.split(":", 1)[1].strip().strip("\"'")
-    except OSError:
-        return ""
-    return ""
-
-
 # A doc box renders a whole vault page inline. A generated dashboard can grow without bound
 # (okcti's adversarial-evidence-review hit 500KB source → a 650KB HTML panel that dominated the
 # tab payload and stalled the browser render — 2026-07-19 UI sweep). Cap what a PANEL inlines;
@@ -352,15 +339,8 @@ def _ref_title(rel: str) -> str:
 
 @functools.lru_cache(maxsize=1)
 def _review_required_types() -> frozenset[str]:
-    for path in (VAULT / ".okengine" / "composed-schema.yaml", VAULT / "schema.yaml"):
-        try:
-            doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        except Exception:
-            continue
-        values = doc.get("review_required_types") if isinstance(doc, dict) else None
-        if isinstance(values, list):
-            return frozenset(str(v) for v in values)
-    return frozenset()
+    from okengine.review_policy import review_required_types
+    return review_required_types(VAULT)
 
 
 # -inf, not 0.0 (fresh-host trap — see _DIR_TTL note): a finite init on a just-booted container

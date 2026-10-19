@@ -32,6 +32,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from subprocess import SubprocessError  # bare: cosmic-ray cannot mutate a dotted except name
 
 SELF_NAME = "budget-guard"
 WINDOWS = {"day": 86400, "week": 604800, "month": 2592000}
@@ -61,24 +62,42 @@ def _state_db_path() -> str:
     return os.environ.get("OKENGINE_STATE_DB") or str(Path(_hermes_home()) / "state.db")
 
 
+class UsageUnreadable(Exception):
+    """The state DB could not be read, so window usage is UNKNOWN (okengine#994 [9]).
+
+    Unknown is never zero: reading a missing, locked, corrupt or permission-denied state.db as 0
+    usage made a paused guard auto-resume every paid cron on a transient read error."""
+
+
+# A read that waits on a writer's lock longer than this is reported as unreadable (unknown usage),
+# not as zero usage. Module-level so tests can shorten it.
+DB_TIMEOUT_S = 5.0
+
+
 def tokens_in_window(db_path: str | os.PathLike, window_s: int, now: float) -> int:
     """Sum all token columns for sessions started within the trailing window.
-    Tolerates a missing DB / table / column (returns 0) so a fresh deploy is a
-    clean no-op rather than an error."""
+
+    FAILS CLOSED: a missing, locked, corrupt or permission-denied DB, or one without a `sessions`
+    table carrying any token column, raises UsageUnreadable instead of returning 0. Usage is then
+    unknown, and main() holds the current pause state rather than resuming (okengine#994 [9]). The
+    gateway creates state.db at startup, so a missing file means a wrong OKENGINE_STATE_DB path or a
+    lost volume, and reading that as zero would leave the cap silently inert."""
     p = Path(db_path)
-    if not p.is_file():
-        return 0
     try:
-        con = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return 0
+        exists = p.is_file()
+    except OSError as e:
+        raise UsageUnreadable(f"cannot stat {p}: {e}") from e
+    if not exists:
+        raise UsageUnreadable(f"{p} does not exist")
+    try:
+        con = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=DB_TIMEOUT_S)
+    except sqlite3.Error as e:
+        raise UsageUnreadable(f"cannot open {p}: {e}") from e
     try:
         have = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
-        if not have:
-            return 0
         cols = [c for c in _TOKEN_COLS if c in have]
         if not cols:
-            return 0
+            raise UsageUnreadable(f"{p} has no sessions table with a token column")
         total = 0
         if "started_at" in have:
             cutoff = now - window_s
@@ -90,8 +109,8 @@ def tokens_in_window(db_path: str | os.PathLike, window_s: int, now: float) -> i
                 row = con.execute(_TOKEN_SUM_QUERIES[col]).fetchone()
                 total += int(row[0] or 0)
         return total
-    except sqlite3.Error:
-        return 0
+    except sqlite3.Error as e:
+        raise UsageUnreadable(f"cannot read {p}: {e}") from e
     finally:
         con.close()
 
@@ -127,8 +146,13 @@ def estimated_usd(tokens: int, price_per_mtok: float) -> float:
     return (tokens / 1_000_000.0) * price_per_mtok if price_per_mtok else 0.0
 
 
-def decide(*, over_budget: bool, currently_paused: bool, resume_policy: str) -> str:
-    """Pure decision: 'pause', 'resume', or 'noop'."""
+def decide(*, over_budget: bool | None, currently_paused: bool, resume_policy: str) -> str:
+    """Pure decision: 'pause', 'resume', or 'noop'.
+
+    over_budget=None means usage is UNKNOWN (unreadable state.db): never resume and never pause on
+    a guess, so hold whatever state the guard is in (okengine#994 [9])."""
+    if over_budget is None:
+        return "noop"
     if over_budget and not currently_paused:
         return "pause"
     if not over_budget and currently_paused and resume_policy == "auto":
@@ -231,7 +255,7 @@ def _cronplus(action: str, job_id: str) -> bool:
         subprocess.run([sys.executable, cli, action, job_id],
                        check=True, capture_output=True, timeout=30)
         return True
-    except (subprocess.SubprocessError, OSError) as e:
+    except (SubprocessError, OSError) as e:
         print(f"budget-guard: WARN {action} {job_id} failed: {e}", file=sys.stderr)
         return False
 
@@ -350,20 +374,33 @@ def main(argv: list[str] | None = None) -> int:
 
     now = time.time()
     win_s = window_seconds(win_name)
-    tokens = tokens_in_window(_state_db_path(), win_s, now)
+    unreadable = ""
+    try:
+        tokens = tokens_in_window(_state_db_path(), win_s, now)
+    except UsageUnreadable as e:
+        tokens, unreadable = 0, str(e)
     usd = estimated_usd(tokens, price)
-    over = malformed or bool((tok_budget and tokens >= tok_budget)
-                             or (usd_budget and price and usd >= usd_budget))
+    over: bool | None = malformed or bool((tok_budget and tokens >= tok_budget)
+                                          or (usd_budget and price and usd >= usd_budget))
+    if unreadable and not malformed:
+        over = None                                      # unknown usage: hold, never resume
 
     state = _load_state()
     paused = bool(state.get("paused"))
     action = decide(over_budget=over, currently_paused=paused, resume_policy=resume_policy)
 
-    usage_str = f"{tokens:,} tok/{win_name}" + (f" (~${usd:,.2f})" if price else "")
+    usage_str = (f"UNKNOWN tok/{win_name}" if unreadable
+                 else f"{tokens:,} tok/{win_name}" + (f" (~${usd:,.2f})" if price else ""))
     budget_str = (f"{tok_budget:,} tok" if tok_budget else "") + \
                  (f" / ${usd_budget:,.2f}" if usd_budget else "")
     print(f"budget-guard: usage {usage_str}  budget {budget_str}  "
           f"over={over} paused={paused} -> {action}")
+
+    if unreadable:
+        print(f"budget-guard: ⚠ USAGE UNKNOWN — the state DB is unreadable ({unreadable}). Treating "
+              f"usage as unknown, not zero: the guard will NOT resume paused crons until it can read "
+              f"usage again (fail-closed). Check OKENGINE_STATE_DB / {_state_db_path()}.",
+              file=sys.stderr)
 
     if action == "pause":
         prior = state                                    # the state read above (this trip's record so far)
@@ -432,7 +469,7 @@ def main(argv: list[str] | None = None) -> int:
     # cost_bearing_ids skips them as "already disabled"). On an under-budget auto tick, resume the
     # jobs the guard OWNS (its own persisted intent/paused ids) that are still disabled — never an
     # operator pause it doesn't own — and clear the record so the heal doesn't loop (HIGH + re-verify).
-    if not over and resume_policy == "auto":
+    if over is False and resume_policy == "auto":
         st = _load_state()
         jobs = _load_jobs()
         if jobs is None:
@@ -457,7 +494,7 @@ def main(argv: list[str] | None = None) -> int:
                   f"(a prior state write was lost after pausing): {', '.join(healed)}"
                   f"{'; retrying ' + str(len(failed_ids)) + ' remaining pause(s)' if failed_ids else ''}.",
                   file=sys.stderr)
-    return 0
+    return 1 if unreadable else 0
 
 
 if __name__ == "__main__":

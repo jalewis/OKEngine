@@ -83,7 +83,14 @@ def test_review_detail_exposes_assessment_specific_decision_semantics(tmp_path, 
         "review_change_meaning: Correct labels or evidence.\n---\nBody.\n", encoding="utf-8")
     tmp_path.joinpath("schema.yaml").write_text("cockpit: {tabs: [browse]}\n", encoding="utf-8")
     m = _load(tmp_path, monkeypatch)
-    dc = m.api_review("assessments/identity/x")["decision_context"]
+    dc = dict(m.api_review("assessments/identity/x")["decision_context"])
+    # The engine-owned half is pinned to the SHARED vocabulary by identity, not by a copy of its
+    # prose: a panel rendering its own wording would drift from the Markdown dashboards and from
+    # docs/human-review.md, which is the defect okengine#823 is about.
+    from okengine.review_vocabulary import DECISION_EFFECTS, VERSION_LOCK_NOTICE
+    assert dc.pop("effects") == DECISION_EFFECTS
+    assert dc.pop("version_lock") == VERSION_LOCK_NOTICE
+    # ...and the pack-overridable half stays an exact contract.
     assert dc == {
         "question": "Are A and B aliases?",
         "proposition": "Reporting treats A and B as labels for one tracked identity.",
@@ -615,3 +622,131 @@ def test_assessment_reasoning_reaches_the_entity_page(tmp_path, monkeypatch):
     assert row["evidence"] and row["evidence"][0]["source"] == "https://example.invalid/report"
     assert row["evidence"][0]["observation"].startswith("DDoS")
     assert row["evidence"][0]["lineage"] == "vendor:lineage-unresolved"
+
+
+def test_a_resharded_page_still_finds_its_review_record(review_app):
+    """okengine#822. A record stores `subject:` as the path at write time; a partitioned namespace
+    then re-files the page (`entities/q/qakbot` -> `entities/q/a/qakbot`). Joining on the raw string
+    strands the record: open forever, never in a worklist, uncloseable -- while the page reads as
+    unreviewed. Measured on a live vault: 821 stranded records, 741 of them (90%) with the page
+    still present and merely re-shelved."""
+    m, root = review_app
+    page = root / "wiki" / "entities" / "q" / "a" / "qakbot.md"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    page.write_text("---\ntype: actor\nname: Qakbot\nneeds_review: true\n---\n\nbody\n",
+                    encoding="utf-8")
+    store = root / "wiki" / "operational" / "reviews"
+    store.mkdir(parents=True, exist_ok=True)
+    (store / "stranded.yaml").write_text(
+        "version: 1\nreview_id: review:entities/q/qakbot:1:deadbeef:cafe\n"
+        "subject: entities/q/qakbot\n"          # the PRE-reshard path
+        "subject_version: 1\nstate: open\nrequested_by: job\n"
+        "requested_at: '2026-09-01T00:00:00Z'\n"
+        "reasons:\n- code: manual\n  detail: 'field `type`: caller attempted x'\n",
+        encoding="utf-8")
+    m._invalidate_review_snapshot()
+
+    rows = [r for r in m.api_reviews(offset=0, limit=100, reason="", page_type="", state="")["items"] if r["subject"].endswith("qakbot")]
+    assert rows, "the resharded page did not appear in the worklist at all"
+    assert [c["code"] for c in rows[0]["reasons"]] == ["manual"], (
+        "the page was listed but its record did not join: the reason fell back to a derived one, "
+        "so the stored request is still stranded")
+
+
+def test_the_exact_path_still_wins_when_it_matches(review_app):
+    """The fallback must not override a record that matches exactly -- two pages sharing a slug
+    across shards is a duplicate (deployment_checks.check_partition_dups), not a join target."""
+    m, root = review_app
+    page = root / "wiki" / "entities" / "z" / "z" / "zed.md"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    page.write_text("---\ntype: actor\nname: Zed\nneeds_review: true\n---\n\nbody\n",
+                    encoding="utf-8")
+    store = root / "wiki" / "operational" / "reviews"
+    store.mkdir(parents=True, exist_ok=True)
+    for name, subject, code, when in (
+        ("exact.yaml", "entities/z/z/zed", "agent-draft", "2026-09-01T00:00:00Z"),
+        ("stale.yaml", "entities/z/zed", "manual", "2026-09-02T00:00:00Z"),
+    ):
+        (store / name).write_text(
+            f"version: 1\nreview_id: review:{subject}:1:d:c\nsubject: {subject}\n"
+            f"subject_version: 1\nstate: open\nrequested_by: job\nrequested_at: '{when}'\n"
+            f"reasons:\n- code: {code}\n  detail: d\n", encoding="utf-8")
+    m._invalidate_review_snapshot()
+
+    rows = [r for r in m.api_reviews(offset=0, limit=100, reason="", page_type="", state="")["items"] if r["subject"].endswith("zed")]
+    assert rows and [c["code"] for c in rows[0]["reasons"]] == ["agent-draft"], (
+        "the shard-insensitive fallback overrode an exact-path match")
+
+
+def test_a_record_for_an_earlier_version_still_explains_why_the_page_is_held(review_app):
+    """The page moved to version 2 after its review was requested at version 1. The old request is
+    history -- its id must not be offered for a decision -- but its stated reasons are still the
+    best account of why the page is held, and the detail view must show them rather than a
+    reason re-derived from the page."""
+    m, root = review_app
+    page = root / "wiki" / "entities" / "q" / "a" / "qakbot.md"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    page.write_text("---\ntype: actor\nname: Qakbot\nversion: 2\nneeds_review: true\n---\n\nbody\n",
+                    encoding="utf-8")
+    store = root / "wiki" / "operational" / "reviews"
+    store.mkdir(parents=True, exist_ok=True)
+    (store / "old.yaml").write_text(
+        "version: 1\nreview_id: review:entities/q/a/qakbot:1:d:c\nsubject: entities/q/a/qakbot\n"
+        "subject_version: 1\nstate: open\nrequested_by: job\nrequested_at: '2026-09-01T00:00:00Z'\n"
+        "reasons:\n- code: manual\n  detail: d\n", encoding="utf-8")
+    m._invalidate_review_snapshot()
+
+    detail = m.api_review("entities/q/a/qakbot")
+    assert detail["review_id"] is None
+    assert [c["code"] for c in detail["reasons"]] == ["manual"]
+
+
+def _record(root, name, subject, state="approved", detail="belongs to the OTHER page"):
+    store = root / "wiki" / "operational" / "reviews"
+    store.mkdir(parents=True, exist_ok=True)
+    (store / name).write_text(
+        f"version: 1\nreview_id: review:{subject}:1:d:c\nsubject: {subject}\nsubject_version: 1\n"
+        f"state: {state}\nrequested_by: job\nrequested_at: '2026-09-01T00:00:00Z'\n"
+        f"assigned_to: alice\nreasons:\n- code: manual\n  detail: '{detail}'\n", encoding="utf-8")
+
+
+def _row(m, suffix):
+    rows = [r for r in m.api_reviews(offset=0, limit=100, reason="", page_type="", state="")["items"]
+            if r["subject"].endswith(suffix)]
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+@pytest.mark.parametrize("mine, other", [
+    ("sec/entities/r/ransomware", "sec/concepts/r/ransomware"),   # walk-up sub-domain
+    ("briefings/daily/topic", "briefings/weekly/topic"),           # flat namespace, sub-folders
+])
+def test_a_colliding_namespace_slug_never_borrows_another_pages_record(review_app, mine, other):
+    """okengine#868: (namespace, slug) collapsed these pairs to one key, so the page needing review
+    showed the OTHER page's approved state, reasons and assignee."""
+    m, root = review_app
+    for rel, flag in ((mine, "true"), (other, "false")):
+        page = root / "wiki" / f"{rel}.md"
+        page.parent.mkdir(parents=True, exist_ok=True)
+        page.write_text(f"---\ntype: actor\nname: X\nneeds_review: {flag}\n---\n\nbody\n", encoding="utf-8")
+    _record(root, "other.yaml", other)
+    m._invalidate_review_snapshot()
+
+    row = _row(m, mine)
+    assert all("OTHER page" not in str(r.get("detail")) for r in row["reasons"]), row["reasons"]
+    assert row.get("assigned_to") != "alice" and row["state"] != "approved", row
+
+
+def test_two_stranded_records_for_one_page_key_are_ambiguous_and_not_borrowed(review_app):
+    """okengine#868: two DIFFERENT recorded subjects collapsing to one key are ambiguous even when a
+    single live page carries that key -- neither is borrowed."""
+    m, root = review_app
+    page = root / "wiki" / "entities" / "q" / "a" / "qakbot.md"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    page.write_text("---\ntype: actor\nname: Qakbot\nneeds_review: true\n---\n\nbody\n", encoding="utf-8")
+    _record(root, "one.yaml", "entities/q/qakbot", detail="first stranded record")
+    _record(root, "two.yaml", "entities/qakbot", detail="second stranded record")
+    m._invalidate_review_snapshot()
+
+    row = _row(m, "entities/q/a/qakbot")
+    assert all("stranded record" not in str(r.get("detail")) for r in row["reasons"]), row["reasons"]

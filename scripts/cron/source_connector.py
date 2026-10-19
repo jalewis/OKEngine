@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import ipaddress
 import json
+from json import JSONDecodeError
 import os
 import re
 import socket
@@ -20,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from urllib.error import URLError
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +39,7 @@ except ImportError:  # pragma: no cover - old staged runtimes during rolling upg
 
 try:
     import yaml
+    from yaml import YAMLError
 except Exception:  # pragma: no cover - deploy/runtime dependency
     yaml = None
 
@@ -47,8 +50,8 @@ PERMISSION_LEVELS = {"public", "authenticated", "licensed", "internal"}
 SENSITIVITY = {"clear", "internal", "restricted"}
 PAGINATION_TYPES = {"none", "page", "cursor"}
 FORMATS = {"json", "jsonl"}
-ID_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,126}[a-z0-9]$")
-ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,126}[a-z0-9]\Z")
+ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*\Z")
 TEMPLATE_RE = re.compile(r"\$\{(input|secret|runtime)\.([A-Za-z0-9_.-]+)\}")
 MAX_TIMEOUT = 120
 MAX_BYTES = 25 * 1024 * 1024
@@ -116,7 +119,7 @@ def load_yaml(path: Path) -> dict:
         raise ConnectorError("PyYAML is required to read connector manifests")
     try:
         value = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
+    except (OSError, YAMLError) as exc:
         raise ConnectorError(f"cannot read {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise ConnectorError(f"{path}: expected a YAML mapping")
@@ -408,7 +411,7 @@ def _load_state(path: Path) -> dict:
         return {}
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, JSONDecodeError) as exc:
         raise ConnectorError(f"invalid checkpoint {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise ConnectorError(f"invalid checkpoint {path}: expected an object")
@@ -508,14 +511,14 @@ def _open_http(url: str, headers: dict[str, str], manifest: dict) -> ResponsePag
         if exc.code == 304:
             raise NotModified from None
         raise ConnectorError(f"HTTP {exc.code}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (URLError, TimeoutError, OSError) as exc:
         raise ConnectorError(f"network failure: {exc}") from exc
 
 
 def _load_fixture(path: Path) -> list[ResponsePage]:
     try:
         fixture = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, JSONDecodeError) as exc:
         raise ConnectorError(f"invalid fixture {path}: {exc}") from exc
     if not isinstance(fixture, dict) or fixture.get("fixture_version") != 1 \
             or not isinstance(fixture.get("pages"), list) or not fixture["pages"]:
@@ -538,7 +541,7 @@ def _decode_records(page: ResponsePage, response: dict) -> tuple[Any, list[dict]
             decoded = json.loads(page.body)
         else:
             decoded = [json.loads(line) for line in page.body.splitlines() if line.strip()]
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except (JSONDecodeError, UnicodeDecodeError) as exc:
         raise ConnectorError(f"response is not valid {response['format']}: {exc}") from exc
     records = _lookup(decoded, response.get("records_path", ""))
     if isinstance(records, dict):

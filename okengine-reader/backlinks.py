@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import os
 import json
+from json import JSONDecodeError
 import re
 import time
+
+from okengine.file_fingerprint import fingerprint
 
 FRONTMATTER_RE = re.compile(r"\A---\s*\n.*?\n---\s*(?:\n|\Z)", re.DOTALL)
 WIKILINK_RE = re.compile(r"\[\[([^\]]+?)\]\]", re.DOTALL)
@@ -158,17 +161,20 @@ def artifact_map(*, wiki, max_age: int, cache: dict) -> dict | None:
         return None
     if time.time() - stat.st_mtime > max_age:
         return None
-    if cache["mtime"] == stat.st_mtime and cache["map"] is not None:
+    # The "mtime" slot holds the file fingerprint: an mtime-only key kept serving the previous map
+    # after a rebuild landing in the same timestamp tick (okengine#1017).
+    key = fingerprint(path, stat)
+    if cache["mtime"] == key and cache["map"] is not None:
         return cache["map"]
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, JSONDecodeError):
         return None
     mapping = data.get("backlinks")
     if not isinstance(mapping, dict):
         return None
     cache["map"] = mapping
-    cache["mtime"] = stat.st_mtime
+    cache["mtime"] = key
     return mapping
 
 
@@ -209,3 +215,9 @@ def load_map(
 
 def prewarm(*, load, threading_module) -> None:
     threading_module.Thread(target=load, daemon=True).start()
+
+
+def live(refs: list, wiki, tombstoned) -> list:
+    """Drop backlinks from tombstoned pages. The graph may be the backlinks-refresh artifact,
+    built before a source page was tombstoned, so this is checked at response time."""
+    return [ref for ref in refs if not tombstoned(wiki / f"{ref.get('key')}.md")]

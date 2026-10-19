@@ -237,3 +237,28 @@ def test_scan_io_races_refresh_write_failure_and_main(tmp_path, monkeypatch, cap
     assert "COLLISION same" in capsys.readouterr().out
     collision._collisions = {}
     assert m.main([]) == 0
+
+
+def test_loaded_by_path_it_appends_the_checkout_package_only_when_missing(monkeypatch):
+    """okengine#1042 [19]: id_index imports okengine.list_scalars. Loaded by path from a checkout
+    with src/ off sys.path, it appends src/ (an installed copy, earlier on the path, keeps winning);
+    with src/ present it adds nothing."""
+    import runpy
+    src = str(REPO / "src")
+    monkeypatch.setattr(sys, "path", [p for p in sys.path if p != src])
+    runpy.run_path(str(MOD), run_name="probe")
+    assert sys.path[-1] == src and sys.path.count(src) == 1
+    before = list(sys.path)
+    runpy.run_path(str(MOD), run_name="probe")
+    assert sys.path == before
+
+
+def test_a_scalar_alias_list_is_split_as_the_write_path_coerces_it():
+    """okengine#1042 [19]: a bracketed comma is not a delimiter, in both alias maps."""
+    m = _load()
+    idx = m.IdIndex()
+    stored = "Cl0p (aka TA505, Graceful Spider), Lace Tempest"
+    idx._add("clop", "entities/c/clop.md", {"aliases": stored})
+    idx._add_identity("entities/c/clop.md", {"name": "Clop", "aliases": stored})
+    assert set(idx.aliases) == {"Cl0p (aka TA505, Graceful Spider)", "Lace Tempest"}
+    assert len(idx.alias_to_rels) == 2

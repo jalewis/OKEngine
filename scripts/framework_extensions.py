@@ -163,8 +163,15 @@ def _cmd_validate(args) -> int:
     # Enabled-state must resolve against discovery (referenced-but-absent = FAIL).
     enabled, en_errors = disc.load_enabled_state(pack)
     fails.extend(en_errors)
-    _, res_errors = disc.resolve_enabled(list(enabled), extensions)
+    resolved, res_errors = disc.resolve_enabled(list(enabled), extensions)
     fails.extend(res_errors)
+    # okengine#994 [14]: an enabled operator-tier in-gateway extension needs a recorded acceptance.
+    fails.extend(disc.unaccepted_trust(pack, resolved).values())
+    # okengine#1042 [32]: a stale `disabled:` id, judged as `framework validate` judges it.
+    fails.extend(disc.stale_disabled_errors(pack, extensions))
+    # okengine#969: a pack/operator-tier operation may bind no write server but its own.
+    comp = _composer()
+    fails.extend(error for record in extensions for error in comp.foreign_writer_errors(record))
 
     if not args.quiet:
         for w in warns:
@@ -213,6 +220,9 @@ def _seed_about(pack: Path, target: dict) -> None:
     ledger. Idempotent + non-clobbering: writes only when the target is absent, so an
     operator's edits to the description are never overwritten."""
     import yaml
+    # Bare name: cosmic-ray cannot mutate a dotted exception in an `except (...)` tuple (it
+    # reports an incompetent mutant, which fails the whole-file campaign).
+    from yaml import YAMLError
     extdir = Path(target["dir"])
     about = extdir / "about.md"
     if not about.is_file():
@@ -221,7 +231,7 @@ def _seed_about(pack: Path, target: dict) -> None:
     for sf in (target["manifest"].get("schema") or []):
         try:
             frag = yaml.safe_load((extdir / sf).read_text(encoding="utf-8")) or {}
-        except (OSError, yaml.YAMLError):
+        except (OSError, YAMLError):
             continue
         namespaces += list(((frag.get("owns") or {}).get("namespaces") or []))
     text = about.read_text(encoding="utf-8")
@@ -273,11 +283,18 @@ def _cmd_enable(args) -> int:
     # an in-gateway one there is untrusted code with full gateway reach — refuse unless the
     # operator explicitly accepts it. sidecar (isolated via scoped MCP #132 + own
     # container) and declarative (no code) extensions are allowed for any tier.
-    trust = target["manifest"].get("trust")
-    if target["tier"] == "operator" and trust == "in-gateway" \
-            and not getattr(args, "allow_untrusted", False):
+    #
+    # The acceptance is RECORDED in the enabled-state entry (okengine#994 [14]): regen, script
+    # staging and `framework validate` re-check it, so code that reached the gateway without it
+    # (a hand-edited extensions.yaml, a manifest flipped to in-gateway after enable) is refused at
+    # load time too. A recorded acceptance of the current trust level needs no flag again.
+    allow_untrusted = args.allow_untrusted          # argparse always sets it for `enable`
+    needs_acceptance = disc.requires_trust_acceptance(target)
+    if needs_acceptance and not allow_untrusted \
+            and not disc.is_trust_accepted(enabled.get(args.id), target):
         fails.append(
-            f"{args.id}: refusing an operator-tier `in-gateway` extension — it runs "
+            f"{args.id}: refusing an operator-tier extension that runs code in the gateway "
+            f"(`trust: {target['manifest'].get('trust')}`) — it runs "
             "potentially-untrusted third-party code IN the gateway with full access, and OS "
             "sandboxing/signing is not yet available (okengine#124). Repackage as "
             "`trust: sidecar` (isolated, scoped MCP), or pass --allow-untrusted to accept "
@@ -320,8 +337,32 @@ def _cmd_enable(args) -> int:
     # already-running sidecar is not disrupted; rotate only if its credential record is incomplete.
     tok = _tokens()
     read_scopes, write_scopes = tok.scopes_from_manifest(target["manifest"])
-    write_capability = tok.write_capability_from_manifest(target["manifest"])
+    accept = target["manifest"].get("trust") if needs_acceptance and allow_untrusted else None
+    # okengine#1032 [12]: a pack/operator-tier identity-edit grant reaches the token only once the
+    # operator accepts it, bound to the digest of the write policy as it is NOW.
+    identity_accept = (tok.identity_edit_acceptance(target)
+                       if args.accept_identity_edit and tok.identity_edit_needs_acceptance(target)
+                       else None)
+    settings = dict(enabled.get(args.id) or {})
+    if identity_accept is not None:
+        settings[disc.IDENTITY_ACCEPTED_KEY] = identity_accept
+    write_capability, grant_warnings = tok.effective_write_capability(target, settings, pack)
+    for warning in grant_warnings:
+        print(f"WARN: {warning}")
+    acceptances = {key: value for key, value in (("trust_accepted", accept),
+                                                 ("identity_edit_accepted", identity_accept))
+                   if value is not None}
     if args.id in enabled:
+        if acceptances:
+            errs = disc.set_enabled(pack, args.id, True, **acceptances)
+            if errs:
+                for e in errs:
+                    print(f"FAIL: {e}", file=sys.stderr)
+                return 1
+        if accept is not None:
+            print(f"trust acceptance recorded: {args.id} (trust: {accept})")
+        if identity_accept is not None:
+            print(f"identity-edit grant accepted: {args.id} ({identity_accept['digest']})")
         rec = tok.reconcile(pack, args.id, read_scopes, write_scopes, write_capability)
         policy_errors = _materialize_policy(pack)
         if policy_errors:
@@ -332,7 +373,9 @@ def _cmd_enable(args) -> int:
             "token scopes reconciled" if rec["changed"] else "token scopes current")
         print(f"already enabled: {args.id} ({action})")
         return 0
-    errs = disc.set_enabled(pack, args.id, True)
+    errs = disc.set_enabled(pack, args.id, True, **acceptances)
+    if identity_accept is not None and not errs:
+        print(f"identity-edit grant accepted: {args.id} ({identity_accept['digest']})")
     if errs:
         for e in errs:
             print(f"FAIL: {e}", file=sys.stderr)
@@ -352,6 +395,36 @@ def _cmd_enable(args) -> int:
     print(f"enabled: {args.id}")
     print("redeploy to apply — regen folds its cron job into cron-plus-jobs.json "
           "(generated-from-source); scoped MCP token minted; composed schema regenerated.")
+    return 0
+
+
+def _cmd_reconcile_tokens(args) -> int:
+    """okengine#1032 [17]: the token store is a COPY of each enabled extension's manifest scopes and
+    write policy that only `enable` refreshed, so a deploy shipped whatever authority it last held,
+    including an identity-edit grant the manifest has since dropped. Deploy re-derives it here: a
+    stale record is rewritten (WARN, no token rotation); `--check` reports it and exits 1."""
+    disc, tok = _discovery(), _tokens()
+    pack = Path(args.pack).expanduser()
+    resolved, errors = disc.resolve_for_pack(pack)
+    enabled, state_errors = disc.load_enabled_state(pack)
+    errors = list(errors) + list(state_errors)
+    if errors:
+        for error in errors:
+            print(error if str(error).startswith("FAIL") else f"FAIL: {error}", file=sys.stderr)
+        print("token store NOT reconciled (extension discovery failed)", file=sys.stderr)
+        return 1
+    drift, warnings = tok.reconcile_store(pack, resolved, enabled, write=not args.check)
+    for warning in warnings:
+        print(f"WARN: {warning}")
+    for line, action in drift:
+        if args.check:
+            print(f"FAIL: {line}", file=sys.stderr)
+        else:
+            print(f"WARN: {line}; {action}")
+    if args.check and drift:
+        print(f"run `framework extensions reconcile-tokens {pack}` (deploy does it) to re-derive "
+              "the stale records and revoke the orphaned ones", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -430,10 +503,21 @@ def _cmd_sidecar_generate(args) -> int:
     <pack>/.okengine/generated/sidecars.compose.yml (a compose override with each
     sidecar service + injected scoped token/MCP env) and a per-extension trigger.sh.
     The override holds tokens -> written 0600. A no-op when no sidecars are enabled."""
+    import os
+
     import yaml
     comp = _composer()
     pack = Path(args.pack).expanduser()
-    override, wrappers, errors = comp.sidecar_compose_override(pack)
+    # The project this deployment's own `docker compose up` runs as, the one engine_images claims
+    # (okengine#1044 [5]): COMPOSE_PROJECT_NAME from the shell or the pack .env, else the
+    # directory name. A fixed project put every pack's sidecars on one foreign network.
+    images = _load("engine_images")
+    try:
+        project = images.project_name(pack, images._pack_env(pack, os.environ))
+    except ValueError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
+    override, wrappers, errors = comp.sidecar_compose_override(pack, project=project)
     if errors:
         for e in errors:
             print(f"FAIL: {e}" if not str(e).startswith("FAIL") else e, file=sys.stderr)
@@ -482,8 +566,32 @@ def _cmd_disable(args) -> int:
             print(f"FAIL: {e}", file=sys.stderr)
         return 1
     if args.id not in enabled:
-        print(f"not enabled: {args.id} (nothing to do)")
-        return 0
+        # A core (default-on) extension is active WITHOUT an explicit `enabled:` entry, so the
+        # explicit map alone called it "not enabled" and exited 0 having changed nothing: the
+        # documented opt-out (`disabled:`, extension-system.md §2) was unreachable from the CLI
+        # (okengine#994 [26]). Decide on the EFFECTIVE set, which needs a clean discovery.
+        extensions, disc_errors = disc.discover(pack)
+        if disc_errors:
+            for e in _require_clean_discovery(extensions, disc_errors, pack):
+                print(e, file=sys.stderr)
+            print(f"cannot tell whether {args.id} is a default-on core extension while discovery "
+                  "fails; nothing was changed", file=sys.stderr)
+            return 1
+        # Its errors are load_enabled_state's, already reported and returned on above.
+        effective, _ = disc.effective_enabled(pack, extensions)
+        if args.id not in effective:
+            core = any(e["id"] == args.id and disc.is_core(e) for e in extensions)
+            state = (f"already disabled (core opt-out): {args.id}" if core
+                     else f"not enabled: {args.id}")
+            # okengine#1042 [9]: an extension removed or dropped from extensions.yaml without
+            # `disable` leaves its token active; this is the command an operator reaches for. Revoke it.
+            tok = _tokens()
+            if tok.holds_token(pack, args.id):
+                tok.revoke(pack, args.id)
+                print(f"{state}; revoked its leftover token")
+            else:
+                print(f"{state} (nothing to do)")
+            return 0
     errs = disc.set_enabled(pack, args.id, False)
     if errs:
         for e in errs:
@@ -516,6 +624,33 @@ def _cmd_disable(args) -> int:
     return 0
 
 
+def _cmd_forget(args) -> int:
+    """okengine#1042 [32]: clear a `disabled:` id that no tier discovers any more (a renamed or
+    removed extension). A discovered id is refused: dropping a core id's opt-out turns it back ON,
+    which is `extensions enable`'s job."""
+    disc = _discovery()
+    pack = Path(args.pack).expanduser()
+    extensions, disc_errors = disc.discover(pack)
+    if disc_errors:
+        for e in _require_clean_discovery(extensions, disc_errors, pack):
+            print(e, file=sys.stderr)
+        print(f"cannot tell whether {args.id} is discovered while discovery fails; nothing was "
+              "changed", file=sys.stderr)
+        return 1
+    if any(e["id"] == args.id for e in extensions):
+        print(f"FAIL: {args.id} is discovered, so its opt-out is not stale; `framework extensions "
+              f"enable {pack} {args.id}` turns it back on", file=sys.stderr)
+        return 1
+    changed, errors = disc.forget_disabled(pack, args.id)
+    if errors:
+        for e in errors:
+            print(f"FAIL: {e}", file=sys.stderr)
+        return 1
+    print(f"forgot the stale opt-out: {args.id}" if changed
+          else f"not in disabled: {args.id} (nothing to do)")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="framework extensions", add_help=True,
                                  description="Discover/inspect/validate pack extensions.")
@@ -543,12 +678,29 @@ def main(argv: list[str]) -> int:
     p_en.add_argument("id")
     p_en.add_argument("--allow-untrusted", action="store_true",
                       help="accept the risk of a non-first-party in-gateway extension (okengine#124)")
+    p_en.add_argument("--accept-identity-edit", action="store_true",
+                      help="accept a pack/operator-tier extension's identity_edit grant as "
+                           "declared now (okengine#1032)")
     p_en.set_defaults(func=_cmd_enable)
+
+    p_tok = sub.add_parser("reconcile-tokens",
+                           help="re-derive stored token scopes/capabilities from the manifests "
+                                "(deploy; --check reports drift and exits 1)")
+    p_tok.add_argument("pack")
+    p_tok.add_argument("--check", action="store_true",
+                       help="report drift without rewriting the store; exit 1 on any")
+    p_tok.set_defaults(func=_cmd_reconcile_tokens)
 
     p_dis = sub.add_parser("disable", help="disable an extension (preserves its pages)")
     p_dis.add_argument("pack")
     p_dis.add_argument("id")
     p_dis.set_defaults(func=_cmd_disable)
+
+    p_forget = sub.add_parser("forget",
+                              help="clear a disabled: id no tier discovers any more")
+    p_forget.add_argument("pack")
+    p_forget.add_argument("id")
+    p_forget.set_defaults(func=_cmd_forget)
 
     p_stage = sub.add_parser("stage-plan",
                              help="print <id>\\t<dir> staging plan (for deploy)")

@@ -329,6 +329,23 @@ refuses an **operator-tier** (the third-party/paid drop-in home) extension with
 passes `--allow-untrusted`. Engine- and pack-tier in-gateway code is allowed (the
 author already runs in-gateway via the engine/pack crons); any-tier `sidecar` is
 allowed (isolated via scoped MCP + its own container); `declarative` runs no code.
+The acceptance is **recorded** in the enabled-state entry (`trust_accepted: {trust, accepted_at}`
+in `.okengine/extensions.yaml`) and re-checked at load time (okengine#994): cron regen generates
+no job and `stage-plan` stages no scripts for an operator-tier in-gateway extension without a
+recorded acceptance of the trust level its manifest declares now, and `framework validate` (deploy
+step 1) FAILs naming the one-time accept command,
+`framework extensions enable <pack> <id> --allow-untrusted`. A hand-edited enable, or a manifest
+that changed to `in-gateway` after it was enabled, is therefore refused. Disabling drops the
+record, so re-enabling must accept again.
+**`declarative` declares no operation, and the gate also checks what would run (okengine#1004).**
+Any operation under `trust: declarative` — a manifest `operation`/`operations` block or a
+`crons/*.cron.json` drop-in, prompt or script — is a validation error (discovery, `enable`,
+`extensions validate`, `framework validate` and the composer all reject it), so an extension that
+runs anything is labelled `in-gateway` or `sidecar`. As defense in depth,
+`extension_discovery.requires_trust_acceptance` also treats an operator-tier operation as needing
+acceptance whatever its label when it would schedule a script, stage `*.py`, or list a toolset
+outside the no-code allowlist (`terminal`, `file`, `code_execution`, composites such as
+`hermes-cron`). That one predicate is what `enable`, staging, cron regen and both validators call.
 **Still deferred (okengine#124):** OS sandboxing and image signing — the preconditions
 before running untrusted third-party extensions from *remote* sources unattended.
 

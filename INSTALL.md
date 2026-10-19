@@ -1,6 +1,6 @@
 # Installing OKEngine on Hermes
 
-OKEngine = **a pinned Hermes** + **23 carried patch artifacts** + an **overlay** (new
+OKEngine = **a pinned Hermes** + **24 carried patch artifacts** + an **overlay** (new
 files) + **plugins** + **config**, then **one pack or bundle**. This is the procedure
 to take a stock Hermes install and bring it up to OKEngine — i.e. the exact
 stock→OKEngine delta.
@@ -134,7 +134,7 @@ git clone https://github.com/NousResearch/hermes-agent.git hermes
 cd hermes && git checkout v2026.9.14           # == Hermes v0.21.3
 ```
 
-## 2. Apply the carried patches (23 carried patch artifacts)
+## 2. Apply the carried patches (24 carried patch artifacts)
 ```bash
 <OKEngine>/patches/apply.sh "$PWD"           # idempotent; fails loudly on drift
 ```
@@ -216,11 +216,25 @@ cron-plus → build the image (if missing) → `docker compose up` → deploy cr
 # Add --kickstart to populate the vault NOW instead of waiting for the schedule.
 cd <pack> && bash $ENGINE_DIR/scripts/deploy.sh
 ```
-Or step by step (exactly what `deploy.sh` runs in order):
+Or step by step: the order `deploy.sh` runs, for understanding or debugging it. It is **not** a
+substitute for `deploy.sh` on an engine image build. The provenance label
+`org.okengine.engine_image_tag` is declared only in `docker-compose.okengine-image.yml`, which
+`deploy.sh` generates (with the image pins it writes to `.env`), and `deploy.sh` alone sets the
+`OKENGINE_ENGINE_BUILD_TAG` it carries. An engine image built by a bare `docker compose up --build`
+is therefore labeled `unattributed`, and post-deploy `engine_images.py drift` reports it
+UNATTRIBUTED. That is by design: it is how a rebuild from whatever `ENGINE_DIR` holds is caught
+(okengine#1042 [14], okengine#1044 [10]/[11]). Re-run `deploy.sh` afterwards to build and label them.
 ```bash
 bash $ENGINE_DIR/scripts/ensure-runtime.sh "$(pwd)"                    # seed .hermes-data/config.yaml + cron-plus + MCP token
 bash $ENGINE_DIR/scripts/build-engine-image.sh                        # build hermes-agent — once per engine version
-ENGINE_DIR=$ENGINE_DIR docker compose up -d --build                   # --build rebuilds reader/mcp/cockpit on an engine update (plain up -d only builds when ABSENT — #45)
+# Pin this deployment's engine image tag first (okengine#1033/#1042). Without it the skeleton builds
+# the shared `:unpinned` tag, which a second pack on this host would move under this one, and
+# `engine_images.py drift` reports it as SHARED. deploy.sh writes the same values into .env.
+rel=$(awk -F': *' '/^engine_release:/{print $2; exit}' $ENGINE_DIR/engine-manifest.yaml | awk '{print $1}')
+export OKENGINE_ENGINE_IMAGE_TAG=$(python3 $ENGINE_DIR/scripts/engine_images.py tag "$(pwd)" --release "$rel" --sha "$(git -C $ENGINE_DIR rev-parse --short HEAD)")
+python3 $ENGINE_DIR/scripts/engine_images.py claim "$(pwd)"            # refuse a compose project another dir already runs
+python3 $ENGINE_DIR/scripts/engine_images.py ports "$(pwd)"            # refuse host ports another deployment publishes
+ENGINE_DIR=$ENGINE_DIR docker compose up -d --build   # builds reader/mcp/cockpit UNLABELED (see above); plain up -d only builds when ABSENT (#45)
 CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-scripts.sh   # engine + pack scripts/data -> /opt/data
 CRON_PACK_DIR=$(pwd) bash $ENGINE_DIR/scripts/deploy-cron-plus-jobs.sh # cron defs -> live (self-heals next_run_at)
 ```
@@ -234,6 +248,15 @@ a delivery lands; `curl :8730/mcp` → 401 without token (read MCP up); the
 Then feeds → ingest → first compiled pages.
 
 ## Upgrading Hermes
-Bump the pin: `git checkout <new-tag>` in the Hermes checkout, re-run
-`patches/apply.sh` (rebase any patch that fails — `patches/README.md`), rebuild,
-smoke-gauntlet, cut over. The overlay + plugins + pack are unaffected.
+`patches/apply.sh` applies only on the exact commit `engine-manifest.yaml` pins (`pinned_sha`,
+exit 2 otherwise), and only for a pin its `case "$PIN"` statement maps to a governed series
+(exit 3 otherwise). A bump therefore runs in this order:
+
+1. Clone the new tag. While the manifest still pins the old one, rebase the series against the
+   new checkout: `OKENGINE_ALLOW_UNPINNED_HERMES=1 patches/apply.sh <new-checkout>` (it warns that
+   hunk placement is not proven), and rebase any patch that fails (`patches/README.md`).
+2. Add the new tag's arm to the `case "$PIN"` statement in `patches/apply.sh`, pointing at the
+   rebased series directory, and move `runtime.pinned_tag`, `runtime.pinned_sha` and
+   `runtime.carried_patches` in `engine-manifest.yaml` together.
+3. Re-run `patches/apply.sh <pristine-checkout-at-pinned_sha>` without the override: it must exit
+   0. Then rebuild, smoke-gauntlet, cut over. The overlay + plugins + pack are unaffected.

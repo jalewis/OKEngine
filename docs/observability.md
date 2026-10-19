@@ -6,6 +6,12 @@ OKEngine's health is visible three ways, in increasing automation:
 The `operator-dashboard` rolls the per-area dashboards (fleet-health, source-grounding, review-queue,
 conformance, kb-health) into `wiki/dashboards/operator.md` with an overall 🟢/🟡/🔴 + drill-down.
 
+`fleet-health` judges lanes by whether they **ran** (stale, errored, off-model, never-run). Whether
+a lane is **producing** comes from each lane's `expect:` declaration
+([`lane-expectations.md`](lane-expectations.md)): an **Outcome** column (okengine#892) evaluates it
+from artifacts, worst-first, with recently added lanes shown beside the longest-unmet ones. It is
+a pull signal on the existing page, not a new alert.
+
 ## Metrics (Prometheus)
 `health-export` writes a Prometheus textfile to `<METRICS_DIR>/okengine.prom` (default
 `/opt/data/metrics`):

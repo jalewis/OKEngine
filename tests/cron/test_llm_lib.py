@@ -1,6 +1,7 @@
 """llm_lib: the reasoning-off policy is applied by default, opt-in passes through, and the
 thinking-truncation signature raises instead of silently reading as a bad answer."""
 import importlib.util
+import inspect
 import sys
 import urllib.error
 import io
@@ -235,3 +236,29 @@ def test_chat_sets_authorization_and_reraises_parsed_errors(monkeypatch):
         L.chat("x", model="m", base_url="http://local/v1", api_key="secret", retries=0,
                stream=False)
     assert seen[0].get_header("Authorization") == "Bearer secret"
+
+
+# --- the byte-identical extension copies (okengine#898) -------------------------------------------
+# extensions/okengine.viz and extensions/okengine.relevance-gate each ship a copy of this client
+# (test_responses_endpoint_contract pins them identical). To coverage they are separate files, and
+# their coverage used to come only from whichever copy happened to be bound to
+# sys.modules["llm_lib"] when OTHER tests imported it -- an accident of which test files shared a
+# process. Sharding the suite broke that accident (relevance-gate's copy fell to 15%), so run this
+# suite against every copy explicitly instead of relying on process composition.
+_EXTENSION_COPIES = ("extensions/okengine.viz/llm_lib.py",
+                     "extensions/okengine.relevance-gate/llm_lib.py")
+_CASES = sorted(name for name, obj in list(globals().items())
+                if name.startswith("test_") and callable(obj))
+
+
+@pytest.mark.parametrize("case", _CASES)
+@pytest.mark.parametrize("copy", _EXTENSION_COPIES)
+def test_extension_copy_passes_the_canonical_suite(copy, case, request, monkeypatch):
+    name = "llm_lib_copy_" + copy.split("/")[1].replace(".", "_").replace("-", "_")
+    copy_spec = importlib.util.spec_from_file_location(name, REPO / copy)
+    module = importlib.util.module_from_spec(copy_spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    copy_spec.loader.exec_module(module)
+    monkeypatch.setitem(globals(), "L", module)
+    test = globals()[case]
+    test(**{arg: request.getfixturevalue(arg) for arg in inspect.signature(test).parameters})

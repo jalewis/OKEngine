@@ -1,0 +1,36 @@
+diff --git a/scheduler.py b/scheduler.py
+index adf91f5..82e9357 100644
+--- a/scheduler.py
++++ b/scheduler.py
+@@ -30,6 +30,11 @@ try:
+ except ImportError:
+     import jobs as jobs_mod  # type: ignore[import]
+ 
++try:
++    from . import run_records  # type: ignore[import]
++except ImportError:
++    import run_records  # type: ignore[import]
++
+ logger = logging.getLogger(__name__)
+ 
+ HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+@@ -420,6 +425,19 @@ def tick() -> dict:
+         return summary
+ 
+     try:
++        # A runner killed from outside (e.g. by the gateway's MCP connect cleanup, okengine#1010)
++        # leaves its record `running`, and the lane-start reconcile only clears it when the SAME
++        # lane next starts: a day for a daily lane, with the healthcheck red all that time. Sweep
++        # every lane here, under the tick lock. Never let a sweep failure stop the schedule.
++        try:
++            closed = run_records.reconcile_all_orphaned_runs(jobs_mod.CRON_PLUS_HOME)
++        except Exception as e:
++            logger.error("cron-plus tick: orphaned-run reconciliation failed: %s", e)
++        else:
++            if closed:
++                logger.warning("cron-plus tick: closed %d orphaned run record(s)", closed)
++            summary["reconciled_orphans"] = closed
++
+         # Atomic claim: under a single jobs.json lock, re-verify each due
+         # job is still enabled, not removed, and not currently running,
+         # advance next_run_at, and return the snapshot. Eliminates the

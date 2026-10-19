@@ -60,7 +60,10 @@ Daily, the wake-gate `select_lacuna_field.py` ranks concept clusters by density,
 analyzed within `reanalyze_days`, and surfaces the densest unanalyzed field(s) (with their
 measured density). A pack may nominate fields from recent material sources through the bounded
 operational queue; fresh nominations sort ahead of rotation candidates but cannot bypass the
-concept-page, density, or recency gates. The agent runs the 6 steps over that field's real
+concept-page, density, or recency gates. Fields declared by an open `okengine.inquiry` page rank
+first of all and are the one exception to the density floor: they may be mapped down to
+`inquiry_min_density`, with an explicit EXTRAPOLATION warning, because the vault said what it is
+researching (okengine#854). The agent runs the 6 steps over that field's real
 subgraph and — only if it can name a real force — writes one `lacuna/<slug>` page
 (`type: lacuna`). It **defers** any
 field where the gap has no nameable force. Coverage is not a goal.
@@ -91,6 +94,9 @@ supported by the reader; this extension ships neither.
 | `batch_size` | 3 | how many of the densest unanalyzed fields to surface per run (the agent writes at most one) |
 | `nominations_path` | `.okengine/lacuna-nominations.json` | vault-relative JSON queue of pack-supplied material-source field nominations |
 | `nomination_max_age_days` | 7 | discard routing hints older than this window |
+| `density_exclude_namespaces` | `lacuna,dashboards,operational,briefings` | derived-view namespaces never counted toward a field's density (okengine#855); `lacuna`, vault-root pages and `INDEX*`/`_*` pages are always excluded |
+| `inquiry_nominations_path` | `.okengine/inquiry/lacuna-nominations.json` | fields declared by open `okengine.inquiry` pages (written by the inquiry dossier lane); ranked first |
+| `inquiry_min_density` | 3 | an inquiry-declared field may be mapped this thin (below `min_density`), always with the EXTRAPOLATION warning |
 
 ## When to use it (and when not)
 

@@ -43,21 +43,23 @@ import yaml
 
 _FM = re.compile(r"\A---\n(.*?\n)---\n", re.S)
 _ID_LINE = re.compile(r"^id:[ \t].*$", re.M)
-_URL_SOURCE_ID = re.compile(r"^sources:url-[0-9a-f]{20}$")
+_URL_SOURCE_ID = re.compile(r"^sources:url-[0-9a-f]{20}\Z")
 _SOURCE_ID_TOKEN = re.compile(r"sources:[A-Za-z0-9._:-]{4,}")
 
 
-_REAL_URL = re.compile(r"^https?://[^\s/]+", re.I)
+# The URL-identity rule is the write path's own (okengine#901), imported rather than copied: a
+# private copy here once lacked the service-endpoint rule, so this lane would have grouped every
+# record read from one bare API endpoint as "the same document".
+sys.path.append(str(Path(__file__).resolve().parent / "cron"))
+import engine_package  # noqa: E402,F401 — makes `okengine` importable when loaded by path
+from okengine.write_services.state import _source_identity_url  # noqa: E402
 
 
 def norm_url(value: object) -> str:
-    """Whitespace and ONE trailing slash. No case folding — a URL path is
-    case-significant on many hosts, and an over-eager normalizer would fuse genuinely
-    different pages. Must match write_server._norm_url."""
-    text = str(value or "").strip()
-    if not text or not _REAL_URL.match(text):
-        return ""
-    return text[:-1] if text.endswith("/") and len(text) > 1 else text
+    """Whitespace and ONE trailing slash; no case folding; "" for a non-address or a bare
+    service endpoint. Delegates to `state._source_identity_url`, the rule the write path's
+    `_norm_url` also calls, so the readers cannot drift apart."""
+    return _source_identity_url(value)
 
 
 def source_url_id(url: object) -> str:

@@ -17,6 +17,7 @@ import re
 import tempfile
 
 import yaml
+from yaml import YAMLError
 
 
 OPEN = {"open", "in-review", "changes-requested", "rejected"}
@@ -57,19 +58,26 @@ def _queue_reasons(wiki: Path) -> dict[str, str]:
     return found
 
 
+# (substring of the recorded detail, reason code), first match wins; "manual" otherwise. A table
+# rather than a return ladder so tests/test_review_vocabulary.py can see every code this emits
+# (okengine#866: four of them reached the Cockpit with no glossary entry, invisible to that test).
+REASON_CODES: tuple[tuple[str, str], ...] = (
+    ("unresolvable wikilink", "broken-link"),
+    ("degenerate", "agent-draft"),
+    ("repetition", "agent-draft"),
+    ("slug id collision", "id-collision"),
+    ("immutable field change reverted", "rejected-write"),
+    ("field `", "owner-conflict"),
+)
+DEFAULT_REASON_CODE = "manual"
+
+
 def _reason_code(detail: str) -> str:
     lowered = detail.lower()
-    if "unresolvable wikilink" in lowered:
-        return "broken-link"
-    if "degenerate" in lowered or "repetition" in lowered:
-        return "agent-draft"
-    if "slug id collision" in lowered:
-        return "id-collision"
-    if "immutable field change reverted" in lowered:
-        return "rejected-write"
-    if "field `" in lowered:
-        return "owner-conflict"
-    return "manual"
+    for needle, code in REASON_CODES:
+        if needle in lowered:
+            return code
+    return DEFAULT_REASON_CODE
 
 
 def _write(path: Path, record: dict) -> None:
@@ -97,7 +105,7 @@ def main() -> int:
     for path in sorted(store.rglob("*.yaml")):
         try:
             record = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        except (OSError, yaml.YAMLError):
+        except (OSError, YAMLError):
             continue
         if not isinstance(record, dict) or str(record.get("state")) not in OPEN:
             continue

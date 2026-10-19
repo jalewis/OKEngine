@@ -20,6 +20,12 @@ bash tests/e2e/smoke/smoke-e2e.sh --keep         # leave the stack up (9880 read
 bash tests/e2e/smoke/smoke-e2e.sh --no-build     # reuse existing images
 ```
 
+Local builds are tagged `okengine-smoke-<service>:${SMOKE_RUN_ID:-local}`, never a name a
+deployment runs (`okengine-reader`, `okengine-mcp`, ...). Under the old shared names, a smoke build
+on a deploy host silently moved the live `:latest` tags to branch code (okengine#1033), and
+`tests/test_smoke_image_scope.py` now rejects any smoke image that shares a deployment's name.
+Set `SMOKE_RUN_ID` to keep concurrent local runs apart.
+
 ## Use it as the contributor sandbox
 
 The same frozen, dependency-light stack is the one-command local sandbox:
@@ -108,3 +114,23 @@ When a render/integration bug is found and fixed, add its shape here so it can't
 
 The vault is bind-mounted read-only, so edits to `vault/` are picked up live against a running
 stack (`--keep`) with no rebuild.
+
+### Candidate images in release CI (#902)
+
+`release-images` builds all five service images once in its disposable Docker
+daemon and publishes them to the project registry. Its `manifest.json` records
+source SHA, project, pipeline and immutable repository digests. Each release job
+requires that artifact, checks the identity, pulls each digest, and verifies both
+the daemon's repository digest and the embedded source-revision label. Missing,
+stale or mismatched evidence fails before a stack starts. Consumers prohibit
+builds and implicit pulls; local runs retain their existing build behavior.
+
+Each mode has its own DinD service, job-specific Compose project/container names,
+and newly seeded temporary vault. Faults cannot reach a performance job's daemon
+or volume. Existing per-mode JUnit, logs and verified teardown remain mandatory.
+The producer's `build-timing.json` and each consumer's `consume-timing.json` report
+elapsed build/push or pull/verify time with source/pipeline/job attribution. These
+are cold per-job daemons, not evidence of a warm registry or runner image cache.
+Compare equivalent release populations and include producer time and queueing
+when reporting pipeline savings. An expired manifest or removed registry image
+requires a new producer execution; consumers never rebuild as a fallback.

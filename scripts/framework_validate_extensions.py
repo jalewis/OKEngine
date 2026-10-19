@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from scripts.framework_validate_pack import check_fragment_type_roles
 from scripts.framework_validate_report import Report
 
 
@@ -78,16 +79,21 @@ class ExtensionChecks:
         enabled) otherwise slips past `framework validate` and first hard-stops at deploy.sh step 5, AFTER
         step 4 already recreated every container (with --no-crons, never at all). check_extension_requirements
         only covers ids the pack DECLARES via requires:/schema-owner, so an enabled-only id was unguarded
-        at the fail-fast gate (invariant-audit #39). This mirrors framework_extensions._cmd_validate."""
-        if not (pack / ".okengine" / "extensions.yaml").is_file():
-            return                                  # nothing enabled -> nothing to resolve
+        at the fail-fast gate (invariant-audit #39). This mirrors framework_extensions._cmd_validate.
+
+        Discovery itself runs even with NO enabled map (okengine#991): resolve_for_pack, which the
+        deploy's stage-plan calls, reports discover()'s faults (reserved okengine.* id squatted by a
+        pack/operator tier, cross-tier duplicate id, broken manifest) whatever is enabled, so gating
+        them on extensions.yaml let a fresh pack validate green and dead-end at deploy step 5."""
         disc = self.discovery()
         try:
             discovered, disc_errors = disc.discover(pack)
-            enabled, en_errors = disc.load_enabled_state(pack)
-            _, res_errors = disc.resolve_enabled(list(enabled), discovered)
-            disabled = (disc._load_disabled(pack)
-                        if hasattr(disc, "_load_disabled") else set())
+            if (pack / ".okengine" / "extensions.yaml").is_file():
+                enabled, en_errors = disc.load_enabled_state(pack)
+                _, res_errors = disc.resolve_enabled(list(enabled), discovered)
+                disabled_errors = disc.stale_disabled_errors(pack, discovered)
+            else:                                   # nothing enabled -> only discovery can fault
+                enabled, en_errors, res_errors, disabled_errors = {}, [], [], []
         except Exception as e:                       # discovery faults are reported elsewhere; don't crash
             r.warn("enabled extensions", f"could not resolve enabled set: {e}")
             return
@@ -96,11 +102,10 @@ class ExtensionChecks:
         # keyed by bare id, so a duplicate is silently last-wins and yields NO res_errors — dropping
         # disc_errors here let `framework validate` / `pull --update` report an ambiguous extension as
         # clean (invariant-audit #351). Fold them into the fail set.
-        discovered_ids = {record.get("id") for record in discovered}
-        disabled_errors = [
-            f"FAIL: disabled extension '{ext_id}' is not discovered in any tier"
-            for ext_id in sorted(disabled - discovered_ids)
-        ]
+        # A `disabled:` id no tier discovers (okengine#1042 [32]): `extensions validate` FAILs it
+        # too, and the line names `extensions forget`, the CLI path that clears it.
+        # The discovered fragments' owned-type roles (okengine#1032 [24]), on the one discovery.
+        check_fragment_type_roles(discovered, self.load_yaml, r)
         problems = (list(en_errors) + list(res_errors) + list(disc_errors)
                     + disabled_errors)
         if problems:
@@ -108,6 +113,42 @@ class ExtensionChecks:
                 r.fail("enabled extension", p if not p.startswith("FAIL") else p[5:].strip())
         elif enabled:
             r.ok("enabled extensions", f"{len(enabled)} enabled, all discovered")
+        # An enabled extension must also be one the deploy will load (okengine#994 [14]).
+        self.check_operator_trust_acceptance(pack, r)
+
+    def check_operator_trust_acceptance(self, pack: Path, r: Report) -> None:
+        """okengine#994 [14]: an enabled operator-tier `trust: in-gateway` extension must carry a
+        recorded trust acceptance. Regen and script staging refuse one without it, so this is the
+        earliest gate: deploy step 1 FAILs naming the one-time accept command, before step 4
+        recreates any container, instead of the lane silently vanishing at step 5."""
+        disc = self.discovery()
+        resolved = self._effective_extensions(pack)
+        try:
+            needing = [ext_id for ext_id in sorted(resolved)
+                       if disc.requires_trust_acceptance(resolved[ext_id])]
+            if not needing:
+                return                              # nothing operator-tier in-gateway is enabled
+            blocked = disc.unaccepted_trust(pack, resolved)
+        except Exception as e:                      # a discovery fault is reported by the check above
+            r.warn("operator trust", f"could not check operator trust acceptance: {e}")
+            return
+        for ext_id, error in blocked.items():
+            r.fail(f"operator trust {ext_id}", error.removeprefix("FAIL:").strip())
+        accepted = [ext_id for ext_id in needing if ext_id not in blocked]
+        if accepted:
+            r.ok("operator trust", f"{len(accepted)} operator in-gateway extension(s) accepted")
+
+    def _effective_extensions(self, pack: Path) -> dict:
+        """id -> record for the EFFECTIVE set (explicit opt-ins ∪ core default-ons), the set the
+        deploy actually runs. The explicit set alone is wrong for a core extension: it is active in
+        every pack that never listed it, and a gate that consults only the explicit list skips it
+        there entirely — validating a different composition than ships (invariant-audit #63).
+        Empty on a discovery fault; those are reported by the check above."""
+        try:
+            resolved, _ = self.discovery().resolve_for_pack(pack)
+        except Exception:
+            return {}
+        return resolved
 
     def _inquiry_lib(self, pack: Path):
         """Import inquiry_lib from the DISCOVERED okengine.inquiry record, not a hard-coded
@@ -116,14 +157,7 @@ class ExtensionChecks:
         baked-vs-staged drift this repo guards elsewhere. Returns None when not enabled."""
         import importlib.util
 
-        disc = self.discovery()
-        try:
-            discovered, _ = disc.discover(pack)
-            enabled, _ = disc.load_enabled_state(pack)
-            resolved, _ = disc.resolve_enabled(list(enabled), discovered)
-        except Exception:
-            return None                             # discovery faults are reported by the check above
-        record = resolved.get("okengine.inquiry")
+        record = self._effective_extensions(pack).get("okengine.inquiry")
         if not record:
             return None
         lib_path = Path(record.get("dir") or "") / "inquiry_lib.py"
@@ -167,10 +201,26 @@ class ExtensionChecks:
                 cid = str(data.get("id") or "") if isinstance(data, dict) else ""
                 if cid:
                     connector_ids.add(cid)
-        problems = list(contract_errors) + lib.connector_errors(inquiries, connector_ids)
+        problems = (list(contract_errors) + lib.connector_errors(inquiries, connector_ids)
+                    + lib.field_errors(inquiries, wiki))
         for problem in problems:
             r.fail("inquiry", problem)
         if not problems:
             open_count = sum(1 for i in inquiries if i.is_open)
             r.ok("inquiry", f"{len(inquiries)} declared ({open_count} open), "
                             "every term set has a reachable connector")
+        # inquiry-analyze answers standing questions as okengine.assessments pages, and the two
+        # extensions are enabled independently. Without assessments the lane has no type to write,
+        # so a declared question would never be answered while collection looks healthy. WARN,
+        # not FAIL: collection and the dossier are useful on their own (okengine#854).
+        # Declared lacuna fields with no lacuna to consume them are a declaration nothing reads.
+        if any(i.is_open and i.fields for i in inquiries) and \
+                "okengine.lacuna" not in self._effective_extensions(pack):
+            r.warn("inquiry", "open inquiries declare `fields` but okengine.lacuna is not enabled — "
+                              "nothing maps them. `framework extensions enable <pack> okengine.lacuna`")
+        if any(i.is_open for i in inquiries) and \
+                "okengine.assessments" not in self._effective_extensions(pack):
+            r.warn("inquiry", "open inquiries declared but okengine.assessments is not enabled — "
+                              "inquiry-analyze cannot answer their standing questions (collection "
+                              "and the dossier still run). `framework extensions enable <pack> "
+                              "okengine.assessments`")

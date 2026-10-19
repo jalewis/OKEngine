@@ -192,6 +192,32 @@ if qerr:
     print("ERROR: Qwen Coder fallback policy (not deploying):\n  " + "\n  ".join(qerr),
           file=sys.stderr)
     sys.exit(1)
+import cron_pack_split
+werr = cron_pack_split.unregistered_writers(jobs, runtime_config)
+if werr:
+    print("ERROR: unregistered write server(s) (not deploying):\n  " + "\n  ".join(werr),
+          file=sys.stderr)
+    sys.exit(1)
+# okengine#969: a pack lane may bind only a server registered FOR it. The config keeps servers
+# it no longer has a lane for (another pack's, a disabled extension's), and ensure-runtime never
+# rewrites an existing entry's actor, so naming one would write as its actor.
+ferr = cron_pack_split.foreign_writer_bindings(jobs, runtime_config)
+if ferr:
+    print("ERROR: write server(s) owned by another identity (not deploying):\n  "
+          + "\n  ".join(ferr), file=sys.stderr)
+    sys.exit(1)
+# okengine#1029: the reverse direction. A lane writer registered for a lane this deployment does
+# not run is a foreign identity the gateway still spawns, left by a render from another pack's
+# split. ensure-runtime removes them; a config it has not reconciled yet stops here. The same gate
+# refuses a lane writer whose contract mode or write_tools no longer match its lane, which
+# ensure-runtime re-derives (okengine#1042 [3]/[18]).
+import lane_writers
+serr = lane_writers.stale_writer_errors(runtime_config, jobs, lane_writers.load_policy(pack_dir),
+                                        cron_pack_split)
+if serr:
+    print("ERROR: write server(s) for lanes this deployment does not run (not deploying):\n  "
+          + "\n  ".join(serr), file=sys.stderr)
+    sys.exit(1)
 json.dump(d, open(out, "w", encoding="utf-8"), indent=2)
 print(f"  expanded {bn} @morning brief(s) @{brief_hour:02d}:MM + {n} @jitter sentinel(s) "
       f"+ {sn} schedule override(s) + {ln} lane override(s) + {pn} model-profile ref(s) for deploy")
@@ -240,59 +266,6 @@ if [ -n "$MISSING_SCRIPTS" ]; then
     exit 1
 fi
 
-# PRESERVE OPERATOR PAUSE (okengine#517). Pause is RUNTIME state: it lives in the deployed
-# jobs.json as `enabled: false` + `paused_at`, while the SOURCE always declares `enabled: true`.
-# Regeneration therefore overwrote runtime state with declared state and silently re-armed a held
-# lane — twice on one pack, once ~40 minutes before a reshelve that would then have moved 988
-# pages unattended. It is the worst shape of bug: silent, time-delayed to the job's next fire, and
-# it punishes pausing, which is the careful thing to do.
-# Matched on the stable job `id` (source-assigned, survives regeneration), so a renamed lane keeps
-# its pause and a re-used name does not inherit one.
-# RESUME_PAUSED=1 is the deliberate "yes, re-arm everything" path.
-LIVE_JOBS_TMP="$DEPLOY_JOBS.live"
-if docker exec -u "$HERMES_UID" "$CONTAINER" sh -c "cat '$DEST_IN' 2>/dev/null" > "$LIVE_JOBS_TMP" \
-        && [ -s "$LIVE_JOBS_TMP" ]; then
-    RESUME_PAUSED="${RESUME_PAUSED:-0}" "$HOST_PYTHON" - "$DEPLOY_JOBS" "$LIVE_JOBS_TMP" <<'PY'
-import json, os, sys
-new_path, live_path = sys.argv[1], sys.argv[2]
-resume = os.environ.get("RESUME_PAUSED", "0").strip().lower() not in ("", "0", "false", "no", "off")
-try:
-    live = json.load(open(live_path, encoding="utf-8"))
-except (OSError, ValueError):
-    sys.exit(0)                       # unreadable live store: deploy as generated
-live_jobs = live if isinstance(live, list) else (live.get("jobs") or [])
-paused = {j["id"]: j for j in live_jobs
-          if j.get("id") and j.get("enabled") is False}
-if not paused:
-    sys.exit(0)
-names = sorted((j.get("name") or j["id"]) for j in paused.values())
-if resume:
-    print(f"  RESUME_PAUSED=1 — re-arming {len(paused)} operator-paused lane(s): "
-          + ", ".join(names))
-    sys.exit(0)
-new = json.load(open(new_path, encoding="utf-8"))
-kept = []
-for job in (new.get("jobs") or []):
-    held = paused.get(job.get("id"))
-    if not held:
-        continue
-    job["enabled"] = False
-    if held.get("paused_at"):
-        job["paused_at"] = held["paused_at"]
-    kept.append(job.get("name") or job["id"])
-json.dump(new, open(new_path, "w", encoding="utf-8"), indent=2)
-if kept:
-    print(f"  preserved operator pause on {len(kept)} lane(s): " + ", ".join(sorted(kept)))
-dropped = len(paused) - len(kept)
-if dropped:
-    print(f"  note: {dropped} paused lane(s) are no longer in the source and were not carried "
-          "forward")
-PY
-fi
-rm -f "$LIVE_JOBS_TMP"
-
-# Create the runtime dir, snapshot any existing jobs.json, then stream the new one
-# in as `hermes` (so the cron-plus subprocess, also hermes, can read it).
 # Reconcile model-slot artifacts as root first: an operator diagnostic may have
 # created the directory or a lock through `docker exec`'s root default. flock
 # state is process-owned, so changing inode ownership does not disturb a live
@@ -300,10 +273,27 @@ rm -f "$LIVE_JOBS_TMP"
 docker exec "$CONTAINER" sh -c \
     "mkdir -p /opt/data/cron-plus/model-slots && chown -R '$HERMES_UID:$HERMES_GID' /opt/data/cron-plus/model-slots && chmod 700 /opt/data/cron-plus/model-slots && find /opt/data/cron-plus/model-slots -type f -exec chmod 600 {} +"
 docker exec -u "$HERMES_UID" "$CONTAINER" mkdir -p /opt/data/cron-plus
-docker exec -u "$HERMES_UID" "$CONTAINER" sh -c \
-    "[ -f '$DEST_IN' ] && cp -p '$DEST_IN' '$DEST_IN.bak.$TS' && echo '  snapshot: $DEST_IN.bak.$TS' || true"
-docker exec -i -u "$HERMES_UID" "$CONTAINER" sh -c "cat > '$DEST_IN' && chmod 600 '$DEST_IN'" < "$DEPLOY_JOBS"
+
+# WRITE UNDER THE SCHEDULER'S LOCK (okengine#850). The old path merged operator pauses host-side
+# and then `cat >`-ed the file with no lock, while the scheduler read-modify-writes the same store:
+# on a freshly recreated gateway the scheduler read the OLD list, this deploy wrote the new one,
+# and the scheduler's save put the old one back -- 14 lanes kept retired writer names, and every
+# step printed success. cron_plus_store.py runs INSIDE the gateway and does snapshot + operator-
+# pause carry-forward (okengine#517; RESUME_PAUSED=1 re-arms) + atomic write under the sidecar
+# lock the patched scheduler also takes (patches/cron-plus/jobs-store-lock.patch), and records
+# what it deployed as jobs.deployed.json so post_deploy_verify can prove it survived.
+INCOMING_IN="/opt/data/cron-plus/.jobs.incoming.json"
+docker exec -i -u "$HERMES_UID" "$CONTAINER" sh -c "cat > '$INCOMING_IN'" < "$DEPLOY_JOBS"
+docker exec -i -u "$HERMES_UID" -e RESUME_PAUSED="${RESUME_PAUSED:-0}" "$CONTAINER" \
+    python3 - write "$DEST_IN" "$INCOMING_IN" "$TS" < "$REPO_ROOT/scripts/cron_plus_store.py"
 echo "  deployed: $CONTAINER:$DEST_IN"
+if ! drift_report=$(docker exec -i -u "$HERMES_UID" "$CONTAINER" \
+        python3 - drift /opt/data/cron-plus/jobs.deployed.json "$DEST_IN" \
+        < "$REPO_ROOT/scripts/cron_plus_store.py" 2>&1); then
+    echo "ERROR: the live jobs.json does not hold what was just deployed:" >&2
+    printf '%s\n' "$drift_report" | sed 's/^/    /' >&2
+    exit 1
+fi
 
 JOB_COUNT=$("$HOST_PYTHON" -c "import json; print(len(json.load(open('$SRC'))['jobs']))")
 echo "  jobs: $JOB_COUNT (all lane scripts staged — validated pre-write)"

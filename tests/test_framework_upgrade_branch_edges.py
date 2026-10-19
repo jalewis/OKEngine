@@ -41,7 +41,8 @@ def test_malformed_pin_and_state(tmp_path):
     state = tmp_path / m.STATE_REL
     state.parent.mkdir()
     state.write_text("{broken")
-    assert m.read_state(tmp_path) == {}
+    with pytest.raises(m.MigrationStateError):   # unknown, never "nothing applied" (#991)
+        m.read_state(tmp_path)
 
 
 def test_load_migrations_restores_engine_script_import_path(tmp_path, monkeypatch):
@@ -66,7 +67,8 @@ def test_default_validator_all_adapter_outcomes(tmp_path, monkeypatch):
     fake.main = lambda _argv: 0
     assert m._default_validator(tmp_path)[0] is True
     fake.main = lambda _argv: (_ for _ in ()).throw(RuntimeError("validator crash"))
-    assert "skipped" in m._default_validator(tmp_path)[1]
+    ok, summary = m._default_validator(tmp_path)          # fails closed (#991)
+    assert ok is False and "validator crash" in summary
 
 
 def test_failure_map_import_skip_and_read_errors(tmp_path, monkeypatch):
@@ -218,7 +220,7 @@ def test_render_and_main_early_paths(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(m, "_engine_meta", lambda: _meta())
     monkeypatch.setattr(m, "load_all_migrations",
                         lambda *_a: (_ for _ in ()).throw(RuntimeError("broken migration")))
-    assert m.main([str(pack)]) == 2
+    assert m.main([str(pack)]) == 1                      # a failed reconcile, not "nothing to do"
     assert "broken migration" in capsys.readouterr().err
 
     monkeypatch.setattr(m, "load_all_migrations", lambda *_a: [])

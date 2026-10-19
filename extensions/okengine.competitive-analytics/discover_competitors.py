@@ -30,6 +30,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Engine cron libs, appended so this extension's own modules keep precedence: staged one level
+# up (/opt/data/scripts/ holds /opt/data/scripts/<id>/), or scripts/cron/ in a repo checkout.
+_ENGINE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(_ENGINE_ROOT))
+sys.path.append(str(_ENGINE_ROOT.parent / "scripts" / "cron"))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import comp_lib  # noqa: E402
 
 WIKI = comp_lib.WIKI
@@ -232,7 +238,7 @@ def main() -> int:
         L += ["_No off-watchlist candidates yet — add broader sources to `feeds/feeds.opml` so the "
               "ingest pipeline creates more company entities + source coverage, then re-run._", ""]
     DASH.parent.mkdir(parents=True, exist_ok=True)
-    DASH.write_text("\n".join(L), encoding="utf-8")
+    generated_page.write(DASH, "\n".join(L))
     print(f"discover-competitors: {len(cands)} entity candidate(s) + {len(mined_list)} language-mined "
           f"from {len(ents)} entities ({len(known)} tracked) -> wiki/dashboards/competitive/discovery.md")
     print(json.dumps({"wakeAgent": False}))

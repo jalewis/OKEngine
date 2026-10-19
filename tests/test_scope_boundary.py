@@ -229,3 +229,20 @@ def test_empty_or_absent_scopes_grant_nothing(scope):
     for empty in ([], None):
         assert not scope.path_in_scopes("entities/a/acme", empty), empty
         assert not scope.is_full(empty), empty
+
+
+def test_a_token_revoked_within_one_tick_stops_resolving(scope, tmp_path):
+    """okengine#1017: the store cache was keyed on mtime alone, so a token revoked within the same
+    timestamp tick as the previous load kept resolving until the next write to the store."""
+    import os
+    store = tmp_path / ".okengine" / "extension-tokens.json"
+    tok = "deadbeef" * 8
+    record = {"ext_id": "demo.x", "token_sha256": scope.token_sha256(tok),
+              "read_scopes": ["wiki/**"], "write_scopes": [], "status": "active"}
+    write_store(store, [record])
+    assert scope.resolve(tok) is not None
+    before = store.stat()
+    write_store(store, [{**record, "status": "revokd"}])   # same size: only the content differs
+    os.utime(store, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert store.stat().st_size == before.st_size
+    assert scope.resolve(tok) is None

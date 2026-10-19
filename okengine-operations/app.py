@@ -22,6 +22,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 
 from okengine.compat import engine_root
+from okengine.http_auth import authorization_header
 from okengine.operations import framework as operations
 from okengine.operations import run as operation_run
 from okengine import corpus_transaction
@@ -67,7 +68,7 @@ class BearerAuth:
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") == "http" and scope.get("path") != "/healthz":
-            provided = dict(scope.get("headers") or []).get(b"authorization", b"").decode()
+            provided = authorization_header(scope)
             expected = f"Bearer {TOKEN}"
             if not TOKEN or not hmac.compare_digest(provided, expected):
                 await send({"type": "http.response.start", "status": 401,
@@ -140,7 +141,7 @@ def load_request(request_id: str) -> tuple[Path, dict[str, Any]]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise HTTPException(404, "operation request not found") from exc
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, JSONDecodeError) as exc:
         raise HTTPException(500, "operation request is unreadable") from exc
     return path, value
 
@@ -201,7 +202,7 @@ def refresh(path: Path, value: dict[str, Any]) -> dict[str, Any]:
     if rpath and rpath.is_file():
         try:
             receipt = json.loads(rpath.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, JSONDecodeError):
             receipt = {}
         if receipt:
             # `finalize` nests the worker's own result under receipt["result"]; the domain progress

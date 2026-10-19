@@ -43,6 +43,7 @@ import yaml
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
+import generated_page  # noqa: E402 — keeps a regenerated page's id (okengine#933)
 import schema_lib  # noqa: E402
 import tz_lib  # noqa: E402
 
@@ -206,7 +207,7 @@ def _header(title: str, ts: str, note: str) -> list[str]:
 
 def _write(name: str, lines: list[str]) -> Path:
     path = DASH_DIR / f"{name}.md"
-    path.write_text("\n".join(lines) + "\n")
+    generated_page.write(path, "\n".join(lines) + "\n")
     return path
 
 

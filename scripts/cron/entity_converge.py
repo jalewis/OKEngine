@@ -28,7 +28,7 @@ import schema_lib  # noqa: E402
 
 _FM = re.compile(r"\A---[ \t]*\n(.*?\n)---[ \t]*\n?(.*)\Z", re.S)
 _ADDITIVE = frozenset({"aliases", "sources", "related", "related_entities", "related_actors",
-                       "tags", "merged_from"})
+                       "tags", "merged_from", schema_lib.REJECTED_ALIASES_FIELD})
 _MIN_KEY = 5
 
 
@@ -164,6 +164,17 @@ def _union(winner: dict, losers: list[dict], loser_rels: list[str]) -> dict:
                     values.append(rel)
         if values:
             out[field] = values
+    # Aliases are NOT a plain union: a loser's junk or a name some member's review rejected would
+    # land on the canonical page, below the write path's guard (okengine#845, TAA#48). The winner's
+    # own list is kept as-is; loser names are admitted through the one shared rule.
+    additions: list = []
+    for fm in losers:
+        raw = fm.get("aliases") or []
+        additions += raw if isinstance(raw, list) else [raw]
+    aliases, _refused = schema_lib.admissible_aliases(
+        winner.get("aliases"), additions, out.get(schema_lib.REJECTED_ALIASES_FIELD))
+    if aliases:
+        out["aliases"] = aliases
     return out
 
 

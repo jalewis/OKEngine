@@ -42,7 +42,7 @@ def test_clock_policy_and_capability_outcomes(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "_effective_policy", lambda: policy)
     monkeypatch.setattr(m, "_rel", lambda _p: "entities/e/example.md")
     evaluated = []
-    monkeypatch.setattr(m.policy_plane, "evaluate_capability", lambda *a: evaluated.append(a[0]))
+    monkeypatch.setattr(m.policy_plane, "evaluate_capability", lambda *a, **_k: evaluated.append(a[0]))
     token = m._caller_var.set({"kind": "extension", "actor": "ext:x", "ext_id": "x",
                                "write_capability": {"operations": ["create"]}})
     try:
@@ -54,7 +54,7 @@ def test_clock_policy_and_capability_outcomes(tmp_path, monkeypatch):
     token = m._caller_var.set({"kind": "job", "actor": "cron:lane"})
     monkeypatch.setattr(m._output_contract, "resolve", lambda _c: ({"_missing": True}, None))
     finding = {"code": "denied"}
-    monkeypatch.setattr(m.policy_plane, "evaluate_capability", lambda *_a: finding)
+    monkeypatch.setattr(m.policy_plane, "evaluate_capability", lambda *_a, **_k: finding)
     monkeypatch.setattr(m.policy_plane, "finding_message", lambda _r: "refused")
     monkeypatch.setattr(m.policy_plane, "append_event", lambda *_a: (_ for _ in ()).throw(OSError()))
     try:
@@ -580,7 +580,7 @@ def test_final_statement_error_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "_missing_source_reject", lambda *_a, **_k: None)
     monkeypatch.setattr(m, "_page_id_and_kind", lambda *_a: (_ for _ in ()).throw(RuntimeError()))
     monkeypatch.setattr(m, "schema_reject_reason", lambda *_a: None)
-    monkeypatch.setattr(m, "_dedup_on_create", lambda *_a: None)
+    monkeypatch.setattr(m, "_dedup_on_create", lambda *_a, **_k: None)
     assert m._create("x", {"type": "concept"}).startswith("created")
 
     # The second schema validation after dedup can reject a dedup-mutated candidate.
@@ -737,7 +737,7 @@ def test_remaining_helper_branch_outcomes(tmp_path, monkeypatch):
     policy = {"capabilities": {"cron:x": {"operations": ["update"]}}}
     token = m._caller_var.set({"kind": "job", "actor": "cron:x"})
     monkeypatch.setattr(m, "_effective_policy", lambda: policy)
-    monkeypatch.setattr(m.policy_plane, "evaluate_capability", lambda *_a: None)
+    monkeypatch.setattr(m.policy_plane, "evaluate_capability", lambda *_a, **_k: None)
     try:
         assert m._capability_reject(page, "update") is None
     finally:
@@ -788,7 +788,7 @@ def test_create_existing_fields_and_identity_branch_outcomes(tmp_path, monkeypat
     monkeypatch.setattr(m, "_missing_source_reject", lambda *_a, **_k: None)
     monkeypatch.setattr(m, "_page_id_and_kind", lambda *_a: ("", "slug"))
     monkeypatch.setattr(m, "schema_reject_reason", lambda *_a: None)
-    monkeypatch.setattr(m, "_dedup_on_create", lambda *_a: None)
+    monkeypatch.setattr(m, "_dedup_on_create", lambda *_a, **_k: None)
     out = m._create("x", {"type": "good_type", "version": 7,
                            "created": "2026-01-01", "last_updated": "2026-01-01"})
     assert out.startswith("created")

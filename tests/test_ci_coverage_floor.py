@@ -63,12 +63,15 @@ def test_private_ci_full_suite_publishes_and_enforces_branch_aware_coverage():
     #   ConfigError: Couldn't read '"/builds/jlew/okengine/pyproject.toml"'
     # The old assertion pinned the broken form, so the gate that should have caught this asserted
     # it instead.
-    assert "--cov-config=$CI_PROJECT_DIR/pyproject.toml" in ci
+    # Since okengine#900 the shards read pyproject's run table rewritten with absolute paths.
+    assert "--cov-config=$CI_PROJECT_DIR/artifacts/coverage-absolute.rc" in ci
     assert '--cov-config="' not in ci, (
         "a quoted --cov-config path reaches coverage with the quotes attached")
-    assert "--cov-report=term" in ci
-    assert "--cov-report=json:coverage.json" in ci
-    assert "--cov-fail-under=" in ci
+    # Sharded since okengine#898: the shards write raw data; full-suite-combine combines it and
+    # publishes the terminal report, coverage.json and the enforced floors.
+    assert "coverage combine" in ci
+    assert "coverage report --fail-under=" in ci
+    assert "coverage json -o coverage.json" in ci
     assert "scripts/check_branch_coverage.py coverage.json" in ci
     assert "--line-min 100 --per-file" in ci
     assert "coverage: '/TOTAL.*?([0-9]{1,3}%)$/'" in ci
@@ -97,17 +100,34 @@ def test_release_and_coverage_targets_share_the_canonical_interpreter():
 
 def test_ci_flag_matches_the_declared_floor():
     """The half-applied-ratchet guard: the CLI flag wins, so a mismatch means the
-    lower of the two is silently the real bar."""
+    lower of the two is silently the real bar.
+
+    Sharded (okengine#898): the ENFORCING flag is full-suite-combine's `coverage report
+    --fail-under=`, over the union of every shard. The one permitted exception is the shards'
+    `--cov-fail-under=0`, which only stops pyproject's floor from failing a partial slice; it is
+    pinned to full-suite's SUITE_COV so it cannot spread to a job that decides the gate."""
     if not CI.is_file():
         pytest.skip("private pipeline configuration is publish-excluded and absent from this snapshot")
+    yaml = pytest.importorskip("yaml")
+    text = CI.read_text(encoding="utf-8")
+    doc = yaml.safe_load(text)
 
-    flags = re.findall(r"--cov-fail-under=(\d+)", CI.read_text(encoding="utf-8"))
-    assert flags, "the CI full-suite job must pass an explicit --cov-fail-under"
+    enforcing = re.findall(r"coverage report --fail-under=(\d+)",
+                           " ".join(map(str, doc["full-suite-combine"]["script"])))
+    assert enforcing, "full-suite-combine must pass an explicit --fail-under to coverage report"
 
     declared = declared_floor()
-    for flag in flags:
+    shard_cov = doc["full-suite"]["variables"]["SUITE_COV"]
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    flags = re.findall(r"--(?:cov-)?fail-under=(\d+)", code)
+    exempt = re.findall(r"--(?:cov-)?fail-under=(\d+)", shard_cov)
+    assert exempt == ["0"], f"shards must disable the per-slice floor explicitly, got {exempt}"
+    remaining = list(flags)
+    remaining.remove("0")
+    assert remaining, "no enforcing coverage floor left in the CI file"
+    for flag in remaining:
         assert int(flag) == declared, (
-            f"CI passes --cov-fail-under={flag} but pyproject declares "
+            f"CI passes a fail-under of {flag} but pyproject declares "
             f"fail_under={declared}. The command-line flag WINS, so the lower of the "
             f"two is the real bar — raise both together or the ratchet is inert."
         )
@@ -188,4 +208,9 @@ def test_coverage_is_part_of_the_automatic_full_suite():
     extends = job.get("extends") or []
     extends = [extends] if isinstance(extends, str) else list(extends)
     assert ".code-gates" in extends
-    assert "--cov-fail-under=100" in job["variables"]["SUITE_COV"]
+    assert "--cov" in job["variables"]["SUITE_COV"].split()
+    # The floor is judged on the union by the combine job, which is exactly as automatic.
+    combine = doc["full-suite-combine"]
+    assert ".code-gates" in ([combine["extends"]] if isinstance(combine["extends"], str)
+                             else combine["extends"])
+    assert any("coverage report --fail-under=100" in str(line) for line in combine["script"])

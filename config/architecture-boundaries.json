@@ -29,6 +29,7 @@
     ,"src/okengine/write_services/integrity.py": {"maximum_lines": 800, "target_lines": 800}
     ,"src/okengine/write_services/patching.py": {"maximum_lines": 800, "target_lines": 800}
     ,"src/okengine/write_services/policy.py": {"maximum_lines": 800, "target_lines": 800}
+    ,"src/okengine/write_services/raw_sources.py": {"maximum_lines": 800, "target_lines": 800}
     ,"src/okengine/write_services/review.py": {"maximum_lines": 800, "target_lines": 800}
     ,"src/okengine/write_services/state.py": {"maximum_lines": 800, "target_lines": 800}
     ,"src/okengine/write_services/transactions.py": {"maximum_lines": 800, "target_lines": 800}

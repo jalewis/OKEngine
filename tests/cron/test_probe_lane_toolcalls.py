@@ -392,3 +392,53 @@ def test_the_cron_lane_script_field_has_no_arguments():
     assert lane["script"].endswith("probe_lane_toolcalls.py")
     assert lane["no_agent"] is True
     assert lane["env"]["OKENGINE_PROBE_CRON"] == "1"
+
+
+# --------------------------------------------------------------- okengine#874: MCP SDK shapes
+
+class _Mcp2Tool:
+    """MCP 2 renamed Tool.inputSchema to input_schema (the gateway runs mcp 2.0.0)."""
+    def __init__(self, name, schema):
+        self.name, self.description, self.input_schema = name, "d", schema
+
+
+def test_the_probe_reads_the_mcp2_input_schema():
+    m = _load()
+    schema = {"type": "object", "properties": {"path": {"type": "string"}}}
+    arr = m.build_array("okengine-write", [_Mcp2Tool("create_entity", schema)])
+    assert arr[0]["parameters"] == schema
+    assert arr[0]["name"] == "mcp__okengine_write__create_entity"
+
+
+def test_the_probe_still_reads_the_legacy_input_schema():
+    m = _load()
+    schema = {"type": "object", "properties": {"q": {"type": "string"}}}
+    assert m.build_array("okengine-write", [_Tool("search", schema=schema)])[0]["parameters"] == schema
+
+
+def test_a_tool_with_no_schema_is_a_named_error_not_an_empty_schema():
+    m = _load()
+
+    class _Bare:
+        name, description = "mystery", "d"
+    with pytest.raises(ValueError, match="mystery.*no input schema"):
+        m.build_array("okengine-write", [_Bare()])
+
+
+def test_the_probe_reads_the_installed_mcp_sdks_real_tool():
+    """Contract against the SDK actually installed, whichever major it is."""
+    types = pytest.importorskip("mcp.types")
+    schema = {"type": "object", "properties": {}}
+    field = "input_schema" if "input_schema" in getattr(types.Tool, "model_fields", {}) else "inputSchema"
+    tool = types.Tool(name="create_entity", description="d", **{field: schema})
+    assert _load().build_array("okengine-write", [tool])[0]["parameters"] == schema
+
+
+def test_the_probe_keeps_a_tools_description_and_blanks_a_missing_one():
+    m = _load()
+    described = _Mcp2Tool("create_entity", {"type": "object"})
+    described.description = "Create a governed page."
+    bare = _Mcp2Tool("update_entity", {"type": "object"})
+    bare.description = None
+    arr = m.build_array("okengine-write", [described, bare])
+    assert [t["description"] for t in arr] == ["Create a governed page.", ""]

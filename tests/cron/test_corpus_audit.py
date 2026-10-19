@@ -244,12 +244,37 @@ def test_body_integrity_detects_malformed_and_reader_derived_headings(tmp_path):
             "actor_is_a_publisher_examples": [],
             "actor_class_contradiction_pages": 0,
             "actor_class_contradiction_examples": [],
+            # no page carries an actor type: nothing measured, so undetectable, not 0 (QA !1296)
+            "actor_identity_ungrounded_pages": None,
+            "actor_identity_ungrounded_reasons": {},
+            "actor_identity_ungrounded_examples": [],
+            "actor_identity_unsourced_pages": None,
+            "actor_identity_unsourced_examples": [],
         "source_descriptor_pages": 0,
         "source_descriptor_examples": [],
         "overbroad_alias_pages": 0,
         "overbroad_alias_terms": [],
         "overbroad_alias_examples": [],
         "scalar_alias_pages": 0,
+        "non_name_alias_pages": 0,
+        "non_name_alias_examples": [],
+        "readded_rejected_alias_pages": 0,
+        "readded_rejected_alias_examples": [],
+        "broken_tombstone_pages": 0,
+        "broken_tombstone_kinds": {},
+        "broken_tombstone_examples": [],
+        "unnamed_actor_pages": 0,
+        "unnamed_actor_examples": [],
+        "misplaced_attestation_pages": 0,
+        "misplaced_attestation_examples": [],
+        "lane_created_attestation_pages": 0,
+        "lane_created_attestation_examples": [],
+        "unattested_operator_ref_pages": 0,
+        "unattested_operator_ref_examples": [],
+        "dangling_operator_ref_pages": 0,
+        "dangling_operator_ref_examples": [],
+        "actor_types_undeclared": {},
+        "actor_identity_library": True,
     }
     rendered = mod.render(state, "2026-07-16")
     assert "## Body integrity" in rendered
@@ -531,7 +556,7 @@ def test_wake_sentinel_is_valid_json(tmp_path, capsys):
     mod = _load()
     mod.VAULT = tmp_path
     mod.WIKI = tmp_path / "wiki"          # absent -> the early-return sentinel path
-    rc = mod.main()
+    rc = mod.main([])
     assert rc == 0
     last = capsys.readouterr().out.strip().splitlines()[-1]
     assert json.loads(last) == {"wakeAgent": False}
@@ -608,15 +633,17 @@ coverage_fields:
     (wiki / "bad.md").write_text("---\n[bad\n---\n")
     page = wiki / "entities" / "a.md"
     _page(page, "type: entity\nname: Alpha\nevidence: [scalar]\nsubject: external/path")
+    # The page vanishes between its frontmatter read (streamed through Path.open since #880) and
+    # its full-text body read (Path.read_text): the body read must degrade, not crash.
     original = mod.Path.read_text
     reads = {page: 0}
-    def race_on_second(self, *args, **kwargs):
+    def race_on_body_read(self, *args, **kwargs):
         if self == page:
             reads[page] += 1
-            if reads[page] == 2:
+            if reads[page] == 1:
                 raise OSError("moved")
         return original(self, *args, **kwargs)
-    monkeypatch.setattr(mod.Path, "read_text", race_on_second)
+    monkeypatch.setattr(mod.Path, "read_text", race_on_body_read)
     state = mod.audit(vault)
     assert state["parse_errors"] == 1
     assert state["pages"] == 2
@@ -647,7 +674,7 @@ def test_main_completion_writes_dashboard_and_json_sentinel(tmp_path, capsys):
     mod.VAULT = vault
     mod.WIKI = vault / "wiki"
     mod.DASH_DIR = vault / "wiki" / "dashboards"
-    assert mod.main() == 0
+    assert mod.main([]) == 0
     assert (mod.DASH_DIR / "corpus-audit.md").is_file()
     assert json.loads(capsys.readouterr().out.strip().splitlines()[-1]) == {"wakeAgent": False}
 
@@ -1346,6 +1373,100 @@ def test_short_generic_aliases_are_flagged_but_catalogue_ids_are_not(tmp_path):
     assert "| Over-broad alias (< 4 chars) | 1 | 2 distinct term(s) — `AI`, `LLM` |" in rendered
 
 
+def test_names_that_differ_only_in_spacing_cluster(tmp_path):
+    """okengine#99: the spaced identity key could not join "TheVikingsofDW" with "The Vikings of DW",
+    so live duplicates stayed invisible. Two IP-shaped names that collapse to the same digits must
+    NOT join, and a leading "The" is only dropped as a word or CamelCase prefix ("Theft" keeps it)."""
+    mod = _load()
+    vault = _vault(tmp_path, SCHEMA_TYPED)
+    E = vault / "wiki" / "entities"
+    _page(E / "t/h/thevikingsofdw.md", "type: actor\ntitle: TheVikingsofDW")
+    _page(E / "t/h/the-vikings-of-dw.md", "type: actor\ntitle: The Vikings of DW")
+    _page(E / "0-9/1/110-37-3-251.md", "type: indicator\ntitle: 110.37.3.251")
+    _page(E / "0-9/1/110-37-32-51.md", "type: indicator\ntitle: 110.37.32.51")
+    _page(E / "t/h/theft-crew.md", "type: actor\ntitle: Theft Crew")
+    _page(E / "f/t/ft-crew.md", "type: actor\ntitle: FT Crew")
+    clusters = mod.audit(vault)["fragmentation"]
+    members = [sorted(p.rsplit("/", 1)[-1] for p in c["members"]) for c in clusters]
+    assert ["the-vikings-of-dw.md", "thevikingsofdw.md"] in members, members
+    assert not any("110-37-3-251.md" in m for m in members), "digit-only keys never join"
+    assert not any("theft-crew.md" in m for m in members), "'Theft' is not 'The' + 'ft'"
+def test_an_alias_that_is_not_a_name_is_counted_by_page(tmp_path):
+    """okengine#845: a URL, prose or a comma-joined list is not an alias at all. The write path now
+    refuses new ones through the same schema_lib rule, so this row measures legacy data and any lane
+    writing around the write path. Tombstoned pages are ignored, like every other alias row."""
+    mod = _load()
+    vault = _vault(tmp_path, SCHEMA_TYPED)
+    _page(vault / "wiki" / "entities" / "a.md",
+          "type: actor\ntitle: X\naliases: ['https://example.test/report', Cozy Bear]")
+    _page(vault / "wiki" / "entities" / "b.md",
+          "type: actor\ntitle: Y\naliases: ['Red Apollo, CVNX, POTASSIUM']")
+    _page(vault / "wiki" / "entities" / "c.md",
+          "type: actor\ntitle: Z\naliases: [ALPHV, 'Furuno Electric Co., Ltd.']")
+    _page(vault / "wiki" / "entities" / "d.md",
+          "type: actor\ntitle: W\nstatus: tombstoned\naliases: ['https://example.test/old']")
+    state = mod.audit(vault)
+    integrity = state["body_integrity"]
+    assert integrity["non_name_alias_pages"] == 2, "a and b only; real names and tombstones pass"
+    rendered = mod.render(state, "2026-09-23")
+    assert "| Alias that is not a name (URL / prose / list) | 2 | 2 |" in rendered
+def test_tombstones_with_an_unusable_successor_are_counted_by_kind(tmp_path):
+    """okengine#101: a tombstone retires a page ONTO the same identity. Each broken shape below was
+    measured on a live vault; the legitimate retirements (a generic label with no successor, a real
+    duplicate onto its live canonical) must not be counted."""
+    mod = _load()
+    vault = _vault(tmp_path, SCHEMA_TYPED)
+    E = vault / "wiki" / "entities"
+    _page(E / "l/a/lazarus-group.md", "type: actor\ntitle: Lazarus Group\nstatus: tombstoned\n"
+          "tombstone_reason: Different entity from Sapphire Sleet")
+    _page(E / "u/n/unit-8200.md", "type: actor\ntitle: Unit 8200\nstatus: tombstoned\n"
+          "tombstone_reason: Duplicate of Stuxnet\nsuperseded_by: entities/s/t/stuxnet")
+    _page(E / "s/t/stuxnet.md", "type: malware\ntitle: Stuxnet")
+    _page(E / "f/o/fox-kitten.md", "type: actor\ntitle: Fox Kitten\nstatus: tombstoned\n"
+          "tombstone_reason: Duplicate\nsuperseded_by: entities/f/o/fox-kitten")
+    _page(E / "a/p/apt45.md", "type: actor\ntitle: APT45\nstatus: tombstoned\n"
+          "tombstone_reason: Duplicate of Andariel\nsuperseded_by: entities/a/n/andariel")
+    _page(E / "a/n/andariel.md", "type: actor\ntitle: Andariel\nstatus: tombstoned\n"
+          "tombstone_reason: generic reason")
+    _page(E / "c/o/cozy-bear.md", "type: actor\ntitle: Cozy Bear\nstatus: tombstoned\n"
+          "tombstone_reason: Duplicate of APT28\nsuperseded_by: entities/a/apt28-not-a-page")
+    _page(E / "w/i/winnti-group.md", "type: actor\ntitle: Winnti Group\nstatus: tombstoned\n"
+          "tombstone_reason: merged into a note\nsuperseded_by: concepts/t/winnti-note")
+    _page(vault / "wiki/concepts/t/winnti-note.md", "type: concept\ntitle: Winnti note")
+    _page(E / "x/y/xyz-dup.md", "type: actor\ntitle: Xyz\nstatus: tombstoned\n"
+          "tombstone_reason: Duplicate of Lazarus")
+    _page(E / "o/f/off-namespace.md", "type: actor\ntitle: Off\nstatus: tombstoned\n"
+          "tombstone_reason: merged into a note\nsuperseded_by: concepts/n/nowhere")
+    # legitimate: a generic label with no successor, and a duplicate onto a live canonical
+    _page(E / "u/n/unknown-actor.md", "type: actor\ntitle: Unknown Actor\nstatus: tombstoned\n"
+          "tombstone_reason: generic class label, not a named threat actor")
+    _page(E / "a/p/apt38.md", "type: actor\ntitle: APT38\nstatus: tombstoned\n"
+          "tombstone_reason: Duplicate of Sapphire Sleet\nsuperseded_by: entities/sapphire-sleet")
+    _page(E / "s/a/sapphire-sleet.md", "type: actor\ntitle: Sapphire Sleet")
+    integrity = mod.audit(vault)["body_integrity"]
+    assert integrity["broken_tombstone_kinds"] == {
+        "reason says the subjects differ": 1, "successor is another type": 1, "supersedes itself": 1,
+        "successor is tombstoned": 1, "successor does not exist": 2,
+        "successor is not an entity": 1, "duplicate with no successor": 1,
+    }, integrity["broken_tombstone_kinds"]
+    assert integrity["broken_tombstone_pages"] == 8
+    rendered = mod.render(mod.audit(vault), "2026-09-23")
+    assert "| Tombstoned entity with an unusable successor | 8 |" in rendered
+def test_an_actor_with_no_name_is_counted(tmp_path):
+    """okengine#846: every name-based identity guard is blind to an actor with no name."""
+    mod = _load()
+    vault = _vault(tmp_path, SCHEMA_TYPED)
+    E = vault / "wiki" / "entities"
+    _page(E / "a.md", "type: actor\nid: entities:a")
+    _page(E / "b.md", "type: actor\ntitle: '---'")
+    _page(E / "c.md", "type: actor\nname: Named By Name")
+    _page(E / "d.md", "type: actor\ntitle: Titled")
+    _page(E / "e.md", "type: actor\nstatus: tombstoned")
+    integrity = mod.audit(vault)["body_integrity"]
+    assert integrity["unnamed_actor_pages"] == 2, "a and b; name counts; tombstones ignored"
+    assert "| Actor page with no name | 2 | 2 |" in mod.render(mod.audit(vault), "2026-09-23")
+
+
 def test_a_short_non_ascii_alias_is_not_short(tmp_path):
     """Character count proxies for specificity only within one script: three CJK characters are a
     full name, not an acronym. `狼毒草` is on the live vault and must not be reported."""
@@ -1396,6 +1517,24 @@ def test_a_scalar_alias_still_enters_the_fragmentation_index(tmp_path):
         "a scalar-aliased page must still cluster with the page it shares a token with")
 
 
+def test_an_alias_its_own_review_rejected_is_counted_when_it_comes_back(tmp_path):
+    """TAA#48: `rejected_aliases` records names a review removed. The write path refuses them and
+    direct writers go through schema_lib.admissible_aliases, so a page carrying one again means a
+    writer merged aliases around that rule. Spelling-blind, and tombstones are ignored."""
+    mod = _load()
+    vault = _vault(tmp_path, SCHEMA_TYPED)
+    _page(vault / "wiki" / "entities" / "a.md",
+          "type: actor\ntitle: X\naliases: [Cozy Bear, Hydraq]\nrejected_aliases: [HYDRAQ]")
+    _page(vault / "wiki" / "entities" / "b.md",
+          "type: actor\ntitle: Y\naliases: [Red Apollo]\nrejected_aliases: [Stuxnet]")
+    _page(vault / "wiki" / "entities" / "c.md",
+          "type: actor\ntitle: Z\nstatus: tombstoned\naliases: [Hydraq]\nrejected_aliases: [Hydraq]")
+    state = mod.audit(vault)
+    assert state["body_integrity"]["readded_rejected_alias_pages"] == 1, "a only"
+    assert state["body_integrity"]["readded_rejected_alias_examples"] == ["entities/a.md → Hydraq"]
+    assert "| Alias re-added after review rejected it | 1 | 1 |" in mod.render(state, "2026-09-23")
+
+
 def test_the_new_example_lists_cap_while_their_counts_stay_complete(tmp_path):
     """Examples are a sample; the counts are the measurement. A cap that also truncated the count
     would under-report the defect and make a spreading problem look contained -- the dashboard is
@@ -1406,8 +1545,23 @@ def test_the_new_example_lists_cap_while_their_counts_stay_complete(tmp_path):
         _page(vault / "wiki" / "entities" / f"d{i}.md",
               f"type: actor\ntitle: D{i}\npublisher: Outlet\nsource_kind: report")
         _page(vault / "wiki" / "entities" / f"a{i}.md", f"type: actor\ntitle: A{i}\naliases: [AI]")
+        _page(vault / "wiki" / "entities" / f"u{i}.md",
+              f"type: actor\ntitle: U{i}\naliases: ['https://example.test/{i}']")
+        _page(vault / "wiki" / "entities" / f"t{i}.md",
+              f"type: actor\ntitle: T{i}\nstatus: tombstoned\ntombstone_reason: Different entity from X{i}")
+        _page(vault / "wiki" / "entities" / f"n{i}.md", f"type: actor\nid: entities:n{i}")
+        _page(vault / "wiki" / "entities" / f"r{i}.md",
+              f"type: actor\ntitle: R{i}\naliases: [Hydraq{i}]\nrejected_aliases: [hydraq{i}]")
     integrity = mod.audit(vault)["body_integrity"]
     assert integrity["source_descriptor_pages"] == 5
+    assert integrity["non_name_alias_pages"] == 5
+    assert len(integrity["non_name_alias_examples"]) == mod.MAX_EXAMPLES
+    assert integrity["broken_tombstone_pages"] == 5
+    assert len(integrity["broken_tombstone_examples"]) == mod.MAX_EXAMPLES
+    assert integrity["unnamed_actor_pages"] == 5
+    assert len(integrity["unnamed_actor_examples"]) == mod.MAX_EXAMPLES
+    assert integrity["readded_rejected_alias_pages"] == 5
+    assert len(integrity["readded_rejected_alias_examples"]) == mod.MAX_EXAMPLES
     assert len(integrity["source_descriptor_examples"]) == mod.MAX_EXAMPLES
     assert integrity["overbroad_alias_pages"] == 5
     assert len(integrity["overbroad_alias_examples"]) == mod.MAX_EXAMPLES
@@ -1676,6 +1830,19 @@ def test_underscores_case_and_spacing_are_all_the_same_name(tmp_path):
     assert len(state["near_duplicate_slugs"][0]) == 3
 
 
+def test_a_case_only_variant_is_reported_as_one_pair(tmp_path):
+    """okengine#883: nvd-import minted `cve-2025-62673` beside an agent's `CVE-2025-62673`. The
+    partition-dup gate compares stems for equality and cannot see the pair; this detector must."""
+    mod = _load()
+    vault = _vault(tmp_path, SCHEMA_WITH_ENUMS)
+    _page(vault / "wiki" / "entities" / "c" / "v" / "CVE-2025-62673.md", "type: entity")
+    _page(vault / "wiki" / "entities" / "c" / "v" / "cve-2025-62673.md", "type: entity")
+    state = mod.audit(vault)
+    assert state["near_duplicate_slug_count"] == 1
+    assert state["near_duplicate_slugs"] == [
+        ["entities/c/v/CVE-2025-62673", "entities/c/v/cve-2025-62673"]]
+
+
 def test_a_distinct_name_is_never_paired(tmp_path):
     mod = _load()
     vault = _vault(tmp_path, SCHEMA_WITH_ENUMS)
@@ -1741,3 +1908,287 @@ def test_a_corpus_with_no_near_duplicates_says_zero(tmp_path):
     _page(vault / "wiki" / "entities" / "apt1.md", "type: entity")
     rendered = mod.render(mod.audit(vault), "2026-08-15")
     assert "**0** name(s) exist at more than one spelling" in rendered
+
+
+# --- okengine#1012: actor identity not grounded in its sources -------------------------------------
+
+SCHEMA_GROUNDING = SCHEMA_PUB + """
+identity_admission:
+  actor:
+    excluded_exact_titles: [China PRC Mainland]
+"""
+
+
+def _grounding_vault(tmp_path):
+    vault = _vault(tmp_path, SCHEMA_GROUNDING)
+    wiki = vault / "wiki"
+    _page(wiki / "sources" / "lockbit.md", "type: source\ntitle: Bank breach\nid: src:lockbit",
+          "LockBit claimed the attack on the bank.")
+    _page(wiki / "sources" / "wazza.md", "type: source\ntitle: Wazza phishkit",
+          "ANY.RUN has identified Wazza, a new phishkit targeting banks.")
+    _page(wiki / "sources" / "firefox.md", "type: source\ntitle: Firefox extensions",
+          "Researchers found 16 malicious Firefox extensions.")
+    _page(wiki / "entities" / "l" / "lockbit.md",
+          "type: actor\ntitle: LockBit\nsources: [src:lockbit]")              # id-ref, affirmed
+    _page(wiki / "entities" / "a" / "apt28.md",
+          "type: actor\ntitle: APT28\nsources: [MITRE ATT&CK]")              # curated label
+    _page(wiki / "entities" / "a" / "anyrun.md",
+          "type: actor\ntitle: ANY.RUN\nsources: [sources/wazza]")
+    _page(wiki / "entities" / "a" / "anonymous-dog.md",
+          "type: actor\ntitle: Anonymous Dog\nsources: [sources/firefox]")
+    _page(wiki / "entities" / "n" / "npm.md",
+          "type: actor\ntitle: npm\npublisher: npm\nsources: [MISP galaxy]")   # a byline
+    _page(wiki / "entities" / "i" / "iran-nexus.md",
+          "type: actor\ntitle: Iran-nexus\nsources: [MITRE ATT&CK]")
+    _page(wiki / "entities" / "c" / "china.md",
+          "type: actor\ntitle: China PRC Mainland\nsources: [MITRE ATT&CK]")
+    _page(wiki / "entities" / "h" / "hackers-breach-plant.md",
+          "type: actor\ntitle: Hackers Breach Polish Power Plant Controls\nsources: [MITRE ATT&CK]")
+    _page(wiki / "entities" / "u" / "unsourced.md", "type: actor\ntitle: Nightfall Group")
+    _page(wiki / "entities" / "d" / "dangling.md",
+          "type: actor\ntitle: Phantom Foxtrot\nsources: [sources/missing]")
+    _page(wiki / "entities" / "t" / "tombstoned.md",
+          "type: actor\ntitle: Accord\nstatus: tombstoned\nsources: [sources/firefox]")
+    return vault
+
+
+def test_ungrounded_actor_identities_are_counted_by_reason(tmp_path):
+    mod = _load()
+    integrity = mod.audit(_grounding_vault(tmp_path))["body_integrity"]
+    assert integrity["actor_identity_ungrounded_pages"] == 6, integrity
+    assert integrity["actor_identity_ungrounded_reasons"] == {
+        "geopolitical_or_nexus_label": 2,
+        "headline_title": 1,
+        "name_absent_from_sources": 1,
+        "name_equals_publisher": 1,
+        "source_defines_non_actor": 1,
+    }
+    assert integrity["actor_identity_unsourced_pages"] == 2, "unverifiable, counted apart"
+    assert integrity["actor_identity_unsourced_examples"] == [
+        "entities/d/dangling", "entities/u/unsourced"]
+    assert "entities/a/anyrun → source_defines_non_actor" in integrity[
+        "actor_identity_ungrounded_examples"]
+
+
+def test_the_ungrounded_actor_rows_render_as_warnings(tmp_path):
+    mod = _load()
+    rendered = mod.render(mod.audit(_grounding_vault(tmp_path)), "2026-10-08")
+    assert ("| Actor identity not grounded in its sources (WARN: review) | 6 | "
+            "geopolitical_or_nexus_label: 2, headline_title: 1") in rendered
+    assert "| Actor page with no resolvable source (WARN: unverifiable) | 2 | 2 |" in rendered
+
+
+def test_the_grounding_rows_say_undetectable_without_the_library(tmp_path, monkeypatch):
+    """The missing-key rule: no predicate is never a vacuous zero."""
+    mod = _load()
+    monkeypatch.setattr(mod, "actor_grounding_lib", None)
+    state = mod.audit(_grounding_vault(tmp_path))
+    assert state["body_integrity"]["actor_identity_ungrounded_pages"] is None
+    rendered = mod.render(state, "2026-10-08")
+    assert "| Actor identity not grounded in its sources | — | — | **undetectable**" in rendered
+    assert "| Actor page with no resolvable source | — | — | **undetectable**" in rendered
+
+
+def test_a_byline_is_flagged_even_when_a_source_affirms_it(tmp_path):
+    """`publisher` describes a source record; on an actor it is the report's identity stamped on
+    its subject, worth a look whatever the evidence says."""
+    mod = _load()
+    vault = _vault(tmp_path, SCHEMA_PUB)
+    _page(vault / "wiki" / "sources" / "s.md", "type: source\ntitle: R",
+          "Lapsus claimed the breach.")
+    _page(vault / "wiki" / "entities" / "l" / "lapsus.md",
+          "type: actor\ntitle: Lapsus\npublisher: Lapsus\nsources: [sources/s]")
+    integrity = mod.audit(vault)["body_integrity"]
+    assert integrity["actor_identity_ungrounded_reasons"] == {"name_equals_publisher": 1}
+
+
+def test_ungrounded_actor_examples_are_capped_and_names_fall_back_to_the_slug(tmp_path):
+    mod = _load()
+    vault = _vault(tmp_path, SCHEMA_PUB)
+    wiki = vault / "wiki"
+    for index in range(mod.MAX_EXAMPLES + 1):
+        _page(wiki / "entities" / f"u{index}.md", f"type: actor\ntitle: Unsourced {index}")
+        _page(wiki / "entities" / f"h{index}.md",
+              f"type: actor\ntitle: Hackers Breach Plant {index}\nsources: [MITRE ATT&CK]")
+    # nameless: the slug is the name, so a byline on the slug is still a byline
+    _page(wiki / "entities" / "zeta-crew.md", "type: actor\npublisher: zeta-crew\n"
+          "sources: [MITRE ATT&CK]")
+    integrity = mod.audit(vault)["body_integrity"]
+    assert integrity["actor_identity_unsourced_pages"] == mod.MAX_EXAMPLES + 1
+    assert len(integrity["actor_identity_unsourced_examples"]) == mod.MAX_EXAMPLES
+    assert integrity["actor_identity_ungrounded_pages"] == mod.MAX_EXAMPLES + 2
+    assert len(integrity["actor_identity_ungrounded_examples"]) == mod.MAX_EXAMPLES
+    assert integrity["actor_identity_ungrounded_reasons"] == {
+        "headline_title": mod.MAX_EXAMPLES + 1, "name_equals_publisher": 1}
+
+
+# --- okengine#1020: actors stored under a type the schema never declared ---------------------------
+
+SCHEMA_STIX = """
+types:
+  source: {required: [type]}
+  threat-actor: {required: [type]}
+  campaign: {required: [type]}
+  malware: {required: [type]}
+"""
+
+
+def _stix_vault(tmp_path, schema=SCHEMA_STIX):
+    vault = _vault(tmp_path, schema)
+    wiki = vault / "wiki"
+    _page(wiki / "sources" / "wazza.md", "type: source\ntitle: Wazza phishkit",
+          "ANY.RUN has identified Wazza, a new phishkit targeting banks.")
+    _page(wiki / "entities" / "t" / "a" / "ta505.md",
+          "type: threat-actor\ntitle: TA505\nsources: [MITRE ATT&CK]")
+    _page(wiki / "entities" / "a" / "n" / "anyrun.md",
+          "type: threat-actor\ntitle: ANY.RUN\nsources: [sources/wazza]")
+    _page(wiki / "entities" / "l" / "a" / "lazarus.md",
+          "type: threat-actor\naliases: [Lazarus Group]\nsources: [MITRE ATT&CK]")
+    _page(wiki / "entities" / "z" / "e" / "zeta.md", "type: threat-actor\nsources: [MITRE ATT&CK]")
+    _page(wiki / "entities" / "r" / "e" / "redline.md", "type: malware\ntitle: RedLine")
+    # The corpus's own actor references: three land on threat-actor (one partition-unaware, one
+    # a wikilink), one stray reference lands on malware, one names no page.
+    _page(wiki / "entities" / "c" / "a" / "c1.md", "type: campaign\nactor: entities/t/a/ta505")
+    _page(wiki / "entities" / "c" / "a" / "c2.md", "type: campaign\nactor: entities/anyrun")
+    _page(wiki / "entities" / "c" / "a" / "c3.md",
+          "type: campaign\nactors: ['[[entities/l/a/lazarus|Lazarus]]', Lazarus]")
+    _page(wiki / "entities" / "c" / "a" / "c4.md", "type: campaign\nactor: entities/r/e/redline")
+    _page(wiki / "entities" / "c" / "a" / "c5.md", "type: campaign\nactor: entities/n/o/nowhere")
+    _page(wiki / "entities" / "u" / "n" / "untyped.md", "title: Untyped\nactor: entities/t/a/ta505")
+    return vault
+
+
+def test_actors_under_an_undeclared_type_are_undetectable_not_zero(tmp_path):
+    """Red before okengine#1020: the grounding rows read 0 on a vault whose 1,882 actors were all
+    `threat-actor` and `intrusion-set` -- a vacuous pass."""
+    mod = _load()
+    state = mod.audit(_stix_vault(tmp_path))
+    integrity = state["body_integrity"]
+    assert integrity["actor_types_undeclared"] == {"threat-actor": 4}, integrity
+    assert integrity["actor_identity_ungrounded_pages"] is None
+    assert integrity["actor_identity_unsourced_pages"] is None
+    rendered = mod.render(state, "2026-10-09")
+    assert ("| Actor identity not grounded in its sources | — | — | **undetectable** — actors are "
+            "stored under type(s) the schema does not declare `role: actor`: `threat-actor` |"
+            ) in rendered
+    assert ("| Actor type not declared (WARN: declare `role: actor` on the type) | 1 type(s) | "
+            "4 actor reference(s) | `threat-actor` (4 actor references) |") in rendered
+
+
+def test_a_declared_actor_type_is_measured(tmp_path):
+    mod = _load()
+    schema = SCHEMA_STIX.replace("threat-actor: {required: [type]}",
+                                 "threat-actor: {required: [type], role: actor}")
+    integrity = mod.audit(_stix_vault(tmp_path, schema))["body_integrity"]
+    assert integrity["actor_types_undeclared"] == {}
+    assert integrity["actor_identity_ungrounded_reasons"] == {"source_defines_non_actor": 1}
+    assert integrity["actor_identity_ungrounded_pages"] == 1
+    # named by an alias is named; only the slug-only page is unnamed (okengine#846 still counts)
+    assert integrity["unnamed_actor_pages"] == 1
+    assert integrity["unnamed_actor_examples"] == ["entities/z/e/zeta.md"]
+    rendered = mod.render(mod.audit(_stix_vault(tmp_path / "again", schema)), "2026-10-09")
+    assert ("| Actor type not declared (WARN: declare `role: actor` on the type) | 0 type(s) | "
+            "0 actor reference(s) | — |") in rendered
+
+
+def test_a_stray_actor_reference_does_not_make_a_type_an_actor(tmp_path):
+    """One reference to a malware page among actor references is a wiring slip, not a type."""
+    mod = _load()
+    vault = _vault(tmp_path, SCHEMA_PUB)
+    wiki = vault / "wiki"
+    for name in ("one", "two", "three", "four"):
+        _page(wiki / "entities" / f"{name}.md", f"type: actor\ntitle: {name.title()} Crew")
+        _page(wiki / "campaigns" / f"c-{name}.md", f"type: source\nactor: entities/{name}")
+    _page(wiki / "entities" / "redline.md", "type: publisher\ntitle: RedLine")
+    for index in range(12):
+        _page(wiki / "campaigns" / f"x{index}.md", f"type: source\nactor: entities/{'one' if index % 2 else 'two'}")
+    for index in range(3):
+        _page(wiki / "campaigns" / f"m{index}.md", "type: source\nactor: entities/redline")
+    integrity = mod.audit(vault)["body_integrity"]
+    assert integrity["actor_types_undeclared"] == {}, "3 of 19 references is under the 20% share"
+
+
+def test_a_type_with_a_real_share_of_actor_references_is_reported_beside_declared_actors(tmp_path):
+    """Mixed: some actors are declared, a second type holds the rest undeclared. The grounding
+    count stays (it measured something) and the undeclared type is a WARN beside it."""
+    mod = _load()
+    vault = _vault(tmp_path, SCHEMA_PUB)
+    wiki = vault / "wiki"
+    _page(wiki / "entities" / "one.md", "type: actor\ntitle: One Crew")
+    for index in range(4):
+        _page(wiki / "entities" / f"set{index}.md", "type: publisher\ntitle: Set {index}")
+        _page(wiki / "campaigns" / f"c{index}.md", f"type: source\nactor: entities/set{index}")
+    _page(wiki / "campaigns" / "c-one.md", "type: source\nactor: entities/one")
+    integrity = mod.audit(vault)["body_integrity"]
+    assert integrity["actor_types_undeclared"] == {"publisher": 4}
+    assert integrity["actor_identity_ungrounded_pages"] is not None
+
+
+def test_an_actor_named_like_a_corpus_non_actor_is_not_grounded_by_its_actions(tmp_path):
+    """okengine#1014: the detector reads the corpus's own evidence that a name is not an actor -- a
+    live `malware` page called RedLine -- so "RedLine steals ..." no longer grounds a RedLine actor.
+    A source page of the same title is a document, not that evidence. Red before."""
+    mod = _load()
+    schema = SCHEMA_STIX.replace("threat-actor: {required: [type]}",
+                                 "threat-actor: {required: [type], role: actor}")
+    vault = _vault(tmp_path, schema)
+    wiki = vault / "wiki"
+    _page(wiki / "sources" / "r.md", "type: source\ntitle: Stealer report",
+          "RedLine steals browser passwords. Vidar steals wallets.")
+    _page(wiki / "sources" / "vidar.md", "type: source\ntitle: Vidar")
+    _page(wiki / "entities" / "r" / "redline-malware.md", "type: malware\ntitle: RedLine")
+    _page(wiki / "entities" / "r" / "redline-old.md",
+          "type: malware\ntitle: Retired\nstatus: tombstoned")
+    _page(wiki / "entities" / "r" / "redline.md",
+          "type: threat-actor\ntitle: RedLine\nsources: [sources/r]")
+    _page(wiki / "entities" / "v" / "vidar.md",
+          "type: threat-actor\ntitle: Vidar\nsources: [sources/r]")
+    integrity = mod.audit(vault)["body_integrity"]
+    assert integrity["actor_identity_ungrounded_reasons"] == {"no_source_affirms_actor": 1}
+    assert integrity["actor_identity_ungrounded_examples"] == [
+        "entities/r/redline → no_source_affirms_actor"]
+
+
+def test_a_vault_with_no_actor_type_page_reads_undetectable_not_zero(tmp_path):
+    """QA of !1296: undeclared actors linked only by `attributed_to` (or not at all) read 0 with no
+    WARN. With no actor-type page nothing was measured, so the rows say undetectable."""
+    mod = _load()
+    vault = _vault(tmp_path, SCHEMA_STIX)
+    wiki = vault / "wiki"
+    for slug in ("ta505", "fin7", "anyrun"):
+        _page(wiki / "entities" / f"{slug}.md", f"type: threat-actor\ntitle: {slug.upper()}")
+        _page(wiki / "entities" / f"c-{slug}.md", f"type: campaign\nattributed_to: entities/{slug}")
+    state = mod.audit(vault)
+    integrity = state["body_integrity"]
+    assert integrity["actor_types_undeclared"] == {"threat-actor": 3}
+    assert integrity["actor_identity_ungrounded_pages"] is None
+    empty = mod.audit(_vault(tmp_path / "empty", SCHEMA_STIX))
+    assert empty["body_integrity"]["actor_identity_ungrounded_pages"] is None
+    assert empty["body_integrity"]["actor_types_undeclared"] == {}
+    rendered = mod.render(empty, "2026-10-09")
+    assert ("| Actor identity not grounded in its sources | — | — | **undetectable** — no page "
+            "carries a declared actor type") in rendered
+
+
+def test_an_undeclared_actor_like_type_is_not_namesake_evidence(tmp_path):
+    """Delta QA of !1297: with only `threat-actor` declared, the same APT stored under the
+    undeclared `intrusion-set` type became a "non-actor namesake", so its verbs stopped grounding
+    the declared page. A type the audit flags as undeclared-actor-like holds actors, not namesakes."""
+    mod = _load()
+    schema = SCHEMA_STIX.replace("threat-actor: {required: [type]}",
+                                 "threat-actor: {required: [type], role: actor}\n"
+                                 "  intrusion-set: {required: [type]}")
+    vault = _vault(tmp_path, schema)
+    wiki = vault / "wiki"
+    _page(wiki / "sources" / "mb.md", "type: source\ntitle: Report",
+          "Midnight Blizzard breached the email system.")
+    _page(wiki / "entities" / "midnight-blizzard.md",
+          "type: threat-actor\ntitle: Midnight Blizzard\nsources: [sources/mb]")
+    for slug in ("midnight-blizzard-set", "nobelium", "apt29"):
+        _page(wiki / "entities" / f"{slug}.md", f"type: intrusion-set\ntitle: "
+              f"{'Midnight Blizzard' if slug.startswith('midnight') else slug.upper()}")
+        _page(wiki / "entities" / f"c-{slug}.md", f"type: campaign\nactor: entities/{slug}")
+    integrity = mod.audit(vault)["body_integrity"]
+    assert integrity["actor_types_undeclared"] == {"intrusion-set": 3}
+    assert integrity["actor_identity_ungrounded_pages"] == 0, integrity[
+        "actor_identity_ungrounded_examples"]

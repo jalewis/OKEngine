@@ -64,8 +64,10 @@ def test_covers_every_required_surface():
         "least-privilege capability probe (#283)": "source-quality capability probe rejects",
         "hardened posture host-side peer (#326 [1])": "hardened_posture_violations",
         "shared deployment-checks section (#405)": "import deployment_checks as C",
-        "scheduler-independent full cron contract": '"crons", "timezone"',
-        "scheduler-independent Agent Chat toolset check": '"operations", "auth"',
+        # crons/timezone/operations/auth run in step [9]'s derived list (okengine#1032 [22]), which
+        # tests/cron/test_post_deploy_verify_checks.py proves by executing the step. The derivation
+        # lives in the step's driver script since okengine#1043.
+        "scheduler-independent shared checks (step [9] driver)": "scripts/post_deploy_selfchecks.py",
         "scheduler-independent base-schema drift": 'config/base-schema.yaml:config/base-schema.yaml',
         "scheduler-independent schema-validator drift": 'tools/schema_validator.py:config/schema_validator.py',
         "invalid timezone fails closed": 'not a valid IANA timezone',

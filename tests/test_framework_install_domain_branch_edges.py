@@ -25,6 +25,12 @@ def _mod(name="framework_install_domain_edges"):
     return module
 
 
+_STATE_SPEC = importlib.util.spec_from_file_location(
+    "composed_pack_state_branch_edges", REPO / "scripts/composed_pack_state.py")
+_REAL_STATE = importlib.util.module_from_spec(_STATE_SPEC)
+_STATE_SPEC.loader.exec_module(_REAL_STATE)
+
+
 def _base(tmp_path):
     host, pack = tmp_path / "host", tmp_path / "pack"
     (host / "wiki").mkdir(parents=True)
@@ -223,7 +229,9 @@ def test_main_missing_pack_preflight_and_script_entrypoint(tmp_path, monkeypatch
     m = _mod("install_domain_main_edges")
     assert m.main([str(tmp_path / "missing-host"), str(tmp_path / "missing-pack")]) == 2
     host, pack = _base(tmp_path)
-    preflight = SimpleNamespace(main=lambda _args: 1)
+    # One stand-in serves every _load_mod name: the preflight gate and the state precheck.
+    preflight = SimpleNamespace(main=lambda _args: 1, read_state=lambda _host: {},
+                                MigrationStateError=RuntimeError)
     monkeypatch.setattr(m, "_load_mod", lambda _name: preflight)
     assert m.main([str(host), str(pack)]) == 1
     assert "preflight FAIL" in capsys.readouterr().err
@@ -404,8 +412,11 @@ def test_main_transaction_failures_without_snapshot(tmp_path, monkeypatch):
         source_manifest=lambda *_a: {"pack_version": "2.0.0", "lane_scripts": {"new": "x"}},
         write=lambda *_a: True,
         manifest_path=lambda *_a: Path("manifest.json"),
+        guest_chat_warning=lambda *_a: None,
+        with_chat_record=_REAL_STATE.with_chat_record,
     )
     fu = SimpleNamespace(
+        read_state=lambda _host: {}, MigrationStateError=RuntimeError,
         installed_pack_version=lambda *_a, **_k: "1.0.0",
         snapshot=lambda *_a, **_k: None,
         added_since_snapshot=lambda *_a: set(), changed_since_snapshot=lambda *_a: set(),

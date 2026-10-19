@@ -356,6 +356,18 @@ def _engine_meta_mod():
     return m
 
 
+def _require_readable_migration_state(dest: Path) -> None:
+    """Refuse an update before it writes anything when `dest`'s migration state is unreadable.
+
+    The installed version and the applied migrations live in that file. Reading it as empty would
+    replay the pack's migrations, so the update stops with the restore hint (okengine#991)."""
+    fu = _framework_upgrade_mod()
+    try:
+        fu.read_state(dest)
+    except fu.MigrationStateError as exc:
+        raise SystemExit(f"ERROR: {exc}")
+
+
 def _framework_upgrade_mod():
     """Load the sibling framework_upgrade module by path (the migration runner, okengine#312)."""
     spec = importlib.util.spec_from_file_location(
@@ -413,6 +425,12 @@ def _resolve_member(name: str, bundle_spec: dict, catalog: dict | None) -> dict:
 
 
 _BUNDLE_IDENT_KEYS = ("name", "description", "mission")
+# What the re-stamp writes. NOT `name`: the composed pack.yaml `name` is the deployment's write
+# principal (okengine.pack_principal, okengine#1027), and the host pack's types declare
+# `owner: <host>`. Stamping the bundle's name there left the host's own lanes non-owners of the
+# host's types, so their field updates on existing pages were silently kept as conflicts
+# (okengine#1032 [11]). The About panel reads the description and mission (okengine#183).
+_BUNDLE_DISPLAY_KEYS = ("description", "mission")
 
 
 def _bundle_identity(dest: Path) -> dict:
@@ -431,17 +449,18 @@ def _bundle_identity(dest: Path) -> dict:
 
 
 def _apply_bundle_identity(dest: Path, ident: dict) -> None:
-    """Re-stamp the BUNDLE's identity onto the composed pack.yaml — the host fetch overwrote it,
-    so the reader/cockpit About panel described the vault as the HOST pack (okengine#183: okcti
-    showed "threat-actor tracking" instead of the composed CTI vault). Surgical line edits so the
-    host pack.yaml's comments/structure survive; owns/requires/ports stay the host's (they ARE the
-    composed vault's contract — only the display identity belongs to the bundle)."""
+    """Re-stamp the BUNDLE's description and mission onto the composed pack.yaml — the host fetch
+    overwrote them, so the reader/cockpit About panel described the vault as the HOST pack
+    (okengine#183: okcti showed "threat-actor tracking" instead of the composed CTI vault).
+    Surgical line edits so the host pack.yaml's comments/structure survive; name/owns/requires/
+    ports stay the host's (they ARE the composed vault's contract, and `name` is its write
+    principal: see _BUNDLE_DISPLAY_KEYS)."""
     py = dest / "pack.yaml"
     try:
         txt = py.read_text(encoding="utf-8")
     except OSError:
         return
-    for k in _BUNDLE_IDENT_KEYS:
+    for k in _BUNDLE_DISPLAY_KEYS:
         if k not in ident:
             continue
         if re.search(rf"^{k}:", txt, re.M):
@@ -477,7 +496,8 @@ def _expand_bundle(meta: dict, bundle_spec: dict, dest: Path, catalog: dict | No
                     f"the recipe does not compose cleanly onto {host}.")
     if ident:
         _apply_bundle_identity(dest, ident)      # About describes the BUNDLE, not the host (#183)
-        print(f"    ✎ identity: {ident.get('name', host)} (bundle) re-stamped onto the composed pack.yaml")
+        print(f"    ✎ identity: {ident.get('name', host)} (bundle) description re-stamped onto the "
+              f"composed pack.yaml; its name stays {host} (the write principal)")
     print(f"  ✓ bundle composed into {dest} (host {host} + {len(compose)} pack(s))")
 
 
@@ -570,6 +590,7 @@ def main(argv: list[str]) -> int:
     if args.update:
         if not dest.is_dir() or not ((dest / "pack.yaml").is_file() or (dest / "schema.yaml").is_file()):
             raise SystemExit(f"ERROR: --update needs an existing pack dir (with pack.yaml/schema.yaml): {dest}")
+        _require_readable_migration_state(dest)   # before anything below writes to dest
         print(f"  ↻ update {spec['name']}  in {dest}  ←  {where}")
         with tempfile.TemporaryDirectory() as td:
             clone = Path(td) / "clone"
@@ -672,8 +693,11 @@ def main(argv: list[str]) -> int:
     # compute the migration span even after reconcile rewrites pack.yaml.
     fresh_meta = _load_meta_safe(dest)
     if fresh_meta and str(fresh_meta.get("version") or "") not in ("", "0.0.0"):
-        _framework_upgrade_mod().record_pack_version(
-            dest, str(fresh_meta["name"]), str(fresh_meta["version"]))
+        fu = _framework_upgrade_mod()
+        try:
+            fu.record_pack_version(dest, str(fresh_meta["name"]), str(fresh_meta["version"]))
+        except fu.MigrationStateError as exc:   # a forced pull kept an existing, torn state
+            raise SystemExit(f"ERROR: fetched, but the installed version is not recorded: {exc}")
 
     if not args.no_validate:
         _validate(dest)

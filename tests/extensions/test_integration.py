@@ -127,7 +127,7 @@ def test_two_extensions_compose_consistently(tmp_path):
     assert terr == [] and {t["id"] for t in targets} == {"demo.alpha"}
 
     # sidecar-generate: only the sidecar yields a service + token
-    override, wrappers, oerr = comp.sidecar_compose_override(pack)
+    override, wrappers, oerr = comp.sidecar_compose_override(pack, project="pack")
     assert oerr == []
     assert set(override["services"]) == {"demo.side-sidecar"}
     assert "demo.side" in wrappers

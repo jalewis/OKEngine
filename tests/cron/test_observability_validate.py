@@ -543,7 +543,7 @@ def test_lane_keys_cover_every_bucket_fleet_health_publishes():
 
 def test_writer_records_each_error_and_creates_parent(tmp_path, monkeypatch):
     m = load()
-    monkeypatch.setattr(m, "OUTPUT", tmp_path / "new" / "result.md")
+    monkeypatch.setattr(m, "OUTPUT", tmp_path / "wiki" / "new" / "result.md")
     m._write(["first", "second"])
     text = m.OUTPUT.read_text()
     assert "**FAIL** — 2 error(s)" in text
@@ -552,7 +552,9 @@ def test_writer_records_each_error_and_creates_parent(tmp_path, monkeypatch):
 
 def test_main_fails_when_result_cannot_be_published(tmp_path, monkeypatch, capsys):
     m, _ = fixture(tmp_path, monkeypatch)
-    monkeypatch.setattr(m, "OUTPUT", tmp_path)  # a directory cannot be replaced by the report
+    blocked = tmp_path / "wiki" / "operational" / "blocked.md"
+    blocked.mkdir(parents=True)
+    monkeypatch.setattr(m, "OUTPUT", blocked)  # a directory cannot be replaced by the report
     assert m.main() == 2
     assert "cannot publish result" in capsys.readouterr().err
 
