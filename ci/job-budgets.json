@@ -187,10 +187,10 @@
       "note": "max of 16 successful runs 2026-09-20..27; slowest was public-compatibility: [3.11]."
     },
     "public-snapshot": {
-      "measured_s": 838.9,
-      "job_id": 132669,
-      "measured_on": "2026-09-27",
-      "note": "max of 12 successful runs 2026-09-20..27; slowest was public-snapshot."
+      "measured_s": 2647.2,
+      "job_id": 174311,
+      "measured_on": "2026-10-20",
+      "note": "first run with the public coverage floor (okengine#1067): the public-tree suite under coverage took 42.6 min of it, against about 14 min without coverage (job 171798)."
     },
     "publication-policy": {
       "measured_s": 28.2,

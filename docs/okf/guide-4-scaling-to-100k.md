@@ -18,7 +18,7 @@ scaling concerns are driven by operating the live wiki, not by OKF itself.
 
 At small scale (hundreds of files) the pattern works with a flat `index.md` and minimal tooling. At ~100,000 files several structural assumptions break down and require deliberate architectural decisions. The examples below use neutral object kinds — **entities** (the things the domain tracks), **sources** (ingested raw material), **concepts** (cross-cutting patterns/segments), and **predictions** (falsifiable, dated claims) — with security (hosts/IOCs/TTPs/investigations) as one illustrative instantiation. The strategies are domain-independent.
 
-> **This engine is built for domain-agnostic scaling.** It performs link-preserving flat→hierarchical migration at scale (the IWE reference count holds constant across the move), and it can run **multiple domains in one vault** — a root domain and related sub-domains, each with its own `schema.yaml`, resolved by a walk-up validator.
+> **This engine is built for domain-agnostic scaling.** It performs link-preserving flat→hierarchical migration at scale (every `[[wikilink]]` to a moved page is rewritten in the same pass), and it can run **multiple domains in one vault** — a root domain and related sub-domains, each with its own `schema.yaml`, resolved by a walk-up validator.
 
 ---
 
@@ -105,7 +105,7 @@ Each INDEX entry is one line: a markdown link, a type tag, a status, and a one-l
 ### Sizing rule — the 500-entry rule
 **No index file exceeds 500 entries.** When a category grows past 500, it splits into subcategories (or paginates). This keeps every index readable in one pass regardless of total wiki size.
 
-> **In this engine.** `build_index_tree` auto-discovers namespaces from `schema.yaml` and regenerates the INDEX tree; the top INDEX is namespaces-only. The 500-rule is enforced via `reshard_over: 500` in `schema.yaml` (with `reshard_by`), and oversized leaves paginate into `INDEX-pNN.md`. The `reshelve` job re-files flat pages into the hierarchy. The flat→hierarchical migration (`okf_migrate`/`reshelve`) builds this tree while holding the IWE reference count constant — links survive the move.
+> **In this engine.** `build_index_tree` auto-discovers namespaces from `schema.yaml` and regenerates the INDEX tree; the top INDEX is namespaces-only. The 500-rule is enforced via `reshard_over: 500` in `schema.yaml` (with `reshard_by`), and oversized leaves paginate into `INDEX-pNN.md`. The `reshelve` job re-files flat pages into the hierarchy. The flat→hierarchical migration (`okf_migrate`/`reshelve`) builds this tree and rewrites every `[[wikilink]]` to a moved page in the same pass — links survive the move.
 
 ---
 
@@ -238,7 +238,7 @@ RAG embeds chunks into a vector space and retrieves by semantic similarity. For 
 - **Tier B — BM25.** Ranked keyword search across the full wiki (tantivy/whoosh-class) for phrase/concept queries.
 - **Tier C — qmd.** Local hybrid BM25 + lightweight vector + LLM re-rank, CLI + MCP, for concept queries over narrative content.
 
-> **In this engine.** Retrieval runs on **qmd** (hybrid BM25 + vector + rerank, Tier C — which subsumes Tier B), **IWE** (markdown knowledge-graph: backlinks, graph export, traversal over the `[[wikilinks]]`), and **ripgrep**. Embeddings-RAG is explicitly rejected per the engine's design. The **Tier-A identifier manifest is optional** — qmd + ripgrep already serve exact + ranked lookup, so the manifest is revisited only if qmd latency/cost becomes a constraint.
+> **In this engine.** Retrieval runs on **qmd** (hybrid BM25 + vector + rerank, Tier C — which subsumes Tier B), a **precomputed backlink graph** (`wiki/.backlinks.json`, rebuilt daily from the `[[wikilinks]]` and Markdown links by the `backlinks-refresh` cron), and **ripgrep**. Embeddings-RAG is explicitly rejected per the engine's design. The **Tier-A identifier manifest is optional** — qmd + ripgrep already serve exact + ranked lookup, so the manifest is revisited only if qmd latency/cost becomes a constraint.
 
 ---
 
@@ -340,7 +340,7 @@ Top-level INDEX example:
 | **okengine-reader** | Human web browsing/review interface over the vault | ✅ in use |
 | **okengine-mcp** | MCP query surface for the agent | ✅ read-only; ✅ write tools (`okengine-write`) |
 
-> **In this engine.** The read stack: IWE + qmd + ripgrep for retrieval, `okengine-reader` for human review, and `okengine-mcp` exposing `search`/`get_page`/`find_references`/`list_*`. The **write path through MCP**: a separate local stdio server **`okengine-write`** exposes `create_entity`/`update_entity`/`tombstone_entity`/`flag_for_review`/`patch_entity`/`append_to_section`, each validating against the walk-up `schema.yaml` and appending to `log.md` before write. Writer crons run on this enforced MCP write path; the `file`-tool schema validator is kept as the shape backstop.
+> **In this engine.** The read stack: qmd + ripgrep + the backlink graph (`wiki/.backlinks.json`) for retrieval, `okengine-reader` for human review, and `okengine-mcp` exposing `search`/`get_page`/`find_references`/`list_*`. The **write path through MCP**: a separate local stdio server **`okengine-write`** exposes `create_entity`/`update_entity`/`tombstone_entity`/`flag_for_review`/`patch_entity`/`append_to_section`, each validating against the walk-up `schema.yaml` and appending to `log.md` before write. Writer crons run on this enforced MCP write path; the `file`-tool schema validator is kept as the shape backstop.
 
 ---
 
@@ -355,11 +355,11 @@ How each strategy maps to a concrete engine mechanism:
 | 2 | Typed schema / mandatory frontmatter | per-type required fields in `schema.yaml`; write-guard; drift-lint; by-letter/by-date/by-type partitioning |
 | 3 | Namespace partitioning by write permission | write-guard + per-job toolset scoping + explicit matrix (`schema.yaml` `permissions:`, enforced in `okengine-write`) |
 | 4 | Tiered hot/warm/cold storage | derived `HOT.md` via `build_hot_set`; derived tiers (`tier_lib.tier_of`) + `tier-refresh` cron + `--tier` filter |
-| 5 | Search without RAG | qmd (hybrid) + IWE + ripgrep; RAG rejected; identifier manifest optional |
+| 5 | Search without RAG | qmd (hybrid) + backlink graph + ripgrep; RAG rejected; identifier manifest optional |
 | 6 | Incremental rolling lint | `schema-drift-lint` + drains (broken-wikilinks, orphans, repair-*, normalize, sanitize, field-loss); spread across the cron fleet |
 | 7 | Agent behavioral contract | `wiki/AGENTS.md` is the authoritative permissions + review contract; before-write/before-answer/dedup in force; confidence flag-model + formal matrix |
 | 8 | Structural files | INDEX tree, log, AGENTS, BUNDLE, HEALTH, HOT all generated |
-| 9 | Tooling ecosystem | IWE + qmd + ripgrep + okengine-reader + okengine-mcp (read); MCP write path via `okengine-write` |
+| 9 | Tooling ecosystem | qmd + ripgrep + backlink graph + okengine-reader + okengine-mcp (read); MCP write path via `okengine-write` |
 
 The engine is also *ahead* of the bare reference design on deployability (engine/pack split, versioned engine, a public reference pack — okpack-cti, a separate repo — plus multi-domain-in-one-vault via walk-up schema), search, the INDEX/500-rule tree, and structural files. Every mechanism above is **pattern-level and domain-agnostic** — each lands in the engine and every pack inherits it.
 

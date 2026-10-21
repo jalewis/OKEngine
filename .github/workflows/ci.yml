@@ -42,12 +42,18 @@ jobs:
       - name: pytest (compatibility)
         if: matrix.python-version != '3.12'
         run: python -m pytest --junitxml=artifacts/junit-${{ matrix.python-version }}.xml
+      # pyproject.toml's coverage sources are relative, so a test that runs a temporary copy of the
+      # tree (or an installed package named like a source dir) was measured too: 191,799 statements
+      # at 33.64% (okengine#1067). Measure the checkout only, through absolute paths.
+      - name: absolute coverage configuration
+        if: matrix.python-version == '3.12'
+        run: python ci/coverage_rcfile.py --root "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/coverage-absolute.rc"
       - name: pytest (authoritative correctness + coverage)
         if: matrix.python-version == '3.12'
         run: >-
           python -m pytest tests/ -q --import-mode=importlib
           --junitxml=artifacts/junit-3.12.xml --cov
-          --cov-config=pyproject.toml --cov-report=term-missing
+          --cov-config="$RUNNER_TEMP/coverage-absolute.rc" --cov-report=term-missing
           --cov-report=xml:artifacts/coverage.xml
           --cov-report=json:coverage.json --cov-fail-under=100
       - name: branch and per-file coverage floor

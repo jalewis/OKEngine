@@ -60,14 +60,13 @@ cd my-brain && bash ../okengine/scripts/deploy.sh            # build (once) + up
    not a bug — check the URL in a browser, or pick a higher-volume feed to prove
    the pipeline before tuning your source set.
 
-4. **`iwe` for the gateway — now automatic (was a trap).** The `backlinks-refresh`
-   cron shells out to `iwe`, which the gateway image doesn't ship. `ensure-runtime`
-   (run by `deploy.sh`) now stages the pinned, sha-verified binary into the mounted
-   runtime dir automatically — **no action needed on a normal deploy.** If you see
-   a `deployment-validate` FAIL about a missing `/opt/data/iwe/bin/iwe` (e.g. an
-   air-gapped host where the fetch couldn't run), stage it by hand from the
-   `iwe-org/iwe` v0.3.2 release; until then the reader/cockpit fall back to their
-   own in-container build, so "what links here" still works.
+4. **Backlinks ("what links here") need no extra binary.** The `backlinks-refresh`
+   cron builds the link graph with the engine's in-process scanner
+   (`scripts/cron/backlink_lib.py`) and publishes it as `wiki/.backlinks.json`; the
+   read MCP, reader and cockpit serve that artifact. Nothing is staged by hand. Until
+   the first refresh publishes it, the read MCP reports backlinks as unavailable and
+   the reader/cockpit fall back to a bounded background scan; run the lane once by
+   hand if you don't want to wait for its daily schedule.
 
 ## After deploy — is it actually healthy?
 
@@ -75,6 +74,6 @@ cd my-brain && bash ../okengine/scripts/deploy.sh            # build (once) + up
 auth, the enforced write path, cron registration, index readiness). Re-run it any
 time: `( cd my-brain && bash ../okengine/scripts/post_deploy_verify.sh )`. The
 weekly `deployment-validate` lane then guards the running instance (pins vs
-runtime stamp, the iwe dependency, alias shadows, ownership, auth). A green
+runtime stamp, alias shadows, ownership, auth). A green
 `post_deploy_verify` plus one successful LLM cron run (visible in the gateway's
 cron-plus logs, or as new pages under `wiki/`) means you're live.

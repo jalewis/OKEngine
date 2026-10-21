@@ -12,7 +12,7 @@
 # (schema.yaml + persona + feeds + crons + content). See INSTALL.md and
 # docs/deploy-a-new-domain.md.
 version: 1
-engine_release: v0.15.18  # PATCH: scheduler-dst check writes no bytecode into the cron-plus plugin tree (#1064); completes the v0.15.17 DST fold roll
+engine_release: v0.15.19  # PATCH: public CI measures only the checkout for coverage (#1067); IWE references retired from the docs (#1066)
 
 runtime:
   # Hermes is a PINNED DEPENDENCY, not vendored into this repo. You clone Hermes

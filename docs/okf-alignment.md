@@ -48,7 +48,7 @@ projection.
 | Tool | What | Stars / pushed | Relevance |
 |---|---|---|---|
 | **qmd** (`tobi/qmd`) | local hybrid BM25 + vector markdown search, CLI + MCP, all on-device | — | Ranked-search layer (concept queries over narratives) |
-| **IWE** (`iwe-org/iwe`) | markdown knowledge-graph; LSP + CLI + MCP; backlinks, graph export, bulk ops | — | Agent-accessible graph layer (alt to bespoke reader tooling) |
+| **IWE** (`iwe-org/iwe`) | markdown knowledge-graph; LSP + CLI + MCP; backlinks, graph export, bulk ops | — | Evaluated, not run: the engine retired it in favor of its own backlink scanner (okengine#651); see [`kb-tooling.md`](kb-tooling.md) |
 | **Obsidian** | the vault's editor; Dataview + graph view | — | Current human browse/review layer |
 | **okengine-reader** (this repo) | standalone read-only web reader over the vault | — | Current custom reader; domain-neutral |
 
@@ -79,7 +79,7 @@ underlying pattern, search **"LLM wiki" / "agent-maintained wiki"**, not the bar
 | Karpathy "LLM wiki" gist (the origin pattern) | https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f | ✅ real (2026-04-04) |
 | LlamaIndex — "Is Grep All You Need?" | https://www.llamaindex.ai/blog/is-grep-all-you-need-lexical-vs-sematic-search-for-agents | ✅ real (2026-05-26) — **argues grep degrades at enterprise scale; advocates layered semantic+lexical** (i.e. a counterpoint to pure-grep, not support) |
 | qmd | https://github.com/tobi/qmd | ✅ |
-| IWE | https://github.com/iwe-org/iwe | ✅ |
+| IWE (ecosystem tool; the engine does not run it) | https://github.com/iwe-org/iwe | ✅ |
 
 ---
 

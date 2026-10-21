@@ -242,7 +242,7 @@ This is the mechanism that makes the pattern *deployable* rather than a one-off:
 | Tiered working set (hot set) | `schema.yaml` `hot_set` — the load-first working set |
 | Reserved structural files | generated: `INDEX.md`, `log.md`, `AGENTS.md`, `BUNDLE.md`, `HEALTH.md`, `HOT.md` |
 | Lint as proactive discovery | rolling maintenance **drains** + the `wake-gate` cron pattern (below) |
-| Search without RAG | `qmd` (local hybrid BM25 + vector + rerank) + `IWE` (markdown knowledge-graph) + `ripgrep`; RAG explicitly rejected |
+| Search without RAG | `qmd` (local hybrid BM25 + vector + rerank) + the precomputed backlink graph (`wiki/.backlinks.json`) + `ripgrep`; RAG explicitly rejected |
 | Schema extension = domain contract | the domain pack's `schema.yaml` (one per deployment) |
 
 ### Multi-domain in one vault

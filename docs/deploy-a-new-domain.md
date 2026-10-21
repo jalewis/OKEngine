@@ -219,10 +219,7 @@ vault file ownership doesn't shift.
 3. Recreate the gateway, then **sweep `/opt/data/cron-plus/pids/`** for dead-pid
    orphans (a recreate strands in-flight lanes' pidfiles; a stranded pidfile blocks
    that lane's every future run as "still active").
-4. If the fleet includes `backlinks-refresh` (okengine#168): the gateway image ships
-   no iwe — stage the binary at `/opt/data/iwe/bin/iwe` (the reader image carries the
-   pinned build). The weekly validation lane FAILs when the job is enabled without it.
-5. Run the validation lane once by hand and require **PASS**:
+4. Run the validation lane once by hand and require **PASS**:
    `scripts/vault-exec.sh <deployment> sh -c 'cd /opt/vault && python3 /opt/data/scripts/deployment_validate.py'`
 
 ## 3a. Updating a deployed pack (pack updates, not engine upgrades)

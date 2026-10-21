@@ -456,13 +456,13 @@ The wiki is the memory; search is an access path (`docs/kb-tooling.md`):
 - **ripgrep** for exact/structural matches (fast, zero infra);
 - **qmd** for lexical + hybrid local search over the vault (one index per
   instance);
-- **IWE** for the markdown knowledge graph — backlinks ("what links here"),
-  reference resolution. Backlink queries warm a server-side graph on first use
-  and are cached with a TTL; the graph build is **never** allowed to block a UI
-  request (it runs async; the UI renders and fills in). A daily engine cron
-  (`backlinks-refresh`) precomputes the inverted graph into a static
-  `wiki/.backlinks.json` artifact so the reader/cockpit serve it directly and the
-  heavy build runs once per deployment, off the UI containers.
+- **the backlink graph** — backlinks ("what links here") and reference
+  resolution. A daily engine cron (`backlinks-refresh`) scans every non-excluded
+  page's `[[wikilinks]]` and Markdown links in-process
+  (`backlink_lib.scan_forward_refs`) and atomically publishes the inverted graph as
+  `wiki/.backlinks.json`. The read MCP, reader and cockpit serve that artifact; a
+  request never rebuilds the graph, and a missing or stale artifact is reported as
+  degraded rather than repaired on the request path. No external graph tool runs.
 
 ### 9.2 The reader and the cockpit
 

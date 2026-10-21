@@ -36,7 +36,7 @@ RAG embeds document chunks and retrieves semantically similar fragments at query
 
 The vault therefore uses **lexical + hybrid search over the markdown itself** (see §7), not a vector store as the primary retrieval path.
 
-> **Reference implementation.** The engine is a pinned Hermes-Agent (the exact pin is in `engine-manifest.yaml`, consumed as a dependency, not forked) + the `cron-plus` scheduler + LLM-wiki governance/maintenance machinery with an OKF-compatible validation floor, driving a fleet of autonomous cron jobs. The three-layer stack is literal: `raw/` (immutable, gitignored, durable storage) → `wiki/` (agent-maintained) → `schema.yaml` + the vault's persona `CLAUDE.md`. No RAG; search is qmd-hybrid + IWE + ripgrep (§7).
+> **Reference implementation.** The engine is a pinned Hermes-Agent (the exact pin is in `engine-manifest.yaml`, consumed as a dependency, not forked) + the `cron-plus` scheduler + LLM-wiki governance/maintenance machinery with an OKF-compatible validation floor, driving a fleet of autonomous cron jobs. The three-layer stack is literal: `raw/` (immutable, gitignored, durable storage) → `wiki/` (agent-maintained) → `schema.yaml` + the vault's persona `CLAUDE.md`. No RAG; search is qmd-hybrid + the precomputed backlink graph + ripgrep (§7).
 
 ---
 
@@ -304,7 +304,7 @@ The agent interacts through an **MCP server** rather than raw shell. Direct file
 - **Read tools:** `search` (exact + ranked), `get_page`, `find_references`, `list_*`.
 - **Write tools:** `create_entity` (validate → write → version bump → update INDEX → append log), `update_entity`, `tombstone_entity`, `flag_for_review`.
 
-> **Reference implementation.** Search = `qmd` (hybrid BM25+vector+rerank, wrapped by `kb_search.py`) + `IWE` (markdown KG, wrapped read-only by `kb_graph.py`) + ripgrep. No RAG, by design. `okengine-mcp` is the **read-only** MCP server (streamable-http + bearer auth) — `search` / `get_page` / `find_references` / `list_*`. `okengine-reader` is the human web reader over the same vault. The MCP **write path**: a separate local stdio server **`okengine-write`** (`okengine-mcp/write_server.py`, wired as `mcp_servers.okengine-write`) exposes `create_entity`/`update_entity`/`tombstone_entity`/`flag_for_review`/`patch_entity`/`append_to_section`, each schema-validated against the governing `schema.yaml` and log-appending; writer crons run on it, with Hermes' `file`-tool `schema_validator` kept as the shape backstop. A pre-built identifier→path manifest (Tier-A inverted index) is deliberately **not built** — ripgrep + qmd already serve exact + ranked lookup (optional).
+> **Reference implementation.** Search = `qmd` (hybrid BM25+vector+rerank, wrapped by `kb_search.py`) + the backlink graph (`wiki/.backlinks.json`, precomputed by the `backlinks-refresh` cron and served by `find_references`) + ripgrep. No RAG, by design. `okengine-mcp` is the **read-only** MCP server (streamable-http + bearer auth) — `search` / `get_page` / `find_references` / `list_*`. `okengine-reader` is the human web reader over the same vault. The MCP **write path**: a separate local stdio server **`okengine-write`** (`okengine-mcp/write_server.py`, wired as `mcp_servers.okengine-write`) exposes `create_entity`/`update_entity`/`tombstone_entity`/`flag_for_review`/`patch_entity`/`append_to_section`, each schema-validated against the governing `schema.yaml` and log-appending; writer crons run on it, with Hermes' `file`-tool `schema_validator` kept as the shape backstop. A pre-built identifier→path manifest (Tier-A inverted index) is deliberately **not built** — ripgrep + qmd already serve exact + ranked lookup (optional).
 
 ---
 
@@ -379,7 +379,7 @@ The autonomous loop runs on `cron-plus`: subprocess-per-job (true parallelism), 
 - **`no_agent: true`** — a pure-script job that writes its output as a side effect and never needs the LLM. The script *is* the job; no agent is constructed (no prompt, no tool loop, no token spend).
 - **wake-gate** — a script emits `{"wakeAgent": true|false}`; on `true` the agent runs the real work, on `false` the tick is silent. This keeps the LLM off the critical path until there's actually something to do.
 
-> **Reference implementation.** A fleet of cron-plus jobs; pure-script jobs carry `no_agent: true`; the rest are wake-gated (script gate → agent works) or always-on agent jobs. The engine *exceeds* this guide on deployability (engine/pack split, the `framework` CLI, versioned engine, a public reference pack — okpack-cti, a separate repo — plus multi-domain-in-one-vault via walk-up schema), on search (qmd hybrid + IWE + ripgrep), and on the conformance stack (walk-up multi-domain validator + rolling drains). The conformance machinery covers the full pattern:
+> **Reference implementation.** A fleet of cron-plus jobs; pure-script jobs carry `no_agent: true`; the rest are wake-gated (script gate → agent works) or always-on agent jobs. The engine *exceeds* this guide on deployability (engine/pack split, the `framework` CLI, versioned engine, a public reference pack — okpack-cti, a separate repo — plus multi-domain-in-one-vault via walk-up schema), on search (qmd hybrid + backlink graph + ripgrep), and on the conformance stack (walk-up multi-domain validator + rolling drains). The conformance machinery covers the full pattern:
 
 | Item | Engine mechanism |
 |---|---|

@@ -79,6 +79,27 @@ def test_timeout_terminates_group_and_returns_reserved_code(monkeypatch, capsys)
     assert "partial-out" in captured.out and "partial-err" in captured.err
 
 
+def test_timeout_on_stdout_repeats_the_sentinel_on_stdout(monkeypatch, capsys):
+    m = load()
+    timeout = subprocess.TimeoutExpired("command", 1)
+    process = Process([timeout, ("partial-out", "")])
+    monkeypatch.setattr(m.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(m.os, "killpg", lambda pid, signal: None)
+    assert m.main(["--seconds", "1", "--timeout-on-stdout", "--", "command"]) == 124
+    captured = capsys.readouterr()
+    assert captured.out.startswith("partial-out"), "the command's own output comes first"
+    assert "OKENGINE_MUTATION_TIMEOUT" in captured.out.removeprefix("partial-out"), \
+        "--timeout-on-stdout must print the sentinel on stdout after the command's output"
+    assert "OKENGINE_MUTATION_TIMEOUT" in captured.err
+
+
+def test_no_stdout_sentinel_without_a_timeout(monkeypatch, capsys):
+    m = load()
+    monkeypatch.setattr(m.subprocess, "Popen", lambda *args, **kwargs: Process([("out", "")]))
+    assert m.main(["--seconds", "1", "--timeout-on-stdout", "--", "command"]) == 7
+    assert capsys.readouterr().out == "out", "a run that finished in time prints no sentinel"
+
+
 def test_unresponsive_process_is_killed_after_term_grace(monkeypatch):
     m = load()
     timeout = subprocess.TimeoutExpired("command", 1)

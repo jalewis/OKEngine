@@ -35,7 +35,7 @@ The skeleton sequences the import in the order that matters:
 3. **id backfill** — `backfill_ids` (IRREVERSIBLE). Resolve the authority-duplicate worklist from
    the import report **first**; ids depend on final types, so this runs after retype/reconcile.
 4. **partition** — assert the source layout already conforms, or run `okf_migrate` per oversized
-   namespace (link-preserving, single O(n) pass; `iwe stats` reference count is the invariant).
+   namespace (link-preserving, single O(n) pass; see **Link integrity** below for what to compare).
 5. **validate** — `framework validate` is the roll-forward gate `upgrade` runs automatically.
 
 ```
@@ -46,7 +46,14 @@ python scripts/framework.py upgrade <pack-dir> --apply    # snapshot -> apply ->
 ## Guarantees & gotchas
 - **Dry-run first.** `import` never writes; `upgrade` (no `--apply`) only reports.
 - **Snapshot + auto-rollback.** A failed validation gate restores the pre-import source.
-- **Link integrity.** Keep `iwe stats` reference count unchanged pre/post (okf_migrate's invariant).
+- **Link integrity.** `okf_migrate` does not verify links itself. It rewrites every
+  `[[<namespace>/…]]` wikilink to a moved page in one pass and prints
+  `link rewrite: N links in M files`; the dry-run count is what `--apply` should report, with
+  `move errors: 0` and no unwritable files listed. To confirm nothing broke, run
+  `backlinks_refresh.py` (with `VAULT_DIR=<vault>`) before and after and compare the `edges` count
+  it prints (also stored in `wiki/.backlinks.json`). It should not drop. `okf_migrate` does not
+  rewrite bare frontmatter path references (`subject: entities/foo`); check the corpus audit's
+  "Dangling path references" section after the move.
 - **`id` is required** under base-schema — the backfill + duplicate merge must complete **before**
   the vault is governed. This is the one irreversible step; do it deliberately.
 - **Gated on the pack schema.** retype/reconcile/validate can't be finalized until the target

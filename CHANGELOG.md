@@ -14,6 +14,26 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
 > **About panel** (reader/cockpit deployment purpose + composition from live state); and now **pack
 > bundles** (v0.10.0). If you are jumping from v0.3.5, read v0.4.0 onward.
 
+## v0.15.19
+
+PATCH. Public CI and documentation only. No runtime, image or pack change. Deployment scope:
+**none**; a host on v0.15.18 runs the same engine code.
+
+### Fixed
+- **Public coverage run measured files outside the checkout** (okengine#1067). The public
+  workflow's Python 3.12 job read `pyproject.toml`'s relative coverage sources, so tests that run a
+  temporary copy of the tree, and an installed package named like a source directory, were
+  measured too: 191,799 statements at 33.64%, against the 100% floor. The job now writes an
+  absolute coverage configuration with `ci/coverage_rcfile.py` and measures the checkout only.
+  Measured that way the public tree stood at 99.74%: `ci/mutation_dispositions.py` shipped while
+  its only test was excluded from the snapshot. It is now excluded with its test, and the timeout
+  wrapper's stdout sentinel has a public test. The snapshot build now enforces public CI's coverage
+  floors on the assembled public tree, so this class fails before publication.
+- **Docs still described IWE as the backlink engine** (okengine#1066). IWE was retired in
+  v0.14.0 (okengine#651); backlinks come from the engine's own forward-reference scanner and
+  `wiki/.backlinks.json`. Ten documents are corrected, and a test fails any new IWE reference
+  outside an allowlisted historical note.
+
 ## v0.15.18
 
 PATCH. Fixes a defect in v0.15.17's new `scheduler-dst` deployment check, which blocked the

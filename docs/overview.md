@@ -183,7 +183,8 @@ only wake the agent when there is real work.
 ### Search Without Using RAG As Memory
 
 The wiki is the memory. Retrieval is layered on top: `ripgrep` for exact matches,
-`qmd` for local lexical/hybrid search, and `IWE` for the markdown knowledge graph.
+`qmd` for local lexical/hybrid search, and a precomputed backlink graph
+(`wiki/.backlinks.json`, built by the `backlinks-refresh` cron) for "what links here".
 See [`kb-tooling.md`](kb-tooling.md).
 
 ---

@@ -60,7 +60,7 @@ become **shareable**.
 | Classify raw → a `type` | **pack** (engine-template loop + pack prompt) | domain judgment; the engine cannot know "this is a threat-actor" |
 | Required fields per type | **pack** (schema) | domain contract |
 | Index / dedup / tier | engine | generic over any OKF page |
-| Wikilink + backlink graph | engine (IWE) | generic; links anything to anything |
+| Wikilink + backlink graph | engine (`backlinks-refresh`) | generic; links anything to anything |
 | Reshelve / reshard / repair | engine | structural, schema-driven |
 | Search / read / MCP | engine | generic over the vault |
 | What to deliver (digest content) | **pack** (cron + prompt) | domain output |
@@ -82,7 +82,7 @@ pack queries┘                                                     │
                                               wiki/<namespace>/...  (typed pages)
                                                                   │
    ┌──────────────────────── engine, generic, shared ────────────┴───────────┐
-   │ index-tree · hot-set · tiers · IWE graph · reshelve/reshard · repairs ·  │
+   │ index-tree · hot-set · tiers · link graph · reshelve/reshard · repairs · │
    │ health · search · MCP · dedup · delivery transport                        │
    └───────────────────────────────────────────────────────────────────────────┘
 ```
