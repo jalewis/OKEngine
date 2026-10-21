@@ -14,7 +14,7 @@ Tracked-but-modified files are still baked on purpose -- that is the local itera
 the label already reports it as `X-dirty`. Only ignored paths are dropped.
 
 The guard is extracted from the shipped script and executed, so this exercises the real bytes
-rather than a paraphrase (same approach as tests/cron/test_receipt_nowork_exemption.py).
+rather than a paraphrase (the approach hermes-cron-plus's test_receipt_nowork_exemption.py takes with runner.py).
 """
 import shutil
 import subprocess

@@ -196,12 +196,6 @@ def test_responses_requests_are_attributed_by_deployment_and_conversation():
     assert "X-Oneshot" in added
 
 
-def test_cron_plus_run_patch_is_null_safe():
-    text = (PATCHES / "cron-plus" / "cli-null-next-run.patch").read_text()
-    assert 'j.get("next_run_at")' in text
-    assert "pending scheduler reconciliation" in text
-
-
 def test_local_pool_contract_is_in_seed_template():
     text = (REPO / "config" / "config.yaml.template").read_text()
     for status, attempts in ((404, 1), (500, 2), (503, 6), (504, 1)):

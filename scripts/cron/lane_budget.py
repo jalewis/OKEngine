@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A lane's own view of the wall-clock it has left.
 
-cron-plus enforces a hard timeout and, with `run-deadline-env.patch`, now PUBLISHES it. Before
+cron-plus enforces a hard timeout and, since hermes-cron-plus v0.2.0, PUBLISHES it. Before
 that a lane could not see its own ceiling, so its only available failure was being killed
 mid-work: everything done so far discarded, no partial result, and a red lane whose output said
 nothing about how far it got. Three weekly lanes on one deployment failed that way for a week,

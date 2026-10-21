@@ -13,7 +13,7 @@ documents what is pinned, where, and how to bump each dependency safely.
 | **MCP Python deps** | `okengine-mcp/requirements.txt` | `==` pins (`mcp`, `PyYAML`, `uvicorn`) | exact versions |
 | **Reader Python deps** | `okengine-reader/requirements.txt` | `==` pins | exact versions |
 | **Hermes-Agent** runtime | `engine-manifest.yaml` → `runtime.pinned_sha` | tag `v2026.9.14` → commit `345cd2b057a452236de401d3534b8502a7465e8d` | `build-engine-image.sh` verifies the clone matches |
-| **cron-plus** plugin (required runtime scheduler) | `engine-manifest.yaml` → `dependencies.cron-plus`, `INSTALL.md` §4 | commit `bdb6cf5f…c836d` (untagged) | operator clones + `git checkout` the pin |
+| **cron-plus** plugin (required runtime scheduler) | `engine-manifest.yaml` → `dependencies.cron-plus`, `INSTALL.md` §4 | tag `v0.2.0` → commit `92239108…c64f2` | `install-cron-plus.sh` checks out the pin and verifies the engine's policy-module mirror |
 
 apt packages are intentionally **not** version-pinned individually: the base-image
 digest pins the Debian snapshot they come from, so they're reproducible without the
@@ -115,11 +115,12 @@ This is the biggest bump — it can require rebasing the carried `patches/`.
    in unnoticed. Update `pinned_version`/`pinned_tag`/`pinned_sha` together.
 
 ### cron-plus (the runtime scheduler plugin)
-A separate required Hermes plugin the operator clones into
-`~/.hermes/plugins/cron-plus` (INSTALL.md §4). It is untagged, so it is pinned by
-commit. To bump: pick the new commit, update
-`engine-manifest.yaml` `dependencies.cron-plus.pinned_sha` and the `git checkout`
-SHA in INSTALL.md §4, then re-clone/checkout on the host.
+A separate required Hermes plugin that `scripts/install-cron-plus.sh` clones into the pack runtime
+(INSTALL.md §4). It is pinned by commit; releases are tagged since v0.2.0, which folded in every
+change OKEngine had carried as a patch. To bump: land the change upstream, update
+`engine-manifest.yaml` `dependencies.cron-plus.pinned_sha`, this document, and any changed module
+in the engine's mirror (`patches/cron-plus/*.py`) together; the installer refuses a pin whose
+policy modules differ from the mirror.
 ```sh
 git ls-remote https://github.com/jalewis/hermes-cron-plus.git HEAD
 ```

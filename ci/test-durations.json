@@ -163,7 +163,6 @@
   "tests/cron/test_raw_compile.py": 53.924,
   "tests/cron/test_reap_stale_sessions.py": 0.296,
   "tests/cron/test_rebuild_index_direct.py": 0.258,
-  "tests/cron/test_receipt_nowork_exemption.py": 0.115,
   "tests/cron/test_reference_connectors.py": 0.338,
   "tests/cron/test_reference_integrity.py": 0.115,
   "tests/cron/test_refresh_kb_dashboards.py": 0.299,

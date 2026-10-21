@@ -74,12 +74,11 @@ def test_a_malformed_deadline_is_unknown_not_expired(monkeypatch):
     assert mod.remaining() == float("inf")
 
 
-def test_the_runner_patch_publishes_what_this_reads():
-    """The helper and the patch are one contract across two repos; a rename in either is silent."""
-    patch = (REPO / "patches" / "cron-plus" / "run-deadline-env.patch").read_text(encoding="utf-8")
+def test_the_helper_reads_what_the_cron_plus_runner_publishes():
+    """One contract across two repos. hermes-cron-plus pins these names in
+    tests/test_okengine_contracts.py; this side pins that the helper reads exactly them."""
     helper = MOD.read_text(encoding="utf-8")
     for var in ("OKENGINE_RUN_DEADLINE_EPOCH", "OKENGINE_RUN_TIMEOUT_SECONDS"):
-        assert var in patch, f"{var} is read by lane_budget but never published by the patch"
         assert var in helper
 
 

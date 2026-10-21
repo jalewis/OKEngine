@@ -14,7 +14,7 @@ import cron.jobs as cron_jobs
 import pytest
 
 
-CRON_PLUS_SHA = "bdb6cf5f73815b66cf6b33a252a08dc8f78c836d"
+CRON_PLUS_SHA = "92239108641bff5de8e2784891f63c9f940c64f2"  # engine-manifest.yaml dependencies.cron-plus.pinned_sha
 ENGINE = Path(__file__).resolve().parents[3]
 
 

@@ -42,19 +42,19 @@ if [ -d "$DEST/.git" ]; then
     if [ "$(gitd rev-parse HEAD 2>/dev/null)" != "$SHA" ]; then
         gitd fetch --quiet --depth 1 origin "$SHA" 2>/dev/null || gitd fetch --quiet origin
     fi
-    # The plugin dir is an engine-MANAGED clone and carried patches deliberately
-    # leave tracked modifications behind. Always restore the exact pin before
-    # applying the CURRENT patch set: otherwise an evolved patch cannot apply to
-    # the prior patched form, and non-idempotent patches accumulate duplicate
-    # definitions on every deploy. Surface what is discarded, including helper
-    # overlays copied below, then clean tracked + untracked managed content.
+    # The plugin dir is an engine-MANAGED clone. Before hermes-cron-plus v0.2.0 the engine patched it
+    # in place and copied overlay modules in, so a host's clone still carries those edits and untracked
+    # files, which the new pin now tracks. Always restore the exact pin: surface what is discarded,
+    # clean untracked content FIRST (a checkout refuses to overwrite an untracked file the target
+    # commit tracks), then force the tracked tree to the pin.
     if [ -n "$(gitd status --porcelain 2>/dev/null)" ]; then
-        echo "  ⚠ discarding LOCAL/generated modification(s) in the managed cron-plus clone before refreshing the patch set:" >&2
+        echo "  ⚠ discarding LOCAL/generated modification(s) in the managed cron-plus clone before restoring the pin:" >&2
         gitd status --porcelain 2>/dev/null | sed 's/^/        /' >&2
     fi
+    gitd clean -fdq
     gitd checkout --quiet --force "$SHA"
     gitd clean -fdq
-    echo "  restored pinned cron-plus tree before applying carried patches"
+    echo "  restored pinned cron-plus tree"
 else
     mkdir -p "$(dirname "$DEST")"
     rm -rf "$DEST"
@@ -63,66 +63,30 @@ else
     echo "  cloned to $DEST"
 fi
 
-# Apply OKEngine's small dependency-boundary capabilities in a fixed order.
-# Fail loudly when a future pin changes their context; silently losing runtime
-# configuration or `after:` enforcement would be worse than stopping deploy.
-apply_carried_patch() {
-    local patch="$1" label="$2"
-    if [ ! -f "$patch" ]; then
-        echo "ERROR: required cron-plus patch not found: $patch" >&2
-        exit 1
+# The changes OKEngine once carried as patches live upstream since hermes-cron-plus v0.2.0, so the
+# pinned tree is installed as-is. The engine keeps a mirror of the plugin's policy modules in
+# patches/cron-plus/*.py, where they are unit- and mutation-tested; the pinned upstream file must be
+# byte-identical to that mirror, or the engine has tested code that this deploy would not run. Fail
+# loudly: a silent mismatch would put untested scheduler behavior in front of the whole cron fleet.
+mirror_drift=0
+for mirror in "$ENGINE_DIR"/patches/cron-plus/*.py; do
+    name="$(basename "$mirror")"
+    if ! cmp -s "$mirror" "$DEST/$name"; then
+        echo "ERROR: cron-plus pin ${SHA:0:12} $name differs from the engine's tested copy patches/cron-plus/$name" >&2
+        mirror_drift=1
     fi
-    if gitd apply --check "$patch" >/dev/null 2>&1; then
-        gitd apply "$patch"
-        echo "  applied $label"
-    elif gitd apply --reverse --check "$patch" >/dev/null 2>&1; then
-        echo "  $label already applied"
-    else
-        echo "ERROR: $patch does not apply to cron-plus pin ${SHA:0:12}" >&2
-        echo "       refresh the carried patch when updating dependencies.cron-plus.pinned_sha" >&2
-        exit 1
-    fi
-}
-
-apply_carried_patch "$ENGINE_DIR/patches/cron-plus/job-env.patch" \
-    "OKEngine per-job environment support"
-apply_carried_patch "$ENGINE_DIR/patches/cron-plus/after-ordering.patch" \
-    "OKEngine after: runtime ordering"
-apply_carried_patch "$ENGINE_DIR/patches/cron-plus/run-receipts.patch" \
-    "OKEngine verified model-run receipts"
-apply_carried_patch "$ENGINE_DIR/patches/cron-plus/cli-null-next-run.patch" \
-    "OKEngine null-safe manual run output"
-apply_carried_patch "$ENGINE_DIR/patches/cron-plus/pid-ownership.patch" \
-    "OKEngine runner PID ownership cleanup"
-apply_carried_patch "$ENGINE_DIR/patches/cron-plus/run-records.patch" \
-    "OKEngine runner-owned execution records"
-# LAST of the runner patches: it depends on _apply_job_env's call site from job-env.patch.
-apply_carried_patch "$ENGINE_DIR/patches/cron-plus/run-deadline-env.patch" \
-    "OKEngine run deadline published to the lane"
-apply_carried_patch "$ENGINE_DIR/patches/cron-plus/slug-identity-guard.patch" \
-    "OKEngine deterministic direct-writer identity guard"
-# The job store's lock moves to a sidecar that os.replace never swaps out (okengine#850);
-# deploy-cron-plus-jobs.sh takes the same lock when it writes jobs.json.
-apply_carried_patch "$ENGINE_DIR/patches/cron-plus/jobs-store-lock.patch" \
-    "OKEngine stable job-store lock"
-# Every tick closes any lane's orphaned `running` record, not only the next start of that lane
-# (okengine#1010). Imports the run_records overlay copied below.
-apply_carried_patch "$ENGINE_DIR/patches/cron-plus/reconcile-orphans-on-tick.patch" \
-    "OKEngine per-tick orphaned-run reconciliation"
-# The fall-back fold policy: an explicit-hour slot fires once in the repeated hour, a star-hour
-# slot in both passes (okengine#1055, #1061 [4]). Replaces the pin's claim-time guard in jobs.py.
-apply_carried_patch "$ENGINE_DIR/patches/cron-plus/dst-fold.patch" \
-    "OKEngine DST fall-back fold policy"
-cp "$ENGINE_DIR/patches/cron-plus/after_ordering.py" "$DEST/after_ordering.py"
-cp "$ENGINE_DIR/patches/cron-plus/dst_fold.py" "$DEST/dst_fold.py"
-cp "$ENGINE_DIR/patches/cron-plus/run_receipts.py" "$DEST/run_receipts.py"
-cp "$ENGINE_DIR/patches/cron-plus/model_slots.py" "$DEST/model_slots.py"
-cp "$ENGINE_DIR/patches/cron-plus/run_timeout.py" "$DEST/run_timeout.py"
-cp "$ENGINE_DIR/patches/cron-plus/run_records.py" "$DEST/run_records.py"
-cp "$ENGINE_DIR/patches/cron-plus/artifact_records.py" "$DEST/artifact_records.py"
-cp "$ENGINE_DIR/patches/cron-plus/pid_ownership.py" "$DEST/pid_ownership.py"
-cp "$ENGINE_DIR/patches/cron-plus/slug_identity_guard.py" "$DEST/slug_identity_guard.py"
-echo "  installed OKEngine after: policy overlay"
+done
+if [ "$mirror_drift" -ne 0 ]; then
+    echo "       land the change in hermes-cron-plus and the engine mirror together, then move the pin" >&2
+    exit 1
+fi
+# The deploy writes the live job store under the scheduler's lock (scripts/cron_plus_store.py
+# LOCK_NAME); the pinned scheduler must take that same sidecar lock (okengine#850).
+if ! grep -qF 'JOBS_LOCK_FILE = CRON_PLUS_HOME / "jobs.json.lock"' "$DEST/jobs.py"; then
+    echo "ERROR: cron-plus pin ${SHA:0:12} does not lock the job store through jobs.json.lock" >&2
+    exit 1
+fi
+echo "  verified the pinned policy modules match the engine's tested copies"
 
 # Sanity: the CLI the cron helpers invoke must be present.
 if [ ! -f "$DEST/cli.py" ]; then

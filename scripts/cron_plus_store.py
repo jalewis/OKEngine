@@ -8,7 +8,7 @@ the deploy wrote the new one, and the scheduler's read-modify-write then persist
 over it: 14 lanes on one deployment kept write-server names the same deploy had retired, while
 every step reported success.
 
-The carried patch `patches/cron-plus/jobs-store-lock.patch` moves the scheduler's lock to the
+hermes-cron-plus (since v0.2.0; formerly a carried patch) moves the scheduler's lock to the
 sidecar LOCK_NAME, which is never replaced. This module takes the same lock. Stdlib only: `write`
 runs INSIDE the gateway (`docker exec -i … python3 - write …` with this file on stdin).
 
@@ -29,7 +29,7 @@ import shutil
 import sys
 import tempfile
 
-LOCK_NAME = "jobs.json.lock"          # must equal JOBS_LOCK_FILE in jobs-store-lock.patch
+LOCK_NAME = "jobs.json.lock"          # must equal cron-plus jobs.py JOBS_LOCK_FILE; install-cron-plus.sh checks
 DEPLOYED_NAME = "jobs.deployed.json"
 # Fields the scheduler rewrites at runtime (cron-plus jobs.py, the after_ordering overlay) or an
 # operator pause sets. Only the ones a DEPLOYED job can also carry matter to drift(): it compares the

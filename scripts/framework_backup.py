@@ -111,7 +111,7 @@ _FORCED_COPY_MAX_BYTES = 128 * 1024 * 1024
 _IN_PLACE_NAMES = frozenset({"log.md"})
 _IN_PLACE_SUFFIXES = (".jsonl",)
 # The cron-plus job store's sidecar lock: must equal cron_plus_store.LOCK_NAME and JOBS_LOCK_FILE in
-# patches/cron-plus/jobs-store-lock.patch (okengine#850; pinned by tests/test_framework_backup.py).
+# hermes-cron-plus jobs.py, checked by install-cron-plus.sh (okengine#850; pinned by tests/test_framework_backup.py).
 _CRON_PLUS_LOCK_NAME = "jobs.json.lock"
 _JOBS_STORE = ".hermes-data/cron-plus/jobs.json"
 

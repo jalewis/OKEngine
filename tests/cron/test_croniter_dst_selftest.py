@@ -281,7 +281,7 @@ def test_the_pinned_guard_fails_the_plugin_cases(tmp_path):
     assert "gave 2026-11-01T07:12:00+00:00, expected 2026-11-01T06:12:00+00:00" in detail
     assert "gave 2026-11-01T06:30:00+00:00, expected 2026-11-02T06:30:00+00:00" in detail
     assert "gave 2026-11-01T06:00:00+00:00, expected 2026-11-01T08:00:00+00:00" in detail
-    assert "dst-fold.patch" in detail, "the remedy must be named"
+    assert "install-cron-plus.sh" in detail and "dst_fold.py" in detail, "the remedy must be named"
 
 
 def test_a_fixed_plugin_passes(tmp_path):

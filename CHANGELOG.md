@@ -14,6 +14,29 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
 > **About panel** (reader/cockpit deployment purpose + composition from live state); and now **pack
 > bundles** (v0.10.0). If you are jumping from v0.3.5, read v0.4.0 onward.
 
+## v0.15.20
+
+PATCH. The cron-plus scheduler changes OKEngine carried as patches now live in
+[hermes-cron-plus](https://github.com/jalewis/hermes-cron-plus) v0.2.0, and the engine pins it.
+The scheduler code a host runs is byte-identical to v0.15.19's patched plugin. Deployment scope:
+**stage only**; the next deploy re-clones the plugin at the new pin, with no image change and no
+gateway recreate.
+
+### Changed
+- **cron-plus pinned at hermes-cron-plus v0.2.0.** The eleven carried patches (per-job `env`,
+  `after:` ordering, run receipts, null-safe `cron-plus run`, PID ownership, run records and
+  artifact contracts, the run deadline, the slug identity guard, the sidecar store lock, the
+  per-tick orphan sweep and the DST fall-back fold) and their policy modules were folded into the
+  plugin as commits, with their unit tests and the plugin's own CI. A standalone cron-plus install
+  now gets them too. `patches/cron-plus/` holds no patches; it keeps the engine's tested mirror of
+  the plugin's nine policy modules.
+- **`install-cron-plus.sh` installs the pin as-is and verifies it.** It refuses a pin whose policy
+  modules are not byte-identical to the engine's mirror, or whose `jobs.py` does not lock the job
+  store through `jobs.json.lock`. Each refusal has a negative test. A host's clone still carrying
+  the old in-place patches and overlay copies is cleaned before the checkout, which would otherwise
+  refuse to overwrite an untracked file the new pin tracks.
+- `docs/supply-chain.md` describes the tagged upstream and the mirror check.
+
 ## v0.15.19
 
 PATCH. Public CI and documentation only. No runtime, image or pack change. Deployment scope:

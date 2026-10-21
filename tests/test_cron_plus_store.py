@@ -24,7 +24,6 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 import cron_plus_store as store  # noqa: E402
 
-PATCH = REPO / "patches" / "cron-plus" / "jobs-store-lock.patch"
 
 
 def _jobs(*jobs):
@@ -85,18 +84,12 @@ def test_write_waits_for_a_holder_of_the_schedulers_lock(tmp_path):
     assert json.loads((home / "jobs.json").read_text())["jobs"][0]["prompt"] == "new"
 
 
-def test_write_takes_the_same_sidecar_the_patched_scheduler_takes():
-    """The two sides of the lock must name one file, or the lock excludes nothing (the original bug
-    in a new place). The patch is the scheduler's side."""
-    text = PATCH.read_text(encoding="utf-8")
-    assert f'+JOBS_LOCK_FILE = CRON_PLUS_HOME / "{store.LOCK_NAME}"' in text
-    assert text.count("with _jobs_lock(fcntl.LOCK_") == 3, "load, save and locked_modify all lock it"
-    assert "fcntl.flock(fd, fcntl.LOCK_EX)\n-        _write_jobs_atomic" not in text
-
-
-def test_the_installer_carries_the_patch_and_the_deploy_uses_the_store():
+def test_the_installer_requires_the_pins_lock_and_the_deploy_uses_the_store():
+    """The two sides of the lock must name one file, or the lock excludes nothing. The scheduler's
+    side lives upstream since hermes-cron-plus v0.2.0, so the installer refuses a pin whose jobs.py
+    does not take this module's lock file."""
     install = (REPO / "scripts" / "install-cron-plus.sh").read_text(encoding="utf-8")
-    assert "patches/cron-plus/jobs-store-lock.patch" in install
+    assert f'JOBS_LOCK_FILE = CRON_PLUS_HOME / "{store.LOCK_NAME}"' in install
     deploy = (REPO / "scripts" / "deploy-cron-plus-jobs.sh").read_text(encoding="utf-8")
     assert "python3 - write" in deploy and "scripts/cron_plus_store.py" in deploy
     assert "cat > '$DEST_IN'" not in deploy, "an unlocked write into the live store is the bug"

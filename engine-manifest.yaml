@@ -12,7 +12,7 @@
 # (schema.yaml + persona + feeds + crons + content). See INSTALL.md and
 # docs/deploy-a-new-domain.md.
 version: 1
-engine_release: v0.15.19  # PATCH: public CI measures only the checkout for coverage (#1067); IWE references retired from the docs (#1066)
+engine_release: v0.15.20  # PATCH: cron-plus pinned at hermes-cron-plus v0.2.0, which carries every former engine patch
 
 runtime:
   # Hermes is a PINNED DEPENDENCY, not vendored into this repo. You clone Hermes
@@ -46,7 +46,7 @@ dependencies:
           (the deployed config/cron-plus-jobs.json) runs on it; without it nothing
           schedules.
     upstream: https://github.com/jalewis/hermes-cron-plus.git
-    pinned_sha: bdb6cf5f73815b66cf6b33a252a08dc8f78c836d   # untagged; pin by commit (okengine#326 [28] DST fall-back double-fire guard for range/step hour exprs, atop #197 ownership-preserving writes + stall sentinel + TZ-aware scheduling)
+    pinned_sha: 92239108641bff5de8e2784891f63c9f940c64f2   # v0.2.0: folds in every change OKEngine carried as a patch (okengine#1055 DST fold, #1010 orphan sweep, #883 slug guard, #850 store lock, run receipts/records, after: ordering, per-job env)
     install_to: ~/.hermes/plugins/cron-plus
 
 engine_layer:

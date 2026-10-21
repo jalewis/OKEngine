@@ -87,49 +87,24 @@ def test_install_cron_plus_targets_runtime_and_reads_pin():  # #20
     t = (S / "install-cron-plus.sh").read_text()
     assert ".hermes-data/plugins/cron-plus" in t
     assert "pinned_sha" in t and "dependencies.cron-plus" not in t.split("\n")[0]  # reads the manifest pin
-    assert "cron-plus/job-env.patch" in t and "cron-plus/after-ordering.patch" in t
-    assert "cron-plus/run-receipts.patch" in t and "run_receipts.py" in t and "model_slots.py" in t
-    assert "cron-plus/cli-null-next-run.patch" in t
-    assert "cron-plus/pid-ownership.patch" in t and "pid_ownership.py" in t
-    assert "cron-plus/slug-identity-guard.patch" in t and "slug_identity_guard.py" in t
-    assert "after_ordering.py" in t and "apply --reverse --check" in t
-    assert (REPO / "patches" / "cron-plus" / "job-env.patch").is_file()
-    assert (REPO / "patches" / "cron-plus" / "after-ordering.patch").is_file()
-    assert (REPO / "patches" / "cron-plus" / "after_ordering.py").is_file()
-    assert (REPO / "patches" / "cron-plus" / "run-receipts.patch").is_file()
-    assert (REPO / "patches" / "cron-plus" / "run_receipts.py").is_file()
-    assert (REPO / "patches" / "cron-plus" / "model_slots.py").is_file()
-    assert (REPO / "patches" / "cron-plus" / "run_timeout.py").is_file()
-    assert (REPO / "patches" / "cron-plus" / "cli-null-next-run.patch").is_file()
-    assert (REPO / "patches" / "cron-plus" / "pid-ownership.patch").is_file()
-    assert (REPO / "patches" / "cron-plus" / "pid_ownership.py").is_file()
-    assert (REPO / "patches" / "cron-plus" / "slug-identity-guard.patch").is_file()
-    assert (REPO / "patches" / "cron-plus" / "slug_identity_guard.py").is_file()
+    assert "apply_carried_patch" not in t, "the carried patches live upstream since cron-plus v0.2.0"
+    assert '"$ENGINE_DIR"/patches/cron-plus/*.py' in t and 'cmp -s "$mirror" "$DEST/$name"' in t
+    for name in ("after_ordering", "artifact_records", "dst_fold", "model_slots", "pid_ownership",
+                 "run_receipts", "run_records", "run_timeout", "slug_identity_guard"):
+        assert (REPO / "patches" / "cron-plus" / f"{name}.py").is_file(), f"engine mirror {name}.py missing"
     r = subprocess.run(["bash", "-n", str(S / "install-cron-plus.sh")], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
 
 
-def test_carried_cron_plus_patches_are_well_formed():  # #419
-    """A one-line payload edit must not leave stale unified-diff hunk lengths.
-
-    `git apply --numstat` parses every hunk without needing the upstream checkout,
-    so malformed carried patches fail CI instead of blocking the next deployment.
-    Context compatibility with the pin remains enforced by install-cron-plus.sh.
-    """
-    patch_dir = REPO / "patches" / "cron-plus"
-    patches = sorted(patch_dir.glob("*.patch"))
-    assert patches
-    for patch in patches:
-        result = subprocess.run(
-            ["git", "apply", "--numstat", str(patch)],
-            cwd=REPO, capture_output=True, text=True,
-        )
-        assert result.returncode == 0, f"{patch.name}: {result.stderr}"
+def test_no_carried_cron_plus_patches_remain():
+    """Since hermes-cron-plus v0.2.0 the plugin carries OKEngine's changes itself. A new scheduler
+    change lands upstream and moves the pin; a patch here would be applied by nothing."""
+    assert not sorted((REPO / "patches" / "cron-plus").glob("*.patch"))
 
 
 def test_cron_plus_pin_agrees_across_manifest_and_docs():  # #177 follow-up; #6 (H6)
     """The cron-plus pin must not DRIFT across the places that cite it. The manifest is the single
-    source of truth (what install-cron-plus.sh clones + patches). INSTALL.md must NOT hardcode the
+    source of truth (what install-cron-plus.sh clones and verifies). INSTALL.md must NOT hardcode the
     SHA — it delegates to install-cron-plus.sh, so it cannot drift by construction (invariant-audit
     HIGH #6; the old bare `git clone <sha>` in INSTALL.md was both a drift surface AND shipped an
     UNPATCHED scheduler). docs/supply-chain.md (the SBOM row) legitimately cites the SHA and must
@@ -143,7 +118,7 @@ def test_cron_plus_pin_agrees_across_manifest_and_docs():  # #177 follow-up; #6 
     install = (REPO / "INSTALL.md").read_text()
     # INSTALL.md delegates, never hardcodes — so it can't drift from the manifest.
     assert "install-cron-plus.sh" in install, \
-        "INSTALL.md must install cron-plus via install-cron-plus.sh (pins + patches from the manifest)"
+        "INSTALL.md must install cron-plus via install-cron-plus.sh (pin from the manifest)"
     assert sha not in install, (
         f"INSTALL.md hardcodes the cron-plus pin {sha[:12]} — remove it and delegate to "
         f"install-cron-plus.sh; a hardcoded SHA in docs is a drift surface (invariant-audit #6)")
@@ -219,11 +194,10 @@ def test_job_deploy_recovers_root_owned_model_slot_artifacts():
     assert text.index(reconcile) < text.index('docker exec -u "$HERMES_UID" "$CONTAINER" mkdir')
 
 
-def test_install_cron_plus_force_recovers_a_dirty_managed_clone(tmp_path):  # invariant-audit redeploy trap
-    """The plugin dir is an engine-MANAGED clone; a plain `git checkout` ABORTS on any local edit —
-    a hand-patched jobs.py did exactly this and killed a live redeploy at step 2. install-cron-plus
-    must FORCE the tree to the pin (recover) and surface what it discarded. Functional: a local
-    upstream + a dirty clone at an OLD commit + a fake manifest -> recovers to the pin, no abort."""
+def _fake_cron_plus(tmp_path):
+    """A local upstream with an old commit and a pinned commit that tracks the policy module, a
+    fake engine whose manifest pins it, and a managed clone left at the old commit the way a
+    pre-v0.2.0 install left it: tracked edits plus an untracked overlay copy."""
     import os
     import shutil
     genv = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
@@ -235,12 +209,14 @@ def test_install_cron_plus_force_recovers_a_dirty_managed_clone(tmp_path):  # in
     def rev(cwd):
         return subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(cwd), capture_output=True, text=True).stdout.strip()
 
+    lock = 'JOBS_LOCK_FILE = CRON_PLUS_HOME / "jobs.json.lock"\n'
     up = tmp_path / "upstream"; up.mkdir(); git("init", "-q", cwd=up)
     (up / "cli.py").write_text("# cli\n")
     (up / "jobs.py").write_text("OLD\n")
     git("add", "-A", cwd=up); git("commit", "-qm", "A", cwd=up)
     old = rev(up)
-    (up / "jobs.py").write_text("NEW-PINNED\n")
+    (up / "jobs.py").write_text("NEW-PINNED\n" + lock)
+    (up / "dst_fold.py").write_text("# fall-back fold policy\n")
     git("add", "-A", cwd=up); git("commit", "-qm", "B", cwd=up)
     new = rev(up)
 
@@ -250,142 +226,67 @@ def test_install_cron_plus_force_recovers_a_dirty_managed_clone(tmp_path):  # in
     (eng / "engine-manifest.yaml").write_text(
         f"dependencies:\n  cron-plus:\n    upstream: file://{up}\n    pinned_sha: {new}\n")
     shutil.copy(S / "install-cron-plus.sh", eng / "scripts" / "install-cron-plus.sh")
-    # This test exercises the installer's carried-patch lifecycle independently
-    # of the real dependency's runner.py context.
-    (eng / "patches" / "cron-plus" / "job-env.patch").write_text(
-        "diff --git a/jobs.py b/jobs.py\n"
-        "--- a/jobs.py\n"
-        "+++ b/jobs.py\n"
-        "@@ -1 +1,2 @@\n"
-        " NEW-PINNED\n"
-        "+JOB-ENV-PATCHED\n"
-    )
-    (eng / "patches" / "cron-plus" / "after-ordering.patch").write_text(
-        "diff --git a/cli.py b/cli.py\n"
-        "--- a/cli.py\n"
-        "+++ b/cli.py\n"
-        "@@ -1 +1,2 @@\n"
-        " # cli\n"
-        "+AFTER-ORDERING-PATCHED\n"
-    )
-    (eng / "patches" / "cron-plus" / "after_ordering.py").write_text("# policy overlay\n")
-    (eng / "patches" / "cron-plus" / "run-receipts.patch").write_text(
-        "diff --git a/receipt-hook b/receipt-hook\n"
-        "new file mode 100644\n"
-        "--- /dev/null\n"
-        "+++ b/receipt-hook\n"
-        "@@ -0,0 +1 @@\n"
-        "+RUN-RECEIPTS-PATCHED\n"
-    )
-    (eng / "patches" / "cron-plus" / "run_receipts.py").write_text("# receipt overlay\n")
-    (eng / "patches" / "cron-plus" / "model_slots.py").write_text("# model slot overlay\n")
-    (eng / "patches" / "cron-plus" / "run_timeout.py").write_text("# timeout overlay\n")
-    (eng / "patches" / "cron-plus" / "cli-null-next-run.patch").write_text(
-        "diff --git a/cli.py b/cli.py\n"
-        "--- a/cli.py\n"
-        "+++ b/cli.py\n"
-        "@@ -1,2 +1,3 @@\n"
-        " # cli\n"
-        " AFTER-ORDERING-PATCHED\n"
-        "+NULL-NEXT-RUN-PATCHED\n"
-    )
-    (eng / "patches" / "cron-plus" / "pid-ownership.patch").write_text(
-        "diff --git a/pid-hook b/pid-hook\n"
-        "new file mode 100644\n"
-        "--- /dev/null\n"
-        "+++ b/pid-hook\n"
-        "@@ -0,0 +1 @@\n"
-        "+PID-OWNERSHIP-PATCHED\n"
-    )
-    (eng / "patches" / "cron-plus" / "pid_ownership.py").write_text("# pid ownership overlay\n")
-    (eng / "patches" / "cron-plus" / "run_records.py").write_text("# run records overlay\n")
-    (eng / "patches" / "cron-plus" / "artifact_records.py").write_text(
-        "# artifact records overlay\n")
-    (eng / "patches" / "cron-plus" / "run-records.patch").write_text(
-        "diff --git a/run-record-hook b/run-record-hook\n"
-        "new file mode 100644\n"
-        "--- /dev/null\n"
-        "+++ b/run-record-hook\n"
-        "@@ -0,0 +1 @@\n"
-        "+RUN-RECORDS-PATCHED\n"
-    )
-    # every patch the installer applies must exist in the fixture, or the install aborts on a
-    # "required cron-plus patch not found" that has nothing to do with what the test is asserting
-    (eng / "patches" / "cron-plus" / "run-deadline-env.patch").write_text(
-        "diff --git a/run-deadline-hook b/run-deadline-hook\n"
-        "new file mode 100644\n"
-        "--- /dev/null\n"
-        "+++ b/run-deadline-hook\n"
-        "@@ -0,0 +1 @@\n"
-        "+RUN-DEADLINE-PATCHED\n"
-    )
-    (eng / "patches" / "cron-plus" / "slug-identity-guard.patch").write_text(
-        "diff --git a/slug-guard-hook b/slug-guard-hook\n"
-        "new file mode 100644\n"
-        "--- /dev/null\n"
-        "+++ b/slug-guard-hook\n"
-        "@@ -0,0 +1 @@\n"
-        "+SLUG-GUARD-PATCHED\n"
-    )
-    (eng / "patches" / "cron-plus" / "slug_identity_guard.py").write_text(
-        "# slug identity overlay\n"
-    )
-    (eng / "patches" / "cron-plus" / "jobs-store-lock.patch").write_text(
-        "diff --git a/jobs-lock-hook b/jobs-lock-hook\n"
-        "new file mode 100644\n"
-        "--- /dev/null\n"
-        "+++ b/jobs-lock-hook\n"
-        "@@ -0,0 +1 @@\n"
-        "+JOBS-STORE-LOCK-PATCHED\n"
-    )
-    (eng / "patches" / "cron-plus" / "reconcile-orphans-on-tick.patch").write_text(
-        "diff --git a/tick-reconcile-hook b/tick-reconcile-hook\n"
-        "new file mode 100644\n"
-        "--- /dev/null\n"
-        "+++ b/tick-reconcile-hook\n"
-        "@@ -0,0 +1 @@\n"
-        "+TICK-RECONCILE-PATCHED\n"
-    )
-    (eng / "patches" / "cron-plus" / "dst-fold.patch").write_text(
-        "diff --git a/dst-fold-hook b/dst-fold-hook\n"
-        "new file mode 100644\n"
-        "--- /dev/null\n"
-        "+++ b/dst-fold-hook\n"
-        "@@ -0,0 +1 @@\n"
-        "+DST-FOLD-PATCHED\n"
-    )
-    (eng / "patches" / "cron-plus" / "dst_fold.py").write_text("# fall-back fold overlay\n")
+    (eng / "patches" / "cron-plus" / "dst_fold.py").write_text("# fall-back fold policy\n")
 
     pack = tmp_path / "pack"; dest = pack / ".hermes-data" / "plugins" / "cron-plus"
     dest.parent.mkdir(parents=True)
     git("clone", "-q", str(up), str(dest), cwd=tmp_path); git("checkout", "-q", old, cwd=dest)
-    (dest / "jobs.py").write_text("HAND-PATCHED\n")           # local mod -> plain checkout would abort
+    (dest / "jobs.py").write_text("OLD\nHAND-PATCHED\n")       # tracked edit: a plain checkout aborts
+    (dest / "dst_fold.py").write_text("# old overlay copy\n")  # untracked; the pin tracks this path
 
-    r = subprocess.run(["bash", str(eng / "scripts" / "install-cron-plus.sh"), str(pack)],
-                       capture_output=True, text=True, env=genv)
+    def install():
+        return subprocess.run(["bash", str(eng / "scripts" / "install-cron-plus.sh"), str(pack)],
+                              capture_output=True, text=True, env=genv)
+
+    return eng, dest, new, rev, install
+
+
+def test_install_cron_plus_force_recovers_a_dirty_managed_clone(tmp_path):  # invariant-audit redeploy trap
+    """The plugin dir is an engine-MANAGED clone; a plain `git checkout` ABORTS on any local edit —
+    a hand-patched jobs.py did exactly this and killed a live redeploy at step 2. install-cron-plus
+    must FORCE the tree to the pin (recover) and surface what it discarded, including a clone left
+    patched with untracked overlay copies by an engine before hermes-cron-plus v0.2.0."""
+    _eng, dest, new, rev, install = _fake_cron_plus(tmp_path)
+    r = install()
     assert r.returncode == 0, f"aborted on a dirty managed clone:\n{r.stderr}"   # the bug
     assert rev(dest) == new, "did not recover to the pin"
-    assert (dest / "jobs.py").read_text() == "NEW-PINNED\nJOB-ENV-PATCHED\n", \
-        "local edit was not discarded and replaced by the carried patch"
-    assert (dest / "cli.py").read_text() == \
-        "# cli\nAFTER-ORDERING-PATCHED\nNULL-NEXT-RUN-PATCHED\n"
-    assert (dest / "receipt-hook").read_text() == "RUN-RECEIPTS-PATCHED\n"
-    assert (dest / "pid-hook").read_text() == "PID-OWNERSHIP-PATCHED\n"
-    assert (dest / "jobs-lock-hook").read_text() == "JOBS-STORE-LOCK-PATCHED\n"
-    assert (dest / "tick-reconcile-hook").read_text() == "TICK-RECONCILE-PATCHED\n"
-    assert (dest / "run-record-hook").read_text() == "RUN-RECORDS-PATCHED\n"
-    assert (dest / "after_ordering.py").read_text() == "# policy overlay\n"
-    assert (dest / "pid_ownership.py").read_text() == "# pid ownership overlay\n"
+    assert (dest / "jobs.py").read_text().startswith("NEW-PINNED\n"), "local edit was not discarded"
+    assert (dest / "dst_fold.py").read_text() == "# fall-back fold policy\n"
     assert "discarding LOCAL" in r.stderr, "must surface the discarded change, not silently drop it"
+    assert "verified the pinned policy modules" in r.stdout
 
-    again = subprocess.run(["bash", str(eng / "scripts" / "install-cron-plus.sh"), str(pack)],
-                           capture_output=True, text=True, env=genv)
+    again = install()
     assert again.returncode == 0, again.stderr
     assert "restored pinned cron-plus tree" in again.stdout
-    assert (dest / "jobs.py").read_text() == "NEW-PINNED\nJOB-ENV-PATCHED\n", \
-        "same-pin redeploy accumulated or lost a carried patch"
-    assert (dest / "receipt-hook").read_text() == "RUN-RECEIPTS-PATCHED\n"
-    assert (dest / "pid-hook").read_text() == "PID-OWNERSHIP-PATCHED\n"
+    assert rev(dest) == new and "discarding LOCAL" not in again.stderr
+
+
+def test_install_cron_plus_refuses_a_pin_that_differs_from_the_tested_mirror(tmp_path):
+    """Negative fixture: the engine tests patches/cron-plus/*.py, so a pinned upstream module that
+    is not byte-identical must stop the deploy rather than run untested scheduler code."""
+    eng, _dest, _new, _rev, install = _fake_cron_plus(tmp_path)
+    (eng / "patches" / "cron-plus" / "dst_fold.py").write_text("# engine-only edit\n")
+    r = install()
+    assert r.returncode != 0, "a drifted mirror must fail the install"
+    assert "dst_fold.py differs from the engine's tested copy" in r.stderr
+
+
+def test_install_cron_plus_refuses_a_pin_without_the_sidecar_store_lock(tmp_path):
+    """Negative fixture: the deploy writes jobs.json under jobs.json.lock (okengine#850); a pinned
+    scheduler that locks anything else would race it, so the install must fail."""
+    import subprocess as sp
+    eng, dest, _new, _rev, install = _fake_cron_plus(tmp_path)
+    up = tmp_path / "upstream"
+    (up / "jobs.py").write_text("NEW-PINNED\n")
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t", "PATH": "/usr/bin:/bin"}
+    sp.run(["git", "commit", "-qam", "C"], cwd=up, check=True, env=env)
+    head = sp.run(["git", "rev-parse", "HEAD"], cwd=up, capture_output=True, text=True).stdout.strip()
+    man = eng / "engine-manifest.yaml"
+    man.write_text(man.read_text().rsplit("pinned_sha:", 1)[0] + f"pinned_sha: {head}\n")
+    r = install()
+    assert r.returncode != 0, "a pin without the sidecar lock must fail the install"
+    assert "does not lock the job store through jobs.json.lock" in r.stderr
 
 
 def test_cron_plus_logs_reads_container_not_host_hermes():  # invariant-audit #15

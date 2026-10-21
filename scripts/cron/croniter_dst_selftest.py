@@ -165,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.dont_write_bytecode = saved
     if wrong:
         print(f"FAIL\tcron-plus at {args.cron_plus} mis-schedules the fall-back hour: "
-              f"{'; '.join(wrong)}. Rerun deploy.sh (install-cron-plus.sh applies dst-fold.patch)")
+              f"{'; '.join(wrong)}. Rerun deploy.sh (install-cron-plus.sh installs the pinned hermes-cron-plus, whose fold policy is dst_fold.py)")
         return FAIL
     print(f"PASS\tcroniter {found} computes {len(CASES)} DST case(s) correctly; cron-plus "
           f"compute_next_run passes {len(CRON_PLUS_CASES)} fall-back case(s)")

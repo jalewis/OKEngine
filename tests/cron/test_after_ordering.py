@@ -90,11 +90,3 @@ def test_legacy_success_state_upgrades_via_last_run_at_fallback():
               "last_run_at": "2026-07-16T12:00:00+00:00"}
     ready, claim, _ = m.after_ready({"after": ["up"]}, {"up": legacy})
     assert ready and claim["up"] == legacy["last_run_at"]
-
-
-def test_carried_patch_wires_policy_at_atomic_claim_and_completion_boundaries():
-    text = (REPO / "patches" / "cron-plus" / "after-ordering.patch").read_text()
-    assert "ready, after_claim, reason = after_ready(job, by_name)" in text
-    assert "begin_claim(job, after_claim)" in text
-    assert "record_outcome(job, success" in text
-    assert text.index("after_ready(job, by_name)") < text.index("compute_next_run(schedule")

@@ -1,4 +1,5 @@
-"""cron-plus fall-back fold policy (``patches/cron-plus/dst_fold.py``; okengine#1055, #1061 [4]).
+"""cron-plus fall-back fold policy (``patches/cron-plus/dst_fold.py``, the engine's tested mirror of
+hermes-cron-plus ``dst_fold.py``; okengine#1055, #1061 [4]).
 
 On 2026-11-01 America/New_York the 01:xx wall-clock hour happens twice: 05:xxZ (EDT), then 06:xxZ
 (EST). The pinned cron-plus guard compared croniter's candidate against the claim time, so a daily
@@ -22,7 +23,6 @@ from croniter import croniter
 
 REPO = Path(__file__).resolve().parents[2]
 POLICY = REPO / "patches" / "cron-plus" / "dst_fold.py"
-PATCH = REPO / "patches" / "cron-plus" / "dst-fold.patch"
 NY = ZoneInfo("America/New_York")
 
 
@@ -129,20 +129,3 @@ def test_a_star_hour_returns_the_second_pass_without_skipping():
     # Compare in UTC: PEP 495 makes an inter-zone == False for any time in a repeated span.
     assert _mod().next_fire(it, "30 * * * *").astimezone(timezone.utc) == _utc("2026-11-01T06:30")
     assert it.calls == 1
-
-
-def test_the_patch_replaces_the_claim_time_guard_with_the_policy():
-    text = PATCH.read_text(encoding="utf-8")
-    removed = [line[1:] for line in text.splitlines() if line.startswith("-") and not line.startswith("---")]
-    added = [line[1:] for line in text.splitlines() if line.startswith("+") and not line.startswith("+++")]
-    assert any("nxt_local.date() == base_local.date()" in line for line in removed), \
-        "the pin's claim-time comparison must be removed"
-    assert any("dst_fold.next_fire(it, expr)" in line for line in added)
-    assert not any("base_local" in line for line in added), \
-        "the new policy must not depend on the claim time"
-
-
-def test_the_installer_applies_the_patch_and_ships_the_overlay():
-    install = (REPO / "scripts" / "install-cron-plus.sh").read_text(encoding="utf-8")
-    assert 'apply_carried_patch "$ENGINE_DIR/patches/cron-plus/dst-fold.patch"' in install
-    assert 'cp "$ENGINE_DIR/patches/cron-plus/dst_fold.py" "$DEST/dst_fold.py"' in install

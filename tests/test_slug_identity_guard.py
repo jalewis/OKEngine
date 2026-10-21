@@ -81,12 +81,6 @@ def test_nested_pack_namespaces_are_isolated(tmp_path):
     assert guard.enforce(wiki, before, tmp_path / "quarantine", job_id="nested") == []
 
 
-def test_runner_enforces_after_failed_as_well_as_successful_direct_writers():
-    patch = (ROOT / "patches" / "cron-plus" / "slug-identity-guard.patch").read_text()
-    assert "if slug_snapshot is not None:" in patch
-    assert "if success and slug_snapshot is not None:" not in patch
-
-
 def test_paginated_index_artifacts_across_shards_are_not_a_collision(tmp_path):
     """okengine#836. `INDEX-p02.md` is a PER-DIRECTORY artifact -- it is supposed to exist in every
     shard, and those files are different pages sharing a basename, not spellings of one page.
@@ -400,12 +394,6 @@ def test_malformed_record_fields_are_unknown_not_absent(tmp_path):
          "ended_at": "garbage"}))
     records = guard.enforce(wiki, before, tmp_path / "q", job_id="budget-guard", runs_root=runs)
     assert records[0]["concurrent_jobs"] == ["a", "b", "c"]
-
-
-def test_the_runner_hands_the_guard_its_run_records_and_output():
-    patch = (ROOT / "patches" / "cron-plus" / "slug-identity-guard.patch").read_text()
-    assert 'runs_root=jobs_mod.CRON_PLUS_HOME / "runs"' in patch
-    assert "response=response" in patch
 
 
 def test_snapshot_records_when_the_window_opened(tmp_path):

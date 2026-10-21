@@ -500,12 +500,13 @@ def test_cron_plus_install_delegates_to_the_shared_installer():
         "ensure-runtime should not inline-clone cron-plus — delegate to install-cron-plus.sh"
 
 
-def test_install_cron_plus_applies_both_carried_patches():
-    """The shared installer must apply BOTH carried patches + the after_ordering overlay — the
-    capabilities extension crons depend on (per-job env, after: ordering)."""
+def test_install_cron_plus_verifies_the_pinned_policy_modules():
+    """Per-job env and after: ordering, which extension crons depend on, ship in the pinned
+    hermes-cron-plus since v0.2.0; the shared installer verifies the pin's policy modules against
+    the engine's tested copies instead of patching them in."""
     installer = (REPO / "scripts" / "install-cron-plus.sh").read_text(encoding="utf-8")
-    assert "job-env.patch" in installer and "after-ordering.patch" in installer
-    assert "after_ordering.py" in installer
+    assert '"$ENGINE_DIR"/patches/cron-plus/*.py' in installer and "cmp -s" in installer
+    assert (REPO / "patches" / "cron-plus" / "after_ordering.py").is_file()
 
 
 # --- bounded writer names (okengine#840) --------------------------------------------------------

@@ -280,7 +280,7 @@ docker exec -u "$HERMES_UID" "$CONTAINER" mkdir -p /opt/data/cron-plus
 # and the scheduler's save put the old one back -- 14 lanes kept retired writer names, and every
 # step printed success. cron_plus_store.py runs INSIDE the gateway and does snapshot + operator-
 # pause carry-forward (okengine#517; RESUME_PAUSED=1 re-arms) + atomic write under the sidecar
-# lock the patched scheduler also takes (patches/cron-plus/jobs-store-lock.patch), and records
+# lock the patched scheduler also takes (hermes-cron-plus jobs.py; install-cron-plus.sh checks the pin), and records
 # what it deployed as jobs.deployed.json so post_deploy_verify can prove it survived.
 INCOMING_IN="/opt/data/cron-plus/.jobs.incoming.json"
 docker exec -i -u "$HERMES_UID" "$CONTAINER" sh -c "cat > '$INCOMING_IN'" < "$DEPLOY_JOBS"

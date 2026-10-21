@@ -163,11 +163,11 @@ Copy the overlay paths from the OKEngine repo onto the Hermes tree. The
   # containerized deployment (the normal case): ensure-runtime.sh installs it automatically at
   # <pack>/.hermes-data/plugins/cron-plus (= /opt/data/plugins/cron-plus in the gateway), pinned.
   # Manual/explicit form — ALWAYS use install-cron-plus.sh, never a bare clone: it pins to the
-  # manifest SHA AND applies the carried patches (job-env + after-ordering) that extension crons
-  # REQUIRE (per-job env for scoped MCP tokens; after: freshness ordering). A bare clone+checkout
-  # gives an UNPATCHED scheduler and silently-broken extension lanes.
+  # manifest SHA, restores a dirty managed clone, and verifies the pinned policy modules against
+  # the engine's tested copies (patches/cron-plus/*.py). A bare clone of another commit can lack
+  # what extension crons REQUIRE (per-job env for scoped MCP tokens; after: freshness ordering).
   bash $ENGINE_DIR/scripts/install-cron-plus.sh <pack>
-  # (for a HOST-run hermes, install into ~/.hermes/plugins/cron-plus and apply patches/cron-plus/*)
+  # (for a HOST-run hermes, clone the manifest pin into ~/.hermes/plugins/cron-plus)
   # `cron-plus` under plugins.enabled in config.yaml (the seeded template already lists it)
   ```
 - **model-provider plugins** ship in the overlay (`plugins/model-providers/custom` — the local-Ollama `reasoning_effort:none` lever; `openrouter`).
