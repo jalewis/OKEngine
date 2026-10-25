@@ -399,8 +399,8 @@ def api_rollup(stream: str = Query(...), days: int = Query(7)):
 # writes the inverted+filtered+titled map to wiki/.backlinks.json once per
 # deployment per day (scripts/cron/backlink_lib.py is the canonical logic —
 # it also applies the generated-source filter and curated titles this app's
-# live build never had). When present and fresh we serve it directly and never
-# run iwe in this container; the live build below is only the fallback for a
+# live build never had). When present and fresh we serve it directly; the live
+# in-process scan below is only the fallback for a
 # missing/stale artifact. Ceiling default 48h = two missed daily runs.
 
 

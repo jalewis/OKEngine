@@ -89,7 +89,9 @@ def test_the_installer_requires_the_pins_lock_and_the_deploy_uses_the_store():
     side lives upstream since hermes-cron-plus v0.2.0, so the installer refuses a pin whose jobs.py
     does not take this module's lock file."""
     install = (REPO / "scripts" / "install-cron-plus.sh").read_text(encoding="utf-8")
-    assert f'JOBS_LOCK_FILE = CRON_PLUS_HOME / "{store.LOCK_NAME}"' in install
+    # The installer imports the pin and compares its lock with this module's LOCK_NAME (okengine#1068);
+    # tests/test_cron_plus_deploy.py proves it refuses a pin that locks anything else.
+    assert "scripts/cron_plus_store.py" in install and "store.LOCK_NAME" in install
     deploy = (REPO / "scripts" / "deploy-cron-plus-jobs.sh").read_text(encoding="utf-8")
     assert "python3 - write" in deploy and "scripts/cron_plus_store.py" in deploy
     assert "cat > '$DEST_IN'" not in deploy, "an unlocked write into the live store is the bug"

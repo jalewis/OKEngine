@@ -38,10 +38,12 @@ UNMEASURED_TREES: dict[str, str] = {
         "never runs is caught by collection, not by coverage."
     ),
     "patches": (
-        "carried patches for cron-plus, a PINNED EXTERNAL dependency. These files are copied "
-        "into the plugin clone by install-cron-plus.sh and execute inside cron-plus's own "
-        "package; importing them here measures a copy that no deployment runs. Their behaviour "
-        "is gated by tests/test_patches_registered.py and the cron-plus lane instead."
+        "the carried Hermes patches, applied to the Hermes clone at image build, and the engine's "
+        "mirror of the hermes-cron-plus policy modules (patches/cron-plus/*.py), which "
+        "install-cron-plus.sh requires to be byte-identical to the pinned plugin. Neither runs "
+        "from this tree; the plugin executes its own copy inside the cron-plus package. Their "
+        "behavior is gated by tests/test_patches_registered.py, tests/test_cron_plus_deploy.py "
+        "and the cron-plus lane instead."
     ),
     "templates": (
         "the pack skeleton shipped by `framework init`. It is rendered with {{PACK}} substitution "

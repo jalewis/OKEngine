@@ -327,7 +327,7 @@ async function openPage(path, push = true) {
     _setPageUrl(d.rel || path);   // reflect the open page in the URL (refresh-safe)
   } catch (e) { c.innerHTML = `<div class='empty'>page not found: ${esc(path)}</div>`; }
 }
-// IWE knowledge-graph: "what links here". The first call warms the server-side
+// Knowledge graph: "what links here". The first call warms the server-side
 // graph; subsequent ones are instant.
 async function loadBacklinks(path) {
   const box = $("#backlinks"); if (!box) return;

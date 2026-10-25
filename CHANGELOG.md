@@ -14,13 +14,55 @@ Notable changes to the OKEngine layer. Versions track `engine_release` in
 > **About panel** (reader/cockpit deployment purpose + composition from live state); and now **pack
 > bundles** (v0.10.0). If you are jumping from v0.3.5, read v0.4.0 onward.
 
+## v0.15.21
+
+PATCH. Hardens the cron-plus installer, makes the read MCP's page scan deterministic, and
+retires two mutation-floor waivers. Deployment scope: **image roll plus stage**. The read MCP
+image changes (`okengine-mcp/server.py`), and `scripts/install-cron-plus.sh` and
+`scripts/post_deploy_verify.sh` change on the deploy host. The pinned cron-plus tree is unchanged
+(hermes-cron-plus v0.2.0, `92239108`), so the plugin a host runs does not change.
+
+### Fixed
+- **`install-cron-plus.sh` switched the managed clone before verifying the pin** (okengine#1069).
+  A refused install exited 1 with the refused pin already checked out. The installer now builds
+  the candidate tree in a scratch directory, runs the mirror and lock checks there, and switches
+  the clone only after both pass. A refused fresh install leaves no clone.
+- **`install-cron-plus.sh` checked the scheduler's store lock by text** (okengine#1068). A pin that
+  kept the `JOBS_LOCK_FILE` line and rebound the name later installed cleanly. The installer now
+  imports the pinned `jobs.py` (isolated, with a throwaway `HERMES_HOME`) and requires its lock
+  path to be the file the deploy locks. Negative fixtures cover a missing lock, a rebinding, a
+  wrong directory, a moved store and an import that raises.
+- **Read MCP `list_pages` scanned in directory order**, which varies by filesystem. The scan is now
+  sorted, so the order in which pages are considered is fixed. The nightly critical mutation
+  campaign had failed two nights on survivors whose kill depended on that order.
+- **Read MCP `_safe` listed an entity shard directory on every read** (okengine#1070). The probe
+  could not change the resolved path. Resolution is unchanged: the two-level shard, then the
+  one-level shard, then the exact spelling.
+- The `scheduler-dst` FAIL hint in `post_deploy_verify.sh` now says to rerun `install-cron-plus.sh`
+  and restart the gateway, rather than to reapply carried patches.
+
+### Testing and CI
+- `okengine-mcp/server.py` reaches its 90% critical mutation floor and `scripts/framework_review.py`
+  its 80% floor; both waivers are deleted (okengine#965, okengine#843).
+- The weekly full mutation campaign rotates within its capacity, reusing unchanged passing
+  evidence, and a nightly detector fails when the campaign goes stale (okengine#1071). A new
+  `mutation-targeted` lane measures named targets whole-file.
+- The #993 reader/gateway compose test runs in the compose lane, and a strict XPASS fails
+  (okengine#1065).
+- Every test gets its own empty `HERMES_DATA` under a per-process directory, so a mutant cannot
+  leave a persisted id index behind for later targets in the same shard, and no test inherits
+  another test's lane state (okengine#1072).
+- The retired-IWE test scans code and UI text as well as Markdown.
+
 ## v0.15.20
 
 PATCH. The cron-plus scheduler changes OKEngine carried as patches now live in
 [hermes-cron-plus](https://github.com/jalewis/hermes-cron-plus) v0.2.0, and the engine pins it.
 The scheduler code a host runs is byte-identical to v0.15.19's patched plugin. Deployment scope:
-**stage only**; the next deploy re-clones the plugin at the new pin, with no image change and no
-gateway recreate.
+**stage only**; the next deploy re-clones the plugin at the new pin, with no gateway recreate.
+No image behavior changes, but the release images were rebuilt from the new tree, so all eight
+image digests differ from v0.15.19's (corrected after release; the original note said "no image
+change").
 
 ### Changed
 - **cron-plus pinned at hermes-cron-plus v0.2.0.** The eleven carried patches (per-job `env`,

@@ -196,6 +196,20 @@ def test_an_excluded_check_is_run_by_its_in_container_step(tmp_path, name):
     assert f"\x1b[31mFAIL\x1b[0m  {verdict}" in out, out[-3000:]
 
 
+@needs_bash
+def test_a_scheduler_dst_fail_points_at_the_pinned_plugin_not_carried_patches(tmp_path):
+    """Since hermes-cron-plus v0.2.0 the engine carries no cron-plus patches: install-cron-plus.sh
+    restores the pinned tree, and the gateway loads the plugin only at start. The FAIL hint must
+    say both, not send the operator to re-apply patches that no longer exist."""
+    _gateway_docker(tmp_path / "bin", _DST_SHIFTED)
+    out = _verify(tmp_path)
+    marker = "\x1b[31mFAIL\x1b[0m  [scheduler-dst] croniter 6.0.0 mis-computes"
+    assert marker in out, out[-3000:]
+    hint = out.split(marker, 1)[1].split("\n", 2)[1]
+    assert "install-cron-plus.sh" in hint and "restart" in hint, hint
+    assert "carried patches" not in hint, f"stale hint: {hint}"
+
+
 @pytest.mark.parametrize("name", [n for n, (body, _) in IN_CONTAINER_PROBE.items() if not body])
 def test_an_in_gateway_check_step_is_present(name):
     """CANNOT DETECT: whether the step is reached or passes on a live gateway; the marker is the

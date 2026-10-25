@@ -1083,7 +1083,7 @@ async function openPage(path, push = true) {
     loadBacklinks(d.rel || path);
   } catch (e) { c.innerHTML = `<div class='empty'>page not found: ${esc(path)}</div>`; }
 }
-// IWE knowledge-graph: "what links here". The first call in a 10-min window
+// Knowledge graph: "what links here". The first call in a 10-min window
 // warms the server-side graph (~20s); subsequent ones are instant.
 async function loadBacklinks(path) {
   const box = $("#backlinks"); if (!box) return;

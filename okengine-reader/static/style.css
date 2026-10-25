@@ -112,7 +112,7 @@ a.wl:hover{border-bottom-style:solid}
 .gsnip{color:var(--muted);font-size:0.857rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
 .gempty,.gmore{padding:8px 12px;color:var(--dim);font:0.857rem var(--mono)}
 
-/* IWE backlinks panel (overlay "what links here") */
+/* Backlinks panel (overlay "what links here") */
 .backlinks{margin-top:22px;border-top:1px solid var(--border);padding-top:12px}
 .bl-head{font:600 0.857rem var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px}
 .bl-head .bl-n{color:var(--live);margin-left:4px}

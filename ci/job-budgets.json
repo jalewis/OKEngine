@@ -281,6 +281,12 @@
       "job_id": 159956,
       "measured_on": "2026-10-12",
       "note": "Slowest of two MR runs (okengine#1048): pipeline 13085 job 159956 (9.6s) and 13105 job 160453 (8.0s). Tooling verify plus combining two JSON artifacts; queue excluded."
+    },
+    "mutation-targeted": {
+      "measured_s": 870.0,
+      "job_id": 179744,
+      "measured_on": "2026-10-23",
+      "note": "first run, pipeline 14302 at ae6f171e, MUTATION_TARGETS=scripts/framework_review.py (one target, 471 mutants); the job failed on the score floor, not the clock. The runtime scales with the named targets; the 12h timeout matches mutation-full and the gate's own 41,400s admission budget refuses a selection that cannot finish."
     }
   },
   "unmeasured": {
@@ -301,6 +307,12 @@
     },
     "public-tree-tests": {
       "reason": "new 2026-10-14 (okengine#1054): the MR-time public-tree slice. Not yet run in CI; locally the broad scope (16 files on main) took 12s of pytest after a ~1s tree build. Record its first MR pipeline run and move it to jobs."
+    },
+    "mutation-full-preflight": {
+      "reason": "new 2026-10-24 (okengine#1071): plans the weekly full rotation; runs only in the weekly RUN_FULL_MUTATION schedule (or an opted-in web/API pipeline), so it cannot run before merge. Its caps match mutation-critical-preflight (75m job, TEST_MUTATION_PREFLIGHT_DEADLINE 4200s); with a map it proves only the full-command baselines of the targets it admits. Record the first weekly run and move it to jobs."
+    },
+    "mutation-full-staleness": {
+      "reason": "new 2026-10-24 (okengine#1071): the nightly check that the weekly full rotation still runs; a handful of CI API reads. Runs only in the nightly critical schedule, so it cannot run before merge. Record the first nightly run and move it to jobs."
     }
   },
   "make_deadlines": {

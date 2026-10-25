@@ -336,12 +336,6 @@
       "rationale": "Reachable survivors remain counted after #566 boundary-focused strengthening; the freshness and authorization target must clear the 90% critical floor."
     },
     {
-      "pattern": "okengine-mcp/server.py:*",
-      "disposition": "assertion-gap-counted",
-      "owner": "okengine-maintainers",
-      "rationale": "Reachable server survivors remain counted after #566 wrapper argument and scope assertions; the target must clear the 90% critical floor."
-    },
-    {
       "pattern": "scripts/framework_ingest_rebuild.py:*",
       "disposition": "assertion-gap-counted",
       "owner": "okengine-maintainers",
@@ -2479,19 +2473,19 @@
       "approved_by": "okengine-maintainers",
       "rationale": "`os.environ.get(\"OKENGINE_WRITE_REVIEW_ONLY\") == \"1\"` -> `is \"1\"` in the __main__ entry point. The left operand is always an os.environ value (or None), and os.environ values are produced by decoding the process environment (os.fsdecode -> PyUnicode_DecodeFSDefaultAndSize). CPython returns its cached Latin-1 singleton for every one-character decode result, the same object the literal \"1\" names, so identity and equality agree for every reachable value: the decoded \"1\" is the literal, and any other value (or None) is neither equal nor identical. Verified on Python 3.14.4 with a runtime-built environment value. The sibling NotEq/Lt/LtE/Gt/GtE mutants are killed by test_only_the_exact_review_only_flag_selects_the_review_app and test_review_only_mode_serves_only_the_review_routes (tests/test_write_server_facade_mutation.py)."
     },
-    "okengine-mcp/server.py:659:57:core/ReplaceComparisonOperator_Eq_Is:9": {
+    "okengine-mcp/server.py:661:57:core/ReplaceComparisonOperator_Eq_Is:9": {
       "disposition": "equivalent",
       "owner": "okengine-maintainers",
       "approved_by": "okengine-maintainers",
       "rationale": "`env.get(...) == \"1\"` / `!= \"1\"` -> `is` / `is not` in _resolve_http_auth. Its only production caller passes os.environ, whose values are decoded from the process environment (os.fsdecode -> PyUnicode_DecodeFSDefaultAndSize); CPython returns its cached Latin-1 singleton for every one-character decode result, the same object the literal \"1\" names, and the default \"\" is CPython's single empty-string object. Identity and equality therefore agree for every reachable value (verified on Python 3.14.4 with a runtime-built environment value). The sibling ordering mutants are killed by test_only_the_exact_opt_out_value_serves_unauthenticated and test_only_the_exact_default_token_opt_in_serves_it_off_loopback (tests/test_mcp_server_read_boundary.py)."
     },
-    "okengine-mcp/server.py:670:59:core/ReplaceComparisonOperator_NotEq_IsNot:5": {
+    "okengine-mcp/server.py:672:59:core/ReplaceComparisonOperator_NotEq_IsNot:5": {
       "disposition": "equivalent",
       "owner": "okengine-maintainers",
       "approved_by": "okengine-maintainers",
       "rationale": "`env.get(...) == \"1\"` / `!= \"1\"` -> `is` / `is not` in _resolve_http_auth. Its only production caller passes os.environ, whose values are decoded from the process environment (os.fsdecode -> PyUnicode_DecodeFSDefaultAndSize); CPython returns its cached Latin-1 singleton for every one-character decode result, the same object the literal \"1\" names, and the default \"\" is CPython's single empty-string object. Identity and equality therefore agree for every reachable value (verified on Python 3.14.4 with a runtime-built environment value). The sibling ordering mutants are killed by test_only_the_exact_opt_out_value_serves_unauthenticated and test_only_the_exact_default_token_opt_in_serves_it_off_loopback (tests/test_mcp_server_read_boundary.py)."
     },
-    "okengine-mcp/server.py:696:21:core/ReplaceComparisonOperator_Eq_LtE:15": {
+    "okengine-mcp/server.py:698:21:core/ReplaceComparisonOperator_Eq_LtE:14": {
       "disposition": "equivalent",
       "owner": "okengine-maintainers",
       "approved_by": "okengine-maintainers",
@@ -2503,7 +2497,7 @@
       "approved_by": "okengine-maintainers",
       "rationale": "`caller.get(\"kind\") != \"admin\"` -> `>` in _authorize_projection_query. Caller `kind` in the read server is a closed domain built only by this module: \"admin\" (the _caller default and the admin-token branch of _ScopedAuth) and \"extension\" (a resolved extension token). \"extension\" sorts after \"admin\", so `kind > \"admin\"` agrees with the original for both values: admin -> False, extension -> True. The identity variant is killed by test_projection_queries_admit_admin_by_kind_value (tests/test_mcp_server_read_boundary.py)."
     },
-    "okengine-mcp/server.py:712:29:core/ReplaceComparisonOperator_Eq_LtE:16": {
+    "okengine-mcp/server.py:714:29:core/ReplaceComparisonOperator_Eq_LtE:15": {
       "disposition": "equivalent",
       "owner": "okengine-maintainers",
       "approved_by": "okengine-maintainers",
@@ -3144,6 +3138,84 @@
       "approved_by": "okengine-maintainers",
       "disposition": "equivalent",
       "rationale": "Reached only for an ambiguous wall time, where `moment` has that wall time and is therefore exactly one of the two passes: the first-pass instant (earlier) or the second-pass instant. `==` and `>=` agree on both (False for the earlier, True for the equal one). The `<=`, `<`, `!=` and `is` siblings are killed by test_repeated_wall_time[first-pass] / [second-pass]."
+    },
+    "okengine-mcp/server.py:784:28:core/ReplaceComparisonOperator_Gt_GtE:3": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "`len(samples) > cap` -> `>=` in _record_qmd: at len == cap the mutant runs `del samples[:0]`, which removes nothing, so the retained samples are identical. (okengine#965)"
+    },
+    "okengine-mcp/server.py:795:30:core/NumberReplacer:157": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "`max(0, n*50//100 - 1)` -> `max(-1, ...)` in _percentiles: the index is -1 only when n == 1 (n == 0 returns early), and then ordered[-1] is ordered[0]. (okengine#965)"
+    },
+    "okengine-mcp/server.py:796:30:core/NumberReplacer:165": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "`max(0, n*95//100 - 1)` -> `max(-1, ...)` in _percentiles: the index is -1 only when n == 1 (n == 0 returns early), and then ordered[-1] is ordered[0]. (okengine#965)"
+    },
+    "okengine-mcp/server.py:933:21:core/ReplaceComparisonOperator_Gt_GtE:4": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "`m > newest` -> `>=` in _vault_max_mtime: when m == newest the mutant assigns newest = m, the same value. (okengine#965)"
+    },
+    "okengine-mcp/server.py:941:29:core/ReplaceComparisonOperator_Gt_GtE:5": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "`m > newest` -> `>=` in _vault_max_mtime: when m == newest the mutant assigns newest = m, the same value. (okengine#965)"
+    },
+    "okengine-mcp/server.py:992:45:core/NumberReplacer:216": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "initial last_seen -1.0 -> -2.0 in _index_maintainer: _vault_max_mtime() starts at 0.0 and never returns a negative value, so `cur > -1.0` and `cur > -2.0` always agree. (okengine#965)"
+    },
+    "okengine-mcp/server.py:992:68:core/NumberReplacer:218": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "initial cooldown_until 0.0 -> 1.0 in _index_maintainer: the first step always takes the full-refresh branch (last_full == 0.0), which writes cooldown_until before anything reads it; if the refresh raises, neither field is written and the next step takes the full branch again. (okengine#965)"
+    },
+    "okengine-mcp/server.py:992:68:core/NumberReplacer:219": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "initial cooldown_until 0.0 -> -1.0 in _index_maintainer: the first step always takes the full-refresh branch (last_full == 0.0), which writes cooldown_until before anything reads it; if the refresh raises, neither field is written and the next step takes the full branch again. (okengine#965)"
+    },
+    "okengine-mcp/server.py:1001:12:core/ReplaceComparisonOperator_Eq_Is:14": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "`__name__ is \"__main__\"`: the interpreter and runpy bind __name__ to the interned \"__main__\" string, so identity and equality agree on every real entry path; on import the name differs under both. (okengine#965)"
+    },
+    "okengine-mcp/server.py:183:42:core/NumberReplacer:19": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "max(0.0, r) -> max(-1.0, r) in the capacity poll: the two differ only when the deadline passed between the check and the sleep (r in (-1, 0)), and asyncio.sleep treats every delay <= 0 identically (a single yield), so no observable difference exists. (okengine#965)"
+    },
+    "okengine-mcp/server.py:208:15:core/ReplaceComparisonOperator_Eq_Is:2": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "rel is reassigned only to a strictly shorter string, so rel is unchanged exactly when it is the same object as before; == and is agree on every path (okengine#965)"
+    },
+    "okengine-mcp/server.py:236:50:core/ReplaceComparisonOperator_Gt_NotEq:0": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "guarded by `if stem:`, so len(stem) >= 1 and len(stem) > 1 is identical to len(stem) != 1 (okengine#965)"
+    },
+    "okengine-mcp/server.py:222:47:core/NumberReplacer:25": {
+      "disposition": "equivalent",
+      "owner": "okengine-maintainers",
+      "approved_by": "okengine-maintainers",
+      "rationale": "len(parts) >= 2 differs from >= 3 only at len 2, where parts[1:-1] is empty (all() is True) and the left disjunct len(parts) == 2 is already True (okengine#965)"
     }
   }
 }

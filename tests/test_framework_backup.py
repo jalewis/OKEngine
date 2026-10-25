@@ -1274,8 +1274,8 @@ def test_restore_rearm_lock_name_matches_the_scheduler_and_the_deploy():
     store = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(store)
     assert _mod()._CRON_PLUS_LOCK_NAME == store.LOCK_NAME
-    assert f'JOBS_LOCK_FILE = CRON_PLUS_HOME / "{store.LOCK_NAME}"' in (
-        REPO / "scripts/install-cron-plus.sh").read_text()
+    install = (REPO / "scripts/install-cron-plus.sh").read_text()
+    assert "scripts/cron_plus_store.py" in install and "store.LOCK_NAME" in install
 
 
 def test_restore_rearm_keeps_the_job_store_owner(tmp_path, monkeypatch):

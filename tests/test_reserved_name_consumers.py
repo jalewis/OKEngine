@@ -113,3 +113,15 @@ def test_the_broad_index_scans_hide_no_writable_page():
     writable = [n for n in BATTERY if not sv.is_reserved_basename(n)]
     hidden = {f: [n for n in writable if pred(n)] for f, pred in _BROAD.items()}
     assert hidden == {f: [] for f in _BROAD}
+
+
+def test_the_broad_scan_xfail_is_not_vacuous():
+    """okengine#1065: the xfail above must fail for its stated reason, never pass on nothing. It
+    needs predicates to check, writable names to check them against, and at least one writable
+    name a predicate hides (the known defect); when the defect is fixed, drop this last assert
+    with the xfail marker."""
+    writable = [n for n in BATTERY if not sv.is_reserved_basename(n)]
+    assert len(_BROAD) == 2, f"broad-scan predicate families changed: {sorted(_BROAD)}"
+    assert writable, "the battery has no writable names; the broad-scan check would be vacuous"
+    assert any(pred(n) for pred in _BROAD.values() for n in writable), (
+        "no writable name is hidden any more: the #997 follow-up is fixed, so remove the xfail")

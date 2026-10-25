@@ -72,6 +72,9 @@ EXPECTED_GATED = {
     "test_mcp_search_capacity.py",
     "test_mcp_server_contract_edges.py",
     "test_mcp_server_helpers.py",
+    "test_mcp_server_mutants_a.py",       # read-MCP mutation floor, group A (okengine#965)
+    "test_mcp_server_mutants_b.py",       # read-MCP mutation floor, group B (okengine#965)
+    "test_mcp_server_mutants_c.py",       # read-MCP mutation floor, group C (okengine#965)
     "test_mcp_server_resolve_key_containment.py",
     "test_okengine_mcp_backlinks.py",
     "test_reader.py",

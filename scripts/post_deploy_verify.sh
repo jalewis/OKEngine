@@ -452,7 +452,7 @@ else
     while IFS=$'\t' read -r level msg; do
         case "$level" in
             ""|END) continue ;;
-            FAIL) bad "[scheduler-dst] $msg" "a croniter case: rebuild the gateway image (build-engine-image.sh) and recreate $GW; a cron-plus case: rerun deploy.sh so install-cron-plus.sh reapplies the carried patches" ;;
+            FAIL) bad "[scheduler-dst] $msg" "a croniter case: rebuild the gateway image (build-engine-image.sh) and recreate $GW; a cron-plus case: rerun install-cron-plus.sh (deploy.sh calls it) to restore the pinned hermes-cron-plus tree, then restart $GW, whose scheduler loads the plugin only at start" ;;
             STALE) bad "[scheduler-dst] $msg" "restage the cron scripts (deploy-cron-scripts.sh), then rerun this verify" ;;
             WARN) wn  "[scheduler-dst] $msg" "run the check inside the gateway" ;;
             *)    ok  "[scheduler-dst] $msg" ;;

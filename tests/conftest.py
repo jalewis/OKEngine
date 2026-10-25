@@ -15,11 +15,31 @@ import os
 import inspect
 import re
 import runpy
+import shutil
+import tempfile
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
 import pytest
+
+
+# okengine#1072: the write path's id_index.build() LOADS the persisted artifact at
+# $HERMES_DATA/state/id-index.json (default /opt/data) whenever one exists, for any vault. As root
+# in a mutation shard container, an id_index mutant's background refresh wrote that default path, and
+# every later target in the same job read another vault's index unmutated: 7 write-server tests
+# failed their baseline and transport.py went unmeasured. Point HERMES_DATA at a fresh directory per
+# pytest process, at conftest import, before any test module imports id_index (which binds the path
+# at import). Every session, and so every mutant run, gets its own; nothing reads or writes /opt/data.
+# Each test then gets a fresh subdirectory (_restore_process_environment).
+TEST_HERMES_DATA = tempfile.mkdtemp(prefix="okengine-test-hermes-data-")
+os.environ["HERMES_DATA"] = TEST_HERMES_DATA
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _remove_test_hermes_data():
+    yield
+    shutil.rmtree(TEST_HERMES_DATA, ignore_errors=True)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -275,13 +295,36 @@ def pytest_runtest_call(item: pytest.Item):
     )
 
 
+def _is_honest_xfail(item: pytest.Item, call: pytest.CallInfo, report: pytest.TestReport) -> bool:
+    """True for the one xfail a blocking layer accepts: a ``strict=True`` xfail marker whose test
+    ran and failed. Its XPASS already fails the run (pytest's own strict handling), so it cannot go
+    vacuous. An imperative ``pytest.xfail()``, a non-strict marker, and ``run=False`` are skips by
+    another name and stay failures."""
+    marker = item.get_closest_marker("xfail")
+    strict = marker is not None and bool(
+        marker.kwargs.get("strict", item.config.getini("xfail_strict")))
+    imperative = call.excinfo is not None and call.excinfo.errisinstance(pytest.xfail.Exception)
+    return (strict and not imperative and report.when == "call" and report.skipped
+            and hasattr(report, "wasxfail"))
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
     outcome = yield
     report = outcome.get_result()
-    if _STRICT_SKIPS and report.skipped:
+    # okengine#1065: pytest reports an xfail as `skipped` and a non-strict XPASS as `passed`, both
+    # carrying `wasxfail`. Turning such a report into `failed` while leaving `wasxfail` on it made
+    # the session NOT count the failure (pytest's main.py skips any report carrying `wasxfail`) and
+    # JUnit record "xfail-marked test passes unexpectedly": security-properties job 176029 printed
+    # "1 failed" and exited 0. So an honest strict xfail stays an xfail, and every other conversion
+    # drops `wasxfail` so the failure counts.
+    xpass = report.passed and hasattr(report, "wasxfail")
+    if _STRICT_SKIPS and (report.skipped or xpass) and not _is_honest_xfail(item, call, report):
+        reason = "unexpected xfail/xpass" if hasattr(report, "wasxfail") else "unexpected skip"
         report.outcome = "failed"
-        report.longrepr = f"unexpected skip in blocking layer: {report.nodeid}"
+        report.longrepr = f"{reason} in blocking layer: {report.nodeid}"
+        if hasattr(report, "wasxfail"):
+            del report.wasxfail
     cpu_duration = float(getattr(item, "_okengine_cpu_duration", report.duration))
     if (
         _STRICT_SKIPS and report.when == "call" and report.passed
@@ -307,10 +350,17 @@ def _restore_process_environment():
     whole environment after every test removes the class instead of chasing each helper.
     """
     saved = dict(os.environ)
+    # okengine#1072: each test also gets its own empty HERMES_DATA under the session directory.
+    # Lanes that persist state there (event scores, calibration history, base rates) otherwise
+    # leave it for every later test in the session, which then exercises a different branch than
+    # its fixture intends. Before the session directory existed, an unset HERMES_DATA meant a
+    # fresh vault-local fallback per test; this keeps that isolation.
+    test_hermes_data = tempfile.mkdtemp(prefix="test-", dir=TEST_HERMES_DATA)
+    os.environ["HERMES_DATA"] = test_hermes_data
     yield
-    if os.environ != saved:
-        os.environ.clear()
-        os.environ.update(saved)
+    os.environ.clear()
+    os.environ.update(saved)
+    shutil.rmtree(test_hermes_data, ignore_errors=True)
 
 
 @pytest.fixture(scope="session", autouse=True)

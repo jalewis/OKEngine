@@ -101,7 +101,7 @@ def hardened_posture_violations(env: Mapping) -> list[str]:
             "OKENGINE_READER_RATE=0 disables reader rate limiting — hardened mode requires "
             "it on. Unset it for the built-in default, or set a positive per-minute cap.")
 
-    # 4. a public reader must not also enable exports (unbounded pandoc/IWE work).
+    # 4. a public reader must not also enable exports (unbounded pandoc work).
     if public and _truthy(env.get("OKENGINE_READER_EXPORTS")):
         out.append(
             "OKENGINE_READER_EXPORTS is enabled on a PUBLIC reader — hardened mode requires "

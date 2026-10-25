@@ -235,16 +235,16 @@ def _safe(path: str) -> Path | None:
             one = f"entities/{first}/{stem}.md"
             second = stem[1].lower() if len(stem) > 1 and stem[1].isalnum() else "_"
             two = f"entities/{first}/{second}/{stem}.md"
+            # The two-level shard wins, then the one-level shard, then the exact spelling. Where a new
+            # page lands is the write path's decision (canonical_key), so the read path probes only
+            # files that exist (okengine#1070).
             try:
-                leaf = WIKI / "entities" / first
-                if (WIKI / two).is_file() or (
-                    not (WIKI / one).exists()
-                    and leaf.is_dir()
-                    and any(child.is_dir() and len(child.name) == 1 for child in leaf.iterdir())
-                ):
-                    rel = two if (WIKI / two).is_file() else str(exact_relative or rel)
+                if (WIKI / two).is_file():
+                    rel = two
+                elif (WIKI / one).is_file():
+                    rel = one
                 else:
-                    rel = one if (WIKI / one).is_file() else str(exact_relative or rel)
+                    rel = str(exact_relative or rel)
             except OSError:
                 rel = one
 
@@ -595,7 +595,9 @@ def list_pages(namespace: str, type: str = "", status: str = "", limit: int = 40
     for base in (WIKI / ns, *sorted(WIKI.glob(f"*/{ns}"))):  # glob-ok: discovers per-pack namespace dirs (*/<ns>), not content
         if not base.is_dir():
             continue
-        for p in base.rglob("*.md"):
+        # sorted: rglob yields directory order, which varies by filesystem; a fixed order makes the
+        # scan (and the tests that pin each skip below) deterministic.
+        for p in sorted(base.rglob("*.md")):
             if p.name == "INDEX.md" or p.name.startswith((".", "_")):
                 continue
             try:

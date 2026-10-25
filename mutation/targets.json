@@ -119,22 +119,7 @@
       "src/okengine/identity_guard.py": 200
     }
   },
-  "floor_waivers": {
-    "okengine-mcp/server.py": {
-      "owner": "okengine-maintainers",
-      "approved_by": "okengine-maintainers",
-      "rationale": "Measured 72.00% at 6f99048b on 2026-10-01 (1707 mutants: 1139 killed, 125 equivalent, 443 counted survivors; raw 71.77% before five exact-fingerprint equivalents). The auth, scope and get_page survivors are killed or dispositioned; about 277 more kills are needed, mostly in index maintenance, qmd telemetry and process handling, module-level env parsing, search, _safe and the graph tools. Plan and survivor groups: #965.",
-      "issue": "#965",
-      "expires": "2026-10-31"
-    },
-    "scripts/framework_review.py": {
-      "owner": "okengine-maintainers",
-      "approved_by": "okengine-maintainers",
-      "rationale": "2026-09-21 first full-file baseline is 62.39% (registered by #842); the new --reconcile code has 0 undispositioned survivors, and the 176 remaining survivors are in the pre-existing main()/--migrate/--decision paths, strengthened under #843.",
-      "issue": "#843",
-      "expires": "2026-10-21"
-    }
-  },
+  "floor_waivers": {},
   "targets": [
     {
       "path": "scripts/deploy_matrix.py",
@@ -443,7 +428,7 @@
       "owner": "okengine-maintainers",
       "timeout_seconds": 45,
       "session_deadline_seconds": 7200,
-      "test_command": "{python} -m pytest tests/test_mcp_auth.py tests/test_mcp_graph_hardening.py tests/test_mcp_index_maintainer.py tests/test_mcp_search_capacity.py tests/test_mcp_server_contract_edges.py tests/test_mcp_server_edge_paths.py tests/test_mcp_server_helpers.py tests/contract/test_read_plane_contract_v1.py tests/test_mcp_server_read_boundary.py -q",
+      "test_command": "{python} -m pytest tests/test_mcp_auth.py tests/test_mcp_graph_hardening.py tests/test_mcp_index_maintainer.py tests/test_mcp_search_capacity.py tests/test_mcp_server_contract_edges.py tests/test_mcp_server_edge_paths.py tests/test_mcp_server_helpers.py tests/contract/test_read_plane_contract_v1.py tests/test_mcp_server_read_boundary.py tests/test_mcp_server_mutants_a.py tests/test_mcp_server_mutants_b.py tests/test_mcp_server_mutants_c.py -q",
       "min_mutants": 1
     },
     {
@@ -2351,9 +2336,9 @@
       "category": "review",
       "critical": false,
       "owner": "okengine-maintainers",
-      "timeout_seconds": 66,
+      "timeout_seconds": 160,
       "session_deadline_seconds": 3600,
-      "test_command": "{python} -m pytest tests/test_review_reconcile.py tests/test_framework_review_cli.py -q",
+      "test_command": "{python} -m pytest tests/test_review_reconcile.py tests/test_framework_review_cli.py tests/test_framework_review_mutants_a.py tests/test_framework_review_mutants_b.py -q",
       "min_mutants": 1
     },
     {

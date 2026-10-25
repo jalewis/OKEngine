@@ -45,13 +45,15 @@ incompetent mutations, abnormal outcomes, and runner errors are hard failures.
 
 ```sh
 make test-mutation-changed MUTATION_BASE=origin/main
-make test-mutation-full
+make test-mutation-full-preflight   # plan one weekly rotation run
+make test-mutation-full             # one shard of it (MUTATION_REUSE_PLAN, MUTATION_BASELINE_PROOF)
 ```
 
 Merge requests automatically validate target registration; their changed-target
 campaign is manual. The daily schedule selects critical targets and the weekly
-opt-in schedule selects the full manifest. Campaigns carry an 11.5-hour internal
-budget below the twelve-hour runner timeout.
+opt-in schedule rotates through the full manifest (see "The weekly full lane is a
+rotation" below). Campaigns carry an 11.5-hour internal budget below the
+twelve-hour runner timeout.
 
 Before creating any mutant, the critical preflight job groups targets by effective test command,
 timeout, and exit-first semantics and runs each distinct baseline once in a fresh worktree (with
@@ -155,6 +157,50 @@ last passing measurement (okengine#943, `ci/mutation_reuse.py`):
   survivor the old command killed. A target that runs selected is also keyed on the map's
   covering files. Narrowing its command changes its key only if the narrower command is measured
   cheaper than selection, so that it switches to full-command mode.
+
+## The weekly full lane is a rotation (okengine#1071)
+
+The whole manifest does not fit one weekly run, and never will by tuning: priced with the gate's
+own estimates it is about 4.77M worker-seconds, while one run has 3 shards x 33,120 usable seconds
+x 4 workers = 397,440. Pipeline 14253 had all three `mutation-full` shards refused at admission.
+So the weekly lane measures part of the manifest each week, and **every target is measured at
+least once per 42-day window (six weekly runs) or the lane fails**:
+
+- **Plan.** `mutation-full-preflight` (`make test-mutation-full-preflight`: `--preflight-only
+  --reuse-evidence --rotation-shards 3 --rotation-workers 4`) reads the same scheduled evidence
+  as the nightly, over `MUTATION_FULL_REBASELINE_DAYS` (42; the nightly keeps its 7). Nightly
+  critical shards count as evidence for the critical targets. Unchanged, passing, in-window
+  targets are reused exactly as in the nightly.
+- **Admission.** Targets that need a re-measure are admitted in priority order: the latest
+  measurement failed; inputs changed, incomplete, unhashable, or evidence unreadable; never
+  measured in the window; evidence older than the window. Within a priority the oldest
+  evidence goes first (none first), then the path. Leftover capacity re-measures the oldest
+  reusable evidence. Each admitted target goes to the least-loaded shard (each shard holds at
+  most `floor(0.8 x deadline) x workers` worker-seconds); what fits nowhere is **deferred** with
+  its reason, including "exceeds one shard's capacity". The plan records the deferrals, each
+  shard's list (`shards`, in admission order), and the cost charged per target (`costs`).
+- **Self-calibrating cost.** A target is charged its own most recent complete measurement,
+  `elapsed_seconds x` that shard's `budget.workers x 1.25`, even when its inputs changed since.
+  Otherwise a formula-priced target (`selected_cost_seconds`) is charged formula x the median
+  measured/formula ratio over this plan's targets that have both (clamped to [0.1, 1.0]; 1.0
+  below five samples), and any other target its whole-file cost. `rotation.basis` and
+  `rotation.calibration` in the plan say which applied.
+- **Shards.** Shard N measures exactly `shards[N]`, in order, and its admission check charges the
+  plan's `costs`, so the preflight and the shard cannot disagree. A shard refuses a plan packed
+  for another shard count, worker count or deadline. At its deadline a shard stops starting
+  targets; the ones it did not reach are a warning in the shard and a deferral in the aggregate,
+  never a crash. The preflight's shard count is pinned to `mutation-full`'s `parallel:`.
+- **Aggregate.** `mutation-full-aggregate` scores measured and reused targets exactly as before
+  and lists every deferral (`deferred` in `summary.json`, a JUnit case each) with its reason and
+  latest evidence. A deferral **fails the lane** when the target has no complete measurement in
+  the window ("never measured", "stale"), or its latest complete measurement failed. A deferral
+  whose last complete measurement passed inside the window (its inputs changed since) is only a
+  warning: `mutation-changed` covers that diff at merge time. The report states the backlog
+  (count, estimated worker-seconds) and the weekly runs needed to clear it at this capacity.
+- **Staleness.** `mutation-full-staleness` runs in every nightly critical pipeline
+  (`ci/mutation_staleness.py`) and **fails when the weekly lane stops**: no finished
+  `mutation-full-aggregate` on a scheduled `main` pipeline, or the newest one started more than
+  `MUTATION_FULL_MAX_AGE_DAYS` (8) days ago. An unreadable API fails it too: unknown is not fresh.
 
 Locally, build a map from any `--cov-context=test` run with `ci/coverage_map.py build` and pass
 `--coverage-map` (or `MUTATION_COVERAGE_MAP`) to `ci/mutation_gate.py`.

@@ -5,6 +5,7 @@ that the deploy targets the PACK RUNTIME (the gateway container / .hermes-data),
 not the old host ~/.hermes or engine-repo compose, so a refactor can't silently
 revert the fixes.
 """
+import os
 import subprocess
 from pathlib import Path
 
@@ -88,7 +89,7 @@ def test_install_cron_plus_targets_runtime_and_reads_pin():  # #20
     assert ".hermes-data/plugins/cron-plus" in t
     assert "pinned_sha" in t and "dependencies.cron-plus" not in t.split("\n")[0]  # reads the manifest pin
     assert "apply_carried_patch" not in t, "the carried patches live upstream since cron-plus v0.2.0"
-    assert '"$ENGINE_DIR"/patches/cron-plus/*.py' in t and 'cmp -s "$mirror" "$DEST/$name"' in t
+    assert '"$ENGINE_DIR"/patches/cron-plus/*.py' in t and 'cmp -s "$mirror" "$CANDIDATE/$name"' in t
     for name in ("after_ordering", "artifact_records", "dst_fold", "model_slots", "pid_ownership",
                  "run_receipts", "run_records", "run_timeout", "slug_identity_guard"):
         assert (REPO / "patches" / "cron-plus" / f"{name}.py").is_file(), f"engine mirror {name}.py missing"
@@ -194,6 +195,18 @@ def test_job_deploy_recovers_root_owned_model_slot_artifacts():
     assert text.index(reconcile) < text.index('docker exec -u "$HERMES_UID" "$CONTAINER" mkdir')
 
 
+def _jobs_module(after=""):
+    """A pinned jobs.py reduced to the store paths the installer reads: it imports the module and
+    checks the lock path the scheduler resolves, so the fixture must be importable Python."""
+    return ("# NEW-PINNED\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "HERMES_HOME = Path(os.environ.get('HERMES_HOME', str(Path.home() / '.hermes')))\n"
+            "CRON_PLUS_HOME = HERMES_HOME / 'cron-plus'\n"
+            "JOBS_FILE = CRON_PLUS_HOME / 'jobs.json'\n"
+            'JOBS_LOCK_FILE = CRON_PLUS_HOME / "jobs.json.lock"\n' + after)
+
+
 def _fake_cron_plus(tmp_path):
     """A local upstream with an old commit and a pinned commit that tracks the policy module, a
     fake engine whose manifest pins it, and a managed clone left at the old commit the way a
@@ -209,13 +222,13 @@ def _fake_cron_plus(tmp_path):
     def rev(cwd):
         return subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(cwd), capture_output=True, text=True).stdout.strip()
 
-    lock = 'JOBS_LOCK_FILE = CRON_PLUS_HOME / "jobs.json.lock"\n'
+    pinned_jobs = _jobs_module()
     up = tmp_path / "upstream"; up.mkdir(); git("init", "-q", cwd=up)
     (up / "cli.py").write_text("# cli\n")
     (up / "jobs.py").write_text("OLD\n")
     git("add", "-A", cwd=up); git("commit", "-qm", "A", cwd=up)
     old = rev(up)
-    (up / "jobs.py").write_text("NEW-PINNED\n" + lock)
+    (up / "jobs.py").write_text(pinned_jobs)
     (up / "dst_fold.py").write_text("# fall-back fold policy\n")
     git("add", "-A", cwd=up); git("commit", "-qm", "B", cwd=up)
     new = rev(up)
@@ -226,6 +239,7 @@ def _fake_cron_plus(tmp_path):
     (eng / "engine-manifest.yaml").write_text(
         f"dependencies:\n  cron-plus:\n    upstream: file://{up}\n    pinned_sha: {new}\n")
     shutil.copy(S / "install-cron-plus.sh", eng / "scripts" / "install-cron-plus.sh")
+    shutil.copy(S / "cron_plus_store.py", eng / "scripts" / "cron_plus_store.py")
     (eng / "patches" / "cron-plus" / "dst_fold.py").write_text("# fall-back fold policy\n")
 
     pack = tmp_path / "pack"; dest = pack / ".hermes-data" / "plugins" / "cron-plus"
@@ -250,7 +264,7 @@ def test_install_cron_plus_force_recovers_a_dirty_managed_clone(tmp_path):  # in
     r = install()
     assert r.returncode == 0, f"aborted on a dirty managed clone:\n{r.stderr}"   # the bug
     assert rev(dest) == new, "did not recover to the pin"
-    assert (dest / "jobs.py").read_text().startswith("NEW-PINNED\n"), "local edit was not discarded"
+    assert (dest / "jobs.py").read_text() == _jobs_module(), "local edit was not discarded"
     assert (dest / "dst_fold.py").read_text() == "# fall-back fold policy\n"
     assert "discarding LOCAL" in r.stderr, "must surface the discarded change, not silently drop it"
     assert "verified the pinned policy modules" in r.stdout
@@ -271,22 +285,110 @@ def test_install_cron_plus_refuses_a_pin_that_differs_from_the_tested_mirror(tmp
     assert "dst_fold.py differs from the engine's tested copy" in r.stderr
 
 
-def test_install_cron_plus_refuses_a_pin_without_the_sidecar_store_lock(tmp_path):
-    """Negative fixture: the deploy writes jobs.json under jobs.json.lock (okengine#850); a pinned
-    scheduler that locks anything else would race it, so the install must fail."""
+def _pin_jobs_module(tmp_path, eng, text):
+    """Commit ``text`` as the upstream jobs.py and move the fake engine's pin to that commit."""
     import subprocess as sp
-    eng, dest, _new, _rev, install = _fake_cron_plus(tmp_path)
     up = tmp_path / "upstream"
-    (up / "jobs.py").write_text("NEW-PINNED\n")
+    (up / "jobs.py").write_text(text)
     env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
            "GIT_COMMITTER_EMAIL": "t@t", "PATH": "/usr/bin:/bin"}
     sp.run(["git", "commit", "-qam", "C"], cwd=up, check=True, env=env)
     head = sp.run(["git", "rev-parse", "HEAD"], cwd=up, capture_output=True, text=True).stdout.strip()
     man = eng / "engine-manifest.yaml"
     man.write_text(man.read_text().rsplit("pinned_sha:", 1)[0] + f"pinned_sha: {head}\n")
+
+
+@pytest.mark.parametrize("jobs_text, detail", [
+    pytest.param("NEW-PINNED\n", "cannot import the pinned jobs.py", id="no-lock-at-all"),
+    # okengine#1068 probe r2: the expected line survives and the name is rebound right after it.
+    pytest.param(_jobs_module("JOBS_LOCK_FILE = CRON_PLUS_HOME / 'jobs.json'\n"),
+                 "locks", id="rebound-after-the-expected-line"),
+    pytest.param(_jobs_module("JOBS_LOCK_FILE = HERMES_HOME / 'jobs.json.lock'\n"),
+                 "locks", id="right-name-wrong-directory"),
+    pytest.param(_jobs_module("JOBS_FILE = HERMES_HOME / 'elsewhere' / 'jobs.json'\n"),
+                 "locks", id="store-moved-away-from-the-lock"),
+    pytest.param(_jobs_module("raise RuntimeError('boom')\n"),
+                 "cannot import the pinned jobs.py", id="import-fails"),
+])
+def test_install_cron_plus_refuses_a_pin_without_the_sidecar_store_lock(tmp_path, jobs_text, detail):
+    """Negative fixtures: the deploy writes jobs.json under jobs.json.lock next to it (okengine#850);
+    a pinned scheduler that locks anything else would race it, so the install must fail. The check
+    reads the paths the imported module resolves, so a rebinding that keeps the expected source
+    line is refused too (okengine#1068)."""
+    eng, _dest, _new, _rev, install = _fake_cron_plus(tmp_path)
+    _pin_jobs_module(tmp_path, eng, jobs_text)
     r = install()
-    assert r.returncode != 0, "a pin without the sidecar lock must fail the install"
+    assert r.returncode != 0, f"a pin without the sidecar lock must fail the install:\n{r.stdout}"
     assert "does not lock the job store through jobs.json.lock" in r.stderr
+    assert detail in r.stderr, r.stderr
+
+
+def _clone_state(dest):
+    """HEAD, porcelain status, and every file's bytes outside .git: what a refused install must keep."""
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=dest, capture_output=True, text=True).stdout
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=dest, capture_output=True,
+                            text=True).stdout
+    files = {str(p.relative_to(dest)): p.read_bytes() for p in sorted(dest.rglob("*"))
+             if p.is_file() and ".git" not in p.relative_to(dest).parts}
+    return head, status, files
+
+
+@pytest.mark.parametrize("refusal", ["mirror-drift", "lock"])
+def test_a_refused_install_leaves_the_managed_clone_untouched(tmp_path, refusal):
+    """okengine#1069: the pin is verified in a scratch tree, so a refused install leaves the managed
+    clone at its previous HEAD with its tree, including local edits, exactly as it was."""
+    eng, dest, _new, _rev, install = _fake_cron_plus(tmp_path)
+    if refusal == "mirror-drift":
+        (eng / "patches" / "cron-plus" / "dst_fold.py").write_text("# engine-only edit\n")
+    else:
+        _pin_jobs_module(tmp_path, eng, _jobs_module("JOBS_LOCK_FILE = CRON_PLUS_HOME / 'jobs.json'\n"))
+    before = _clone_state(dest)
+    r = install()
+    assert r.returncode != 0, "the pin must be refused"
+    assert "restored pinned cron-plus tree" not in r.stdout and "discarding LOCAL" not in r.stderr, \
+        "the managed clone was switched before the checks ran"
+    assert _clone_state(dest) == before, "a refused install changed the managed clone"
+
+
+def test_a_refused_fresh_install_creates_no_managed_clone(tmp_path):
+    """With no clone yet, a refused pin must not leave one behind for the gateway to load."""
+    eng, dest, _new, _rev, install = _fake_cron_plus(tmp_path)
+    import shutil
+    shutil.rmtree(dest)
+    (eng / "patches" / "cron-plus" / "dst_fold.py").write_text("# engine-only edit\n")
+    r = install()
+    assert r.returncode != 0
+    assert "cloned to" not in r.stdout
+    assert not dest.exists(), "a refused fresh install left the refused pin on disk"
+
+
+def test_a_fresh_install_lands_the_verified_pin(tmp_path):
+    _eng, dest, new, rev, install = _fake_cron_plus(tmp_path)
+    import shutil
+    shutil.rmtree(dest)
+    r = install()
+    assert r.returncode == 0, r.stderr
+    assert "cloned to" in r.stdout and rev(dest) == new
+    assert subprocess.run(["git", "status", "--porcelain"], cwd=dest, capture_output=True,
+                          text=True).stdout == ""
+
+
+def test_install_cron_plus_lock_check_leaves_no_state_behind(tmp_path, monkeypatch):
+    """The import runs with HERMES_HOME at a throwaway directory that is removed afterward, so a
+    module that creates its store directory at import time touches nothing real."""
+    home = tmp_path / "real-home"; home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    eng, _dest, _new, _rev, install = _fake_cron_plus(tmp_path)
+    marker = tmp_path / "home-seen"
+    _pin_jobs_module(tmp_path, eng, _jobs_module(
+        f"CRON_PLUS_HOME.mkdir(parents=True)\nopen({str(marker)!r}, 'w').write(str(HERMES_HOME))\n"))
+    r = install()
+    assert r.returncode == 0, r.stderr
+    seen = marker.read_text()
+    assert not seen.startswith(str(home)), "the import must not see the real HERMES_HOME"
+    assert not os.path.exists(seen), "the throwaway HERMES_HOME was not removed"
+    assert list(home.iterdir()) == []
 
 
 def test_cron_plus_logs_reads_container_not_host_hermes():  # invariant-audit #15

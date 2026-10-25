@@ -1,6 +1,6 @@
 # OKEngine dev tasks. See CONTRIBUTING.md. Run `make help` for the list.
 .DEFAULT_GOAL := help
-.PHONY: help dev editable-install test test-policy test-unit test-integration test-contract test-invariant test-security test-mutation-changed test-mutation-full test-mutation-critical test-mutation-critical-preflight lint package-check wheel prompt-lint scrub preflight test-release release-evidence scaffold-check check audit coverage typecheck diff-check docker-smoke smoke-e2e smoke-release e2e-release resilience-release performance-release sandbox-start sandbox-stop sandbox-reset render-lint content-lint publish-snapshot
+.PHONY: help dev editable-install test test-policy test-unit test-integration test-contract test-invariant test-security test-mutation-changed test-mutation-full test-mutation-full-preflight test-mutation-targeted test-mutation-critical test-mutation-critical-preflight lint package-check wheel prompt-lint scrub preflight test-release release-evidence scaffold-check check audit coverage typecheck diff-check docker-smoke smoke-e2e smoke-release e2e-release resilience-release performance-release sandbox-start sandbox-stop sandbox-reset render-lint content-lint publish-snapshot
 
 # One interpreter for every test/release gate. Prefer the repository's canonical
 # environment when it exists; operators and CI can override with TEST_PYTHON=...
@@ -95,12 +95,38 @@ MUTATION_SHARD_COUNT ?= 1
 MUTATION_SHARD_INDEX ?= 0
 MUTATION_BASELINE_PROOF ?=
 
-test-mutation-full:  ## run the complete reviewed mutation manifest (weekly CI)
+# okengine#1071: the weekly full lane is a ROTATION. The whole manifest costs about twelve times one
+# run's capacity, so each run measures what its shards can fit (failing, changed, never measured
+# and stale targets first) and defers the rest. Every target must be measured at least once per
+# MUTATION_FULL_REBASELINE_DAYS (six weekly runs), or its deferral fails the lane.
+MUTATION_FULL_REBASELINE_DAYS ?= 42
+# Must equal mutation-full's `parallel:` (pinned by tests/test_ci_config.py).
+MUTATION_FULL_SHARD_COUNT ?= 3
+
+test-mutation-full:  ## one shard of the weekly full-manifest ROTATION (weekly CI; with MUTATION_REUSE_PLAN from test-mutation-full-preflight it measures that plan's shard list)
 	mkdir -p "$(MUTATION_ARTIFACTS)"
 	$(TEST_TIMEOUT) $(TEST_MUTATION_DEADLINE) "$(TEST_PYTHON)" ci/mutation_gate.py --mode full \
 		--deadline-seconds "$(MUTATION_GATE_BUDGET)" --jobs "$(MUTATION_JOBS)" \
 		--artifacts "$(MUTATION_ARTIFACTS)" --shard-count "$(MUTATION_SHARD_COUNT)" \
-		--shard-index "$(MUTATION_SHARD_INDEX)"
+		--shard-index "$(MUTATION_SHARD_INDEX)" \
+		$(if $(MUTATION_BASELINE_PROOF),--baseline-proof "$(MUTATION_BASELINE_PROOF)",) \
+		$(if $(MUTATION_REUSE_PLAN),--reuse-plan "$(MUTATION_REUSE_PLAN)",)
+
+test-mutation-full-preflight:  ## plan the weekly rotation: reuse evidence, admit what MUTATION_FULL_SHARD_COUNT shards fit, defer the rest, prove baselines
+	mkdir -p "$(MUTATION_ARTIFACTS)"
+	$(TEST_TIMEOUT) $(TEST_MUTATION_PREFLIGHT_DEADLINE) "$(TEST_PYTHON)" ci/mutation_gate.py --mode full \
+		--preflight-only --jobs 1 --artifacts "$(MUTATION_ARTIFACTS)" --reuse-evidence \
+		--rebaseline-days "$(MUTATION_FULL_REBASELINE_DAYS)" \
+		--rotation-shards "$(MUTATION_FULL_SHARD_COUNT)" --rotation-workers "$(MUTATION_JOBS)" \
+		--deadline-seconds "$(MUTATION_GATE_BUDGET)"
+
+test-mutation-targeted:  ## whole-file campaign on the named MUTATION_TARGETS only (okengine#1071)
+	@test -n "$(strip $(MUTATION_TARGETS))" || { echo "MUTATION_TARGETS is empty: name one or more manifest paths" >&2; exit 2; }
+	mkdir -p "$(MUTATION_ARTIFACTS)"
+	$(TEST_TIMEOUT) $(TEST_MUTATION_DEADLINE) "$(TEST_PYTHON)" ci/mutation_gate.py --mode full \
+		$(foreach target,$(MUTATION_TARGETS),--target "$(target)") \
+		--deadline-seconds "$(MUTATION_GATE_BUDGET)" --jobs "$(MUTATION_JOBS)" \
+		--artifacts "$(MUTATION_ARTIFACTS)"
 
 test-mutation-critical:  ## the declared critical targets — the daily signal (nightly CI)
 	mkdir -p "$(MUTATION_ARTIFACTS)"

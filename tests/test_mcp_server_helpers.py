@@ -167,6 +167,49 @@ def test_safe_preserves_flat_legacy_and_special_entity_files_without_canonical(s
     assert mod._safe("entities/INDEX") == index.resolve()
 
 
+def _sharded_letter(vault):
+    """entities/a already resharded: single-letter subdirectories with pages for other slugs."""
+    sibling = vault / "wiki/entities/a/b/abacus.md"
+    sibling.parent.mkdir(parents=True)
+    sibling.write_text("abacus")
+    return vault / "wiki/entities"
+
+
+def test_safe_reads_a_flat_legacy_entity_inside_a_sharded_letter(srv):
+    """okengine#1070: a sharded letter directory does not redirect a read away from the flat page
+    that holds the only copy; the read path probes files that exist, not where a page would land."""
+    mod, vault = srv
+    flat = _sharded_letter(vault) / "acme-corp.md"
+    flat.write_text("legacy")
+    assert mod._safe("entities/acme-corp") == flat.resolve()
+
+
+def test_safe_resolves_a_missing_entity_to_its_exact_spelling_inside_a_sharded_letter(srv):
+    mod, vault = srv
+    entities = _sharded_letter(vault)
+    assert mod._safe("entities/acme-corp") == (entities / "acme-corp.md").resolve()
+
+
+def test_safe_reads_a_one_level_entity_inside_a_sharded_letter(srv):
+    mod, vault = srv
+    one = _sharded_letter(vault) / "a/acme-corp.md"
+    one.write_text("one-level")
+    assert mod._safe("entities/acme-corp") == one.resolve()
+
+
+def test_safe_does_not_list_entity_directories(srv, monkeypatch):
+    """Resolution stats candidate files only: a directory listing on every entity-shaped read was
+    dead work (okengine#1070) and must not come back."""
+    mod, vault = srv
+    _sharded_letter(vault)
+
+    def no_listing(path):
+        raise AssertionError(f"_safe listed {path}")
+
+    monkeypatch.setattr(Path, "iterdir", no_listing)
+    assert mod._safe("entities/acme-corp") is not None
+
+
 def test_safe_strips_repeated_absolute_vault_prefixes(srv):
     mod, vault = srv
     page = vault / "wiki/entities/a/acme.md"

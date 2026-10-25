@@ -18,6 +18,8 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 DEPLOY = REPO / "scripts" / "deploy.sh"
 SKELETON = REPO / "templates" / "pack" / "skeleton" / "docker-compose.yml"
+#: Set by the `dotenv-compose-parity` CI job, where `docker compose` exists: a skip there FAILS.
+REQUIRE_COMPOSE = "OKENGINE_REQUIRE_COMPOSE_PARITY"
 
 
 def _pin_block() -> str:
@@ -83,6 +85,11 @@ def test_the_pinned_reader_agrees_with_the_gateway_under_compose(tmp_path):
     docker = shutil.which("docker")
     if docker is None or subprocess.run([docker, "compose", "version"], capture_output=True,
                                         timeout=60).returncode != 0:
+        # okengine#1065: the `dotenv-compose-parity` lane sets this, so a lane that has compose
+        # never records this check as skipped.
+        if os.environ.get(REQUIRE_COMPOSE) == "1":
+            pytest.fail(f"{REQUIRE_COMPOSE}=1 but `docker compose` is unavailable: the "
+                        "reader/gateway agreement check would be skipped, which is not a pass")
         pytest.skip("docker compose is not available here; reader/gateway agreement unverified")
     (tmp_path / ".env").write_text("OKENGINE_EDITING=0\n")
     reader_line = next(x for x in SKELETON.read_text().splitlines()
@@ -105,3 +112,15 @@ def test_the_pinned_reader_agrees_with_the_gateway_under_compose(tmp_path):
 
     assert services("1") == {"gateway": "0", "reader": "1"}       # the split, unpinned
     assert services(value) == {"gateway": "0", "reader": "0"}     # pinned by deploy.sh
+
+
+def test_a_required_compose_run_fails_rather_than_skips(tmp_path, monkeypatch):
+    """Negative fixture for the guard above (okengine#1065): without compose, the required lane
+    FAILS; elsewhere the check still skips."""
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setenv(REQUIRE_COMPOSE, "1")
+    with pytest.raises(pytest.fail.Exception, match="not a pass"):
+        test_the_pinned_reader_agrees_with_the_gateway_under_compose(tmp_path)
+    monkeypatch.delenv(REQUIRE_COMPOSE)
+    with pytest.raises(pytest.skip.Exception):
+        test_the_pinned_reader_agrees_with_the_gateway_under_compose(tmp_path)

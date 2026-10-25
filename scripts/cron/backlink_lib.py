@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Backlink-graph build: invert IWE forward-references into {target: [referrers]}.
+"""Backlink-graph build: invert scanned forward-references into {target: [referrers]}.
 
 Canonical home of the invert + source-filter + title logic (okengine#168). The
 `backlinks-refresh` cron uses this to precompute wiki/.backlinks.json once per
 deployment per day; the reader and cockpit serve that artifact instead of each
-running the heavy `iwe find -f json -l 0` full-graph dump (~minutes / ~2GB RSS
-on a large vault) inside their own containers. The UIs keep a live-iwe build
-ONLY as a fallback for a missing/stale artifact — when touching the filter
+building the graph inside their own containers (originally the heavy `iwe find -f json -l 0`
+full-graph dump, ~minutes / ~2GB RSS on a large vault, retired in okengine#179). The UIs keep a
+live in-process scan ONLY as a fallback for a missing/stale artifact — when touching the filter
 semantics here, mirror the change in okengine-reader/app.py
 (_skip_backlink_src) so the degraded path doesn't drift.
 
@@ -136,7 +136,7 @@ def page_title(wiki_root: Path, key: str) -> str:
 
 
 def invert(docs: list, wiki_root: Path, excluded: frozenset[str]) -> dict:
-    """Invert IWE's per-doc forward-references into {target: [{key,title}]},
+    """Invert the per-doc forward-references (scan_forward_refs) into {target: [{key,title}]},
     filtered, deduped, title-sorted — the exact map the UIs serve."""
     bl: dict[str, list] = {}
     titles: dict[str, str] = {}

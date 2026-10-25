@@ -310,7 +310,7 @@ a.wl:hover{border-bottom-style:solid}
 .gsnip{color:var(--muted);font-size:0.857rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
 .gempty,.gmore{padding:8px 12px;color:var(--dim);font:12px var(--mono)}
 
-/* IWE backlinks panel (overlay "what links here") */
+/* Backlinks panel (overlay "what links here") */
 /* trust/provenance strip — top of every page overlay */
 .provenance{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 14px;padding-bottom:11px;border-bottom:1px solid var(--border)}
 .pv-chip{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:11px;border:1px solid var(--border);background:var(--panel);color:var(--muted);font:600 11px/16px var(--mono);white-space:nowrap}

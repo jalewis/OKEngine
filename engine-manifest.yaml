@@ -12,7 +12,7 @@
 # (schema.yaml + persona + feeds + crons + content). See INSTALL.md and
 # docs/deploy-a-new-domain.md.
 version: 1
-engine_release: v0.15.20  # PATCH: cron-plus pinned at hermes-cron-plus v0.2.0, which carries every former engine patch
+engine_release: v0.15.21  # PATCH: install-cron-plus.sh verifies the pin before switching and checks the lock by import (#1068/#1069); read MCP list_pages scan order (#1070)
 
 runtime:
   # Hermes is a PINNED DEPENDENCY, not vendored into this repo. You clone Hermes

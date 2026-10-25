@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """OKF hierarchical migration — bulk, link-preserving namespace reorganization.
 
-Replicates `iwe rename`'s semantics (move file + rewrite every [[reference]]) but
-as a SINGLE O(n) pass over the corpus, because per-file `iwe rename` rebuilds the
-graph each call (~13s on 40k = infeasible at scale). `iwe stats` is the validator
-(run before/after: reference count must be unchanged), not the mover.
+Replicates the semantics of IWE's `iwe rename` (move file + rewrite every [[reference]]) but
+as a SINGLE O(n) pass over the corpus, because per-file `iwe rename` rebuilt the
+graph each call (~13s on 40k = infeasible at scale). The engine no longer runs IWE (#651):
+the validator is the reference count, which must be unchanged before and after a move.
 
 Target layout is CONFIG-DRIVEN: the governing schema.yaml's `partitioning` block
 (inherited from base-schema — entities: by-letter `entities/{L}/{slug}`, sources:
